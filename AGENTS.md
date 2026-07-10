@@ -51,8 +51,8 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
 ## Layout
 
 - `crates/infer/src/` — model loading, Qwen runtime, decode, and probes.
-- `crates/infer/src/runtime/` — reusable runtime state such as the KV
-  cache.
+- `crates/infer/src/runtime/` — reusable KV-cache, sampling, and generation
+  state.
 - `crates/infer/src/qwen3/` — Qwen model formats, layers, and decoding.
 - `crates/infer/benches/` — runtime and routed-MoE micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.

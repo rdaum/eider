@@ -16,3 +16,7 @@ micromeasure.workspace = true
 [[bench]]
 name = "qwen36_routed_gate_up"
 harness = false
+
+[[bench]]
+name = "sampling"
+harness = false

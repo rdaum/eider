@@ -1,7 +1,7 @@
 use infer::nvfp4::{Error, Result};
 use infer::qwen3::infer::Qwen3Model;
 use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
-use rand::Rng;
+use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;
@@ -22,13 +22,6 @@ enum PromptInput {
         system: Option<String>,
         message: String,
     },
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SamplingConfig {
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
 }
 
 fn main() -> Result<()> {
@@ -52,20 +45,27 @@ fn main() -> Result<()> {
     println!("  max new tokens: {}", args.max_new_tokens);
     println!("  eos token ids: {:?}", eos_token_ids);
     println!(
-        "  sampling: temperature={} top_k={} top_p={}",
-        args.sampling.temperature, args.sampling.top_k, args.sampling.top_p
+        "  sampling: temperature={} top_k={} top_p={} seed={:?} presence_penalty={} frequency_penalty={}",
+        args.sampling.temperature,
+        args.sampling.top_k,
+        args.sampling.top_p,
+        args.sampling.seed,
+        args.sampling.presence_penalty,
+        args.sampling.frequency_penalty,
     );
 
     let mut state = model.new_decode_state(prompt_ids.len() + args.max_new_tokens)?;
 
     let mut generated_ids = Vec::with_capacity(args.max_new_tokens);
     let mut stopped_on_eos = None;
-    let mut rng = rand::rng();
-    let mut next_token = sample_next_token(
-        &model.prefill_logits(&mut state, &prompt_ids)?.logits,
-        args.sampling,
-        &mut rng,
-    )?;
+    let mut history = TokenHistory::from_tokens(prompt_ids.iter().copied());
+    let mut sampler = Sampler::new(args.sampling)?;
+    let mut next_token = sampler
+        .sample(
+            &model.prefill_logits(&mut state, &prompt_ids)?.logits,
+            &history,
+        )?
+        .id;
     state.last_token = Some(next_token);
 
     for _ in 0..args.max_new_tokens {
@@ -74,11 +74,13 @@ fn main() -> Result<()> {
             break;
         }
         generated_ids.push(next_token);
-        next_token = sample_next_token(
-            &model.decode_one_logits(&mut state, next_token)?.logits,
-            args.sampling,
-            &mut rng,
-        )?;
+        history.push(next_token);
+        next_token = sampler
+            .sample(
+                &model.decode_one_logits(&mut state, next_token)?.logits,
+                &history,
+            )?
+            .id;
         state.last_token = Some(next_token);
     }
 
@@ -107,7 +109,12 @@ impl GenerateArgs {
         let mut chat_message = None;
         let mut system = None;
         let mut max_new_tokens = 64;
-        let mut sampling = SamplingConfig::default();
+        let mut sampling = SamplingConfig {
+            temperature: 0.8,
+            top_k: 50,
+            top_p: 0.95,
+            ..SamplingConfig::default()
+        };
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -176,6 +183,38 @@ impl GenerateArgs {
                         detail: err.to_string(),
                     })?;
                 }
+                "--seed" => {
+                    let value = args.next().ok_or_else(|| Error::Format {
+                        label: "--seed",
+                        detail: "expected unsigned integer".to_string(),
+                    })?;
+                    sampling.seed = Some(value.parse::<u64>().map_err(|err| Error::Format {
+                        label: "--seed",
+                        detail: err.to_string(),
+                    })?);
+                }
+                "--presence-penalty" => {
+                    let value = args.next().ok_or_else(|| Error::Format {
+                        label: "--presence-penalty",
+                        detail: "expected penalty".to_string(),
+                    })?;
+                    sampling.presence_penalty =
+                        value.parse::<f32>().map_err(|err| Error::Format {
+                            label: "--presence-penalty",
+                            detail: err.to_string(),
+                        })?;
+                }
+                "--frequency-penalty" => {
+                    let value = args.next().ok_or_else(|| Error::Format {
+                        label: "--frequency-penalty",
+                        detail: "expected penalty".to_string(),
+                    })?;
+                    sampling.frequency_penalty =
+                        value.parse::<f32>().map_err(|err| Error::Format {
+                            label: "--frequency-penalty",
+                            detail: err.to_string(),
+                        })?;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -234,19 +273,9 @@ impl PromptInput {
     }
 }
 
-impl Default for SamplingConfig {
-    fn default() -> Self {
-        Self {
-            temperature: 0.8,
-            top_k: 50,
-            top_p: 0.95,
-        }
-    }
-}
-
 fn print_usage() {
     println!(
-        "usage: qwen-generate --model models/qwen3-8b-nvfp4 (--prompt TEXT | --chat-message TEXT [--system TEXT]) [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P]"
+        "usage: qwen-generate --model models/qwen3-8b-nvfp4 (--prompt TEXT | --chat-message TEXT [--system TEXT]) [--max-new-tokens N] [--temperature T] [--top-k K] [--top-p P] [--seed N] [--presence-penalty P] [--frequency-penalty P]"
     );
 }
 
@@ -344,100 +373,4 @@ fn validate_token_ids(label: &'static str, token_ids: &[u32], vocab_size: usize)
         }
     }
     Ok(())
-}
-
-fn sample_next_token<R: Rng + ?Sized>(
-    logits: &[f32],
-    config: SamplingConfig,
-    rng: &mut R,
-) -> Result<u32> {
-    if logits.is_empty() {
-        return Err(Error::Shape {
-            label: "sampling logits",
-            expected: "at least one logit".to_string(),
-            actual: "0 logits".to_string(),
-        });
-    }
-    if !config.temperature.is_finite() || config.temperature < 0.0 {
-        return Err(Error::Format {
-            label: "--temperature",
-            detail: format!(
-                "expected finite non-negative temperature, got {}",
-                config.temperature
-            ),
-        });
-    }
-    if !config.top_p.is_finite() || config.top_p <= 0.0 || config.top_p > 1.0 {
-        return Err(Error::Format {
-            label: "--top-p",
-            detail: format!("expected 0 < top_p <= 1, got {}", config.top_p),
-        });
-    }
-
-    if config.temperature == 0.0 || config.top_k == 1 {
-        return Ok(argmax(logits).0);
-    }
-
-    let mut candidates = logits
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, logit)| logit.is_finite())
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return Err(Error::Format {
-            label: "sampling logits",
-            detail: "no finite logits".to_string(),
-        });
-    }
-
-    candidates.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-    if config.top_k > 0 && config.top_k < candidates.len() {
-        candidates.truncate(config.top_k);
-    }
-
-    let max_logit = candidates[0].1;
-    let mut weighted = candidates
-        .into_iter()
-        .map(|(idx, logit)| (idx, ((logit - max_logit) / config.temperature).exp()))
-        .collect::<Vec<_>>();
-    let total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
-    if !total.is_finite() || total <= 0.0 {
-        return Ok(argmax(logits).0);
-    }
-    for (_, weight) in &mut weighted {
-        *weight /= total;
-    }
-
-    weighted.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-    let mut cumulative = 0.0;
-    let mut cutoff = weighted.len();
-    for (idx, (_, probability)) in weighted.iter().enumerate() {
-        cumulative += *probability;
-        if cumulative >= config.top_p {
-            cutoff = idx + 1;
-            break;
-        }
-    }
-    weighted.truncate(cutoff.max(1));
-
-    let renormalized_total = weighted.iter().map(|(_, weight)| *weight).sum::<f32>();
-    let mut draw = rng.random::<f32>() * renormalized_total;
-    for (idx, weight) in weighted {
-        if draw <= weight {
-            return Ok(idx as u32);
-        }
-        draw -= weight;
-    }
-    Ok(argmax(logits).0)
-}
-
-fn argmax(logits: &[f32]) -> (u32, f32) {
-    logits
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-        .map(|(idx, value)| (idx as u32, value))
-        .unwrap_or((0, f32::NEG_INFINITY))
 }

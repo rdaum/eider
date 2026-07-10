@@ -62,9 +62,9 @@ The workspace has two layers:
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
 - `crates/infer` owns model loading, Qwen layer execution, KV-cache state,
-  prefill/decode orchestration, CLI binaries, and runtime benchmarks.
-  Its reusable execution state lives under `runtime/`, while model-family code
-  lives under `qwen3/`.
+  request-scoped sampling and generation, prefill/decode orchestration, CLI
+  binaries, and runtime benchmarks. Its reusable execution state lives under
+  `runtime/`, while model-family code lives under `qwen3/`.
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust
 crate by its build script. CUTLASS is optional; when it is unavailable, the
@@ -157,8 +157,9 @@ cargo run --release -p infer --bin qwen36-generate -- \
 
 The generator applies the checkpoint's text chat prefix and reads its sampling
 defaults from `generation_config.json` (`temperature`, `top_k`, `top_p`, and
-EOS token IDs). Positional overrides follow the token count; pass `0` as the
-temperature to use the faster deterministic GPU top-1 path:
+EOS token IDs). Positional overrides follow the token count in this order:
+temperature, top-k, top-p, seed, presence penalty, and frequency penalty. Pass
+`0` as the temperature to use the faster deterministic GPU top-1 path:
 
 ```sh
 cargo run --release -p infer --bin qwen36-generate -- \
@@ -221,6 +222,7 @@ cargo bench -p nvfp4 --bench lm_head_top1
 cargo bench -p nvfp4 --bench sm12x_indexed_gemv
 cargo bench -p nvfp4 --bench fp4_cublaslt
 cargo bench -p nvfp4 --bench fp4_quantization
+cargo bench -p infer --bench sampling
 ```
 
 Keep kernel claims tied to a shape-appropriate micromeasure and an end-to-end
