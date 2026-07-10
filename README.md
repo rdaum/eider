@@ -82,6 +82,12 @@ The current model targets are:
 Models are expected to be ModelOpt-quantized NVFP4 checkpoints with the
 repository's expected manifest and tokenizer files.
 
+The first Qwen3.6 startup builds the SM12x down-weight cache under
+`.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
+down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Cache files are
+written atomically and incomplete layers are resumed on the next startup;
+later runs validate and reuse the completed cache automatically.
+
 ## Runtime shape
 
 The steady-state Qwen3.6 path is a device-resident decode loop. Rust owns the

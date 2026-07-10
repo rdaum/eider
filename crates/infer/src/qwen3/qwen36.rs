@@ -29,6 +29,7 @@ use super::infer::{
     QwenArchitecture, QwenDecodeProfile, QwenFfnConfig, QwenLayerKind, QwenLinearAttentionConfig,
     QwenModelManifest,
 };
+use super::qwen36_cache::{ensure_layer_cache, ensure_model_cache, prepared_layer_dir};
 
 use std::time::Instant;
 
@@ -289,7 +290,11 @@ impl Qwen36Model {
                 actual: layer.to_string(),
             });
         }
-        Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer)
+        Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer, false)
+    }
+
+    fn load_moe_from_prepared_cache(&self, layer: usize) -> Result<Qwen36MoeWeights> {
+        Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer, true)
     }
 
     /// Allocates workspace for a loaded MoE + shared-expert FFN.
@@ -1448,7 +1453,13 @@ impl Qwen36MoeWeights {
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         layer: usize,
+        cache_prepared: bool,
     ) -> Result<Self> {
+        let sm12x_cache_dir = if cache_prepared {
+            prepared_layer_dir(checkpoint, layer)
+        } else {
+            ensure_layer_cache(checkpoint, manifest, layer)?
+        };
         let (experts, experts_per_token, expert_intermediate, norm_topk_prob) = match manifest.ffn {
             QwenFfnConfig::Moe {
                 experts,
@@ -1489,10 +1500,6 @@ impl Qwen36MoeWeights {
             });
         }
 
-        let sm12x_cache_dir = checkpoint
-            .root()
-            .join(".spark-sm12x")
-            .join(format!("layer-{layer:03}"));
         // Marlin gate/up plus SM12x down is the validated Qwen3.6 fast path.
         let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
@@ -2956,6 +2963,14 @@ pub struct Qwen36LayerBlockStep<'a> {
 impl Qwen36LayerBlock {
     /// Loads the full layer block (norms + attention + MoE) for `layer`.
     pub fn load(model: &Qwen36Model, layer: usize) -> Result<Self> {
+        Self::load_inner(model, layer, false)
+    }
+
+    fn load_from_prepared_cache(model: &Qwen36Model, layer: usize) -> Result<Self> {
+        Self::load_inner(model, layer, true)
+    }
+
+    fn load_inner(model: &Qwen36Model, layer: usize, cache_prepared: bool) -> Result<Self> {
         let kind = model.layer_kind(layer)?;
         let input_norm = model.load_input_norm(layer)?;
         let post_attn_norm = model.load_post_attn_norm(layer)?;
@@ -2967,7 +2982,11 @@ impl Qwen36LayerBlock {
                 Qwen36FullAttentionWeights::load(&model.checkpoint, &model.manifest, layer)?,
             ),
         };
-        let moe = model.load_moe(layer)?;
+        let moe = if cache_prepared {
+            model.load_moe_from_prepared_cache(layer)?
+        } else {
+            model.load_moe(layer)?
+        };
         Ok(Self {
             layer,
             kind,
@@ -3482,10 +3501,11 @@ impl Qwen36TextModel {
     pub fn from_qwen36_model(model: Qwen36Model) -> Result<Self> {
         let manifest = model.manifest().clone();
         let checkpoint = model.checkpoint().clone();
+        ensure_model_cache(&checkpoint, &manifest)?;
         let lt = CublasLt::new()?;
         let mut layers = Vec::with_capacity(manifest.layers);
         for layer in 0..manifest.layers {
-            layers.push(Qwen36LayerBlock::load(&model, layer)?);
+            layers.push(Qwen36LayerBlock::load_from_prepared_cache(&model, layer)?);
         }
         let embedding = read_bf16_matrix_device(
             &checkpoint,

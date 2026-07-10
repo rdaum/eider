@@ -56,7 +56,3 @@ harness = false
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"
-
-[[bin]]
-name = "sm12x-cache-qwen36-gate-up"
-path = "src/bin/sm12x-cache-qwen36-gate-up.rs"

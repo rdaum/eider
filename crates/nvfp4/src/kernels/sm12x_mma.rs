@@ -509,8 +509,9 @@ impl Sm12xFp4GemmWeight {
 
     pub fn write_cache_file(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let mut file =
-            std::fs::File::create(path).map_err(|error| cache_io_error("create", path, error))?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|error| cache_io_error("create", &temporary, error))?;
         let tile_bytes = self.tiles.to_bytes();
         file.write_all(CACHE_MAGIC)
             .map_err(|error| cache_io_error("write", path, error))?;
@@ -530,7 +531,56 @@ impl Sm12xFp4GemmWeight {
             file.write_all(&scale.to_le_bytes())
                 .map_err(|error| cache_io_error("write", path, error))?;
         }
+        file.flush()
+            .map_err(|error| cache_io_error("flush", &temporary, error))?;
+        drop(file);
+        std::fs::rename(&temporary, path).map_err(|error| cache_io_error("rename", path, error))?;
         Ok(())
+    }
+
+    /// Checks that a cache file has the expected header and complete payload.
+    pub fn cache_file_matches(path: impl AsRef<Path>, m: usize, k: usize) -> bool {
+        let path = path.as_ref();
+        if m == 0 || k == 0 || !m.is_multiple_of(16) || !k.is_multiple_of(64) {
+            return false;
+        }
+        let expected_m_tiles = m / 16;
+        let expected_k_tiles = k / 64;
+        let expected_tiles = expected_m_tiles * expected_k_tiles * TILE_BYTES;
+        let expected_scales = expected_m_tiles * expected_k_tiles;
+        let expected_file_len = 44 + expected_tiles as u64 + (expected_scales * 4) as u64;
+
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        if !matches!(file.metadata(), Ok(metadata) if metadata.len() == expected_file_len) {
+            return false;
+        }
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_err() {
+            return false;
+        }
+        let Ok(version) = read_u32(&mut file) else {
+            return false;
+        };
+        let Ok(m_tiles) = read_u64(&mut file) else {
+            return false;
+        };
+        let Ok(k_tiles) = read_u64(&mut file) else {
+            return false;
+        };
+        let Ok(tile_len) = read_u64(&mut file) else {
+            return false;
+        };
+        let Ok(scale_len) = read_u64(&mut file) else {
+            return false;
+        };
+        &magic == CACHE_MAGIC
+            && version == CACHE_VERSION
+            && m_tiles as usize == expected_m_tiles
+            && k_tiles as usize == expected_k_tiles
+            && tile_len as usize == expected_tiles
+            && scale_len as usize == expected_scales
     }
 
     pub fn read_cache_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -1830,5 +1880,38 @@ mod tests {
         )
         .expect_err("shape mismatch");
         assert!(format!("{err}").contains("SM12x FP4 GEMV weight"));
+    }
+
+    #[test]
+    fn sm12x_cache_validation_rejects_truncated_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "eider-sm12x-cache-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create test cache directory");
+        let path = directory.join("weight.s12x");
+        let weight = Sm12xFp4GemmWeight::from_packed_row_major(
+            16,
+            64,
+            &vec![0x44; 16 * 64 / 2],
+            vec![0x38383838],
+        )
+        .expect("cache weight");
+
+        weight.write_cache_file(&path).expect("write cache");
+        assert!(Sm12xFp4GemmWeight::cache_file_matches(&path, 16, 64));
+        assert!(
+            !path
+                .with_extension(format!("tmp-{}", std::process::id()))
+                .exists()
+        );
+
+        let mut bytes = std::fs::read(&path).expect("read cache");
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(&path, bytes).expect("truncate cache");
+        assert!(!Sm12xFp4GemmWeight::cache_file_matches(&path, 16, 64));
+
+        std::fs::remove_dir_all(directory).expect("remove test cache directory");
     }
 }

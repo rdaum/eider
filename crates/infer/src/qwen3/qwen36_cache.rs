@@ -1,0 +1,270 @@
+use super::infer::{QwenFfnConfig, QwenModelManifest};
+use nvfp4::{Error, ModelOptCheckpoint, Result, Sm12xFp4GemmWeight};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const CACHE_DIR: &str = ".eider-cache/sm12x-down-v1";
+const CACHE_MARKER_VERSION: &str = "eider-sm12x-down-v1";
+
+pub(crate) fn ensure_model_cache(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+) -> Result<()> {
+    let missing = (0..manifest.layers)
+        .filter(|&layer| !layer_cache_complete(checkpoint, manifest, layer))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "preparing SM12x down cache: {} missing layer{} in {}",
+        missing.len(),
+        if missing.len() == 1 { "" } else { "s" },
+        cache_root(checkpoint).display()
+    );
+    for (completed, layer) in missing.iter().copied().enumerate() {
+        build_layer_cache(checkpoint, manifest, layer)?;
+        eprintln!(
+            "prepared SM12x down cache layer {} ({}/{})",
+            layer,
+            completed + 1,
+            missing.len()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_layer_cache(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer: usize,
+) -> Result<PathBuf> {
+    if layer >= manifest.layers {
+        return Err(Error::Shape {
+            label: "Qwen3.6 SM12x cache layer",
+            expected: format!("layer < {}", manifest.layers),
+            actual: layer.to_string(),
+        });
+    }
+    if !layer_cache_complete(checkpoint, manifest, layer) {
+        eprintln!("preparing SM12x down cache layer {layer}");
+        build_layer_cache(checkpoint, manifest, layer)?;
+    }
+    Ok(layer_dir(checkpoint, layer))
+}
+
+pub(crate) fn prepared_layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {
+    layer_dir(checkpoint, layer)
+}
+
+fn build_layer_cache(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer: usize,
+) -> Result<()> {
+    let (experts, intermediate) = moe_shape(manifest)?;
+    let layer_dir = layer_dir(checkpoint, layer);
+    std::fs::create_dir_all(&layer_dir)
+        .map_err(|error| cache_fs_error("create", &layer_dir, error))?;
+
+    let expected_marker = marker_contents(checkpoint, manifest, layer)?;
+    let rebuild_all = matches!(
+        std::fs::read_to_string(layer_dir.join(".complete")),
+        Ok(marker) if marker != expected_marker
+    );
+
+    let missing = (0..experts)
+        .filter(|&expert| {
+            rebuild_all
+                || !Sm12xFp4GemmWeight::cache_file_matches(
+                    expert_path(&layer_dir, expert),
+                    manifest.hidden,
+                    intermediate,
+                )
+        })
+        .collect::<Vec<_>>();
+    let next = AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(missing.len().max(1));
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let next = &next;
+            let missing = &missing;
+            let layer_dir = &layer_dir;
+            handles.push(scope.spawn(move || -> Result<()> {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&expert) = missing.get(index) else {
+                        break;
+                    };
+                    build_expert_cache(checkpoint, manifest, layer_dir, layer, expert)?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().map_err(|_| Error::Format {
+                label: "Qwen3.6 SM12x cache",
+                detail: "cache worker panicked".to_string(),
+            })??;
+        }
+        Ok::<(), Error>(())
+    })?;
+
+    write_atomic(&layer_dir.join(".complete"), expected_marker.as_bytes())
+}
+
+fn build_expert_cache(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer_dir: &Path,
+    layer: usize,
+    expert: usize,
+) -> Result<()> {
+    let prefix = format!(
+        "{}.layers.{layer}.mlp.experts.{expert}.down_proj",
+        manifest.tensor_prefix
+    );
+    let down = checkpoint.load_nvfp4_linear(&prefix)?;
+    let row_major = down.dequantize_to_f32_col_major();
+    let quantized = Sm12xFp4GemmWeight::quantize_f32_row_major_m16_k16(
+        down.out_features,
+        down.in_features,
+        &row_major,
+    )?;
+    quantized
+        .weight
+        .write_cache_file(expert_path(layer_dir, expert))
+}
+
+fn layer_cache_complete(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer: usize,
+) -> bool {
+    let Ok(expected_marker) = marker_contents(checkpoint, manifest, layer) else {
+        return false;
+    };
+    let layer_dir = layer_dir(checkpoint, layer);
+    if !matches!(
+        std::fs::read_to_string(layer_dir.join(".complete")),
+        Ok(marker) if marker == expected_marker
+    ) {
+        return false;
+    }
+    let Ok((experts, intermediate)) = moe_shape(manifest) else {
+        return false;
+    };
+    (0..experts).all(|expert| {
+        Sm12xFp4GemmWeight::cache_file_matches(
+            expert_path(&layer_dir, expert),
+            manifest.hidden,
+            intermediate,
+        )
+    })
+}
+
+fn marker_contents(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer: usize,
+) -> Result<String> {
+    let (experts, intermediate) = moe_shape(manifest)?;
+    Ok(format!(
+        "{CACHE_MARKER_VERSION}\nlayer={layer}\nexperts={experts}\nout={};in={intermediate}\n{}",
+        manifest.hidden,
+        checkpoint_stamp(checkpoint.root())?
+    ))
+}
+
+fn checkpoint_stamp(model_dir: &Path) -> Result<String> {
+    let mut shards = std::fs::read_dir(model_dir)
+        .map_err(|error| cache_fs_error("read", model_dir, error))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "safetensors")
+        })
+        .collect::<Vec<_>>();
+    shards.sort();
+    if shards.is_empty() {
+        return Err(Error::Format {
+            label: "Qwen3.6 SM12x cache",
+            detail: format!("no safetensors shards found in {}", model_dir.display()),
+        });
+    }
+
+    let mut stamp = String::new();
+    for path in shards {
+        let metadata =
+            std::fs::metadata(&path).map_err(|error| cache_fs_error("inspect", &path, error))?;
+        let modified = metadata
+            .modified()
+            .and_then(|time| {
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            })
+            .map_err(|error| cache_fs_error("inspect", &path, error))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.6 SM12x cache",
+                detail: format!("non-UTF-8 shard name {}", path.display()),
+            })?;
+        stamp.push_str(&format!(
+            "source={name}:{}:{}:{}\n",
+            metadata.len(),
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ));
+    }
+    Ok(stamp)
+}
+
+fn moe_shape(manifest: &QwenModelManifest) -> Result<(usize, usize)> {
+    match manifest.ffn {
+        QwenFfnConfig::Moe {
+            experts,
+            expert_intermediate,
+            ..
+        } => Ok((experts, expert_intermediate)),
+        QwenFfnConfig::Dense => Err(Error::Format {
+            label: "Qwen3.6 SM12x cache",
+            detail: "expected MoE model".to_string(),
+        }),
+    }
+}
+
+fn cache_root(checkpoint: &ModelOptCheckpoint) -> PathBuf {
+    checkpoint.root().join(CACHE_DIR)
+}
+
+fn layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {
+    cache_root(checkpoint).join(format!("layer-{layer:03}"))
+}
+
+fn expert_path(layer_dir: &Path, expert: usize) -> PathBuf {
+    layer_dir.join(format!("expert-{expert:03}.down.s12x"))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, contents)
+        .map_err(|error| cache_fs_error("write", &temporary, error))?;
+    std::fs::rename(&temporary, path).map_err(|error| cache_fs_error("rename", path, error))
+}
+
+fn cache_fs_error(action: &'static str, path: &Path, error: std::io::Error) -> Error {
+    Error::Format {
+        label: "Qwen3.6 SM12x cache",
+        detail: format!("failed to {action} {}: {error}", path.display()),
+    }
+}
