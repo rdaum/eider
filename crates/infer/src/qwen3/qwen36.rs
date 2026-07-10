@@ -12,12 +12,13 @@ use crate::nvfp4::{
     copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
-    fp8_linear_w8a8_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
+    fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
+    fp8_moe_grouped_gate_up_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_into_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_fp8_slots_f32_into_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_into_on_stream,
     qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
@@ -1570,11 +1571,10 @@ fn apply_rope_indexed(
 
 /// Device-ready weights for the Qwen3.6 MoE + shared-expert FFN block.
 ///
-/// Every Qwen3.6 text layer carries the same MoE FFN: a BF16 router over 256
-/// routed experts (top-8), a NVFP4 shared expert, and a BF16 scalar shared
-/// expert gate. This struct owns the device-resident router and shared expert;
-/// routed expert weights are loaded lazily on first use to avoid pinning all
-/// 256 experts in device memory simultaneously.
+/// Every Qwen3.6 text layer carries a BF16 router over 256 routed experts
+/// (top-8), a quantized shared expert, and a BF16 scalar shared-expert gate.
+/// NVFP4 layers use Marlin/SM12x; mixed-precision layers keep channel-scaled
+/// FP8 expert tables device-resident for device-routed W8A8 execution.
 pub struct Qwen36MoeWeights {
     router: Bf16Linear,
     experts: Vec<LazyQwen36Expert>,
@@ -1583,7 +1583,8 @@ pub struct Qwen36MoeWeights {
     gate_up_w4a16_unity_alphas: DeviceBuffer<f32>,
     storage_plan: Qwen36MoeStoragePlan,
     gate_up_storage: Qwen36GateUpStorage,
-    shared: Qwen36SharedExpert,
+    fp8_experts: Option<Qwen36Fp8Experts>,
+    shared: Qwen36SharedExpertStorage,
     shared_gate: Bf16Linear,
     _sm12x_down: Vec<Sm12xFp4DeviceGemmWeight>,
     sm12x_down_tiles: Option<DeviceBuffer<*const u8>>,
@@ -1599,12 +1600,14 @@ pub struct Qwen36MoeWeights {
 enum Qwen36GateUpStorage {
     Marlin(MarlinNvfp4GateUp),
     Grouped { _weights: Vec<Nvfp4DeviceLinear> },
+    Fp8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Qwen36DownStorage {
     Legacy,
     Sm12x,
+    Fp8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1637,6 +1640,24 @@ struct Qwen36SharedExpert {
     down: Nvfp4DeviceLinear,
 }
 
+struct Qwen36Fp8ExpertTable {
+    _weights: DeviceBuffer<u8>,
+    _scales: DeviceBuffer<f32>,
+    weights: DeviceBuffer<*const u8>,
+    scales: DeviceBuffer<*const f32>,
+}
+
+struct Qwen36Fp8Experts {
+    gate: Qwen36Fp8ExpertTable,
+    up: Qwen36Fp8ExpertTable,
+    down: Qwen36Fp8ExpertTable,
+}
+
+enum Qwen36SharedExpertStorage {
+    Nvfp4(Qwen36SharedExpert),
+    Fp8 { gate_up: Fp8Linear, down: Fp8Linear },
+}
+
 /// A device-resident NVFP4 linear weight for W4A16 execution.
 ///
 /// Stores the raw ModelOpt packed E2M1 weight and UE4M3 per-block scales
@@ -1667,6 +1688,12 @@ pub struct Qwen36MoeWorkspace {
     pub grouped_gate_up: Option<GroupedGemvWorkspace>,
     marlin_gate_up_output: DeviceBuffer<f32>,
     marlin_gate_up_table: DeviceBuffer<*const f32>,
+    fp8_hidden_input: DeviceBuffer<u8>,
+    fp8_hidden_input_scale: DeviceBuffer<f32>,
+    fp8_down_input: DeviceBuffer<u8>,
+    fp8_down_input_scales: DeviceBuffer<f32>,
+    fp8_shared_input: DeviceBuffer<u8>,
+    fp8_shared_input_scale: DeviceBuffer<f32>,
     sm12x_down: Sm12xGateUpWorkspace,
     pub grouped_down: Option<MoeGroupedDownWorkspace>,
     pub fallback_gate_up_out: DeviceBuffer<f32>,
@@ -1743,11 +1770,6 @@ impl Qwen36MoeWeights {
         layer: usize,
         cache_prepared: bool,
     ) -> Result<Self> {
-        let sm12x_cache_dir = if cache_prepared {
-            prepared_layer_dir(checkpoint, layer)
-        } else {
-            ensure_layer_cache(checkpoint, manifest, layer)?
-        };
         let (experts, experts_per_token, expert_intermediate, norm_topk_prob) = match manifest.ffn {
             QwenFfnConfig::Moe {
                 experts,
@@ -1768,13 +1790,32 @@ impl Qwen36MoeWeights {
             }
         };
         let prefix = format!("{}.layers.{layer}.mlp", manifest.tensor_prefix);
-
         let router = Bf16Linear::load(
             checkpoint,
             &format!("{prefix}.gate.weight"),
             experts,
             manifest.hidden,
         )?;
+        let first_gate = format!("{prefix}.experts.0.gate_proj");
+        let uses_nvfp4 = checkpoint.contains_tensor(&format!("{first_gate}.weight_scale_2"))
+            || checkpoint.contains_tensor(&format!("{first_gate}.weight_global_scale"));
+        if !uses_nvfp4 {
+            return Self::load_fp8(
+                checkpoint,
+                manifest,
+                prefix,
+                router,
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                norm_topk_prob,
+            );
+        }
+        let sm12x_cache_dir = if cache_prepared {
+            prepared_layer_dir(checkpoint, layer)
+        } else {
+            ensure_layer_cache(checkpoint, manifest, layer)?
+        };
 
         let mut lazy_experts = Vec::with_capacity(experts);
         for expert_idx in 0..experts {
@@ -1858,6 +1899,9 @@ impl Qwen36MoeWeights {
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
                 }
+                Qwen36DownStorage::Fp8 => {
+                    unreachable!("NVFP4 loader cannot select FP8 down storage")
+                }
             }
 
             if storage_plan.down == Qwen36DownStorage::Sm12x {
@@ -1940,10 +1984,10 @@ impl Qwen36MoeWeights {
                 ),
             });
         }
-        let shared = Qwen36SharedExpert {
+        let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
             gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
             down: Nvfp4DeviceLinear::from_host(&shared_down)?,
-        };
+        });
 
         let shared_gate = Bf16Linear::load(
             checkpoint,
@@ -1960,6 +2004,7 @@ impl Qwen36MoeWeights {
             gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan,
             gate_up_storage,
+            fp8_experts: None,
             shared,
             shared_gate,
             _sm12x_down: sm12x_down,
@@ -1975,6 +2020,99 @@ impl Qwen36MoeWeights {
             },
             sm12x_down_m_tiles,
             sm12x_down_k_tiles,
+            num_experts: experts,
+            experts_per_token,
+            expert_intermediate,
+            norm_topk_prob,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_fp8(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        prefix: String,
+        router: Bf16Linear,
+        experts: usize,
+        experts_per_token: usize,
+        expert_intermediate: usize,
+        norm_topk_prob: bool,
+    ) -> Result<Self> {
+        let expert_prefix =
+            |expert: usize, projection: &str| format!("{prefix}.experts.{expert}.{projection}");
+        let fp8_experts = Qwen36Fp8Experts {
+            gate: Qwen36Fp8ExpertTable::load(
+                checkpoint,
+                experts,
+                expert_intermediate,
+                manifest.hidden,
+                |expert| expert_prefix(expert, "gate_proj"),
+            )?,
+            up: Qwen36Fp8ExpertTable::load(
+                checkpoint,
+                experts,
+                expert_intermediate,
+                manifest.hidden,
+                |expert| expert_prefix(expert, "up_proj"),
+            )?,
+            down: Qwen36Fp8ExpertTable::load(
+                checkpoint,
+                experts,
+                manifest.hidden,
+                expert_intermediate,
+                |expert| expert_prefix(expert, "down_proj"),
+            )?,
+        };
+        let shared_gate =
+            checkpoint.load_fp8_linear(&format!("{prefix}.shared_expert.gate_proj"))?;
+        let shared_up = checkpoint.load_fp8_linear(&format!("{prefix}.shared_expert.up_proj"))?;
+        let shared_gate_up =
+            concat_fp8_out_features(shared_gate, shared_up, "Qwen3.6 FP8 shared expert gate/up")?;
+        let shared_down =
+            checkpoint.load_fp8_linear(&format!("{prefix}.shared_expert.down_proj"))?;
+        let shared = Qwen36SharedExpertStorage::Fp8 {
+            gate_up: Fp8Linear::from_host(&shared_gate_up)?,
+            down: Fp8Linear::from_host(&shared_down)?,
+        };
+        let shared_gate = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.shared_expert_gate.weight"),
+            1,
+            manifest.hidden,
+        )?;
+        let null_u8 = vec![std::ptr::null(); experts];
+        let expert_ptrs = MoeExpertPointerTables {
+            gate_up_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_scales: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_values: DeviceBuffer::from_host(&null_u8)?,
+            down_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_input_scales: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            down_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            shared_gate_up_input_scale: None,
+            gate_up_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+        };
+        Ok(Self {
+            router,
+            experts: Vec::new(),
+            expert_ptrs,
+            gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            storage_plan: Qwen36MoeStoragePlan {
+                down: Qwen36DownStorage::Fp8,
+            },
+            gate_up_storage: Qwen36GateUpStorage::Fp8,
+            fp8_experts: Some(fp8_experts),
+            shared,
+            shared_gate,
+            _sm12x_down: Vec::new(),
+            sm12x_down_tiles: None,
+            sm12x_down_scales: None,
+            sm12x_down_m_tiles: 0,
+            sm12x_down_k_tiles: 0,
             num_experts: experts,
             experts_per_token,
             expert_intermediate,
@@ -2045,6 +2183,32 @@ impl Qwen36MoeWeights {
                 workspace.marlin_gate_up_output.output(),
                 stream,
             ),
+            Qwen36GateUpStorage::Fp8 => {
+                let fp8 = self.fp8_experts.as_ref().ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 FP8 routed gate/up",
+                    detail: "FP8 expert tables are unavailable".to_string(),
+                })?;
+                quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+                    ffn_norm,
+                    &mut workspace.fp8_hidden_input,
+                    &mut workspace.fp8_hidden_input_scale,
+                    stream,
+                )?;
+                fp8_moe_grouped_gate_up_f32_into_on_stream(
+                    &workspace.route.indices,
+                    &workspace.fp8_hidden_input,
+                    &workspace.fp8_hidden_input_scale,
+                    &fp8.gate.weights,
+                    &fp8.gate.scales,
+                    &fp8.up.weights,
+                    &fp8.up.scales,
+                    workspace.marlin_gate_up_output.output(),
+                    self.expert_intermediate,
+                    ffn_norm.len(),
+                    self.experts_per_token,
+                    stream,
+                )
+            }
         }
     }
 
@@ -2471,9 +2635,20 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.shared
-            .gate_up
-            .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+        match &self.shared {
+            Qwen36SharedExpertStorage::Nvfp4(shared) => {
+                shared
+                    .gate_up
+                    .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+            }
+            Qwen36SharedExpertStorage::Fp8 { gate_up, .. } => gate_up.run_into(
+                ffn_norm,
+                &mut workspace.shared_gate_up_output,
+                &mut workspace.fp8_shared_input,
+                &mut workspace.fp8_shared_input_scale,
+                stream,
+            ),
+        }
     }
 
     fn run_shared_down(
@@ -2481,11 +2656,20 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.shared.down.run_f32_into(
-            &workspace.shared_activated,
-            &mut workspace.shared_output,
-            stream,
-        )
+        match &self.shared {
+            Qwen36SharedExpertStorage::Nvfp4(shared) => shared.down.run_f32_into(
+                &workspace.shared_activated,
+                &mut workspace.shared_output,
+                stream,
+            ),
+            Qwen36SharedExpertStorage::Fp8 { down, .. } => down.run_into(
+                &workspace.shared_activated,
+                &mut workspace.shared_output,
+                &mut workspace.fp8_shared_input,
+                &mut workspace.fp8_shared_input_scale,
+                stream,
+            ),
+        }
     }
 
     /// Runs only shared expert gate/up projection.
@@ -2603,7 +2787,118 @@ impl Qwen36MoeWeights {
             && self.sm12x_down_tiles.is_some()
             && self.sm12x_down_scales.is_some();
         let use_device_route = workspace.grouped_down.is_some();
-        let used_grouped = if use_device_route {
+        let used_grouped = if let Some(fp8) = &self.fp8_experts {
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, topk_ms) = timed_cuda(stream, || {
+                    workspace
+                        .route
+                        .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)
+                })?;
+                profile.qwen36_router_topk_ms += topk_ms;
+                profile.qwen36_router_ms += topk_ms;
+            } else {
+                workspace
+                    .route
+                    .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
+            }
+            let mut run_gate_up = || {
+                quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+                    ffn_norm,
+                    &mut workspace.fp8_hidden_input,
+                    &mut workspace.fp8_hidden_input_scale,
+                    stream,
+                )?;
+                fp8_moe_grouped_gate_up_f32_into_on_stream(
+                    &workspace.route.indices,
+                    &workspace.fp8_hidden_input,
+                    &workspace.fp8_hidden_input_scale,
+                    &fp8.gate.weights,
+                    &fp8.gate.scales,
+                    &fp8.up.weights,
+                    &fp8.up.scales,
+                    workspace.marlin_gate_up_output.output(),
+                    self.expert_intermediate,
+                    manifest.hidden,
+                    self.experts_per_token,
+                    stream,
+                )
+            };
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, run_gate_up)?;
+                profile.qwen36_routed_gate_up_ms += ms;
+            } else {
+                run_gate_up()?;
+            }
+            let mut run_silu_quantize = || {
+                moe_silu_quantize_fp8_slots_f32_into_on_stream(
+                    &workspace.marlin_gate_up_output,
+                    &mut workspace.fp8_down_input,
+                    &mut workspace.fp8_down_input_scales,
+                    self.expert_intermediate,
+                    self.experts_per_token,
+                    stream,
+                )
+            };
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, run_silu_quantize)?;
+                profile.qwen36_routed_silu_quantize_ms += ms;
+            } else {
+                run_silu_quantize()?;
+            }
+            fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+            let sm12x_down = &workspace.sm12x_down;
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, gemv_ms) = timed_cuda(stream, || {
+                    fp8_moe_grouped_down_f32_into_on_stream(
+                        &workspace.route.indices,
+                        &workspace.fp8_down_input,
+                        &workspace.fp8_down_input_scales,
+                        &fp8.down.weights,
+                        &fp8.down.scales,
+                        &sm12x_down.d,
+                        manifest.hidden,
+                        self.expert_intermediate,
+                        self.experts_per_token,
+                        stream,
+                    )
+                })?;
+                profile.qwen36_routed_down_gemv_ms += gemv_ms;
+                let (_, accum_ms) = timed_cuda(stream, || {
+                    moe_weighted_accumulate_slots_f32_on_stream(
+                        &workspace.route.indices,
+                        &workspace.route.weights,
+                        &sm12x_down.c,
+                        &self.expert_ptrs.down_alphas,
+                        workspace.moe_out.inout(),
+                        stream,
+                    )
+                })?;
+                profile.qwen36_routed_down_accum_ms += accum_ms;
+                profile.qwen36_routed_down_ms += gemv_ms + accum_ms;
+            } else {
+                fp8_moe_grouped_down_f32_into_on_stream(
+                    &workspace.route.indices,
+                    &workspace.fp8_down_input,
+                    &workspace.fp8_down_input_scales,
+                    &fp8.down.weights,
+                    &fp8.down.scales,
+                    &sm12x_down.d,
+                    manifest.hidden,
+                    self.expert_intermediate,
+                    self.experts_per_token,
+                    stream,
+                )?;
+                moe_weighted_accumulate_slots_f32_on_stream(
+                    &workspace.route.indices,
+                    &workspace.route.weights,
+                    &sm12x_down.c,
+                    &self.expert_ptrs.down_alphas,
+                    workspace.moe_out.inout(),
+                    stream,
+                )?;
+            }
+            true
+        } else if use_device_route {
             let grouped_down = workspace
                 .grouped_down
                 .as_mut()
@@ -2976,8 +3271,8 @@ impl Qwen36MoeWeights {
         };
         let _ = used_grouped;
 
-        // Shared expert. Compressed-tensors checkpoints use W4A4 here, while
-        // ModelOpt retains the established W4A16 path.
+        // Shared experts follow the layer's checkpoint format: NVFP4 uses the
+        // established W4A16 path, while mixed layers use dynamic W8A8.
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
                 self.run_shared_gate_up(workspace, ffn_norm, stream)
@@ -3239,6 +3534,70 @@ fn maybe_round_device_f32_to_bf16(
     round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
 }
 
+impl Qwen36Fp8ExpertTable {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+        prefix: impl Fn(usize) -> String,
+    ) -> Result<Self> {
+        let matrix_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+            label: "Qwen3.6 FP8 expert table",
+            expected: "rows * cols fits usize".to_string(),
+            actual: format!("rows={rows} cols={cols}"),
+        })?;
+        let mut host_weights = Vec::with_capacity(experts * matrix_len);
+        let mut host_scales = Vec::with_capacity(experts * rows);
+        for expert in 0..experts {
+            let weight = checkpoint.load_fp8_linear(&prefix(expert))?;
+            let scales = weight.channel_weight_scale.ok_or_else(|| Error::Format {
+                label: "Qwen3.6 FP8 expert table",
+                detail: format!("expert {expert} lacks per-channel weight scales"),
+            })?;
+            if weight.out_features != rows
+                || weight.in_features != cols
+                || weight.weight.len() != matrix_len
+                || scales.len() != rows
+                || weight.input_scale.is_some()
+            {
+                return Err(Error::Shape {
+                    label: "Qwen3.6 FP8 expert table",
+                    expected: format!(
+                        "{rows}x{cols} channel-scaled weight with dynamic input activation"
+                    ),
+                    actual: format!(
+                        "expert={expert} shape={}x{} weight={} scales={} input_scale={:?}",
+                        weight.out_features,
+                        weight.in_features,
+                        weight.weight.len(),
+                        scales.len(),
+                        weight.input_scale
+                    ),
+                });
+            }
+            host_weights.extend_from_slice(&weight.weight);
+            host_scales.extend_from_slice(&scales);
+        }
+        let weights = DeviceBuffer::from_host(&host_weights)?;
+        let scales = DeviceBuffer::from_host(&host_scales)?;
+        let weight_base = weights.as_const_ptr().cast::<u8>();
+        let scale_base = scales.as_const_ptr().cast::<f32>();
+        let weight_ptrs = (0..experts)
+            .map(|expert| unsafe { weight_base.add(expert * matrix_len) })
+            .collect::<Vec<_>>();
+        let scale_ptrs = (0..experts)
+            .map(|expert| unsafe { scale_base.add(expert * rows) })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            _weights: weights,
+            _scales: scales,
+            weights: DeviceBuffer::from_host(&weight_ptrs)?,
+            scales: DeviceBuffer::from_host(&scale_ptrs)?,
+        })
+    }
+}
+
 impl Qwen36MoeWorkspace {
     /// Allocates one-token workspace for the Qwen3.6 MoE + shared-expert FFN.
     pub fn new(manifest: &QwenModelManifest) -> Result<Self> {
@@ -3305,6 +3664,12 @@ impl Qwen36MoeWorkspace {
             grouped_gate_up,
             marlin_gate_up_output,
             marlin_gate_up_table: DeviceBuffer::from_host(&marlin_gate_up_ptrs)?,
+            fp8_hidden_input: DeviceBuffer::zeroed(hidden)?,
+            fp8_hidden_input_scale: DeviceBuffer::zeroed(1)?,
+            fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,
+            fp8_down_input_scales: DeviceBuffer::zeroed(experts_per_token)?,
+            fp8_shared_input: DeviceBuffer::zeroed(hidden.max(expert_intermediate))?,
+            fp8_shared_input_scale: DeviceBuffer::zeroed(1)?,
             sm12x_down: Sm12xGateUpWorkspace::new(
                 hidden,
                 expert_intermediate,
@@ -3343,6 +3708,51 @@ fn load_concat_gate_up(
         });
     }
     ModelOptNvfp4Linear::concat_out_features(format!("{gate_prefix}.gate_up_proj"), &gate, &up)
+}
+
+fn concat_fp8_out_features(
+    first: ModelOptFp8Linear,
+    second: ModelOptFp8Linear,
+    label: &'static str,
+) -> Result<ModelOptFp8Linear> {
+    if first.in_features != second.in_features
+        || first.input_scale.map(f32::to_bits) != second.input_scale.map(f32::to_bits)
+    {
+        return Err(Error::Shape {
+            label,
+            expected: "matching input shape and activation scale".to_string(),
+            actual: format!(
+                "first={}x{} input_scale={:?} second={}x{} input_scale={:?}",
+                first.out_features,
+                first.in_features,
+                first.input_scale,
+                second.out_features,
+                second.in_features,
+                second.input_scale
+            ),
+        });
+    }
+    let first_scales = first.channel_weight_scale.ok_or_else(|| Error::Format {
+        label,
+        detail: "first projection lacks per-channel scales".to_string(),
+    })?;
+    let second_scales = second.channel_weight_scale.ok_or_else(|| Error::Format {
+        label,
+        detail: "second projection lacks per-channel scales".to_string(),
+    })?;
+    let mut weight = first.weight;
+    weight.extend_from_slice(&second.weight);
+    let mut channel_weight_scale = first_scales;
+    channel_weight_scale.extend_from_slice(&second_scales);
+    Ok(ModelOptFp8Linear {
+        prefix: format!("{}+{}", first.prefix, second.prefix),
+        out_features: first.out_features + second.out_features,
+        in_features: first.in_features,
+        weight,
+        weight_scale: 1.0,
+        channel_weight_scale: Some(channel_weight_scale),
+        input_scale: first.input_scale,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -3498,6 +3498,201 @@ extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_con
     return cudaGetLastError();
 }
 
+__global__ void infer_fp8_moe_grouped_gate_up_f32_kernel(
+    const std::uint32_t* indices,
+    const std::uint8_t* input,
+    const float* input_scale,
+    const std::uint8_t* const* gate_weights,
+    const float* const* gate_scales,
+    const std::uint8_t* const* up_weights,
+    const float* const* up_scales,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots) {
+    const std::uint32_t slot = blockIdx.x / rows;
+    const std::uint32_t row = blockIdx.x % rows;
+    if (slot >= slots) {
+        return;
+    }
+    const std::uint32_t expert = indices[slot];
+    const std::uint8_t* gate_weight = gate_weights[expert] + row * cols;
+    const std::uint8_t* up_weight = up_weights[expert] + row * cols;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    if ((cols & 3U) == 0) {
+        const auto* input4 = reinterpret_cast<const uchar4*>(input);
+        const auto* gate4 = reinterpret_cast<const uchar4*>(gate_weight);
+        const auto* up4 = reinterpret_cast<const uchar4*>(up_weight);
+        const std::uint32_t cols4 = cols >> 2;
+        for (std::uint32_t col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+            const uchar4 in = input4[col4];
+            const uchar4 gate = gate4[col4];
+            const uchar4 up = up4[col4];
+            const float ix = infer_e4m3_value(in.x);
+            const float iy = infer_e4m3_value(in.y);
+            const float iz = infer_e4m3_value(in.z);
+            const float iw = infer_e4m3_value(in.w);
+            gate_sum += ix * infer_e4m3_value(gate.x);
+            gate_sum += iy * infer_e4m3_value(gate.y);
+            gate_sum += iz * infer_e4m3_value(gate.z);
+            gate_sum += iw * infer_e4m3_value(gate.w);
+            up_sum += ix * infer_e4m3_value(up.x);
+            up_sum += iy * infer_e4m3_value(up.y);
+            up_sum += iz * infer_e4m3_value(up.z);
+            up_sum += iw * infer_e4m3_value(up.w);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            const float value = infer_e4m3_value(input[col]);
+            gate_sum += value * infer_e4m3_value(gate_weight[col]);
+            up_sum += value * infer_e4m3_value(up_weight[col]);
+        }
+    }
+    gate_sum = infer_block_reduce_sum(gate_sum);
+    up_sum = infer_block_reduce_sum(up_sum);
+    if (threadIdx.x == 0) {
+        const std::uint32_t base = slot * rows * 2;
+        output[base + row] = gate_sum * input_scale[0] * gate_scales[expert][row];
+        output[base + rows + row] = up_sum * input_scale[0] * up_scales[expert][row];
+    }
+}
+
+extern "C" cudaError_t infer_fp8_moe_grouped_gate_up_f32_on_stream(
+    const std::uint32_t* indices,
+    const std::uint8_t* input,
+    const float* input_scale,
+    const std::uint8_t* const* gate_weights,
+    const float* const* gate_scales,
+    const std::uint8_t* const* up_weights,
+    const float* const* up_scales,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots,
+    cudaStream_t stream) {
+    if (indices == nullptr || input == nullptr || input_scale == nullptr ||
+        gate_weights == nullptr || gate_scales == nullptr || up_weights == nullptr ||
+        up_scales == nullptr || output == nullptr || rows == 0 || cols == 0 || slots == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_fp8_moe_grouped_gate_up_f32_kernel<<<rows * slots, kThreads, 0, stream>>>(
+        indices, input, input_scale, gate_weights, gate_scales, up_weights, up_scales,
+        output, rows, cols, slots);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_silu_quantize_fp8_slots_f32_kernel(
+    const float* gate_up,
+    std::uint8_t* quantized,
+    float* scales,
+    std::uint32_t rows) {
+    const std::uint32_t slot = blockIdx.x;
+    const float* slot_gate = gate_up + slot * rows * 2;
+    const float* slot_up = slot_gate + rows;
+    std::uint8_t* slot_output = quantized + slot * rows;
+    float local_max = 0.0f;
+    for (std::uint32_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const float gate = slot_gate[row];
+        const float value = (gate / (1.0f + expf(-gate))) * slot_up[row];
+        if (isfinite(value)) {
+            local_max = fmaxf(local_max, fabsf(value));
+        }
+    }
+    const float max_abs = infer_block_reduce_max(local_max);
+    if (threadIdx.x == 0) {
+        scales[slot] = max_abs == 0.0f ? 1.0f : max_abs / 448.0f;
+    }
+    __syncthreads();
+    const float scale = scales[slot];
+    for (std::uint32_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const float gate = slot_gate[row];
+        const float value = (gate / (1.0f + expf(-gate))) * slot_up[row];
+        slot_output[row] = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(value / scale, __NV_SATFINITE, __NV_E4M3));
+    }
+}
+
+extern "C" cudaError_t infer_moe_silu_quantize_fp8_slots_f32_on_stream(
+    const float* gate_up,
+    std::uint8_t* quantized,
+    float* scales,
+    std::uint32_t rows,
+    std::uint32_t slots,
+    cudaStream_t stream) {
+    if (gate_up == nullptr || quantized == nullptr || scales == nullptr || rows == 0 || slots == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_moe_silu_quantize_fp8_slots_f32_kernel<<<slots, kThreads, 0, stream>>>(
+        gate_up, quantized, scales, rows);
+    return cudaGetLastError();
+}
+
+__global__ void infer_fp8_moe_grouped_down_f32_kernel(
+    const std::uint32_t* indices,
+    const std::uint8_t* inputs,
+    const float* input_scales,
+    const std::uint8_t* const* weights,
+    const float* const* weight_scales,
+    float* const* outputs,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots) {
+    const std::uint32_t slot = blockIdx.x / rows;
+    const std::uint32_t row = blockIdx.x % rows;
+    if (slot >= slots) {
+        return;
+    }
+    const std::uint32_t expert = indices[slot];
+    const std::uint8_t* input = inputs + slot * cols;
+    const std::uint8_t* weight = weights[expert] + row * cols;
+    float sum = 0.0f;
+    if ((cols & 3U) == 0) {
+        const auto* input4 = reinterpret_cast<const uchar4*>(input);
+        const auto* weight4 = reinterpret_cast<const uchar4*>(weight);
+        const std::uint32_t cols4 = cols >> 2;
+        for (std::uint32_t col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+            const uchar4 in = input4[col4];
+            const uchar4 w = weight4[col4];
+            sum += infer_e4m3_value(in.x) * infer_e4m3_value(w.x);
+            sum += infer_e4m3_value(in.y) * infer_e4m3_value(w.y);
+            sum += infer_e4m3_value(in.z) * infer_e4m3_value(w.z);
+            sum += infer_e4m3_value(in.w) * infer_e4m3_value(w.w);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            sum += infer_e4m3_value(input[col]) * infer_e4m3_value(weight[col]);
+        }
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        outputs[slot][row] = sum * input_scales[slot] * weight_scales[expert][row];
+    }
+}
+
+extern "C" cudaError_t infer_fp8_moe_grouped_down_f32_on_stream(
+    const std::uint32_t* indices,
+    const std::uint8_t* inputs,
+    const float* input_scales,
+    const std::uint8_t* const* weights,
+    const float* const* weight_scales,
+    float* const* outputs,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots,
+    cudaStream_t stream) {
+    if (indices == nullptr || inputs == nullptr || input_scales == nullptr || weights == nullptr ||
+        weight_scales == nullptr || outputs == nullptr || rows == 0 || cols == 0 || slots == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_fp8_moe_grouped_down_f32_kernel<<<rows * slots, kThreads, 0, stream>>>(
+        indices, inputs, input_scales, weights, weight_scales, outputs, rows, cols, slots);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_fp8_linear_f32_configured_on_stream(
     const float* input,
     const std::uint8_t* weight,

@@ -77,14 +77,20 @@ The current model targets are:
 - `models/qwen3-30b-a3b-nvfp4`
 - `models/qwen3-32b-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4`
+- `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
+- `models/qwen3.6-35b-a3b-nvfp4-unsloth`
 
-Models are expected to be ModelOpt-quantized NVFP4 checkpoints with the
-repository's expected manifest and tokenizer files.
+Models are expected to use the repository's supported ModelOpt or
+compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
+tokenizer files. The Unsloth Fast checkpoint keeps its MoE experts in NVFP4;
+the accuracy-oriented Unsloth checkpoint uses channel-scaled FP8 experts and
+shared experts in layers 32-39.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
-down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Cache files are
-written atomically and incomplete layers are resumed on the next startup;
+down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Mixed-precision
+checkpoints build it only for layers whose down weights are NVFP4. Cache files
+are written atomically and incomplete layers are resumed on the next startup;
 later runs validate and reuse the completed cache automatically.
 
 ## Runtime shape
@@ -104,10 +110,11 @@ flowchart TD
     F --> H[MoE FFN]
     G --> H
     H --> I[Router + top-k]
-    I --> J[Marlin W4A16 gate/up]
-    J --> K[SiLU + NVFP4 quantization]
-    K --> L[SM12x down]
-    L --> M[Shared expert + weighted combine]
+    I --> J{Expert weight format}
+    J -->|NVFP4| K[Marlin W4A16 gate/up + SM12x down]
+    J -->|FP8| L[Grouped W8A8 gate/up + down]
+    K --> M[Shared expert + weighted combine]
+    L --> M
     M --> N[Final RMSNorm + lm-head top-1]
     N --> O[Next token]
     O --> C
@@ -219,6 +226,7 @@ cargo bench -p nvfp4 --bench marlin_routed_gate_up
 cargo bench -p infer --bench qwen36_routed_gate_up
 cargo bench -p nvfp4 --bench lm_head_top1
 cargo bench -p nvfp4 --bench sm12x_indexed_gemv
+cargo bench -p nvfp4 --bench fp8_routed_moe
 cargo bench -p nvfp4 --bench fp4_cublaslt
 cargo bench -p nvfp4 --bench fp4_quantization
 cargo bench -p infer --bench sampling

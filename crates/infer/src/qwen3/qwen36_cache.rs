@@ -11,6 +11,7 @@ pub(crate) fn ensure_model_cache(
     manifest: &QwenModelManifest,
 ) -> Result<()> {
     let missing = (0..manifest.layers)
+        .filter(|&layer| layer_uses_nvfp4_down(checkpoint, manifest, layer))
         .filter(|&layer| !layer_cache_complete(checkpoint, manifest, layer))
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -47,11 +48,28 @@ pub(crate) fn ensure_layer_cache(
             actual: layer.to_string(),
         });
     }
+    if !layer_uses_nvfp4_down(checkpoint, manifest, layer) {
+        return Ok(layer_dir(checkpoint, layer));
+    }
     if !layer_cache_complete(checkpoint, manifest, layer) {
         eprintln!("preparing SM12x down cache layer {layer}");
         build_layer_cache(checkpoint, manifest, layer)?;
     }
     Ok(layer_dir(checkpoint, layer))
+}
+
+fn layer_uses_nvfp4_down(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    layer: usize,
+) -> bool {
+    checkpoint.contains_tensor(&format!(
+        "{}.layers.{layer}.mlp.experts.0.down_proj.weight_scale_2",
+        manifest.tensor_prefix
+    )) || checkpoint.contains_tensor(&format!(
+        "{}.layers.{layer}.mlp.experts.0.down_proj.weight_global_scale",
+        manifest.tensor_prefix
+    ))
 }
 
 pub(crate) fn prepared_layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {

@@ -789,6 +789,40 @@ unsafe extern "C" {
         threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_fp8_moe_grouped_gate_up_f32_on_stream(
+        indices: *const u32,
+        input: *const u8,
+        input_scale: *const f32,
+        gate_weights: *const *const u8,
+        gate_scales: *const *const f32,
+        up_weights: *const *const u8,
+        up_scales: *const *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        slots: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_silu_quantize_fp8_slots_f32_on_stream(
+        gate_up: *const f32,
+        quantized: *mut u8,
+        scales: *mut f32,
+        rows: u32,
+        slots: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_moe_grouped_down_f32_on_stream(
+        indices: *const u32,
+        inputs: *const u8,
+        input_scales: *const f32,
+        weights: *const *const u8,
+        weight_scales: *const *const f32,
+        outputs: *const *mut f32,
+        rows: u32,
+        cols: u32,
+        slots: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_quantize_fp8_e4m3_dynamic_f32_on_stream(
         input: *const f32,
         quantized_input: *mut u8,

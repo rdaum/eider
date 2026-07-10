@@ -3331,6 +3331,185 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream
     }
 }
 
+/// Enqueues device-routed channel-scaled FP8 gate and up projections.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_moe_grouped_gate_up_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    gate_weights: &DeviceBuffer<*const u8>,
+    gate_scales: &DeviceBuffer<*const f32>,
+    up_weights: &DeviceBuffer<*const u8>,
+    up_scales: &DeviceBuffer<*const f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let output_len = rows.saturating_mul(2).saturating_mul(slots);
+    if rows == 0
+        || cols == 0
+        || slots == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || slots > u32::MAX as usize
+        || rows.saturating_mul(slots) > u32::MAX as usize
+        || indices.len() < slots
+        || input.len() != cols
+        || input_scale.len() != 1
+        || gate_weights.len() != gate_scales.len()
+        || gate_weights.len() != up_weights.len()
+        || gate_weights.len() != up_scales.len()
+        || output.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "grouped FP8 gate/up",
+            expected: format!(
+                "indices>={slots} input={cols} input_scale=1 matching expert tables output={output_len}"
+            ),
+            actual: format!(
+                "indices={} input={} input_scale={} gate_weights={} gate_scales={} up_weights={} up_scales={} output={}",
+                indices.len(),
+                input.len(),
+                input_scale.len(),
+                gate_weights.len(),
+                gate_scales.len(),
+                up_weights.len(),
+                up_scales.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_moe_grouped_gate_up_f32_on_stream",
+            ffi::infer_fp8_moe_grouped_gate_up_f32_on_stream(
+                indices.ptr,
+                input.ptr,
+                input_scale.ptr,
+                gate_weights.ptr,
+                gate_scales.ptr,
+                up_weights.ptr,
+                up_scales.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                slots as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies SiLU to grouped gate/up slots and dynamically quantizes each slot to FP8.
+pub fn moe_silu_quantize_fp8_slots_f32_into_on_stream(
+    gate_up: &DeviceBuffer<f32>,
+    quantized: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<f32>,
+    rows: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let gate_up_len = rows.saturating_mul(2).saturating_mul(slots);
+    let quantized_len = rows.saturating_mul(slots);
+    if rows == 0
+        || slots == 0
+        || rows > u32::MAX as usize
+        || slots > u32::MAX as usize
+        || gate_up.len() != gate_up_len
+        || quantized.len() != quantized_len
+        || scales.len() != slots
+    {
+        return Err(Error::Shape {
+            label: "MoE SiLU FP8 slot quantization",
+            expected: format!("gate_up={gate_up_len} quantized={quantized_len} scales={slots}"),
+            actual: format!(
+                "gate_up={} quantized={} scales={}",
+                gate_up.len(),
+                quantized.len(),
+                scales.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_silu_quantize_fp8_slots_f32_on_stream",
+            ffi::infer_moe_silu_quantize_fp8_slots_f32_on_stream(
+                gate_up.ptr,
+                quantized.ptr,
+                scales.ptr,
+                rows as u32,
+                slots as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues device-routed channel-scaled FP8 down projections for quantized slots.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_moe_grouped_down_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    inputs: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<*const u8>,
+    weight_scales: &DeviceBuffer<*const f32>,
+    outputs: &DeviceBuffer<*mut f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = cols.saturating_mul(slots);
+    if rows == 0
+        || cols == 0
+        || slots == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || slots > u32::MAX as usize
+        || rows.saturating_mul(slots) > u32::MAX as usize
+        || indices.len() < slots
+        || inputs.len() != input_len
+        || input_scales.len() != slots
+        || weights.len() != weight_scales.len()
+        || outputs.len() != slots
+    {
+        return Err(Error::Shape {
+            label: "grouped FP8 down",
+            expected: format!(
+                "indices>={slots} inputs={input_len} input_scales={slots} matching expert tables outputs={slots}"
+            ),
+            actual: format!(
+                "indices={} inputs={} input_scales={} weights={} weight_scales={} outputs={}",
+                indices.len(),
+                inputs.len(),
+                input_scales.len(),
+                weights.len(),
+                weight_scales.len(),
+                outputs.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_moe_grouped_down_f32_on_stream",
+            ffi::infer_fp8_moe_grouped_down_f32_on_stream(
+                indices.ptr,
+                inputs.ptr,
+                input_scales.ptr,
+                weights.ptr,
+                weight_scales.ptr,
+                outputs.ptr,
+                rows as u32,
+                cols as u32,
+                slots as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Dynamically quantizes one f32 activation vector to E4M3 on `stream`.
 ///
 /// The device-resident `input_scale` receives `max(abs(input)) / 448` and can
@@ -5891,6 +6070,237 @@ mod tests {
             2.0e-6,
             "quantized dynamic channel-scaled FP8 linear",
         );
+    }
+
+    #[test]
+    fn fp8_grouped_moe_matches_quantized_cpu_reference() {
+        let experts = 3usize;
+        let slots = 2usize;
+        let hidden = 32usize;
+        let intermediate = 5usize;
+        let input = (0..hidden)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.125)
+            .collect::<Vec<_>>();
+        let indices = vec![2u32, 0];
+        let make_weight = |salt: usize, rows: usize, cols: usize| {
+            (0..rows * cols)
+                .map(|idx| format::cuda_e4m3_code(((idx + salt) % 13) as f32 * 0.125 - 0.75))
+                .collect::<Vec<_>>()
+        };
+        let make_scales = |salt: usize, rows: usize| {
+            (0..rows)
+                .map(|row| 0.25 + ((row + salt) % 5) as f32 * 0.125)
+                .collect::<Vec<_>>()
+        };
+        let gate_host = (0..experts)
+            .map(|expert| make_weight(expert, intermediate, hidden))
+            .collect::<Vec<_>>();
+        let up_host = (0..experts)
+            .map(|expert| make_weight(expert + 3, intermediate, hidden))
+            .collect::<Vec<_>>();
+        let down_host = (0..experts)
+            .map(|expert| make_weight(expert + 6, hidden, intermediate))
+            .collect::<Vec<_>>();
+        let gate_scale_host = (0..experts)
+            .map(|expert| make_scales(expert, intermediate))
+            .collect::<Vec<_>>();
+        let up_scale_host = (0..experts)
+            .map(|expert| make_scales(expert + 2, intermediate))
+            .collect::<Vec<_>>();
+        let down_scale_host = (0..experts)
+            .map(|expert| make_scales(expert + 4, hidden))
+            .collect::<Vec<_>>();
+
+        let gate = gate_host
+            .iter()
+            .map(|weight| DeviceBuffer::from_host(weight).expect("gate upload"))
+            .collect::<Vec<_>>();
+        let up = up_host
+            .iter()
+            .map(|weight| DeviceBuffer::from_host(weight).expect("up upload"))
+            .collect::<Vec<_>>();
+        let down = down_host
+            .iter()
+            .map(|weight| DeviceBuffer::from_host(weight).expect("down upload"))
+            .collect::<Vec<_>>();
+        let gate_scales = gate_scale_host
+            .iter()
+            .map(|scale| DeviceBuffer::from_host(scale).expect("gate scale upload"))
+            .collect::<Vec<_>>();
+        let up_scales = up_scale_host
+            .iter()
+            .map(|scale| DeviceBuffer::from_host(scale).expect("up scale upload"))
+            .collect::<Vec<_>>();
+        let down_scales = down_scale_host
+            .iter()
+            .map(|scale| DeviceBuffer::from_host(scale).expect("down scale upload"))
+            .collect::<Vec<_>>();
+        let gate_table = DeviceBuffer::from_host(
+            &gate
+                .iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("gate table upload");
+        let up_table = DeviceBuffer::from_host(
+            &up.iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("up table upload");
+        let down_table = DeviceBuffer::from_host(
+            &down
+                .iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("down table upload");
+        let gate_scale_table = DeviceBuffer::from_host(
+            &gate_scales
+                .iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("gate scale table upload");
+        let up_scale_table = DeviceBuffer::from_host(
+            &up_scales
+                .iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("up scale table upload");
+        let down_scale_table = DeviceBuffer::from_host(
+            &down_scales
+                .iter()
+                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("down scale table upload");
+
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let indices_device = DeviceBuffer::from_host(&indices).expect("indices upload");
+        let mut input_fp8 = DeviceBuffer::<u8>::zeroed(hidden).expect("input FP8 alloc");
+        let mut input_scale = DeviceBuffer::<f32>::zeroed(1).expect("input scale alloc");
+        let mut gate_up_output =
+            DeviceBuffer::<f32>::zeroed(slots * intermediate * 2).expect("gate/up alloc");
+        let mut down_input =
+            DeviceBuffer::<u8>::zeroed(slots * intermediate).expect("down input alloc");
+        let mut down_input_scales =
+            DeviceBuffer::<f32>::zeroed(slots).expect("down input scales alloc");
+        let mut down_outputs = (0..slots)
+            .map(|_| DeviceBuffer::<f32>::zeroed(hidden).expect("down output alloc"))
+            .collect::<Vec<_>>();
+        let down_output_table = DeviceBuffer::from_host(
+            &down_outputs
+                .iter_mut()
+                .map(|buffer| buffer.as_mut_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("down output table upload");
+
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            &input_device,
+            &mut input_fp8,
+            &mut input_scale,
+            &stream,
+        )
+        .expect("input quantization");
+        fp8_moe_grouped_gate_up_f32_into_on_stream(
+            &indices_device,
+            &input_fp8,
+            &input_scale,
+            &gate_table,
+            &gate_scale_table,
+            &up_table,
+            &up_scale_table,
+            gate_up_output.output(),
+            intermediate,
+            hidden,
+            slots,
+            &stream,
+        )
+        .expect("grouped gate/up");
+        moe_silu_quantize_fp8_slots_f32_into_on_stream(
+            &gate_up_output,
+            &mut down_input,
+            &mut down_input_scales,
+            intermediate,
+            slots,
+            &stream,
+        )
+        .expect("SiLU quantization");
+        fp8_moe_grouped_down_f32_into_on_stream(
+            &indices_device,
+            &down_input,
+            &down_input_scales,
+            &down_table,
+            &down_scale_table,
+            &down_output_table,
+            hidden,
+            intermediate,
+            slots,
+            &stream,
+        )
+        .expect("grouped down");
+
+        let input_scale_value =
+            input.iter().fold(0.0f32, |max, value| max.max(value.abs())) / 448.0;
+        let quantized_input = input
+            .iter()
+            .map(|value| {
+                format::e4m3_value(format::cuda_e4m3_code(*value / input_scale_value))
+                    * input_scale_value
+            })
+            .collect::<Vec<_>>();
+        for (slot, &expert) in indices.iter().enumerate() {
+            let expert = expert as usize;
+            let mut gate_output = cpu_fp8_linear_f32(
+                &quantized_input,
+                &gate_host[expert],
+                intermediate,
+                hidden,
+                1.0,
+            );
+            let mut up_output = cpu_fp8_linear_f32(
+                &quantized_input,
+                &up_host[expert],
+                intermediate,
+                hidden,
+                1.0,
+            );
+            for row in 0..intermediate {
+                gate_output[row] *= gate_scale_host[expert][row];
+                up_output[row] *= up_scale_host[expert][row];
+            }
+            let activated = gate_output
+                .iter()
+                .zip(&up_output)
+                .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+                .collect::<Vec<_>>();
+            let scale = activated
+                .iter()
+                .fold(0.0f32, |max, value| max.max(value.abs()))
+                / 448.0;
+            let quantized_activated = activated
+                .iter()
+                .map(|value| format::e4m3_value(format::cuda_e4m3_code(*value / scale)) * scale)
+                .collect::<Vec<_>>();
+            let mut expected = cpu_fp8_linear_f32(
+                &quantized_activated,
+                &down_host[expert],
+                hidden,
+                intermediate,
+                1.0,
+            );
+            for row in 0..hidden {
+                expected[row] *= down_scale_host[expert][row];
+            }
+            let actual = down_outputs[slot]
+                .copy_to_host(&stream)
+                .expect("down output download");
+            assert_close(&actual, &expected, 2.0e-5, "grouped FP8 MoE down");
+        }
     }
 
     #[test]

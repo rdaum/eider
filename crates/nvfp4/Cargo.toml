@@ -26,6 +26,10 @@ name = "fp8_linear"
 harness = false
 
 [[bench]]
+name = "fp8_routed_moe"
+harness = false
+
+[[bench]]
 name = "nvfp4_routed_moe_shape"
 harness = false
 
