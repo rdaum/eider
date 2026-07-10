@@ -2,13 +2,15 @@
 
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
-    GpuCounterCollector, GroupedGemvPointerTableBuffers, MarlinNvfp4GateUp, ModelOptCheckpoint,
-    ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
+    Fp4TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
+    MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear,
+    ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, Nvfp4TnInputs,
     Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     add_f32_into_on_stream, append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    device_weight_gemv_on_stream, fill_f32_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
+    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
@@ -59,6 +61,8 @@ pub struct Qwen36FullAttentionWeights {
 
 /// Mutable one-token decode workspace for a Qwen3.6 full-attention layer.
 pub struct Qwen36FullAttentionWorkspace {
+    fp8_dynamic_input: DeviceBuffer<u8>,
+    fp8_dynamic_input_scale: DeviceBuffer<f32>,
     pub q_proj_output: DeviceBuffer<f32>,
     pub q_normed: DeviceBuffer<f32>,
     pub gate: DeviceBuffer<f32>,
@@ -105,6 +109,8 @@ pub struct Qwen36LinearAttentionWeights {
 /// Mutable one-token decode workspace for a Qwen3.6 Gated Delta Net layer.
 pub struct Qwen36LinearAttentionWorkspace {
     linear: QwenLinearAttentionConfig,
+    fp8_dynamic_input: DeviceBuffer<u8>,
+    fp8_dynamic_input_scale: DeviceBuffer<f32>,
     pub qkv_output: DeviceBuffer<f32>,
     pub z_output: DeviceBuffer<f32>,
     pub alpha: DeviceBuffer<f32>,
@@ -140,7 +146,8 @@ struct Fp8Linear {
     rows: usize,
     cols: usize,
     weight_scale: f32,
-    input_scale: f32,
+    channel_weight_scale: Option<DeviceBuffer<f32>>,
+    input_scale: Option<f32>,
 }
 
 struct Bf16Linear {
@@ -417,10 +424,27 @@ impl Qwen36FullAttentionWeights {
             });
         }
 
-        self.q
-            .run_into(hidden, &mut workspace.q_proj_output, stream)?;
-        self.k.run_into(hidden, &mut workspace.k, stream)?;
-        self.v.run_into(hidden, &mut workspace.v, stream)?;
+        self.q.run_into(
+            hidden,
+            &mut workspace.q_proj_output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.k.run_into(
+            hidden,
+            &mut workspace.k,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.v.run_into(
+            hidden,
+            &mut workspace.v,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
         qwen36_full_attn_prep_f32_into_on_stream(
             &workspace.q_proj_output,
             &workspace.k,
@@ -484,8 +508,13 @@ impl Qwen36FullAttentionWeights {
             workspace.gated_attn.output(),
             stream,
         )?;
-        self.o
-            .run_into(&workspace.gated_attn, &mut workspace.output, stream)?;
+        self.o.run_into(
+            &workspace.gated_attn,
+            &mut workspace.output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
         Ok(Qwen36FullAttentionStep {
             q_proj_output: &workspace.q_proj_output,
             q_rope: &workspace.q_rope,
@@ -504,10 +533,27 @@ impl Qwen36FullAttentionWeights {
         cache_len: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<Qwen36FullAttentionStep<'a>> {
-        self.q
-            .run_into(hidden, &mut workspace.q_proj_output, stream)?;
-        self.k.run_into(hidden, &mut workspace.k, stream)?;
-        self.v.run_into(hidden, &mut workspace.v, stream)?;
+        self.q.run_into(
+            hidden,
+            &mut workspace.q_proj_output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.k.run_into(
+            hidden,
+            &mut workspace.k,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.v.run_into(
+            hidden,
+            &mut workspace.v,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
         qwen36_full_attn_prep_f32_into_on_stream(
             &workspace.q_proj_output,
             &workspace.k,
@@ -574,8 +620,13 @@ impl Qwen36FullAttentionWeights {
             workspace.gated_attn.output(),
             stream,
         )?;
-        self.o
-            .run_into(&workspace.gated_attn, &mut workspace.output, stream)?;
+        self.o.run_into(
+            &workspace.gated_attn,
+            &mut workspace.output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
         Ok(Qwen36FullAttentionStep {
             q_proj_output: &workspace.q_proj_output,
             q_rope: &workspace.q_rope,
@@ -669,9 +720,20 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.qkv
-            .run_into(hidden, &mut workspace.qkv_output, stream)?;
-        self.z.run_into(hidden, &mut workspace.z_output, stream)?;
+        self.qkv.run_into(
+            hidden,
+            &mut workspace.qkv_output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.z.run_into(
+            hidden,
+            &mut workspace.z_output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
         self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
         self.beta
             .run_into(hidden, &mut workspace.beta_input, stream)?;
@@ -733,8 +795,13 @@ impl Qwen36LinearAttentionWeights {
             rms_eps,
             stream,
         )?;
-        self.out
-            .run_into(&workspace.normed, &mut workspace.output, stream)
+        self.out.run_into(
+            &workspace.normed,
+            &mut workspace.output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )
     }
 
     /// Runs one token through this linear-attention layer.
@@ -749,11 +816,23 @@ impl Qwen36LinearAttentionWeights {
     ) -> Result<Qwen36LinearAttentionStep<'a>> {
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
-                self.qkv.run_into(hidden, &mut workspace.qkv_output, stream)
+                self.qkv.run_into(
+                    hidden,
+                    &mut workspace.qkv_output,
+                    &mut workspace.fp8_dynamic_input,
+                    &mut workspace.fp8_dynamic_input_scale,
+                    stream,
+                )
             })?;
             profile.qwen36_linear_qkv_ms += ms;
             let (_, ms) = timed_cuda(stream, || {
-                self.z.run_into(hidden, &mut workspace.z_output, stream)
+                self.z.run_into(
+                    hidden,
+                    &mut workspace.z_output,
+                    &mut workspace.fp8_dynamic_input,
+                    &mut workspace.fp8_dynamic_input_scale,
+                    stream,
+                )
             })?;
             profile.qwen36_linear_z_ms += ms;
             let (_, ms) = timed_cuda(stream, || {
@@ -818,8 +897,13 @@ impl Qwen36LinearAttentionWeights {
             })?;
             profile.qwen36_linear_norm_ms += ms;
             let (_, ms) = timed_cuda(stream, || {
-                self.out
-                    .run_into(&workspace.normed, &mut workspace.output, stream)
+                self.out.run_into(
+                    &workspace.normed,
+                    &mut workspace.output,
+                    &mut workspace.fp8_dynamic_input,
+                    &mut workspace.fp8_dynamic_input_scale,
+                    stream,
+                )
             })?;
             profile.qwen36_linear_out_ms += ms;
         } else {
@@ -851,6 +935,8 @@ impl Qwen36LinearAttentionWorkspace {
         let value_dim = linear.value_heads * linear.value_head_dim;
         Ok(Self {
             linear,
+            fp8_dynamic_input: DeviceBuffer::zeroed(manifest.hidden.max(value_dim))?,
+            fp8_dynamic_input_scale: DeviceBuffer::zeroed(1)?,
             qkv_output: DeviceBuffer::zeroed(weights.qkv.rows)?,
             z_output: DeviceBuffer::zeroed(weights.z.rows)?,
             alpha: DeviceBuffer::zeroed(linear.value_heads)?,
@@ -888,6 +974,8 @@ impl Qwen36FullAttentionWorkspace {
         let q_width = manifest.q_heads * manifest.head_dim;
         let kv_width = manifest.kv_heads * manifest.head_dim;
         Ok(Self {
+            fp8_dynamic_input: DeviceBuffer::zeroed(manifest.hidden.max(q_width))?,
+            fp8_dynamic_input_scale: DeviceBuffer::zeroed(1)?,
             q_proj_output: DeviceBuffer::zeroed(weights.q.rows)?,
             q_normed: DeviceBuffer::zeroed(q_width)?,
             gate: DeviceBuffer::zeroed(q_width)?,
@@ -924,6 +1012,11 @@ impl Fp8Linear {
             rows: host.out_features,
             cols: host.in_features,
             weight_scale: host.weight_scale,
+            channel_weight_scale: host
+                .channel_weight_scale
+                .as_deref()
+                .map(DeviceBuffer::from_host)
+                .transpose()?,
             input_scale: host.input_scale,
         })
     }
@@ -932,9 +1025,34 @@ impl Fp8Linear {
         &self,
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
+        dynamic_input: &mut DeviceBuffer<u8>,
+        dynamic_input_scale: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let result = if std::env::var_os("QWEN36_FP8_W8A8").is_some() {
+        let result = if let Some(channel_weight_scale) = &self.channel_weight_scale {
+            if std::env::var_os("QWEN36_FP8_W8A8").is_some() {
+                return Err(Error::Format {
+                    label: "Qwen3.6 compressed-tensors FP8",
+                    detail: "dynamic per-token W8A8 activation quantization is not implemented"
+                        .to_string(),
+                });
+            }
+            fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+                input,
+                dynamic_input,
+                &self.weight,
+                channel_weight_scale,
+                dynamic_input_scale,
+                output.output(),
+                self.rows,
+                self.cols,
+                stream,
+            )
+        } else if std::env::var_os("QWEN36_FP8_W8A8").is_some() {
+            let input_scale = self.input_scale.ok_or_else(|| Error::Format {
+                label: "Qwen3.6 FP8 activation scale",
+                detail: "checkpoint does not contain a static input scale".to_string(),
+            })?;
             fp8_linear_w8a8_f32_into_on_stream(
                 input,
                 &self.weight,
@@ -942,7 +1060,7 @@ impl Fp8Linear {
                 self.rows,
                 self.cols,
                 self.weight_scale,
-                self.input_scale,
+                input_scale,
                 stream,
             )
         } else {
@@ -1158,6 +1276,16 @@ fn reorder_fp8_v_rows(
         reordered[dst..dst + row_bytes].copy_from_slice(src_row);
     }
     host.weight = reordered;
+    if let Some(scales) = host.channel_weight_scale.take() {
+        let mut reordered_scales = vec![0.0; scales.len()];
+        for (v_k_head, src) in scales.chunks_exact(head_v_dim).enumerate() {
+            let k_head = v_k_head / v_per_k;
+            let v_sub = v_k_head % v_per_k;
+            let dst = (v_sub * key_heads + k_head) * head_v_dim;
+            reordered_scales[dst..dst + head_v_dim].copy_from_slice(src);
+        }
+        host.channel_weight_scale = Some(reordered_scales);
+    }
     host
 }
 
@@ -1299,7 +1427,7 @@ pub struct Qwen36MoeWeights {
     gate_up_w4a16_weight_scale_2: DeviceBuffer<f32>,
     gate_up_w4a16_unity_alphas: DeviceBuffer<f32>,
     storage_plan: Qwen36MoeStoragePlan,
-    marlin_gate_up: MarlinNvfp4GateUp,
+    gate_up_storage: Qwen36GateUpStorage,
     shared: Qwen36SharedExpert,
     shared_gate: Bf16Linear,
     _sm12x_down: Vec<Sm12xFp4DeviceGemmWeight>,
@@ -1311,6 +1439,11 @@ pub struct Qwen36MoeWeights {
     experts_per_token: usize,
     expert_intermediate: usize,
     norm_topk_prob: bool,
+}
+
+enum Qwen36GateUpStorage {
+    Marlin(MarlinNvfp4GateUp),
+    Grouped { _weights: Vec<Nvfp4DeviceLinear> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1344,9 +1477,69 @@ struct LazyQwen36Expert {
     down_sm12x: std::cell::RefCell<Option<Sm12xDeviceLinear>>,
 }
 
-struct Qwen36SharedExpert {
-    gate_up: Nvfp4DeviceLinear,
-    down: Nvfp4DeviceLinear,
+enum Qwen36SharedExpert {
+    W4A16 {
+        gate_up: Nvfp4DeviceLinear,
+        down: Nvfp4DeviceLinear,
+    },
+    W4A4 {
+        gate_up: ModelOptCublasLtWeight,
+        down: ModelOptCublasLtWeight,
+    },
+}
+
+struct Qwen36SharedW4a4Workspace {
+    lt: CublasLt,
+    gate_up_input: Nvfp4Matrix,
+    _gate_up_c: F32Matrix,
+    gate_up_plan: Fp4TnMatmulPlan,
+    down_input: Nvfp4Matrix,
+    _down_c: F32Matrix,
+    down_plan: Fp4TnMatmulPlan,
+}
+
+impl Qwen36SharedW4a4Workspace {
+    fn new(
+        shared: &Qwen36SharedExpert,
+        hidden: usize,
+        intermediate: usize,
+    ) -> Result<Option<Self>> {
+        let Qwen36SharedExpert::W4A4 { gate_up, down } = shared else {
+            return Ok(None);
+        };
+        const WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
+
+        let lt = CublasLt::new()?;
+        let gate_up_input = Nvfp4Matrix::zeroed_col_major(hidden, 1)?;
+        let gate_up_c = F32Matrix::zeroed(intermediate * 2, 1)?;
+        let gate_up_plan = Fp4TnMatmulPlan::new_f32_output(
+            &lt,
+            GemmShape::new(intermediate * 2, 1, hidden),
+            Nvfp4TnInputs::new(gate_up.matrix(), &gate_up_input),
+            &gate_up_c,
+            WORKSPACE_LIMIT,
+        )?;
+
+        let down_input = Nvfp4Matrix::zeroed_col_major(intermediate, 1)?;
+        let down_c = F32Matrix::zeroed(hidden, 1)?;
+        let down_plan = Fp4TnMatmulPlan::new_f32_output(
+            &lt,
+            GemmShape::new(hidden, 1, intermediate),
+            Nvfp4TnInputs::new(down.matrix(), &down_input),
+            &down_c,
+            WORKSPACE_LIMIT,
+        )?;
+
+        Ok(Some(Self {
+            lt,
+            gate_up_input,
+            _gate_up_c: gate_up_c,
+            gate_up_plan,
+            down_input,
+            _down_c: down_c,
+            down_plan,
+        }))
+    }
 }
 
 /// A device-resident NVFP4 linear weight for W4A16 execution.
@@ -1387,6 +1580,7 @@ pub struct Qwen36MoeWorkspace {
     pub shared_gate_up_output: DeviceBuffer<f32>,
     pub shared_activated: DeviceBuffer<f32>,
     pub shared_output: DeviceBuffer<f32>,
+    shared_w4a4: Option<Qwen36SharedW4a4Workspace>,
     pub shared_gate_logits: DeviceBuffer<f32>,
     pub shared_gated: DeviceBuffer<f32>,
     pub moe_out: DeviceBuffer<f32>,
@@ -1500,7 +1694,10 @@ impl Qwen36MoeWeights {
             });
         }
 
-        // Marlin gate/up plus SM12x down is the validated Qwen3.6 fast path.
+        // ModelOpt uses the validated Marlin gate/up path. Compressed-tensors
+        // checkpoints request dynamic W4A4 and retain only grouped weights.
+        let use_grouped_w4a4 =
+            checkpoint.contains_tensor(&format!("{prefix}.experts.0.gate_proj.weight_packed"));
         let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
             && (0..experts).all(|expert_idx| {
@@ -1515,18 +1712,19 @@ impl Qwen36MoeWeights {
         // null. Their allocations are tiny and preserve the shared table ABI.
         let gate_up_ptrs = vec![std::ptr::null(); experts];
         let gate_up_scale_ptrs = vec![std::ptr::null(); experts];
-        let gate_up_grouped_value_ptrs = vec![std::ptr::null(); experts];
-        let gate_up_grouped_scale_ptrs = vec![std::ptr::null(); experts];
+        let mut gate_up_grouped_value_ptrs = vec![std::ptr::null(); experts];
+        let mut gate_up_grouped_scale_ptrs = vec![std::ptr::null(); experts];
         let down_ptrs = vec![std::ptr::null(); experts];
         let down_scale_ptrs = vec![std::ptr::null(); experts];
         let mut down_grouped_value_ptrs = vec![std::ptr::null(); experts];
         let mut down_grouped_scale_ptrs = vec![std::ptr::null(); experts];
         let mut down_input_scales = Vec::with_capacity(experts);
         let mut down_alphas = Vec::with_capacity(experts);
-        let shared_gate_up_input_scale: Option<f32> = None;
-        let gate_up_alphas = Vec::with_capacity(experts);
-        let gate_up_w4a16_weight_scale_2 = Vec::with_capacity(experts);
+        let mut shared_gate_up_input_scale: Option<f32> = None;
+        let mut gate_up_alphas = Vec::with_capacity(experts);
+        let mut gate_up_w4a16_weight_scale_2 = Vec::with_capacity(experts);
         let mut marlin_gate_up_weights = Vec::with_capacity(experts);
+        let mut grouped_gate_up_weights = Vec::with_capacity(experts);
         let mut sm12x_down = Vec::with_capacity(experts);
         let mut sm12x_down_tile_ptrs = Vec::with_capacity(experts);
         let mut sm12x_down_scale_ptrs = Vec::with_capacity(experts);
@@ -1540,7 +1738,21 @@ impl Qwen36MoeWeights {
                 &gate,
                 &up,
             )?;
-            marlin_gate_up_weights.push(weight);
+            if use_grouped_w4a4 {
+                match shared_gate_up_input_scale {
+                    None => shared_gate_up_input_scale = Some(weight.input_scale),
+                    Some(first) if first.to_bits() == weight.input_scale.to_bits() => {}
+                    Some(_) => shared_gate_up_input_scale = Some(f32::NAN),
+                }
+                gate_up_alphas.push(weight.weight_scale_2 * weight.input_scale);
+                let device = Nvfp4DeviceLinear::from_host(&weight)?;
+                gate_up_grouped_value_ptrs[expert_idx] = device.packed_weight.as_const_ptr().cast();
+                gate_up_grouped_scale_ptrs[expert_idx] = device.weight_scale.as_const_ptr().cast();
+                grouped_gate_up_weights.push(device);
+            } else {
+                gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
+                marlin_gate_up_weights.push(weight);
+            }
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
@@ -1584,14 +1796,14 @@ impl Qwen36MoeWeights {
             gate_up_alphas: DeviceBuffer::from_host(&gate_up_alphas)?,
         };
 
-        let shared_gate_up = concat_gate_up(
+        let shared_gate_up = load_concat_gate_up(
             checkpoint,
             &format!("{prefix}.shared_expert.gate_proj"),
             &format!("{prefix}.shared_expert.up_proj"),
             "Qwen3.6 shared expert gate/up",
         )?;
         let shared_down =
-            Nvfp4DeviceLinear::load(checkpoint, &format!("{prefix}.shared_expert.down_proj"))?;
+            checkpoint.load_nvfp4_linear(&format!("{prefix}.shared_expert.down_proj"))?;
         let shared_intermediate = shared_gate_up.out_features / 2;
         if shared_gate_up.in_features != manifest.hidden
             || shared_down.in_features != shared_intermediate
@@ -1612,9 +1824,16 @@ impl Qwen36MoeWeights {
                 ),
             });
         }
-        let shared = Qwen36SharedExpert {
-            gate_up: shared_gate_up,
-            down: shared_down,
+        let shared = if use_grouped_w4a4 {
+            Qwen36SharedExpert::W4A4 {
+                gate_up: shared_gate_up.as_cublaslt_weight()?,
+                down: shared_down.as_cublaslt_weight()?,
+            }
+        } else {
+            Qwen36SharedExpert::W4A16 {
+                gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
+                down: Nvfp4DeviceLinear::from_host(&shared_down)?,
+            }
         };
 
         let shared_gate = Bf16Linear::load(
@@ -1624,7 +1843,19 @@ impl Qwen36MoeWeights {
             manifest.hidden,
         )?;
 
-        let marlin_gate_up = MarlinNvfp4GateUp::new(&marlin_gate_up_weights)?;
+        let gate_up_storage = if use_grouped_w4a4 {
+            if shared_gate_up_input_scale.is_none_or(f32::is_nan) {
+                return Err(Error::Format {
+                    label: "Qwen3.6 grouped gate/up",
+                    detail: "expert gate/up input scales are not shared".to_string(),
+                });
+            }
+            Qwen36GateUpStorage::Grouped {
+                _weights: grouped_gate_up_weights,
+            }
+        } else {
+            Qwen36GateUpStorage::Marlin(MarlinNvfp4GateUp::new(&marlin_gate_up_weights)?)
+        };
 
         Ok(Self {
             router,
@@ -1633,7 +1864,7 @@ impl Qwen36MoeWeights {
             gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&gate_up_w4a16_weight_scale_2)?,
             gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan,
-            marlin_gate_up,
+            gate_up_storage,
             shared,
             shared_gate,
             _sm12x_down: sm12x_down,
@@ -1667,11 +1898,17 @@ impl Qwen36MoeWeights {
 
     fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36MoeWorkspace> {
         let enable_grouped = true;
-        Qwen36MoeWorkspace::new_for_paths(
+        let mut workspace = Qwen36MoeWorkspace::new_for_paths(
             manifest,
             enable_grouped,
             self.storage_plan.down == Qwen36DownStorage::Sm12x,
-        )
+        )?;
+        workspace.shared_w4a4 = Qwen36SharedW4a4Workspace::new(
+            &self.shared,
+            manifest.hidden,
+            self.expert_intermediate,
+        )?;
+        Ok(workspace)
     }
 
     /// Prepares route indices and the quantized gate/up input for grouped gate/up benchmarking.
@@ -2091,6 +2328,79 @@ impl Qwen36MoeWeights {
         )
     }
 
+    fn run_shared_gate_up(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match &self.shared {
+            Qwen36SharedExpert::W4A16 { gate_up, .. } => {
+                gate_up.run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+            }
+            Qwen36SharedExpert::W4A4 { gate_up, .. } => {
+                let shared = workspace
+                    .shared_w4a4
+                    .as_mut()
+                    .expect("W4A4 shared expert requires W4A4 workspace");
+                gate_up.quantize_activation_device_col_major_f32_into_on_stream(
+                    ffn_norm.len(),
+                    1,
+                    ffn_norm,
+                    &mut shared.gate_up_input,
+                    stream,
+                )?;
+                shared
+                    .gate_up_plan
+                    .run_with_alpha_beta_f32_inout_buffer_on_stream(
+                        &shared.lt,
+                        Nvfp4TnInputs::new(gate_up.matrix(), &shared.gate_up_input),
+                        workspace.shared_gate_up_output.inout(),
+                        gate_up.matmul_alpha(),
+                        0.0,
+                        stream,
+                    )
+            }
+        }
+    }
+
+    fn run_shared_down(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match &self.shared {
+            Qwen36SharedExpert::W4A16 { down, .. } => down.run_f32_into(
+                &workspace.shared_activated,
+                &mut workspace.shared_output,
+                stream,
+            ),
+            Qwen36SharedExpert::W4A4 { down, .. } => {
+                let shared = workspace
+                    .shared_w4a4
+                    .as_mut()
+                    .expect("W4A4 shared expert requires W4A4 workspace");
+                down.quantize_activation_device_col_major_f32_into_on_stream(
+                    workspace.shared_activated.len(),
+                    1,
+                    &workspace.shared_activated,
+                    &mut shared.down_input,
+                    stream,
+                )?;
+                shared
+                    .down_plan
+                    .run_with_alpha_beta_f32_inout_buffer_on_stream(
+                        &shared.lt,
+                        Nvfp4TnInputs::new(down.matrix(), &shared.down_input),
+                        workspace.shared_output.inout(),
+                        down.matmul_alpha(),
+                        0.0,
+                        stream,
+                    )
+            }
+        }
+    }
+
     /// Runs only shared expert gate/up projection.
     pub fn run_shared_gate_up_only(
         &self,
@@ -2098,9 +2408,7 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.shared
-            .gate_up
-            .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+        self.run_shared_gate_up(workspace, ffn_norm, stream)
     }
 
     /// Runs only shared expert SiLU activation.
@@ -2123,11 +2431,7 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.shared.down.run_f32_into(
-            &workspace.shared_activated,
-            &mut workspace.shared_output,
-            stream,
-        )
+        self.run_shared_down(workspace, stream)
     }
 
     /// Runs only shared expert gate projection and scaling.
@@ -2231,9 +2535,55 @@ impl Qwen36MoeWeights {
                     .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
             }
 
-            let gate_up_table = {
+            let use_grouped_w4a4 =
+                matches!(self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. });
+            if use_grouped_w4a4 {
+                let input_scale = self
+                    .expert_ptrs
+                    .shared_gate_up_input_scale
+                    .expect("grouped W4A4 storage requires a shared input scale");
+                quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
+                    manifest.hidden,
+                    ffn_norm,
+                    &mut workspace.gate_up_input,
+                    &mut workspace.gate_up_input_simple_scales,
+                    input_scale,
+                    stream,
+                )?;
+                let grouped_gate_up = workspace
+                    .grouped_gate_up
+                    .as_mut()
+                    .expect("device route requires grouped gate/up workspace");
+                let mut run_grouped = || {
+                    grouped_gate_up.run_gate_up_device_route(
+                        &workspace.route,
+                        &self.expert_ptrs,
+                        &workspace.gate_up_input,
+                        workspace.gate_up_input_simple_scales.as_const_ptr().cast(),
+                        stream,
+                    )?;
+                    Ok(())
+                };
+                if gpu_probe
+                    .as_ref()
+                    .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::RoutedGateUp))
+                {
+                    gpu_probe
+                        .as_deref_mut()
+                        .expect("probe present")
+                        .capture(run_grouped)?;
+                } else if let Some(profile) = profile.as_deref_mut() {
+                    let (_, ms) = timed_cuda(stream, run_grouped)?;
+                    profile.qwen36_routed_gate_up_ms += ms;
+                } else {
+                    run_grouped()?;
+                }
+            } else {
                 let mut run_marlin = || {
-                    self.marlin_gate_up.run_on_stream(
+                    let Qwen36GateUpStorage::Marlin(marlin) = &self.gate_up_storage else {
+                        unreachable!("checked Marlin gate/up storage")
+                    };
+                    marlin.run_on_stream(
                         &workspace.route.indices,
                         ffn_norm,
                         workspace.marlin_gate_up_output.output(),
@@ -2254,9 +2604,21 @@ impl Qwen36MoeWeights {
                 } else {
                     run_marlin()?;
                 }
+            }
+            let gate_up_table = if use_grouped_w4a4 {
+                &workspace
+                    .grouped_gate_up
+                    .as_ref()
+                    .expect("grouped W4A4 workspace")
+                    .c
+            } else {
                 &workspace.marlin_gate_up_table
             };
-            let gate_up_alpha_table = &self.gate_up_w4a16_unity_alphas;
+            let gate_up_alpha_table = if use_grouped_w4a4 {
+                &self.expert_ptrs.gate_up_alphas
+            } else {
+                &self.gate_up_w4a16_unity_alphas
+            };
             if use_sm12x_down {
                 let sm12x_down = &mut workspace.sm12x_down;
                 let mut run_silu_quantize = || {
@@ -2527,19 +2889,15 @@ impl Qwen36MoeWeights {
         };
         let _ = used_grouped;
 
-        // Shared expert (W4A16, not part of grouped GEMV).
-        let shared = &self.shared;
+        // Shared expert. Compressed-tensors checkpoints use W4A4 here, while
+        // ModelOpt retains the established W4A16 path.
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
-                shared
-                    .gate_up
-                    .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+                self.run_shared_gate_up(workspace, ffn_norm, stream)
             })?;
             profile.qwen36_shared_gate_up_ms += ms;
         } else {
-            shared
-                .gate_up
-                .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)?;
+            self.run_shared_gate_up(workspace, ffn_norm, stream)?;
         }
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
@@ -2560,20 +2918,10 @@ impl Qwen36MoeWeights {
             )?;
         }
         if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || {
-                shared.down.run_f32_into(
-                    &workspace.shared_activated,
-                    &mut workspace.shared_output,
-                    stream,
-                )
-            })?;
+            let (_, ms) = timed_cuda(stream, || self.run_shared_down(workspace, stream))?;
             profile.qwen36_shared_down_ms += ms;
         } else {
-            shared.down.run_f32_into(
-                &workspace.shared_activated,
-                &mut workspace.shared_output,
-                stream,
-            )?;
+            self.run_shared_down(workspace, stream)?;
         }
 
         if let Some(profile) = profile.as_deref_mut() {
@@ -2883,6 +3231,7 @@ impl Qwen36MoeWorkspace {
             shared_gate_up_output: DeviceBuffer::zeroed(gate_up_out_features)?,
             shared_activated: DeviceBuffer::zeroed(expert_intermediate)?,
             shared_output: DeviceBuffer::zeroed(hidden)?,
+            shared_w4a4: None,
             shared_gate_logits: DeviceBuffer::zeroed(1)?,
             shared_gated: DeviceBuffer::zeroed(hidden)?,
             moe_out: DeviceBuffer::zeroed(hidden)?,
@@ -2892,12 +3241,12 @@ impl Qwen36MoeWorkspace {
     }
 }
 
-fn concat_gate_up(
+fn load_concat_gate_up(
     checkpoint: &ModelOptCheckpoint,
     gate_prefix: &str,
     up_prefix: &str,
     label: &'static str,
-) -> Result<Nvfp4DeviceLinear> {
+) -> Result<ModelOptNvfp4Linear> {
     let gate = checkpoint.load_nvfp4_linear(gate_prefix)?;
     let up = checkpoint.load_nvfp4_linear(up_prefix)?;
     if gate.in_features != up.in_features {
@@ -2907,12 +3256,7 @@ fn concat_gate_up(
             actual: format!("gate={} up={}", gate.in_features, up.in_features),
         });
     }
-    let concat = ModelOptNvfp4Linear::concat_out_features(
-        format!("{gate_prefix}.gate_up_proj"),
-        &gate,
-        &up,
-    )?;
-    Nvfp4DeviceLinear::from_host(&concat)
+    ModelOptNvfp4Linear::concat_out_features(format!("{gate_prefix}.gate_up_proj"), &gate, &up)
 }
 
 // ---------------------------------------------------------------------------
@@ -3385,7 +3729,7 @@ fn timed_cuda<T>(stream: &CudaStream, f: impl FnOnce() -> Result<T>) -> Result<(
 /// Fully loaded Qwen3.6 text model ready for one-token-at-a-time decode.
 ///
 /// Holds all layer block weights, the BF16 embedding table, the final RMSNorm
-/// weight, and the NVFP4 lm_head. Routed-expert NVFP4 weights are loaded
+/// weight, and the quantized lm_head. Routed-expert NVFP4 weights are loaded
 /// lazily on first use.
 pub struct Qwen36TextModel {
     manifest: QwenModelManifest,
@@ -3394,7 +3738,97 @@ pub struct Qwen36TextModel {
     layers: Vec<Qwen36LayerBlock>,
     embedding: DeviceBuffer<u16>,
     final_norm: DeviceBuffer<f32>,
-    lm_head: Nvfp4DeviceLinear,
+    lm_head: Qwen36LmHead,
+}
+
+enum Qwen36LmHead {
+    Nvfp4(Nvfp4DeviceLinear),
+    Fp8(Fp8Linear),
+}
+
+impl Qwen36LmHead {
+    fn load(checkpoint: &ModelOptCheckpoint) -> Result<Self> {
+        if checkpoint.contains_tensor("lm_head.weight_scale_2") {
+            Ok(Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, "lm_head")?))
+        } else {
+            Ok(Self::Fp8(Fp8Linear::from_host(
+                &checkpoint.load_fp8_linear("lm_head")?,
+            )?))
+        }
+    }
+
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            Self::Nvfp4(linear) => (linear.out_features, linear.in_features),
+            Self::Fp8(linear) => (linear.rows, linear.cols),
+        }
+    }
+
+    fn run_logits(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Qwen36LmHeadWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
+            Self::Fp8(linear) => linear.run_into(
+                input,
+                &mut workspace.logits,
+                &mut workspace.dynamic_input,
+                &mut workspace.dynamic_input_scale,
+                stream,
+            ),
+        }
+    }
+
+    fn run_top1(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Qwen36LmHeadWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Nvfp4(linear) => nvfp4_w4a16_top1_f32_into_on_stream(
+                input,
+                &linear.packed_weight,
+                &linear.weight_scale,
+                &workspace.scratch_value,
+                &workspace.scratch_index,
+                &workspace.next_index,
+                &workspace.next_value,
+                linear.out_features,
+                linear.in_features,
+                linear.weight_scale_2,
+                stream,
+            ),
+            Self::Fp8(linear) => {
+                linear.run_into(
+                    input,
+                    &mut workspace.logits,
+                    &mut workspace.dynamic_input,
+                    &mut workspace.dynamic_input_scale,
+                    stream,
+                )?;
+                argmax_f32_into_on_stream(
+                    &workspace.logits,
+                    workspace.next_index.output(),
+                    workspace.next_value.output(),
+                    stream,
+                )
+            }
+        }
+    }
+}
+
+struct Qwen36LmHeadWorkspace {
+    logits: DeviceBuffer<f32>,
+    dynamic_input: DeviceBuffer<u8>,
+    dynamic_input_scale: DeviceBuffer<f32>,
+    scratch_value: DeviceBuffer<f32>,
+    scratch_index: DeviceBuffer<u32>,
+    next_index: DeviceBuffer<u32>,
+    next_value: DeviceBuffer<f32>,
 }
 
 struct Qwen36LinearLayerGraphs {
@@ -3417,11 +3851,7 @@ pub struct Qwen36DecodeState {
     layer_workspaces: Vec<Qwen36LayerBlockWorkspace>,
     rounded_hidden: DeviceBuffer<f32>,
     final_hidden: DeviceBuffer<f32>,
-    lm_head_logits: DeviceBuffer<f32>,
-    lm_head_scratch_value: DeviceBuffer<f32>,
-    lm_head_scratch_index: DeviceBuffer<u32>,
-    next_index: DeviceBuffer<u32>,
-    next_value: DeviceBuffer<f32>,
+    lm_head: Qwen36LmHeadWorkspace,
     segmented_graphs: Option<Vec<Qwen36LayerGraphs>>,
     position: usize,
     max_tokens: usize,
@@ -3518,12 +3948,13 @@ impl Qwen36TextModel {
             &format!("{}.norm.weight", manifest.tensor_prefix),
             manifest.hidden,
         )?;
-        let lm_head = Nvfp4DeviceLinear::load(&checkpoint, "lm_head")?;
-        if lm_head.out_features != manifest.vocab || lm_head.in_features != manifest.hidden {
+        let lm_head = Qwen36LmHead::load(&checkpoint)?;
+        let lm_head_shape = lm_head.shape();
+        if lm_head_shape != (manifest.vocab, manifest.hidden) {
             return Err(Error::Shape {
                 label: "Qwen3.6 lm_head",
                 expected: format!("[{}, {}]", manifest.vocab, manifest.hidden),
-                actual: format!("[{}, {}]", lm_head.out_features, lm_head.in_features),
+                actual: format!("[{}, {}]", lm_head_shape.0, lm_head_shape.1),
             });
         }
         Ok(Self {
@@ -3574,11 +4005,15 @@ impl Qwen36TextModel {
             layer_workspaces,
             rounded_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             final_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
-            lm_head_logits: DeviceBuffer::zeroed(self.manifest.vocab)?,
-            lm_head_scratch_value: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
-            lm_head_scratch_index: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
-            next_index: DeviceBuffer::zeroed(1)?,
-            next_value: DeviceBuffer::zeroed(1)?,
+            lm_head: Qwen36LmHeadWorkspace {
+                logits: DeviceBuffer::zeroed(self.manifest.vocab)?,
+                dynamic_input: DeviceBuffer::zeroed(self.manifest.hidden)?,
+                dynamic_input_scale: DeviceBuffer::zeroed(1)?,
+                scratch_value: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
+                scratch_index: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
+                next_index: DeviceBuffer::zeroed(1)?,
+                next_value: DeviceBuffer::zeroed(1)?,
+            },
             segmented_graphs: None,
             position: 0,
             max_tokens,
@@ -3823,8 +4258,8 @@ impl Qwen36TextModel {
 
         let (id, value, logits) = if return_logits {
             self.lm_head
-                .run_f32_into(&state.final_hidden, &mut state.lm_head_logits, stream)?;
-            let logits = state.lm_head_logits.copy_to_host(stream)?.into_vec();
+                .run_logits(&state.final_hidden, &mut state.lm_head, stream)?;
+            let logits = state.lm_head.logits.copy_to_host(stream)?.into_vec();
             let (id, value) = logits
                 .iter()
                 .copied()
@@ -3835,43 +4270,47 @@ impl Qwen36TextModel {
             (id, value, Some(logits))
         } else if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
-                nvfp4_w4a16_top1_f32_into_on_stream(
-                    &state.final_hidden,
-                    &self.lm_head.packed_weight,
-                    &self.lm_head.weight_scale,
-                    &state.lm_head_scratch_value,
-                    &state.lm_head_scratch_index,
-                    &state.next_index,
-                    &state.next_value,
-                    self.lm_head.out_features,
-                    self.lm_head.in_features,
-                    self.lm_head.weight_scale_2,
-                    stream,
-                )
+                self.lm_head
+                    .run_top1(&state.final_hidden, &mut state.lm_head, stream)
             })?;
             profile.lm_head_argmax_ms += ms;
-            let id = state.next_index.copy_to_host(stream)?[0];
-            let value = state.next_value.copy_to_host(stream)?[0];
+            let id = state.lm_head.next_index.copy_to_host(stream)?[0];
+            let value = state.lm_head.next_value.copy_to_host(stream)?[0];
             (id, value, None)
         } else {
-            nvfp4_w4a16_top1_f32_into_on_stream(
-                &state.final_hidden,
-                &self.lm_head.packed_weight,
-                &self.lm_head.weight_scale,
-                &state.lm_head_scratch_value,
-                &state.lm_head_scratch_index,
-                &state.next_index,
-                &state.next_value,
-                self.lm_head.out_features,
-                self.lm_head.in_features,
-                self.lm_head.weight_scale_2,
-                stream,
-            )?;
-            let id = state.next_index.copy_to_host(stream)?[0];
-            let value = state.next_value.copy_to_host(stream)?[0];
+            self.lm_head
+                .run_top1(&state.final_hidden, &mut state.lm_head, stream)?;
+            let id = state.lm_head.next_index.copy_to_host(stream)?[0];
+            let value = state.lm_head.next_value.copy_to_host(stream)?[0];
             (id, value, None)
         };
         state.position += 1;
         Ok((Qwen36NextToken { id, value }, logits))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reorder_fp8_v_rows;
+    use crate::nvfp4::ModelOptFp8Linear;
+
+    #[test]
+    fn reorder_fp8_v_rows_keeps_channel_scales_with_weights() {
+        let host = ModelOptFp8Linear {
+            prefix: "z".to_string(),
+            out_features: 8,
+            in_features: 1,
+            weight: (0..8).collect(),
+            weight_scale: 1.0,
+            channel_weight_scale: Some((100..108).map(|value| value as f32).collect()),
+            input_scale: None,
+        };
+
+        let reordered = reorder_fp8_v_rows(host, 2, 4, 2);
+        assert_eq!(reordered.weight, vec![0, 1, 4, 5, 2, 3, 6, 7]);
+        assert_eq!(
+            reordered.channel_weight_scale,
+            Some(vec![100.0, 101.0, 104.0, 105.0, 102.0, 103.0, 106.0, 107.0])
+        );
     }
 }

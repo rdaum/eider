@@ -1,123 +1,88 @@
-use infer::nvfp4::{CublasLt, CudaStream, DeviceBuffer, Result, rms_norm_f32_into_on_stream};
-use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model};
+use infer::nvfp4::{Error, Result};
+use infer::qwen3::qwen36::Qwen36TextModel;
 use std::env;
 use std::path::PathBuf;
+use tokenizers::Tokenizer;
 
 fn main() -> Result<()> {
-    let model_dir = parse_model_dir()?;
-    let model = Qwen36Model::open(&model_dir)?;
-    let manifest = model.manifest().clone();
-    let stream = CudaStream::new_non_blocking()?;
-    let lt = CublasLt::new()?;
-
-    let checkpoint = model.checkpoint().clone();
-    let emb_name = format!("{}.embed_tokens.weight", manifest.tensor_prefix);
-    let emb_host = load_bf16_row(&checkpoint, &emb_name, manifest.vocab, manifest.hidden, 0)?;
-    let hidden = DeviceBuffer::from_host(&emb_host)?;
-
-    let mut layer_workspaces = Vec::with_capacity(manifest.layers);
-    let mut blocks = Vec::with_capacity(manifest.layers);
-    for layer in 0..manifest.layers {
-        let block = Qwen36LayerBlock::load(&model, layer)?;
-        let ws = block.workspace(&model, 8)?;
-        blocks.push(block);
-        layer_workspaces.push(ws);
+    let (model_dir, prompt) = parse_args()?;
+    let tokenizer =
+        Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|error| Error::Format {
+            label: "tokenizer",
+            detail: error.to_string(),
+        })?;
+    let rendered = render_prompt(&prompt);
+    let encoding = tokenizer
+        .encode(rendered, false)
+        .map_err(|error| Error::Format {
+            label: "tokenizer encode",
+            detail: error.to_string(),
+        })?;
+    let prompt_ids = encoding.get_ids();
+    if prompt_ids.is_empty() {
+        return Err(Error::Format {
+            label: "prompt",
+            detail: "prompt tokenized to zero tokens".to_string(),
+        });
     }
 
-    let mut current = hidden;
-    for (layer, (block, ws)) in blocks.iter().zip(layer_workspaces.iter_mut()).enumerate() {
-        let step = block.run_one_token(&lt, ws, &manifest, &current, 0, &stream, None, None)?;
-        let out = step.output.copy_to_host(&stream)?;
-        if layer == 0 || layer == manifest.layers - 1 {
-            println!(
-                "layer {layer}: first={:.6} max|={:.6}",
-                out[0],
-                max_abs(&out)
-            );
-        }
-        current = DeviceBuffer::from_host(&out)?;
+    let model = Qwen36TextModel::open(&model_dir)?;
+    let mut state = model.new_decode_state(prompt_ids.len() + 1)?;
+    for &token in &prompt_ids[..prompt_ids.len() - 1] {
+        model.decode_one_token(&mut state, token)?;
     }
+    let last = *prompt_ids.last().expect("non-empty prompt");
+    let output = model.decode_one_token_logits(&mut state, last)?;
 
-    // Final norm
-    let final_norm_name = format!("{}.norm.weight", manifest.tensor_prefix);
-    let final_norm = load_bf16_vec_delta(&checkpoint, &final_norm_name, manifest.hidden)?;
-    let final_norm_device = DeviceBuffer::from_host(&final_norm)?;
-    let mut final_hidden = DeviceBuffer::zeroed(manifest.hidden)?;
-    rms_norm_f32_into_on_stream(
-        1,
-        manifest.hidden,
-        &current,
-        &final_norm_device,
-        final_hidden.output(),
-        manifest.rms_eps,
-        &stream,
-    )?;
-    let fh = final_hidden.copy_to_host(&stream)?;
-    println!("final_hidden: first={:.6} max|={:.6}", fh[0], max_abs(&fh));
+    let mut ranked = output
+        .logits
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<_>>();
+    ranked.select_nth_unstable_by(20, |left, right| right.1.total_cmp(&left.1));
+    ranked.truncate(20);
+    ranked.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
 
-    // Also dump the pre-norm hidden
-    let pre_norm = current.copy_to_host(&stream)?;
-    println!(
-        "pre_norm_hidden: first={:.6} max|={:.6}",
-        pre_norm[0],
-        max_abs(&pre_norm)
-    );
-    let rms = (pre_norm.iter().map(|x| x * x).sum::<f32>() / pre_norm.len() as f32).sqrt();
-    println!("pre_norm rms={:.6}", rms);
-
-    // lm_head: BF16 matvec to get logits
-    // The checkpoint stores lm_head as NVFP4, but for a quick check let's
-    // just dump the final hidden state stats and the top-5 tokens from the
-    // existing decode path.
-    let text = infer::qwen3::qwen36::Qwen36TextModel::open(&model_dir)?;
-    let mut state = text.new_decode_state(8)?;
-    let next = text.decode_one_token(&mut state, 0)?;
-    println!("decode token 0 -> id={} value={:.6}", next.id, next.value);
-
+    println!("prompt_tokens={prompt_ids:?}");
+    for (rank, (token, logit)) in ranked.into_iter().enumerate() {
+        let text = tokenizer
+            .decode(&[token as u32], true)
+            .unwrap_or_else(|_| "<decode error>".to_string());
+        println!("{rank:2}: token={token:6} logit={logit:10.5} text={text:?}");
+    }
     Ok(())
 }
 
-fn load_bf16_row(
-    checkpoint: &infer::nvfp4::ModelOptCheckpoint,
-    name: &str,
-    _rows: usize,
-    cols: usize,
-    row: usize,
-) -> Result<Vec<f32>> {
-    let shard = checkpoint.open_shard_for_tensor(name)?;
-    let offset = (row * cols * 2) as u64;
-    let bytes = shard.read_tensor_byte_range(name, offset, cols * 2)?;
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| infer::nvfp4::format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect())
-}
-
-fn load_bf16_vec_delta(
-    checkpoint: &infer::nvfp4::ModelOptCheckpoint,
-    name: &str,
-    _len: usize,
-) -> Result<Vec<f32>> {
-    let shard = checkpoint.open_shard_for_tensor(name)?;
-    let bytes = shard.read_tensor_bytes(name)?;
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|c| 1.0 + infer::nvfp4::format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect())
-}
-
-fn max_abs(v: &[f32]) -> f32 {
-    v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
-}
-
-fn parse_model_dir() -> Result<PathBuf> {
-    let mut args = env::args_os();
-    let _ = args.next();
-    match (args.next(), args.next()) {
-        (Some(path), None) => Ok(PathBuf::from(path)),
-        _ => Err(infer::nvfp4::Error::Format {
-            label: "usage",
-            detail: "qwen36-logit-dump <model-dir>".to_string(),
-        }),
+fn render_prompt(prompt: &str) -> String {
+    if prompt.contains("<|im_start|>") {
+        return prompt.to_string();
     }
+    format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+}
+
+fn parse_args() -> Result<(PathBuf, String)> {
+    let mut args = env::args_os();
+    let program = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "qwen36-logit-dump".to_string());
+    let model_dir = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::Format {
+            label: "usage",
+            detail: format!("{program} <model-dir> [prompt]"),
+        })?;
+    let prompt = args
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "What is the meaning of life".to_string());
+    if args.next().is_some() {
+        return Err(Error::Format {
+            label: "usage",
+            detail: format!("{program} <model-dir> [prompt]"),
+        });
+    }
+    Ok((model_dir, prompt))
 }

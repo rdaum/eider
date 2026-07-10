@@ -66,6 +66,31 @@ __device__ __forceinline__ float infer_block_reduce_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float infer_warp_reduce_max(float value) {
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 16));
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 8));
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 4));
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 2));
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, 1));
+    return value;
+}
+
+__device__ __forceinline__ float infer_block_reduce_max(float value) {
+    __shared__ float warp_maxes[32];
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    value = infer_warp_reduce_max(value);
+    if (lane == 0) {
+        warp_maxes[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < ((blockDim.x + 31U) >> 5) ? warp_maxes[lane] : 0.0f;
+    if (warp == 0) {
+        value = infer_warp_reduce_max(value);
+    }
+    return value;
+}
+
 // Quantization and elementwise activation kernels.
 __global__ void infer_quantize_nvfp4_col_major_f32_kernel(const float* input,
                                                                std::uint8_t* packed,
@@ -3142,7 +3167,8 @@ __global__ void infer_fp8_linear_f32_kernel(const float* input,
                                                   float* output,
                                                   std::uint32_t rows,
                                                   std::uint32_t cols,
-                                                  float weight_scale) {
+                                                  float weight_scale,
+                                                  const float* channel_weight_scale) {
     const std::uint32_t row = blockIdx.x;
     if (row >= rows) {
         return;
@@ -3170,7 +3196,10 @@ __global__ void infer_fp8_linear_f32_kernel(const float* input,
     sum = infer_block_reduce_sum(sum);
 
     if (threadIdx.x == 0) {
-        output[row] = sum * weight_scale;
+        const float scale = channel_weight_scale == nullptr
+            ? weight_scale
+            : channel_weight_scale[row];
+        output[row] = sum * scale;
     }
 }
 
@@ -3189,7 +3218,240 @@ static cudaError_t infer_launch_fp8_linear_f32(
     }
 
     infer_fp8_linear_f32_kernel<<<rows, threads, 0, stream>>>(
-        input, weight, output, rows, cols, weight_scale);
+        input, weight, output, rows, cols, weight_scale, nullptr);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_fp8_linear_channel_scaled_f32_configured_on_stream(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t threads,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || channel_weight_scale == nullptr ||
+        output == nullptr || rows == 0 || cols == 0 || threads < 64 || threads > 512 ||
+        (threads % 32) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_fp8_linear_f32_kernel<<<rows, threads, 0, stream>>>(
+        input, weight, output, rows, cols, 1.0f, channel_weight_scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_fp8_linear_channel_scaled_dynamic_f32_kernel(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float local_max = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[col];
+        if (isfinite(value)) {
+            local_max = fmaxf(local_max, fabsf(value));
+        }
+    }
+    const float max_abs = infer_block_reduce_max(local_max);
+    __shared__ float input_scale;
+    if (threadIdx.x == 0) {
+        input_scale = max_abs == 0.0f ? 1.0f : max_abs / 448.0f;
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    const std::uint32_t row_base = row * cols;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const std::uint8_t input_code = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(input[col] / input_scale, __NV_SATFINITE, __NV_E4M3));
+        sum += infer_e4m3_value(input_code) * infer_e4m3_value(weight[row_base + col]);
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        output[row] = sum * input_scale * channel_weight_scale[row];
+    }
+}
+
+extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_f32_on_stream(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || channel_weight_scale == nullptr ||
+        output == nullptr || rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_fp8_linear_channel_scaled_dynamic_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, channel_weight_scale, output, rows, cols);
+    return cudaGetLastError();
+}
+
+__global__ void infer_fp8_dynamic_input_scale_f32_kernel(
+    const float* input,
+    float* input_scale,
+    std::uint32_t cols) {
+    float local_max = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[col];
+        if (isfinite(value)) {
+            local_max = fmaxf(local_max, fabsf(value));
+        }
+    }
+    const float max_abs = infer_block_reduce_max(local_max);
+    if (threadIdx.x == 0) {
+        input_scale[0] = max_abs == 0.0f ? 1.0f : max_abs / 448.0f;
+    }
+}
+
+__global__ void infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_kernel(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    const float* input_scale_ptr,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const float input_scale = input_scale_ptr[0];
+    float sum = 0.0f;
+    const std::uint32_t row_base = row * cols;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const std::uint8_t input_code = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(input[col] / input_scale, __NV_SATFINITE, __NV_E4M3));
+        sum += infer_e4m3_value(input_code) * infer_e4m3_value(weight[row_base + col]);
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        output[row] = sum * input_scale * channel_weight_scale[row];
+    }
+}
+
+extern "C" cudaError_t infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_on_stream(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    float* input_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || channel_weight_scale == nullptr ||
+        input_scale == nullptr || output == nullptr || rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_fp8_dynamic_input_scale_f32_kernel<<<1, kThreads, 0, stream>>>(
+        input, input_scale, cols);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, channel_weight_scale, input_scale, output, rows, cols);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dynamic_quantize_fp8_e4m3_f32_kernel(
+    const float* input,
+    std::uint8_t* quantized_input,
+    float* input_scale,
+    std::uint32_t cols) {
+    float local_max = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[col];
+        if (isfinite(value)) {
+            local_max = fmaxf(local_max, fabsf(value));
+        }
+    }
+    const float max_abs = infer_block_reduce_max(local_max);
+    if (threadIdx.x == 0) {
+        input_scale[0] = max_abs == 0.0f ? 1.0f : max_abs / 448.0f;
+    }
+    __syncthreads();
+    const float scale = input_scale[0];
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        quantized_input[col] = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(input[col] / scale, __NV_SATFINITE, __NV_E4M3));
+    }
+}
+
+__global__ void infer_fp8_linear_quantized_channel_scaled_f32_kernel(
+    const std::uint8_t* input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    const float* input_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    float sum = 0.0f;
+    const std::uint32_t row_base = row * cols;
+    if ((cols & 3U) == 0) {
+        const auto* input4 = reinterpret_cast<const uchar4*>(input);
+        const auto* weight4 = reinterpret_cast<const uchar4*>(weight + row_base);
+        const std::uint32_t cols4 = cols >> 2;
+        for (std::uint32_t col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+            const uchar4 in = input4[col4];
+            const uchar4 w = weight4[col4];
+            sum += infer_e4m3_value(in.x) * infer_e4m3_value(w.x);
+            sum += infer_e4m3_value(in.y) * infer_e4m3_value(w.y);
+            sum += infer_e4m3_value(in.z) * infer_e4m3_value(w.z);
+            sum += infer_e4m3_value(in.w) * infer_e4m3_value(w.w);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            sum += infer_e4m3_value(input[col]) * infer_e4m3_value(weight[row_base + col]);
+        }
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        output[row] = sum * input_scale[0] * channel_weight_scale[row];
+    }
+}
+
+extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+    const float* input,
+    std::uint8_t* quantized_input,
+    const std::uint8_t* weight,
+    const float* channel_weight_scale,
+    float* input_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || quantized_input == nullptr || weight == nullptr ||
+        channel_weight_scale == nullptr || input_scale == nullptr || output == nullptr ||
+        rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_dynamic_quantize_fp8_e4m3_f32_kernel<<<1, kThreads, 0, stream>>>(
+        input, quantized_input, input_scale, cols);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    infer_fp8_linear_quantized_channel_scaled_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        quantized_input, weight, channel_weight_scale, input_scale, output, rows, cols);
     return cudaGetLastError();
 }
 

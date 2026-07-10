@@ -176,6 +176,57 @@ impl SafeTensorShard {
             bytes.try_into().expect("checked F32 byte length"),
         ))
     }
+
+    /// Reads an F32 tensor without imposing a particular shape.
+    pub fn read_f32_tensor(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self.require_tensor(name)?;
+        if info.dtype != "F32" || !info.byte_len().is_multiple_of(4) {
+            return Err(Error::Shape {
+                label: "safetensors F32 tensor",
+                expected: "dtype=F32 with a byte length divisible by 4".to_string(),
+                actual: format!(
+                    "dtype={} shape={:?} bytes={}",
+                    info.dtype,
+                    info.shape,
+                    info.byte_len()
+                ),
+            });
+        }
+        Ok(self
+            .read_tensor_bytes(name)?
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .collect())
+    }
+
+    /// Reads an F32 or BF16 tensor and returns its values as F32.
+    pub fn read_float_tensor_as_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let info = self.require_tensor(name)?;
+        let bytes = self.read_tensor_bytes(name)?;
+        match info.dtype.as_str() {
+            "F32" if bytes.len().is_multiple_of(4) => Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+                .collect()),
+            "BF16" if bytes.len().is_multiple_of(2) => Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u16::from_le_bytes(chunk.try_into().expect("two-byte chunk"));
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()),
+            _ => Err(Error::Shape {
+                label: "safetensors floating-point tensor",
+                expected: "dtype=F32 or BF16 with a valid byte length".to_string(),
+                actual: format!(
+                    "dtype={} shape={:?} bytes={}",
+                    info.dtype,
+                    info.shape,
+                    info.byte_len()
+                ),
+            }),
+        }
+    }
 }
 
 fn parse_tensor_info(name: &str, value: &Value) -> Result<SafeTensorInfo> {

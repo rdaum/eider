@@ -241,4 +241,8 @@ scripts/compare-vllm.sh
 and runs the same comparison. The scripts accept environment overrides for the
 model, prompt, token count, repeat count, and endpoint.
 
-The remaining deep-dive kernel reference lives in `docs/cutlass-sm12x-nvfp4.md`.
+Further implementation notes live in:
+
+- `docs/qwen36-batch-decode-plan.md` for the measured batch-API work that must
+  precede scheduler design.
+- `docs/cutlass-sm12x-nvfp4.md` for the SM12x/CUTLASS kernel investigation.

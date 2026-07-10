@@ -748,6 +748,46 @@ unsafe extern "C" {
         threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_channel_scaled_f32_configured_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        channel_weight_scale: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_channel_scaled_dynamic_f32_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        channel_weight_scale: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        channel_weight_scale: *const f32,
+        input_scale: *mut f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+        input: *const f32,
+        quantized_input: *mut u8,
+        weight: *const u8,
+        channel_weight_scale: *const f32,
+        input_scale: *mut f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_fp8_linear_w8a8_f32_on_stream(
         input: *const f32,
         weight: *const u8,

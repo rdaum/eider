@@ -133,8 +133,7 @@ fn main() -> Result<()> {
     idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     println!("CPU top-8: {:?}", &idx[..8]);
 
-    // CPU reference for the shared expert: gate_up + silu_mul + down + sigmoid_gate
-    // Step 1: shared gate_up W4A16 matvec
+    // CPU reference for the shared expert: gate_up + silu_mul + down + sigmoid_gate.
     let shared_gate_up_host =
         checkpoint.load_nvfp4_linear(&format!("{prefix}.shared_expert.gate_proj"))?;
     let shared_up_host =
@@ -145,15 +144,28 @@ fn main() -> Result<()> {
     // Concat gate and up (matching concat_gate_up)
     let concat_gu = concat_nvfp4(&shared_gate_up_host, &shared_up_host);
 
-    // CPU W4A16 matvec: gate_up
-    let cpu_gate_up = cpu_nvfp4_w4a16_matvec(
-        &ffn_norm,
-        &concat_gu.packed_weight,
-        &concat_gu.weight_scale,
-        concat_gu.out_features,
-        concat_gu.in_features,
-        concat_gu.weight_scale_2,
-    );
+    let compressed_tensors =
+        checkpoint.contains_tensor(&format!("{prefix}.shared_expert.gate_proj.weight_packed"));
+    let cpu_gate_up = if compressed_tensors {
+        cpu_nvfp4_w4a4_matvec(
+            &ffn_norm,
+            &concat_gu.packed_weight,
+            &concat_gu.weight_scale,
+            concat_gu.out_features,
+            concat_gu.in_features,
+            concat_gu.weight_scale_2,
+            shared_gate_up_host.input_scale,
+        )
+    } else {
+        cpu_nvfp4_w4a16_matvec(
+            &ffn_norm,
+            &concat_gu.packed_weight,
+            &concat_gu.weight_scale,
+            concat_gu.out_features,
+            concat_gu.in_features,
+            concat_gu.weight_scale_2,
+        )
+    };
 
     // SiLU * up (silu_mul_halves: output[i] = silu(gate[i]) * up[i+intermediate])
     let intermediate = concat_gu.out_features / 2;
@@ -166,15 +178,26 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    // CPU W4A16 matvec: down
-    let cpu_shared_out = cpu_nvfp4_w4a16_matvec(
-        &cpu_activated,
-        &shared_down_host.packed_weight,
-        &shared_down_host.weight_scale,
-        shared_down_host.out_features,
-        shared_down_host.in_features,
-        shared_down_host.weight_scale_2,
-    );
+    let cpu_shared_out = if compressed_tensors {
+        cpu_nvfp4_w4a4_matvec(
+            &cpu_activated,
+            &shared_down_host.packed_weight,
+            &shared_down_host.weight_scale,
+            shared_down_host.out_features,
+            shared_down_host.in_features,
+            shared_down_host.weight_scale_2,
+            shared_down_host.input_scale,
+        )
+    } else {
+        cpu_nvfp4_w4a16_matvec(
+            &cpu_activated,
+            &shared_down_host.packed_weight,
+            &shared_down_host.weight_scale,
+            shared_down_host.out_features,
+            shared_down_host.in_features,
+            shared_down_host.weight_scale_2,
+        )
+    };
 
     // Apply shared expert gate (sigmoid)
     let cpu_sgate_sig = 1.0 / (1.0 + (-cpu_sgate[0]).exp());
@@ -216,15 +239,26 @@ fn main() -> Result<()> {
 
         let concat_eu = concat_nvfp4(&expert_gate, &expert_up);
 
-        // gate_up W4A16
-        let gate_up_out = cpu_nvfp4_w4a16_matvec(
-            &ffn_norm,
-            &concat_eu.packed_weight,
-            &concat_eu.weight_scale,
-            concat_eu.out_features,
-            concat_eu.in_features,
-            concat_eu.weight_scale_2,
-        );
+        let gate_up_out = if compressed_tensors {
+            cpu_nvfp4_w4a4_matvec(
+                &ffn_norm,
+                &concat_eu.packed_weight,
+                &concat_eu.weight_scale,
+                concat_eu.out_features,
+                concat_eu.in_features,
+                concat_eu.weight_scale_2,
+                expert_gate.input_scale,
+            )
+        } else {
+            cpu_nvfp4_w4a16_matvec(
+                &ffn_norm,
+                &concat_eu.packed_weight,
+                &concat_eu.weight_scale,
+                concat_eu.out_features,
+                concat_eu.in_features,
+                concat_eu.weight_scale_2,
+            )
+        };
 
         // silu * up
         let intermediate = concat_eu.out_features / 2;
@@ -236,15 +270,26 @@ fn main() -> Result<()> {
             })
             .collect();
 
-        // down W4A16
-        let down_out = cpu_nvfp4_w4a16_matvec(
-            &activated,
-            &expert_down.packed_weight,
-            &expert_down.weight_scale,
-            expert_down.out_features,
-            expert_down.in_features,
-            expert_down.weight_scale_2,
-        );
+        let down_out = if compressed_tensors {
+            cpu_nvfp4_w4a4_matvec(
+                &activated,
+                &expert_down.packed_weight,
+                &expert_down.weight_scale,
+                expert_down.out_features,
+                expert_down.in_features,
+                expert_down.weight_scale_2,
+                expert_down.input_scale,
+            )
+        } else {
+            cpu_nvfp4_w4a16_matvec(
+                &activated,
+                &expert_down.packed_weight,
+                &expert_down.weight_scale,
+                expert_down.out_features,
+                expert_down.in_features,
+                expert_down.weight_scale_2,
+            )
+        };
 
         // weighted accumulate
         for i in 0..manifest.hidden {
@@ -275,22 +320,41 @@ fn main() -> Result<()> {
     let expert_down =
         checkpoint.load_nvfp4_linear(&format!("{prefix}.experts.{expert_idx}.down_proj"))?;
     let concat_eu = concat_nvfp4(&expert_gate, &expert_up);
-    let cpu_gate_up_out = cpu_nvfp4_w4a16_matvec(
-        &ffn_norm,
-        &concat_eu.packed_weight,
-        &concat_eu.weight_scale,
-        concat_eu.out_features,
-        concat_eu.in_features,
-        concat_eu.weight_scale_2,
-    );
-    let gpu_gate_up_out = workspace
+    let cpu_gate_up_out = if compressed_tensors {
+        cpu_nvfp4_w4a4_matvec(
+            &ffn_norm,
+            &concat_eu.packed_weight,
+            &concat_eu.weight_scale,
+            concat_eu.out_features,
+            concat_eu.in_features,
+            concat_eu.weight_scale_2,
+            expert_gate.input_scale,
+        )
+    } else {
+        cpu_nvfp4_w4a16_matvec(
+            &ffn_norm,
+            &concat_eu.packed_weight,
+            &concat_eu.weight_scale,
+            concat_eu.out_features,
+            concat_eu.in_features,
+            concat_eu.weight_scale_2,
+        )
+    };
+    let mut gpu_gate_up_out = workspace
         .moe
         .grouped_gate_up
         .as_ref()
         .expect("grouped gate_up")
         .outputs[0]
         .data()
-        .copy_to_host(&stream)?;
+        .copy_to_host(&stream)?
+        .into_vec();
+    if compressed_tensors {
+        let alpha = expert_gate.weight_scale_2 * expert_gate.input_scale;
+        for value in gpu_gate_up_out.iter_mut() {
+            *value *= alpha;
+        }
+    }
     let max_diff_gu = gpu_gate_up_out
         .iter()
         .zip(cpu_gate_up_out.iter())
@@ -528,20 +592,25 @@ fn main() -> Result<()> {
         q_host.out_features,
         q_host.in_features,
         q_host.weight_scale,
+        q_host.channel_weight_scale.as_deref(),
     );
-    let cpu_q_proj_w8a8 = cpu_fp8_matvec(
-        &q_host.weight,
-        &cpu_fp8_activation_dequant(&normed_host, q_host.input_scale),
-        q_host.out_features,
-        q_host.in_features,
-        q_host.weight_scale,
-    );
+    let cpu_q_proj_w8a8 = q_host.input_scale.map(|input_scale| {
+        cpu_fp8_matvec(
+            &q_host.weight,
+            &cpu_fp8_activation_dequant(&normed_host, input_scale),
+            q_host.out_features,
+            q_host.in_features,
+            q_host.weight_scale,
+            q_host.channel_weight_scale.as_deref(),
+        )
+    });
     let cpu_v = cpu_fp8_matvec(
         &v_host.weight,
         &normed_host,
         v_host.out_features,
         v_host.in_features,
         v_host.weight_scale,
+        v_host.channel_weight_scale.as_deref(),
     );
     let (cpu_q_raw, cpu_gate) =
         cpu_split_interleaved_q_gate(&cpu_q_proj, manifest.q_heads, manifest.head_dim);
@@ -569,22 +638,30 @@ fn main() -> Result<()> {
         o_host.out_features,
         o_host.in_features,
         o_host.weight_scale,
+        o_host.channel_weight_scale.as_deref(),
     );
-    let cpu_out_w8a8 = cpu_fp8_matvec(
-        &o_host.weight,
-        &cpu_fp8_activation_dequant(&cpu_gated, o_host.input_scale),
-        o_host.out_features,
-        o_host.in_features,
-        o_host.weight_scale,
-    );
+    let cpu_out_w8a8 = o_host.input_scale.map(|input_scale| {
+        cpu_fp8_matvec(
+            &o_host.weight,
+            &cpu_fp8_activation_dequant(&cpu_gated, input_scale),
+            o_host.out_features,
+            o_host.in_features,
+            o_host.weight_scale,
+            o_host.channel_weight_scale.as_deref(),
+        )
+    });
 
     print_cmp("q_proj", &gpu_q_proj, &cpu_q_proj);
-    print_cmp("q_proj W8A8 vs W8A16", &cpu_q_proj_w8a8, &cpu_q_proj);
+    if let Some(cpu_q_proj_w8a8) = &cpu_q_proj_w8a8 {
+        print_cmp("q_proj W8A8 vs W8A16", cpu_q_proj_w8a8, &cpu_q_proj);
+    }
     print_cmp("q_rope(pos0=q_normed)", &gpu_q_rope, &cpu_q_rope);
     print_cmp("attn(pos0=v repeated)", &gpu_attn, &cpu_attn);
     print_cmp("gated_attn", &gpu_gated, &cpu_gated);
     print_cmp("o_proj output", &gpu_out, &cpu_out);
-    print_cmp("o_proj W8A8 vs W8A16", &cpu_out_w8a8, &cpu_out);
+    if let Some(cpu_out_w8a8) = &cpu_out_w8a8 {
+        print_cmp("o_proj W8A8 vs W8A16", cpu_out_w8a8, &cpu_out);
+    }
 
     Ok(())
 }
@@ -775,6 +852,7 @@ fn cpu_fp8_matvec(
     rows: usize,
     cols: usize,
     weight_scale: f32,
+    channel_weight_scale: Option<&[f32]>,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; rows];
     for row in 0..rows {
@@ -782,7 +860,7 @@ fn cpu_fp8_matvec(
         for col in 0..cols {
             sum += input[col] * format::e4m3_value(weight[row * cols + col]);
         }
-        out[row] = sum * weight_scale;
+        out[row] = sum * channel_weight_scale.map_or(weight_scale, |scales| scales[row]);
     }
     out
 }
@@ -915,6 +993,30 @@ fn cpu_nvfp4_w4a16_matvec(
         output[row] = sum * weight_scale_2;
     }
     output
+}
+
+fn cpu_nvfp4_w4a4_matvec(
+    input: &[f32],
+    packed_weight: &[u8],
+    weight_scale: &[u8],
+    out_features: usize,
+    in_features: usize,
+    weight_scale_2: f32,
+    input_scale: f32,
+) -> Vec<f32> {
+    let scaled = input
+        .iter()
+        .map(|value| value / input_scale)
+        .collect::<Vec<_>>();
+    let quantized = format::quantize_nvfp4_col_major(in_features, 1, &scaled);
+    cpu_nvfp4_w4a16_matvec(
+        &quantized.dequantized_values,
+        packed_weight,
+        weight_scale,
+        out_features,
+        in_features,
+        weight_scale_2 * input_scale,
+    )
 }
 
 fn load_bf16_row(

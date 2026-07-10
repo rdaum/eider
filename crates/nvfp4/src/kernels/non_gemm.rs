@@ -3059,6 +3059,246 @@ pub fn fp8_linear_configured_f32_into_on_stream(
     }
 }
 
+/// Enqueues an f32-input, FP8-weight linear projection with one dequantization
+/// scale per output channel.
+pub fn fp8_linear_channel_scaled_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "channel-scaled FP8 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !(64..=512).contains(&threads)
+        || !threads.is_multiple_of(32)
+    {
+        return Err(Error::Shape {
+            label: "channel-scaled FP8 linear dimensions",
+            expected: "non-zero u32-sized rows and cols; threads a multiple of 32 in 64..=512"
+                .to_string(),
+            actual: format!("rows={rows} cols={cols} threads={threads}"),
+        });
+    }
+    if input.len() != cols
+        || weight.len() != weight_len
+        || channel_weight_scale.len() != rows
+        || output.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "channel-scaled FP8 linear buffers",
+            expected: format!("input={cols} weight={weight_len} scales={rows} output={rows}"),
+            actual: format!(
+                "input={} weight={} scales={} output={}",
+                input.len(),
+                weight.len(),
+                channel_weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_channel_scaled_f32_configured_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_f32_configured_on_stream(
+                input.ptr,
+                weight.ptr,
+                channel_weight_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                threads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues a channel-scaled FP8 projection with dynamic per-token E4M3
+/// activation quantization.
+pub fn fp8_linear_channel_scaled_dynamic_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "dynamic channel-scaled FP8 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != cols
+        || weight.len() != weight_len
+        || channel_weight_scale.len() != rows
+        || output.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "dynamic channel-scaled FP8 linear",
+            expected: format!("input={cols} weight={weight_len} scales={rows} output={rows}"),
+            actual: format!(
+                "rows={rows} cols={cols} input={} weight={} scales={} output={}",
+                input.len(),
+                weight.len(),
+                channel_weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_channel_scaled_dynamic_f32_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_dynamic_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                channel_weight_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues channel-scaled FP8 projection with dynamic per-token E4M3
+/// activation quantization, using persistent storage for the reduced scale.
+pub fn fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    input_scale: &mut DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "precomputed dynamic channel-scaled FP8 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != cols
+        || weight.len() != weight_len
+        || channel_weight_scale.len() != rows
+        || input_scale.len() != 1
+        || output.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "precomputed dynamic channel-scaled FP8 linear",
+            expected: format!(
+                "input={cols} weight={weight_len} scales={rows} input_scale=1 output={rows}"
+            ),
+            actual: format!(
+                "rows={rows} cols={cols} input={} weight={} scales={} input_scale={} output={}",
+                input.len(),
+                weight.len(),
+                channel_weight_scale.len(),
+                input_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_precomputed_dynamic_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                channel_weight_scale.ptr,
+                input_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues channel-scaled FP8 projection after dynamically quantizing the
+/// activation vector once into persistent storage.
+pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    quantized_input: &mut DeviceBuffer<u8>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    input_scale: &mut DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "quantized dynamic channel-scaled FP8 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != cols
+        || quantized_input.len() < cols
+        || weight.len() != weight_len
+        || channel_weight_scale.len() != rows
+        || input_scale.len() != 1
+        || output.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "quantized dynamic channel-scaled FP8 linear",
+            expected: format!(
+                "input={cols} quantized_input>={cols} weight={weight_len} scales={rows} input_scale=1 output={rows}"
+            ),
+            actual: format!(
+                "rows={rows} cols={cols} input={} quantized_input={} weight={} scales={} input_scale={} output={}",
+                input.len(),
+                quantized_input.len(),
+                weight.len(),
+                channel_weight_scale.len(),
+                input_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+                input.ptr,
+                quantized_input.ptr,
+                weight.ptr,
+                channel_weight_scale.ptr,
+                input_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues f32-input, FP8 E4M3-weight linear projection with static FP8
 /// activation quantization using the checkpoint input scale.
 pub fn fp8_linear_w8a8_f32_into_on_stream(
@@ -5404,6 +5644,140 @@ mod tests {
                 &format!("fp8 linear threads={threads}"),
             );
         }
+    }
+
+    #[test]
+    fn fp8_linear_channel_scales_match_cpu_reference() {
+        let rows = 5usize;
+        let cols = 7usize;
+        let input = (0..cols)
+            .map(|idx| ((idx % 5) as f32 - 2.0) * 0.25)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::cuda_e4m3_code(((idx % 13) as f32 - 6.0) * 0.125))
+            .collect::<Vec<_>>();
+        let scales = vec![0.25f32, 0.5, 0.75, 1.0, 1.25];
+        let mut expected = cpu_fp8_linear_f32(&input, &weight, rows, cols, 1.0);
+        for (row, value) in expected.iter_mut().enumerate() {
+            *value *= scales[row];
+        }
+
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let scale_device = DeviceBuffer::from_host(&scales).expect("scale upload");
+        let mut output_device = DeviceBuffer::<f32>::zeroed(rows).expect("output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+        fp8_linear_channel_scaled_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            &scale_device,
+            output_device.output(),
+            rows,
+            cols,
+            128,
+            &stream,
+        )
+        .expect("channel-scaled FP8 linear enqueue");
+
+        let output = output_device
+            .copy_to_host(&stream)
+            .expect("output download");
+        assert_close(&output, &expected, 2.0e-6, "channel-scaled FP8 linear");
+    }
+
+    #[test]
+    fn fp8_linear_dynamic_channel_scales_match_cpu_reference() {
+        let rows = 5usize;
+        let cols = 32usize;
+        let input = (0..cols)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.125)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::cuda_e4m3_code(((idx % 13) as f32 - 6.0) * 0.125))
+            .collect::<Vec<_>>();
+        let scales = vec![0.25f32, 0.5, 0.75, 1.0, 1.25];
+        let input_scale = input.iter().fold(0.0f32, |max, value| max.max(value.abs())) / 448.0;
+        let quantized_input = input
+            .iter()
+            .map(|value| {
+                format::e4m3_value(format::cuda_e4m3_code(*value / input_scale)) * input_scale
+            })
+            .collect::<Vec<_>>();
+        let mut expected = cpu_fp8_linear_f32(&quantized_input, &weight, rows, cols, 1.0);
+        for (row, value) in expected.iter_mut().enumerate() {
+            *value *= scales[row];
+        }
+
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let scale_device = DeviceBuffer::from_host(&scales).expect("scale upload");
+        let mut output_device = DeviceBuffer::<f32>::zeroed(rows).expect("output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+        fp8_linear_channel_scaled_dynamic_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            &scale_device,
+            output_device.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("dynamic channel-scaled FP8 linear enqueue");
+
+        let output = output_device
+            .copy_to_host(&stream)
+            .expect("output download");
+        assert_close(
+            &output,
+            &expected,
+            2.0e-6,
+            "dynamic channel-scaled FP8 linear",
+        );
+
+        let mut input_scale_device = DeviceBuffer::<f32>::zeroed(1).expect("scale alloc");
+        let mut precomputed_output = DeviceBuffer::<f32>::zeroed(rows).expect("output alloc");
+        fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            &scale_device,
+            &mut input_scale_device,
+            precomputed_output.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("precomputed dynamic channel-scaled FP8 linear enqueue");
+        assert_close(
+            &precomputed_output
+                .copy_to_host(&stream)
+                .expect("precomputed output download"),
+            &expected,
+            2.0e-6,
+            "precomputed dynamic channel-scaled FP8 linear",
+        );
+
+        let mut quantized_input = DeviceBuffer::<u8>::zeroed(cols).expect("quantized input alloc");
+        let mut quantized_output = DeviceBuffer::<f32>::zeroed(rows).expect("output alloc");
+        fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+            &input_device,
+            &mut quantized_input,
+            &weight_device,
+            &scale_device,
+            &mut input_scale_device,
+            quantized_output.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("quantized dynamic channel-scaled FP8 linear enqueue");
+        assert_close(
+            &quantized_output
+                .copy_to_host(&stream)
+                .expect("quantized output download"),
+            &expected,
+            2.0e-6,
+            "quantized dynamic channel-scaled FP8 linear",
+        );
     }
 
     #[test]

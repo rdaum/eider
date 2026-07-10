@@ -1,10 +1,14 @@
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
-    ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
+    ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
     CublasLt, CudaEvent, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape, ModelOptCheckpoint,
-    Result, fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
+    Result, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    fp8_linear_channel_scaled_f32_into_on_stream,
+    fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream,
+    fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
 };
 use std::path::PathBuf;
@@ -30,6 +34,8 @@ struct Fp8LinearBench {
     hidden_input_fp8: DeviceBuffer<u8>,
     value_input_fp8: DeviceBuffer<u8>,
     qkv_weight: DeviceBuffer<u8>,
+    qkv_channel_scales: DeviceBuffer<f32>,
+    dynamic_input_scale: DeviceBuffer<f32>,
     z_weight: DeviceBuffer<u8>,
     out_weight: DeviceBuffer<u8>,
     qkv_output: DeviceBuffer<f32>,
@@ -118,6 +124,9 @@ impl BenchContext for Fp8LinearBench {
             hidden_input_fp8: DeviceBuffer::zeroed(HIDDEN).expect("hidden input FP8"),
             value_input_fp8: DeviceBuffer::zeroed(VALUE_DIM).expect("value input FP8"),
             qkv_weight: DeviceBuffer::from_host(&host_fp8(QKV_ROWS * HIDDEN)).expect("qkv"),
+            qkv_channel_scales: DeviceBuffer::from_host(&vec![0.03125; QKV_ROWS])
+                .expect("qkv channel scales"),
+            dynamic_input_scale: DeviceBuffer::zeroed(1).expect("dynamic input scale"),
             z_weight: DeviceBuffer::from_host(&host_fp8(VALUE_DIM * HIDDEN)).expect("z"),
             out_weight: DeviceBuffer::from_host(&host_fp8(HIDDEN * VALUE_DIM)).expect("out"),
             qkv_output: DeviceBuffer::zeroed(QKV_ROWS).expect("qkv out"),
@@ -181,10 +190,22 @@ impl Fp8StreamingBench {
                     ),
                 });
             }
-            if qkv.input_scale.to_bits() != z.input_scale.to_bits() {
+            let qkv_input_scale = qkv.input_scale.ok_or_else(|| nvfp4::Error::Format {
+                label: "Qwen3.6 streaming FP8 benchmark",
+                detail: "qkv projection does not have a static input scale".to_string(),
+            })?;
+            let z_input_scale = z.input_scale.ok_or_else(|| nvfp4::Error::Format {
+                label: "Qwen3.6 streaming FP8 benchmark",
+                detail: "z projection does not have a static input scale".to_string(),
+            })?;
+            let out_input_scale = out.input_scale.ok_or_else(|| nvfp4::Error::Format {
+                label: "Qwen3.6 streaming FP8 benchmark",
+                detail: "output projection does not have a static input scale".to_string(),
+            })?;
+            if qkv_input_scale.to_bits() != z_input_scale.to_bits() {
                 return Err(nvfp4::Error::Format {
                     label: "Qwen3.6 shared QKV/Z input scale",
-                    detail: format!("layer={layer} qkv={} z={}", qkv.input_scale, z.input_scale),
+                    detail: format!("layer={layer} qkv={qkv_input_scale} z={z_input_scale}"),
                 });
             }
             projections.push(StreamingProjection {
@@ -192,11 +213,11 @@ impl Fp8StreamingBench {
                 z_weight: DeviceBuffer::from_host(&z.weight)?,
                 out_weight: DeviceBuffer::from_host(&out.weight)?,
                 qkv_weight_scale: qkv.weight_scale,
-                qkv_input_scale: qkv.input_scale,
+                qkv_input_scale,
                 z_weight_scale: z.weight_scale,
-                z_input_scale: z.input_scale,
+                z_input_scale,
                 out_weight_scale: out.weight_scale,
-                out_input_scale: out.input_scale,
+                out_input_scale,
             });
         }
         if projections.len() != LINEAR_LAYERS {
@@ -363,6 +384,90 @@ fn qkv_w8a8_sample(
             &ctx.stream,
         )
         .expect("qkv w8a8");
+        black_box(ctx.qkv_output.as_const_ptr());
+    })
+}
+
+fn qkv_channel_scaled_sample(
+    ctx: &mut Fp8LinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    run_timed(ctx, chunk_size, |ctx| {
+        fp8_linear_channel_scaled_f32_into_on_stream(
+            &ctx.hidden_input,
+            &ctx.qkv_weight,
+            &ctx.qkv_channel_scales,
+            ctx.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            128,
+            &ctx.stream,
+        )
+        .expect("channel-scaled qkv");
+        black_box(ctx.qkv_output.as_const_ptr());
+    })
+}
+
+fn qkv_channel_scaled_dynamic_sample(
+    ctx: &mut Fp8LinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    run_timed(ctx, chunk_size, |ctx| {
+        fp8_linear_channel_scaled_dynamic_f32_into_on_stream(
+            &ctx.hidden_input,
+            &ctx.qkv_weight,
+            &ctx.qkv_channel_scales,
+            ctx.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            &ctx.stream,
+        )
+        .expect("dynamic channel-scaled qkv");
+        black_box(ctx.qkv_output.as_const_ptr());
+    })
+}
+
+fn qkv_channel_scaled_precomputed_dynamic_sample(
+    ctx: &mut Fp8LinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    run_timed(ctx, chunk_size, |ctx| {
+        fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream(
+            &ctx.hidden_input,
+            &ctx.qkv_weight,
+            &ctx.qkv_channel_scales,
+            &mut ctx.dynamic_input_scale,
+            ctx.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            &ctx.stream,
+        )
+        .expect("precomputed dynamic channel-scaled qkv");
+        black_box(ctx.qkv_output.as_const_ptr());
+    })
+}
+
+fn qkv_channel_scaled_dynamic_quantized_sample(
+    ctx: &mut Fp8LinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    run_timed(ctx, chunk_size, |ctx| {
+        fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+            &ctx.hidden_input,
+            &mut ctx.hidden_input_fp8,
+            &ctx.qkv_weight,
+            &ctx.qkv_channel_scales,
+            &mut ctx.dynamic_input_scale,
+            ctx.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            &ctx.stream,
+        )
+        .expect("quantized dynamic channel-scaled qkv");
         black_box(ctx.qkv_output.as_const_ptr());
     })
 }
@@ -814,7 +919,24 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<Fp8LinearBench>("FP8 linear", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample("qwen36_linear_qkv_8192x2048", qkv_sample);
+            group.bench_sample(
+                "qwen36_linear_qkv_channel_scaled_8192x2048",
+                qkv_channel_scaled_sample,
+            );
+            group.bench_sample(
+                "qwen36_linear_qkv_channel_scaled_dynamic_8192x2048",
+                qkv_channel_scaled_dynamic_sample,
+            );
+            group.bench_sample(
+                "qwen36_linear_qkv_channel_scaled_precomputed_dynamic_8192x2048",
+                qkv_channel_scaled_precomputed_dynamic_sample,
+            );
+            group.bench_sample(
+                "qwen36_linear_qkv_channel_scaled_dynamic_quantized_8192x2048",
+                qkv_channel_scaled_dynamic_quantized_sample,
+            );
             group.bench_sample("qwen36_linear_qkv_w8a8_8192x2048", qkv_w8a8_sample);
             group.bench_sample("qwen36_linear_qkv_cublaslt_8192x2048", qkv_cublaslt_sample);
             group.bench_sample("qwen36_linear_z_4096x2048", z_sample);
@@ -823,6 +945,7 @@ fn main() {
             group.bench_sample("qwen36_linear_out_cublaslt_2048x4096", out_cublaslt_sample);
         });
         runner.group::<Fp8StreamingBench>("FP8 linear streaming", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample(
                 "qwen36_30_layers_scalar_t64",
                 streaming_scalar_sample::<64, 64, 64>,
@@ -886,6 +1009,7 @@ fn main() {
             );
         });
         runner.group::<Fp8FullAttentionStreamingBench>("FP8 full-attention streaming", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample(
                 "qwen36_10_full_attn_q256_kv256_o256",
                 streaming_full_attention_sample::<256, 256, 256>,

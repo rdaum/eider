@@ -59,8 +59,10 @@ pub struct ModelOptFp8Linear {
     pub weight: Vec<u8>,
     /// Tensor-wide ModelOpt weight scale.
     pub weight_scale: f32,
+    /// Optional per-output-channel compressed-tensors weight scales.
+    pub channel_weight_scale: Option<Vec<f32>>,
     /// Static calibrated activation scale.
-    pub input_scale: f32,
+    pub input_scale: Option<f32>,
 }
 
 /// cuBLASLt-ready imported ModelOpt NVFP4 weight plus scalar scale metadata.
@@ -435,7 +437,8 @@ impl ModelOptFp8Linear {
             in_features,
             weight: shard.read_tensor_bytes(&weight_name)?,
             weight_scale: shard.read_scalar_f32(&scale_name)?,
-            input_scale: shard.read_scalar_f32(&input_scale_name)?,
+            channel_weight_scale: None,
+            input_scale: Some(shard.read_scalar_f32(&input_scale_name)?),
         })
     }
 
@@ -542,6 +545,9 @@ impl ModelOptCheckpoint {
 
     /// Imports a ModelOpt NVFP4 linear by tensor prefix.
     pub fn load_nvfp4_linear(&self, prefix: &str) -> Result<ModelOptNvfp4Linear> {
+        if self.contains_tensor(&format!("{prefix}.weight_packed")) {
+            return self.load_compressed_tensors_nvfp4_linear(prefix);
+        }
         let weight_name = format!("{prefix}.weight");
         let scale_name = format!("{prefix}.weight_scale");
         let weight_scale_2_name = format!("{prefix}.weight_scale_2");
@@ -572,24 +578,114 @@ impl ModelOptCheckpoint {
     pub fn load_fp8_linear(&self, prefix: &str) -> Result<ModelOptFp8Linear> {
         let weight_name = format!("{prefix}.weight");
         let scale_name = format!("{prefix}.weight_scale");
-        let input_scale_name = format!("{prefix}.input_scale");
-
         let weight_shard = self.open_shard_for_tensor(&weight_name)?;
         let scale_shard = self.open_shard_for_tensor(&scale_name)?;
-        let input_scale_shard = self.open_shard_for_tensor(&input_scale_name)?;
 
         let weight_info = weight_shard.require_tensor(&weight_name)?;
         let (out_features, in_features) = validate_modelopt_fp8_weight(weight_info)?;
+
+        let input_scale_name = format!("{prefix}.input_scale");
+        let (weight_scale, channel_weight_scale, input_scale) =
+            if self.contains_tensor(&input_scale_name) {
+                let input_scale_shard = self.open_shard_for_tensor(&input_scale_name)?;
+                (
+                    scale_shard.read_scalar_f32(&scale_name)?,
+                    None,
+                    Some(input_scale_shard.read_scalar_f32(&input_scale_name)?),
+                )
+            } else {
+                let scales = scale_shard.read_float_tensor_as_f32(&scale_name)?;
+                if scales.len() != out_features {
+                    return Err(Error::Shape {
+                        label: "compressed-tensors FP8 weight_scale",
+                        expected: format!("{out_features} per-output-channel scales"),
+                        actual: format!("{} values", scales.len()),
+                    });
+                }
+                if scales.iter().any(|scale| !scale.is_finite()) {
+                    return Err(Error::Format {
+                        label: "compressed-tensors FP8 weight_scale",
+                        detail: "all channel scales must be finite".to_string(),
+                    });
+                }
+                (1.0, Some(scales), None)
+            };
 
         Ok(ModelOptFp8Linear {
             prefix: prefix.to_string(),
             out_features,
             in_features,
             weight: weight_shard.read_tensor_bytes(&weight_name)?,
-            weight_scale: scale_shard.read_scalar_f32(&scale_name)?,
-            input_scale: input_scale_shard.read_scalar_f32(&input_scale_name)?,
+            weight_scale,
+            channel_weight_scale,
+            input_scale,
         })
     }
+
+    fn load_compressed_tensors_nvfp4_linear(&self, prefix: &str) -> Result<ModelOptNvfp4Linear> {
+        let weight_name = format!("{prefix}.weight_packed");
+        let scale_name = format!("{prefix}.weight_scale");
+        let weight_global_scale_name = format!("{prefix}.weight_global_scale");
+        let input_global_scale_name = format!("{prefix}.input_global_scale");
+
+        let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+        let scale_shard = self.open_shard_for_tensor(&scale_name)?;
+        let weight_global_scale_shard = self.open_shard_for_tensor(&weight_global_scale_name)?;
+        let input_global_scale_shard = self.open_shard_for_tensor(&input_global_scale_name)?;
+        let weight_info = weight_shard.require_tensor(&weight_name)?;
+        let scale_info = scale_shard.require_tensor(&scale_name)?;
+        let (out_features, in_features) = validate_modelopt_weight(weight_info)?;
+        validate_modelopt_scale(scale_info, out_features, in_features)?;
+
+        let weight_divisor = read_single_f32(
+            &weight_global_scale_shard,
+            &weight_global_scale_name,
+            "compressed-tensors NVFP4 weight_global_scale",
+        )?;
+        let input_divisor = read_single_f32(
+            &input_global_scale_shard,
+            &input_global_scale_name,
+            "compressed-tensors NVFP4 input_global_scale",
+        )?;
+
+        Ok(ModelOptNvfp4Linear {
+            prefix: prefix.to_string(),
+            out_features,
+            in_features,
+            packed_weight: weight_shard.read_tensor_bytes(&weight_name)?,
+            weight_scale: scale_shard.read_tensor_bytes(&scale_name)?,
+            weight_scale_2: reciprocal_scale(
+                weight_divisor,
+                "compressed-tensors NVFP4 weight_global_scale",
+            )?,
+            input_scale: reciprocal_scale(
+                input_divisor,
+                "compressed-tensors NVFP4 input_global_scale",
+            )?,
+        })
+    }
+}
+
+fn read_single_f32(shard: &SafeTensorShard, name: &str, label: &'static str) -> Result<f32> {
+    let values = shard.read_float_tensor_as_f32(name)?;
+    if values.len() != 1 {
+        return Err(Error::Shape {
+            label,
+            expected: "one F32 value".to_string(),
+            actual: format!("{} values", values.len()),
+        });
+    }
+    Ok(values[0])
+}
+
+fn reciprocal_scale(value: f32, label: &'static str) -> Result<f32> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(Error::Format {
+            label,
+            detail: format!("expected positive finite divisor, got {value}"),
+        });
+    }
+    Ok(value.recip())
 }
 
 /// Converts ModelOpt's linear `[out, in / 16]` E4M3 scale matrix into
