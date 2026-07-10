@@ -1,0 +1,18 @@
+[package]
+name = "infer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fast-telemetry.workspace = true
+rand = "0.9"
+serde_json.workspace = true
+nvfp4.workspace = true
+tokenizers = "0.22"
+
+[dev-dependencies]
+micromeasure.workspace = true
+
+[[bench]]
+name = "qwen36_routed_gate_up"
+harness = false

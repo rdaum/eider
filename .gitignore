@@ -1,0 +1,23 @@
+/target/
+
+# Local editor/project state.
+/.idea/
+.vscode/
+*.swp
+*~
+
+# Local planning/provisional notes.
+/SCOPE.md
+/planning/
+
+# Downloaded checkpoints.
+/models/
+
+# Native build byproducts.
+*.o
+*.a
+*.so
+*.dylib
+
+# Local third-party dependency checkouts/builds.
+/.deps/

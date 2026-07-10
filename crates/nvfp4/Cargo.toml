@@ -1,0 +1,62 @@
+[package]
+name = "nvfp4"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+micromeasure.workspace = true
+
+[[bench]]
+name = "fp4_cublaslt"
+harness = false
+
+[[bench]]
+name = "fp4_quantization"
+harness = false
+
+[[bench]]
+name = "sm12x_indexed_gemv"
+harness = false
+
+[[bench]]
+name = "fp8_linear"
+harness = false
+
+[[bench]]
+name = "nvfp4_routed_moe_shape"
+harness = false
+
+[[bench]]
+name = "marlin_routed_gate_up"
+harness = false
+
+[[bench]]
+name = "lm_head_top1"
+harness = false
+
+[[bench]]
+name = "marlin_shared_expert"
+harness = false
+
+[[bench]]
+name = "moe_topk"
+harness = false
+
+[[bench]]
+name = "cuda_graph_launch"
+harness = false
+
+[[bench]]
+name = "gated_delta_net"
+harness = false
+
+[[bin]]
+name = "nvfp4-smoke"
+path = "src/bin/nvfp4-smoke.rs"
+
+[[bin]]
+name = "sm12x-cache-qwen36-gate-up"
+path = "src/bin/sm12x-cache-qwen36-gate-up.rs"

@@ -1,0 +1,616 @@
+//! CUDA runtime helpers and device-buffer ownership.
+
+use crate::error::{Error, Result};
+use crate::ffi;
+use std::ffi::c_void;
+use std::marker::PhantomData;
+use std::mem::size_of;
+use std::ops::Deref;
+use std::ptr::null_mut;
+use std::sync::OnceLock;
+
+/// Host-side view of a device-buffer readback.
+///
+/// This value keeps the source device buffer borrowed for as long as the host
+/// data is live, making readback boundaries visible to Rust's borrow checker.
+#[derive(Debug)]
+pub struct HostRead<'a, T> {
+    values: Vec<T>,
+    _device: PhantomData<&'a DeviceBuffer<T>>,
+}
+
+/// Borrowed device input role.
+pub struct DeviceInput<'a, T> {
+    buffer: &'a DeviceBuffer<T>,
+}
+
+/// Borrowed device output role.
+pub struct DeviceOutput<'a, T> {
+    buffer: &'a mut DeviceBuffer<T>,
+}
+
+/// Borrowed device in-place role.
+pub struct DeviceInOut<'a, T> {
+    buffer: &'a mut DeviceBuffer<T>,
+}
+
+impl<T> HostRead<'_, T> {
+    /// Consumes the readback and returns the owned host vector.
+    pub fn into_vec(self) -> Vec<T> {
+        self.values
+    }
+
+    /// Returns the host-side values as a slice.
+    pub fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+}
+
+impl<T: PartialEq> PartialEq<[T]> for HostRead<'_, T> {
+    fn eq(&self, other: &[T]) -> bool {
+        self.values == other
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq<[T; N]> for HostRead<'_, T> {
+    fn eq(&self, other: &[T; N]) -> bool {
+        self.values == other.as_slice()
+    }
+}
+
+impl<T: PartialEq> PartialEq<Vec<T>> for HostRead<'_, T> {
+    fn eq(&self, other: &Vec<T>) -> bool {
+        &self.values == other
+    }
+}
+
+impl<T: PartialEq> PartialEq for HostRead<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl<T> Deref for HostRead<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<'a, T> IntoIterator for HostRead<'a, T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.into_iter()
+    }
+}
+
+impl<'a, T> DeviceInput<'a, T> {
+    /// Creates an input-role borrow from a device buffer.
+    pub fn new(buffer: &'a DeviceBuffer<T>) -> Self {
+        Self { buffer }
+    }
+
+    /// Returns the number of elements available through this input role.
+    pub fn len(&self) -> usize {
+        self.buffer.len
+    }
+
+    /// Returns true when this input role contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.len == 0
+    }
+
+    /// Returns the raw device pointer as an immutable C pointer.
+    pub fn as_const_ptr(&self) -> *const c_void {
+        self.buffer.ptr.cast()
+    }
+
+    /// Returns the underlying device buffer.
+    pub fn buffer(&self) -> &DeviceBuffer<T> {
+        self.buffer
+    }
+}
+
+impl<T> Copy for DeviceInput<'_, T> {}
+
+impl<T> Clone for DeviceInput<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T> DeviceOutput<'a, T> {
+    /// Creates an output-role borrow from a mutable device buffer.
+    pub fn new(buffer: &'a mut DeviceBuffer<T>) -> Self {
+        Self { buffer }
+    }
+
+    /// Returns the number of elements available through this output role.
+    pub fn len(&self) -> usize {
+        self.buffer.len
+    }
+
+    /// Returns true when this output role contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.len == 0
+    }
+
+    /// Returns the raw device pointer as a mutable C pointer.
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.buffer.ptr.cast()
+    }
+
+    /// Returns the underlying device buffer as an immutable borrow.
+    pub fn buffer(&self) -> &DeviceBuffer<T> {
+        self.buffer
+    }
+
+    /// Returns the underlying device buffer as a mutable borrow.
+    pub fn buffer_mut(&mut self) -> &mut DeviceBuffer<T> {
+        self.buffer
+    }
+}
+
+impl<'a, T> DeviceInOut<'a, T> {
+    /// Creates an in-place-role borrow from a mutable device buffer.
+    pub fn new(buffer: &'a mut DeviceBuffer<T>) -> Self {
+        Self { buffer }
+    }
+
+    /// Returns the number of elements available through this in-place role.
+    pub fn len(&self) -> usize {
+        self.buffer.len
+    }
+
+    /// Returns true when this in-place role contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.len == 0
+    }
+
+    /// Returns the raw device pointer as an immutable C pointer.
+    pub fn as_const_ptr(&self) -> *const c_void {
+        self.buffer.ptr.cast()
+    }
+
+    /// Returns the raw device pointer as a mutable C pointer.
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.buffer.ptr.cast()
+    }
+
+    /// Returns the underlying device buffer as an immutable borrow.
+    pub fn buffer(&self) -> &DeviceBuffer<T> {
+        self.buffer
+    }
+
+    /// Returns the underlying device buffer as a mutable borrow.
+    pub fn buffer_mut(&mut self) -> &mut DeviceBuffer<T> {
+        self.buffer
+    }
+}
+
+pub(crate) fn check_cuda(call: &'static str, status: ffi::cudaError_t) -> Result<()> {
+    if status == ffi::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::Cuda(call, status))
+    }
+}
+
+pub(crate) fn check_cublas(call: &'static str, status: ffi::cublasStatus_t) -> Result<()> {
+    if status == ffi::CUBLAS_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::Cublas(call, status))
+    }
+}
+
+pub(crate) fn max_shared_memory_per_block() -> Result<usize> {
+    static MAX_SHARED_MEMORY_PER_BLOCK: OnceLock<usize> = OnceLock::new();
+    if let Some(bytes) = MAX_SHARED_MEMORY_PER_BLOCK.get() {
+        return Ok(*bytes);
+    }
+
+    let mut device = 0;
+    let mut bytes = 0;
+    unsafe {
+        check_cuda("cudaGetDevice", ffi::cudaGetDevice(&mut device))?;
+        check_cuda(
+            "cudaDeviceGetAttribute(max shared memory per block)",
+            ffi::cudaDeviceGetAttribute(
+                &mut bytes,
+                ffi::CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK,
+                device,
+            ),
+        )?;
+    }
+    if bytes <= 0 {
+        return Err(Error::Format {
+            label: "CUDA shared memory attribute",
+            detail: format!("expected a positive byte count, got {bytes}"),
+        });
+    }
+    let bytes = bytes as usize;
+    let _ = MAX_SHARED_MEMORY_PER_BLOCK.set(bytes);
+    Ok(bytes)
+}
+
+/// Blocks until all previously submitted work on the current CUDA device has
+/// completed.
+///
+/// This is useful for host-wall-clock smoke tests and the current benchmark
+/// harness. CUDA event timing should be used for GPU-side elapsed time.
+pub fn synchronize_device() -> Result<()> {
+    unsafe { check_cuda("cudaDeviceSynchronize", ffi::cudaDeviceSynchronize()) }
+}
+
+/// Non-blocking CUDA stream suitable for graph capture and replay.
+pub struct CudaStream {
+    stream: ffi::cudaStream_t,
+}
+
+impl CudaStream {
+    /// Creates a non-blocking CUDA stream.
+    pub fn new_non_blocking() -> Result<Self> {
+        let mut stream = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaStreamCreateWithFlags",
+                ffi::cudaStreamCreateWithFlags(&mut stream, ffi::CUDA_STREAM_NON_BLOCKING),
+            )?;
+        }
+        Ok(Self { stream })
+    }
+
+    /// Creates a blocking (default-stream-compatible) CUDA stream.
+    pub fn new_blocking() -> Result<Self> {
+        let mut stream = null_mut();
+        unsafe {
+            check_cuda("cudaStreamCreate", ffi::cudaStreamCreate(&mut stream))?;
+        }
+        Ok(Self { stream })
+    }
+
+    /// Blocks until all work submitted to this stream has completed.
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaStreamSynchronize",
+                ffi::cudaStreamSynchronize(self.stream),
+            )
+        }
+    }
+
+    /// Makes this stream wait until `event` has completed.
+    pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaStreamWaitEvent",
+                ffi::cudaStreamWaitEvent(self.stream, event.event, 0),
+            )
+        }
+    }
+
+    /// Begins CUDA graph capture on this stream.
+    pub fn begin_capture(&self) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaStreamBeginCapture",
+                ffi::cudaStreamBeginCapture(self.stream, ffi::CUDA_STREAM_CAPTURE_MODE_RELAXED),
+            )
+        }
+    }
+
+    /// Ends CUDA graph capture on this stream and instantiates an executable
+    /// graph.
+    pub fn end_capture(&self) -> Result<CudaGraphExec> {
+        let mut graph = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaStreamEndCapture",
+                ffi::cudaStreamEndCapture(self.stream, &mut graph),
+            )?;
+        }
+        CudaGraphExec::instantiate(graph)
+    }
+
+    /// Captures CUDA work submitted to this stream and returns an executable
+    /// graph.
+    pub fn capture<F>(&self, f: F) -> Result<CudaGraphExec>
+    where
+        F: FnOnce(&CudaStream) -> Result<()>,
+    {
+        unsafe {
+            check_cuda(
+                "cudaStreamBeginCapture",
+                ffi::cudaStreamBeginCapture(self.stream, ffi::CUDA_STREAM_CAPTURE_MODE_RELAXED),
+            )?;
+        }
+
+        let result = f(self);
+        let mut graph = null_mut();
+        let end_result = unsafe {
+            check_cuda(
+                "cudaStreamEndCapture",
+                ffi::cudaStreamEndCapture(self.stream, &mut graph),
+            )
+        };
+
+        result?;
+        end_result?;
+        CudaGraphExec::instantiate(graph)
+    }
+
+    pub(crate) fn as_raw(&self) -> ffi::cudaStream_t {
+        self.stream
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.stream.is_null() {
+            unsafe {
+                let _ = ffi::cudaStreamDestroy(self.stream);
+            }
+        }
+    }
+}
+
+/// Executable CUDA graph captured from a [`CudaStream`].
+pub struct CudaGraphExec {
+    exec: ffi::cudaGraphExec_t,
+    graph: ffi::cudaGraph_t,
+}
+
+impl CudaGraphExec {
+    fn instantiate(graph: ffi::cudaGraph_t) -> Result<Self> {
+        let mut exec = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaGraphInstantiate",
+                ffi::cudaGraphInstantiate(&mut exec, graph, 0),
+            )?;
+        }
+        Ok(Self { exec, graph })
+    }
+
+    /// Launches this graph on `stream`.
+    pub fn launch(&self, stream: &CudaStream) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaGraphLaunch",
+                ffi::cudaGraphLaunch(self.exec, stream.as_raw()),
+            )
+        }
+    }
+}
+
+impl Drop for CudaGraphExec {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.exec.is_null() {
+                let _ = ffi::cudaGraphExecDestroy(self.exec);
+            }
+            if !self.graph.is_null() {
+                let _ = ffi::cudaGraphDestroy(self.graph);
+            }
+        }
+    }
+}
+
+/// CUDA event used for device-side timing.
+pub struct CudaEvent {
+    event: ffi::cudaEvent_t,
+}
+
+impl CudaEvent {
+    /// Creates a CUDA event with the runtime defaults.
+    pub fn new() -> Result<Self> {
+        let mut event = null_mut();
+        unsafe {
+            check_cuda("cudaEventCreate", ffi::cudaEventCreate(&mut event))?;
+        }
+        Ok(Self { event })
+    }
+
+    /// Records the event on the default stream.
+    pub fn record_default_stream(&self) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaEventRecord",
+                ffi::cudaEventRecord(self.event, null_mut()),
+            )
+        }
+    }
+
+    /// Records the event on `stream`.
+    pub fn record_on_stream(&self, stream: &CudaStream) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaEventRecord",
+                ffi::cudaEventRecord(self.event, stream.as_raw()),
+            )
+        }
+    }
+
+    /// Blocks until this event has completed.
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe {
+            check_cuda(
+                "cudaEventSynchronize",
+                ffi::cudaEventSynchronize(self.event),
+            )
+        }
+    }
+
+    /// Returns elapsed device time from `self` to `end`, in milliseconds.
+    pub fn elapsed_ms_until(&self, end: &Self) -> Result<f32> {
+        let mut ms = 0.0f32;
+        unsafe {
+            check_cuda(
+                "cudaEventElapsedTime",
+                ffi::cudaEventElapsedTime(&mut ms, self.event, end.event),
+            )?;
+        }
+        Ok(ms)
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        if !self.event.is_null() {
+            unsafe {
+                let _ = ffi::cudaEventDestroy(self.event);
+            }
+        }
+    }
+}
+
+/// Owns a typed allocation in CUDA device memory.
+///
+/// The buffer frees its allocation with `cudaFree` on drop. It is intentionally
+/// small: allocation, host-to-device initialization, zero initialization, and
+/// device-to-host copy are enough for the current cuBLASLt experiments.
+pub struct DeviceBuffer<T> {
+    pub(crate) ptr: *mut T,
+    len: usize,
+}
+
+impl<T: Copy> DeviceBuffer<T> {
+    /// Allocates device memory and copies `values` into it.
+    pub fn from_host(values: &[T]) -> Result<Self> {
+        let mut raw = null_mut();
+        let bytes = std::mem::size_of_val(values);
+        unsafe {
+            check_cuda("cudaMalloc", ffi::cudaMalloc(&mut raw, bytes))?;
+            check_cuda(
+                "cudaMemcpy(H2D)",
+                ffi::cudaMemcpy(
+                    raw,
+                    values.as_ptr().cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )?;
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len: values.len(),
+        })
+    }
+
+    /// Allocates `len` elements of device memory and initializes them to zero.
+    pub fn zeroed(len: usize) -> Result<Self> {
+        let zeros = vec![0u8; len * size_of::<T>()];
+        let mut raw = null_mut();
+        unsafe {
+            check_cuda("cudaMalloc", ffi::cudaMalloc(&mut raw, zeros.len()))?;
+            check_cuda(
+                "cudaMemcpy(H2D zero)",
+                ffi::cudaMemcpy(
+                    raw,
+                    zeros.as_ptr().cast(),
+                    zeros.len(),
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )?;
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len,
+        })
+    }
+
+    /// Synchronizes `stream` and copies the complete device allocation back to host memory.
+    pub fn copy_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, T>> {
+        stream.synchronize()?;
+        let mut out = Vec::<T>::with_capacity(self.len);
+        let bytes = self.len * size_of::<T>();
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(D2H)",
+                ffi::cudaMemcpy(
+                    out.as_mut_ptr().cast(),
+                    self.ptr.cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
+                ),
+            )?;
+            out.set_len(self.len);
+        }
+        Ok(HostRead {
+            values: out,
+            _device: PhantomData,
+        })
+    }
+
+    /// Copies host values into this existing device allocation.
+    pub fn copy_from_host(&mut self, values: &[T]) -> Result<()> {
+        if values.len() != self.len {
+            return Err(Error::Shape {
+                label: "device copy from host",
+                expected: format!("{} values", self.len),
+                actual: format!("{} values", values.len()),
+            });
+        }
+        let bytes = std::mem::size_of_val(values);
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(H2D existing)",
+                ffi::cudaMemcpy(
+                    self.ptr.cast(),
+                    values.as_ptr().cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )
+        }
+    }
+
+    /// Returns the number of elements in this device allocation.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when this allocation contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the raw device pointer as an immutable C pointer.
+    pub fn as_const_ptr(&self) -> *const c_void {
+        self.ptr.cast()
+    }
+
+    /// Returns the raw device pointer as a mutable C pointer.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr.cast()
+    }
+
+    /// Borrows this allocation as a kernel input role.
+    pub fn input(&self) -> DeviceInput<'_, T> {
+        DeviceInput::new(self)
+    }
+
+    /// Borrows this allocation as a kernel output role.
+    pub fn output(&mut self) -> DeviceOutput<'_, T> {
+        DeviceOutput::new(self)
+    }
+
+    /// Borrows this allocation as a kernel in-place role.
+    pub fn inout(&mut self) -> DeviceInOut<'_, T> {
+        DeviceInOut::new(self)
+    }
+}
+
+impl<T> Drop for DeviceBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = ffi::cudaFree(self.ptr.cast());
+            }
+        }
+    }
+}
