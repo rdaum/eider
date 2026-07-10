@@ -12,12 +12,11 @@ Spark -- which I've had for months without really taking full
 advantage of -- but without putting a pile of tensor frameworks and
 abstraction between me and the interesting bits.
 
-This machine is materially different from a datacentre GPU: it is an aarch64
-host with 128 GiB of coherent unified memory and shared LPDDR5x bandwidth.
-Those constraints make memory traffic, launch overhead, and the host/device
-boundary important parts of the design. Decode tends to become a bandwidth
-problem before it becomes a compute problem, which is why the project spends so
-much time on representations, small kernels, and measuring the whole path.
+This machine is different from a datacentre GPU despite the marketing:
+it is an aarch64 host with 128 GiB of unified memory and shared LPDDR5
+bandwidth. Those constraints make memory traffic, launch overhead, and
+the host/device boundary important parts of the design. Decode tends
+to become a bandwidth problem before it becomes a compute problem.
 
 Anyways, this is a bit of research project, not a production engine,
 and I'm pretty new to this stuff, so be easy on me if you happen to
