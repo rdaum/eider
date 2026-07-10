@@ -2,16 +2,15 @@
 
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
-    Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuCounterCollector,
-    GroupedGemvPointerTableBuffers, MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
-    Nvfp4TnInputs, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector,
-    Sm12xFp4GemmWeight, add_f32_into_on_stream, append_rows_f32_indexed_into_on_stream,
-    append_rows_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    device_weight_gemv_on_stream, fill_f32_into_on_stream,
-    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
+    MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
+    MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, Result, SafeTensorInfo,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, add_f32_into_on_stream,
+    append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
+    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
@@ -1480,69 +1479,9 @@ struct LazyQwen36Expert {
     down_sm12x: std::cell::RefCell<Option<Sm12xDeviceLinear>>,
 }
 
-enum Qwen36SharedExpert {
-    W4A16 {
-        gate_up: Nvfp4DeviceLinear,
-        down: Nvfp4DeviceLinear,
-    },
-    W4A4 {
-        gate_up: ModelOptCublasLtWeight,
-        down: ModelOptCublasLtWeight,
-    },
-}
-
-struct Qwen36SharedW4a4Workspace {
-    lt: CublasLt,
-    gate_up_input: Nvfp4Matrix,
-    _gate_up_c: F32Matrix,
-    gate_up_plan: Fp4TnMatmulPlan,
-    down_input: Nvfp4Matrix,
-    _down_c: F32Matrix,
-    down_plan: Fp4TnMatmulPlan,
-}
-
-impl Qwen36SharedW4a4Workspace {
-    fn new(
-        shared: &Qwen36SharedExpert,
-        hidden: usize,
-        intermediate: usize,
-    ) -> Result<Option<Self>> {
-        let Qwen36SharedExpert::W4A4 { gate_up, down } = shared else {
-            return Ok(None);
-        };
-        const WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
-
-        let lt = CublasLt::new()?;
-        let gate_up_input = Nvfp4Matrix::zeroed_col_major(hidden, 1)?;
-        let gate_up_c = F32Matrix::zeroed(intermediate * 2, 1)?;
-        let gate_up_plan = Fp4TnMatmulPlan::new_f32_output(
-            &lt,
-            GemmShape::new(intermediate * 2, 1, hidden),
-            Nvfp4TnInputs::new(gate_up.matrix(), &gate_up_input),
-            &gate_up_c,
-            WORKSPACE_LIMIT,
-        )?;
-
-        let down_input = Nvfp4Matrix::zeroed_col_major(intermediate, 1)?;
-        let down_c = F32Matrix::zeroed(hidden, 1)?;
-        let down_plan = Fp4TnMatmulPlan::new_f32_output(
-            &lt,
-            GemmShape::new(hidden, 1, intermediate),
-            Nvfp4TnInputs::new(down.matrix(), &down_input),
-            &down_c,
-            WORKSPACE_LIMIT,
-        )?;
-
-        Ok(Some(Self {
-            lt,
-            gate_up_input,
-            _gate_up_c: gate_up_c,
-            gate_up_plan,
-            down_input,
-            _down_c: down_c,
-            down_plan,
-        }))
-    }
+struct Qwen36SharedExpert {
+    gate_up: Nvfp4DeviceLinear,
+    down: Nvfp4DeviceLinear,
 }
 
 /// A device-resident NVFP4 linear weight for W4A16 execution.
@@ -1583,7 +1522,6 @@ pub struct Qwen36MoeWorkspace {
     pub shared_gate_up_output: DeviceBuffer<f32>,
     pub shared_activated: DeviceBuffer<f32>,
     pub shared_output: DeviceBuffer<f32>,
-    shared_w4a4: Option<Qwen36SharedW4a4Workspace>,
     pub shared_gate_logits: DeviceBuffer<f32>,
     pub shared_gated: DeviceBuffer<f32>,
     pub moe_out: DeviceBuffer<f32>,
@@ -1849,16 +1787,9 @@ impl Qwen36MoeWeights {
                 ),
             });
         }
-        let shared = if compressed_tensors {
-            Qwen36SharedExpert::W4A4 {
-                gate_up: shared_gate_up.as_cublaslt_weight()?,
-                down: shared_down.as_cublaslt_weight()?,
-            }
-        } else {
-            Qwen36SharedExpert::W4A16 {
-                gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
-                down: Nvfp4DeviceLinear::from_host(&shared_down)?,
-            }
+        let shared = Qwen36SharedExpert {
+            gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
+            down: Nvfp4DeviceLinear::from_host(&shared_down)?,
         };
 
         let shared_gate = Bf16Linear::load(
@@ -1909,17 +1840,11 @@ impl Qwen36MoeWeights {
 
     fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36MoeWorkspace> {
         let enable_grouped = true;
-        let mut workspace = Qwen36MoeWorkspace::new_for_paths(
+        Qwen36MoeWorkspace::new_for_paths(
             manifest,
             enable_grouped,
             self.storage_plan.down == Qwen36DownStorage::Sm12x,
-        )?;
-        workspace.shared_w4a4 = Qwen36SharedW4a4Workspace::new(
-            &self.shared,
-            manifest.hidden,
-            self.expert_intermediate,
-        )?;
-        Ok(workspace)
+        )
     }
 
     /// Prepares routing and any activation state required by the selected gate/up path.
@@ -2393,34 +2318,9 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        match &self.shared {
-            Qwen36SharedExpert::W4A16 { gate_up, .. } => {
-                gate_up.run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
-            }
-            Qwen36SharedExpert::W4A4 { gate_up, .. } => {
-                let shared = workspace
-                    .shared_w4a4
-                    .as_mut()
-                    .expect("W4A4 shared expert requires W4A4 workspace");
-                gate_up.quantize_activation_device_col_major_f32_into_on_stream(
-                    ffn_norm.len(),
-                    1,
-                    ffn_norm,
-                    &mut shared.gate_up_input,
-                    stream,
-                )?;
-                shared
-                    .gate_up_plan
-                    .run_with_alpha_beta_f32_inout_buffer_on_stream(
-                        &shared.lt,
-                        Nvfp4TnInputs::new(gate_up.matrix(), &shared.gate_up_input),
-                        workspace.shared_gate_up_output.inout(),
-                        gate_up.matmul_alpha(),
-                        0.0,
-                        stream,
-                    )
-            }
-        }
+        self.shared
+            .gate_up
+            .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
     }
 
     fn run_shared_down(
@@ -2428,36 +2328,11 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        match &self.shared {
-            Qwen36SharedExpert::W4A16 { down, .. } => down.run_f32_into(
-                &workspace.shared_activated,
-                &mut workspace.shared_output,
-                stream,
-            ),
-            Qwen36SharedExpert::W4A4 { down, .. } => {
-                let shared = workspace
-                    .shared_w4a4
-                    .as_mut()
-                    .expect("W4A4 shared expert requires W4A4 workspace");
-                down.quantize_activation_device_col_major_f32_into_on_stream(
-                    workspace.shared_activated.len(),
-                    1,
-                    &workspace.shared_activated,
-                    &mut shared.down_input,
-                    stream,
-                )?;
-                shared
-                    .down_plan
-                    .run_with_alpha_beta_f32_inout_buffer_on_stream(
-                        &shared.lt,
-                        Nvfp4TnInputs::new(down.matrix(), &shared.down_input),
-                        workspace.shared_output.inout(),
-                        down.matmul_alpha(),
-                        0.0,
-                        stream,
-                    )
-            }
-        }
+        self.shared.down.run_f32_into(
+            &workspace.shared_activated,
+            &mut workspace.shared_output,
+            stream,
+        )
     }
 
     /// Runs only shared expert gate/up projection.
@@ -3290,7 +3165,6 @@ impl Qwen36MoeWorkspace {
             shared_gate_up_output: DeviceBuffer::zeroed(gate_up_out_features)?,
             shared_activated: DeviceBuffer::zeroed(expert_intermediate)?,
             shared_output: DeviceBuffer::zeroed(hidden)?,
-            shared_w4a4: None,
             shared_gate_logits: DeviceBuffer::zeroed(1)?,
             shared_gated: DeviceBuffer::zeroed(hidden)?,
             moe_out: DeviceBuffer::zeroed(hidden)?,
