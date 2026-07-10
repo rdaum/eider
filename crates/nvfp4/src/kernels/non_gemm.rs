@@ -3244,9 +3244,38 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
     weight: &DeviceBuffer<u8>,
     channel_weight_scale: &DeviceBuffer<f32>,
     input_scale: &mut DeviceBuffer<f32>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+        input,
+        quantized_input,
+        weight,
+        channel_weight_scale,
+        input_scale,
+        output,
+        rows,
+        cols,
+        256,
+        stream,
+    )
+}
+
+/// Enqueues the dynamically quantized channel-scaled FP8 projection with an
+/// explicit row-reduction block size for shape-specific scheduling.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    quantized_input: &mut DeviceBuffer<u8>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    input_scale: &mut DeviceBuffer<f32>,
     mut output: DeviceOutput<'_, f32>,
     rows: usize,
     cols: usize,
+    threads: usize,
     stream: &CudaStream,
 ) -> Result<()> {
     let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
@@ -3258,6 +3287,8 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
         || cols == 0
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
+        || !(64..=512).contains(&threads)
+        || !threads.is_multiple_of(32)
         || input.len() != cols
         || quantized_input.len() < cols
         || weight.len() != weight_len
@@ -3268,10 +3299,10 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
         return Err(Error::Shape {
             label: "quantized dynamic channel-scaled FP8 linear",
             expected: format!(
-                "input={cols} quantized_input>={cols} weight={weight_len} scales={rows} input_scale=1 output={rows}"
+                "input={cols} quantized_input>={cols} weight={weight_len} scales={rows} input_scale=1 output={rows} threads=64..512/multiple-of-32"
             ),
             actual: format!(
-                "rows={rows} cols={cols} input={} quantized_input={} weight={} scales={} input_scale={} output={}",
+                "rows={rows} cols={cols} input={} quantized_input={} weight={} scales={} input_scale={} output={} threads={threads}",
                 input.len(),
                 quantized_input.len(),
                 weight.len(),
@@ -3283,8 +3314,8 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
     }
     unsafe {
         check_cuda(
-            "infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream",
-            ffi::infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+            "infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream(
                 input.ptr,
                 quantized_input.ptr,
                 weight.ptr,
@@ -3293,6 +3324,7 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
                 output.buffer_mut().ptr,
                 rows as u32,
                 cols as u32,
+                threads as u32,
                 stream.as_raw(),
             ),
         )

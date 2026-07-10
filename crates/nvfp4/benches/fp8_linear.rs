@@ -3,8 +3,10 @@ use micromeasure::{
     ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CublasLt, CudaEvent, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape, ModelOptCheckpoint,
-    Result, argmax_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
+    ModelOptCheckpoint, Result, argmax_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream,
     fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream,
@@ -72,6 +74,47 @@ struct Fp8StreamingBench {
     z_output: DeviceBuffer<f32>,
     out_output: DeviceBuffer<f32>,
     projections: Vec<StreamingProjection>,
+}
+
+struct ChannelProjection {
+    qkv_weight: DeviceBuffer<u8>,
+    qkv_scales: DeviceBuffer<f32>,
+    z_weight: DeviceBuffer<u8>,
+    z_scales: DeviceBuffer<f32>,
+    out_weight: DeviceBuffer<u8>,
+    out_scales: DeviceBuffer<f32>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ChannelCandidate {
+    Simt,
+    TunedSimt,
+    QkvCublasLt,
+    ZCublasLt,
+    OutCublasLt,
+    AllCublasLt,
+}
+
+struct Fp8ChannelStreamingBench {
+    qkv_plan: Fp8TnMatmulPlan,
+    z_plan: Fp8TnMatmulPlan,
+    out_plan: Fp8TnMatmulPlan,
+    lt: CublasLt,
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    hidden_input: DeviceBuffer<f32>,
+    value_input: DeviceBuffer<f32>,
+    hidden_input_fp8: DeviceBuffer<u8>,
+    hidden_input_scale: DeviceBuffer<f32>,
+    value_input_fp8: DeviceBuffer<u8>,
+    value_input_scale: DeviceBuffer<f32>,
+    qkv_output: DeviceBuffer<f32>,
+    z_output: DeviceBuffer<f32>,
+    out_output: DeviceBuffer<f32>,
+    projections: Vec<ChannelProjection>,
+    graphs: Vec<CudaGraphExec>,
+    graph_candidate: Option<ChannelCandidate>,
 }
 
 struct FullAttentionProjection {
@@ -168,6 +211,16 @@ impl BenchContext for Fp8StreamingBench {
     }
 }
 
+impl BenchContext for Fp8ChannelStreamingBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        Self::new().expect("prepare channel-scaled streaming FP8 benchmark")
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
 impl BenchContext for Fp8FullAttentionStreamingBench {
     fn prepare(_num_chunks: usize) -> Self {
         Self::new().expect("prepare full-attention FP8 benchmark")
@@ -190,7 +243,7 @@ impl BenchContext for Fp8LmHeadBench {
 
 impl Fp8LmHeadBench {
     fn new() -> Result<Self> {
-        let checkpoint = ModelOptCheckpoint::open(model_dir())?;
+        let checkpoint = ModelOptCheckpoint::open(channel_model_dir())?;
         let lm_head = checkpoint.load_fp8_linear("lm_head")?;
         if lm_head.in_features != HIDDEN {
             return Err(nvfp4::Error::Shape {
@@ -301,7 +354,7 @@ impl Fp8LmHeadBench {
 impl Fp8StreamingBench {
     fn new() -> Result<Self> {
         let lt = CublasLt::new()?;
-        let checkpoint = ModelOptCheckpoint::open(model_dir())?;
+        let checkpoint = ModelOptCheckpoint::open(static_model_dir())?;
         let mut projections = Vec::with_capacity(LINEAR_LAYERS);
         for layer in (0..40).filter(|layer| layer % 4 != 3) {
             let prefix = format!("model.language_model.layers.{layer}.linear_attn");
@@ -385,9 +438,405 @@ impl Fp8StreamingBench {
     }
 }
 
+impl Fp8ChannelStreamingBench {
+    fn new() -> Result<Self> {
+        let checkpoint = ModelOptCheckpoint::open(channel_model_dir())?;
+        let mut projections = Vec::with_capacity(LINEAR_LAYERS);
+        for layer in (0..40).filter(|layer| layer % 4 != 3) {
+            let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+            let qkv = checkpoint.load_fp8_linear(&format!("{prefix}.in_proj_qkv"))?;
+            let z = checkpoint.load_fp8_linear(&format!("{prefix}.in_proj_z"))?;
+            let out = checkpoint.load_fp8_linear(&format!("{prefix}.out_proj"))?;
+            if (qkv.out_features, qkv.in_features) != (QKV_ROWS, HIDDEN)
+                || (z.out_features, z.in_features) != (VALUE_DIM, HIDDEN)
+                || (out.out_features, out.in_features) != (HIDDEN, VALUE_DIM)
+            {
+                return Err(nvfp4::Error::Shape {
+                    label: "Qwen3.6 channel-scaled streaming FP8 projection",
+                    expected: format!(
+                        "qkv={QKV_ROWS}x{HIDDEN} z={VALUE_DIM}x{HIDDEN} out={HIDDEN}x{VALUE_DIM}"
+                    ),
+                    actual: format!(
+                        "layer={layer} qkv={}x{} z={}x{} out={}x{}",
+                        qkv.out_features,
+                        qkv.in_features,
+                        z.out_features,
+                        z.in_features,
+                        out.out_features,
+                        out.in_features
+                    ),
+                });
+            }
+            let qkv_scales = qkv
+                .channel_weight_scale
+                .ok_or_else(|| missing_channel_scale(layer, "in_proj_qkv", qkv.input_scale))?;
+            let z_scales = z
+                .channel_weight_scale
+                .ok_or_else(|| missing_channel_scale(layer, "in_proj_z", z.input_scale))?;
+            let out_scales = out
+                .channel_weight_scale
+                .ok_or_else(|| missing_channel_scale(layer, "out_proj", out.input_scale))?;
+            projections.push(ChannelProjection {
+                qkv_weight: DeviceBuffer::from_host(&qkv.weight)?,
+                qkv_scales: DeviceBuffer::from_host(&qkv_scales)?,
+                z_weight: DeviceBuffer::from_host(&z.weight)?,
+                z_scales: DeviceBuffer::from_host(&z_scales)?,
+                out_weight: DeviceBuffer::from_host(&out.weight)?,
+                out_scales: DeviceBuffer::from_host(&out_scales)?,
+            });
+        }
+        if projections.len() != LINEAR_LAYERS {
+            return Err(nvfp4::Error::Shape {
+                label: "Qwen3.6 channel-scaled linear-attention layer count",
+                expected: LINEAR_LAYERS.to_string(),
+                actual: projections.len().to_string(),
+            });
+        }
+
+        let lt = CublasLt::new()?;
+        let mut bench = Self {
+            qkv_plan: Fp8TnMatmulPlan::new(&lt, GemmShape::new(QKV_ROWS, 1, HIDDEN), 8 << 20)?,
+            z_plan: Fp8TnMatmulPlan::new(&lt, GemmShape::new(VALUE_DIM, 1, HIDDEN), 8 << 20)?,
+            out_plan: Fp8TnMatmulPlan::new(&lt, GemmShape::new(HIDDEN, 1, VALUE_DIM), 8 << 20)?,
+            lt,
+            stream: CudaStream::new_non_blocking()?,
+            start: CudaEvent::new()?,
+            stop: CudaEvent::new()?,
+            hidden_input: DeviceBuffer::from_host(&host_f32(HIDDEN))?,
+            value_input: DeviceBuffer::from_host(&host_f32(VALUE_DIM))?,
+            hidden_input_fp8: DeviceBuffer::zeroed(HIDDEN)?,
+            hidden_input_scale: DeviceBuffer::zeroed(1)?,
+            value_input_fp8: DeviceBuffer::zeroed(VALUE_DIM)?,
+            value_input_scale: DeviceBuffer::zeroed(1)?,
+            qkv_output: DeviceBuffer::zeroed(QKV_ROWS)?,
+            z_output: DeviceBuffer::zeroed(VALUE_DIM)?,
+            out_output: DeviceBuffer::zeroed(HIDDEN)?,
+            projections,
+            graphs: Vec::with_capacity(LINEAR_LAYERS),
+            graph_candidate: None,
+        };
+        bench.validate()?;
+        Ok(bench)
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        let stream = CudaStream::new_blocking()?;
+        for layer in 0..self.projections.len() {
+            self.enqueue_projection(layer, ChannelCandidate::Simt, &stream)?;
+            let expected_qkv = self.qkv_output.copy_to_host(&stream)?.into_vec();
+            let expected_z = self.z_output.copy_to_host(&stream)?.into_vec();
+            let expected_out = self.out_output.copy_to_host(&stream)?.into_vec();
+
+            self.enqueue_projection(layer, ChannelCandidate::AllCublasLt, &stream)?;
+            let actual_qkv = self.qkv_output.copy_to_host(&stream)?.into_vec();
+            let actual_z = self.z_output.copy_to_host(&stream)?.into_vec();
+            let actual_out = self.out_output.copy_to_host(&stream)?.into_vec();
+            check_channel_close(layer, "qkv", &actual_qkv, &expected_qkv)?;
+            check_channel_close(layer, "z", &actual_z, &expected_z)?;
+            check_channel_close(layer, "out", &actual_out, &expected_out)?;
+
+            for threads in [64, 128, 512] {
+                self.enqueue_configured_projection(layer, threads, threads, threads, &stream)?;
+                let actual_qkv = self.qkv_output.copy_to_host(&stream)?.into_vec();
+                let actual_z = self.z_output.copy_to_host(&stream)?.into_vec();
+                let actual_out = self.out_output.copy_to_host(&stream)?.into_vec();
+                check_channel_close(layer, "configured qkv", &actual_qkv, &expected_qkv)?;
+                check_channel_close(layer, "configured z", &actual_z, &expected_z)?;
+                check_channel_close(layer, "configured out", &actual_out, &expected_out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_candidate(
+        &mut self,
+        candidate: ChannelCandidate,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for layer in 0..self.projections.len() {
+            self.enqueue_projection(layer, candidate, stream)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_graphs(&mut self, candidate: ChannelCandidate) -> Result<()> {
+        if self.graph_candidate == Some(candidate) {
+            return Ok(());
+        }
+        self.graphs.clear();
+        let capture_stream = CudaStream::new_non_blocking()?;
+        for layer in 0..LINEAR_LAYERS {
+            let graph = capture_stream
+                .capture(|stream| self.enqueue_projection(layer, candidate, stream))?;
+            self.graphs.push(graph);
+        }
+        self.graph_candidate = Some(candidate);
+        Ok(())
+    }
+
+    fn enqueue_configured_simt(
+        &mut self,
+        qkv_threads: usize,
+        z_threads: usize,
+        out_threads: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for layer in 0..self.projections.len() {
+            self.enqueue_configured_projection(layer, qkv_threads, z_threads, out_threads, stream)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_configured_projection(
+        &mut self,
+        layer: usize,
+        qkv_threads: usize,
+        z_threads: usize,
+        out_threads: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection = &self.projections[layer];
+        fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+            &self.hidden_input,
+            &mut self.hidden_input_fp8,
+            &projection.qkv_weight,
+            &projection.qkv_scales,
+            &mut self.hidden_input_scale,
+            self.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            qkv_threads,
+            stream,
+        )?;
+        fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+            &self.hidden_input,
+            &mut self.hidden_input_fp8,
+            &projection.z_weight,
+            &projection.z_scales,
+            &mut self.hidden_input_scale,
+            self.z_output.output(),
+            VALUE_DIM,
+            HIDDEN,
+            z_threads,
+            stream,
+        )?;
+        fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+            &self.value_input,
+            &mut self.value_input_fp8,
+            &projection.out_weight,
+            &projection.out_scales,
+            &mut self.value_input_scale,
+            self.out_output.output(),
+            HIDDEN,
+            VALUE_DIM,
+            out_threads,
+            stream,
+        )
+    }
+
+    fn enqueue_projection(
+        &mut self,
+        layer: usize,
+        candidate: ChannelCandidate,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection = &self.projections[layer];
+        let tuned_simt = matches!(candidate, ChannelCandidate::TunedSimt);
+        let qkv_cublaslt = matches!(
+            candidate,
+            ChannelCandidate::QkvCublasLt | ChannelCandidate::AllCublasLt
+        );
+        let z_cublaslt = matches!(
+            candidate,
+            ChannelCandidate::ZCublasLt | ChannelCandidate::AllCublasLt
+        );
+        let out_cublaslt = matches!(
+            candidate,
+            ChannelCandidate::OutCublasLt | ChannelCandidate::AllCublasLt
+        );
+
+        if qkv_cublaslt || z_cublaslt {
+            quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+                &self.hidden_input,
+                &mut self.hidden_input_fp8,
+                &mut self.hidden_input_scale,
+                stream,
+            )?;
+        }
+        if qkv_cublaslt {
+            run_channel_cublaslt(
+                &self.lt,
+                &self.qkv_plan,
+                &projection.qkv_weight,
+                &projection.qkv_scales,
+                &self.hidden_input_fp8,
+                &self.hidden_input_scale,
+                &mut self.qkv_output,
+                stream,
+            )?;
+        } else if tuned_simt {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+                &self.hidden_input,
+                &mut self.hidden_input_fp8,
+                &projection.qkv_weight,
+                &projection.qkv_scales,
+                &mut self.hidden_input_scale,
+                self.qkv_output.output(),
+                QKV_ROWS,
+                HIDDEN,
+                64,
+                stream,
+            )?;
+        } else {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+                &self.hidden_input,
+                &mut self.hidden_input_fp8,
+                &projection.qkv_weight,
+                &projection.qkv_scales,
+                &mut self.hidden_input_scale,
+                self.qkv_output.output(),
+                QKV_ROWS,
+                HIDDEN,
+                stream,
+            )?;
+        }
+        if z_cublaslt {
+            run_channel_cublaslt(
+                &self.lt,
+                &self.z_plan,
+                &projection.z_weight,
+                &projection.z_scales,
+                &self.hidden_input_fp8,
+                &self.hidden_input_scale,
+                &mut self.z_output,
+                stream,
+            )?;
+        } else if tuned_simt {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+                &self.hidden_input,
+                &mut self.hidden_input_fp8,
+                &projection.z_weight,
+                &projection.z_scales,
+                &mut self.hidden_input_scale,
+                self.z_output.output(),
+                VALUE_DIM,
+                HIDDEN,
+                256,
+                stream,
+            )?;
+        } else {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+                &self.hidden_input,
+                &mut self.hidden_input_fp8,
+                &projection.z_weight,
+                &projection.z_scales,
+                &mut self.hidden_input_scale,
+                self.z_output.output(),
+                VALUE_DIM,
+                HIDDEN,
+                stream,
+            )?;
+        }
+
+        if out_cublaslt {
+            quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+                &self.value_input,
+                &mut self.value_input_fp8,
+                &mut self.value_input_scale,
+                stream,
+            )?;
+            run_channel_cublaslt(
+                &self.lt,
+                &self.out_plan,
+                &projection.out_weight,
+                &projection.out_scales,
+                &self.value_input_fp8,
+                &self.value_input_scale,
+                &mut self.out_output,
+                stream,
+            )
+        } else if tuned_simt {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream(
+                &self.value_input,
+                &mut self.value_input_fp8,
+                &projection.out_weight,
+                &projection.out_scales,
+                &mut self.value_input_scale,
+                self.out_output.output(),
+                HIDDEN,
+                VALUE_DIM,
+                64,
+                stream,
+            )
+        } else {
+            fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+                &self.value_input,
+                &mut self.value_input_fp8,
+                &projection.out_weight,
+                &projection.out_scales,
+                &mut self.value_input_scale,
+                self.out_output.output(),
+                HIDDEN,
+                VALUE_DIM,
+                stream,
+            )
+        }
+    }
+}
+
+fn missing_channel_scale(layer: usize, projection: &str, input_scale: Option<f32>) -> nvfp4::Error {
+    nvfp4::Error::Format {
+        label: "Qwen3.6 channel-scaled streaming FP8 benchmark",
+        detail: format!(
+            "layer={layer} projection={projection} has no channel scales; input_scale={input_scale:?}"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_channel_cublaslt(
+    lt: &CublasLt,
+    plan: &Fp8TnMatmulPlan,
+    weight: &DeviceBuffer<u8>,
+    channel_scales: &DeviceBuffer<f32>,
+    input_fp8: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    plan.run_with_alpha_on_stream(lt, weight, input_fp8, output.output(), 1.0, stream)?;
+    scale_channel_f32_device_scalar_in_place_on_stream(
+        output.inout(),
+        channel_scales,
+        input_scale,
+        stream,
+    )
+}
+
+fn check_channel_close(
+    layer: usize,
+    projection: &'static str,
+    actual: &[f32],
+    expected: &[f32],
+) -> Result<()> {
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let error = (actual - expected).abs();
+        let allowed = 0.02 + expected.abs() * 0.02;
+        if error > allowed {
+            return Err(nvfp4::Error::Format {
+                label: "Qwen3.6 channel-scaled FP8 cuBLASLt validation",
+                detail: format!(
+                    "layer={layer} projection={projection} index={index} actual={actual} expected={expected} error={error} allowed={allowed}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl Fp8FullAttentionStreamingBench {
     fn new() -> Result<Self> {
-        let checkpoint = ModelOptCheckpoint::open(model_dir())?;
+        let checkpoint = ModelOptCheckpoint::open(static_model_dir())?;
         let mut projections = Vec::with_capacity(FULL_ATTENTION_LAYERS);
         for layer in (0..40).filter(|layer| layer % 4 == 3) {
             let prefix = format!("model.language_model.layers.{layer}.self_attn");
@@ -451,11 +900,20 @@ impl Fp8FullAttentionStreamingBench {
     }
 }
 
-fn model_dir() -> PathBuf {
-    std::env::var_os("QWEN36_MODEL")
+fn static_model_dir() -> PathBuf {
+    std::env::var_os("QWEN36_STATIC_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen3.6-35b-a3-nvfp4")
+        })
+}
+
+fn channel_model_dir() -> PathBuf {
+    std::env::var_os("QWEN36_CHANNEL_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../models/qwen3.6-35b-a3b-nvfp4-unsloth-fast")
         })
 }
 
@@ -1008,6 +1466,147 @@ fn streaming_cublaslt_z_only_sample(
     )
 }
 
+fn channel_streaming_sample(
+    ctx: &mut Fp8ChannelStreamingBench,
+    chunk_size: usize,
+    candidate: ChannelCandidate,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        let stream = &ctx.stream as *const CudaStream;
+        // The stream allocation is stable and enqueue_candidate only mutates device buffers.
+        let stream = unsafe { &*stream };
+        ctx.enqueue_candidate(candidate, stream)
+            .expect("channel-scaled streaming candidate");
+    }
+    finish_channel_sample(ctx, chunk_size)
+}
+
+fn channel_graph_sample(
+    ctx: &mut Fp8ChannelStreamingBench,
+    chunk_size: usize,
+    candidate: ChannelCandidate,
+) -> BenchSampleResult {
+    ctx.ensure_graphs(candidate)
+        .expect("capture channel-scaled streaming graphs");
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        for graph in &ctx.graphs {
+            graph
+                .launch(&ctx.stream)
+                .expect("channel-scaled streaming graph");
+        }
+    }
+    finish_channel_sample(ctx, chunk_size)
+}
+
+fn finish_channel_sample(
+    ctx: &mut Fp8ChannelStreamingBench,
+    chunk_size: usize,
+) -> BenchSampleResult {
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.qkv_output.as_const_ptr());
+    black_box(ctx.z_output.as_const_ptr());
+    black_box(ctx.out_output.as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
+fn channel_configured_sample(
+    ctx: &mut Fp8ChannelStreamingBench,
+    chunk_size: usize,
+    qkv_threads: usize,
+    z_threads: usize,
+    out_threads: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        let stream = &ctx.stream as *const CudaStream;
+        // The stream allocation is stable and enqueue_configured_simt only mutates device buffers.
+        let stream = unsafe { &*stream };
+        ctx.enqueue_configured_simt(qkv_threads, z_threads, out_threads, stream)
+            .expect("configured channel-scaled streaming candidate");
+    }
+    finish_channel_sample(ctx, chunk_size)
+}
+
+macro_rules! channel_samples {
+    ($direct:ident, $graph:ident, $candidate:expr) => {
+        fn $direct(
+            ctx: &mut Fp8ChannelStreamingBench,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) -> BenchSampleResult {
+            channel_streaming_sample(ctx, chunk_size, $candidate)
+        }
+
+        fn $graph(
+            ctx: &mut Fp8ChannelStreamingBench,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) -> BenchSampleResult {
+            channel_graph_sample(ctx, chunk_size, $candidate)
+        }
+    };
+}
+
+channel_samples!(
+    channel_simt_sample,
+    channel_simt_graph_sample,
+    ChannelCandidate::Simt
+);
+channel_samples!(
+    channel_tuned_simt_sample,
+    channel_tuned_simt_graph_sample,
+    ChannelCandidate::TunedSimt
+);
+channel_samples!(
+    channel_qkv_cublaslt_sample,
+    channel_qkv_cublaslt_graph_sample,
+    ChannelCandidate::QkvCublasLt
+);
+channel_samples!(
+    channel_z_cublaslt_sample,
+    channel_z_cublaslt_graph_sample,
+    ChannelCandidate::ZCublasLt
+);
+channel_samples!(
+    channel_out_cublaslt_sample,
+    channel_out_cublaslt_graph_sample,
+    ChannelCandidate::OutCublasLt
+);
+channel_samples!(
+    channel_all_cublaslt_sample,
+    channel_all_cublaslt_graph_sample,
+    ChannelCandidate::AllCublasLt
+);
+
+macro_rules! configured_channel_sample {
+    ($name:ident, $qkv_threads:expr, $z_threads:expr, $out_threads:expr) => {
+        fn $name(
+            ctx: &mut Fp8ChannelStreamingBench,
+            chunk_size: usize,
+            _chunk_num: usize,
+        ) -> BenchSampleResult {
+            channel_configured_sample(ctx, chunk_size, $qkv_threads, $z_threads, $out_threads)
+        }
+    };
+}
+
+configured_channel_sample!(channel_simt_q64, 64, 256, 256);
+configured_channel_sample!(channel_simt_q128, 128, 256, 256);
+configured_channel_sample!(channel_simt_q512, 512, 256, 256);
+configured_channel_sample!(channel_simt_z64, 256, 64, 256);
+configured_channel_sample!(channel_simt_z128, 256, 128, 256);
+configured_channel_sample!(channel_simt_z512, 256, 512, 256);
+configured_channel_sample!(channel_simt_out64, 256, 256, 64);
+configured_channel_sample!(channel_simt_out128, 256, 256, 128);
+configured_channel_sample!(channel_simt_out512, 256, 256, 512);
+
 fn streaming_full_attention_sample<
     const Q_THREADS: usize,
     const KV_THREADS: usize,
@@ -1220,6 +1819,45 @@ fn main() {
             group.bench_sample(
                 "qwen36_30_layers_cublaslt_z_only",
                 streaming_cublaslt_z_only_sample,
+            );
+        });
+        runner.group::<Fp8ChannelStreamingBench>("FP8 channel-scaled linear streaming", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample("qwen36_30_layers_simt", channel_simt_sample);
+            group.bench_sample("qwen36_30_layers_tuned_simt", channel_tuned_simt_sample);
+            group.bench_sample("qwen36_30_layers_simt_q64", channel_simt_q64);
+            group.bench_sample("qwen36_30_layers_simt_q128", channel_simt_q128);
+            group.bench_sample("qwen36_30_layers_simt_q512", channel_simt_q512);
+            group.bench_sample("qwen36_30_layers_simt_z64", channel_simt_z64);
+            group.bench_sample("qwen36_30_layers_simt_z128", channel_simt_z128);
+            group.bench_sample("qwen36_30_layers_simt_z512", channel_simt_z512);
+            group.bench_sample("qwen36_30_layers_simt_out64", channel_simt_out64);
+            group.bench_sample("qwen36_30_layers_simt_out128", channel_simt_out128);
+            group.bench_sample("qwen36_30_layers_simt_out512", channel_simt_out512);
+            group.bench_sample("qwen36_30_layers_qkv_cublaslt", channel_qkv_cublaslt_sample);
+            group.bench_sample("qwen36_30_layers_z_cublaslt", channel_z_cublaslt_sample);
+            group.bench_sample("qwen36_30_layers_out_cublaslt", channel_out_cublaslt_sample);
+            group.bench_sample("qwen36_30_layers_all_cublaslt", channel_all_cublaslt_sample);
+            group.bench_sample("qwen36_30_layers_simt_graph", channel_simt_graph_sample);
+            group.bench_sample(
+                "qwen36_30_layers_tuned_simt_graph",
+                channel_tuned_simt_graph_sample,
+            );
+            group.bench_sample(
+                "qwen36_30_layers_qkv_cublaslt_graph",
+                channel_qkv_cublaslt_graph_sample,
+            );
+            group.bench_sample(
+                "qwen36_30_layers_z_cublaslt_graph",
+                channel_z_cublaslt_graph_sample,
+            );
+            group.bench_sample(
+                "qwen36_30_layers_out_cublaslt_graph",
+                channel_out_cublaslt_graph_sample,
+            );
+            group.bench_sample(
+                "qwen36_30_layers_all_cublaslt_graph",
+                channel_all_cublaslt_graph_sample,
             );
         });
         runner.group::<Fp8FullAttentionStreamingBench>("FP8 full-attention streaming", |group| {

@@ -45,6 +45,7 @@ pub use kernels::non_gemm::{
     cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream,
     fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream,

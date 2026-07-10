@@ -35,6 +35,7 @@ use super::infer::{
 };
 use super::qwen36_cache::{ensure_layer_cache, ensure_model_cache, prepared_layer_dir};
 
+use std::rc::Rc;
 use std::time::Instant;
 
 /// Loader scaffold for the Qwen3.6/Qwen3.5-MoE hybrid text stack.
@@ -97,6 +98,7 @@ pub struct Qwen36FullAttentionStep<'a> {
 
 /// Device-ready Qwen3.6 Gated Delta Net layer weights.
 pub struct Qwen36LinearAttentionWeights {
+    fp8: Rc<Qwen36LinearFp8Execution>,
     qkv: Fp8Linear,
     z: Fp8Linear,
     alpha: Bf16Linear,
@@ -113,6 +115,8 @@ pub struct Qwen36LinearAttentionWorkspace {
     linear: QwenLinearAttentionConfig,
     fp8_dynamic_input: DeviceBuffer<u8>,
     fp8_dynamic_input_scale: DeviceBuffer<f32>,
+    fp8_value_input: DeviceBuffer<u8>,
+    fp8_value_input_scale: DeviceBuffer<f32>,
     pub qkv_output: DeviceBuffer<f32>,
     pub z_output: DeviceBuffer<f32>,
     pub alpha: DeviceBuffer<f32>,
@@ -150,6 +154,65 @@ struct Fp8Linear {
     weight_scale: f32,
     channel_weight_scale: Option<DeviceBuffer<f32>>,
     input_scale: Option<f32>,
+}
+
+struct Qwen36LinearFp8Plans {
+    qkv: Fp8TnMatmulPlan,
+    z: Fp8TnMatmulPlan,
+    out: Fp8TnMatmulPlan,
+}
+
+struct Qwen36LinearFp8Execution {
+    lt: CublasLt,
+    plans: Option<Qwen36LinearFp8Plans>,
+}
+
+impl Qwen36LinearFp8Execution {
+    fn new(checkpoint: &ModelOptCheckpoint, manifest: &QwenModelManifest) -> Result<Self> {
+        let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
+            label: "Qwen3.6 linear FP8 execution",
+            detail: "manifest has no linear-attention config".to_string(),
+        })?;
+        let first_linear_layer = manifest
+            .layer_kinds
+            .iter()
+            .position(|kind| *kind == QwenLayerKind::LinearAttention)
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.6 linear FP8 execution",
+                detail: "model has no linear-attention layer".to_string(),
+            })?;
+        let prefix = format!(
+            "{}.layers.{first_linear_layer}.linear_attn.in_proj_qkv",
+            manifest.tensor_prefix
+        );
+        let lt = CublasLt::new()?;
+        let plans = if checkpoint.contains_tensor(&format!("{prefix}.input_scale")) {
+            None
+        } else {
+            let key_dim = linear.key_heads * linear.key_head_dim;
+            let value_dim = linear.value_heads * linear.value_head_dim;
+            let qkv_dim = key_dim * 2 + value_dim;
+            const WORKSPACE_LIMIT: u64 = 8 << 20;
+            Some(Qwen36LinearFp8Plans {
+                qkv: Fp8TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(qkv_dim, 1, manifest.hidden),
+                    WORKSPACE_LIMIT,
+                )?,
+                z: Fp8TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(value_dim, 1, manifest.hidden),
+                    WORKSPACE_LIMIT,
+                )?,
+                out: Fp8TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(manifest.hidden, 1, value_dim),
+                    WORKSPACE_LIMIT,
+                )?,
+            })
+        };
+        Ok(Self { lt, plans })
+    }
 }
 
 struct Bf16Linear {
@@ -646,6 +709,16 @@ impl Qwen36LinearAttentionWeights {
         manifest: &QwenModelManifest,
         layer: usize,
     ) -> Result<Self> {
+        let fp8 = Rc::new(Qwen36LinearFp8Execution::new(checkpoint, manifest)?);
+        Self::load_with_fp8(checkpoint, manifest, layer, fp8)
+    }
+
+    fn load_with_fp8(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        layer: usize,
+        fp8: Rc<Qwen36LinearFp8Execution>,
+    ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear attention",
             detail: "manifest has no linear-attention config".to_string(),
@@ -700,6 +773,7 @@ impl Qwen36LinearAttentionWeights {
         let dt_bias_host = reorder_v_heads_1d(dt_bias_host, key_heads, value_heads);
 
         Ok(Self {
+            fp8,
             qkv: Fp8Linear::from_host(&qkv_host)?,
             z: Fp8Linear::from_host(&z_host)?,
             alpha: Bf16Linear::from_host(&alpha_host, value_heads, manifest.hidden)?,
@@ -716,26 +790,100 @@ impl Qwen36LinearAttentionWeights {
         })
     }
 
+    fn run_qkv(
+        &self,
+        workspace: &mut Qwen36LinearAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return self.qkv.run_into(
+                hidden,
+                &mut workspace.qkv_output,
+                &mut workspace.fp8_dynamic_input,
+                &mut workspace.fp8_dynamic_input_scale,
+                stream,
+            );
+        };
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            hidden,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        self.qkv.run_prequantized_channel_scaled_with_plan_into(
+            &self.fp8,
+            &plans.qkv,
+            &workspace.fp8_dynamic_input,
+            &workspace.fp8_dynamic_input_scale,
+            &mut workspace.qkv_output,
+            stream,
+        )
+    }
+
+    fn run_z(
+        &self,
+        workspace: &mut Qwen36LinearAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return self.z.run_into(
+                hidden,
+                &mut workspace.z_output,
+                &mut workspace.fp8_dynamic_input,
+                &mut workspace.fp8_dynamic_input_scale,
+                stream,
+            );
+        };
+        self.z.run_prequantized_channel_scaled_with_plan_into(
+            &self.fp8,
+            &plans.z,
+            &workspace.fp8_dynamic_input,
+            &workspace.fp8_dynamic_input_scale,
+            &mut workspace.z_output,
+            stream,
+        )
+    }
+
+    fn run_output_projection(
+        &self,
+        workspace: &mut Qwen36LinearAttentionWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return self.out.run_into(
+                &workspace.normed,
+                &mut workspace.output,
+                &mut workspace.fp8_dynamic_input,
+                &mut workspace.fp8_dynamic_input_scale,
+                stream,
+            );
+        };
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            &workspace.normed,
+            &mut workspace.fp8_value_input,
+            &mut workspace.fp8_value_input_scale,
+            stream,
+        )?;
+        self.out.run_prequantized_channel_scaled_with_plan_into(
+            &self.fp8,
+            &plans.out,
+            &workspace.fp8_value_input,
+            &workspace.fp8_value_input_scale,
+            &mut workspace.output,
+            stream,
+        )
+    }
+
     fn enqueue_pre_gdn(
         &self,
         workspace: &mut Qwen36LinearAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.qkv.run_into(
-            hidden,
-            &mut workspace.qkv_output,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )?;
-        self.z.run_into(
-            hidden,
-            &mut workspace.z_output,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )?;
+        self.run_qkv(workspace, hidden, stream)?;
+        self.run_z(workspace, hidden, stream)?;
         self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
         self.beta
             .run_into(hidden, &mut workspace.beta_input, stream)?;
@@ -797,13 +945,7 @@ impl Qwen36LinearAttentionWeights {
             rms_eps,
             stream,
         )?;
-        self.out.run_into(
-            &workspace.normed,
-            &mut workspace.output,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )
+        self.run_output_projection(workspace, stream)
     }
 
     /// Runs one token through this linear-attention layer.
@@ -817,25 +959,9 @@ impl Qwen36LinearAttentionWeights {
         mut profile: Option<&mut QwenDecodeProfile>,
     ) -> Result<Qwen36LinearAttentionStep<'a>> {
         if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || {
-                self.qkv.run_into(
-                    hidden,
-                    &mut workspace.qkv_output,
-                    &mut workspace.fp8_dynamic_input,
-                    &mut workspace.fp8_dynamic_input_scale,
-                    stream,
-                )
-            })?;
+            let (_, ms) = timed_cuda(stream, || self.run_qkv(workspace, hidden, stream))?;
             profile.qwen36_linear_qkv_ms += ms;
-            let (_, ms) = timed_cuda(stream, || {
-                self.z.run_into(
-                    hidden,
-                    &mut workspace.z_output,
-                    &mut workspace.fp8_dynamic_input,
-                    &mut workspace.fp8_dynamic_input_scale,
-                    stream,
-                )
-            })?;
+            let (_, ms) = timed_cuda(stream, || self.run_z(workspace, hidden, stream))?;
             profile.qwen36_linear_z_ms += ms;
             let (_, ms) = timed_cuda(stream, || {
                 self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
@@ -898,15 +1024,7 @@ impl Qwen36LinearAttentionWeights {
                 )
             })?;
             profile.qwen36_linear_norm_ms += ms;
-            let (_, ms) = timed_cuda(stream, || {
-                self.out.run_into(
-                    &workspace.normed,
-                    &mut workspace.output,
-                    &mut workspace.fp8_dynamic_input,
-                    &mut workspace.fp8_dynamic_input_scale,
-                    stream,
-                )
-            })?;
+            let (_, ms) = timed_cuda(stream, || self.run_output_projection(workspace, stream))?;
             profile.qwen36_linear_out_ms += ms;
         } else {
             self.enqueue_pre_gdn(workspace, hidden, stream)?;
@@ -937,8 +1055,10 @@ impl Qwen36LinearAttentionWorkspace {
         let value_dim = linear.value_heads * linear.value_head_dim;
         Ok(Self {
             linear,
-            fp8_dynamic_input: DeviceBuffer::zeroed(manifest.hidden.max(value_dim))?,
+            fp8_dynamic_input: DeviceBuffer::zeroed(manifest.hidden)?,
             fp8_dynamic_input_scale: DeviceBuffer::zeroed(1)?,
+            fp8_value_input: DeviceBuffer::zeroed(value_dim)?,
+            fp8_value_input_scale: DeviceBuffer::zeroed(1)?,
             qkv_output: DeviceBuffer::zeroed(weights.qkv.rows)?,
             z_output: DeviceBuffer::zeroed(weights.z.rows)?,
             alpha: DeviceBuffer::zeroed(linear.value_heads)?,
@@ -1090,6 +1210,39 @@ impl Fp8Linear {
             }
         };
         result?;
+        maybe_round_device_f32_to_bf16(output, stream)
+    }
+
+    fn run_prequantized_channel_scaled_with_plan_into(
+        &self,
+        execution: &Qwen36LinearFp8Execution,
+        plan: &Fp8TnMatmulPlan,
+        input: &DeviceBuffer<u8>,
+        input_scale: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let channel_scale = self
+            .channel_weight_scale
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.6 channel-scaled FP8 plan",
+                detail: "linear does not have per-output-channel scales".to_string(),
+            })?;
+        plan.run_with_alpha_on_stream(
+            &execution.lt,
+            &self.weight,
+            input,
+            output.output(),
+            1.0,
+            stream,
+        )?;
+        scale_channel_f32_device_scalar_in_place_on_stream(
+            output.inout(),
+            channel_scale,
+            input_scale,
+            stream,
+        )?;
         maybe_round_device_f32_to_bf16(output, stream)
     }
 
@@ -3240,21 +3393,39 @@ pub struct Qwen36LayerBlockStep<'a> {
 impl Qwen36LayerBlock {
     /// Loads the full layer block (norms + attention + MoE) for `layer`.
     pub fn load(model: &Qwen36Model, layer: usize) -> Result<Self> {
-        Self::load_inner(model, layer, false)
+        let fp8 = Rc::new(Qwen36LinearFp8Execution::new(
+            model.checkpoint(),
+            model.manifest(),
+        )?);
+        Self::load_inner(model, layer, false, fp8)
     }
 
-    fn load_from_prepared_cache(model: &Qwen36Model, layer: usize) -> Result<Self> {
-        Self::load_inner(model, layer, true)
+    fn load_from_prepared_cache(
+        model: &Qwen36Model,
+        layer: usize,
+        fp8: Rc<Qwen36LinearFp8Execution>,
+    ) -> Result<Self> {
+        Self::load_inner(model, layer, true, fp8)
     }
 
-    fn load_inner(model: &Qwen36Model, layer: usize, cache_prepared: bool) -> Result<Self> {
+    fn load_inner(
+        model: &Qwen36Model,
+        layer: usize,
+        cache_prepared: bool,
+        fp8: Rc<Qwen36LinearFp8Execution>,
+    ) -> Result<Self> {
         let kind = model.layer_kind(layer)?;
         let input_norm = model.load_input_norm(layer)?;
         let post_attn_norm = model.load_post_attn_norm(layer)?;
         let attention = match kind {
-            QwenLayerKind::LinearAttention => Qwen36Attention::LinearAttention(
-                Qwen36LinearAttentionWeights::load(&model.checkpoint, &model.manifest, layer)?,
-            ),
+            QwenLayerKind::LinearAttention => {
+                Qwen36Attention::LinearAttention(Qwen36LinearAttentionWeights::load_with_fp8(
+                    &model.checkpoint,
+                    &model.manifest,
+                    layer,
+                    fp8,
+                )?)
+            }
             QwenLayerKind::FullAttention => Qwen36Attention::FullAttention(
                 Qwen36FullAttentionWeights::load(&model.checkpoint, &model.manifest, layer)?,
             ),
@@ -3904,9 +4075,14 @@ impl Qwen36TextModel {
         let checkpoint = model.checkpoint().clone();
         ensure_model_cache(&checkpoint, &manifest)?;
         let lt = CublasLt::new()?;
+        let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(&checkpoint, &manifest)?);
         let mut layers = Vec::with_capacity(manifest.layers);
         for layer in 0..manifest.layers {
-            layers.push(Qwen36LayerBlock::load_from_prepared_cache(&model, layer)?);
+            layers.push(Qwen36LayerBlock::load_from_prepared_cache(
+                &model,
+                layer,
+                Rc::clone(&linear_fp8),
+            )?);
         }
         let embedding = read_bf16_matrix_device(
             &checkpoint,

@@ -777,7 +777,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+    pub(crate) fn infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream(
         input: *const f32,
         quantized_input: *mut u8,
         weight: *const u8,
@@ -786,6 +786,7 @@ unsafe extern "C" {
         output: *mut f32,
         rows: u32,
         cols: u32,
+        threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_quantize_fp8_e4m3_dynamic_f32_on_stream(

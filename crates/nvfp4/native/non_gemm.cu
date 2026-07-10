@@ -3470,7 +3470,7 @@ extern "C" cudaError_t infer_scale_channel_f32_device_scalar_on_stream(
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
+extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream(
     const float* input,
     std::uint8_t* quantized_input,
     const std::uint8_t* weight,
@@ -3479,20 +3479,21 @@ extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_
     float* output,
     std::uint32_t rows,
     std::uint32_t cols,
+    std::uint32_t threads,
     cudaStream_t stream) {
     if (input == nullptr || quantized_input == nullptr || weight == nullptr ||
         channel_weight_scale == nullptr || input_scale == nullptr || output == nullptr ||
-        rows == 0 || cols == 0) {
+        rows == 0 || cols == 0 || threads < 64 || threads > 512 || (threads % 32) != 0) {
         return cudaErrorInvalidValue;
     }
-    constexpr int kThreads = 256;
-    infer_dynamic_quantize_fp8_e4m3_f32_kernel<<<1, kThreads, 0, stream>>>(
+    constexpr int kQuantizeThreads = 256;
+    infer_dynamic_quantize_fp8_e4m3_f32_kernel<<<1, kQuantizeThreads, 0, stream>>>(
         input, quantized_input, input_scale, cols);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
         return status;
     }
-    infer_fp8_linear_quantized_channel_scaled_f32_kernel<<<rows, kThreads, 0, stream>>>(
+    infer_fp8_linear_quantized_channel_scaled_f32_kernel<<<rows, threads, 0, stream>>>(
         quantized_input, weight, channel_weight_scale, input_scale, output, rows, cols);
     return cudaGetLastError();
 }
