@@ -4,12 +4,13 @@ use micromeasure::{
 };
 use nvfp4::{
     CublasLt, CudaEvent, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape, ModelOptCheckpoint,
-    Result, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    Result, argmax_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream,
     fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
-    fp8_linear_w8a8_f32_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
+    fp8_linear_w8a8_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
+    quantize_fp8_e4m3_f32_into_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -97,6 +98,23 @@ struct Fp8FullAttentionStreamingBench {
     projections: Vec<FullAttentionProjection>,
 }
 
+struct Fp8LmHeadBench {
+    lt: CublasLt,
+    plan: Fp8TnMatmulPlan,
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    input: DeviceBuffer<f32>,
+    input_fp8: DeviceBuffer<u8>,
+    input_scale: DeviceBuffer<f32>,
+    weight: DeviceBuffer<u8>,
+    channel_scales: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    out_index: DeviceBuffer<u32>,
+    out_value: DeviceBuffer<f32>,
+    rows: usize,
+}
+
 impl BenchContext for Fp8LinearBench {
     fn prepare(_num_chunks: usize) -> Self {
         let lt = CublasLt::new().expect("cuBLASLt");
@@ -157,6 +175,126 @@ impl BenchContext for Fp8FullAttentionStreamingBench {
 
     fn chunk_size() -> Option<usize> {
         Some(1)
+    }
+}
+
+impl BenchContext for Fp8LmHeadBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        Self::new().expect("prepare FP8 LM-head benchmark")
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(3)
+    }
+}
+
+impl Fp8LmHeadBench {
+    fn new() -> Result<Self> {
+        let checkpoint = ModelOptCheckpoint::open(model_dir())?;
+        let lm_head = checkpoint.load_fp8_linear("lm_head")?;
+        if lm_head.in_features != HIDDEN {
+            return Err(nvfp4::Error::Shape {
+                label: "FP8 LM-head benchmark",
+                expected: format!("in_features={HIDDEN}"),
+                actual: format!("in_features={}", lm_head.in_features),
+            });
+        }
+        let channel_scales = lm_head
+            .channel_weight_scale
+            .ok_or_else(|| nvfp4::Error::Format {
+                label: "FP8 LM-head benchmark",
+                detail: "checkpoint does not have channel weight scales".to_string(),
+            })?;
+        let rows = lm_head.out_features;
+        let lt = CublasLt::new()?;
+        let plan = Fp8TnMatmulPlan::new(&lt, GemmShape::new(rows, 1, HIDDEN), 8 << 20)?;
+        let stream = CudaStream::new_blocking()?;
+        let mut bench = Self {
+            lt,
+            plan,
+            stream,
+            start: CudaEvent::new()?,
+            stop: CudaEvent::new()?,
+            input: DeviceBuffer::from_host(&host_f32(HIDDEN))?,
+            input_fp8: DeviceBuffer::zeroed(HIDDEN)?,
+            input_scale: DeviceBuffer::zeroed(1)?,
+            weight: DeviceBuffer::from_host(&lm_head.weight)?,
+            channel_scales: DeviceBuffer::from_host(&channel_scales)?,
+            logits: DeviceBuffer::zeroed(rows)?,
+            out_index: DeviceBuffer::zeroed(1)?,
+            out_value: DeviceBuffer::zeroed(1)?,
+            rows,
+        };
+        bench.validate()?;
+        Ok(bench)
+    }
+
+    fn run_simt(&mut self) -> Result<()> {
+        fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
+            &self.input,
+            &mut self.input_fp8,
+            &self.weight,
+            &self.channel_scales,
+            &mut self.input_scale,
+            self.logits.output(),
+            self.rows,
+            HIDDEN,
+            &self.stream,
+        )?;
+        argmax_f32_into_on_stream(
+            &self.logits,
+            self.out_index.output(),
+            self.out_value.output(),
+            &self.stream,
+        )
+    }
+
+    fn run_cublaslt(&mut self) -> Result<()> {
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            &self.input,
+            &mut self.input_fp8,
+            &mut self.input_scale,
+            &self.stream,
+        )?;
+        self.plan.run_with_alpha_on_stream(
+            &self.lt,
+            &self.weight,
+            &self.input_fp8,
+            self.logits.output(),
+            1.0,
+            &self.stream,
+        )?;
+        scale_channel_f32_device_scalar_in_place_on_stream(
+            self.logits.inout(),
+            &self.channel_scales,
+            &self.input_scale,
+            &self.stream,
+        )?;
+        argmax_f32_into_on_stream(
+            &self.logits,
+            self.out_index.output(),
+            self.out_value.output(),
+            &self.stream,
+        )
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        self.run_simt()?;
+        let simt_index = self.out_index.copy_to_host(&self.stream)?[0];
+        let simt_value = self.out_value.copy_to_host(&self.stream)?[0];
+        self.run_cublaslt()?;
+        let cublas_index = self.out_index.copy_to_host(&self.stream)?[0];
+        let cublas_value = self.out_value.copy_to_host(&self.stream)?[0];
+        let allowed = 1.0e-3 * (1.0 + simt_value.abs());
+        if simt_index != cublas_index || (simt_value - cublas_value).abs() > allowed {
+            return Err(nvfp4::Error::Format {
+                label: "FP8 LM-head cuBLASLt validation",
+                detail: format!(
+                    "SIMT=({simt_index}, {simt_value}) cuBLASLt=({cublas_index}, {cublas_value}) allowed={allowed}"
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -468,6 +606,40 @@ fn qkv_channel_scaled_dynamic_quantized_sample(
             &ctx.stream,
         )
         .expect("quantized dynamic channel-scaled qkv");
+        black_box(ctx.qkv_output.as_const_ptr());
+    })
+}
+
+fn qkv_channel_scaled_dynamic_cublaslt_sample(
+    ctx: &mut Fp8LinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    run_timed(ctx, chunk_size, |ctx| {
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            &ctx.hidden_input,
+            &mut ctx.hidden_input_fp8,
+            &mut ctx.dynamic_input_scale,
+            &ctx.stream,
+        )
+        .expect("dynamically quantize QKV input");
+        ctx.qkv_plan
+            .run_with_alpha_on_stream(
+                &ctx.lt,
+                &ctx.qkv_weight,
+                &ctx.hidden_input_fp8,
+                ctx.qkv_output.output(),
+                1.0,
+                &ctx.stream,
+            )
+            .expect("channel-scaled QKV cuBLASLt");
+        scale_channel_f32_device_scalar_in_place_on_stream(
+            ctx.qkv_output.inout(),
+            &ctx.qkv_channel_scales,
+            &ctx.dynamic_input_scale,
+            &ctx.stream,
+        )
+        .expect("scale channel QKV output");
         black_box(ctx.qkv_output.as_const_ptr());
     })
 }
@@ -904,6 +1076,44 @@ fn streaming_full_attention_sample<
     )
 }
 
+fn lm_head_simt_sample(
+    ctx: &mut Fp8LmHeadBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        ctx.run_simt().expect("SIMT FP8 LM head");
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.out_index.as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
+fn lm_head_cublaslt_sample(
+    ctx: &mut Fp8LmHeadBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        ctx.run_cublaslt().expect("cuBLASLt FP8 LM head");
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.out_index.as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-fp8-linear".to_string()),
@@ -936,6 +1146,10 @@ fn main() {
             group.bench_sample(
                 "qwen36_linear_qkv_channel_scaled_dynamic_quantized_8192x2048",
                 qkv_channel_scaled_dynamic_quantized_sample,
+            );
+            group.bench_sample(
+                "qwen36_linear_qkv_channel_scaled_dynamic_cublaslt_8192x2048",
+                qkv_channel_scaled_dynamic_cublaslt_sample,
             );
             group.bench_sample("qwen36_linear_qkv_w8a8_8192x2048", qkv_w8a8_sample);
             group.bench_sample("qwen36_linear_qkv_cublaslt_8192x2048", qkv_cublaslt_sample);
@@ -1034,6 +1248,11 @@ fn main() {
                 "qwen36_10_full_attn_q128_kv128_o128",
                 streaming_full_attention_sample::<128, 128, 128>,
             );
+        });
+        runner.group::<Fp8LmHeadBench>("FP8 LM head", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample("qwen36_fp8_lm_head_simt", lm_head_simt_sample);
+            group.bench_sample("qwen36_fp8_lm_head_cublaslt", lm_head_cublaslt_sample);
         });
     });
 }

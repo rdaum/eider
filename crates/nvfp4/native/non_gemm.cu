@@ -3428,6 +3428,48 @@ __global__ void infer_fp8_linear_quantized_channel_scaled_f32_kernel(
     }
 }
 
+extern "C" cudaError_t infer_quantize_fp8_e4m3_dynamic_f32_on_stream(
+    const float* input,
+    std::uint8_t* quantized_input,
+    float* input_scale,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || quantized_input == nullptr || input_scale == nullptr || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_dynamic_quantize_fp8_e4m3_f32_kernel<<<1, kThreads, 0, stream>>>(
+        input, quantized_input, input_scale, cols);
+    return cudaGetLastError();
+}
+
+__global__ void infer_scale_channel_f32_device_scalar_kernel(
+    float* values,
+    const float* channel_scale,
+    const float* scalar,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        values[idx] *= channel_scale[idx] * scalar[0];
+    }
+}
+
+extern "C" cudaError_t infer_scale_channel_f32_device_scalar_on_stream(
+    float* values,
+    const float* channel_scale,
+    const float* scalar,
+    std::uint32_t len,
+    cudaStream_t stream) {
+    if (values == nullptr || channel_scale == nullptr || scalar == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_scale_channel_f32_device_scalar_kernel<<<blocks, kThreads, 0, stream>>>(
+        values, channel_scale, scalar, len);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_fp8_linear_channel_scaled_dynamic_quantized_f32_on_stream(
     const float* input,
     std::uint8_t* quantized_input,

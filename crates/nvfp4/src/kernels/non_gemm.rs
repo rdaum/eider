@@ -3299,6 +3299,87 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream(
     }
 }
 
+/// Dynamically quantizes one f32 activation vector to E4M3 on `stream`.
+///
+/// The device-resident `input_scale` receives `max(abs(input)) / 448` and can
+/// be consumed by subsequent kernels without synchronizing it to the host.
+pub fn quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    quantized_input: &mut DeviceBuffer<u8>,
+    input_scale: &mut DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty()
+        || input.len() > u32::MAX as usize
+        || quantized_input.len() < input.len()
+        || input_scale.len() != 1
+    {
+        return Err(Error::Shape {
+            label: "dynamic FP8 quantization",
+            expected: format!(
+                "non-empty input<=u32::MAX quantized_input>={} input_scale=1",
+                input.len()
+            ),
+            actual: format!(
+                "input={} quantized_input={} input_scale={}",
+                input.len(),
+                quantized_input.len(),
+                input_scale.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_quantize_fp8_e4m3_dynamic_f32_on_stream",
+            ffi::infer_quantize_fp8_e4m3_dynamic_f32_on_stream(
+                input.ptr,
+                quantized_input.ptr,
+                input_scale.ptr,
+                input.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Multiplies each f32 value by its channel scale and one device scalar.
+pub fn scale_channel_f32_device_scalar_in_place_on_stream(
+    mut values: DeviceInOut<'_, f32>,
+    channel_scale: &DeviceBuffer<f32>,
+    scalar: &DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if values.is_empty()
+        || values.len() > u32::MAX as usize
+        || channel_scale.len() != values.len()
+        || scalar.len() != 1
+    {
+        return Err(Error::Shape {
+            label: "channel-scaled device-scalar f32",
+            expected: format!("values=scales={} scalar=1", values.len()),
+            actual: format!(
+                "values={} scales={} scalar={}",
+                values.len(),
+                channel_scale.len(),
+                scalar.len()
+            ),
+        });
+    }
+    let len = values.len();
+    unsafe {
+        check_cuda(
+            "infer_scale_channel_f32_device_scalar_on_stream",
+            ffi::infer_scale_channel_f32_device_scalar_on_stream(
+                values.buffer_mut().ptr,
+                channel_scale.ptr,
+                scalar.ptr,
+                len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues f32-input, FP8 E4M3-weight linear projection with static FP8
 /// activation quantization using the checkpoint input scale.
 pub fn fp8_linear_w8a8_f32_into_on_stream(

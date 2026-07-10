@@ -141,10 +141,10 @@ impl Qwen36RoutedGateUpBench {
         let residual = DeviceBuffer::from_host(&residual_host)?;
         block
             .moe
-            .prepare_grouped_gate_up(&mut workspace.moe, manifest, &ffn_norm, &stream)?;
+            .prepare_routed_gate_up(&mut workspace.moe, manifest, &ffn_norm, &stream)?;
         block
             .moe
-            .run_grouped_gate_up_only(&mut workspace.moe, &stream)?;
+            .run_routed_gate_up_only(&mut workspace.moe, &ffn_norm, &stream)?;
         block
             .moe
             .prepare_grouped_down(&mut workspace.moe, &stream)?;
@@ -184,40 +184,6 @@ impl Qwen36RoutedGateUpBench {
             .weights
             .copy_to_host(&stream)?
             .into_vec();
-        block
-            .moe
-            .run_grouped_w4a16_gate_up_only(&mut workspace.moe, &ffn_norm, &stream)?;
-        let grouped_outputs = workspace
-            .moe
-            .grouped_gate_up
-            .as_ref()
-            .expect("grouped gate/up workspace")
-            .outputs
-            .iter()
-            .map(|output| {
-                output
-                    .data()
-                    .copy_to_host(&stream)
-                    .map(|read| read.into_vec())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (slot, &expert) in route_indices.iter().enumerate() {
-            block.moe.run_w4a16_gate_up_slots_only(
-                &mut workspace.moe,
-                &ffn_norm,
-                std::slice::from_ref(&expert),
-                &stream,
-            )?;
-            let reference = workspace.moe.fallback_gate_up_out.copy_to_host(&stream)?;
-            assert_w4a16_close(&grouped_outputs[slot], &reference, slot, expert);
-        }
-        block.moe.run_w4a16_moe_slots_only(
-            &mut workspace.moe,
-            &ffn_norm,
-            &route_indices,
-            &route_weights,
-            &stream,
-        )?;
         stream.synchronize()?;
         let (experts, top_k, expert_intermediate) = block.moe.shape();
         Ok(Self {
@@ -239,8 +205,8 @@ impl Qwen36RoutedGateUpBench {
         for _ in 0..chunk_size {
             self.block
                 .moe
-                .run_grouped_gate_up_only(&mut self.workspace.moe, &self.stream)
-                .expect("run grouped routed gate/up");
+                .run_routed_gate_up_only(&mut self.workspace.moe, &self.ffn_norm, &self.stream)
+                .expect("run selected routed gate/up");
         }
         self.stream
             .synchronize()
@@ -306,22 +272,6 @@ impl Qwen36RoutedGateUpBench {
                     &self.stream,
                 )
                 .expect("run W4A16 routed gate/up");
-        }
-        self.stream
-            .synchronize()
-            .expect("synchronize benchmark stream");
-    }
-
-    fn run_grouped_w4a16_gate_up_chunk(&mut self, chunk_size: usize) {
-        for _ in 0..chunk_size {
-            self.block
-                .moe
-                .run_grouped_w4a16_gate_up_only(
-                    &mut self.workspace.moe,
-                    &self.ffn_norm,
-                    &self.stream,
-                )
-                .expect("run grouped W4A16 routed gate/up");
         }
         self.stream
             .synchronize()
@@ -471,21 +421,6 @@ impl Qwen36RoutedGateUpBench {
     }
 }
 
-fn assert_w4a16_close(actual: &[f32], expected: &[f32], slot: usize, expert: usize) {
-    assert_eq!(actual.len(), expected.len());
-    let mut max_abs = 0.0f32;
-    let mut max_reference = 0.0f32;
-    for (&actual, &expected) in actual.iter().zip(expected) {
-        max_abs = max_abs.max((actual - expected).abs());
-        max_reference = max_reference.max(expected.abs());
-    }
-    let tolerance = 2.0e-5 * (1.0 + max_reference);
-    assert!(
-        max_abs <= tolerance,
-        "grouped W4A16 slot {slot} expert {expert} mismatch: max_abs={max_abs:e} tolerance={tolerance:e}"
-    );
-}
-
 fn routed_gate_up_sample(
     ctx: &mut Qwen36RoutedGateUpBench,
     chunk_size: usize,
@@ -553,15 +488,6 @@ fn w4a16_gate_up_sample(
     _chunk_num: usize,
 ) -> BenchSampleResult {
     ctx.run_w4a16_gate_up_chunk(chunk_size);
-    common_sample_metrics(ctx, chunk_size)
-}
-
-fn grouped_w4a16_gate_up_sample(
-    ctx: &mut Qwen36RoutedGateUpBench,
-    chunk_size: usize,
-    _chunk_num: usize,
-) -> BenchSampleResult {
-    ctx.run_grouped_w4a16_gate_up_chunk(chunk_size);
     common_sample_metrics(ctx, chunk_size)
 }
 
@@ -792,7 +718,7 @@ fn main() {
                 .diagnostic_samples(2)
                 .diagnostic_pass(routed_gate_up_diagnostic)
                 .bench_sample(
-                    "grouped_gate_up_top8_hidden2048_intermediate512",
+                    "routed_gate_up_top8_hidden2048_intermediate512",
                     routed_gate_up_sample,
                 );
             g.throughput(Throughput::ops())
@@ -815,13 +741,6 @@ fn main() {
                 .bench_sample(
                     "w4a16_gate_up_top8_hidden2048_intermediate512",
                     w4a16_gate_up_sample,
-                );
-            g.throughput(Throughput::ops())
-                .measurement_domain(MeasurementDomain::Gpu)
-                .backend(|| Box::new(CudaEventBackend::new()))
-                .bench_sample(
-                    "grouped_w4a16_gate_up_top8_hidden2048_intermediate512",
-                    grouped_w4a16_gate_up_sample,
                 );
             g.throughput(Throughput::ops())
                 .measurement_domain(MeasurementDomain::Gpu)

@@ -3,9 +3,9 @@ use micromeasure::{
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CudaEvent, CudaStream, DeviceBuffer, F32Matrix, ModelOptCheckpoint, ModelOptNvfp4Linear,
-    Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, indexed_gemv_on_stream,
-    quantize_fixed_scale_vector_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, ModelOptCheckpoint,
+    ModelOptNvfp4Linear, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
+    indexed_gemv_on_stream, quantize_fixed_scale_vector_on_stream,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,6 +51,7 @@ struct Sm12xQwenSlotGemvBench {
     down_outputs: Vec<F32Matrix>,
     down_d: DeviceBuffer<*mut f32>,
     indices: DeviceBuffer<u32>,
+    gate_graph: Option<CudaGraphExec>,
 }
 
 impl BenchContext for Sm12xIndexedGemvBench {
@@ -190,7 +191,7 @@ impl Sm12xQwenSlotGemvBench {
         )?;
         let (gate_outputs, gate_d) = output_table(1024, GROUPS)?;
         let (down_outputs, down_d) = output_table(2048, GROUPS)?;
-        Ok(Self {
+        let mut bench = Self {
             stream,
             start: CudaEvent::new()?,
             stop: CudaEvent::new()?,
@@ -211,7 +212,31 @@ impl Sm12xQwenSlotGemvBench {
             down_outputs,
             down_d,
             indices,
-        })
+            gate_graph: None,
+        };
+        bench.gate_graph = Some(bench.stream.capture(|stream| {
+            quantize_fixed_scale_vector_on_stream(
+                &bench.gate_input,
+                0.25,
+                &mut bench.gate_b_tiles,
+                &mut bench.gate_b_scales,
+                stream,
+            )?;
+            indexed_gemv_on_stream(
+                &bench.indices,
+                &bench.gate_a_tiles,
+                &bench.gate_a_scales,
+                EXPERTS,
+                &bench.gate_b_tiles,
+                &bench.gate_b_scales,
+                &bench.gate_d,
+                1024 / 16,
+                2048 / 64,
+                GROUPS,
+                stream,
+            )
+        })?);
+        Ok(bench)
     }
 }
 
@@ -367,6 +392,29 @@ fn sm12x_qwen_down(
     )
 }
 
+fn sm12x_qwen_gate_up_graph(
+    ctx: &mut Sm12xQwenSlotGemvBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        ctx.gate_graph
+            .as_ref()
+            .expect("gate/up graph")
+            .launch(&ctx.stream)
+            .expect("launch gate/up graph");
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.gate_outputs[0].data_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-sm12x-indexed-gemv".to_string()),
@@ -387,6 +435,10 @@ fn main() {
         });
         runner.group::<Sm12xQwenSlotGemvBench>("SM12x Qwen slot GEMV", |group| {
             group.bench_sample("real_gate_up_m1024_k2048_g8", sm12x_qwen_gate_up);
+            group.bench_sample(
+                "real_gate_up_m1024_k2048_g8_graph",
+                sm12x_qwen_gate_up_graph,
+            );
             group.bench_sample("real_down_m2048_k512_g8", sm12x_qwen_down);
         });
     });

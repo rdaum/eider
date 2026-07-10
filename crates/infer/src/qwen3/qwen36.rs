@@ -2,28 +2,31 @@
 
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
-    Fp4TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear,
-    ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, Nvfp4TnInputs,
-    Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
-    add_f32_into_on_stream, append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
-    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuCounterCollector,
+    GroupedGemvPointerTableBuffers, MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptCublasLtWeight,
+    ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
+    Nvfp4TnInputs, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector,
+    Sm12xFp4GemmWeight, add_f32_into_on_stream, append_rows_f32_indexed_into_on_stream,
+    append_rows_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    device_weight_gemv_on_stream, fill_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
     indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
     nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_into_on_stream,
     qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_into_on_stream,
-    scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
-    sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
+    scale_channel_f32_device_scalar_in_place_on_stream, scaled_add_f32_into_on_stream,
+    sigmoid_mul_f32_into_on_stream, sigmoid_scale_scalar_f32_into_on_stream,
+    silu_mul_halves_f32_into_on_stream,
 };
 
 use super::infer::{
@@ -1694,9 +1697,9 @@ impl Qwen36MoeWeights {
             });
         }
 
-        // ModelOpt uses the validated Marlin gate/up path. Compressed-tensors
-        // checkpoints request dynamic W4A4 and retain only grouped weights.
-        let use_grouped_w4a4 =
+        // Compressed-tensors checkpoints use W4A4 for the shared expert and
+        // provide the scale metadata needed by the grouped routed fallback.
+        let compressed_tensors =
             checkpoint.contains_tensor(&format!("{prefix}.experts.0.gate_proj.weight_packed"));
         let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
@@ -1738,21 +1741,16 @@ impl Qwen36MoeWeights {
                 &gate,
                 &up,
             )?;
-            if use_grouped_w4a4 {
+            if compressed_tensors {
                 match shared_gate_up_input_scale {
                     None => shared_gate_up_input_scale = Some(weight.input_scale),
                     Some(first) if first.to_bits() == weight.input_scale.to_bits() => {}
                     Some(_) => shared_gate_up_input_scale = Some(f32::NAN),
                 }
                 gate_up_alphas.push(weight.weight_scale_2 * weight.input_scale);
-                let device = Nvfp4DeviceLinear::from_host(&weight)?;
-                gate_up_grouped_value_ptrs[expert_idx] = device.packed_weight.as_const_ptr().cast();
-                gate_up_grouped_scale_ptrs[expert_idx] = device.weight_scale.as_const_ptr().cast();
-                grouped_gate_up_weights.push(device);
-            } else {
-                gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
-                marlin_gate_up_weights.push(weight);
             }
+            gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
+            marlin_gate_up_weights.push(weight);
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
@@ -1781,6 +1779,33 @@ impl Qwen36MoeWeights {
                 sm12x_down.push(weight);
             }
         }
+
+        // The Marlin tensor-core path is substantially faster than the SIMT
+        // grouped W4A4 kernel for this batch-one top-8 shape. Keep grouped W4A4
+        // as the device-support fallback without retaining both weight layouts.
+        let gate_up_storage = match MarlinNvfp4GateUp::new(&marlin_gate_up_weights) {
+            Ok(marlin) => Qwen36GateUpStorage::Marlin(marlin),
+            Err(_error) if compressed_tensors => {
+                if shared_gate_up_input_scale.is_none_or(f32::is_nan) {
+                    return Err(Error::Format {
+                        label: "Qwen3.6 grouped gate/up",
+                        detail: "expert gate/up input scales are not shared".to_string(),
+                    });
+                }
+                for (expert_idx, weight) in marlin_gate_up_weights.iter().enumerate() {
+                    let device = Nvfp4DeviceLinear::from_host(weight)?;
+                    gate_up_grouped_value_ptrs[expert_idx] =
+                        device.packed_weight.as_const_ptr().cast();
+                    gate_up_grouped_scale_ptrs[expert_idx] =
+                        device.weight_scale.as_const_ptr().cast();
+                    grouped_gate_up_weights.push(device);
+                }
+                Qwen36GateUpStorage::Grouped {
+                    _weights: grouped_gate_up_weights,
+                }
+            }
+            Err(error) => return Err(error),
+        };
         let expert_ptrs = MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&gate_up_ptrs)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scale_ptrs)?,
@@ -1824,7 +1849,7 @@ impl Qwen36MoeWeights {
                 ),
             });
         }
-        let shared = if use_grouped_w4a4 {
+        let shared = if compressed_tensors {
             Qwen36SharedExpert::W4A4 {
                 gate_up: shared_gate_up.as_cublaslt_weight()?,
                 down: shared_down.as_cublaslt_weight()?,
@@ -1842,20 +1867,6 @@ impl Qwen36MoeWeights {
             1,
             manifest.hidden,
         )?;
-
-        let gate_up_storage = if use_grouped_w4a4 {
-            if shared_gate_up_input_scale.is_none_or(f32::is_nan) {
-                return Err(Error::Format {
-                    label: "Qwen3.6 grouped gate/up",
-                    detail: "expert gate/up input scales are not shared".to_string(),
-                });
-            }
-            Qwen36GateUpStorage::Grouped {
-                _weights: grouped_gate_up_weights,
-            }
-        } else {
-            Qwen36GateUpStorage::Marlin(MarlinNvfp4GateUp::new(&marlin_gate_up_weights)?)
-        };
 
         Ok(Self {
             router,
@@ -1909,6 +1920,54 @@ impl Qwen36MoeWeights {
             self.expert_intermediate,
         )?;
         Ok(workspace)
+    }
+
+    /// Prepares routing and any activation state required by the selected gate/up path.
+    pub fn prepare_routed_gate_up(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        manifest: &QwenModelManifest,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.router
+            .run_into(ffn_norm, &mut workspace.router_logits, stream)?;
+        workspace
+            .route
+            .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
+        if matches!(self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. }) {
+            let input_scale = self
+                .expert_ptrs
+                .shared_gate_up_input_scale
+                .expect("grouped W4A4 storage requires a shared input scale");
+            quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
+                manifest.hidden,
+                ffn_norm,
+                &mut workspace.gate_up_input,
+                &mut workspace.gate_up_input_simple_scales,
+                input_scale,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Runs the selected routed gate/up kernel using prepared route state.
+    pub fn run_routed_gate_up_only(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match &self.gate_up_storage {
+            Qwen36GateUpStorage::Grouped { .. } => self.run_grouped_gate_up_only(workspace, stream),
+            Qwen36GateUpStorage::Marlin(marlin) => marlin.run_on_stream(
+                &workspace.route.indices,
+                ffn_norm,
+                workspace.marlin_gate_up_output.output(),
+                stream,
+            ),
+        }
     }
 
     /// Prepares route indices and the quantized gate/up input for grouped gate/up benchmarking.
@@ -3743,47 +3802,52 @@ pub struct Qwen36TextModel {
 
 enum Qwen36LmHead {
     Nvfp4(Nvfp4DeviceLinear),
-    Fp8(Fp8Linear),
+    Fp8 {
+        linear: Fp8Linear,
+        plan: Box<Fp8TnMatmulPlan>,
+    },
 }
 
 impl Qwen36LmHead {
-    fn load(checkpoint: &ModelOptCheckpoint) -> Result<Self> {
+    fn load(checkpoint: &ModelOptCheckpoint, lt: &CublasLt) -> Result<Self> {
         if checkpoint.contains_tensor("lm_head.weight_scale_2") {
             Ok(Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, "lm_head")?))
         } else {
-            Ok(Self::Fp8(Fp8Linear::from_host(
-                &checkpoint.load_fp8_linear("lm_head")?,
-            )?))
+            let linear = Fp8Linear::from_host(&checkpoint.load_fp8_linear("lm_head")?)?;
+            let plan =
+                Fp8TnMatmulPlan::new(lt, GemmShape::new(linear.rows, 1, linear.cols), 8 << 20)?;
+            Ok(Self::Fp8 {
+                linear,
+                plan: Box::new(plan),
+            })
         }
     }
 
     fn shape(&self) -> (usize, usize) {
         match self {
             Self::Nvfp4(linear) => (linear.out_features, linear.in_features),
-            Self::Fp8(linear) => (linear.rows, linear.cols),
+            Self::Fp8 { linear, .. } => (linear.rows, linear.cols),
         }
     }
 
     fn run_logits(
         &self,
+        lt: &CublasLt,
         input: &DeviceBuffer<f32>,
         workspace: &mut Qwen36LmHeadWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
         match self {
             Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
-            Self::Fp8(linear) => linear.run_into(
-                input,
-                &mut workspace.logits,
-                &mut workspace.dynamic_input,
-                &mut workspace.dynamic_input_scale,
-                stream,
-            ),
+            Self::Fp8 { linear, plan } => {
+                Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)
+            }
         }
     }
 
     fn run_top1(
         &self,
+        lt: &CublasLt,
         input: &DeviceBuffer<f32>,
         workspace: &mut Qwen36LmHeadWorkspace,
         stream: &CudaStream,
@@ -3802,14 +3866,8 @@ impl Qwen36LmHead {
                 linear.weight_scale_2,
                 stream,
             ),
-            Self::Fp8(linear) => {
-                linear.run_into(
-                    input,
-                    &mut workspace.logits,
-                    &mut workspace.dynamic_input,
-                    &mut workspace.dynamic_input_scale,
-                    stream,
-                )?;
+            Self::Fp8 { linear, plan } => {
+                Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)?;
                 argmax_f32_into_on_stream(
                     &workspace.logits,
                     workspace.next_index.output(),
@@ -3818,6 +3876,45 @@ impl Qwen36LmHead {
                 )
             }
         }
+    }
+
+    fn run_fp8_logits(
+        lt: &CublasLt,
+        linear: &Fp8Linear,
+        plan: &Fp8TnMatmulPlan,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Qwen36LmHeadWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(channel_scale) = linear.channel_weight_scale.as_ref() else {
+            return linear.run_into(
+                input,
+                &mut workspace.logits,
+                &mut workspace.dynamic_input,
+                &mut workspace.dynamic_input_scale,
+                stream,
+            );
+        };
+        quantize_fp8_e4m3_dynamic_f32_into_on_stream(
+            input,
+            &mut workspace.dynamic_input,
+            &mut workspace.dynamic_input_scale,
+            stream,
+        )?;
+        plan.run_with_alpha_on_stream(
+            lt,
+            &linear.weight,
+            &workspace.dynamic_input,
+            workspace.logits.output(),
+            1.0,
+            stream,
+        )?;
+        scale_channel_f32_device_scalar_in_place_on_stream(
+            workspace.logits.inout(),
+            channel_scale,
+            &workspace.dynamic_input_scale,
+            stream,
+        )
     }
 }
 
@@ -3948,7 +4045,7 @@ impl Qwen36TextModel {
             &format!("{}.norm.weight", manifest.tensor_prefix),
             manifest.hidden,
         )?;
-        let lm_head = Qwen36LmHead::load(&checkpoint)?;
+        let lm_head = Qwen36LmHead::load(&checkpoint, &lt)?;
         let lm_head_shape = lm_head.shape();
         if lm_head_shape != (manifest.vocab, manifest.hidden) {
             return Err(Error::Shape {
@@ -4258,7 +4355,7 @@ impl Qwen36TextModel {
 
         let (id, value, logits) = if return_logits {
             self.lm_head
-                .run_logits(&state.final_hidden, &mut state.lm_head, stream)?;
+                .run_logits(&self.lt, &state.final_hidden, &mut state.lm_head, stream)?;
             let logits = state.lm_head.logits.copy_to_host(stream)?.into_vec();
             let (id, value) = logits
                 .iter()
@@ -4271,7 +4368,7 @@ impl Qwen36TextModel {
         } else if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
                 self.lm_head
-                    .run_top1(&state.final_hidden, &mut state.lm_head, stream)
+                    .run_top1(&self.lt, &state.final_hidden, &mut state.lm_head, stream)
             })?;
             profile.lm_head_argmax_ms += ms;
             let id = state.lm_head.next_index.copy_to_host(stream)?[0];
@@ -4279,7 +4376,7 @@ impl Qwen36TextModel {
             (id, value, None)
         } else {
             self.lm_head
-                .run_top1(&state.final_hidden, &mut state.lm_head, stream)?;
+                .run_top1(&self.lt, &state.final_hidden, &mut state.lm_head, stream)?;
             let id = state.lm_head.next_index.copy_to_host(stream)?[0];
             let value = state.lm_head.next_value.copy_to_host(stream)?[0];
             (id, value, None)
