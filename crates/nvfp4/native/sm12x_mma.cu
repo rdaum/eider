@@ -581,7 +581,7 @@ extern "C" cudaError_t infer_sm12x_quantize_fixed_scale_vector_on_stream(
     return cudaGetLastError();
 }
 
-__global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
+__global__ void infer_sm12x_moe_silu_quantize_slots_reference_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* const* __restrict__ gate_up_table,
     std::uint8_t* __restrict__ b_native_tiles,
@@ -654,6 +654,110 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
         (static_cast<std::uint32_t>(scale_codes[1]) << 8) |
         (static_cast<std::uint32_t>(scale_codes[2]) << 16) |
         (static_cast<std::uint32_t>(scale_codes[3]) << 24);
+}
+
+extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
+    const std::uint32_t* indices,
+    const float* const* gate_up_table,
+    std::uint8_t* b_native_tiles,
+    std::uint32_t* sfb,
+    const float* input_scale_table,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || gate_up_table == nullptr || b_native_tiles == nullptr || sfb == nullptr || input_scale_table == nullptr || gate_up_alpha_table == nullptr || rows == 0 || groups == 0 || (rows % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t k_tiles = rows / 64;
+    infer_sm12x_moe_silu_quantize_slots_reference_kernel<<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, gate_up_table, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+__global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* const* __restrict__ gate_up_table,
+    std::uint8_t* __restrict__ b_native_tiles,
+    std::uint32_t* __restrict__ sfb,
+    const float* __restrict__ input_scale_table,
+    const float* __restrict__ gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t k_tiles,
+    std::uint32_t groups)
+{
+    const std::uint32_t slot = blockIdx.x;
+    const std::uint32_t kt = blockIdx.y;
+    if (slot >= groups || kt >= k_tiles) return;
+
+    __shared__ float values[64];
+    __shared__ std::uint8_t codes[64];
+    __shared__ std::uint8_t scale_codes[4];
+    __shared__ float scales[4];
+
+    std::uint8_t* tile = b_native_tiles + (slot * k_tiles + kt) * 512;
+    for (int idx = threadIdx.x; idx < 512; idx += blockDim.x) {
+        tile[idx] = 0;
+    }
+
+    const std::uint32_t expert = indices[slot];
+    const float input_scale = input_scale_table[expert];
+    if (input_scale <= 0.0f || !isfinite(input_scale)) return;
+    const float gate_up_alpha = gate_up_alpha_table[expert];
+    const float* gate_up = gate_up_table[slot];
+    const int scale_group = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    float value = 0.0f;
+    if (lane < 16) {
+        const std::uint32_t row = kt * 64 + scale_group * 16 + lane;
+        if (row < rows) {
+            const float gate_value = gate_up[row] * gate_up_alpha;
+            const float up_value = gate_up[rows + row] * gate_up_alpha;
+            const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+            value = (gate_value * sigmoid * up_value) / input_scale;
+        }
+        values[scale_group * 16 + lane] = value;
+    }
+
+    float max_abs = lane < 16 && isfinite(value) ? fabsf(value) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        scale_codes[scale_group] = scale_code;
+        scales[scale_group] = infer_e4m3_value(scale_code);
+    }
+    __syncthreads();
+
+    if (lane < 16) {
+        const float scale = scales[scale_group];
+        const float scaled = scale == 0.0f ? 0.0f : values[scale_group * 16 + lane] / scale;
+        codes[scale_group * 16 + lane] = infer_e2m1_code(scaled);
+    }
+    __syncthreads();
+
+    // Each packed byte contains two adjacent logical nibbles. Writing whole
+    // bytes avoids the read-modify-write races of parallel nibble stores.
+    for (int packed_idx = threadIdx.x; packed_idx < 256; packed_idx += blockDim.x) {
+        const int output_lane = packed_idx >> 3;
+        const int pair = packed_idx & 7;
+        const int v = pair << 1;
+        const int t0 = output_lane & 3;
+        const int col0 = t0 * 8 + (v & 7) + 32 * ((v >> 3) & 1);
+        const int next_v = v + 1;
+        const int col1 = t0 * 8 + (next_v & 7) + 32 * ((next_v >> 3) & 1);
+        tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            codes[col0] | (codes[col1] << 4));
+    }
+    if (threadIdx.x == 0) {
+        sfb[slot * k_tiles + kt] = static_cast<std::uint32_t>(scale_codes[0]) |
+            (static_cast<std::uint32_t>(scale_codes[1]) << 8) |
+            (static_cast<std::uint32_t>(scale_codes[2]) << 16) |
+            (static_cast<std::uint32_t>(scale_codes[3]) << 24);
+    }
 }
 
 extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_on_stream(

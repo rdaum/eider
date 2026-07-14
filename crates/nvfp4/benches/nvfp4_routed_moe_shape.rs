@@ -9,7 +9,8 @@ use nvfp4::{
     ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, Result, Sm12xFp4DeviceGemmWeight,
     Sm12xFp4GemmWeight, format, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
     moe_silu_quantize_slots_nvfp4_simple_scales_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_fixed_scale_vector_on_stream,
+    moe_silu_quantize_slots_reference_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    quantize_fixed_scale_vector_on_stream,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,6 +34,8 @@ struct Nvfp4RoutedMoeShapeBench<const BATCH: usize> {
     input_scale_table: DeviceBuffer<f32>,
     gate_up_alpha_table: DeviceBuffer<f32>,
     down_alpha_table: DeviceBuffer<f32>,
+    sm12x_reference_tiles: DeviceBuffer<u8>,
+    sm12x_reference_scales: DeviceBuffer<u32>,
     reduced: DeviceBuffer<f32>,
 }
 
@@ -88,12 +91,22 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             .map(|slot| (slot % EXPERTS) as u32)
             .collect::<Vec<_>>();
         let route_weight = 1.0 / TOP_K as f32;
-        Ok(Self {
+        let mut sm12x_gate_up = Sm12xOp::load_gate_up(GATE_UP_OUT, HIDDEN, slots)?;
+        for (slot, output) in sm12x_gate_up.outputs.iter_mut().enumerate() {
+            let values = (0..GATE_UP_OUT)
+                .map(|idx| (((idx * 17 + slot * 13) % 257) as f32 - 128.0) / 32.0)
+                .collect::<Vec<_>>();
+            output.data_mut().copy_from_host(&values)?;
+        }
+        let sm12x_down = Sm12xOp::load_down(HIDDEN, INTERMEDIATE, slots)?;
+        let mut bench = Self {
             stream: CudaStream::new_blocking()?,
             gate_up: GroupedOp::new(GATE_UP_OUT, HIDDEN, slots, weights.gate_up)?,
             down: GroupedOp::new(HIDDEN, INTERMEDIATE, slots, weights.down)?,
-            sm12x_gate_up: Sm12xOp::load_gate_up(GATE_UP_OUT, HIDDEN, slots)?,
-            sm12x_down: Sm12xOp::load_down(HIDDEN, INTERMEDIATE, slots)?,
+            sm12x_gate_up,
+            sm12x_reference_tiles: DeviceBuffer::zeroed(sm12x_down.b_tiles.len())?,
+            sm12x_reference_scales: DeviceBuffer::zeroed(sm12x_down.b_scales.len())?,
+            sm12x_down,
             indices: DeviceBuffer::from_host(&indices_host)?,
             route_weights: DeviceBuffer::from_host(&vec![route_weight; slots])?,
             sm12x_input: DeviceBuffer::from_host(
@@ -105,7 +118,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             gate_up_alpha_table: DeviceBuffer::from_host(&[1.0f32; EXPERTS])?,
             down_alpha_table: DeviceBuffer::from_host(&[1.0f32; EXPERTS])?,
             reduced: DeviceBuffer::zeroed(HIDDEN)?,
-        })
+        };
+        bench.verify_sm12x_silu_quantizers()?;
+        Ok(bench)
     }
 
     fn run_gate_up_chunk(&mut self, chunk_size: usize) {
@@ -255,6 +270,90 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream.synchronize().expect("sync SM12x down bench");
         black_box(self.sm12x_down.outputs[0].data_ptr());
         black_box(self.sm12x_down.weights[0].tiles_ptr());
+    }
+
+    fn run_sm12x_silu_quantize_chunk(&mut self, chunk_size: usize) {
+        for _ in 0..chunk_size {
+            moe_silu_quantize_slots_on_stream(
+                &self.indices,
+                &self.sm12x_gate_up.c,
+                &mut self.sm12x_down.b_tiles,
+                &mut self.sm12x_down.b_scales,
+                &self.input_scale_table,
+                &self.gate_up_alpha_table,
+                INTERMEDIATE,
+                self.sm12x_down.slots,
+                &self.stream,
+            )
+            .expect("parallel SM12x SiLU quantize slots");
+        }
+        self.stream
+            .synchronize()
+            .expect("sync parallel SM12x SiLU quantize bench");
+        black_box(self.sm12x_down.b_tiles.as_const_ptr());
+        black_box(self.sm12x_down.b_scales.as_const_ptr());
+    }
+
+    fn run_sm12x_silu_quantize_reference_chunk(&mut self, chunk_size: usize) {
+        for _ in 0..chunk_size {
+            moe_silu_quantize_slots_reference_on_stream(
+                &self.indices,
+                &self.sm12x_gate_up.c,
+                &mut self.sm12x_reference_tiles,
+                &mut self.sm12x_reference_scales,
+                &self.input_scale_table,
+                &self.gate_up_alpha_table,
+                INTERMEDIATE,
+                self.sm12x_down.slots,
+                &self.stream,
+            )
+            .expect("reference SM12x SiLU quantize slots");
+        }
+        self.stream
+            .synchronize()
+            .expect("sync reference SM12x SiLU quantize bench");
+        black_box(self.sm12x_reference_tiles.as_const_ptr());
+        black_box(self.sm12x_reference_scales.as_const_ptr());
+    }
+
+    fn verify_sm12x_silu_quantizers(&mut self) -> Result<()> {
+        moe_silu_quantize_slots_reference_on_stream(
+            &self.indices,
+            &self.sm12x_gate_up.c,
+            &mut self.sm12x_reference_tiles,
+            &mut self.sm12x_reference_scales,
+            &self.input_scale_table,
+            &self.gate_up_alpha_table,
+            INTERMEDIATE,
+            self.sm12x_down.slots,
+            &self.stream,
+        )?;
+        moe_silu_quantize_slots_on_stream(
+            &self.indices,
+            &self.sm12x_gate_up.c,
+            &mut self.sm12x_down.b_tiles,
+            &mut self.sm12x_down.b_scales,
+            &self.input_scale_table,
+            &self.gate_up_alpha_table,
+            INTERMEDIATE,
+            self.sm12x_down.slots,
+            &self.stream,
+        )?;
+        let reference_tiles = self.sm12x_reference_tiles.copy_to_host(&self.stream)?;
+        let candidate_tiles = self.sm12x_down.b_tiles.copy_to_host(&self.stream)?;
+        assert_eq!(
+            candidate_tiles.into_vec(),
+            reference_tiles.into_vec(),
+            "parallel SM12x quantizer changed native tile bytes"
+        );
+        let reference_scales = self.sm12x_reference_scales.copy_to_host(&self.stream)?;
+        let candidate_scales = self.sm12x_down.b_scales.copy_to_host(&self.stream)?;
+        assert_eq!(
+            candidate_scales.into_vec(),
+            reference_scales.into_vec(),
+            "parallel SM12x quantizer changed scale words"
+        );
+        Ok(())
     }
 
     fn run_sm12x_routed_core_chunk(&mut self, chunk_size: usize) {
@@ -609,6 +708,10 @@ fn bytes_per_down(slots: usize) -> u64 {
             + HIDDEN * 4)) as u64
 }
 
+fn bytes_per_silu_quantize(slots: usize) -> u64 {
+    (slots * (GATE_UP_OUT * 4 + INTERMEDIATE / 2 + INTERMEDIATE / 16)) as u64
+}
+
 fn flops_per_gate_up(slots: usize) -> u64 {
     (2 * slots * GATE_UP_OUT * HIDDEN) as u64
 }
@@ -706,6 +809,24 @@ fn sm12x_down_sample<const BATCH: usize>(
     _chunk_num: usize,
 ) -> BenchSampleResult {
     ctx.run_sm12x_down_chunk(chunk_size);
+    sample_metrics::<BATCH>(chunk_size)
+}
+
+fn sm12x_silu_quantize_sample<const BATCH: usize>(
+    ctx: &mut Nvfp4RoutedMoeShapeBench<BATCH>,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.run_sm12x_silu_quantize_chunk(chunk_size);
+    sample_metrics::<BATCH>(chunk_size)
+}
+
+fn sm12x_silu_quantize_reference_sample<const BATCH: usize>(
+    ctx: &mut Nvfp4RoutedMoeShapeBench<BATCH>,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.run_sm12x_silu_quantize_reference_chunk(chunk_size);
     sample_metrics::<BATCH>(chunk_size)
 }
 
@@ -834,6 +955,20 @@ fn register_batch<const BATCH: usize>(runner: &micromeasure::BenchmarkRunner) {
             .bench_sample(
                 &format!("sm12x_down_batch{BATCH}_slots{slots}_m2048_k512"),
                 sm12x_down_sample::<BATCH>,
+            );
+        g.throughput(Throughput::bytes(bytes_per_silu_quantize(slots)))
+            .measurement_domain(MeasurementDomain::Gpu)
+            .backend(move || Box::new(CudaEventBackend::new(bytes_per_silu_quantize(slots), 0)))
+            .bench_sample(
+                &format!("sm12x_silu_quantize_parallel_batch{BATCH}_slots{slots}_k512"),
+                sm12x_silu_quantize_sample::<BATCH>,
+            );
+        g.throughput(Throughput::bytes(bytes_per_silu_quantize(slots)))
+            .measurement_domain(MeasurementDomain::Gpu)
+            .backend(move || Box::new(CudaEventBackend::new(bytes_per_silu_quantize(slots), 0)))
+            .bench_sample(
+                &format!("sm12x_silu_quantize_reference_batch{BATCH}_slots{slots}_k512"),
+                sm12x_silu_quantize_reference_sample::<BATCH>,
             );
         g.throughput(Throughput::bytes(
             bytes_per_gate_up(slots) + bytes_per_down(slots),

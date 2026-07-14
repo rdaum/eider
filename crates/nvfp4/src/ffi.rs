@@ -248,6 +248,17 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
+        indices: *const u32,
+        gate_up_table: *const *const f32,
+        b_native_tiles: *mut u8,
+        sfb: *mut u32,
+        input_scale_table: *const f32,
+        gate_up_alpha_table: *const f32,
+        rows: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_indexed_gemv_on_stream(
         indices: *const u32,
         a_native_tiles_table: *const *const u8,
