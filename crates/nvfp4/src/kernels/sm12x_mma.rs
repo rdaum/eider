@@ -828,6 +828,67 @@ pub fn moe_silu_quantize_slots_on_stream(
     }
 }
 
+/// Runs the retained serial implementation used to validate and benchmark the
+/// parallel SM12x routed activation quantizer.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_slots_reference_on_stream(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<*const f32>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    input_scale_table: &DeviceBuffer<f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k_tiles = rows / 64;
+    if rows == 0
+        || !rows.is_multiple_of(64)
+        || groups == 0
+        || indices.len() != groups
+        || gate_up_table.len() != groups
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || input_scale_table.is_empty()
+        || gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x MoE SiLU quantize slots reference",
+            expected:
+                "rows multiple of 64, slot tables, B native tiles [groups,K/64], SFB [groups,K/64]"
+                    .to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} indices={} gate_up={} B={} SFB={} input_scales={} gate_up_alphas={}",
+                indices.len(),
+                gate_up_table.len(),
+                b_native_tiles.len(),
+                sfb.len(),
+                input_scale_table.len(),
+                gate_up_alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_moe_silu_quantize_slots_reference_on_stream",
+            crate::ffi::infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
+                indices.as_const_ptr().cast(),
+                gate_up_table.as_const_ptr().cast(),
+                b_native_tiles.as_mut_ptr().cast(),
+                sfb.as_mut_ptr().cast(),
+                input_scale_table.as_const_ptr().cast(),
+                gate_up_alpha_table.as_const_ptr().cast(),
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn indexed_gemv_on_stream(
     indices: &DeviceBuffer<u32>,

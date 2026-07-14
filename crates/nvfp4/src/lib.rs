@@ -80,7 +80,8 @@ pub use kernels::sm12x_mma::{
     Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xFp4Tile, Sm12xFp4TileSet, Sm12xRequantizedVector, Sm12xRequantizedWeight,
     device_weight_gemv_on_stream, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_slots_on_stream, quantize_fixed_scale_vector_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
+    quantize_fixed_scale_vector_on_stream,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt::{
