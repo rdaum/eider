@@ -187,6 +187,17 @@ impl Sm12xKvCache {
         value: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
+        self.append_at_on_stream(key, value, self.len, stream)
+    }
+
+    /// Enqueues one K/V append at an explicit host-visible cache position.
+    pub fn append_at_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let width = self.kv_heads * self.head_dim;
         if key.len() != width || value.len() != width {
             return Err(Error::Shape {
@@ -195,11 +206,11 @@ impl Sm12xKvCache {
                 actual: format!("key={} value={}", key.len(), value.len()),
             });
         }
-        if self.len >= self.max_tokens {
+        if position >= self.max_tokens {
             return Err(Error::Shape {
                 label: "SM12x KV append capacity",
                 expected: format!("fewer than {} rows", self.max_tokens),
-                actual: format!("{} rows", self.len + 1),
+                actual: format!("{} rows", position + 1),
             });
         }
 
@@ -215,7 +226,7 @@ impl Sm12xKvCache {
                     self.value_scales.as_mut_ptr().cast(),
                     self.key_tail.as_mut_ptr().cast(),
                     self.value_tail.as_mut_ptr().cast(),
-                    self.len as u32,
+                    position as u32,
                     self.max_tokens as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
@@ -223,8 +234,51 @@ impl Sm12xKvCache {
                 ),
             )?;
         }
-        self.len += 1;
+        self.len = position + 1;
         Ok(())
+    }
+
+    /// Enqueues one K/V append using a device-resident position for CUDA graphs.
+    pub fn append_indexed_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        position: &DeviceBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.kv_heads * self.head_dim;
+        if key.len() != width || value.len() != width || position.len() != 1 {
+            return Err(Error::Shape {
+                label: "SM12x indexed KV append",
+                expected: format!("K/V rows of {width} values and one position"),
+                actual: format!(
+                    "key={} value={} position={}",
+                    key.len(),
+                    value.len(),
+                    position.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_indexed_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_indexed_on_stream(
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    self.key_values.as_mut_ptr().cast(),
+                    self.key_scales.as_mut_ptr().cast(),
+                    self.value_values.as_mut_ptr().cast(),
+                    self.value_scales.as_mut_ptr().cast(),
+                    self.key_tail.as_mut_ptr().cast(),
+                    self.value_tail.as_mut_ptr().cast(),
+                    position.as_const_ptr().cast(),
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Shortens the logical cache without moving device memory.
@@ -265,7 +319,10 @@ impl Sm12xKvAttentionWorkspace {
                 "SM12x KV query tile bytes",
                 &[query_tile_count, 512],
             )?)?,
-            query_scales: DeviceBuffer::zeroed(query_tile_count)?,
+            query_scales: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV query scale words",
+                &[query_tile_count, MMA_N],
+            )?)?,
             scores: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV scores",
                 &[kv_heads, MMA_N, max_tokens],
@@ -274,7 +331,10 @@ impl Sm12xKvAttentionWorkspace {
                 "SM12x KV probability tile bytes",
                 &[probability_tile_count, 512],
             )?)?,
-            probability_scales: DeviceBuffer::zeroed(probability_tile_count)?,
+            probability_scales: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV probability scale words",
+                &[probability_tile_count, MMA_N],
+            )?)?,
             max_tokens,
             kv_heads,
             head_dim,
@@ -335,6 +395,131 @@ impl Sm12xKvAttentionWorkspace {
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Enqueues compact attention using a device-resident cache length for CUDA graphs.
+    pub fn attention_indexed_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        cache_len: &DeviceBuffer<u32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.max_tokens != self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x indexed KV attention cache",
+                expected: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let output_values = self.kv_heads * MMA_N * self.head_dim;
+        if query.len() != output_values || output.len() != output_values || cache_len.len() != 1 {
+            return Err(Error::Shape {
+                label: "SM12x indexed KV attention",
+                expected: format!("query/output of {output_values} values and one cache length"),
+                actual: format!(
+                    "query={} output={} cache_len={}",
+                    query.len(),
+                    output.len(),
+                    cache_len.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_indexed_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_indexed_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values.as_const_ptr().cast(),
+                    cache.key_scales.as_const_ptr().cast(),
+                    cache.key_tail.as_const_ptr().cast(),
+                    cache.value_values.as_const_ptr().cast(),
+                    cache.value_scales.as_const_ptr().cast(),
+                    cache.value_tail.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    cache_len.as_const_ptr().cast(),
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Enqueues P-to-FP4 and PV from caller-provided f32 probabilities.
+    pub fn pv_from_probabilities_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        probabilities: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0
+            || cache.max_tokens != self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV PV cache",
+                expected: format!(
+                    "non-empty cache with max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "len={} max_tokens={} kv_heads={} head_dim={}",
+                    cache.len, cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let probability_values = self.kv_heads * MMA_N * self.max_tokens;
+        let output_values = self.kv_heads * MMA_N * self.head_dim;
+        if probabilities.len() != probability_values || output.len() != output_values {
+            return Err(Error::Shape {
+                label: "SM12x KV PV probabilities/output",
+                expected: format!("{probability_values} probabilities and {output_values} outputs"),
+                actual: format!(
+                    "probabilities={} output={}",
+                    probabilities.len(),
+                    output.len()
+                ),
+            });
+        }
+
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_pv_from_probabilities_on_stream",
+                crate::ffi::infer_sm12x_kv_pv_from_probabilities_on_stream(
+                    probabilities.as_const_ptr().cast(),
+                    cache.value_values.as_const_ptr().cast(),
+                    cache.value_scales.as_const_ptr().cast(),
+                    cache.value_tail.as_const_ptr().cast(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),

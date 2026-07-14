@@ -5,13 +5,11 @@ use crate::nvfp4::{
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
     MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
     MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, Result, SafeTensorInfo,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, add_f32_into_on_stream,
-    append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    bf16_linear_pair_logits_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    device_weight_gemv_on_stream, fill_f32_into_on_stream,
-    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace,
+    Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
+    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_pair_configured_f32_into_on_stream, fp8_linear_triple_configured_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
@@ -77,8 +75,8 @@ pub struct Qwen36FullAttentionWorkspace {
     pub v: DeviceBuffer<f32>,
     pub q_rope: DeviceBuffer<f32>,
     pub k_rope: DeviceBuffer<f32>,
-    pub key_cache: DeviceBuffer<f32>,
-    pub value_cache: DeviceBuffer<f32>,
+    compact_cache: Sm12xKvCache,
+    compact_attention: Sm12xKvAttentionWorkspace,
     pub attn: DeviceBuffer<f32>,
     pub gated_attn: DeviceBuffer<f32>,
     pub output: DeviceBuffer<f32>,
@@ -531,23 +529,22 @@ impl Qwen36FullAttentionWeights {
         )
     }
 
-    /// Runs one token through this full-attention layer.
-    pub fn run_one_token<'a>(
-        &'a self,
-        workspace: &'a mut Qwen36FullAttentionWorkspace,
+    /// Prepares one token's RoPE'd Q/K and V without appending or running attention.
+    pub fn prepare_qkv_one_token(
+        &self,
+        workspace: &mut Qwen36FullAttentionWorkspace,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: usize,
         stream: &CudaStream,
-    ) -> Result<Qwen36FullAttentionStep<'a>> {
+    ) -> Result<()> {
         if position >= workspace.cache_capacity {
             return Err(Error::Shape {
-                label: "Qwen3.6 full-attention cache",
+                label: "Qwen3.6 full-attention preparation",
                 expected: format!("position < {}", workspace.cache_capacity),
                 actual: position.to_string(),
             });
         }
-
         self.run_qkv_projections(workspace, hidden, stream)?;
         qwen36_full_attn_prep_f32_into_on_stream(
             &workspace.q_proj_output,
@@ -578,32 +575,37 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.k_rope,
             position,
             stream,
-        )?;
-        append_rows_f32_into_on_stream(
+        )
+    }
+
+    /// Runs one token through this full-attention layer.
+    pub fn run_one_token<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36FullAttentionWorkspace,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<Qwen36FullAttentionStep<'a>> {
+        if position >= workspace.cache_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.6 full-attention cache",
+                expected: format!("position < {}", workspace.cache_capacity),
+                actual: position.to_string(),
+            });
+        }
+
+        self.prepare_qkv_one_token(workspace, manifest, hidden, position, stream)?;
+        workspace.compact_cache.append_at_on_stream(
             &workspace.k_rope,
-            workspace.key_cache.output(),
-            position,
-            1,
-            manifest.kv_heads * manifest.head_dim,
-            stream,
-        )?;
-        append_rows_f32_into_on_stream(
             &workspace.v,
-            workspace.value_cache.output(),
             position,
-            1,
-            manifest.kv_heads * manifest.head_dim,
             stream,
         )?;
-        cached_gqa_attention_f32_into_on_stream(
+        workspace.compact_attention.attention_into_on_stream(
+            &workspace.compact_cache,
             &workspace.q_rope,
-            &workspace.key_cache,
-            &workspace.value_cache,
             workspace.attn.output(),
-            position + 1,
-            manifest.q_heads,
-            manifest.kv_heads,
-            manifest.head_dim,
             stream,
         )?;
         sigmoid_mul_f32_into_on_stream(
@@ -668,36 +670,21 @@ impl Qwen36FullAttentionWeights {
             position,
             stream,
         )?;
-        append_rows_f32_indexed_into_on_stream(
+        workspace.compact_cache.append_indexed_on_stream(
             &workspace.k_rope,
-            workspace.key_cache.output(),
-            position,
-            workspace.cache_capacity - 1,
-            1,
-            manifest.kv_heads * manifest.head_dim,
-            stream,
-        )?;
-        append_rows_f32_indexed_into_on_stream(
             &workspace.v,
-            workspace.value_cache.output(),
             position,
-            workspace.cache_capacity - 1,
-            1,
-            manifest.kv_heads * manifest.head_dim,
             stream,
         )?;
-        cached_gqa_attention_f32_indexed_into_on_stream(
-            &workspace.q_rope,
-            &workspace.key_cache,
-            &workspace.value_cache,
-            workspace.attn.output(),
-            cache_len,
-            workspace.cache_capacity,
-            manifest.q_heads,
-            manifest.kv_heads,
-            manifest.head_dim,
-            stream,
-        )?;
+        workspace
+            .compact_attention
+            .attention_indexed_into_on_stream(
+                &workspace.compact_cache,
+                &workspace.q_rope,
+                cache_len,
+                workspace.attn.output(),
+                stream,
+            )?;
         sigmoid_mul_f32_into_on_stream(
             &workspace.gate,
             &workspace.attn,
@@ -1169,8 +1156,12 @@ impl Qwen36FullAttentionWorkspace {
             v: DeviceBuffer::zeroed(kv_width)?,
             q_rope: DeviceBuffer::zeroed(q_width)?,
             k_rope: DeviceBuffer::zeroed(kv_width)?,
-            key_cache: DeviceBuffer::zeroed(cache_capacity * kv_width)?,
-            value_cache: DeviceBuffer::zeroed(cache_capacity * kv_width)?,
+            compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
+            compact_attention: Sm12xKvAttentionWorkspace::new(
+                cache_capacity,
+                manifest.kv_heads,
+                manifest.head_dim,
+            )?,
             attn: DeviceBuffer::zeroed(q_width)?,
             gated_attn: DeviceBuffer::zeroed(q_width)?,
             output: DeviceBuffer::zeroed(manifest.hidden)?,
