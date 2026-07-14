@@ -632,6 +632,145 @@ extern "C" cudaError_t infer_sm12x_quantize_dynamic_vector_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_sm12x_kv_copy_tail_kernel(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    float* __restrict__ key_tail,
+    float* __restrict__ value_tail,
+    std::uint32_t position,
+    std::uint32_t width)
+{
+    const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const std::uint32_t destination = (position & 15u) * width + column;
+    key_tail[destination] = key[column];
+    value_tail[destination] = value[column];
+}
+
+__global__ void infer_sm12x_kv_finalize_key_kernel(
+    const float* __restrict__ key_tail,
+    std::uint8_t* __restrict__ key_values,
+    std::uint8_t* __restrict__ key_scales,
+    std::uint32_t position,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t k_block = blockIdx.y;
+    if (head >= kv_heads || k_block >= head_dim / 16 || threadIdx.x != 0) return;
+
+    const std::uint32_t width = kv_heads * head_dim;
+    const std::uint32_t tail_start = (position & 15u) & ~7u;
+    float max_abs = 0.0f;
+    for (std::uint32_t token = 0; token < 8; ++token) {
+        for (std::uint32_t offset = 0; offset < 16; ++offset) {
+            const float value = key_tail[(tail_start + token) * width + head * head_dim + k_block * 16 + offset];
+            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+        }
+    }
+    const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+    const float scale = infer_e4m3_value(scale_code);
+
+    const std::uint32_t token_tiles = (max_tokens + 7) / 8;
+    const std::uint32_t k_tiles = head_dim / 64;
+    const std::uint32_t token_tile = position / 8;
+    const std::uint32_t k_tile = k_block / 4;
+    const std::uint32_t scale_block = k_block & 3u;
+    const std::uint32_t tile = (head * token_tiles + token_tile) * k_tiles + k_tile;
+    std::uint8_t* packed = key_values + tile * 256;
+    for (std::uint32_t token = 0; token < 8; ++token) {
+        for (std::uint32_t offset = 0; offset < 16; ++offset) {
+            const float value = key_tail[(tail_start + token) * width + head * head_dim + k_block * 16 + offset];
+            const std::uint8_t code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
+            infer_set_packed_nibble(packed, token * 64 + scale_block * 16 + offset, code);
+        }
+    }
+    key_scales[tile * 4 + scale_block] = scale_code;
+}
+
+__global__ void infer_sm12x_kv_finalize_value_kernel(
+    const float* __restrict__ value_tail,
+    std::uint8_t* __restrict__ value_values,
+    std::uint8_t* __restrict__ value_scales,
+    std::uint32_t position,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t dim_tile = blockIdx.y;
+    if (head >= kv_heads || dim_tile >= head_dim / 8 || threadIdx.x != 0) return;
+
+    const std::uint32_t width = kv_heads * head_dim;
+    float max_abs = 0.0f;
+    for (std::uint32_t dim = 0; dim < 8; ++dim) {
+        for (std::uint32_t token = 0; token < 16; ++token) {
+            const float value = value_tail[token * width + head * head_dim + dim_tile * 8 + dim];
+            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+        }
+    }
+    const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+    const float scale = infer_e4m3_value(scale_code);
+
+    const std::uint32_t token_tiles = (max_tokens + 63) / 64;
+    const std::uint32_t token_tile = position / 64;
+    const std::uint32_t scale_block = (position & 63u) / 16;
+    const std::uint32_t tile = (head * (head_dim / 8) + dim_tile) * token_tiles + token_tile;
+    std::uint8_t* packed = value_values + tile * 256;
+    for (std::uint32_t dim = 0; dim < 8; ++dim) {
+        for (std::uint32_t token = 0; token < 16; ++token) {
+            const float value = value_tail[token * width + head * head_dim + dim_tile * 8 + dim];
+            const std::uint8_t code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
+            infer_set_packed_nibble(packed, dim * 64 + scale_block * 16 + token, code);
+        }
+    }
+    value_scales[tile * 4 + scale_block] = scale_code;
+}
+
+extern "C" cudaError_t infer_sm12x_kv_cache_append_on_stream(
+    const float* key,
+    const float* value,
+    std::uint8_t* key_values,
+    std::uint8_t* key_scales,
+    std::uint8_t* value_values,
+    std::uint8_t* value_scales,
+    float* key_tail,
+    float* value_tail,
+    std::uint32_t position,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream)
+{
+    if (key == nullptr || value == nullptr || key_values == nullptr || key_scales == nullptr ||
+        value_values == nullptr || value_scales == nullptr || key_tail == nullptr ||
+        value_tail == nullptr || position >= max_tokens || kv_heads == 0 || head_dim == 0 ||
+        (head_dim % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t width = kv_heads * head_dim;
+    infer_sm12x_kv_copy_tail_kernel<<<(width + 255) / 256, 256, 0, stream>>>(
+        key, value, key_tail, value_tail, position, width);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+
+    if ((position & 7u) == 7u) {
+        infer_sm12x_kv_finalize_key_kernel<<<dim3(kv_heads, head_dim / 16, 1), 1, 0, stream>>>(
+            key_tail, key_values, key_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    if ((position & 15u) == 15u) {
+        infer_sm12x_kv_finalize_value_kernel<<<dim3(kv_heads, head_dim / 8, 1), 1, 0, stream>>>(
+            value_tail, value_values, value_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+    }
+    return status;
+}
+
 __global__ void infer_sm12x_moe_silu_quantize_slots_reference_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* const* __restrict__ gate_up_table,

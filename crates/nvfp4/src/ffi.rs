@@ -244,6 +244,21 @@ unsafe extern "C" {
         sfb: *mut u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_cache_append_on_stream(
+        key: *const f32,
+        value: *const f32,
+        key_values: *mut u8,
+        key_scales: *mut u8,
+        value_values: *mut u8,
+        value_scales: *mut u8,
+        key_tail: *mut f32,
+        value_tail: *mut f32,
+        position: u32,
+        max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_moe_silu_quantize_slots_on_stream(
         indices: *const u32,
         gate_up_table: *const *const f32,
