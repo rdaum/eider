@@ -237,6 +237,13 @@ unsafe extern "C" {
         sfb: *mut u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_quantize_dynamic_vector_on_stream(
+        input: *const f32,
+        k: u32,
+        b_native_tiles: *mut u8,
+        sfb: *mut u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_moe_silu_quantize_slots_on_stream(
         indices: *const u32,
         gate_up_table: *const *const f32,
@@ -620,6 +627,24 @@ unsafe extern "C" {
         scales: *mut u8,
         rows: u32,
         input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_cached_gqa_attention_nvfp4_on_stream(
+        query: *const f32,
+        key_cache: *const u8,
+        key_scales: *const u8,
+        value_cache: *const u8,
+        value_scales: *const u8,
+        output: *mut f32,
+        cache_len: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_softmax_f32_in_place_on_stream(
+        values: *mut f32,
+        len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_silu_mul_halves_quantize_nvfp4_col_major_f32_on_stream(

@@ -728,6 +728,44 @@ pub fn device_weight_gemv_on_stream(
     )
 }
 
+/// Multiplies a native SM12x FP4 weight by raw native vector buffers.
+///
+/// This is for vectors produced directly on the device, such as dynamically
+/// quantized attention probabilities.
+pub fn device_weight_gemv_native_vector_on_stream(
+    weight: &Sm12xFp4DeviceGemmWeight,
+    vector_tiles: &DeviceBuffer<u8>,
+    vector_scales: &DeviceBuffer<u32>,
+    out: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if vector_tiles.len() != weight.k_tiles * TILE_BYTES || vector_scales.len() != weight.k_tiles {
+        return Err(crate::Error::Shape {
+            label: "SM12x FP4 native GEMV vector",
+            expected: format!(
+                "tiles={} scales={}",
+                weight.k_tiles * TILE_BYTES,
+                weight.k_tiles
+            ),
+            actual: format!(
+                "tiles={} scales={}",
+                vector_tiles.len(),
+                vector_scales.len()
+            ),
+        });
+    }
+    native_gemv_on_stream(
+        &weight.tiles,
+        vector_tiles,
+        &weight.scales,
+        vector_scales,
+        weight.m_tiles,
+        weight.k_tiles,
+        out,
+        stream,
+    )
+}
+
 pub fn quantize_fixed_scale_vector_on_stream(
     input: &DeviceBuffer<f32>,
     input_scale: f32,
@@ -767,6 +805,64 @@ pub fn quantize_fixed_scale_vector_on_stream(
             ),
         )
     }
+}
+
+/// Dynamically quantizes a f32 vector into SM12x native FP4 tiles with one
+/// UE4M3 scale per 16 values.
+pub fn quantize_dynamic_vector_on_stream(
+    input: &DeviceBuffer<f32>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(64)
+        || b_native_tiles.len() != input.len() / 64 * TILE_BYTES
+        || sfb.len() != input.len() / 64
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x dynamic vector quantization",
+            expected: "K multiple of 64, B native tiles [K/64], SFB [K/64]".to_string(),
+            actual: format!(
+                "K={} B={} SFB={}",
+                input.len(),
+                b_native_tiles.len(),
+                sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_quantize_dynamic_vector_on_stream",
+            crate::ffi::infer_sm12x_quantize_dynamic_vector_on_stream(
+                input.as_const_ptr().cast(),
+                input.len() as u32,
+                b_native_tiles.as_mut_ptr().cast(),
+                sfb.as_mut_ptr().cast(),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Takes ownership of native SM12x FP4 vector buffers.
+pub fn device_vector_from_native_parts(
+    tiles: DeviceBuffer<u8>,
+    scales: DeviceBuffer<u32>,
+) -> Result<Sm12xFp4DeviceGemmVector> {
+    let k_tiles = scales.len();
+    if k_tiles == 0 || tiles.len() != k_tiles * TILE_BYTES {
+        return Err(crate::Error::Shape {
+            label: "SM12x FP4 device vector",
+            expected: "native tiles [K/64] and scales [K/64]".to_string(),
+            actual: format!("tiles={} scales={}", tiles.len(), scales.len()),
+        });
+    }
+    Ok(Sm12xFp4DeviceGemmVector {
+        tiles,
+        scales,
+        k_tiles,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

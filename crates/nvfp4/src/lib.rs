@@ -43,9 +43,9 @@ pub use kernels::non_gemm::{
     argmax_f32_into_on_stream, bf16_linear_argmax_f32, bf16_linear_argmax_f32_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
     bf16_matrix_to_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, fill_f32_into_on_stream,
-    fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, cached_gqa_attention_nvfp4_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream,
@@ -64,6 +64,7 @@ pub use kernels::non_gemm::{
     nvfp4_w4a16_top1_configured_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
     prefill_gqa_attention_f32_into, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_fp8_e4m3_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
+    quantize_nvfp4_simple_scales_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
     qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
@@ -75,15 +76,17 @@ pub use kernels::non_gemm::{
     scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_f32_into_on_stream,
     silu_mul_halves_f32_into_on_stream,
-    silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, split_q_gate_f32_into_on_stream,
-    split_qkv_f32_into_on_stream,
+    silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
+    split_q_gate_f32_into_on_stream, split_qkv_f32_into_on_stream,
 };
 pub use kernels::sm12x_mma::{
     Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xFp4Tile, Sm12xFp4TileSet, Sm12xRequantizedVector, Sm12xRequantizedWeight,
+    device_vector_from_native_parts, device_weight_gemv_native_vector_on_stream,
     device_weight_gemv_on_stream, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
     moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_silu_quantize_slots_reference_on_stream, quantize_fixed_scale_vector_on_stream,
+    moe_silu_quantize_slots_reference_on_stream, quantize_dynamic_vector_on_stream,
+    quantize_fixed_scale_vector_on_stream,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt::{

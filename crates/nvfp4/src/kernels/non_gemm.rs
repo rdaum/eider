@@ -1799,6 +1799,151 @@ pub fn quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
     }
 }
 
+/// Quantizes a flat f32 device buffer to packed NVFP4 E2M1 with one UE4M3
+/// scale per 16 consecutive values.
+///
+/// This is a compact streaming layout for cache experiments, not cuBLASLt's
+/// tiled matrix-scale layout.
+pub fn quantize_nvfp4_simple_scales_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    packed: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty()
+        || packed.len() != input.len().div_ceil(2)
+        || scales.len() != input.len().div_ceil(16)
+        || input.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "NVFP4 simple-scale quantization",
+            expected: "non-empty input with packed=len/2 and scales=len/16".to_string(),
+            actual: format!(
+                "input={} packed={} scales={}",
+                input.len(),
+                packed.len(),
+                scales.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_quantize_nvfp4_vector_simple_scales_f32_on_stream",
+            ffi::infer_quantize_nvfp4_vector_simple_scales_f32_on_stream(
+                input.ptr,
+                packed.ptr,
+                scales.ptr,
+                input.len() as u32,
+                1.0,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues one-token GQA over an NVFP4 K/V cache.
+///
+/// K/V use packed E2M1 values with one UE4M3 scale per 16 consecutive cache
+/// elements. Q and online-softmax accumulation stay f32. This is a focused
+/// cache-format probe and does not yet issue FP4 MMA instructions.
+pub fn cached_gqa_attention_nvfp4_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<u8>,
+    key_scales: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    value_scales: &DeviceBuffer<u8>,
+    mut output: DeviceOutput<'_, f32>,
+    cache_len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_len = q_heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "NVFP4 cached GQA query",
+        expected: "q_heads * head_dim without overflow".to_string(),
+        actual: format!("q_heads={q_heads} head_dim={head_dim}"),
+    })?;
+    let cache_values = cache_len
+        .checked_mul(kv_heads)
+        .and_then(|len| len.checked_mul(head_dim))
+        .ok_or_else(|| Error::Shape {
+            label: "NVFP4 cached GQA cache",
+            expected: "cache_len * kv_heads * head_dim without overflow".to_string(),
+            actual: format!("cache_len={cache_len} kv_heads={kv_heads} head_dim={head_dim}"),
+        })?;
+    if query.len() != query_len
+        || output.len() != query_len
+        || key_cache.len() != cache_values.div_ceil(2)
+        || value_cache.len() != cache_values.div_ceil(2)
+        || key_scales.len() != cache_values.div_ceil(16)
+        || value_scales.len() != cache_values.div_ceil(16)
+        || cache_len == 0
+        || q_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || head_dim > 256
+        || !q_heads.is_multiple_of(kv_heads)
+        || cache_len > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "NVFP4 cached GQA dimensions",
+            expected: "matching packed K/V, per-16 scales, and valid GQA dimensions".to_string(),
+            actual: format!(
+                "query={} output={} cache_values={cache_values} key={} key_scales={} value={} value_scales={} cache_len={cache_len} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}",
+                query.len(),
+                output.len(),
+                key_cache.len(),
+                key_scales.len(),
+                value_cache.len(),
+                value_scales.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_cached_gqa_attention_nvfp4_on_stream",
+            ffi::infer_cached_gqa_attention_nvfp4_on_stream(
+                query.ptr,
+                key_cache.ptr,
+                key_scales.ptr,
+                value_cache.ptr,
+                value_scales.ptr,
+                output.buffer_mut().ptr,
+                cache_len as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies a numerically stable f32 softmax to one device-resident vector.
+pub fn softmax_f32_in_place_on_stream(
+    values: &mut DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if values.is_empty() || values.len() > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "f32 softmax",
+            expected: "non-empty u32-sized vector".to_string(),
+            actual: values.len().to_string(),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_softmax_f32_in_place_on_stream",
+            ffi::infer_softmax_f32_in_place_on_stream(
+                values.ptr,
+                values.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(missing_docs)]
 pub fn silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream(
     gate_up: &DeviceBuffer<f32>,
