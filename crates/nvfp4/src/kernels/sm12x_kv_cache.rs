@@ -1,7 +1,7 @@
 //! Compact SM12x FP4 cache storage and append-time quantization.
 
 use crate::cuda::check_cuda;
-use crate::{CudaStream, DeviceBuffer, Error, Result};
+use crate::{CudaStream, DeviceBuffer, DeviceOutput, Error, Result};
 
 const K_TOKEN_TILE: usize = 8;
 const V_TOKEN_BLOCK: usize = 16;
@@ -26,6 +26,18 @@ pub struct Sm12xKvCache {
     value_tail: DeviceBuffer<f32>,
     max_tokens: usize,
     len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+/// Reusable device workspace for compact-cache FP4 attention.
+pub struct Sm12xKvAttentionWorkspace {
+    query_tiles: DeviceBuffer<u8>,
+    query_scales: DeviceBuffer<u32>,
+    scores: DeviceBuffer<f32>,
+    probability_tiles: DeviceBuffer<u8>,
+    probability_scales: DeviceBuffer<u32>,
+    max_tokens: usize,
     kv_heads: usize,
     head_dim: usize,
 }
@@ -214,6 +226,132 @@ impl Sm12xKvCache {
         self.len += 1;
         Ok(())
     }
+
+    /// Shortens the logical cache without moving device memory.
+    ///
+    /// Subsequent appends overwrite any compact tiles or staging rows that
+    /// become reachable again. This is suitable for speculative decode
+    /// rollback and for reusing a measured decode position.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.len {
+            return Err(Error::Shape {
+                label: "SM12x KV cache truncate",
+                expected: format!("at most {} rows", self.len),
+                actual: format!("{len} rows"),
+            });
+        }
+        self.len = len;
+        Ok(())
+    }
+}
+
+impl Sm12xKvAttentionWorkspace {
+    /// Allocates scratch for a cache with the given shape.
+    pub fn new(max_tokens: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
+        if max_tokens == 0 || kv_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(MMA_K) {
+            return Err(Error::Shape {
+                label: "SM12x KV attention workspace",
+                expected: "non-zero sizes and head_dim multiple of 64".to_string(),
+                actual: format!("max_tokens={max_tokens} kv_heads={kv_heads} head_dim={head_dim}"),
+            });
+        }
+        let head_k_tiles = head_dim / MMA_K;
+        let context_tiles = max_tokens.div_ceil(MMA_K);
+        let query_tile_count = checked_product("SM12x KV query tiles", &[kv_heads, head_k_tiles])?;
+        let probability_tile_count =
+            checked_product("SM12x KV probability tiles", &[kv_heads, context_tiles])?;
+        Ok(Self {
+            query_tiles: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV query tile bytes",
+                &[query_tile_count, 512],
+            )?)?,
+            query_scales: DeviceBuffer::zeroed(query_tile_count)?,
+            scores: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV scores",
+                &[kv_heads, MMA_N, max_tokens],
+            )?)?,
+            probability_tiles: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV probability tile bytes",
+                &[probability_tile_count, 512],
+            )?)?,
+            probability_scales: DeviceBuffer::zeroed(probability_tile_count)?,
+            max_tokens,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Enqueues Q-to-FP4, QK, f32 online softmax, P-to-FP4, and PV.
+    pub fn attention_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0 {
+            return Err(Error::Shape {
+                label: "SM12x KV attention cache length",
+                expected: "at least one token".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        if cache.max_tokens != self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV attention cache",
+                expected: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let output_values = self.kv_heads * MMA_N * self.head_dim;
+        if query.len() != output_values || output.len() != output_values {
+            return Err(Error::Shape {
+                label: "SM12x KV attention query/output",
+                expected: format!("{output_values} values"),
+                actual: format!("query={} output={}", query.len(), output.len()),
+            });
+        }
+
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values.as_const_ptr().cast(),
+                    cache.key_scales.as_const_ptr().cast(),
+                    cache.key_tail.as_const_ptr().cast(),
+                    cache.value_values.as_const_ptr().cast(),
+                    cache.value_scales.as_const_ptr().cast(),
+                    cache.value_tail.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Returns the f32 score/probability scratch for validation.
+    pub fn scores(&self) -> &DeviceBuffer<f32> {
+        &self.scores
+    }
 }
 
 fn checked_product(label: &'static str, values: &[usize]) -> Result<usize> {
@@ -383,5 +521,131 @@ mod tests {
                 &value_rows[source_token]
             );
         }
+    }
+
+    #[test]
+    fn compact_mma_attention_tracks_f32_gqa_through_incomplete_tails() {
+        const MAX_TOKENS: usize = 64;
+        const TOKENS: usize = 17;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        let width = KV_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * width)
+            .map(|index| ((index * 31 % 251) as f32 - 125.0) / 512.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * width)
+            .map(|index| ((index * 47 % 257) as f32 - 128.0) / 384.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 19 % 239) as f32 - 119.0) / 448.0)
+            .collect::<Vec<_>>();
+
+        let mut cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        for token in 0..TOKENS {
+            let key = DeviceBuffer::from_host(&key_host[token * width..(token + 1) * width])
+                .expect("key row");
+            let value = DeviceBuffer::from_host(&value_host[token * width..(token + 1) * width])
+                .expect("value row");
+            cache.append(&key, &value).expect("append");
+        }
+
+        let stream = CudaStream::new_blocking().expect("stream");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let key_f32 = DeviceBuffer::from_host(&key_host).expect("K cache");
+        let value_f32 = DeviceBuffer::from_host(&value_host).expect("V cache");
+        let mut expected = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("f32 output");
+        crate::cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key_f32,
+            &value_f32,
+            expected.output(),
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("f32 attention");
+        let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+        workspace
+            .attention_into_on_stream(&cache, &query, actual.output(), &stream)
+            .expect("compact attention");
+        let expected = expected.copy_to_host(&stream).expect("f32 copy");
+        let actual = actual.copy_to_host(&stream).expect("FP4 copy");
+        let max_abs = expected
+            .iter()
+            .zip(actual.iter())
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.25,
+            "compact FP4 attention error too large: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn compact_mma_attention_tracks_f32_gqa_at_qwen_shape() {
+        const MAX_TOKENS: usize = 128;
+        const TOKENS: usize = 65;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        let width = KV_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * width)
+            .map(|index| ((index * 31 % 509) as f32 - 254.0) / 768.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * width)
+            .map(|index| ((index * 43 % 503) as f32 - 251.0) / 640.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 17 % 251) as f32 - 125.0) / 576.0)
+            .collect::<Vec<_>>();
+
+        let mut cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        for token in 0..TOKENS {
+            let key = DeviceBuffer::from_host(&key_host[token * width..(token + 1) * width])
+                .expect("key row");
+            let value = DeviceBuffer::from_host(&value_host[token * width..(token + 1) * width])
+                .expect("value row");
+            cache.append(&key, &value).expect("append");
+        }
+
+        let stream = CudaStream::new_blocking().expect("stream");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let key_f32 = DeviceBuffer::from_host(&key_host).expect("K cache");
+        let value_f32 = DeviceBuffer::from_host(&value_host).expect("V cache");
+        let mut expected = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("f32 output");
+        crate::cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key_f32,
+            &value_f32,
+            expected.output(),
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("f32 attention");
+        let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+        workspace
+            .attention_into_on_stream(&cache, &query, actual.output(), &stream)
+            .expect("compact attention");
+        let expected = expected.copy_to_host(&stream).expect("f32 copy");
+        let actual = actual.copy_to_host(&stream).expect("FP4 copy");
+        let max_abs = expected
+            .iter()
+            .zip(actual.iter())
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.25,
+            "Qwen-shape compact FP4 attention error too large: max_abs={max_abs}"
+        );
     }
 }
