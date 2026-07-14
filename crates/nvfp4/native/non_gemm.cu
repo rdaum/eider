@@ -2360,6 +2360,7 @@ __global__ void infer_flash_decode_attention_f32_indexed_kernel(
             acc = acc * scale_factor;
             acc = __fmaf_rn(weight, v[tid], acc);
         }
+        __syncthreads();
     }
 
     // Write the normalized output. Thread 0 owns the true running sum; publish
@@ -2450,6 +2451,7 @@ __global__ void infer_flash_decode_attention_f32_kernel(
             acc = acc * scale_factor;
             acc = __fmaf_rn(weight, v[tid], acc);
         }
+        __syncthreads();
     }
     if (threadIdx.x == 0) {
         partial[0] = s;
@@ -2508,6 +2510,127 @@ extern "C" cudaError_t infer_cached_gqa_attention_f32_on_stream(
         infer_cached_gqa_attention_f32_kernel<<<q_heads, kThreads, kThreads * sizeof(float), stream>>>(
             query, key_cache, value_cache, output, cache_len, q_heads, kv_heads, head_dim);
     }
+    return cudaGetLastError();
+}
+
+// NVFP4 KV-cache viability probe. K/V values are packed E2M1 (two values per
+// byte) with one UE4M3 scale per contiguous 16-value block. Q and the
+// online-softmax accumulator remain f32. This measures whether cache traffic
+// and numerical error justify a later SM12x MMA layout; it is not that layout.
+__device__ __forceinline__ float infer_e2m1_cache_value(std::uint8_t nibble) {
+    const float magnitude = (nibble & 0x7) == 0x0 ? 0.0f
+        : (nibble & 0x7) == 0x1 ? 0.5f : (nibble & 0x7) == 0x2 ? 1.0f
+        : (nibble & 0x7) == 0x3 ? 1.5f : (nibble & 0x7) == 0x4 ? 2.0f
+        : (nibble & 0x7) == 0x5 ? 3.0f : (nibble & 0x7) == 0x6 ? 4.0f : 6.0f;
+    return (nibble & 0x8) == 0 ? magnitude : -magnitude;
+}
+
+__device__ __forceinline__ float infer_nvfp4_cache_value(
+    const std::uint8_t* packed, const std::uint8_t* scales, std::size_t index) {
+    const std::uint8_t byte = packed[index >> 1];
+    const std::uint8_t nibble = (index & 1) == 0 ? byte & 0x0f : byte >> 4;
+    return infer_e2m1_cache_value(nibble) * infer_e4m3_value(scales[index >> 4]);
+}
+
+__global__ void infer_flash_decode_attention_nvfp4_kernel(
+    const float* query, const std::uint8_t* key_cache, const std::uint8_t* key_scales,
+    const std::uint8_t* value_cache, const std::uint8_t* value_scales, float* output,
+    std::uint32_t cache_len, std::uint32_t q_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+    extern __shared__ float shmem[];
+    float* q_sh = shmem;
+    float* partial = shmem + head_dim;
+    const std::uint32_t q_head = blockIdx.x;
+    if (q_head >= q_heads || head_dim > blockDim.x) return;
+    const std::uint32_t kv_head = q_head / (q_heads / kv_heads);
+    const std::uint32_t kv_width = kv_heads * head_dim;
+    const float* q_in = query + q_head * head_dim;
+    for (std::uint32_t index = threadIdx.x; index < head_dim; index += blockDim.x) q_sh[index] = q_in[index];
+    __syncthreads();
+    float maximum = -INFINITY;
+    float sum = 0.0f;
+    float accum = 0.0f;
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t lane = tid & 31u;
+    const std::uint32_t warp = tid >> 5u;
+    for (std::uint32_t row = 0; row < cache_len; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * kv_width + kv_head * head_dim;
+        float dot = tid < head_dim ? q_sh[tid] * infer_nvfp4_cache_value(key_cache, key_scales, base + tid) : 0.0f;
+        dot += __shfl_xor_sync(0xffffffffu, dot, 16);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 8);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+        if (lane == 0) partial[warp] = dot;
+        __syncthreads();
+        if (warp == 0 && lane == 0) {
+            dot = 0.0f;
+            for (std::uint32_t index = 0; index < blockDim.x / 32; ++index) dot += partial[index];
+            const float score = dot * rsqrtf(static_cast<float>(head_dim));
+            const float rescale = score > maximum ? expf(maximum - score) : 1.0f;
+            const float weight = score > maximum ? 1.0f : expf(score - maximum);
+            maximum = fmaxf(maximum, score);
+            sum = sum * rescale + weight;
+            partial[0] = rescale;
+            partial[1] = weight;
+        }
+        __syncthreads();
+        if (tid < head_dim) accum = __fmaf_rn(partial[1], infer_nvfp4_cache_value(value_cache, value_scales, base + tid), accum * partial[0]);
+        __syncthreads();
+    }
+    if (tid == 0) partial[0] = sum;
+    __syncthreads();
+    if (tid < head_dim) output[q_head * head_dim + tid] = accum / partial[0];
+}
+
+extern "C" cudaError_t infer_cached_gqa_attention_nvfp4_on_stream(
+    const float* query, const std::uint8_t* key_cache, const std::uint8_t* key_scales,
+    const std::uint8_t* value_cache, const std::uint8_t* value_scales, float* output,
+    std::uint32_t cache_len, std::uint32_t q_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    if (query == nullptr || key_cache == nullptr || key_scales == nullptr || value_cache == nullptr ||
+        value_scales == nullptr || output == nullptr || cache_len == 0 || q_heads == 0 || kv_heads == 0 ||
+        head_dim == 0 || head_dim > kThreads || (q_heads % kv_heads) != 0) return cudaErrorInvalidValue;
+    infer_flash_decode_attention_nvfp4_kernel<<<q_heads, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
+        query, key_cache, key_scales, value_cache, value_scales, output, cache_len, q_heads, kv_heads, head_dim);
+    return cudaGetLastError();
+}
+
+__global__ void infer_softmax_f32_in_place_kernel(float* values, std::uint32_t len) {
+    __shared__ float partial[256];
+    const std::uint32_t tid = threadIdx.x;
+    float maximum = -INFINITY;
+    for (std::uint32_t index = tid; index < len; index += blockDim.x) {
+        maximum = fmaxf(maximum, values[index]);
+    }
+    partial[tid] = maximum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] = fmaxf(partial[tid], partial[tid + stride]);
+        __syncthreads();
+    }
+    maximum = partial[0];
+    float sum = 0.0f;
+    for (std::uint32_t index = tid; index < len; index += blockDim.x) {
+        const float weight = expf(values[index] - maximum);
+        values[index] = weight;
+        sum += weight;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inverse_sum = 1.0f / partial[0];
+    for (std::uint32_t index = tid; index < len; index += blockDim.x) values[index] *= inverse_sum;
+}
+
+extern "C" cudaError_t infer_softmax_f32_in_place_on_stream(
+    float* values, std::uint32_t len, cudaStream_t stream) {
+    if (values == nullptr || len == 0) return cudaErrorInvalidValue;
+    infer_softmax_f32_in_place_kernel<<<1, 256, 0, stream>>>(values, len);
     return cudaGetLastError();
 }
 

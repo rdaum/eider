@@ -582,6 +582,56 @@ extern "C" cudaError_t infer_sm12x_quantize_fixed_scale_vector_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_sm12x_quantize_dynamic_vector_kernel(
+    const float* input, std::uint32_t k_tiles, std::uint8_t* b_native_tiles,
+    std::uint32_t* sfb) {
+    const std::uint32_t kt = blockIdx.x;
+    if (kt >= k_tiles) return;
+    std::uint8_t* tile = b_native_tiles + kt * 512;
+    for (int index = threadIdx.x; index < 512; index += blockDim.x) tile[index] = 0;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    std::uint8_t codes[64];
+    std::uint8_t scale_codes[4];
+    for (int block = 0; block < 4; ++block) {
+        float max_abs = 0.0f;
+        for (int offset = 0; offset < 16; ++offset) {
+            max_abs = fmaxf(max_abs, fabsf(input[kt * 64 + block * 16 + offset]));
+        }
+        scale_codes[block] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        const float scale = infer_e4m3_value(scale_codes[block]);
+        for (int offset = 0; offset < 16; ++offset) {
+            const float value = input[kt * 64 + block * 16 + offset];
+            codes[block * 16 + offset] = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
+        }
+    }
+    for (int lane = 0; lane < 32; ++lane) {
+        const int t0 = lane & 3;
+        const int t1 = lane >> 2;
+        for (int v = 0; v < 16; ++v) {
+            const int v0 = v & 7;
+            const int v1 = (v >> 3) & 1;
+            const int col = t0 * 8 + v0 + 32 * v1;
+            infer_set_packed_nibble(tile, lane * 32 + v, codes[col]);
+        }
+    }
+    sfb[kt] = static_cast<std::uint32_t>(scale_codes[0])
+        | (static_cast<std::uint32_t>(scale_codes[1]) << 8)
+        | (static_cast<std::uint32_t>(scale_codes[2]) << 16)
+        | (static_cast<std::uint32_t>(scale_codes[3]) << 24);
+}
+
+extern "C" cudaError_t infer_sm12x_quantize_dynamic_vector_on_stream(
+    const float* input, std::uint32_t k, std::uint8_t* b_native_tiles,
+    std::uint32_t* sfb, cudaStream_t stream) {
+    if (input == nullptr || b_native_tiles == nullptr || sfb == nullptr || k == 0 || (k % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_sm12x_quantize_dynamic_vector_kernel<<<k / 64, 128, 0, stream>>>(input, k / 64, b_native_tiles, sfb);
+    return cudaGetLastError();
+}
+
 __global__ void infer_sm12x_moe_silu_quantize_slots_reference_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* const* __restrict__ gate_up_table,

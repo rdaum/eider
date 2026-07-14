@@ -57,6 +57,10 @@ harness = false
 name = "gated_delta_net"
 harness = false
 
+[[bench]]
+name = "nvfp4_kv_attention"
+harness = false
+
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"
