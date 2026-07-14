@@ -1,6 +1,6 @@
 use infer::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, format,
-    nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
+    Sm12xKvCache, format, nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
 use infer::qwen3::qwen36::{
     Qwen36Attention, Qwen36AttentionWorkspace, Qwen36LayerBlock, Qwen36Model,
@@ -685,6 +685,9 @@ fn seq_full_attn_bisect(
         blocks.push(block);
         workspaces.push(ws);
     }
+    let mut compact_cache = Sm12xKvCache::new(tokens.len(), manifest.kv_heads, manifest.head_dim)?;
+    let mut compact_workspace =
+        Sm12xKvAttentionWorkspace::new(tokens.len(), manifest.kv_heads, manifest.head_dim)?;
 
     for (pos, token) in tokens.iter().copied().enumerate() {
         let emb = load_bf16_row(
@@ -710,20 +713,30 @@ fn seq_full_attn_bisect(
         }
 
         if pos < target_pos {
-            let step = blocks[target_layer].run_one_token(
-                &lt,
-                &mut workspaces[target_layer],
-                manifest,
-                &hidden_device,
-                pos,
-                &stream,
-                None,
-                None,
-            )?;
-            println!(
-                "primed target layer {target_layer} pos {pos}: outmax={:.6}",
-                max_abs(&step.output.copy_to_host(&stream)?)
-            );
+            {
+                let step = blocks[target_layer].run_one_token(
+                    &lt,
+                    &mut workspaces[target_layer],
+                    manifest,
+                    &hidden_device,
+                    pos,
+                    &stream,
+                    None,
+                    None,
+                )?;
+                println!(
+                    "primed target layer {target_layer} pos {pos}: outmax={:.6}",
+                    max_abs(&step.output.copy_to_host(&stream)?)
+                );
+            }
+            match &workspaces[target_layer].attention {
+                Qwen36AttentionWorkspace::FullAttention(ws) => {
+                    compact_cache.append_on_stream(&ws.k_rope, &ws.v, &stream)?;
+                }
+                Qwen36AttentionWorkspace::LinearAttention(_) => {
+                    unreachable!("target layer must be full attention")
+                }
+            }
             continue;
         }
 
@@ -752,6 +765,17 @@ fn seq_full_attn_bisect(
                         step.attn.copy_to_host(&stream)?.into_vec(),
                     )
                 };
+                compact_cache.append_on_stream(&ws.k_rope, &ws.v, &stream)?;
+                let mut compact_attn = DeviceBuffer::zeroed(manifest.q_heads * manifest.head_dim)?;
+                compact_workspace.attention_into_on_stream(
+                    &compact_cache,
+                    &ws.q_rope,
+                    compact_attn.output(),
+                    &stream,
+                )?;
+                let compact_attn = compact_attn.copy_to_host(&stream)?.into_vec();
+                let compact_probabilities =
+                    compact_workspace.scores().copy_to_host(&stream)?.into_vec();
                 let key_cache = ws.key_cache.copy_to_host(&stream)?.into_vec();
                 let value_cache = ws.value_cache.copy_to_host(&stream)?.into_vec();
                 let cpu_attn = cpu_cached_gqa_attention(
@@ -763,8 +787,39 @@ fn seq_full_attn_bisect(
                     manifest.kv_heads,
                     manifest.head_dim,
                 );
+                let cpu_probabilities = cpu_cached_gqa_probabilities(
+                    &q,
+                    &key_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                );
+                let cpu_fp4_probabilities = cpu_shared_scale_fp4_gqa_probabilities(
+                    &q,
+                    &key_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                );
                 println!("=== seq full-attn layer {target_layer} pos {pos} ===");
                 print_cmp("cached attn CPU(vs GPU caches)", &gpu_attn, &cpu_attn);
+                print_cmp(
+                    "compact FP4 probabilities(vs f32 QK softmax)",
+                    &compact_probabilities,
+                    &cpu_probabilities,
+                );
+                print_cmp(
+                    "compact FP4 probabilities(vs shared-scale CPU FP4)",
+                    &compact_probabilities,
+                    &cpu_fp4_probabilities,
+                );
+                print_cmp(
+                    "compact FP4 tiled KV(vs f32 GPU attn)",
+                    &compact_attn,
+                    &gpu_attn,
+                );
             }
             _ => unreachable!("target layer must be full attention"),
         }
@@ -812,6 +867,131 @@ fn cpu_cached_gqa_attention(
         }
     }
     output
+}
+
+fn cpu_cached_gqa_probabilities(
+    query: &[f32],
+    key_cache: &[f32],
+    cache_len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let groups_per_kv = q_heads / kv_heads;
+    let kv_width = kv_heads * head_dim;
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut probabilities = vec![0.0f32; q_heads * cache_len];
+    for q_head in 0..q_heads {
+        let kv_head = q_head / groups_per_kv;
+        let q = &query[q_head * head_dim..(q_head + 1) * head_dim];
+        let row = &mut probabilities[q_head * cache_len..(q_head + 1) * cache_len];
+        let mut maximum = f32::NEG_INFINITY;
+        for (token, score) in row.iter_mut().enumerate() {
+            let k = &key_cache[token * kv_width + kv_head * head_dim
+                ..token * kv_width + (kv_head + 1) * head_dim];
+            *score = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
+            maximum = maximum.max(*score);
+        }
+        let total = row
+            .iter_mut()
+            .map(|score| {
+                *score = (*score - maximum).exp();
+                *score
+            })
+            .sum::<f32>();
+        for probability in row {
+            *probability /= total;
+        }
+    }
+    probabilities
+}
+
+fn cpu_shared_scale_fp4_gqa_probabilities(
+    query: &[f32],
+    key_cache: &[f32],
+    cache_len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let groups_per_kv = q_heads / kv_heads;
+    let kv_width = kv_heads * head_dim;
+    let q = (0..q_heads)
+        .map(|q_head| {
+            let group = q_head / groups_per_kv;
+            (0..head_dim)
+                .map(|dim| {
+                    let block_start = dim / 16 * 16;
+                    let max_abs = (group * groups_per_kv..(group + 1) * groups_per_kv)
+                        .flat_map(|head| {
+                            query[head * head_dim + block_start..head * head_dim + block_start + 16]
+                                .iter()
+                        })
+                        .filter(|value| value.is_finite())
+                        .map(|value| value.abs())
+                        .fold(0.0f32, f32::max);
+                    let scale = if max_abs == 0.0 {
+                        0.0
+                    } else {
+                        format::e4m3_value(format::ue4m3_code(max_abs / 6.0))
+                    };
+                    let value = query[q_head * head_dim + dim];
+                    format::e2m1_value(format::e2m1_code(if scale == 0.0 {
+                        0.0
+                    } else {
+                        value / scale
+                    })) * scale
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut probabilities = vec![0.0f32; q_heads * cache_len];
+    for q_head in 0..q_heads {
+        let kv_head = q_head / groups_per_kv;
+        let row = &mut probabilities[q_head * cache_len..(q_head + 1) * cache_len];
+        let mut maximum = f32::NEG_INFINITY;
+        for (token, score) in row.iter_mut().enumerate() {
+            let mut dot = 0.0f32;
+            for dim in 0..head_dim {
+                let block_start = dim / 16 * 16;
+                let token_tile_start = token / 8 * 8;
+                let max_abs = (token_tile_start..(token_tile_start + 8).min(cache_len))
+                    .flat_map(|tile_token| {
+                        key_cache[tile_token * kv_width + kv_head * head_dim + block_start
+                            ..tile_token * kv_width + kv_head * head_dim + block_start + 16]
+                            .iter()
+                    })
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.abs())
+                    .fold(0.0f32, f32::max);
+                let scale = if max_abs == 0.0 {
+                    0.0
+                } else {
+                    format::e4m3_value(format::ue4m3_code(max_abs / 6.0))
+                };
+                let value = key_cache[token * kv_width + kv_head * head_dim + dim];
+                let dequantized = format::e2m1_value(format::e2m1_code(if scale == 0.0 {
+                    0.0
+                } else {
+                    value / scale
+                })) * scale;
+                dot += q[q_head][dim] * dequantized;
+            }
+            *score = dot / (head_dim as f32).sqrt();
+            maximum = maximum.max(*score);
+        }
+        let total = row
+            .iter_mut()
+            .map(|score| {
+                *score = (*score - maximum).exp();
+                *score
+            })
+            .sum::<f32>();
+        for probability in row {
+            *probability /= total;
+        }
+    }
+    probabilities
 }
 
 fn print_cmp(label: &str, gpu: &[f32], cpu: &[f32]) {

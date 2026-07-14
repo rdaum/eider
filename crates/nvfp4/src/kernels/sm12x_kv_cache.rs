@@ -13,10 +13,10 @@ const SCALE_BYTES_PER_TILE: usize = MMA_K / 16;
 /// Persistent compact FP4 K/V storage for one attention layer.
 ///
 /// Completed K groups are stored token-major in `[8 tokens, 64 dimensions]`
-/// tiles. Completed V blocks are stored transposed in
-/// `[8 dimensions, 64 tokens]` tiles. The hardware B operand shares scales
-/// across its eight rows, so incomplete groups remain in a bounded f32 tail
-/// until they can be quantized once without rewriting earlier cache entries.
+/// tiles with independent K16 scales for each token. Completed V blocks are
+/// stored transposed in `[8 dimensions, 64 tokens]` tiles with independent
+/// K16 scales for each dimension. The V layout needs a bounded f32 tail so a
+/// token-axis scale block can be finalized without rewriting earlier entries.
 pub struct Sm12xKvCache {
     key_values: DeviceBuffer<u8>,
     key_scales: DeviceBuffer<u8>,
@@ -89,7 +89,7 @@ impl Sm12xKvCache {
             )?)?,
             key_scales: DeviceBuffer::zeroed(checked_product(
                 "SM12x K scales",
-                &[key_tiles, SCALE_BYTES_PER_TILE],
+                &[key_tiles, K_TOKEN_TILE, SCALE_BYTES_PER_TILE],
             )?)?,
             value_values: DeviceBuffer::zeroed(checked_product(
                 "SM12x V values",
@@ -97,7 +97,7 @@ impl Sm12xKvCache {
             )?)?,
             value_scales: DeviceBuffer::zeroed(checked_product(
                 "SM12x V scales",
-                &[value_tiles, SCALE_BYTES_PER_TILE],
+                &[value_tiles, MMA_N, SCALE_BYTES_PER_TILE],
             )?)?,
             key_tail: DeviceBuffer::zeroed(tail_values)?,
             value_tail: DeviceBuffer::zeroed(tail_values)?,
@@ -148,7 +148,7 @@ impl Sm12xKvCache {
         &self.key_values
     }
 
-    /// Returns compact K scale bytes, four per 8-by-64 tile.
+    /// Returns compact K scale bytes, four per token in each 8-by-64 tile.
     pub fn key_scales(&self) -> &DeviceBuffer<u8> {
         &self.key_scales
     }
@@ -158,7 +158,7 @@ impl Sm12xKvCache {
         &self.value_values
     }
 
-    /// Returns compact V scale bytes, four per 8-by-64 tile.
+    /// Returns compact V scale bytes, four per dimension in each 8-by-64 tile.
     pub fn value_scales(&self) -> &DeviceBuffer<u8> {
         &self.value_scales
     }
@@ -437,19 +437,15 @@ mod tests {
         for head in 0..KV_HEADS {
             for token_tile in 0..2 {
                 for scale_block in 0..4 {
-                    let mut block_values = Vec::with_capacity(8 * 16);
                     for token in 0..8 {
-                        for offset in 0..16 {
-                            block_values.push(
-                                key_rows[token_tile * 8 + token]
-                                    [head * HEAD_DIM + scale_block * 16 + offset],
-                            );
-                        }
-                    }
-                    let (scale_code, scale) = scale_for(block_values.into_iter());
-                    let tile = head * key_token_tiles + token_tile;
-                    expected_key_scales[tile * 4 + scale_block] = scale_code;
-                    for token in 0..8 {
+                        let block_values = (0..16).map(|offset| {
+                            key_rows[token_tile * 8 + token]
+                                [head * HEAD_DIM + scale_block * 16 + offset]
+                        });
+                        let (scale_code, scale) = scale_for(block_values);
+                        let tile = head * key_token_tiles + token_tile;
+                        expected_key_scales[(tile * K_TOKEN_TILE + token) * 4 + scale_block] =
+                            scale_code;
                         for offset in 0..16 {
                             let value = key_rows[token_tile * 8 + token]
                                 [head * HEAD_DIM + scale_block * 16 + offset];
@@ -478,16 +474,15 @@ mod tests {
         let mut expected_value_scales = vec![0u8; value_scales.len()];
         for head in 0..KV_HEADS {
             for dim_tile in 0..value_dim_tiles {
-                let mut block_values = Vec::with_capacity(8 * 16);
                 for dim in 0..8 {
-                    for row in value_rows.iter().take(16) {
-                        block_values.push(row[head * HEAD_DIM + dim_tile * 8 + dim]);
-                    }
-                }
-                let (scale_code, scale) = scale_for(block_values.into_iter());
-                let tile = (head * value_dim_tiles + dim_tile) * value_token_tiles;
-                expected_value_scales[tile * 4] = scale_code;
-                for dim in 0..8 {
+                    let (scale_code, scale) = scale_for(
+                        value_rows
+                            .iter()
+                            .take(16)
+                            .map(|row| row[head * HEAD_DIM + dim_tile * 8 + dim]),
+                    );
+                    let tile = (head * value_dim_tiles + dim_tile) * value_token_tiles;
+                    expected_value_scales[(tile * MMA_N + dim) * 4] = scale_code;
                     for token in 0..16 {
                         let value = value_rows[token][head * HEAD_DIM + dim_tile * 8 + dim];
                         let code = crate::format::e2m1_code(if scale == 0.0 {

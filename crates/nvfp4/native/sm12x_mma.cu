@@ -110,6 +110,26 @@ __device__ __forceinline__ void infer_mma_m16n8k64(
     d3 = n3;
 }
 
+__device__ __forceinline__ void infer_load_native_m16n8k64(
+    const std::uint8_t* a_tile,
+    const std::uint8_t* b_tile,
+    std::uint32_t& a0,
+    std::uint32_t& a1,
+    std::uint32_t& a2,
+    std::uint32_t& a3,
+    std::uint32_t& b0,
+    std::uint32_t& b1)
+{
+    const auto* a = reinterpret_cast<const std::uint32_t*>(a_tile + threadIdx.x * 16);
+    const auto* b = reinterpret_cast<const std::uint32_t*>(b_tile + threadIdx.x * 16);
+    a0 = a[0];
+    a1 = a[1];
+    a2 = a[2];
+    a3 = a[3];
+    b0 = b[0];
+    b1 = b[1];
+}
+
 template <std::uint8_t Fill>
 __global__ void infer_sm12x_mma_probe_kernel(float* out) {
     __shared__ __align__(16) std::uint8_t smem[4096];
@@ -239,14 +259,6 @@ __global__ void infer_sm12x_mma_tile_frag_kernel(
     std::uint32_t sfb,
     float* out)
 {
-    __shared__ __align__(16) std::uint8_t smem[1024];
-
-    for (int i = threadIdx.x; i < 512; i += blockDim.x) {
-        smem[i] = a_native_tile[i];
-        smem[512 + i] = b_native_tile[i];
-    }
-    __syncthreads();
-
     std::uint32_t a0 = 0;
     std::uint32_t a1 = 0;
     std::uint32_t a2 = 0;
@@ -264,17 +276,7 @@ __global__ void infer_sm12x_mma_tile_frag_kernel(
     const std::uint16_t bid = 0;
     const std::uint16_t tid = 0;
 
-    std::uint32_t a_addr = infer_smem_u32(smem + threadIdx.x * 16);
-    std::uint32_t b_addr = infer_smem_u32(smem + 512 + threadIdx.x * 16);
-
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-        : "r"(a_addr));
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
-        : "=r"(b0), "=r"(b1)
-        : "r"(b_addr));
+    infer_load_native_m16n8k64(a_native_tile, b_native_tile, a0, a1, a2, a3, b0, b1);
 
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
@@ -323,8 +325,6 @@ __global__ void infer_sm12x_mma_tile_frag_kloop_kernel(
     std::uint32_t k_tiles,
     float* out)
 {
-    __shared__ __align__(16) std::uint8_t smem[1024];
-
     float d0 = 0.0f;
     float d1 = 0.0f;
     float d2 = 0.0f;
@@ -335,29 +335,13 @@ __global__ void infer_sm12x_mma_tile_frag_kloop_kernel(
     for (std::uint32_t tile = 0; tile < k_tiles; ++tile) {
         const std::uint8_t* a_tile = a_native_tiles + tile * 512;
         const std::uint8_t* b_tile = b_native_tiles + tile * 512;
-        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
-            smem[i] = a_tile[i];
-            smem[512 + i] = b_tile[i];
-        }
-        __syncthreads();
-
         std::uint32_t a0 = 0;
         std::uint32_t a1 = 0;
         std::uint32_t a2 = 0;
         std::uint32_t a3 = 0;
         std::uint32_t b0 = 0;
         std::uint32_t b1 = 0;
-        std::uint32_t a_addr = infer_smem_u32(smem + threadIdx.x * 16);
-        std::uint32_t b_addr = infer_smem_u32(smem + 512 + threadIdx.x * 16);
-
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-            : "r"(a_addr));
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
-            : "=r"(b0), "=r"(b1)
-            : "r"(b_addr));
+        infer_load_native_m16n8k64(a_tile, b_tile, a0, a1, a2, a3, b0, b1);
 
         float nd0 = 0.0f;
         float nd1 = 0.0f;
@@ -383,7 +367,6 @@ __global__ void infer_sm12x_mma_tile_frag_kloop_kernel(
         d1 = nd1;
         d2 = nd2;
         d3 = nd3;
-        __syncthreads();
     }
 
     const int base = threadIdx.x * 4;
@@ -401,8 +384,6 @@ __global__ void infer_sm12x_mma_tile_kloop_kernel(
     std::uint32_t k_tiles,
     float* out)
 {
-    __shared__ __align__(16) std::uint8_t smem[1024];
-
     float d0 = 0.0f;
     float d1 = 0.0f;
     float d2 = 0.0f;
@@ -413,29 +394,13 @@ __global__ void infer_sm12x_mma_tile_kloop_kernel(
     for (std::uint32_t tile = 0; tile < k_tiles; ++tile) {
         const std::uint8_t* a_tile = a_native_tiles + tile * 512;
         const std::uint8_t* b_tile = b_native_tiles + tile * 512;
-        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
-            smem[i] = a_tile[i];
-            smem[512 + i] = b_tile[i];
-        }
-        __syncthreads();
-
         std::uint32_t a0 = 0;
         std::uint32_t a1 = 0;
         std::uint32_t a2 = 0;
         std::uint32_t a3 = 0;
         std::uint32_t b0 = 0;
         std::uint32_t b1 = 0;
-        std::uint32_t a_addr = infer_smem_u32(smem + threadIdx.x * 16);
-        std::uint32_t b_addr = infer_smem_u32(smem + 512 + threadIdx.x * 16);
-
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-            : "r"(a_addr));
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
-            : "=r"(b0), "=r"(b1)
-            : "r"(b_addr));
+        infer_load_native_m16n8k64(a_tile, b_tile, a0, a1, a2, a3, b0, b1);
 
         float nd0 = 0.0f;
         float nd1 = 0.0f;
@@ -461,7 +426,6 @@ __global__ void infer_sm12x_mma_tile_kloop_kernel(
         d1 = nd1;
         d2 = nd2;
         d3 = nd3;
-        __syncthreads();
     }
 
     infer_store_m16n8_fragment(out, d0, d1, d2, d3);
@@ -709,17 +673,6 @@ __global__ void infer_sm12x_kv_finalize_key_kernel(
 
     const std::uint32_t width = kv_heads * head_dim;
     const std::uint32_t tail_start = (position & 15u) & ~7u;
-    float max_abs = 0.0f;
-    for (std::uint32_t token = 0; token < 8; ++token) {
-        for (std::uint32_t offset = 0; offset < 16; ++offset) {
-            const float value = key_tail[(tail_start + token) * width + head * head_dim + k_block * 16 + offset];
-            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
-        }
-    }
-    const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-        __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float scale = infer_e4m3_value(scale_code);
-
     const std::uint32_t token_tiles = (max_tokens + 7) / 8;
     const std::uint32_t k_tiles = head_dim / 64;
     const std::uint32_t token_tile = position / 8;
@@ -728,13 +681,21 @@ __global__ void infer_sm12x_kv_finalize_key_kernel(
     const std::uint32_t tile = (head * token_tiles + token_tile) * k_tiles + k_tile;
     std::uint8_t* packed = key_values + tile * 256;
     for (std::uint32_t token = 0; token < 8; ++token) {
+        float max_abs = 0.0f;
+        for (std::uint32_t offset = 0; offset < 16; ++offset) {
+            const float value = key_tail[(tail_start + token) * width + head * head_dim + k_block * 16 + offset];
+            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+        }
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        const float scale = infer_e4m3_value(scale_code);
         for (std::uint32_t offset = 0; offset < 16; ++offset) {
             const float value = key_tail[(tail_start + token) * width + head * head_dim + k_block * 16 + offset];
             const std::uint8_t code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
             infer_set_packed_nibble(packed, token * 64 + scale_block * 16 + offset, code);
         }
+        key_scales[(tile * 8 + token) * 4 + scale_block] = scale_code;
     }
-    key_scales[tile * 4 + scale_block] = scale_code;
 }
 
 __global__ void infer_sm12x_kv_finalize_value_kernel(
@@ -751,30 +712,27 @@ __global__ void infer_sm12x_kv_finalize_value_kernel(
     if (head >= kv_heads || dim_tile >= head_dim / 8 || threadIdx.x != 0) return;
 
     const std::uint32_t width = kv_heads * head_dim;
-    float max_abs = 0.0f;
-    for (std::uint32_t dim = 0; dim < 8; ++dim) {
-        for (std::uint32_t token = 0; token < 16; ++token) {
-            const float value = value_tail[token * width + head * head_dim + dim_tile * 8 + dim];
-            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
-        }
-    }
-    const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-        __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float scale = infer_e4m3_value(scale_code);
-
     const std::uint32_t token_tiles = (max_tokens + 63) / 64;
     const std::uint32_t token_tile = position / 64;
     const std::uint32_t scale_block = (position & 63u) / 16;
     const std::uint32_t tile = (head * (head_dim / 8) + dim_tile) * token_tiles + token_tile;
     std::uint8_t* packed = value_values + tile * 256;
     for (std::uint32_t dim = 0; dim < 8; ++dim) {
+        float max_abs = 0.0f;
+        for (std::uint32_t token = 0; token < 16; ++token) {
+            const float value = value_tail[token * width + head * head_dim + dim_tile * 8 + dim];
+            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+        }
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        const float scale = infer_e4m3_value(scale_code);
         for (std::uint32_t token = 0; token < 16; ++token) {
             const float value = value_tail[token * width + head * head_dim + dim_tile * 8 + dim];
             const std::uint8_t code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
             infer_set_packed_nibble(packed, dim * 64 + scale_block * 16 + token, code);
         }
+        value_scales[(tile * 8 + dim) * 4 + scale_block] = scale_code;
     }
-    value_scales[tile * 4 + scale_block] = scale_code;
 }
 
 extern "C" cudaError_t infer_sm12x_kv_cache_append_on_stream(
@@ -880,10 +838,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
     std::uint32_t kv_heads,
     std::uint32_t head_dim)
 {
-    __shared__ __align__(16) std::uint8_t a_smem[512];
     __shared__ __align__(16) std::uint8_t b_smem[512];
-    __shared__ std::uint32_t b_scale_word;
-    __shared__ float tail_scales[4];
     const std::uint32_t group = blockIdx.x;
     const std::uint32_t token_tile = blockIdx.y;
     const std::uint32_t complete_tiles = cache_len / 8;
@@ -901,39 +856,33 @@ __global__ void infer_sm12x_kv_qk_kernel(
     for (std::uint32_t kt = 0; kt < head_k_tiles; ++kt) {
         const std::uint8_t* a_tile = query_tiles + (group * head_k_tiles + kt) * 512;
         for (int index = threadIdx.x; index < 512; index += blockDim.x) {
-            a_smem[index] = a_tile[index];
             b_smem[index] = 0;
         }
         const std::uint8_t* compact_tile = nullptr;
+        std::uint32_t tile = 0;
         if (compact) {
-            const std::uint32_t tile =
-                (group * max_token_tiles + token_tile) * head_k_tiles + kt;
+            tile = (group * max_token_tiles + token_tile) * head_k_tiles + kt;
             compact_tile = key_values + tile * 256;
-            if (threadIdx.x == 0) b_scale_word = infer_scale_word(key_scales + tile * 4);
-        } else if (threadIdx.x == 0) {
-            std::uint8_t scale_codes[4];
-            for (int kb = 0; kb < 4; ++kb) {
-                float max_abs = 0.0f;
-                for (std::uint32_t row = 0; row < tail_len; ++row) {
-                    for (int offset = 0; offset < 16; ++offset) {
-                        const float value = key_tail[(tail_start + row) * width + group * head_dim + kt * 64 + kb * 16 + offset];
-                        if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
-                    }
-                }
-                scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-                    __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-                tail_scales[kb] = infer_e4m3_value(scale_codes[kb]);
-            }
-            b_scale_word = static_cast<std::uint32_t>(scale_codes[0])
-                | (static_cast<std::uint32_t>(scale_codes[1]) << 8)
-                | (static_cast<std::uint32_t>(scale_codes[2]) << 16)
-                | (static_cast<std::uint32_t>(scale_codes[3]) << 24);
         }
         __syncthreads();
 
         const int lane = threadIdx.x;
         const int t0 = lane & 3;
         const int row = lane >> 2;
+        std::uint8_t tail_scale_codes[4] = {};
+        float tail_scales[4] = {};
+        if (!compact && static_cast<std::uint32_t>(row) < tail_len) {
+            for (int kb = 0; kb < 4; ++kb) {
+                float max_abs = 0.0f;
+                for (int offset = 0; offset < 16; ++offset) {
+                    const float value = key_tail[(tail_start + row) * width + group * head_dim + kt * 64 + kb * 16 + offset];
+                    if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+                }
+                tail_scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+                tail_scales[kb] = infer_e4m3_value(tail_scale_codes[kb]);
+            }
+        }
         for (int v = 0; v < 16; ++v) {
             const int v0 = v & 7;
             const int v1 = (v >> 3) & 1;
@@ -956,14 +905,10 @@ __global__ void infer_sm12x_kv_qk_kernel(
         std::uint32_t a3;
         std::uint32_t b0;
         std::uint32_t b1;
-        const std::uint32_t a_addr = infer_smem_u32(a_smem + lane * 16);
-        const std::uint32_t b_addr = infer_smem_u32(b_smem + lane * 16);
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a_addr));
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
-            : "=r"(b0), "=r"(b1) : "r"(b_addr));
+        infer_load_native_m16n8k64(a_tile, b_smem, a0, a1, a2, a3, b0, b1);
+        const std::uint32_t b_scale_word = compact
+            ? infer_scale_word(key_scales + (tile * 8 + row) * 4)
+            : infer_scale_word(tail_scale_codes);
         infer_mma_m16n8k64(
             a0, a1, a2, a3, b0, b1,
             query_scales[group * head_k_tiles + kt], b_scale_word,
@@ -1091,10 +1036,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
     std::uint32_t kv_heads,
     std::uint32_t head_dim)
 {
-    __shared__ __align__(16) std::uint8_t a_smem[512];
     __shared__ __align__(16) std::uint8_t b_smem[512];
-    __shared__ std::uint8_t b_scale_codes[4];
-    __shared__ float tail_scales[4];
     const std::uint32_t group = blockIdx.x;
     const std::uint32_t dim_tile = blockIdx.y;
     const std::uint32_t context_tiles = (cache_len + 63) / 64;
@@ -1113,37 +1055,30 @@ __global__ void infer_sm12x_kv_pv_kernel(
             (group * (head_dim / 8) + dim_tile) * max_context_tiles + kt;
         const std::uint8_t* compact_tile = value_values + value_tile_index * 256;
         for (int index = threadIdx.x; index < 512; index += blockDim.x) {
-            a_smem[index] = a_tile[index];
             b_smem[index] = 0;
-        }
-        if (threadIdx.x == 0) {
-            for (int kb = 0; kb < 4; ++kb) {
-                const std::uint32_t block_start = kt * 64 + kb * 16;
-                if (block_start + 16 <= full_tokens) {
-                    b_scale_codes[kb] = value_scales[value_tile_index * 4 + kb];
-                    tail_scales[kb] = 0.0f;
-                } else if (block_start == full_tokens && tail_len != 0) {
-                    float max_abs = 0.0f;
-                    for (int dim = 0; dim < 8; ++dim) {
-                        for (std::uint32_t token = 0; token < tail_len; ++token) {
-                            const float value = value_tail[token * width + group * head_dim + dim_tile * 8 + dim];
-                            if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
-                        }
-                    }
-                    b_scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-                        __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-                    tail_scales[kb] = infer_e4m3_value(b_scale_codes[kb]);
-                } else {
-                    b_scale_codes[kb] = 0;
-                    tail_scales[kb] = 0.0f;
-                }
-            }
         }
         __syncthreads();
 
         const int lane = threadIdx.x;
         const int t0 = lane & 3;
         const int dim = lane >> 2;
+        std::uint8_t b_scale_codes[4] = {};
+        float tail_scales[4] = {};
+        for (int kb = 0; kb < 4; ++kb) {
+            const std::uint32_t block_start = kt * 64 + kb * 16;
+            if (block_start + 16 <= full_tokens) {
+                b_scale_codes[kb] = value_scales[(value_tile_index * 8 + dim) * 4 + kb];
+            } else if (block_start == full_tokens && tail_len != 0) {
+                float max_abs = 0.0f;
+                for (std::uint32_t token = 0; token < tail_len; ++token) {
+                    const float value = value_tail[token * width + group * head_dim + dim_tile * 8 + dim];
+                    if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
+                }
+                b_scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+                tail_scales[kb] = infer_e4m3_value(b_scale_codes[kb]);
+            }
+        }
         for (int v = 0; v < 16; ++v) {
             const int v0 = v & 7;
             const int v1 = (v >> 3) & 1;
@@ -1167,14 +1102,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
         std::uint32_t a3;
         std::uint32_t b0;
         std::uint32_t b1;
-        const std::uint32_t a_addr = infer_smem_u32(a_smem + lane * 16);
-        const std::uint32_t b_addr = infer_smem_u32(b_smem + lane * 16);
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(a_addr));
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
-            : "=r"(b0), "=r"(b1) : "r"(b_addr));
+        infer_load_native_m16n8k64(a_tile, b_smem, a0, a1, a2, a3, b0, b1);
         infer_mma_m16n8k64(
             a0, a1, a2, a3, b0, b1,
             probability_scales[group * max_context_tiles + kt],
