@@ -12,6 +12,7 @@ use crate::nvfp4::{
     copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
+    fp8_linear_pair_configured_f32_into_on_stream, fp8_linear_triple_configured_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
     fp8_moe_grouped_gate_up_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
@@ -473,21 +474,37 @@ impl Qwen36FullAttentionWeights {
         self.o.rows
     }
 
-    /// Runs one token through this full-attention layer.
-    pub fn run_one_token<'a>(
-        &'a self,
-        workspace: &'a mut Qwen36FullAttentionWorkspace,
-        manifest: &QwenModelManifest,
+    fn run_qkv_projections(
+        &self,
+        workspace: &mut Qwen36FullAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
-        position: usize,
         stream: &CudaStream,
-    ) -> Result<Qwen36FullAttentionStep<'a>> {
-        if position >= workspace.cache_capacity {
-            return Err(Error::Shape {
-                label: "Qwen3.6 full-attention cache",
-                expected: format!("position < {}", workspace.cache_capacity),
-                actual: position.to_string(),
-            });
+    ) -> Result<()> {
+        let static_scales = self.q.channel_weight_scale.is_none()
+            && self.k.channel_weight_scale.is_none()
+            && self.v.channel_weight_scale.is_none();
+        if static_scales && std::env::var_os("QWEN36_FP8_W8A8").is_none() {
+            fp8_linear_triple_configured_f32_into_on_stream(
+                hidden,
+                &self.q.weight,
+                &self.k.weight,
+                &self.v.weight,
+                workspace.q_proj_output.output(),
+                workspace.k.output(),
+                workspace.v.output(),
+                self.q.rows,
+                self.k.rows,
+                self.v.rows,
+                self.q.cols,
+                self.q.weight_scale,
+                self.k.weight_scale,
+                self.v.weight_scale,
+                128,
+                stream,
+            )?;
+            maybe_round_device_f32_to_bf16(&mut workspace.q_proj_output, stream)?;
+            maybe_round_device_f32_to_bf16(&mut workspace.k, stream)?;
+            return maybe_round_device_f32_to_bf16(&mut workspace.v, stream);
         }
 
         self.q.run_into(
@@ -510,7 +527,27 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.fp8_dynamic_input,
             &mut workspace.fp8_dynamic_input_scale,
             stream,
-        )?;
+        )
+    }
+
+    /// Runs one token through this full-attention layer.
+    pub fn run_one_token<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36FullAttentionWorkspace,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<Qwen36FullAttentionStep<'a>> {
+        if position >= workspace.cache_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.6 full-attention cache",
+                expected: format!("position < {}", workspace.cache_capacity),
+                actual: position.to_string(),
+            });
+        }
+
+        self.run_qkv_projections(workspace, hidden, stream)?;
         qwen36_full_attn_prep_f32_into_on_stream(
             &workspace.q_proj_output,
             &workspace.k,
@@ -599,27 +636,7 @@ impl Qwen36FullAttentionWeights {
         cache_len: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<Qwen36FullAttentionStep<'a>> {
-        self.q.run_into(
-            hidden,
-            &mut workspace.q_proj_output,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )?;
-        self.k.run_into(
-            hidden,
-            &mut workspace.k,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )?;
-        self.v.run_into(
-            hidden,
-            &mut workspace.v,
-            &mut workspace.fp8_dynamic_input,
-            &mut workspace.fp8_dynamic_input_scale,
-            stream,
-        )?;
+        self.run_qkv_projections(workspace, hidden, stream)?;
         qwen36_full_attn_prep_f32_into_on_stream(
             &workspace.q_proj_output,
             &workspace.k,
@@ -847,6 +864,38 @@ impl Qwen36LinearAttentionWeights {
         )
     }
 
+    fn run_qkv_z(
+        &self,
+        workspace: &mut Qwen36LinearAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let static_scales = self.fp8.plans.is_none()
+            && self.qkv.channel_weight_scale.is_none()
+            && self.z.channel_weight_scale.is_none();
+        if static_scales && std::env::var_os("QWEN36_FP8_W8A8").is_none() {
+            fp8_linear_pair_configured_f32_into_on_stream(
+                hidden,
+                &self.qkv.weight,
+                &self.z.weight,
+                workspace.qkv_output.output(),
+                workspace.z_output.output(),
+                self.qkv.rows,
+                self.z.rows,
+                self.qkv.cols,
+                self.qkv.weight_scale,
+                self.z.weight_scale,
+                128,
+                stream,
+            )?;
+            maybe_round_device_f32_to_bf16(&mut workspace.qkv_output, stream)?;
+            return maybe_round_device_f32_to_bf16(&mut workspace.z_output, stream);
+        }
+
+        self.run_qkv(workspace, hidden, stream)?;
+        self.run_z(workspace, hidden, stream)
+    }
+
     fn run_output_projection(
         &self,
         workspace: &mut Qwen36LinearAttentionWorkspace,
@@ -883,8 +932,7 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.run_qkv(workspace, hidden, stream)?;
-        self.run_z(workspace, hidden, stream)?;
+        self.run_qkv_z(workspace, hidden, stream)?;
         self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
         self.beta
             .run_into(hidden, &mut workspace.beta_input, stream)?;

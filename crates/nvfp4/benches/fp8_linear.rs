@@ -11,6 +11,7 @@ use nvfp4::{
     fp8_linear_channel_scaled_f32_into_on_stream,
     fp8_linear_channel_scaled_precomputed_dynamic_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
+    fp8_linear_pair_configured_f32_into_on_stream, fp8_linear_triple_configured_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_fp8_e4m3_f32_into_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
 };
@@ -203,7 +204,9 @@ impl BenchContext for Fp8LinearBench {
 
 impl BenchContext for Fp8StreamingBench {
     fn prepare(_num_chunks: usize) -> Self {
-        Self::new().expect("prepare streaming FP8 benchmark")
+        let mut bench = Self::new().expect("prepare streaming FP8 benchmark");
+        bench.validate_packed().expect("validate packed QKV/Z");
+        bench
     }
 
     fn chunk_size() -> Option<usize> {
@@ -223,7 +226,11 @@ impl BenchContext for Fp8ChannelStreamingBench {
 
 impl BenchContext for Fp8FullAttentionStreamingBench {
     fn prepare(_num_chunks: usize) -> Self {
-        Self::new().expect("prepare full-attention FP8 benchmark")
+        let mut bench = Self::new().expect("prepare full-attention FP8 benchmark");
+        bench
+            .validate_packed()
+            .expect("validate packed full-attention QKV");
+        bench
     }
 
     fn chunk_size() -> Option<usize> {
@@ -435,6 +442,64 @@ impl Fp8StreamingBench {
             out_output: DeviceBuffer::zeroed(HIDDEN)?,
             projections,
         })
+    }
+
+    fn validate_packed(&mut self) -> Result<()> {
+        let projection = &self.projections[0];
+        fp8_linear_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.qkv_weight,
+            self.qkv_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            projection.qkv_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        fp8_linear_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.z_weight,
+            self.z_output.output(),
+            VALUE_DIM,
+            HIDDEN,
+            projection.z_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        let expected_qkv = self
+            .qkv_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        let expected_z = self
+            .z_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        fp8_linear_pair_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.qkv_weight,
+            &projection.z_weight,
+            self.qkv_output.output(),
+            self.z_output.output(),
+            QKV_ROWS,
+            VALUE_DIM,
+            HIDDEN,
+            projection.qkv_weight_scale,
+            projection.z_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        validate_projection(
+            "packed QKV",
+            &self.qkv_output.copy_to_host(&self.stream)?,
+            &expected_qkv,
+        )?;
+        validate_projection(
+            "packed Z",
+            &self.z_output.copy_to_host(&self.stream)?,
+            &expected_z,
+        )
     }
 }
 
@@ -898,6 +963,100 @@ impl Fp8FullAttentionStreamingBench {
             projections,
         })
     }
+
+    fn validate_packed(&mut self) -> Result<()> {
+        let projection = &self.projections[0];
+        fp8_linear_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.q_weight,
+            self.q_output.output(),
+            QKV_ROWS,
+            HIDDEN,
+            projection.q_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        fp8_linear_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.k_weight,
+            self.k_output.output(),
+            KV_ROWS,
+            HIDDEN,
+            projection.k_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        fp8_linear_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.v_weight,
+            self.v_output.output(),
+            KV_ROWS,
+            HIDDEN,
+            projection.v_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        let expected_q = self
+            .q_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        let expected_k = self
+            .k_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        let expected_v = self
+            .v_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        fp8_linear_triple_configured_f32_into_on_stream(
+            &self.hidden_input,
+            &projection.q_weight,
+            &projection.k_weight,
+            &projection.v_weight,
+            self.q_output.output(),
+            self.k_output.output(),
+            self.v_output.output(),
+            QKV_ROWS,
+            KV_ROWS,
+            KV_ROWS,
+            HIDDEN,
+            projection.q_weight_scale,
+            projection.k_weight_scale,
+            projection.v_weight_scale,
+            128,
+            &self.stream,
+        )?;
+        validate_projection(
+            "packed Q",
+            &self.q_output.copy_to_host(&self.stream)?,
+            &expected_q,
+        )?;
+        validate_projection(
+            "packed K",
+            &self.k_output.copy_to_host(&self.stream)?,
+            &expected_k,
+        )?;
+        validate_projection(
+            "packed V",
+            &self.v_output.copy_to_host(&self.stream)?,
+            &expected_v,
+        )
+    }
+}
+
+fn validate_projection(label: &'static str, actual: &[f32], expected: &[f32]) -> Result<()> {
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        if actual.to_bits() != expected.to_bits() {
+            return Err(nvfp4::Error::Format {
+                label,
+                detail: format!("index={index} actual={actual} expected={expected}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn static_model_dir() -> PathBuf {
@@ -1257,6 +1416,52 @@ fn streaming_scalar_sample<
                 VALUE_DIM,
                 projection.out_weight_scale,
                 OUT_THREADS,
+                &ctx.stream,
+            )
+            .expect("streaming out");
+        }
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.out_output.as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
+fn streaming_packed_qkvz_sample(
+    ctx: &mut Fp8StreamingBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        for projection in &ctx.projections {
+            fp8_linear_pair_configured_f32_into_on_stream(
+                &ctx.hidden_input,
+                &projection.qkv_weight,
+                &projection.z_weight,
+                ctx.qkv_output.output(),
+                ctx.z_output.output(),
+                QKV_ROWS,
+                VALUE_DIM,
+                HIDDEN,
+                projection.qkv_weight_scale,
+                projection.z_weight_scale,
+                128,
+                &ctx.stream,
+            )
+            .expect("packed streaming qkv/z");
+            fp8_linear_configured_f32_into_on_stream(
+                &ctx.value_input,
+                &projection.out_weight,
+                ctx.out_output.output(),
+                HIDDEN,
+                VALUE_DIM,
+                projection.out_weight_scale,
+                256,
                 &ctx.stream,
             )
             .expect("streaming out");
@@ -1675,6 +1880,56 @@ fn streaming_full_attention_sample<
     )
 }
 
+fn streaming_full_attention_packed_sample(
+    ctx: &mut Fp8FullAttentionStreamingBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        for projection in &ctx.projections {
+            fp8_linear_triple_configured_f32_into_on_stream(
+                &ctx.hidden_input,
+                &projection.q_weight,
+                &projection.k_weight,
+                &projection.v_weight,
+                ctx.q_output.output(),
+                ctx.k_output.output(),
+                ctx.v_output.output(),
+                QKV_ROWS,
+                KV_ROWS,
+                KV_ROWS,
+                HIDDEN,
+                projection.q_weight_scale,
+                projection.k_weight_scale,
+                projection.v_weight_scale,
+                128,
+                &ctx.stream,
+            )
+            .expect("packed full-attention qkv");
+            fp8_linear_configured_f32_into_on_stream(
+                &ctx.value_input,
+                &projection.out_weight,
+                ctx.out_output.output(),
+                HIDDEN,
+                VALUE_DIM,
+                projection.out_weight_scale,
+                256,
+                &ctx.stream,
+            )
+            .expect("full-attention out");
+        }
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.out_output.as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
 fn lm_head_simt_sample(
     ctx: &mut Fp8LmHeadBench,
     chunk_size: usize,
@@ -1811,6 +2066,10 @@ fn main() {
                 "qwen36_30_layers_scalar_q256_z128_o128",
                 streaming_scalar_sample::<256, 128, 128>,
             );
+            group.bench_sample(
+                "qwen36_30_layers_packed_qkvz_q128_o256",
+                streaming_packed_qkvz_sample,
+            );
             group.bench_sample("qwen36_30_layers_cublaslt", streaming_cublaslt_sample);
             group.bench_sample(
                 "qwen36_30_layers_cublaslt_reuse_hidden",
@@ -1862,6 +2121,10 @@ fn main() {
         });
         runner.group::<Fp8FullAttentionStreamingBench>("FP8 full-attention streaming", |group| {
             let group = group.measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample(
+                "qwen36_10_full_attn_packed_qkv_q128_o256",
+                streaming_full_attention_packed_sample,
+            );
             group.bench_sample(
                 "qwen36_10_full_attn_q256_kv256_o256",
                 streaming_full_attention_sample::<256, 256, 256>,

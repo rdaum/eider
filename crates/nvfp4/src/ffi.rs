@@ -792,6 +792,38 @@ unsafe extern "C" {
         threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_pair_f32_configured_on_stream(
+        input: *const f32,
+        first_weight: *const u8,
+        second_weight: *const u8,
+        first_output: *mut f32,
+        second_output: *mut f32,
+        first_rows: u32,
+        second_rows: u32,
+        cols: u32,
+        first_scale: f32,
+        second_scale: f32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_triple_f32_configured_on_stream(
+        input: *const f32,
+        first_weight: *const u8,
+        second_weight: *const u8,
+        third_weight: *const u8,
+        first_output: *mut f32,
+        second_output: *mut f32,
+        third_output: *mut f32,
+        first_rows: u32,
+        second_rows: u32,
+        third_rows: u32,
+        cols: u32,
+        first_scale: f32,
+        second_scale: f32,
+        third_scale: f32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_fp8_linear_channel_scaled_f32_configured_on_stream(
         input: *const f32,
         weight: *const u8,
