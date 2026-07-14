@@ -157,6 +157,52 @@ impl MarlinNvfp4GateUp {
             )
         }
     }
+
+    /// Runs routed gate/up while retaining Marlin's native BF16 output for a
+    /// following activation kernel.
+    pub fn run_bf16_on_stream(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<&DeviceBuffer<u16>> {
+        const HIDDEN: usize = 2048;
+        const TOP_K: usize = 8;
+        if indices.len() != TOP_K || input.len() != HIDDEN {
+            return Err(Error::Shape {
+                label: "Marlin Qwen3.6 BF16 gate/up buffers",
+                expected: format!("indices={TOP_K} input={HIDDEN}"),
+                actual: format!("indices={} input={}", indices.len(), input.len()),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_marlin_nvfp4_gate_up_on_stream",
+                ffi::infer_marlin_nvfp4_gate_up_on_stream(
+                    indices.ptr,
+                    input.ptr,
+                    self.repacked_weight.ptr,
+                    self.weight_scale.ptr,
+                    self.global_scale.ptr,
+                    std::ptr::null_mut(),
+                    self.input_bf16.ptr,
+                    self.output_bf16.ptr,
+                    self.reduce_tmp.ptr,
+                    self.locks.ptr,
+                    self.sorted_token_ids.ptr,
+                    self.expert_ids.ptr,
+                    self.num_tokens_past_padded.ptr,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        Ok(&self.output_bf16)
+    }
+
+    /// Returns Marlin's persistent BF16 routed gate/up output.
+    pub fn output_bf16(&self) -> &DeviceBuffer<u16> {
+        &self.output_bf16
+    }
 }
 
 impl MarlinNvfp4Linear {

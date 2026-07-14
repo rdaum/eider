@@ -74,6 +74,21 @@ impl MarlinRoutedGateUpBench {
             &self.stream,
         )?;
         let actual = self.output.copy_to_host(&self.stream)?;
+        let output_bf16 = self
+            .plan
+            .run_bf16_on_stream(&self.indices, &self.input, &self.stream)?
+            .copy_to_host(&self.stream)?;
+        let bf16_expanded = output_bf16
+            .iter()
+            .copied()
+            .map(nvfp4::format::bf16_to_f32)
+            .collect::<Vec<_>>();
+        if actual.as_ref() != bf16_expanded.as_slice() {
+            return Err(nvfp4::Error::Format {
+                label: "Marlin BF16 routed gate/up",
+                detail: "BF16-only output differs from the expanded F32 path".to_string(),
+            });
+        }
         self.graph.launch(&self.stream)?;
         let graph_actual = self.output.copy_to_host(&self.stream)?;
         if actual.as_ref() != graph_actual.as_ref() {
@@ -219,6 +234,32 @@ fn graph_sample(
         .push_metric(MetricValue::integer("slots", TOP_K as i64, "slots"))
 }
 
+fn marlin_bf16_sample(
+    ctx: &mut MarlinRoutedGateUpBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start
+        .record_on_stream(&ctx.stream)
+        .expect("start event");
+    for _ in 0..chunk_size {
+        ctx.plan
+            .run_bf16_on_stream(&ctx.indices, &ctx.input, &ctx.stream)
+            .expect("Marlin BF16 routed gate/up");
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
+    ctx.stop.synchronize().expect("sync stop event");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.plan.output_bf16().as_const_ptr());
+    BenchSampleResult::operations(chunk_size as u64)
+        .push_metric(MetricValue::new(
+            "cuda_event_ms",
+            total_ms / chunk_size as f64,
+            "ms",
+        ))
+        .push_metric(MetricValue::integer("slots", TOP_K as i64, "slots"))
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-marlin-routed-gate-up".to_string()),
@@ -235,6 +276,10 @@ fn main() {
     run_benchmark_main(options, |runner| {
         runner.group::<MarlinRoutedGateUpBench>("NVFP4 Marlin routed gate/up", |group| {
             group.bench_sample("qwen36_layer0_top8_m1024_k2048", marlin_sample);
+            group.bench_sample(
+                "qwen36_layer0_top8_m1024_k2048_bf16_output",
+                marlin_bf16_sample,
+            );
             group.bench_sample("qwen36_layer0_top8_m1024_k2048_graph", graph_sample);
         });
     });

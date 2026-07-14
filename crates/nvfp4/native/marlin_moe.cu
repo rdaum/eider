@@ -114,7 +114,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     std::int32_t* num_tokens_past_padded,
     cudaStream_t stream) {
     if (indices == nullptr || input == nullptr || repacked_weight == nullptr ||
-        weight_scale == nullptr || global_scale == nullptr || output == nullptr ||
+        weight_scale == nullptr || global_scale == nullptr ||
         input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
         locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
         num_tokens_past_padded == nullptr) {
@@ -162,8 +162,10 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     constexpr std::uint32_t output_len = kTopK * kGateUp;
     constexpr int convert_threads = 256;
     constexpr int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
-    bf16_to_f32_kernel<<<convert_blocks, convert_threads, 0, stream>>>(
-        output_bf16, output, output_len);
+    if (output != nullptr) {
+        bf16_to_f32_kernel<<<convert_blocks, convert_threads, 0, stream>>>(
+            output_bf16, output, output_len);
+    }
     return cudaGetLastError();
 }
 
