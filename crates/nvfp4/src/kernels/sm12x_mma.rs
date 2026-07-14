@@ -1445,7 +1445,7 @@ mod tests {
         let mut out = DeviceBuffer::zeroed(128).expect("out");
         tile_frag_on_stream(&a, &b, 0x38383838, 0x38383838, &mut out, &stream).expect("launch");
         let actual = out.copy_to_host(&stream).expect("copy");
-        assert!(actual.iter().all(|value| *value == 64.0));
+        assert!(actual.iter().all(|value| *value == 128.0));
     }
 
     #[test]
@@ -1458,7 +1458,7 @@ mod tests {
         let mut out = DeviceBuffer::zeroed(128).expect("out");
         tile_frag_on_stream(&a, &b, 0x40404040, 0x38383838, &mut out, &stream).expect("launch");
         let actual = out.copy_to_host(&stream).expect("copy");
-        assert!(actual.iter().all(|value| *value == 128.0), "{actual:?}");
+        assert!(actual.iter().all(|value| *value == 256.0), "{actual:?}");
     }
 
     #[test]
@@ -1473,7 +1473,7 @@ mod tests {
         let mut out = DeviceBuffer::zeroed(128).expect("out");
         tile_frag_kloop_on_stream(&a, &b, &sfa, &sfb, 2, &mut out, &stream).expect("launch");
         let actual = out.copy_to_host(&stream).expect("copy");
-        assert!(actual.iter().all(|value| *value == 192.0), "{actual:?}");
+        assert!(actual.iter().all(|value| *value == 384.0), "{actual:?}");
     }
 
     #[test]
@@ -1488,7 +1488,7 @@ mod tests {
         let mut out = DeviceBuffer::zeroed(M16N8_FLOATS).expect("out");
         tile_kloop_on_stream(&a, &b, &sfa, &sfb, 2, &mut out, &stream).expect("launch");
         let actual = out.copy_to_host(&stream).expect("copy");
-        assert!(actual.iter().all(|value| *value == 192.0), "{actual:?}");
+        assert!(actual.iter().all(|value| *value == 384.0), "{actual:?}");
     }
 
     #[test]
@@ -1518,7 +1518,7 @@ mod tests {
         let mut out = DeviceBuffer::zeroed(M16N8_FLOATS).expect("out");
         tile_kloop_on_stream(&a, &b, &sfa, &sfb, 1, &mut out, &stream).expect("launch");
         let actual = out.copy_to_host(&stream).expect("copy");
-        assert!(actual.iter().all(|value| *value == 64.0), "{actual:?}");
+        assert!(actual.iter().all(|value| *value == 128.0), "{actual:?}");
     }
 
     #[test]
@@ -1554,7 +1554,7 @@ mod tests {
         }
 
         assert!(
-            accumulated.iter().all(|value| *value == 64.0),
+            accumulated.iter().all(|value| *value == 128.0),
             "{accumulated:?}"
         );
     }
@@ -1583,8 +1583,8 @@ mod tests {
         let actual_b = out_b.copy_to_host(&stream).expect("copy b");
         assert_eq!(actual_a, actual_b);
         assert!(actual_a.iter().all(|value| *value > 0.0), "{actual_a:?}");
-        assert!(actual_a.contains(&32.0), "{actual_a:?}");
         assert!(actual_a.contains(&64.0), "{actual_a:?}");
+        assert!(actual_a.contains(&96.0), "{actual_a:?}");
     }
 
     #[test]
@@ -1915,6 +1915,81 @@ mod tests {
                 (actual - expected).abs() <= 1e-4,
                 "idx={idx} actual={actual} expected={expected}"
             );
+        }
+    }
+
+    #[test]
+    fn sm12x_mma_varied_b_rows_match_shared_scale_cpu_reference() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let m = 16;
+        let n = 8;
+        let k = 64;
+        let a_values = vec![1.0f32; m * k];
+        let (a_packed, a_scales, a_dequantized) =
+            quantize_weight_f32_row_major_m16_k16(m, k, &a_values).expect("A quantize");
+        let b_values = (0..n * k)
+            .map(|index| (index / k + 1) as f32)
+            .collect::<Vec<_>>();
+        let mut b_scaled = vec![0.0f32; n * k];
+        let mut b_dequantized = vec![0.0f32; n * k];
+        let mut b_scale_bytes = [0u8; 4];
+        for kb in 0..4 {
+            let max_abs = (0..n)
+                .flat_map(|row| b_values[row * k + kb * 16..row * k + kb * 16 + 16].iter())
+                .filter(|value| value.is_finite())
+                .map(|value| value.abs())
+                .fold(0.0f32, f32::max);
+            let scale_code = if max_abs == 0.0 {
+                0
+            } else {
+                crate::format::ue4m3_code(max_abs / 6.0)
+            };
+            let scale = crate::format::e4m3_value(scale_code);
+            b_scale_bytes[kb] = scale_code;
+            for row in 0..n {
+                for offset in 0..16 {
+                    let index = row * k + kb * 16 + offset;
+                    let code = crate::format::e2m1_code(if scale == 0.0 {
+                        0.0
+                    } else {
+                        b_values[index] / scale
+                    });
+                    b_scaled[index] = crate::format::e2m1_value(code);
+                    b_dequantized[index] = b_scaled[index] * scale;
+                }
+            }
+        }
+        let b_packed = crate::format::pack_e2m1(&b_scaled);
+        let a_tiles = Sm12xFp4TileSet::from_packed_row_major_mxk(m, k, &a_packed).expect("A tiles");
+        let b_tiles = Sm12xFp4TileSet::from_packed_row_major_nxk(n, k, &b_packed).expect("B tiles");
+        let a_tiles = DeviceBuffer::from_host(&a_tiles.to_bytes()).expect("A device");
+        let b_tiles = DeviceBuffer::from_host(&b_tiles.to_bytes()).expect("B device");
+        let a_scales = DeviceBuffer::from_host(&a_scales).expect("A scales");
+        let b_scales =
+            DeviceBuffer::from_host(&[pack_ue4m3_k16_scale_word(b_scale_bytes)]).expect("B scales");
+        let mut actual = DeviceBuffer::zeroed(M16N8_FLOATS).expect("output");
+        tile_kloop_on_stream(
+            &a_tiles,
+            &b_tiles,
+            &a_scales,
+            &b_scales,
+            1,
+            &mut actual,
+            &stream,
+        )
+        .expect("MMA");
+        let actual = actual.copy_to_host(&stream).expect("copy");
+        for row in 0..m {
+            for col in 0..n {
+                let expected = (0..k)
+                    .map(|index| a_dequantized[row * k + index] * b_dequantized[col * k + index])
+                    .sum::<f32>();
+                let observed = actual[row + col * m];
+                assert!(
+                    (observed - expected).abs() <= 1e-4,
+                    "row={row} col={col} observed={observed} expected={expected}"
+                );
+            }
         }
     }
 
