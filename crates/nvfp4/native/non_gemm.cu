@@ -2803,6 +2803,68 @@ __global__ void infer_bf16_matvec_logits_kernel(const float* input,
     }
 }
 
+__global__ void infer_bf16_matvec_pair_logits_kernel(
+    const float* input,
+    const std::uint16_t* first_weight,
+    const std::uint16_t* second_weight,
+    float* first_logits,
+    float* second_logits,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t cols) {
+    extern __shared__ float partial[];
+    const std::uint32_t global_row = blockIdx.x;
+    const bool first = global_row < first_rows;
+    const std::uint32_t row = first ? global_row : global_row - first_rows;
+    if ((!first && row >= second_rows) || (first && row >= first_rows)) {
+        return;
+    }
+    const std::uint16_t* weight = first ? first_weight : second_weight;
+    float* logits = first ? first_logits : second_logits;
+
+    float* input_sh = partial + blockDim.x;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    const std::uint16_t* row_weight = weight + static_cast<std::size_t>(row) * cols;
+    if ((cols & 1u) == 0u) {
+        const std::uint32_t cols_aligned = cols & ~std::uint32_t(3u);
+        for (std::uint32_t col = threadIdx.x * 4; col < cols_aligned; col += blockDim.x * 4) {
+            const __nv_bfloat162 w0 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col);
+            const __nv_bfloat162 w1 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col + 2);
+            acc = __fmaf_rn(__bfloat162float(__low2bfloat16(w0)), input_sh[col], acc);
+            acc = __fmaf_rn(__bfloat162float(__high2bfloat16(w0)), input_sh[col + 1], acc);
+            acc = __fmaf_rn(__bfloat162float(__low2bfloat16(w1)), input_sh[col + 2], acc);
+            acc = __fmaf_rn(__bfloat162float(__high2bfloat16(w1)), input_sh[col + 3], acc);
+        }
+        for (std::uint32_t col = cols_aligned + threadIdx.x; col < cols; col += blockDim.x) {
+            const __nv_bfloat16 w = *reinterpret_cast<const __nv_bfloat16*>(row_weight + col);
+            acc = __fmaf_rn(__bfloat162float(w), input_sh[col], acc);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            const __nv_bfloat16 w = *reinterpret_cast<const __nv_bfloat16*>(row_weight + col);
+            acc = __fmaf_rn(__bfloat162float(w), input_sh[col], acc);
+        }
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        logits[row] = partial[0];
+    }
+}
+
 __global__ void infer_argmax_f32_kernel(const float* values,
                                               std::uint32_t* out_index,
                                               float* out_value,
@@ -3096,6 +3158,30 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_on_stream(
         kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
     infer_bf16_matvec_logits_kernel<<<rows, kThreads, matvec_shmem, stream>>>(
         input, weight, logits, rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_bf16_linear_pair_logits_f32_on_stream(
+    const float* input,
+    const std::uint16_t* first_weight,
+    const std::uint16_t* second_weight,
+    float* first_logits,
+    float* second_logits,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || first_weight == nullptr || second_weight == nullptr ||
+        first_logits == nullptr || second_logits == nullptr || first_rows == 0 ||
+        second_rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::size_t matvec_shmem =
+        kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+    infer_bf16_matvec_pair_logits_kernel<<<first_rows + second_rows, kThreads, matvec_shmem, stream>>>(
+        input, first_weight, second_weight, first_logits, second_logits,
+        first_rows, second_rows, cols);
     return cudaGetLastError();
 }
 

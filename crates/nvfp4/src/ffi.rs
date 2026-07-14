@@ -742,6 +742,17 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_bf16_linear_pair_logits_f32_on_stream(
+        input: *const f32,
+        first_weight: *const u16,
+        second_weight: *const u16,
+        first_logits: *mut f32,
+        second_logits: *mut f32,
+        first_rows: u32,
+        second_rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_lm_head_top1_f32_on_stream(
         input: *const f32,
         weight: *const u16,
