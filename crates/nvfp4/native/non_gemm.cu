@@ -1359,6 +1359,96 @@ extern "C" cudaError_t infer_moe_weighted_accumulate_slots_f32_on_stream(
     return cudaGetLastError();
 }
 
+__device__ __forceinline__ float infer_round_f32_to_bf16_value(float value) {
+    const std::uint32_t bits = __float_as_uint(value);
+    const std::uint32_t lsb = (bits >> 16) & 1u;
+    const std::uint32_t rounded = bits + 0x7fffu + lsb;
+    return __uint_as_float(rounded & 0xffff0000u);
+}
+
+__global__ void infer_qwen36_ffn_finalize_f32_kernel(
+    const float* moe_output,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const float shared_scale = 1.0f / (1.0f + expf(-shared_gate_logit[0]));
+    const float shared_gated = shared_output[idx] * shared_scale;
+    const float ffn_output = moe_output[idx] + shared_gated;
+    output[idx] = infer_round_f32_to_bf16_value(residual[idx] + ffn_output);
+}
+
+extern "C" cudaError_t infer_qwen36_ffn_finalize_f32_on_stream(
+    const float* moe_output,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t len,
+    cudaStream_t stream) {
+    if (moe_output == nullptr || shared_gate_logit == nullptr || shared_output == nullptr ||
+        residual == nullptr || output == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_qwen36_ffn_finalize_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        moe_output, shared_gate_logit, shared_output, residual, output, len);
+    return cudaGetLastError();
+}
+
+__global__ void infer_qwen36_ffn_finalize_routed_f32_kernel(
+    const std::uint32_t* indices,
+    const float* route_weights,
+    const float* const* routed_outputs,
+    const float* alpha_table,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t len,
+    std::uint32_t groups) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    float routed_sum = 0.0f;
+    for (std::uint32_t slot = 0; slot < groups; ++slot) {
+        const std::uint32_t expert = indices[slot];
+        routed_sum += routed_outputs[slot][idx] * route_weights[slot] * alpha_table[expert];
+    }
+    const float shared_scale = 1.0f / (1.0f + expf(-shared_gate_logit[0]));
+    const float shared_gated = shared_output[idx] * shared_scale;
+    const float ffn_output = routed_sum + shared_gated;
+    output[idx] = infer_round_f32_to_bf16_value(residual[idx] + ffn_output);
+}
+
+extern "C" cudaError_t infer_qwen36_ffn_finalize_routed_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* route_weights,
+    const float* const* routed_outputs,
+    const float* alpha_table,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t len,
+    std::uint32_t groups,
+    cudaStream_t stream) {
+    if (indices == nullptr || route_weights == nullptr || routed_outputs == nullptr ||
+        alpha_table == nullptr || shared_gate_logit == nullptr || shared_output == nullptr ||
+        residual == nullptr || output == nullptr || len == 0 || groups == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_qwen36_ffn_finalize_routed_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        indices, route_weights, routed_outputs, alpha_table, shared_gate_logit,
+        shared_output, residual, output, len, groups);
+    return cudaGetLastError();
+}
+
 // RoPE, layout transforms, and attention/KV-cache kernels.
 __global__ void infer_rope_neox_f32_kernel(const float* input,
                                                  float* output,

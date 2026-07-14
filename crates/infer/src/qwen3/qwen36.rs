@@ -20,14 +20,13 @@ use crate::nvfp4::{
     moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
     nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
-    quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
-    qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_into_on_stream,
-    qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
+    quantize_nvfp4_vector_simple_scales_f32_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
+    qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
+    qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
-    round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_into_on_stream,
-    scale_channel_f32_device_scalar_in_place_on_stream, scaled_add_f32_into_on_stream,
-    sigmoid_mul_f32_into_on_stream, sigmoid_scale_scalar_f32_into_on_stream,
-    silu_mul_halves_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
+    scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
+    sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
 };
 
 use super::infer::{
@@ -1759,7 +1758,7 @@ pub struct Qwen36MoeStep<'a> {
     pub route_indices: &'a DeviceBuffer<u32>,
     /// Router top-k weights.
     pub route_weights: &'a DeviceBuffer<f32>,
-    /// Final FFN output (routed MoE + gated shared expert).
+    /// Final residual FFN output rounded to BF16 precision in F32 storage.
     pub ffn_out: &'a DeviceBuffer<f32>,
 }
 
@@ -2335,13 +2334,21 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        let grouped_gate_up = workspace
-            .grouped_gate_up
-            .as_ref()
-            .ok_or_else(|| Error::Format {
-                label: "Qwen3.6 grouped down",
-                detail: "grouped gate/up workspace is unavailable".to_string(),
-            })?;
+        let gate_up_table = match &self.gate_up_storage {
+            Qwen36GateUpStorage::Grouped { .. } => {
+                &workspace
+                    .grouped_gate_up
+                    .as_ref()
+                    .ok_or_else(|| Error::Format {
+                        label: "Qwen3.6 grouped down",
+                        detail: "grouped gate/up workspace is unavailable".to_string(),
+                    })?
+                    .c
+            }
+            Qwen36GateUpStorage::Marlin(_) | Qwen36GateUpStorage::Fp8 => {
+                &workspace.marlin_gate_up_table
+            }
+        };
         let grouped_down = workspace
             .grouped_down
             .as_mut()
@@ -2351,13 +2358,19 @@ impl Qwen36MoeWeights {
             })?;
         let enable_sm12x = self.storage_plan.down == Qwen36DownStorage::Sm12x;
         if enable_sm12x && self.sm12x_down_tiles.is_some() && self.sm12x_down_scales.is_some() {
+            let gate_up_alpha_table =
+                if matches!(&self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. }) {
+                    &self.expert_ptrs.gate_up_alphas
+                } else {
+                    &self.gate_up_w4a16_unity_alphas
+                };
             return moe_silu_quantize_slots_on_stream(
                 &workspace.route.indices,
-                &grouped_gate_up.c,
+                gate_up_table,
                 &mut workspace.sm12x_down.b_tiles,
                 &mut workspace.sm12x_down.b_scales,
                 &self.expert_ptrs.down_input_scales,
-                &self.expert_ptrs.gate_up_alphas,
+                gate_up_alpha_table,
                 grouped_down.inputs[0].rows,
                 workspace.sm12x_down.groups,
                 stream,
@@ -2366,7 +2379,7 @@ impl Qwen36MoeWeights {
         crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
             MoeSiluQuantizeSlotBuffers {
                 indices: &workspace.route.indices,
-                gate_up_table: &grouped_gate_up.c,
+                gate_up_table,
                 packed_table: grouped_down.input_values_mut.output(),
                 scales_table: grouped_down.input_scales_mut.output(),
                 input_scale_table: &self.expert_ptrs.down_input_scales,
@@ -2723,6 +2736,38 @@ impl Qwen36MoeWeights {
         )
     }
 
+    /// Runs only the shared expert gate projection.
+    pub fn run_shared_gate_linear_only(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.shared_gate
+            .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)
+    }
+
+    /// Runs the fused routed accumulation, shared gate, residual, and BF16
+    /// finalization used by the SM12x routed path.
+    pub fn run_ffn_finalize_routed_only(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        residual: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        qwen36_ffn_finalize_routed_f32_into_on_stream(
+            &workspace.route.indices,
+            &workspace.route.weights,
+            &workspace.sm12x_down.c,
+            &self.expert_ptrs.down_alphas,
+            &workspace.shared_gate_logits,
+            &workspace.shared_output,
+            residual,
+            workspace.ffn_residual.output(),
+            stream,
+        )
+    }
+
     /// Runs only final FFN routed/shared combine and residual add.
     pub fn run_ffn_combine_only(
         &self,
@@ -2748,7 +2793,8 @@ impl Qwen36MoeWeights {
     ///
     /// `ffn_norm` is the post-attention-norm hidden vector; `residual` is the
     /// pre-FFN residual (post-attention output). The output is written to
-    /// `workspace.ffn_out` and equals `residual + (routed_moe + gated_shared)`.
+    /// `workspace.ffn_out` and equals the BF16-rounded value of
+    /// `residual + (routed_moe + gated_shared)`.
     #[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
     pub fn run_one_token<'a>(
         &'a self,
@@ -2846,7 +2892,9 @@ impl Qwen36MoeWeights {
             } else {
                 run_silu_quantize()?;
             }
-            fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+            if !use_sm12x_down {
+                fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+            }
             let sm12x_down = &workspace.sm12x_down;
             if let Some(profile) = profile.as_deref_mut() {
                 let (_, gemv_ms) = timed_cuda(stream, || {
@@ -3106,18 +3154,7 @@ impl Qwen36MoeWeights {
                         )
                     })?;
                     profile.qwen36_routed_down_gemv_ms += gemv_ms;
-                    let (_, accum_ms) = timed_cuda(stream, || {
-                        moe_weighted_accumulate_slots_f32_on_stream(
-                            &workspace.route.indices,
-                            &workspace.route.weights,
-                            &sm12x_down.c,
-                            &self.expert_ptrs.down_alphas,
-                            workspace.moe_out.inout(),
-                            stream,
-                        )
-                    })?;
-                    profile.qwen36_routed_down_accum_ms += accum_ms;
-                    profile.qwen36_routed_down_ms += gemv_ms + accum_ms;
+                    profile.qwen36_routed_down_ms += gemv_ms;
                 } else {
                     indexed_grouped_gemv_on_stream(
                         &workspace.route.indices,
@@ -3130,14 +3167,6 @@ impl Qwen36MoeWeights {
                         self.sm12x_down_m_tiles,
                         self.sm12x_down_k_tiles,
                         sm12x_down.groups,
-                        stream,
-                    )?;
-                    moe_weighted_accumulate_slots_f32_on_stream(
-                        &workspace.route.indices,
-                        &workspace.route.weights,
-                        &sm12x_down.c,
-                        &self.expert_ptrs.down_alphas,
-                        workspace.moe_out.inout(),
                         stream,
                     )?;
                 }
@@ -3333,52 +3362,58 @@ impl Qwen36MoeWeights {
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
                 self.shared_gate
-                    .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)?;
-                sigmoid_scale_scalar_f32_into_on_stream(
-                    &workspace.shared_gate_logits,
-                    &workspace.shared_output,
-                    workspace.shared_gated.output(),
-                    stream,
-                )
+                    .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)
             })?;
             profile.qwen36_shared_gate_ms += ms;
         } else {
             self.shared_gate
                 .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)?;
-            sigmoid_scale_scalar_f32_into_on_stream(
-                &workspace.shared_gate_logits,
-                &workspace.shared_output,
-                workspace.shared_gated.output(),
-                stream,
-            )?;
         }
 
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
-                add_f32_into_on_stream(
-                    &workspace.moe_out,
-                    &workspace.shared_gated,
-                    workspace.ffn_out.output(),
-                    stream,
-                )?;
-                add_f32_into_on_stream(
-                    residual,
-                    &workspace.ffn_out,
-                    workspace.ffn_residual.output(),
-                    stream,
-                )
+                if use_device_route && use_sm12x_down {
+                    qwen36_ffn_finalize_routed_f32_into_on_stream(
+                        &workspace.route.indices,
+                        &workspace.route.weights,
+                        &workspace.sm12x_down.c,
+                        &self.expert_ptrs.down_alphas,
+                        &workspace.shared_gate_logits,
+                        &workspace.shared_output,
+                        residual,
+                        workspace.ffn_residual.output(),
+                        stream,
+                    )
+                } else {
+                    qwen36_ffn_finalize_f32_into_on_stream(
+                        &workspace.moe_out,
+                        &workspace.shared_gate_logits,
+                        &workspace.shared_output,
+                        residual,
+                        workspace.ffn_residual.output(),
+                        stream,
+                    )
+                }
             })?;
             profile.qwen36_ffn_combine_ms += ms;
-        } else {
-            add_f32_into_on_stream(
-                &workspace.moe_out,
-                &workspace.shared_gated,
-                workspace.ffn_out.output(),
+        } else if use_device_route && use_sm12x_down {
+            qwen36_ffn_finalize_routed_f32_into_on_stream(
+                &workspace.route.indices,
+                &workspace.route.weights,
+                &workspace.sm12x_down.c,
+                &self.expert_ptrs.down_alphas,
+                &workspace.shared_gate_logits,
+                &workspace.shared_output,
+                residual,
+                workspace.ffn_residual.output(),
                 stream,
             )?;
-            add_f32_into_on_stream(
+        } else {
+            qwen36_ffn_finalize_f32_into_on_stream(
+                &workspace.moe_out,
+                &workspace.shared_gate_logits,
+                &workspace.shared_output,
                 residual,
-                &workspace.ffn_out,
                 workspace.ffn_residual.output(),
                 stream,
             )?;
@@ -4425,7 +4460,6 @@ pub struct Qwen36DecodeState {
     cache_len_device: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layer_workspaces: Vec<Qwen36LayerBlockWorkspace>,
-    rounded_hidden: DeviceBuffer<f32>,
     final_hidden: DeviceBuffer<f32>,
     lm_head: Qwen36LmHeadWorkspace,
     segmented_graphs: Option<Vec<Qwen36LayerGraphs>>,
@@ -4584,7 +4618,6 @@ impl Qwen36TextModel {
             cache_len_device: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             layer_workspaces,
-            rounded_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             final_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             lm_head: Qwen36LmHeadWorkspace {
                 logits: DeviceBuffer::zeroed(self.manifest.vocab)?,
@@ -4613,12 +4646,13 @@ impl Qwen36TextModel {
     ) -> Result<Vec<Qwen36LayerGraphs>> {
         let mut graphs = Vec::with_capacity(self.layers.len());
         for (layer_idx, block) in self.layers.iter().enumerate() {
+            let (previous, current) = state.layer_workspaces.split_at_mut(layer_idx);
             let hidden = if layer_idx == 0 {
                 &state.hidden
             } else {
-                &state.rounded_hidden
+                &previous[layer_idx - 1].moe.ffn_out
             };
-            let workspace = &mut state.layer_workspaces[layer_idx];
+            let workspace = &mut current[0];
             match &block.attention {
                 Qwen36Attention::LinearAttention(_) => {
                     let pre_gdn = state.stream.capture(|stream| {
@@ -4760,7 +4794,6 @@ impl Qwen36TextModel {
             state.segmented_graphs = None;
         }
 
-        let mut hidden = &state.hidden;
         if let Some(graphs) = state.segmented_graphs.as_ref() {
             state
                 .position_device
@@ -4782,18 +4815,18 @@ impl Qwen36TextModel {
                     }
                     Qwen36LayerGraphs::Full(graph) => graph.launch(stream)?,
                 }
-                round_f32_to_bf16_into_on_stream(
-                    &workspace.moe.ffn_out,
-                    state.rounded_hidden.output(),
-                    stream,
-                )?;
-                hidden = &state.rounded_hidden;
             }
         } else {
-            for (block, workspace) in self.layers.iter().zip(state.layer_workspaces.iter_mut()) {
-                let step = block.run_one_token(
+            for (layer_idx, block) in self.layers.iter().enumerate() {
+                let (previous, current) = state.layer_workspaces.split_at_mut(layer_idx);
+                let hidden = if layer_idx == 0 {
+                    &state.hidden
+                } else {
+                    &previous[layer_idx - 1].moe.ffn_out
+                };
+                block.run_one_token(
                     &self.lt,
-                    workspace,
+                    &mut current[0],
                     &self.manifest,
                     hidden,
                     state.position,
@@ -4801,14 +4834,14 @@ impl Qwen36TextModel {
                     profile.as_deref_mut(),
                     gpu_probe.as_deref_mut(),
                 )?;
-                round_f32_to_bf16_into_on_stream(
-                    step.output,
-                    state.rounded_hidden.output(),
-                    stream,
-                )?;
-                hidden = &state.rounded_hidden;
             }
         }
+        let hidden = &state
+            .layer_workspaces
+            .last()
+            .expect("Qwen3.6 has at least one layer")
+            .moe
+            .ffn_out;
 
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {

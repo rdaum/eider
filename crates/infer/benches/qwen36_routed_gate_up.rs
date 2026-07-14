@@ -1,4 +1,7 @@
-use infer::nvfp4::{CudaEvent, CudaStream, DeviceBuffer, GpuCounterCollector, Result};
+use infer::nvfp4::{
+    CudaEvent, CudaStream, DeviceBuffer, GpuCounterCollector, Result,
+    round_f32_to_bf16_into_on_stream,
+};
 use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36LayerBlockWorkspace, Qwen36Model};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -20,6 +23,7 @@ struct Qwen36RoutedGateUpBench {
     workspace: Qwen36LayerBlockWorkspace,
     ffn_norm: DeviceBuffer<f32>,
     residual: DeviceBuffer<f32>,
+    rounded_reference: DeviceBuffer<f32>,
     stream: CudaStream,
     route_indices: Vec<usize>,
     route_weights: Vec<f32>,
@@ -159,6 +163,9 @@ impl Qwen36RoutedGateUpBench {
             .run_grouped_down_gemv_only(&mut workspace.moe, &stream)?;
         block
             .moe
+            .run_grouped_down_accum_only(&mut workspace.moe, &stream)?;
+        block
+            .moe
             .run_shared_gate_up_only(&mut workspace.moe, &ffn_norm, &stream)?;
         block
             .moe
@@ -169,6 +176,28 @@ impl Qwen36RoutedGateUpBench {
         block
             .moe
             .run_shared_gate_only(&mut workspace.moe, &ffn_norm, &stream)?;
+        block
+            .moe
+            .run_ffn_combine_only(&mut workspace.moe, &residual, &stream)?;
+        let mut rounded_reference = DeviceBuffer::zeroed(manifest.hidden)?;
+        round_f32_to_bf16_into_on_stream(
+            &workspace.moe.ffn_residual,
+            rounded_reference.output(),
+            &stream,
+        )?;
+        block
+            .moe
+            .run_shared_gate_linear_only(&mut workspace.moe, &ffn_norm, &stream)?;
+        block
+            .moe
+            .run_ffn_finalize_routed_only(&mut workspace.moe, &residual, &stream)?;
+        let reference = rounded_reference.copy_to_host(&stream)?;
+        let candidate = workspace.moe.ffn_residual.copy_to_host(&stream)?;
+        assert_eq!(
+            candidate.into_vec(),
+            reference.into_vec(),
+            "fused routed FFN finalization changed BF16-rounded output"
+        );
         let route_indices = workspace
             .moe
             .route
@@ -191,6 +220,7 @@ impl Qwen36RoutedGateUpBench {
             workspace,
             ffn_norm,
             residual,
+            rounded_reference,
             stream,
             route_indices,
             route_weights,
@@ -419,6 +449,48 @@ impl Qwen36RoutedGateUpBench {
             .synchronize()
             .expect("synchronize benchmark stream");
     }
+
+    fn run_ffn_finalize_reference_chunk(&mut self, chunk_size: usize) {
+        for _ in 0..chunk_size {
+            self.block
+                .moe
+                .run_grouped_down_accum_only(&mut self.workspace.moe, &self.stream)
+                .expect("run routed accumulation");
+            self.block
+                .moe
+                .run_shared_gate_only(&mut self.workspace.moe, &self.ffn_norm, &self.stream)
+                .expect("run shared gate");
+            self.block
+                .moe
+                .run_ffn_combine_only(&mut self.workspace.moe, &self.residual, &self.stream)
+                .expect("run FFN combine");
+            round_f32_to_bf16_into_on_stream(
+                &self.workspace.moe.ffn_residual,
+                self.rounded_reference.output(),
+                &self.stream,
+            )
+            .expect("round FFN output to BF16");
+        }
+        self.stream
+            .synchronize()
+            .expect("synchronize reference FFN finalization");
+    }
+
+    fn run_ffn_finalize_fused_chunk(&mut self, chunk_size: usize) {
+        for _ in 0..chunk_size {
+            self.block
+                .moe
+                .run_shared_gate_linear_only(&mut self.workspace.moe, &self.ffn_norm, &self.stream)
+                .expect("run shared gate projection");
+            self.block
+                .moe
+                .run_ffn_finalize_routed_only(&mut self.workspace.moe, &self.residual, &self.stream)
+                .expect("run fused routed FFN finalization");
+        }
+        self.stream
+            .synchronize()
+            .expect("synchronize fused FFN finalization");
+    }
 }
 
 fn routed_gate_up_sample(
@@ -587,6 +659,24 @@ fn ffn_combine_sample(
     _chunk_num: usize,
 ) -> BenchSampleResult {
     ctx.run_ffn_combine_chunk(chunk_size);
+    common_sample_metrics(ctx, chunk_size)
+}
+
+fn ffn_finalize_reference_sample(
+    ctx: &mut Qwen36RoutedGateUpBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.run_ffn_finalize_reference_chunk(chunk_size);
+    common_sample_metrics(ctx, chunk_size)
+}
+
+fn ffn_finalize_fused_sample(
+    ctx: &mut Qwen36RoutedGateUpBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.run_ffn_finalize_fused_chunk(chunk_size);
     common_sample_metrics(ctx, chunk_size)
 }
 
@@ -797,6 +887,17 @@ fn main() {
                 .measurement_domain(MeasurementDomain::Gpu)
                 .backend(|| Box::new(CudaEventBackend::new()))
                 .bench_sample("ffn_combine_hidden2048", ffn_combine_sample);
+            g.throughput(Throughput::ops())
+                .measurement_domain(MeasurementDomain::Gpu)
+                .backend(|| Box::new(CudaEventBackend::new()))
+                .bench_sample(
+                    "ffn_finalize_reference_hidden2048",
+                    ffn_finalize_reference_sample,
+                );
+            g.throughput(Throughput::ops())
+                .measurement_domain(MeasurementDomain::Gpu)
+                .backend(|| Box::new(CudaEventBackend::new()))
+                .bench_sample("ffn_finalize_fused_hidden2048", ffn_finalize_fused_sample);
         });
     });
 }

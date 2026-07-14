@@ -463,6 +463,28 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_ffn_finalize_f32_on_stream(
+        moe_output: *const f32,
+        shared_gate_logit: *const f32,
+        shared_output: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_ffn_finalize_routed_f32_on_stream(
+        indices: *const u32,
+        route_weights: *const f32,
+        routed_outputs: *const *const f32,
+        alpha_table: *const f32,
+        shared_gate_logit: *const f32,
+        shared_output: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        len: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rope_neox_f32_on_stream(
         input: *const f32,
         output: *mut f32,
