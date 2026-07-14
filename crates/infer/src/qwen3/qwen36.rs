@@ -4214,6 +4214,7 @@ impl Qwen36LayerBlock {
                     position,
                     stream,
                     Some(&mut *profile),
+                    gpu_probe.as_deref_mut(),
                 )
             })?;
             profile.attention_ms += ms;
@@ -4231,6 +4232,7 @@ impl Qwen36LayerBlock {
                 position,
                 stream,
                 None,
+                gpu_probe.as_deref_mut(),
             )?
         };
 
@@ -4313,6 +4315,7 @@ impl Qwen36LayerBlock {
     }
 }
 
+#[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
 fn run_qwen36_attention<'a>(
     attention: &'a Qwen36Attention,
     workspace: &'a mut Qwen36AttentionWorkspace,
@@ -4321,14 +4324,37 @@ fn run_qwen36_attention<'a>(
     position: usize,
     stream: &CudaStream,
     profile: Option<&mut QwenDecodeProfile>,
+    mut gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
 ) -> Result<&'a DeviceBuffer<f32>> {
     match (attention, workspace) {
         (Qwen36Attention::LinearAttention(w), Qwen36AttentionWorkspace::LinearAttention(ws)) => {
-            let step = w.run_one_token(ws, normed_hidden, manifest.rms_eps, stream, profile)?;
+            let step = if gpu_probe
+                .as_ref()
+                .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::LinearAttention))
+            {
+                gpu_probe
+                    .as_deref_mut()
+                    .expect("probe present")
+                    .capture(|| {
+                        w.run_one_token(ws, normed_hidden, manifest.rms_eps, stream, None)
+                    })?
+            } else {
+                w.run_one_token(ws, normed_hidden, manifest.rms_eps, stream, profile)?
+            };
             Ok(step.output)
         }
         (Qwen36Attention::FullAttention(w), Qwen36AttentionWorkspace::FullAttention(ws)) => {
-            let step = w.run_one_token(ws, manifest, normed_hidden, position, stream)?;
+            let step = if gpu_probe
+                .as_ref()
+                .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::FullAttention))
+            {
+                gpu_probe
+                    .as_deref_mut()
+                    .expect("probe present")
+                    .capture(|| w.run_one_token(ws, manifest, normed_hidden, position, stream))?
+            } else {
+                w.run_one_token(ws, manifest, normed_hidden, position, stream)?
+            };
             Ok(step.output)
         }
         _ => Err(Error::Format {
@@ -4539,6 +4565,10 @@ pub struct Qwen36NextTokenLogits {
 pub enum Qwen36GpuCounterStage {
     /// Routed expert grouped gate/up stage.
     RoutedGateUp,
+    /// One complete full-attention layer, including projections and KV attention.
+    FullAttention,
+    /// One complete linear-attention layer.
+    LinearAttention,
 }
 
 /// One-shot GPU counter probe for a Qwen3.6 decode stage.

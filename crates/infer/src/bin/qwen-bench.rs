@@ -609,13 +609,15 @@ impl BenchArgs {
 
 fn print_usage() {
     println!(
-        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up] [--metrics-prometheus]"
+        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
     );
 }
 
 fn parse_gpu_counter_stage(value: &str) -> Result<Qwen36GpuCounterStage> {
     match value {
         "qwen36-routed-gate-up" => Ok(Qwen36GpuCounterStage::RoutedGateUp),
+        "qwen36-full-attention" => Ok(Qwen36GpuCounterStage::FullAttention),
+        "qwen36-linear-attention" => Ok(Qwen36GpuCounterStage::LinearAttention),
         _ => Err(Error::Format {
             label: "--gpu-counter-stage",
             detail: format!("unknown stage {value:?}"),
