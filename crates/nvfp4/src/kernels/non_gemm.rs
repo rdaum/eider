@@ -3172,6 +3172,166 @@ pub fn fp8_linear_configured_f32_into_on_stream(
     }
 }
 
+/// Enqueues two f32-input, FP8-weight projections as one segmented CUDA grid.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear_pair_configured_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    first_weight: &DeviceBuffer<u8>,
+    second_weight: &DeviceBuffer<u8>,
+    mut first_output: DeviceOutput<'_, f32>,
+    mut second_output: DeviceOutput<'_, f32>,
+    first_rows: usize,
+    second_rows: usize,
+    cols: usize,
+    first_scale: f32,
+    second_scale: f32,
+    threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_segmented_fp8_linear(
+        input,
+        &[
+            (first_weight, first_output.len(), first_rows, first_scale),
+            (
+                second_weight,
+                second_output.len(),
+                second_rows,
+                second_scale,
+            ),
+        ],
+        cols,
+        threads,
+    )?;
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_pair_f32_configured_on_stream",
+            ffi::infer_fp8_linear_pair_f32_configured_on_stream(
+                input.ptr,
+                first_weight.ptr,
+                second_weight.ptr,
+                first_output.buffer_mut().ptr,
+                second_output.buffer_mut().ptr,
+                first_rows as u32,
+                second_rows as u32,
+                cols as u32,
+                first_scale,
+                second_scale,
+                threads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues three f32-input, FP8-weight projections as one segmented CUDA grid.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear_triple_configured_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    first_weight: &DeviceBuffer<u8>,
+    second_weight: &DeviceBuffer<u8>,
+    third_weight: &DeviceBuffer<u8>,
+    mut first_output: DeviceOutput<'_, f32>,
+    mut second_output: DeviceOutput<'_, f32>,
+    mut third_output: DeviceOutput<'_, f32>,
+    first_rows: usize,
+    second_rows: usize,
+    third_rows: usize,
+    cols: usize,
+    first_scale: f32,
+    second_scale: f32,
+    third_scale: f32,
+    threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_segmented_fp8_linear(
+        input,
+        &[
+            (first_weight, first_output.len(), first_rows, first_scale),
+            (
+                second_weight,
+                second_output.len(),
+                second_rows,
+                second_scale,
+            ),
+            (third_weight, third_output.len(), third_rows, third_scale),
+        ],
+        cols,
+        threads,
+    )?;
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_triple_f32_configured_on_stream",
+            ffi::infer_fp8_linear_triple_f32_configured_on_stream(
+                input.ptr,
+                first_weight.ptr,
+                second_weight.ptr,
+                third_weight.ptr,
+                first_output.buffer_mut().ptr,
+                second_output.buffer_mut().ptr,
+                third_output.buffer_mut().ptr,
+                first_rows as u32,
+                second_rows as u32,
+                third_rows as u32,
+                cols as u32,
+                first_scale,
+                second_scale,
+                third_scale,
+                threads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+fn validate_segmented_fp8_linear(
+    input: &DeviceBuffer<f32>,
+    segments: &[(&DeviceBuffer<u8>, usize, usize, f32)],
+    cols: usize,
+    threads: usize,
+) -> Result<()> {
+    if cols == 0
+        || cols > u32::MAX as usize
+        || !(64..=512).contains(&threads)
+        || !threads.is_multiple_of(32)
+        || input.len() != cols
+    {
+        return Err(Error::Shape {
+            label: "segmented FP8 linear dimensions",
+            expected: "input=cols; non-zero u32 cols; threads a multiple of 32 in 64..=512"
+                .to_string(),
+            actual: format!("input={} cols={cols} threads={threads}", input.len()),
+        });
+    }
+    for (index, (weight, output_len, rows, scale)) in segments.iter().enumerate() {
+        let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+            label: "segmented FP8 linear weight",
+            expected: "rows * cols without overflow".to_string(),
+            actual: format!("segment={index} rows={rows} cols={cols}"),
+        })?;
+        if *rows == 0
+            || *rows > u32::MAX as usize
+            || weight.len() != weight_len
+            || *output_len != *rows
+        {
+            return Err(Error::Shape {
+                label: "segmented FP8 linear buffers",
+                expected: format!("segment={index} weight={weight_len} output={rows}"),
+                actual: format!(
+                    "segment={index} weight={} output={output_len} rows={rows}",
+                    weight.len()
+                ),
+            });
+        }
+        if !scale.is_finite() {
+            return Err(Error::Format {
+                label: "segmented FP8 linear weight scale",
+                detail: format!("segment={index} expected finite scale, got {scale}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Enqueues an f32-input, FP8-weight linear projection with one dequantization
 /// scale per output channel.
 pub fn fp8_linear_channel_scaled_f32_into_on_stream(
@@ -6144,6 +6304,105 @@ mod tests {
                 &expected,
                 2.0e-6,
                 &format!("fp8 linear threads={threads}"),
+            );
+        }
+    }
+
+    #[test]
+    fn segmented_fp8_linears_match_cpu_reference() {
+        let cols = 7usize;
+        let rows = [5usize, 3, 2];
+        let scales = [0.75f32, 0.5, 1.25];
+        let input = (0..cols)
+            .map(|idx| ((idx % 5) as f32 - 2.0) * 0.25)
+            .collect::<Vec<_>>();
+        let weights = rows
+            .iter()
+            .enumerate()
+            .map(|(segment, rows)| {
+                (0..rows * cols)
+                    .map(|idx| {
+                        format::cuda_e4m3_code((((idx + segment * 3) % 13) as f32 - 6.0) * 0.125)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = weights
+            .iter()
+            .enumerate()
+            .map(|(segment, weight)| {
+                cpu_fp8_linear_f32(&input, weight, rows[segment], cols, scales[segment])
+            })
+            .collect::<Vec<_>>();
+
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_devices = weights
+            .iter()
+            .map(|weight| DeviceBuffer::from_host(weight).expect("weight upload"))
+            .collect::<Vec<_>>();
+        let mut outputs = rows
+            .iter()
+            .map(|rows| DeviceBuffer::<f32>::zeroed(*rows).expect("output alloc"))
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+
+        let [first, second, third] = outputs.as_mut_slice() else {
+            unreachable!()
+        };
+        fp8_linear_triple_configured_f32_into_on_stream(
+            &input_device,
+            &weight_devices[0],
+            &weight_devices[1],
+            &weight_devices[2],
+            first.output(),
+            second.output(),
+            third.output(),
+            rows[0],
+            rows[1],
+            rows[2],
+            cols,
+            scales[0],
+            scales[1],
+            scales[2],
+            128,
+            &stream,
+        )
+        .expect("segmented triple enqueue");
+        for (segment, output) in outputs.iter().enumerate() {
+            let actual = output.copy_to_host(&stream).expect("output download");
+            assert_close(
+                &actual,
+                &expected[segment],
+                2.0e-6,
+                &format!("segmented FP8 linear segment {segment}"),
+            );
+        }
+
+        let (first, rest) = outputs.split_at_mut(1);
+        fp8_linear_pair_configured_f32_into_on_stream(
+            &input_device,
+            &weight_devices[0],
+            &weight_devices[1],
+            first[0].output(),
+            rest[0].output(),
+            rows[0],
+            rows[1],
+            cols,
+            scales[0],
+            scales[1],
+            128,
+            &stream,
+        )
+        .expect("segmented pair enqueue");
+        for segment in 0..2 {
+            let actual = outputs[segment]
+                .copy_to_host(&stream)
+                .expect("output download");
+            assert_close(
+                &actual,
+                &expected[segment],
+                2.0e-6,
+                &format!("segmented FP8 pair segment {segment}"),
             );
         }
     }

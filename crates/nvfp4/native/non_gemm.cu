@@ -3293,6 +3293,68 @@ __global__ void infer_fp8_linear_f32_kernel(const float* input,
     }
 }
 
+__global__ void infer_fp8_linear_segmented_f32_kernel(
+    const float* input,
+    const std::uint8_t* first_weight,
+    const std::uint8_t* second_weight,
+    const std::uint8_t* third_weight,
+    float* first_output,
+    float* second_output,
+    float* third_output,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t third_rows,
+    std::uint32_t cols,
+    float first_scale,
+    float second_scale,
+    float third_scale) {
+    const std::uint32_t global_row = blockIdx.x;
+    const std::uint8_t* weight;
+    float* output;
+    std::uint32_t row;
+    float scale;
+    if (global_row < first_rows) {
+        weight = first_weight;
+        output = first_output;
+        row = global_row;
+        scale = first_scale;
+    } else if (global_row < first_rows + second_rows) {
+        weight = second_weight;
+        output = second_output;
+        row = global_row - first_rows;
+        scale = second_scale;
+    } else {
+        weight = third_weight;
+        output = third_output;
+        row = global_row - first_rows - second_rows;
+        scale = third_scale;
+    }
+
+    float sum = 0.0f;
+    const std::size_t row_base = static_cast<std::size_t>(row) * cols;
+    if ((cols & 3U) == 0) {
+        const auto* input4 = reinterpret_cast<const float4*>(input);
+        const auto* weight4 = reinterpret_cast<const uchar4*>(weight + row_base);
+        const std::uint32_t cols4 = cols >> 2;
+        for (std::uint32_t col4 = threadIdx.x; col4 < cols4; col4 += blockDim.x) {
+            const float4 in = input4[col4];
+            const uchar4 w = weight4[col4];
+            sum += in.x * infer_e4m3_value(w.x);
+            sum += in.y * infer_e4m3_value(w.y);
+            sum += in.z * infer_e4m3_value(w.z);
+            sum += in.w * infer_e4m3_value(w.w);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            sum += input[col] * infer_e4m3_value(weight[row_base + col]);
+        }
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        output[row] = sum * scale;
+    }
+}
+
 static cudaError_t infer_launch_fp8_linear_f32(
     const float* input,
     const std::uint8_t* weight,
@@ -3794,6 +3856,61 @@ extern "C" cudaError_t infer_fp8_linear_f32_configured_on_stream(
     cudaStream_t stream) {
     return infer_launch_fp8_linear_f32(
         input, weight, output, rows, cols, weight_scale, threads, stream);
+}
+
+extern "C" cudaError_t infer_fp8_linear_pair_f32_configured_on_stream(
+    const float* input,
+    const std::uint8_t* first_weight,
+    const std::uint8_t* second_weight,
+    float* first_output,
+    float* second_output,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t cols,
+    float first_scale,
+    float second_scale,
+    std::uint32_t threads,
+    cudaStream_t stream) {
+    if (input == nullptr || first_weight == nullptr || second_weight == nullptr ||
+        first_output == nullptr || second_output == nullptr || first_rows == 0 ||
+        second_rows == 0 || cols == 0 || !isfinite(first_scale) || !isfinite(second_scale) ||
+        threads < 64 || threads > 512 || (threads % 32) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_fp8_linear_segmented_f32_kernel<<<first_rows + second_rows, threads, 0, stream>>>(
+        input, first_weight, second_weight, nullptr, first_output, second_output, nullptr,
+        first_rows, second_rows, 0, cols, first_scale, second_scale, 0.0f);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_fp8_linear_triple_f32_configured_on_stream(
+    const float* input,
+    const std::uint8_t* first_weight,
+    const std::uint8_t* second_weight,
+    const std::uint8_t* third_weight,
+    float* first_output,
+    float* second_output,
+    float* third_output,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t third_rows,
+    std::uint32_t cols,
+    float first_scale,
+    float second_scale,
+    float third_scale,
+    std::uint32_t threads,
+    cudaStream_t stream) {
+    if (input == nullptr || first_weight == nullptr || second_weight == nullptr ||
+        third_weight == nullptr || first_output == nullptr || second_output == nullptr ||
+        third_output == nullptr || first_rows == 0 || second_rows == 0 || third_rows == 0 ||
+        cols == 0 || !isfinite(first_scale) || !isfinite(second_scale) ||
+        !isfinite(third_scale) || threads < 64 || threads > 512 || (threads % 32) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_fp8_linear_segmented_f32_kernel<<<first_rows + second_rows + third_rows, threads, 0, stream>>>(
+        input, first_weight, second_weight, third_weight, first_output, second_output, third_output,
+        first_rows, second_rows, third_rows, cols, first_scale, second_scale, third_scale);
+    return cudaGetLastError();
 }
 
 __global__ void infer_fp8_linear_w8a8_f32_kernel(const float* input,
