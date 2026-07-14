@@ -906,6 +906,119 @@ pub fn moe_weighted_accumulate_slots_f32_on_stream(
     }
 }
 
+/// Combines routed and gated shared FFN outputs with the residual, then writes
+/// the result rounded to BF16 precision in F32 storage.
+pub fn qwen36_ffn_finalize_f32_into_on_stream(
+    moe_output: &DeviceBuffer<f32>,
+    shared_gate_logit: &DeviceBuffer<f32>,
+    shared_output: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = residual.len();
+    if len == 0
+        || len > u32::MAX as usize
+        || moe_output.len() != len
+        || shared_gate_logit.len() != 1
+        || shared_output.len() != len
+        || output.len() != len
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.6 FFN finalize",
+            expected: "matching non-empty FFN/residual buffers and one shared gate logit"
+                .to_string(),
+            actual: format!(
+                "moe={} gate={} shared={} residual={} output={}",
+                moe_output.len(),
+                shared_gate_logit.len(),
+                shared_output.len(),
+                residual.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_ffn_finalize_f32_on_stream",
+            ffi::infer_qwen36_ffn_finalize_f32_on_stream(
+                moe_output.ptr,
+                shared_gate_logit.ptr,
+                shared_output.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Accumulates routed slot outputs, applies the shared-expert gate, adds the
+/// residual, and writes BF16-rounded F32 output in one kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_ffn_finalize_routed_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    routed_outputs: &DeviceBuffer<*const f32>,
+    alpha_table: &DeviceBuffer<f32>,
+    shared_gate_logit: &DeviceBuffer<f32>,
+    shared_output: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = indices.len();
+    let len = residual.len();
+    if len == 0
+        || len > u32::MAX as usize
+        || groups == 0
+        || groups > u32::MAX as usize
+        || route_weights.len() != groups
+        || routed_outputs.len() != groups
+        || alpha_table.is_empty()
+        || shared_gate_logit.len() != 1
+        || shared_output.len() != len
+        || output.len() != len
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.6 routed FFN finalize",
+            expected:
+                "matching routed groups, non-empty FFN/residual buffers, and one shared gate logit"
+                    .to_string(),
+            actual: format!(
+                "indices={} weights={} routed={} alphas={} gate={} shared={} residual={} output={}",
+                indices.len(),
+                route_weights.len(),
+                routed_outputs.len(),
+                alpha_table.len(),
+                shared_gate_logit.len(),
+                shared_output.len(),
+                residual.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_ffn_finalize_routed_f32_on_stream",
+            ffi::infer_qwen36_ffn_finalize_routed_f32_on_stream(
+                indices.ptr,
+                route_weights.ptr,
+                routed_outputs.ptr,
+                alpha_table.ptr,
+                shared_gate_logit.ptr,
+                shared_output.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                len as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues one-position Neox RoPE into an existing output buffer on `stream`.
 pub fn rope_neox_f32_into_on_stream(
     rows: usize,
@@ -4889,6 +5002,103 @@ mod tests {
                 "add mismatch at {idx}: actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn qwen36_routed_ffn_finalize_matches_unfused_sequence() {
+        let len = 2048;
+        let groups = 8;
+        let indices =
+            DeviceBuffer::from_host(&[2u32, 0, 3, 1, 2, 3, 0, 1]).expect("route indices upload");
+        let route_weights =
+            DeviceBuffer::from_host(&[0.19f32, 0.17, 0.15, 0.14, 0.12, 0.1, 0.08, 0.05])
+                .expect("route weights upload");
+        let alpha_table =
+            DeviceBuffer::from_host(&[0.75f32, 1.0, 1.25, 0.875]).expect("alpha table upload");
+        let routed = (0..groups)
+            .map(|slot| {
+                DeviceBuffer::from_host(
+                    &(0..len)
+                        .map(|idx| (((idx * 7 + slot * 11) % 101) as f32 - 50.0) * 0.00390625)
+                        .collect::<Vec<_>>(),
+                )
+                .expect("routed output upload")
+            })
+            .collect::<Vec<_>>();
+        let routed_ptrs = DeviceBuffer::from_host(
+            &routed
+                .iter()
+                .map(|values| values.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("routed pointer table upload");
+        let shared_gate_logit = DeviceBuffer::from_host(&[0.375f32]).expect("gate upload");
+        let shared_output = DeviceBuffer::from_host(
+            &(0..len)
+                .map(|idx| ((idx % 79) as f32 - 39.0) * 0.0078125)
+                .collect::<Vec<_>>(),
+        )
+        .expect("shared output upload");
+        let residual = DeviceBuffer::from_host(
+            &(0..len)
+                .map(|idx| ((idx % 67) as f32 - 33.0) * 0.015625)
+                .collect::<Vec<_>>(),
+        )
+        .expect("residual upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut moe_output = DeviceBuffer::zeroed(len).expect("MoE output alloc");
+        moe_weighted_accumulate_slots_f32_on_stream(
+            &indices,
+            &route_weights,
+            &routed_ptrs,
+            &alpha_table,
+            moe_output.inout(),
+            &stream,
+        )
+        .expect("routed accumulation");
+        let mut shared_gated = DeviceBuffer::zeroed(len).expect("shared gated alloc");
+        sigmoid_scale_scalar_f32_into_on_stream(
+            &shared_gate_logit,
+            &shared_output,
+            shared_gated.output(),
+            &stream,
+        )
+        .expect("shared gate");
+        let mut ffn_output = DeviceBuffer::zeroed(len).expect("FFN output alloc");
+        add_f32_into_on_stream(&moe_output, &shared_gated, ffn_output.output(), &stream)
+            .expect("FFN add");
+        let mut residual_output = DeviceBuffer::zeroed(len).expect("residual output alloc");
+        add_f32_into_on_stream(&residual, &ffn_output, residual_output.output(), &stream)
+            .expect("residual add");
+        let mut reference = DeviceBuffer::zeroed(len).expect("reference alloc");
+        round_f32_to_bf16_into_on_stream(&residual_output, reference.output(), &stream)
+            .expect("reference BF16 round");
+
+        let mut candidate = DeviceBuffer::zeroed(len).expect("candidate alloc");
+        qwen36_ffn_finalize_routed_f32_into_on_stream(
+            &indices,
+            &route_weights,
+            &routed_ptrs,
+            &alpha_table,
+            &shared_gate_logit,
+            &shared_output,
+            &residual,
+            candidate.output(),
+            &stream,
+        )
+        .expect("fused FFN finalize");
+
+        assert_eq!(
+            candidate
+                .copy_to_host(&stream)
+                .expect("candidate download")
+                .into_vec(),
+            reference
+                .copy_to_host(&stream)
+                .expect("reference download")
+                .into_vec()
+        );
     }
 
     #[test]
