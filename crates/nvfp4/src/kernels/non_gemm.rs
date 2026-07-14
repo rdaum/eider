@@ -2845,6 +2845,62 @@ pub fn bf16_linear_logits_f32_into_on_stream(
     }
 }
 
+/// Enqueues two BF16-weight projections over the same f32 input as one CUDA grid.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_linear_pair_logits_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    first_weight: &DeviceBuffer<u16>,
+    second_weight: &DeviceBuffer<u16>,
+    mut first_logits: DeviceOutput<'_, f32>,
+    mut second_logits: DeviceOutput<'_, f32>,
+    first_rows: usize,
+    second_rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_bf16_linear(
+        input,
+        first_weight,
+        first_rows,
+        cols,
+        "first BF16 linear pair",
+    )?;
+    validate_bf16_linear(
+        input,
+        second_weight,
+        second_rows,
+        cols,
+        "second BF16 linear pair",
+    )?;
+    if first_logits.len() != first_rows || second_logits.len() != second_rows {
+        return Err(Error::Shape {
+            label: "BF16 linear pair outputs",
+            expected: format!("first={first_rows} second={second_rows}"),
+            actual: format!(
+                "first={} second={}",
+                first_logits.len(),
+                second_logits.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_bf16_linear_pair_logits_f32_on_stream",
+            ffi::infer_bf16_linear_pair_logits_f32_on_stream(
+                input.ptr,
+                first_weight.ptr,
+                second_weight.ptr,
+                first_logits.buffer_mut().ptr,
+                second_logits.buffer_mut().ptr,
+                first_rows as u32,
+                second_rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn validate_bf16_linear(
     input: &DeviceBuffer<f32>,
     weight: &DeviceBuffer<u16>,
@@ -6007,6 +6063,85 @@ mod tests {
             .unwrap();
         assert_eq!(argmax.index, expected_argmax.0);
         assert!((argmax.value - expected_argmax.1).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn bf16_linear_pair_matches_separate_projections() {
+        let cols = 19usize;
+        let rows = [5usize, 3];
+        let input = (0..cols)
+            .map(|idx| ((idx % 11) as f32 - 5.0) * 0.125)
+            .collect::<Vec<_>>();
+        let weights = rows
+            .iter()
+            .enumerate()
+            .map(|(segment, rows)| {
+                (0..rows * cols)
+                    .map(|idx| {
+                        format::f32_to_bf16((((idx + segment * 7) % 23) as f32 - 11.0) * 0.03125)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_devices = weights
+            .iter()
+            .map(|weight| DeviceBuffer::from_host(weight).expect("weight upload"))
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+        let mut expected = rows
+            .iter()
+            .map(|rows| DeviceBuffer::<f32>::zeroed(*rows).expect("expected alloc"))
+            .collect::<Vec<_>>();
+        for segment in 0..2 {
+            bf16_linear_logits_f32_into_on_stream(
+                &input_device,
+                &weight_devices[segment],
+                expected[segment].output(),
+                rows[segment],
+                cols,
+                &stream,
+            )
+            .expect("separate BF16 projection");
+        }
+        let expected = expected
+            .iter()
+            .map(|output| {
+                output
+                    .copy_to_host(&stream)
+                    .expect("expected download")
+                    .as_slice()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        let mut actual = rows
+            .iter()
+            .map(|rows| DeviceBuffer::<f32>::zeroed(*rows).expect("actual alloc"))
+            .collect::<Vec<_>>();
+        let (first, second) = actual.split_at_mut(1);
+        bf16_linear_pair_logits_f32_into_on_stream(
+            &input_device,
+            &weight_devices[0],
+            &weight_devices[1],
+            first[0].output(),
+            second[0].output(),
+            rows[0],
+            rows[1],
+            cols,
+            &stream,
+        )
+        .expect("paired BF16 projections");
+        for segment in 0..2 {
+            let actual = actual[segment]
+                .copy_to_host(&stream)
+                .expect("actual download");
+            assert_close(
+                &actual,
+                &expected[segment],
+                1.0e-6,
+                &format!("BF16 linear pair segment {segment}"),
+            );
+        }
     }
 
     #[test]

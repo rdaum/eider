@@ -4,7 +4,8 @@ use micromeasure::{
 };
 use nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
-    ModelOptCheckpoint, Result, argmax_f32_into_on_stream,
+    ModelOptCheckpoint, Result, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
@@ -24,6 +25,7 @@ const QKV_ROWS: usize = 8192;
 const KV_ROWS: usize = 512;
 const LINEAR_LAYERS: usize = 30;
 const FULL_ATTENTION_LAYERS: usize = 10;
+const VALUE_HEADS: usize = 32;
 
 struct Fp8LinearBench {
     qkv_plan: Fp8TnMatmulPlan,
@@ -159,6 +161,21 @@ struct Fp8LmHeadBench {
     rows: usize,
 }
 
+struct Bf16PairProjection {
+    alpha_weight: DeviceBuffer<u16>,
+    beta_weight: DeviceBuffer<u16>,
+}
+
+struct Bf16PairBench {
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    input: DeviceBuffer<f32>,
+    alpha_output: DeviceBuffer<f32>,
+    beta_output: DeviceBuffer<f32>,
+    projections: Vec<Bf16PairProjection>,
+}
+
 impl BenchContext for Fp8LinearBench {
     fn prepare(_num_chunks: usize) -> Self {
         let lt = CublasLt::new().expect("cuBLASLt");
@@ -245,6 +262,33 @@ impl BenchContext for Fp8LmHeadBench {
 
     fn chunk_size() -> Option<usize> {
         Some(3)
+    }
+}
+
+impl BenchContext for Bf16PairBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        let weights = host_bf16(VALUE_HEADS * HIDDEN);
+        let projections = (0..LINEAR_LAYERS)
+            .map(|_| Bf16PairProjection {
+                alpha_weight: DeviceBuffer::from_host(&weights).expect("alpha weight"),
+                beta_weight: DeviceBuffer::from_host(&weights).expect("beta weight"),
+            })
+            .collect();
+        let mut bench = Self {
+            stream: CudaStream::new_non_blocking().expect("stream"),
+            start: CudaEvent::new().expect("start"),
+            stop: CudaEvent::new().expect("stop"),
+            input: DeviceBuffer::from_host(&host_f32(HIDDEN)).expect("input"),
+            alpha_output: DeviceBuffer::zeroed(VALUE_HEADS).expect("alpha output"),
+            beta_output: DeviceBuffer::zeroed(VALUE_HEADS).expect("beta output"),
+            projections,
+        };
+        bench.validate().expect("validate paired BF16 projections");
+        bench
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
     }
 }
 
@@ -1086,6 +1130,66 @@ fn host_fp8(len: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| [0x00, 0x30, 0x38, 0xb0, 0xb8][idx % 5])
         .collect()
+}
+
+fn host_bf16(len: usize) -> Vec<u16> {
+    host_f32(len)
+        .into_iter()
+        .map(|value| (value.to_bits() >> 16) as u16)
+        .collect()
+}
+
+impl Bf16PairBench {
+    fn validate(&mut self) -> Result<()> {
+        let projection = &self.projections[0];
+        bf16_linear_logits_f32_into_on_stream(
+            &self.input,
+            &projection.alpha_weight,
+            self.alpha_output.output(),
+            VALUE_HEADS,
+            HIDDEN,
+            &self.stream,
+        )?;
+        bf16_linear_logits_f32_into_on_stream(
+            &self.input,
+            &projection.beta_weight,
+            self.beta_output.output(),
+            VALUE_HEADS,
+            HIDDEN,
+            &self.stream,
+        )?;
+        let expected_alpha = self
+            .alpha_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        let expected_beta = self
+            .beta_output
+            .copy_to_host(&self.stream)?
+            .as_slice()
+            .to_vec();
+        bf16_linear_pair_logits_f32_into_on_stream(
+            &self.input,
+            &projection.alpha_weight,
+            &projection.beta_weight,
+            self.alpha_output.output(),
+            self.beta_output.output(),
+            VALUE_HEADS,
+            VALUE_HEADS,
+            HIDDEN,
+            &self.stream,
+        )?;
+        validate_projection(
+            "paired BF16 alpha",
+            &self.alpha_output.copy_to_host(&self.stream)?,
+            &expected_alpha,
+        )?;
+        validate_projection(
+            "paired BF16 beta",
+            &self.beta_output.copy_to_host(&self.stream)?,
+            &expected_beta,
+        )
+    }
 }
 
 fn run_timed(
@@ -1968,6 +2072,74 @@ fn lm_head_cublaslt_sample(
     )
 }
 
+fn bf16_alpha_beta_separate_sample(
+    ctx: &mut Bf16PairBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        for projection in &ctx.projections {
+            bf16_linear_logits_f32_into_on_stream(
+                &ctx.input,
+                &projection.alpha_weight,
+                ctx.alpha_output.output(),
+                VALUE_HEADS,
+                HIDDEN,
+                &ctx.stream,
+            )
+            .expect("alpha projection");
+            bf16_linear_logits_f32_into_on_stream(
+                &ctx.input,
+                &projection.beta_weight,
+                ctx.beta_output.output(),
+                VALUE_HEADS,
+                HIDDEN,
+                &ctx.stream,
+            )
+            .expect("beta projection");
+        }
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
+fn bf16_alpha_beta_paired_sample(
+    ctx: &mut Bf16PairBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        for projection in &ctx.projections {
+            bf16_linear_pair_logits_f32_into_on_stream(
+                &ctx.input,
+                &projection.alpha_weight,
+                &projection.beta_weight,
+                ctx.alpha_output.output(),
+                ctx.beta_output.output(),
+                VALUE_HEADS,
+                VALUE_HEADS,
+                HIDDEN,
+                &ctx.stream,
+            )
+            .expect("paired alpha/beta projections");
+        }
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    BenchSampleResult::operations(chunk_size as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
+            .with_display_name("CUDA event"),
+    )
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-fp8-linear".to_string()),
@@ -1982,6 +2154,17 @@ fn main() {
         ..BenchmarkMainOptions::default()
     };
     run_benchmark_main(options, |runner| {
+        runner.group::<Bf16PairBench>("BF16 paired linear", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample(
+                "qwen36_30_layers_alpha_beta_separate",
+                bf16_alpha_beta_separate_sample,
+            );
+            group.bench_sample(
+                "qwen36_30_layers_alpha_beta_paired",
+                bf16_alpha_beta_paired_sample,
+            );
+        });
         runner.group::<Fp8LinearBench>("FP8 linear", |group| {
             let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample("qwen36_linear_qkv_8192x2048", qkv_sample);

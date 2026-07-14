@@ -8,9 +8,10 @@ use crate::nvfp4::{
     Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, add_f32_into_on_stream,
     append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
     argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
-    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    device_weight_gemv_on_stream, fill_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
     fp8_linear_pair_configured_f32_into_on_stream, fp8_linear_triple_configured_f32_into_on_stream,
     fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
@@ -896,6 +897,25 @@ impl Qwen36LinearAttentionWeights {
         self.run_z(workspace, hidden, stream)
     }
 
+    fn run_alpha_beta(
+        &self,
+        workspace: &mut Qwen36LinearAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        bf16_linear_pair_logits_f32_into_on_stream(
+            hidden,
+            &self.alpha.weight,
+            &self.beta.weight,
+            workspace.alpha.output(),
+            workspace.beta_input.output(),
+            self.alpha.rows,
+            self.beta.rows,
+            self.alpha.cols,
+            stream,
+        )
+    }
+
     fn run_output_projection(
         &self,
         workspace: &mut Qwen36LinearAttentionWorkspace,
@@ -933,9 +953,7 @@ impl Qwen36LinearAttentionWeights {
         stream: &CudaStream,
     ) -> Result<()> {
         self.run_qkv_z(workspace, hidden, stream)?;
-        self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
-        self.beta
-            .run_into(hidden, &mut workspace.beta_input, stream)?;
+        self.run_alpha_beta(workspace, hidden, stream)?;
         qwen36_gdn_prep_into_on_stream(
             &workspace.qkv_output,
             &self.conv_weight,
@@ -1012,11 +1030,7 @@ impl Qwen36LinearAttentionWeights {
             profile.qwen36_linear_qkv_ms += ms;
             let (_, ms) = timed_cuda(stream, || self.run_z(workspace, hidden, stream))?;
             profile.qwen36_linear_z_ms += ms;
-            let (_, ms) = timed_cuda(stream, || {
-                self.alpha.run_into(hidden, &mut workspace.alpha, stream)?;
-                self.beta
-                    .run_into(hidden, &mut workspace.beta_input, stream)
-            })?;
+            let (_, ms) = timed_cuda(stream, || self.run_alpha_beta(workspace, hidden, stream))?;
             profile.qwen36_linear_alpha_beta_ms += ms;
             let (_, ms) = timed_cuda(stream, || {
                 qwen36_gdn_prep_into_on_stream(
