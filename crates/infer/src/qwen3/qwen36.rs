@@ -15,10 +15,11 @@ use crate::nvfp4::{
     fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
     fp8_moe_grouped_gate_up_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_fp8_slots_f32_into_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_into_on_stream,
     qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
@@ -2965,12 +2966,18 @@ impl Qwen36MoeWeights {
                     let Qwen36GateUpStorage::Marlin(marlin) = &self.gate_up_storage else {
                         unreachable!("checked Marlin gate/up storage")
                     };
-                    marlin.run_on_stream(
-                        &workspace.route.indices,
-                        ffn_norm,
-                        workspace.marlin_gate_up_output.output(),
-                        stream,
-                    )
+                    if use_sm12x_down {
+                        marlin
+                            .run_bf16_on_stream(&workspace.route.indices, ffn_norm, stream)
+                            .map(|_| ())
+                    } else {
+                        marlin.run_on_stream(
+                            &workspace.route.indices,
+                            ffn_norm,
+                            workspace.marlin_gate_up_output.output(),
+                            stream,
+                        )
+                    }
                 };
                 if gpu_probe
                     .as_ref()
@@ -3004,17 +3011,34 @@ impl Qwen36MoeWeights {
             if use_sm12x_down {
                 let sm12x_down = &mut workspace.sm12x_down;
                 let mut run_silu_quantize = || {
-                    moe_silu_quantize_slots_on_stream(
-                        &workspace.route.indices,
-                        gate_up_table,
-                        &mut sm12x_down.b_tiles,
-                        &mut sm12x_down.b_scales,
-                        &self.expert_ptrs.down_input_scales,
-                        gate_up_alpha_table,
-                        grouped_down.inputs[0].rows,
-                        sm12x_down.groups,
-                        stream,
-                    )
+                    if use_grouped_w4a4 {
+                        moe_silu_quantize_slots_on_stream(
+                            &workspace.route.indices,
+                            gate_up_table,
+                            &mut sm12x_down.b_tiles,
+                            &mut sm12x_down.b_scales,
+                            &self.expert_ptrs.down_input_scales,
+                            gate_up_alpha_table,
+                            grouped_down.inputs[0].rows,
+                            sm12x_down.groups,
+                            stream,
+                        )
+                    } else {
+                        let Qwen36GateUpStorage::Marlin(marlin) = &self.gate_up_storage else {
+                            unreachable!("checked Marlin gate/up storage")
+                        };
+                        moe_silu_quantize_bf16_slots_on_stream(
+                            &workspace.route.indices,
+                            marlin.output_bf16(),
+                            &mut sm12x_down.b_tiles,
+                            &mut sm12x_down.b_scales,
+                            &self.expert_ptrs.down_input_scales,
+                            gate_up_alpha_table,
+                            grouped_down.inputs[0].rows,
+                            sm12x_down.groups,
+                            stream,
+                        )
+                    }
                 };
                 if let Some(profile) = profile.as_deref_mut() {
                     let (_, ms) = timed_cuda(stream, run_silu_quantize)?;

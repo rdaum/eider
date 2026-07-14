@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
@@ -675,9 +676,11 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
     return cudaGetLastError();
 }
 
+template <bool Bf16Input>
 __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* const* __restrict__ gate_up_table,
+    const std::uint16_t* __restrict__ gate_up_bf16,
     std::uint8_t* __restrict__ b_native_tiles,
     std::uint32_t* __restrict__ sfb,
     const float* __restrict__ input_scale_table,
@@ -704,7 +707,7 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
     const float input_scale = input_scale_table[expert];
     if (input_scale <= 0.0f || !isfinite(input_scale)) return;
     const float gate_up_alpha = gate_up_alpha_table[expert];
-    const float* gate_up = gate_up_table[slot];
+    const float* gate_up = Bf16Input ? nullptr : gate_up_table[slot];
     const int scale_group = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
 
@@ -712,8 +715,13 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
     if (lane < 16) {
         const std::uint32_t row = kt * 64 + scale_group * 16 + lane;
         if (row < rows) {
-            const float gate_value = gate_up[row] * gate_up_alpha;
-            const float up_value = gate_up[rows + row] * gate_up_alpha;
+            const std::uint32_t base = slot * rows * 2;
+            const float gate_value = (Bf16Input
+                    ? __bfloat162float(__ushort_as_bfloat16(gate_up_bf16[base + row]))
+                    : gate_up[row]) * gate_up_alpha;
+            const float up_value = (Bf16Input
+                    ? __bfloat162float(__ushort_as_bfloat16(gate_up_bf16[base + rows + row]))
+                    : gate_up[rows + row]) * gate_up_alpha;
             const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
             value = (gate_value * sigmoid * up_value) / input_scale;
         }
@@ -775,7 +783,26 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_on_stream(
         return cudaErrorInvalidValue;
     }
     const std::uint32_t k_tiles = rows / 64;
-    infer_sm12x_moe_silu_quantize_slots_kernel<<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, gate_up_table, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    infer_sm12x_moe_silu_quantize_slots_kernel<false><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, gate_up_table, nullptr, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_moe_silu_quantize_bf16_slots_on_stream(
+    const std::uint32_t* indices,
+    const std::uint16_t* gate_up_bf16,
+    std::uint8_t* b_native_tiles,
+    std::uint32_t* sfb,
+    const float* input_scale_table,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || gate_up_bf16 == nullptr || b_native_tiles == nullptr || sfb == nullptr || input_scale_table == nullptr || gate_up_alpha_table == nullptr || rows == 0 || groups == 0 || (rows % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t k_tiles = rows / 64;
+    infer_sm12x_moe_silu_quantize_slots_kernel<true><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, nullptr, gate_up_bf16, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
     return cudaGetLastError();
 }
 
