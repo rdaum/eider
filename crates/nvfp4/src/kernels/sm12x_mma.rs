@@ -1265,6 +1265,47 @@ pub(crate) fn tile_frag_on_stream(
     }
 }
 
+#[cfg(test)]
+fn sfa_lane_probe_on_stream(
+    a_native_tile: &DeviceBuffer<u8>,
+    b_native_tile: &DeviceBuffer<u8>,
+    sfa_lanes: &DeviceBuffer<u32>,
+    sfb: u32,
+    out: &mut DeviceBuffer<f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if a_native_tile.len() < TILE_BYTES
+        || b_native_tile.len() < TILE_BYTES
+        || sfa_lanes.len() < 32
+        || out.len() < M16N8_FLOATS
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x SFA lane probe buffers",
+            expected: "A/B native tiles, 32 SFA words, and 16x8 output".to_string(),
+            actual: format!(
+                "A={}, B={}, SFA={}, out={}",
+                a_native_tile.len(),
+                b_native_tile.len(),
+                sfa_lanes.len(),
+                out.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_mma_sfa_lane_probe_on_stream",
+            crate::ffi::infer_sm12x_mma_sfa_lane_probe_on_stream(
+                a_native_tile.as_const_ptr().cast(),
+                b_native_tile.as_const_ptr().cast(),
+                sfa_lanes.as_const_ptr().cast(),
+                sfb,
+                out.as_mut_ptr().cast(),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn tile_frag_kloop_on_stream(
     a_native_tiles: &DeviceBuffer<u8>,
@@ -1990,6 +2031,30 @@ mod tests {
                     "row={row} col={col} observed={observed} expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sm12x_sfa_lane_mapping_matches_m16_rows() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let a = DeviceBuffer::from_host(Sm12xFp4Tile::repeated(0x04).as_slice()).expect("A");
+        let b = DeviceBuffer::from_host(Sm12xFp4Tile::repeated(0x04).as_slice()).expect("B");
+        for active_lane in 0..32 {
+            let mut lanes = [0u32; 32];
+            lanes[active_lane] = 0x38383838;
+            let lanes = DeviceBuffer::from_host(&lanes).expect("SFA lanes");
+            let mut out = DeviceBuffer::zeroed(M16N8_FLOATS).expect("output");
+            sfa_lane_probe_on_stream(&a, &b, &lanes, 0x38383838, &mut out, &stream).expect("probe");
+            let out = out.copy_to_host(&stream).expect("copy");
+            let rows = (0..16)
+                .filter(|row| (0..8).any(|column| out[row + column * 16] != 0.0))
+                .collect::<Vec<_>>();
+            let expected = match active_lane & 3 {
+                0 => vec![active_lane >> 2],
+                1 => vec![8 + (active_lane >> 2)],
+                _ => Vec::new(),
+            };
+            assert_eq!(rows, expected, "SFA lane {active_lane}");
         }
     }
 

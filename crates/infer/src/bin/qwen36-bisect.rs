@@ -1,6 +1,8 @@
 use infer::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
-    Sm12xKvCache, format, nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, append_rows_f32_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, format, nvfp4_w4a16_matvec_f32_into_on_stream,
+    rms_norm_f32_into_on_stream,
 };
 use infer::qwen3::qwen36::{
     Qwen36Attention, Qwen36AttentionWorkspace, Qwen36LayerBlock, Qwen36Model,
@@ -672,8 +674,25 @@ fn seq_full_attn_bisect(
     checkpoint: &ModelOptCheckpoint,
     target_layer: usize,
 ) -> Result<()> {
-    let tokens = [3710usize, 369, 220, 17, 10, 17, 30, 271];
-    let target_pos = tokens.len() - 1;
+    let token_seed = [3710usize, 369, 220, 17, 10, 17, 30, 271];
+    let context_len = env::var("QWEN36_SEQ_CONTEXT")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| Error::Format {
+                label: "QWEN36_SEQ_CONTEXT",
+                detail: error.to_string(),
+            })
+        })
+        .transpose()?
+        .unwrap_or(token_seed.len());
+    if context_len == 0 {
+        return Err(Error::Shape {
+            label: "Qwen3.6 sequential attention probe",
+            expected: "context length greater than zero".to_string(),
+            actual: "0".to_string(),
+        });
+    }
+    let target_pos = context_len - 1;
     let emb_name = format!("{}.embed_tokens.weight", manifest.tensor_prefix);
     let stream = CudaStream::new_non_blocking()?;
     let lt = CublasLt::new()?;
@@ -681,91 +700,120 @@ fn seq_full_attn_bisect(
     let mut workspaces = Vec::with_capacity(target_layer + 1);
     for layer in 0..=target_layer {
         let block = Qwen36LayerBlock::load(model, layer)?;
-        let ws = block.workspace(model, tokens.len())?;
+        let ws = block.workspace(model, context_len)?;
         blocks.push(block);
         workspaces.push(ws);
     }
-    let mut compact_cache = Sm12xKvCache::new(tokens.len(), manifest.kv_heads, manifest.head_dim)?;
+    let embedding_rows = token_seed
+        .iter()
+        .map(|token| {
+            load_bf16_row(
+                checkpoint,
+                &emb_name,
+                manifest.vocab,
+                manifest.hidden,
+                *token,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let embedding_devices = embedding_rows
+        .iter()
+        .map(|embedding| DeviceBuffer::from_host(embedding))
+        .collect::<Result<Vec<_>>>()?;
+    let mut compact_cache = Sm12xKvCache::new(context_len, manifest.kv_heads, manifest.head_dim)?;
     let mut compact_workspace =
-        Sm12xKvAttentionWorkspace::new(tokens.len(), manifest.kv_heads, manifest.head_dim)?;
+        Sm12xKvAttentionWorkspace::new(context_len, manifest.kv_heads, manifest.head_dim)?;
+    let kv_width = manifest.kv_heads * manifest.head_dim;
+    let mut f32_key_cache = DeviceBuffer::zeroed(context_len * kv_width)?;
+    let mut f32_value_cache = DeviceBuffer::zeroed(context_len * kv_width)?;
 
-    for (pos, token) in tokens.iter().copied().enumerate() {
-        let emb = load_bf16_row(
-            checkpoint,
-            &emb_name,
-            manifest.vocab,
-            manifest.hidden,
-            token,
-        )?;
-        let mut hidden_device = DeviceBuffer::from_host(&emb)?;
+    for pos in 0..context_len {
+        let hidden_device = &embedding_devices[pos % embedding_devices.len()];
         for layer in 0..target_layer {
-            let step = blocks[layer].run_one_token(
+            let (previous, current) = workspaces.split_at_mut(layer);
+            let input = if layer == 0 {
+                hidden_device
+            } else {
+                &previous[layer - 1].moe.ffn_out
+            };
+            blocks[layer].run_one_token(
                 &lt,
-                &mut workspaces[layer],
+                &mut current[0],
                 manifest,
-                &hidden_device,
+                input,
                 pos,
                 &stream,
                 None,
                 None,
             )?;
-            hidden_device = DeviceBuffer::from_host(&step.output.copy_to_host(&stream)?)?;
         }
 
-        if pos < target_pos {
-            {
-                let step = blocks[target_layer].run_one_token(
-                    &lt,
-                    &mut workspaces[target_layer],
-                    manifest,
-                    &hidden_device,
-                    pos,
-                    &stream,
-                    None,
-                    None,
-                )?;
-                println!(
-                    "primed target layer {target_layer} pos {pos}: outmax={:.6}",
-                    max_abs(&step.output.copy_to_host(&stream)?)
-                );
-            }
-            match &workspaces[target_layer].attention {
-                Qwen36AttentionWorkspace::FullAttention(ws) => {
-                    compact_cache.append_on_stream(&ws.k_rope, &ws.v, &stream)?;
-                }
-                Qwen36AttentionWorkspace::LinearAttention(_) => {
-                    unreachable!("target layer must be full attention")
-                }
-            }
-            continue;
-        }
-
-        let mut normed_hidden = DeviceBuffer::zeroed(manifest.hidden)?;
+        let (previous, current) = workspaces.split_at_mut(target_layer);
+        let target_hidden = if target_layer == 0 {
+            hidden_device
+        } else {
+            &previous[target_layer - 1].moe.ffn_out
+        };
         rms_norm_f32_into_on_stream(
             1,
             manifest.hidden,
-            &hidden_device,
+            target_hidden,
             &blocks[target_layer].input_norm,
-            normed_hidden.output(),
+            current[0].normed_hidden.output(),
             manifest.rms_eps,
             &stream,
         )?;
-        match (
-            &blocks[target_layer].attention,
-            &mut workspaces[target_layer].attention,
-        ) {
+        match (&blocks[target_layer].attention, &mut current[0].attention) {
             (
                 Qwen36Attention::FullAttention(weights),
                 Qwen36AttentionWorkspace::FullAttention(ws),
             ) => {
-                let (q, gpu_attn) = {
-                    let step = weights.run_one_token(ws, manifest, &normed_hidden, pos, &stream)?;
-                    (
-                        step.q_rope.copy_to_host(&stream)?.into_vec(),
-                        step.attn.copy_to_host(&stream)?.into_vec(),
-                    )
-                };
+                weights.prepare_qkv_one_token(
+                    ws,
+                    manifest,
+                    &current[0].normed_hidden,
+                    pos,
+                    &stream,
+                )?;
+                append_rows_f32_into_on_stream(
+                    &ws.k_rope,
+                    f32_key_cache.output(),
+                    pos,
+                    1,
+                    manifest.kv_heads * manifest.head_dim,
+                    &stream,
+                )?;
+                append_rows_f32_into_on_stream(
+                    &ws.v,
+                    f32_value_cache.output(),
+                    pos,
+                    1,
+                    manifest.kv_heads * manifest.head_dim,
+                    &stream,
+                )?;
                 compact_cache.append_on_stream(&ws.k_rope, &ws.v, &stream)?;
+                if pos < target_pos {
+                    if (pos + 1).is_multiple_of(1024) {
+                        println!(
+                            "captured target layer {target_layer}: {}/{} tokens",
+                            pos + 1,
+                            context_len
+                        );
+                    }
+                    continue;
+                }
+                cached_gqa_attention_f32_into_on_stream(
+                    &ws.q_rope,
+                    &f32_key_cache,
+                    &f32_value_cache,
+                    ws.attn.output(),
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    &stream,
+                )?;
+                let gpu_attn = ws.attn.copy_to_host(&stream)?.into_vec();
                 let mut compact_attn = DeviceBuffer::zeroed(manifest.q_heads * manifest.head_dim)?;
                 compact_workspace.attention_into_on_stream(
                     &compact_cache,
@@ -774,10 +822,20 @@ fn seq_full_attn_bisect(
                     &stream,
                 )?;
                 let compact_attn = compact_attn.copy_to_host(&stream)?.into_vec();
+                if context_len > 32_768 {
+                    println!("=== seq full-attn layer {target_layer} pos {pos} ===");
+                    print_cmp(
+                        "compact FP4 tiled KV(vs f32 GPU attn)",
+                        &compact_attn,
+                        &gpu_attn,
+                    );
+                    continue;
+                }
+                let q = ws.q_rope.copy_to_host(&stream)?.into_vec();
                 let compact_probabilities =
                     compact_workspace.scores().copy_to_host(&stream)?.into_vec();
-                let key_cache = ws.key_cache.copy_to_host(&stream)?.into_vec();
-                let value_cache = ws.value_cache.copy_to_host(&stream)?.into_vec();
+                let key_cache = f32_key_cache.copy_to_host(&stream)?.into_vec();
+                let value_cache = f32_value_cache.copy_to_host(&stream)?.into_vec();
                 let cpu_attn = cpu_cached_gqa_attention(
                     &q,
                     &key_cache,
@@ -795,7 +853,126 @@ fn seq_full_attn_bisect(
                     manifest.kv_heads,
                     manifest.head_dim,
                 );
-                let cpu_fp4_probabilities = cpu_shared_scale_fp4_gqa_probabilities(
+                let fp4_qk_f32_pv = cpu_gqa_attention_from_probabilities(
+                    &compact_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                );
+                let probability_amplification = probability_quantization_amplification(pos + 1);
+                let f32_probabilities_device = DeviceBuffer::from_host(&cpu_probabilities)?;
+                let mut f32_qk_fp4_pv_device =
+                    DeviceBuffer::zeroed(manifest.q_heads * manifest.head_dim)?;
+                compact_workspace.pv_from_probabilities_into_on_stream(
+                    &compact_cache,
+                    &f32_probabilities_device,
+                    f32_qk_fp4_pv_device.output(),
+                    &stream,
+                )?;
+                let f32_qk_fp4_pv = f32_qk_fp4_pv_device.copy_to_host(&stream)?.into_vec();
+                let cpu_f32_qk_fp4_pv = cpu_block_quantized_pv(
+                    &cpu_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    true,
+                    true,
+                    16,
+                    probability_amplification,
+                );
+                let cpu_f32_p_fp4_v = cpu_block_quantized_pv(
+                    &cpu_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    false,
+                    true,
+                    16,
+                    probability_amplification,
+                );
+                let cpu_fp4_p_f32_v = cpu_block_quantized_pv(
+                    &cpu_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    true,
+                    false,
+                    16,
+                    probability_amplification,
+                );
+                let cpu_fp4_p_256_f32_v = cpu_block_quantized_pv(
+                    &cpu_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    true,
+                    false,
+                    256,
+                    probability_amplification,
+                );
+                let cpu_fp4_p_global_f32_v = cpu_block_quantized_pv(
+                    &cpu_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    true,
+                    false,
+                    pos + 1,
+                    probability_amplification,
+                );
+                let cpu_fp4_p_rows = cpu_quantize_probability_rows(
+                    &cpu_probabilities,
+                    pos + 1,
+                    manifest.q_heads,
+                    16,
+                    false,
+                    1.0,
+                );
+                let cpu_normalized_fp4_probabilities = cpu_quantize_probability_rows(
+                    &cpu_probabilities,
+                    pos + 1,
+                    manifest.q_heads,
+                    16,
+                    true,
+                    1.0,
+                );
+                let cpu_amplified_fp4_probabilities = cpu_quantize_probability_rows(
+                    &cpu_probabilities,
+                    pos + 1,
+                    manifest.q_heads,
+                    16,
+                    false,
+                    probability_amplification,
+                );
+                let cpu_amplified_fp4_p_f32_v = cpu_gqa_attention_from_probabilities(
+                    &cpu_amplified_fp4_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                );
+                let cpu_normalized_fp4_p_f32_v = cpu_gqa_attention_from_probabilities(
+                    &cpu_normalized_fp4_probabilities,
+                    &value_cache,
+                    pos + 1,
+                    manifest.q_heads,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                );
+                let cpu_fp4_probabilities = cpu_row_scale_fp4_gqa_probabilities(
                     &q,
                     &key_cache,
                     pos + 1,
@@ -811,9 +988,66 @@ fn seq_full_attn_bisect(
                     &cpu_probabilities,
                 );
                 print_cmp(
-                    "compact FP4 probabilities(vs shared-scale CPU FP4)",
+                    "compact FP4 probabilities(vs row-scale CPU FP4)",
                     &compact_probabilities,
                     &cpu_fp4_probabilities,
+                );
+                print_cmp(
+                    "FP4 QK + f32 PV(vs f32 GPU attn)",
+                    &fp4_qk_f32_pv,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "f32 QK + FP4 PV(vs f32 GPU attn)",
+                    &f32_qk_fp4_pv,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "f32 QK + FP4 PV(vs CPU FP4 PV)",
+                    &f32_qk_fp4_pv,
+                    &cpu_f32_qk_fp4_pv,
+                );
+                print_cmp("CPU FP4 PV(vs f32 GPU attn)", &cpu_f32_qk_fp4_pv, &gpu_attn);
+                print_cmp(
+                    "CPU f32 P + FP4 V(vs f32 GPU attn)",
+                    &cpu_f32_p_fp4_v,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "CPU FP4 P + f32 V(vs f32 GPU attn)",
+                    &cpu_fp4_p_f32_v,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "CPU FP4 P/256 + f32 V(vs f32 GPU attn)",
+                    &cpu_fp4_p_256_f32_v,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "CPU FP4 P/global + f32 V(vs f32 GPU attn)",
+                    &cpu_fp4_p_global_f32_v,
+                    &gpu_attn,
+                );
+                print_probability_mass("CPU FP4 P mass", &cpu_fp4_p_rows, pos + 1);
+                print_probability_mass(
+                    "CPU normalized-FP4 P mass",
+                    &cpu_normalized_fp4_probabilities,
+                    pos + 1,
+                );
+                print_probability_mass(
+                    "CPU amplified-FP4 P mass",
+                    &cpu_amplified_fp4_probabilities,
+                    pos + 1,
+                );
+                print_cmp(
+                    "CPU normalized FP4 P + f32 V(vs f32 GPU attn)",
+                    &cpu_normalized_fp4_p_f32_v,
+                    &gpu_attn,
+                );
+                print_cmp(
+                    "CPU amplified FP4 P + f32 V(vs f32 GPU attn)",
+                    &cpu_amplified_fp4_p_f32_v,
+                    &gpu_attn,
                 );
                 print_cmp(
                     "compact FP4 tiled KV(vs f32 GPU attn)",
@@ -906,7 +1140,186 @@ fn cpu_cached_gqa_probabilities(
     probabilities
 }
 
-fn cpu_shared_scale_fp4_gqa_probabilities(
+fn cpu_gqa_attention_from_probabilities(
+    probabilities: &[f32],
+    value_cache: &[f32],
+    cache_len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let groups_per_kv = q_heads / kv_heads;
+    let kv_width = kv_heads * head_dim;
+    let mut output = vec![0.0f32; q_heads * head_dim];
+    for q_head in 0..q_heads {
+        let kv_head = q_head / groups_per_kv;
+        let row = &probabilities[q_head * cache_len..(q_head + 1) * cache_len];
+        for dim in 0..head_dim {
+            output[q_head * head_dim + dim] = row
+                .iter()
+                .enumerate()
+                .map(|(token, probability)| {
+                    probability * value_cache[token * kv_width + kv_head * head_dim + dim]
+                })
+                .sum();
+        }
+    }
+    output
+}
+
+fn cpu_quantize_probability_rows(
+    probabilities: &[f32],
+    cache_len: usize,
+    q_heads: usize,
+    probability_scale_span: usize,
+    normalize_with_scale: bool,
+    amplification: f32,
+) -> Vec<f32> {
+    assert!(probability_scale_span >= 16 && probability_scale_span.is_multiple_of(16));
+    let mut quantized = vec![0.0f32; probabilities.len()];
+    for q_head in 0..q_heads {
+        let input = &probabilities[q_head * cache_len..(q_head + 1) * cache_len];
+        let output = &mut quantized[q_head * cache_len..(q_head + 1) * cache_len];
+        let mut codes = vec![0u8; cache_len];
+        let mut scales = vec![0.0f32; cache_len];
+        for scale_start in (0..cache_len).step_by(probability_scale_span) {
+            let scale_end = (scale_start + probability_scale_span).min(cache_len);
+            let maximum = input[scale_start..scale_end]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            let scale = if maximum == 0.0 {
+                0.0
+            } else {
+                format::e4m3_value(format::ue4m3_code(maximum * amplification / 6.0))
+            };
+            for token in scale_start..scale_end {
+                codes[token] = format::e2m1_code(if scale == 0.0 {
+                    0.0
+                } else {
+                    input[token] * amplification / scale
+                });
+                scales[token] = scale;
+            }
+        }
+        let total = codes
+            .iter()
+            .zip(scales.iter())
+            .map(|(&code, &scale)| format::e2m1_value(code) * scale)
+            .sum::<f32>();
+        let correction = if normalize_with_scale && total != 0.0 {
+            total.recip()
+        } else {
+            1.0
+        };
+        for token in 0..cache_len {
+            let scale = if normalize_with_scale {
+                format::e4m3_value(format::ue4m3_code(scales[token] * correction))
+            } else {
+                scales[token]
+            };
+            output[token] = format::e2m1_value(codes[token]) * scale / amplification;
+        }
+    }
+    quantized
+}
+
+fn probability_quantization_amplification(cache_len: usize) -> f32 {
+    let minimum = (3 * cache_len).div_ceil(256).max(1);
+    minimum.next_power_of_two() as f32
+}
+
+fn print_probability_mass(label: &str, probabilities: &[f32], cache_len: usize) {
+    let (minimum, maximum) = probabilities
+        .chunks_exact(cache_len)
+        .map(|row| row.iter().sum::<f32>())
+        .fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(minimum, maximum), total| (minimum.min(total), maximum.max(total)),
+        );
+    println!("{label}: row_sum_min={minimum:.6} row_sum_max={maximum:.6}");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_block_quantized_pv(
+    probabilities: &[f32],
+    value_cache: &[f32],
+    cache_len: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    quantize_probabilities: bool,
+    quantize_values: bool,
+    probability_scale_span: usize,
+    probability_amplification: f32,
+) -> Vec<f32> {
+    assert!(probability_scale_span >= 16 && probability_scale_span.is_multiple_of(16));
+    let groups_per_kv = q_heads / kv_heads;
+    let kv_width = kv_heads * head_dim;
+    let mut output = vec![0.0f32; q_heads * head_dim];
+    for q_head in 0..q_heads {
+        let kv_head = q_head / groups_per_kv;
+        let probability_row = &probabilities[q_head * cache_len..(q_head + 1) * cache_len];
+        for dim in 0..head_dim {
+            let mut sum = 0.0f32;
+            for block_start in (0..cache_len).step_by(16) {
+                let block_end = (block_start + 16).min(cache_len);
+                let probability_scale_start =
+                    block_start / probability_scale_span * probability_scale_span;
+                let probability_scale_end =
+                    (probability_scale_start + probability_scale_span).min(cache_len);
+                let probability_max = probability_row
+                    [probability_scale_start..probability_scale_end]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max);
+                let probability_scale = if probability_max == 0.0 {
+                    0.0
+                } else {
+                    format::e4m3_value(format::ue4m3_code(
+                        probability_max * probability_amplification / 6.0,
+                    ))
+                };
+                let value_max = (block_start..block_end)
+                    .map(|token| value_cache[token * kv_width + kv_head * head_dim + dim].abs())
+                    .fold(0.0f32, f32::max);
+                let value_scale = if value_max == 0.0 {
+                    0.0
+                } else {
+                    format::e4m3_value(format::ue4m3_code(value_max / 6.0))
+                };
+                for token in block_start..block_end {
+                    let probability = probability_row[token];
+                    let quantized_probability = if quantize_probabilities {
+                        format::e2m1_value(format::e2m1_code(if probability_scale == 0.0 {
+                            0.0
+                        } else {
+                            probability * probability_amplification / probability_scale
+                        })) * probability_scale
+                            / probability_amplification
+                    } else {
+                        probability
+                    };
+                    let value = value_cache[token * kv_width + kv_head * head_dim + dim];
+                    let quantized_value = if quantize_values {
+                        format::e2m1_value(format::e2m1_code(if value_scale == 0.0 {
+                            0.0
+                        } else {
+                            value / value_scale
+                        })) * value_scale
+                    } else {
+                        value
+                    };
+                    sum += quantized_probability * quantized_value;
+                }
+            }
+            output[q_head * head_dim + dim] = sum;
+        }
+    }
+    output
+}
+
+fn cpu_row_scale_fp4_gqa_probabilities(
     query: &[f32],
     key_cache: &[f32],
     cache_len: usize,
@@ -918,15 +1331,12 @@ fn cpu_shared_scale_fp4_gqa_probabilities(
     let kv_width = kv_heads * head_dim;
     let q = (0..q_heads)
         .map(|q_head| {
-            let group = q_head / groups_per_kv;
             (0..head_dim)
                 .map(|dim| {
                     let block_start = dim / 16 * 16;
-                    let max_abs = (group * groups_per_kv..(group + 1) * groups_per_kv)
-                        .flat_map(|head| {
-                            query[head * head_dim + block_start..head * head_dim + block_start + 16]
-                                .iter()
-                        })
+                    let max_abs = query
+                        [q_head * head_dim + block_start..q_head * head_dim + block_start + 16]
+                        .iter()
                         .filter(|value| value.is_finite())
                         .map(|value| value.abs())
                         .fold(0.0f32, f32::max);
@@ -954,13 +1364,9 @@ fn cpu_shared_scale_fp4_gqa_probabilities(
             let mut dot = 0.0f32;
             for dim in 0..head_dim {
                 let block_start = dim / 16 * 16;
-                let token_tile_start = token / 8 * 8;
-                let max_abs = (token_tile_start..(token_tile_start + 8).min(cache_len))
-                    .flat_map(|tile_token| {
-                        key_cache[tile_token * kv_width + kv_head * head_dim + block_start
-                            ..tile_token * kv_width + kv_head * head_dim + block_start + 16]
-                            .iter()
-                    })
+                let max_abs = key_cache[token * kv_width + kv_head * head_dim + block_start
+                    ..token * kv_width + kv_head * head_dim + block_start + 16]
+                    .iter()
                     .filter(|value| value.is_finite())
                     .map(|value| value.abs())
                     .fold(0.0f32, f32::max);

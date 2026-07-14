@@ -199,6 +199,15 @@ unsafe extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(dead_code)]
+    pub(crate) fn infer_sm12x_mma_sfa_lane_probe_on_stream(
+        a_native_tile: *const u8,
+        b_native_tile: *const u8,
+        sfa_lanes: *const u32,
+        sfb: u32,
+        out: *mut f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(dead_code)]
     pub(crate) fn infer_sm12x_mma_tile_frag_kloop_on_stream(
         a_native_tiles: *const u8,
         b_native_tiles: *const u8,
@@ -259,6 +268,21 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_cache_append_indexed_on_stream(
+        key: *const f32,
+        value: *const f32,
+        key_values: *mut u8,
+        key_scales: *mut u8,
+        value_values: *mut u8,
+        value_scales: *mut u8,
+        key_tail: *mut f32,
+        value_tail: *mut f32,
+        position: *const u32,
+        max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_attention_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -270,6 +294,40 @@ unsafe extern "C" {
         query_tiles: *mut u8,
         query_scales: *mut u32,
         scores: *mut f32,
+        probability_tiles: *mut u8,
+        probability_scales: *mut u32,
+        output: *mut f32,
+        cache_len: u32,
+        max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_attention_indexed_on_stream(
+        query: *const f32,
+        key_values: *const u8,
+        key_scales: *const u8,
+        key_tail: *const f32,
+        value_values: *const u8,
+        value_scales: *const u8,
+        value_tail: *const f32,
+        query_tiles: *mut u8,
+        query_scales: *mut u32,
+        scores: *mut f32,
+        probability_tiles: *mut u8,
+        probability_scales: *mut u32,
+        output: *mut f32,
+        cache_len: *const u32,
+        max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_pv_from_probabilities_on_stream(
+        probabilities: *const f32,
+        value_values: *const u8,
+        value_scales: *const u8,
+        value_tail: *const f32,
         probability_tiles: *mut u8,
         probability_scales: *mut u32,
         output: *mut f32,
