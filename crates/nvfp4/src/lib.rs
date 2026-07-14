@@ -79,7 +79,7 @@ pub use kernels::non_gemm::{
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
     split_q_gate_f32_into_on_stream, split_qkv_f32_into_on_stream,
 };
-pub use kernels::sm12x_kv_cache::Sm12xKvCache;
+pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache};
 pub use kernels::sm12x_mma::{
     Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xFp4Tile, Sm12xFp4TileSet, Sm12xRequantizedVector, Sm12xRequantizedWeight,
