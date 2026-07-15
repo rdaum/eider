@@ -22,10 +22,10 @@ Anyways, this is a bit of research project, not a production engine,
 and I'm pretty new to this stuff, so be easy on me if you happen to
 look at it.
 
-That said, it is currently pretty competitive -- getting ~65 token/sec
-on Qwen 3.6 30b A3B, compared to vLLM's ~70 -- while seemingly using
-quite a bit less memory and having a faster startup time. (Likely
-because I'm missing a bunch of stuff.)
+That said, it is currently pretty competitive. The Qwen3.6-35B-A3B NVFP4 path
+reaches about 77.5 tokens/sec for batch-one greedy decode on my GB10. This is
+about the same as (or a bit better than) what I get with vLLM for the same
+model/quant.
 
 And so I will likely continue to iterate on improving both performance
 and runtime surface (likely adding a more robust KVCache and OpenAI
@@ -177,12 +177,15 @@ Throughput benchmark:
 ```sh
 cargo run --release -p infer --bin qwen-bench -- \
     --model models/qwen3.6-35b-a3-nvfp4 \
-    --prompt "Hello world, this is a benchmark." \
-    --decode-tokens 200 \
+    --prompt "What is the meaning of life?" \
+    --decode-tokens 512 \
     --warmup-repeats 1 \
     --repeats 3 \
     --temperature 0
 ```
+
+On 2026-07-14 at revision `1f445ce`, that run used a seven-token prompt and
+reported a median 6,602.8 ms for 512 decode tokens, or 77.54 tokens/sec.
 
 Use `--profile-decode` for stage timings. It synchronizes between stage groups,
 so its throughput is diagnostic and is not directly comparable with the normal
@@ -229,6 +232,7 @@ cargo bench -p nvfp4 --bench sm12x_indexed_gemv
 cargo bench -p nvfp4 --bench fp8_routed_moe
 cargo bench -p nvfp4 --bench fp4_cublaslt
 cargo bench -p nvfp4 --bench fp4_quantization
+cargo bench -p infer --bench qwen36_cpu_shared_expert
 cargo bench -p infer --bench sampling
 ```
 
