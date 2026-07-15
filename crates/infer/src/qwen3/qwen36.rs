@@ -4522,8 +4522,7 @@ struct Qwen36LmHeadWorkspace {
 }
 
 struct Qwen36LinearLayerGraphs {
-    pre_gdn: CudaGraphExec,
-    post_gdn: CudaGraphExec,
+    layer: CudaGraphExec,
 }
 
 enum Qwen36LayerGraphs {
@@ -4738,10 +4737,9 @@ impl Qwen36TextModel {
             let workspace = &mut current[0];
             match &block.attention {
                 Qwen36Attention::LinearAttention(_) => {
-                    let pre_gdn = state.stream.capture(|stream| {
-                        block.enqueue_linear_pre_gdn(workspace, &self.manifest, hidden, stream)
-                    })?;
-                    let post_gdn = state.stream.capture(|stream| {
+                    let layer = state.stream.capture(|stream| {
+                        block.enqueue_linear_pre_gdn(workspace, &self.manifest, hidden, stream)?;
+                        block.enqueue_linear_gdn(workspace, stream)?;
                         block.enqueue_linear_post_gdn(
                             &self.lt,
                             workspace,
@@ -4750,10 +4748,7 @@ impl Qwen36TextModel {
                             stream,
                         )
                     })?;
-                    graphs.push(Qwen36LayerGraphs::Linear(Qwen36LinearLayerGraphs {
-                        pre_gdn,
-                        post_gdn,
-                    }));
+                    graphs.push(Qwen36LayerGraphs::Linear(Qwen36LinearLayerGraphs { layer }));
                 }
                 Qwen36Attention::FullAttention(_) => {
                     let graph = state.stream.capture(|stream| {
@@ -4884,17 +4879,10 @@ impl Qwen36TextModel {
             state
                 .cache_len_device
                 .copy_from_host(&[(state.position + 1) as u32])?;
-            for ((block, workspace), graph) in self
-                .layers
-                .iter()
-                .zip(state.layer_workspaces.iter_mut())
-                .zip(graphs.iter())
-            {
+            for graph in graphs {
                 match graph {
                     Qwen36LayerGraphs::Linear(graph) => {
-                        graph.pre_gdn.launch(stream)?;
-                        block.enqueue_linear_gdn(workspace, stream)?;
-                        graph.post_gdn.launch(stream)?;
+                        graph.layer.launch(stream)?;
                     }
                     Qwen36LayerGraphs::Full(graph) => graph.launch(stream)?,
                 }
