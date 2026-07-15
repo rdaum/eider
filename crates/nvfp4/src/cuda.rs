@@ -586,6 +586,11 @@ impl<T: Copy> DeviceBuffer<T> {
         self.len
     }
 
+    /// Returns the number of device bytes owned by this allocation.
+    pub fn device_bytes(&self) -> usize {
+        self.len * size_of::<T>()
+    }
+
     /// Returns true when this allocation contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0

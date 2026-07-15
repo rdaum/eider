@@ -3,3 +3,4 @@
 pub mod generation;
 pub mod kv_cache;
 pub mod sampling;
+pub mod scheduler;

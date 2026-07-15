@@ -1160,6 +1160,10 @@ impl Qwen36LinearAttentionState {
             )?,
         })
     }
+
+    fn device_bytes(&self) -> usize {
+        self.conv_state.device_bytes() + self.recurrent_state.device_bytes()
+    }
 }
 
 impl Qwen36FullAttentionWorkspace {
@@ -1215,6 +1219,10 @@ impl Qwen36FullAttentionState {
             compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
             cache_capacity,
         })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.compact_cache.device_bytes()
     }
 }
 
@@ -1850,6 +1858,18 @@ impl Sm12xGateUpWorkspace {
             d: DeviceBuffer::from_host(&d_ptrs)?,
             groups,
         })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.b_tiles.device_bytes()
+            + self.b_scales.device_bytes()
+            + self
+                ._outputs
+                .iter()
+                .map(F32Matrix::device_bytes)
+                .sum::<usize>()
+            + self.c.device_bytes()
+            + self.d.device_bytes()
     }
 }
 
@@ -4764,6 +4784,17 @@ impl Qwen36SequenceState {
     /// Returns the allocated context capacity.
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
+    }
+
+    /// Returns the number of device bytes owned by this sequence state.
+    pub fn device_bytes(&self) -> usize {
+        self.layer_states
+            .iter()
+            .map(|layer| match &layer.attention {
+                Qwen36AttentionState::LinearAttention(state) => state.device_bytes(),
+                Qwen36AttentionState::FullAttention(state) => state.device_bytes(),
+            })
+            .sum()
     }
 }
 

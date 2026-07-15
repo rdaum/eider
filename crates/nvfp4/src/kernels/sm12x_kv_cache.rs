@@ -123,6 +123,16 @@ impl Sm12xKvCache {
         self.max_tokens
     }
 
+    /// Returns the number of device bytes owned by this cache.
+    pub fn device_bytes(&self) -> usize {
+        self.key_values.device_bytes()
+            + self.key_scales.device_bytes()
+            + self.value_values.device_bytes()
+            + self.value_scales.device_bytes()
+            + self.key_tail.device_bytes()
+            + self.value_tail.device_bytes()
+    }
+
     /// Returns the number of K tokens finalized into compact 8-token tiles.
     pub fn compact_key_tokens(&self) -> usize {
         self.len / K_TOKEN_TILE * K_TOKEN_TILE
@@ -398,6 +408,15 @@ impl Sm12xKvAttentionWorkspace {
             kv_heads,
             head_dim,
         })
+    }
+
+    /// Returns the number of device bytes owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.query_tiles.device_bytes()
+            + self.query_scales.device_bytes()
+            + self.scores.device_bytes()
+            + self.probability_tiles.device_bytes()
+            + self.probability_scales.device_bytes()
     }
 
     /// Enqueues Q-to-FP4, QK, f32 online softmax, P-to-FP4, and PV.
