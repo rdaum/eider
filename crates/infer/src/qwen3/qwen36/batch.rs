@@ -1,19 +1,19 @@
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36AttentionState, Qwen36DownStorage,
-    Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LinearAttentionState,
+    Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36LinearAttentionState,
     Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken,
-    Qwen36SequenceState, Qwen36SharedExpertStorage, Qwen36TextModel, Sm12xGateUpWorkspace,
-    maybe_round_device_f32_to_bf16,
+    Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage, Qwen36TextModel,
+    Sm12xGateUpWorkspace, maybe_round_device_f32_to_bf16,
 };
 use crate::nvfp4::{
-    CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape, MarlinNvfp4GateUpBatchWorkspace,
-    MropeSections, Result, Sm12xKvAttentionWorkspace, add_f32_into_on_stream,
-    argmax_f32_batch_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, fill_f32_into_on_stream,
-    fp8_linear_f32_batch_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
-    gated_rms_norm_f32_into_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_topk_f32_batch_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
+    MarlinNvfp4GateUpBatchWorkspace, MropeSections, Result, Sm12xKvAttentionWorkspace,
+    add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    fill_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
+    gated_delta_net_128_f32_batch_into_on_stream, gated_rms_norm_f32_into_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_topk_f32_batch_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
     qwen36_full_attn_prep_f32_batch_into_on_stream, qwen36_gdn_gate_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, rms_norm_f32_into_on_stream,
@@ -211,7 +211,8 @@ impl BatchLinearAttentionWorkspace {
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        let nulls = vec![std::ptr::null_mut(); capacity];
+        let state_table_len = model.layers.len() * capacity;
+        let nulls = vec![std::ptr::null_mut(); state_table_len];
         let mut padding_states = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             padding_states.push(Qwen36LinearAttentionState::new(linear, weights)?);
@@ -247,26 +248,32 @@ impl BatchLinearAttentionWorkspace {
     fn update_state_tables(
         &mut self,
         rows: &mut [Qwen36DecodeRow<'_>],
-        layer_idx: usize,
+        layer_count: usize,
         capacity: usize,
     ) -> Result<()> {
-        for row in 0..capacity {
-            let state = if let Some(row) = rows.get_mut(row) {
-                match &mut row.state.layer_states[layer_idx].attention {
-                    Qwen36AttentionState::LinearAttention(state) => state,
-                    Qwen36AttentionState::FullAttention(_) => {
-                        unreachable!("layer kind validated when sequence state was created")
+        for layer_idx in 0..layer_count {
+            for row_idx in 0..capacity {
+                let table_idx = layer_idx * capacity + row_idx;
+                let state = if let Some(row) = rows.get_mut(row_idx) {
+                    match &mut row.state.layer_states[layer_idx].attention {
+                        Qwen36AttentionState::LinearAttention(state) => state,
+                        Qwen36AttentionState::FullAttention(_) => {
+                            self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
+                            self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                            continue;
+                        }
                     }
-                }
-            } else {
-                &mut self.padding_states[row]
-            };
-            self.conv_state_ptrs[row] = state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
-            self.recurrent_state_ptrs[row] = state
-                .recurrent_state
-                .as_const_ptr()
-                .cast_mut()
-                .cast::<f32>();
+                } else {
+                    &mut self.padding_states[row_idx]
+                };
+                self.conv_state_ptrs[table_idx] =
+                    state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
+                self.recurrent_state_ptrs[table_idx] = state
+                    .recurrent_state
+                    .as_const_ptr()
+                    .cast_mut()
+                    .cast::<f32>();
+            }
         }
         self.conv_state_table
             .copy_from_host(&self.conv_state_ptrs)?;
@@ -402,6 +409,19 @@ struct BatchMoeWorkspace {
     output: DeviceBuffer<f32>,
 }
 
+struct BatchMoeStreamSync {
+    fork: CudaEvent,
+    join: CudaEvent,
+}
+
+enum BatchLayerGraph {
+    Linear(CudaGraphExec),
+    Full {
+        pre_attention: CudaGraphExec,
+        post_attention: CudaGraphExec,
+    },
+}
+
 impl BatchMoeWorkspace {
     fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, capacity: usize) -> Result<Self> {
         let marlin = match &weights.gate_up_storage {
@@ -459,7 +479,10 @@ pub struct Qwen36DecodeBatchWorkspace {
     model_id: u64,
     capacity: usize,
     max_context_tokens: usize,
+    layer_graphs: Option<Vec<BatchLayerGraph>>,
     stream: CudaStream,
+    shared_moe_stream: CudaStream,
+    moe_stream_sync: Vec<BatchMoeStreamSync>,
     token_ids: DeviceBuffer<u32>,
     positions: DeviceBuffer<u32>,
     host_token_ids: Vec<u32>,
@@ -515,6 +538,42 @@ impl Qwen36DecodeBatchWorkspace {
     }
 }
 
+impl Qwen36LayerBlock {
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_batch_tail(
+        &self,
+        model: &Qwen36TextModel,
+        moe: &mut BatchMoeWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        attention_output: &DeviceBuffer<f32>,
+        attn_residual: &mut DeviceBuffer<f32>,
+        ffn_norm: &mut DeviceBuffer<f32>,
+        capacity: usize,
+        stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
+    ) -> Result<()> {
+        add_f32_into_on_stream(hidden, attention_output, attn_residual.output(), stream)?;
+        rms_norm_f32_into_on_stream(
+            capacity,
+            model.manifest.hidden,
+            attn_residual,
+            &self.post_attn_norm,
+            ffn_norm.output(),
+            model.manifest.rms_eps,
+            stream,
+        )?;
+        self.moe.run_batch(
+            model,
+            moe,
+            ffn_norm,
+            attn_residual,
+            capacity,
+            stream,
+            parallel_moe,
+        )
+    }
+}
+
 impl Qwen36TextModel {
     /// Allocates shared scratch and execution plans for batched decode.
     pub fn new_decode_batch_workspace(
@@ -550,11 +609,21 @@ impl Qwen36TextModel {
             Qwen36LmHead::Nvfp4(_) => None,
             Qwen36LmHead::Fp8 { linear, .. } => Some(BatchLinearPlan::new(self, linear, capacity)?),
         };
-        Ok(Qwen36DecodeBatchWorkspace {
+        let mut moe_stream_sync = Vec::with_capacity(self.layers.len());
+        for _ in &self.layers {
+            moe_stream_sync.push(BatchMoeStreamSync {
+                fork: CudaEvent::new_sync()?,
+                join: CudaEvent::new_sync()?,
+            });
+        }
+        let mut workspace = Qwen36DecodeBatchWorkspace {
             model_id: self.model_id,
             capacity,
             max_context_tokens,
+            layer_graphs: None,
             stream: CudaStream::new_blocking()?,
+            shared_moe_stream: CudaStream::new_non_blocking()?,
+            moe_stream_sync,
             token_ids: DeviceBuffer::zeroed(capacity)?,
             positions: DeviceBuffer::zeroed(capacity)?,
             host_token_ids: vec![0; capacity],
@@ -573,7 +642,123 @@ impl Qwen36TextModel {
             logits: DeviceBuffer::zeroed(capacity * self.manifest.vocab)?,
             next_indices: DeviceBuffer::zeroed(capacity)?,
             next_values: DeviceBuffer::zeroed(capacity)?,
-        })
+        };
+        let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        if enable_segmented_graphs {
+            workspace.layer_graphs = Some(self.capture_batch_layer_graphs(&mut workspace)?);
+        }
+        Ok(workspace)
+    }
+
+    fn capture_batch_layer_graphs(
+        &self,
+        workspace: &mut Qwen36DecodeBatchWorkspace,
+    ) -> Result<Vec<BatchLayerGraph>> {
+        let Qwen36DecodeBatchWorkspace {
+            capacity,
+            layer_graphs: _,
+            stream,
+            shared_moe_stream,
+            moe_stream_sync,
+            positions,
+            normed_hidden,
+            ffn_norm,
+            attn_residual,
+            hidden,
+            linear,
+            full,
+            moe,
+            ..
+        } = workspace;
+        let mut graphs = Vec::with_capacity(self.layers.len());
+        for (layer_idx, (block, sync)) in self.layers.iter().zip(moe_stream_sync).enumerate() {
+            let parallel_moe = || Qwen36ParallelMoe {
+                shared_stream: shared_moe_stream,
+                fork: &sync.fork,
+                join: &sync.join,
+            };
+            let graph = match &block.attention {
+                Qwen36Attention::LinearAttention(weights) => {
+                    let graph = stream.capture(|stream| {
+                        rms_norm_f32_into_on_stream(
+                            *capacity,
+                            self.manifest.hidden,
+                            hidden,
+                            &block.input_norm,
+                            normed_hidden.output(),
+                            self.manifest.rms_eps,
+                            stream,
+                        )?;
+                        weights.enqueue_batch(
+                            self,
+                            linear,
+                            normed_hidden,
+                            layer_idx,
+                            *capacity,
+                            stream,
+                        )?;
+                        block.enqueue_batch_tail(
+                            self,
+                            moe,
+                            hidden,
+                            &linear.output,
+                            attn_residual,
+                            ffn_norm,
+                            *capacity,
+                            stream,
+                            Some(parallel_moe()),
+                        )
+                    })?;
+                    BatchLayerGraph::Linear(graph)
+                }
+                Qwen36Attention::FullAttention(weights) => {
+                    let pre_attention = stream.capture(|stream| {
+                        rms_norm_f32_into_on_stream(
+                            *capacity,
+                            self.manifest.hidden,
+                            hidden,
+                            &block.input_norm,
+                            normed_hidden.output(),
+                            self.manifest.rms_eps,
+                            stream,
+                        )?;
+                        weights.enqueue_batch_pre(
+                            self,
+                            full,
+                            normed_hidden,
+                            positions,
+                            *capacity,
+                            stream,
+                        )
+                    })?;
+                    let post_attention = stream.capture(|stream| {
+                        weights.enqueue_batch_post(self, full, *capacity, stream)?;
+                        block.enqueue_batch_tail(
+                            self,
+                            moe,
+                            hidden,
+                            &full.output,
+                            attn_residual,
+                            ffn_norm,
+                            *capacity,
+                            stream,
+                            Some(parallel_moe()),
+                        )
+                    })?;
+                    BatchLayerGraph::Full {
+                        pre_attention,
+                        post_attention,
+                    }
+                }
+            };
+            graphs.push(graph);
+            std::mem::swap(hidden, &mut moe.output);
+        }
+        if !self.layers.len().is_multiple_of(2) {
+            std::mem::swap(hidden, &mut moe.output);
+        }
+        Ok(graphs)
     }
 
     /// Decodes one scheduler tick for arbitrary persistent sequence rows.
@@ -660,6 +845,9 @@ impl Qwen36TextModel {
         workspace
             .positions
             .copy_from_host(&workspace.host_positions)?;
+        workspace
+            .linear
+            .update_state_tables(rows, self.layers.len(), workspace.capacity)?;
         let stream = &workspace.stream;
         copy_bf16_rows_to_f32_indexed_into_on_stream(
             self.manifest.vocab,
@@ -671,6 +859,37 @@ impl Qwen36TextModel {
         )?;
 
         for (layer_idx, block) in self.layers.iter().enumerate() {
+            if let Some(graph) = workspace
+                .layer_graphs
+                .as_ref()
+                .map(|graphs| &graphs[layer_idx])
+            {
+                match graph {
+                    BatchLayerGraph::Linear(graph) => {
+                        graph.launch(stream)?;
+                    }
+                    BatchLayerGraph::Full {
+                        pre_attention,
+                        post_attention,
+                    } => {
+                        let Qwen36Attention::FullAttention(weights) = &block.attention else {
+                            unreachable!("full-attention graph matches its layer")
+                        };
+                        pre_attention.launch(stream)?;
+                        weights.enqueue_batch_cache(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            layer_idx,
+                            active_rows,
+                            stream,
+                        )?;
+                        post_attention.launch(stream)?;
+                    }
+                }
+                std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+                continue;
+            }
             rms_norm_f32_into_on_stream(
                 workspace.capacity,
                 self.manifest.hidden,
@@ -683,54 +902,57 @@ impl Qwen36TextModel {
 
             let attention_output = match (&block.attention, block.kind) {
                 (Qwen36Attention::LinearAttention(weights), _) => {
-                    weights.run_batch(
+                    weights.enqueue_batch(
                         self,
                         &mut workspace.linear,
-                        rows,
-                        layer_idx,
                         &workspace.normed_hidden,
+                        layer_idx,
                         workspace.capacity,
                         stream,
                     )?;
                     &workspace.linear.output
                 }
                 (Qwen36Attention::FullAttention(weights), _) => {
-                    weights.run_batch(
+                    weights.enqueue_batch_pre(
+                        self,
+                        &mut workspace.full,
+                        &workspace.normed_hidden,
+                        &workspace.positions,
+                        workspace.capacity,
+                        stream,
+                    )?;
+                    weights.enqueue_batch_cache(
                         self,
                         &mut workspace.full,
                         rows,
                         layer_idx,
-                        &workspace.normed_hidden,
-                        &workspace.positions,
                         active_rows,
+                        stream,
+                    )?;
+                    weights.enqueue_batch_post(
+                        self,
+                        &mut workspace.full,
                         workspace.capacity,
                         stream,
                     )?;
                     &workspace.full.output
                 }
             };
-            add_f32_into_on_stream(
-                &workspace.hidden,
-                attention_output,
-                workspace.attn_residual.output(),
-                stream,
-            )?;
-            rms_norm_f32_into_on_stream(
-                workspace.capacity,
-                self.manifest.hidden,
-                &workspace.attn_residual,
-                &block.post_attn_norm,
-                workspace.ffn_norm.output(),
-                self.manifest.rms_eps,
-                stream,
-            )?;
-            block.moe.run_batch(
+            let moe_sync = &workspace.moe_stream_sync[layer_idx];
+            block.enqueue_batch_tail(
                 self,
                 &mut workspace.moe,
-                &workspace.ffn_norm,
-                &workspace.attn_residual,
+                &workspace.hidden,
+                attention_output,
+                &mut workspace.attn_residual,
+                &mut workspace.ffn_norm,
                 workspace.capacity,
                 stream,
+                Some(Qwen36ParallelMoe {
+                    shared_stream: &workspace.shared_moe_stream,
+                    fork: &moe_sync.fork,
+                    join: &moe_sync.join,
+                }),
             )?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
         }
@@ -790,14 +1012,12 @@ impl Qwen36TextModel {
 }
 
 impl Qwen36LinearAttentionWeights {
-    #[allow(clippy::too_many_arguments)]
-    fn run_batch(
+    fn enqueue_batch(
         &self,
         model: &Qwen36TextModel,
         workspace: &mut BatchLinearAttentionWorkspace,
-        rows: &mut [Qwen36DecodeRow<'_>],
-        layer_idx: usize,
         hidden: &DeviceBuffer<f32>,
+        layer_idx: usize,
         capacity: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -806,7 +1026,6 @@ impl Qwen36LinearAttentionWeights {
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        workspace.update_state_tables(rows, layer_idx, capacity)?;
         quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
             hidden,
             &mut workspace.hidden_quantized,
@@ -864,6 +1083,7 @@ impl Qwen36LinearAttentionWeights {
             workspace.k.output(),
             workspace.v.output(),
             &workspace.conv_state_table,
+            layer_idx * capacity,
             capacity,
             linear.key_heads,
             linear.value_heads,
@@ -889,6 +1109,7 @@ impl Qwen36LinearAttentionWeights {
             &workspace.beta,
             &workspace.recurrent_state_table,
             workspace.gdn_output.output(),
+            layer_idx * capacity,
             capacity,
             linear.value_heads,
             stream,
@@ -928,20 +1149,15 @@ impl Qwen36LinearAttentionWeights {
 
 impl Qwen36FullAttentionWeights {
     #[allow(clippy::too_many_arguments)]
-    fn run_batch(
+    fn enqueue_batch_pre(
         &self,
         model: &Qwen36TextModel,
         workspace: &mut BatchFullAttentionWorkspace,
-        rows: &mut [Qwen36DecodeRow<'_>],
-        layer_idx: usize,
         hidden: &DeviceBuffer<f32>,
         positions: &DeviceBuffer<u32>,
-        active_rows: usize,
         capacity: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
-        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
         quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
             hidden,
             &mut workspace.hidden_quantized,
@@ -1038,7 +1254,21 @@ impl Qwen36FullAttentionWeights {
             workspace.k_rope.output(),
             model.manifest.rope_theta,
             stream,
-        )?;
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_batch_cache(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+        layer_idx: usize,
+        active_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let q_width = model.manifest.q_heads * model.manifest.head_dim;
+        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
         for (row, decode_row) in rows.iter_mut().enumerate().take(active_rows) {
             let state = match &mut decode_row.state.layer_states[layer_idx].attention {
                 Qwen36AttentionState::FullAttention(state) => state,
@@ -1066,6 +1296,17 @@ impl Qwen36FullAttentionWeights {
                     stream,
                 )?;
         }
+        Ok(())
+    }
+
+    fn enqueue_batch_post(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        capacity: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let q_width = model.manifest.q_heads * model.manifest.head_dim;
         sigmoid_mul_f32_into_on_stream(
             &workspace.gate,
             &workspace.attention,
@@ -1096,6 +1337,54 @@ impl Qwen36FullAttentionWeights {
 }
 
 impl Qwen36MoeWeights {
+    fn enqueue_shared_batch(
+        &self,
+        workspace: &mut BatchMoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        capacity: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match &self.shared {
+            Qwen36SharedExpertStorage::Nvfp4(shared) => {
+                shared.gate_up.run_f32_batch_into(
+                    ffn_norm,
+                    &mut workspace.shared_gate_up,
+                    capacity,
+                    stream,
+                )?;
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &workspace.shared_gate_up,
+                    workspace.shared_activated.output(),
+                    capacity,
+                    self.expert_intermediate,
+                    stream,
+                )?;
+                shared.down.run_f32_batch_into(
+                    &workspace.shared_activated,
+                    &mut workspace.shared_output,
+                    capacity,
+                    stream,
+                )?;
+            }
+            Qwen36SharedExpertStorage::Fp8 { .. } => {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 batched shared expert",
+                    detail: "the current model does not use NVFP4 shared experts".to_string(),
+                });
+            }
+        }
+        bf16_linear_logits_f32_batch_into_on_stream(
+            ffn_norm,
+            &self.shared_gate.weight,
+            workspace.shared_gate.output(),
+            capacity,
+            self.shared_gate.rows,
+            self.shared_gate.cols,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_batch(
         &self,
         model: &Qwen36TextModel,
@@ -1104,7 +1393,14 @@ impl Qwen36MoeWeights {
         residual: &DeviceBuffer<f32>,
         capacity: usize,
         stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
+        if let Some(parallel_moe) = parallel_moe {
+            parallel_moe.fork.record_on_stream(stream)?;
+            parallel_moe.shared_stream.wait_event(parallel_moe.fork)?;
+            self.enqueue_shared_batch(workspace, ffn_norm, capacity, parallel_moe.shared_stream)?;
+        }
+
         bf16_linear_logits_f32_batch_into_on_stream(
             ffn_norm,
             &self.router.weight,
@@ -1164,44 +1460,14 @@ impl Qwen36MoeWeights {
             capacity * self.experts_per_token,
             stream,
         )?;
-        match &self.shared {
-            Qwen36SharedExpertStorage::Nvfp4(shared) => {
-                shared.gate_up.run_f32_batch_into(
-                    ffn_norm,
-                    &mut workspace.shared_gate_up,
-                    capacity,
-                    stream,
-                )?;
-                silu_mul_halves_f32_batch_into_on_stream(
-                    &workspace.shared_gate_up,
-                    workspace.shared_activated.output(),
-                    capacity,
-                    self.expert_intermediate,
-                    stream,
-                )?;
-                shared.down.run_f32_batch_into(
-                    &workspace.shared_activated,
-                    &mut workspace.shared_output,
-                    capacity,
-                    stream,
-                )?;
-            }
-            Qwen36SharedExpertStorage::Fp8 { .. } => {
-                return Err(crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 batched shared expert",
-                    detail: "the current model does not use NVFP4 shared experts".to_string(),
-                });
-            }
+        if let Some(parallel_moe) = parallel_moe {
+            parallel_moe
+                .join
+                .record_on_stream(parallel_moe.shared_stream)?;
+            stream.wait_event(parallel_moe.join)?;
+        } else {
+            self.enqueue_shared_batch(workspace, ffn_norm, capacity, stream)?;
         }
-        bf16_linear_logits_f32_batch_into_on_stream(
-            ffn_norm,
-            &self.shared_gate.weight,
-            workspace.shared_gate.output(),
-            capacity,
-            self.shared_gate.rows,
-            self.shared_gate.cols,
-            stream,
-        )?;
         qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
             &workspace.route_indices,
             &workspace.route_weights,
