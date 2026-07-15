@@ -9,6 +9,9 @@ rand = "0.9"
 serde_json.workspace = true
 nvfp4.workspace = true
 tokenizers = "0.22"
+minijinja = { version = "2.21.0", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+minijinja-contrib = { version = "2.21.0", features = ["pycompat"] }
 
 [dev-dependencies]
 micromeasure.workspace = true
