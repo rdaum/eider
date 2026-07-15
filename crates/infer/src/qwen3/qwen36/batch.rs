@@ -114,6 +114,10 @@ impl BatchLinearPlan {
             scalar_channel_scale: DeviceBuffer::zeroed(linear.rows)?,
         })
     }
+
+    fn device_bytes(&self) -> usize {
+        self.plan.workspace_bytes() + self.scalar_channel_scale.device_bytes()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,6 +273,35 @@ impl BatchLinearAttentionWorkspace {
         self.recurrent_state_table
             .copy_from_host(&self.recurrent_state_ptrs)
     }
+
+    fn device_bytes(&self) -> usize {
+        self.hidden_quantized.device_bytes()
+            + self.hidden_scale.device_bytes()
+            + self.value_quantized.device_bytes()
+            + self.value_scale.device_bytes()
+            + self.qkv_output.device_bytes()
+            + self.z_output.device_bytes()
+            + self.alpha.device_bytes()
+            + self.beta_input.device_bytes()
+            + self.gate.device_bytes()
+            + self.beta.device_bytes()
+            + self.q.device_bytes()
+            + self.k.device_bytes()
+            + self.v.device_bytes()
+            + self.conv_state_table.device_bytes()
+            + self.recurrent_state_table.device_bytes()
+            + self
+                .padding_states
+                .iter()
+                .map(Qwen36LinearAttentionState::device_bytes)
+                .sum::<usize>()
+            + self.gdn_output.device_bytes()
+            + self.normed.device_bytes()
+            + self.output.device_bytes()
+            + self.qkv_plan.device_bytes()
+            + self.z_plan.device_bytes()
+            + self.out_plan.device_bytes()
+    }
 }
 
 struct BatchFullAttentionWorkspace {
@@ -331,6 +364,29 @@ impl BatchFullAttentionWorkspace {
             o_plan: BatchLinearPlan::new(model, &weights.o, capacity)?,
         })
     }
+
+    fn device_bytes(&self) -> usize {
+        self.hidden_quantized.device_bytes()
+            + self.hidden_scale.device_bytes()
+            + self.value_quantized.device_bytes()
+            + self.value_scale.device_bytes()
+            + self.q_proj.device_bytes()
+            + self.k_raw.device_bytes()
+            + self.v.device_bytes()
+            + self.q.device_bytes()
+            + self.gate.device_bytes()
+            + self.k.device_bytes()
+            + self.q_rope.device_bytes()
+            + self.k_rope.device_bytes()
+            + self.attention.device_bytes()
+            + self.gated_attention.device_bytes()
+            + self.output.device_bytes()
+            + self.compact_attention.device_bytes()
+            + self.q_plan.device_bytes()
+            + self.k_plan.device_bytes()
+            + self.v_plan.device_bytes()
+            + self.o_plan.device_bytes()
+    }
 }
 
 struct BatchMoeWorkspace {
@@ -383,6 +439,19 @@ impl BatchMoeWorkspace {
             output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
         })
     }
+
+    fn device_bytes(&self) -> usize {
+        self.router_logits.device_bytes()
+            + self.route_indices.device_bytes()
+            + self.route_weights.device_bytes()
+            + self.marlin.device_bytes()
+            + self.sm12x_down.device_bytes()
+            + self.shared_gate_up.device_bytes()
+            + self.shared_activated.device_bytes()
+            + self.shared_output.device_bytes()
+            + self.shared_gate.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 /// Reusable execution storage for a changing set of decode sequences.
@@ -420,6 +489,29 @@ impl Qwen36DecodeBatchWorkspace {
     /// Returns the largest sequence context accepted by this workspace.
     pub fn max_context_tokens(&self) -> usize {
         self.max_context_tokens
+    }
+
+    /// Returns the number of device bytes owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.token_ids.device_bytes()
+            + self.positions.device_bytes()
+            + self.hidden.device_bytes()
+            + self.normed_hidden.device_bytes()
+            + self.attn_residual.device_bytes()
+            + self.ffn_norm.device_bytes()
+            + self.final_hidden.device_bytes()
+            + self.linear.device_bytes()
+            + self.full.device_bytes()
+            + self.moe.device_bytes()
+            + self
+                .lm_head_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self.lm_head_quantized.device_bytes()
+            + self.lm_head_scale.device_bytes()
+            + self.logits.device_bytes()
+            + self.next_indices.device_bytes()
+            + self.next_values.device_bytes()
     }
 }
 

@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "qwen36_cpu_shared_expert"
 harness = false
+
+[[bench]]
+name = "qwen36_decode_batch"
+harness = false

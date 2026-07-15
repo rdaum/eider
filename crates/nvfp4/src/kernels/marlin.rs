@@ -342,6 +342,17 @@ impl MarlinNvfp4GateUp {
 }
 
 impl MarlinNvfp4GateUpBatchWorkspace {
+    /// Returns the number of device bytes owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.input_bf16.device_bytes()
+            + self.output_bf16.device_bytes()
+            + self.reduce_tmp.device_bytes()
+            + self.locks.device_bytes()
+            + self.sorted_token_ids.device_bytes()
+            + self.expert_ids.device_bytes()
+            + self.num_tokens_past_padded.device_bytes()
+    }
+
     /// Returns Marlin's contiguous `[batch, top_k, gate_up]` BF16 output.
     pub fn output_bf16(&self) -> &DeviceBuffer<u16> {
         &self.output_bf16
