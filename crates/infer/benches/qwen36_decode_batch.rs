@@ -1,5 +1,6 @@
 use infer::qwen3::qwen36::{
-    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState, Qwen36SequenceState,
+    Qwen36TextModel,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -36,6 +37,17 @@ struct DecodeBatchBench {
     case: Rc<RefCell<DecodeBatchCase>>,
 }
 
+struct ProductionDecodeCase {
+    model: Rc<Qwen36TextModel>,
+    state: Qwen36DecodeState,
+    token: u32,
+    start_position: usize,
+}
+
+struct ProductionDecodeBench {
+    case: Rc<RefCell<ProductionDecodeCase>>,
+}
+
 impl BenchContext for DecodeBatchBench {
     fn prepare(_num_chunks: usize) -> Self {
         panic!("qwen36_decode_batch requires its shared model factory")
@@ -43,6 +55,43 @@ impl BenchContext for DecodeBatchBench {
 
     fn chunk_size() -> Option<usize> {
         Some(1)
+    }
+}
+
+impl BenchContext for ProductionDecodeBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        panic!("qwen36_decode_batch requires its shared model factory")
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
+impl ProductionDecodeCase {
+    fn new(model: Rc<Qwen36TextModel>, max_context_tokens: usize, start_position: usize) -> Self {
+        let state = model
+            .new_decode_state(max_context_tokens)
+            .expect("production decode state");
+        let mut case = Self {
+            model,
+            state,
+            token: seed_tokens(1)[0],
+            start_position,
+        };
+        for _ in 0..start_position {
+            case.tick();
+        }
+        case
+    }
+
+    fn tick(&mut self) {
+        self.token = self
+            .model
+            .decode_one_token(&mut self.state, self.token)
+            .expect("production decode tick")
+            .id;
+        black_box(self.token);
     }
 }
 
@@ -164,6 +213,30 @@ fn decode_sample(
         ))
 }
 
+fn production_decode_sample(
+    context: &mut ProductionDecodeBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    let mut case = context.case.borrow_mut();
+    let started = Instant::now();
+    for _ in 0..chunk_size {
+        case.tick();
+    }
+    let elapsed = started.elapsed();
+    BenchSampleResult::operations(chunk_size as u64)
+        .push_metric(
+            MetricValue::duration_ms("tick_ms", elapsed.div_f64(chunk_size as f64))
+                .with_display_name("Tick latency"),
+        )
+        .push_metric(MetricValue::integer("batch", 1, "tokens"))
+        .push_metric(MetricValue::integer(
+            "start_position",
+            case.start_position as i64,
+            "tokens",
+        ))
+}
+
 fn validate_batch(model: &Qwen36TextModel, batch: usize, max_context_tokens: usize) {
     let mut batched_workspace = model
         .new_decode_batch_workspace(batch, max_context_tokens)
@@ -278,6 +351,22 @@ fn main() {
     };
 
     run_benchmark_main(options, |runner| {
+        runner.group::<ProductionDecodeBench>("Qwen3.6 production decode", |group| {
+            let production_case = Rc::new(RefCell::new(ProductionDecodeCase::new(
+                Rc::clone(&model),
+                max_context_tokens,
+                start_position,
+            )));
+            let production_factory = || ProductionDecodeBench {
+                case: Rc::clone(&production_case),
+            };
+            group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu)
+                .factory(&production_factory)
+                .bench_sample("decode_one_token_1", production_decode_sample);
+        });
+
         runner.group::<DecodeBatchBench>("Qwen3.6 decode batching", |group| {
             for batch in BATCH_SIZES {
                 let batched_case = Rc::new(RefCell::new(DecodeBatchCase::new(
@@ -294,7 +383,7 @@ fn main() {
                     .throughput(Throughput::per_operation(1, "tokens"))
                     .measurement_domain(MeasurementDomain::Gpu)
                     .factory(&batched_factory)
-                    .bench_sample(&format!("batched_{batch}"), decode_sample);
+                    .bench_sample(&format!("batch_api_batched_{batch}"), decode_sample);
 
                 let independent_case = Rc::new(RefCell::new(DecodeBatchCase::new(
                     Rc::clone(&model),
@@ -310,7 +399,7 @@ fn main() {
                     .throughput(Throughput::per_operation(1, "tokens"))
                     .measurement_domain(MeasurementDomain::Gpu)
                     .factory(&independent_factory)
-                    .bench_sample(&format!("independent_{batch}"), decode_sample);
+                    .bench_sample(&format!("batch_api_independent_{batch}"), decode_sample);
             }
         });
     });
