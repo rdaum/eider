@@ -11,16 +11,25 @@ use crate::nvfp4::{
     add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     fill_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
-    gated_delta_net_128_f32_batch_into_on_stream, gated_rms_norm_f32_into_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_topk_f32_batch_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
+    gated_rms_norm_f32_into_on_stream, indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream, moe_topk_f32_batch_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
     qwen36_full_attn_prep_f32_batch_into_on_stream, qwen36_gdn_gate_batch_into_on_stream,
-    qwen36_gdn_prep_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_imrope_text_batch_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    scale_channel_f32_device_row_scalar_in_place_on_stream, sigmoid_mul_f32_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream,
+    qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_row_scalar_in_place_on_stream,
+    sigmoid_mul_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
 };
+
+/// One scheduler-selected prompt chunk for batched prefill.
+pub struct Qwen36PrefillRow<'tokens, 'state> {
+    /// Non-empty contiguous prompt tokens consumed by this operation.
+    pub token_ids: &'tokens [u32],
+    /// Persistent state advanced by every token in `token_ids`.
+    pub state: &'state mut Qwen36SequenceState,
+}
 
 /// One scheduler-selected sequence row for a decode tick.
 pub struct Qwen36DecodeRow<'a> {
@@ -204,44 +213,45 @@ impl BatchLinearAttentionWorkspace {
     fn new(
         model: &Qwen36TextModel,
         weights: &Qwen36LinearAttentionWeights,
-        capacity: usize,
+        row_capacity: usize,
+        state_capacity: usize,
     ) -> Result<Self> {
         let linear = model
             .manifest
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        let state_table_len = model.layers.len() * capacity;
+        let state_table_len = model.layers.len() * state_capacity;
         let nulls = vec![std::ptr::null_mut(); state_table_len];
-        let mut padding_states = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
+        let mut padding_states = Vec::with_capacity(state_capacity);
+        for _ in 0..state_capacity {
             padding_states.push(Qwen36LinearAttentionState::new(linear, weights)?);
         }
         Ok(Self {
-            hidden_quantized: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
-            hidden_scale: DeviceBuffer::zeroed(capacity)?,
-            value_quantized: DeviceBuffer::zeroed(capacity * value_dim)?,
-            value_scale: DeviceBuffer::zeroed(capacity)?,
-            qkv_output: DeviceBuffer::zeroed(capacity * weights.qkv.rows)?,
-            z_output: DeviceBuffer::zeroed(capacity * weights.z.rows)?,
-            alpha: DeviceBuffer::zeroed(capacity * linear.value_heads)?,
-            beta_input: DeviceBuffer::zeroed(capacity * linear.value_heads)?,
-            gate: DeviceBuffer::zeroed(capacity * linear.value_heads)?,
-            beta: DeviceBuffer::zeroed(capacity * linear.value_heads)?,
-            q: DeviceBuffer::zeroed(capacity * value_dim)?,
-            k: DeviceBuffer::zeroed(capacity * value_dim)?,
-            v: DeviceBuffer::zeroed(capacity * value_dim)?,
+            hidden_quantized: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
+            hidden_scale: DeviceBuffer::zeroed(row_capacity)?,
+            value_quantized: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            value_scale: DeviceBuffer::zeroed(row_capacity)?,
+            qkv_output: DeviceBuffer::zeroed(row_capacity * weights.qkv.rows)?,
+            z_output: DeviceBuffer::zeroed(row_capacity * weights.z.rows)?,
+            alpha: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
+            beta_input: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
+            gate: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
+            beta: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
+            q: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            k: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            v: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             conv_state_table: DeviceBuffer::from_host(&nulls)?,
             recurrent_state_table: DeviceBuffer::from_host(&nulls)?,
             conv_state_ptrs: nulls.clone(),
             recurrent_state_ptrs: nulls,
             padding_states,
-            gdn_output: DeviceBuffer::zeroed(capacity * value_dim)?,
-            normed: DeviceBuffer::zeroed(capacity * value_dim)?,
-            output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
-            qkv_plan: BatchLinearPlan::new(model, &weights.qkv, capacity)?,
-            z_plan: BatchLinearPlan::new(model, &weights.z, capacity)?,
-            out_plan: BatchLinearPlan::new(model, &weights.out, capacity)?,
+            gdn_output: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            normed: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            output: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
+            qkv_plan: BatchLinearPlan::new(model, &weights.qkv, row_capacity)?,
+            z_plan: BatchLinearPlan::new(model, &weights.z, row_capacity)?,
+            out_plan: BatchLinearPlan::new(model, &weights.out, row_capacity)?,
         })
     }
 
@@ -254,6 +264,42 @@ impl BatchLinearAttentionWorkspace {
         for layer_idx in 0..layer_count {
             for row_idx in 0..capacity {
                 let table_idx = layer_idx * capacity + row_idx;
+                let state = if let Some(row) = rows.get_mut(row_idx) {
+                    match &mut row.state.layer_states[layer_idx].attention {
+                        Qwen36AttentionState::LinearAttention(state) => state,
+                        Qwen36AttentionState::FullAttention(_) => {
+                            self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
+                            self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                            continue;
+                        }
+                    }
+                } else {
+                    &mut self.padding_states[row_idx]
+                };
+                self.conv_state_ptrs[table_idx] =
+                    state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
+                self.recurrent_state_ptrs[table_idx] = state
+                    .recurrent_state
+                    .as_const_ptr()
+                    .cast_mut()
+                    .cast::<f32>();
+            }
+        }
+        self.conv_state_table
+            .copy_from_host(&self.conv_state_ptrs)?;
+        self.recurrent_state_table
+            .copy_from_host(&self.recurrent_state_ptrs)
+    }
+
+    fn update_prefill_state_tables(
+        &mut self,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        layer_count: usize,
+        state_capacity: usize,
+    ) -> Result<()> {
+        for layer_idx in 0..layer_count {
+            for row_idx in 0..state_capacity {
+                let table_idx = layer_idx * state_capacity + row_idx;
                 let state = if let Some(row) = rows.get_mut(row_idx) {
                     match &mut row.state.layer_states[layer_idx].attention {
                         Qwen36AttentionState::LinearAttention(state) => state,
@@ -422,6 +468,64 @@ enum BatchLayerGraph {
     },
 }
 
+/// Reusable execution storage for ragged Qwen3.6 prompt chunks.
+pub struct Qwen36PrefillBatchWorkspace {
+    model_id: u64,
+    sequence_capacity: usize,
+    token_capacity: usize,
+    max_context_tokens: usize,
+    stream: CudaStream,
+    shared_moe_stream: CudaStream,
+    moe_stream_sync: Vec<BatchMoeStreamSync>,
+    token_ids: DeviceBuffer<u32>,
+    positions: DeviceBuffer<u32>,
+    sequence_offsets: DeviceBuffer<u32>,
+    sequence_lengths: DeviceBuffer<u32>,
+    host_token_ids: Vec<u32>,
+    host_positions: Vec<u32>,
+    host_sequence_offsets: Vec<u32>,
+    host_sequence_lengths: Vec<u32>,
+    hidden: DeviceBuffer<f32>,
+    normed_hidden: DeviceBuffer<f32>,
+    attn_residual: DeviceBuffer<f32>,
+    ffn_norm: DeviceBuffer<f32>,
+    linear: BatchLinearAttentionWorkspace,
+    full: BatchFullAttentionWorkspace,
+    moe: BatchMoeWorkspace,
+}
+
+impl Qwen36PrefillBatchWorkspace {
+    /// Returns the maximum number of independent prompt chunks per call.
+    pub fn sequence_capacity(&self) -> usize {
+        self.sequence_capacity
+    }
+
+    /// Returns the maximum total prompt tokens per call.
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity
+    }
+
+    /// Returns the largest sequence context accepted by this workspace.
+    pub fn max_context_tokens(&self) -> usize {
+        self.max_context_tokens
+    }
+
+    /// Returns the exact device bytes owned by the prefill workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.token_ids.device_bytes()
+            + self.positions.device_bytes()
+            + self.sequence_offsets.device_bytes()
+            + self.sequence_lengths.device_bytes()
+            + self.hidden.device_bytes()
+            + self.normed_hidden.device_bytes()
+            + self.attn_residual.device_bytes()
+            + self.ffn_norm.device_bytes()
+            + self.linear.device_bytes()
+            + self.full.device_bytes()
+            + self.moe.device_bytes()
+    }
+}
+
 impl BatchMoeWorkspace {
     fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, capacity: usize) -> Result<Self> {
         let marlin = match &weights.gate_up_storage {
@@ -575,6 +679,311 @@ impl Qwen36LayerBlock {
 }
 
 impl Qwen36TextModel {
+    /// Allocates shared scratch and execution plans for ragged prompt prefill.
+    pub fn new_prefill_batch_workspace(
+        &self,
+        sequence_capacity: usize,
+        token_capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<Qwen36PrefillBatchWorkspace> {
+        if sequence_capacity == 0 || token_capacity == 0 || max_context_tokens == 0 {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 prefill batch workspace",
+                expected: "positive sequence, token, and context capacities".to_string(),
+                actual: format!(
+                    "sequence_capacity={sequence_capacity} token_capacity={token_capacity} max_context_tokens={max_context_tokens}"
+                ),
+            });
+        }
+        let first_linear = self
+            .layers
+            .iter()
+            .find_map(|block| match &block.attention {
+                Qwen36Attention::LinearAttention(weights) => Some(weights),
+                Qwen36Attention::FullAttention(_) => None,
+            })
+            .expect("Qwen3.6 has linear-attention layers");
+        let first_full = self
+            .layers
+            .iter()
+            .find_map(|block| match &block.attention {
+                Qwen36Attention::FullAttention(weights) => Some(weights),
+                Qwen36Attention::LinearAttention(_) => None,
+            })
+            .expect("Qwen3.6 has full-attention layers");
+        let first_moe = &self.layers.first().expect("Qwen3.6 has layers").moe;
+        let mut moe_stream_sync = Vec::with_capacity(self.layers.len());
+        for _ in &self.layers {
+            moe_stream_sync.push(BatchMoeStreamSync {
+                fork: CudaEvent::new_sync()?,
+                join: CudaEvent::new_sync()?,
+            });
+        }
+        Ok(Qwen36PrefillBatchWorkspace {
+            model_id: self.model_id,
+            sequence_capacity,
+            token_capacity,
+            max_context_tokens,
+            stream: CudaStream::new_blocking()?,
+            shared_moe_stream: CudaStream::new_non_blocking()?,
+            moe_stream_sync,
+            token_ids: DeviceBuffer::zeroed(token_capacity)?,
+            positions: DeviceBuffer::zeroed(token_capacity)?,
+            sequence_offsets: DeviceBuffer::zeroed(sequence_capacity)?,
+            sequence_lengths: DeviceBuffer::zeroed(sequence_capacity)?,
+            host_token_ids: vec![0; token_capacity],
+            host_positions: vec![0; token_capacity],
+            host_sequence_offsets: vec![0; sequence_capacity],
+            host_sequence_lengths: vec![0; sequence_capacity],
+            hidden: DeviceBuffer::zeroed(token_capacity * self.manifest.hidden)?,
+            normed_hidden: DeviceBuffer::zeroed(token_capacity * self.manifest.hidden)?,
+            attn_residual: DeviceBuffer::zeroed(token_capacity * self.manifest.hidden)?,
+            ffn_norm: DeviceBuffer::zeroed(token_capacity * self.manifest.hidden)?,
+            linear: BatchLinearAttentionWorkspace::new(
+                self,
+                first_linear,
+                token_capacity,
+                sequence_capacity,
+            )?,
+            full: BatchFullAttentionWorkspace::new(
+                self,
+                first_full,
+                token_capacity,
+                max_context_tokens,
+            )?,
+            moe: BatchMoeWorkspace::new(self, first_moe, token_capacity)?,
+        })
+    }
+
+    /// Advances persistent sequence state by ragged prompt chunks.
+    ///
+    /// This operation intentionally does not run the final norm or language
+    /// head. A scheduler should retain the final prompt token and pass it to
+    /// [`Self::decode_batch`] to obtain the first completion logits.
+    pub fn prefill_batch(
+        &self,
+        workspace: &mut Qwen36PrefillBatchWorkspace,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+    ) -> Result<()> {
+        if workspace.model_id != self.model_id {
+            return Err(crate::nvfp4::Error::Format {
+                label: "Qwen3.6 prefill batch workspace",
+                detail: "workspace was created by a different model instance".to_string(),
+            });
+        }
+        if rows.is_empty() || rows.len() > workspace.sequence_capacity {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 prefill batch rows",
+                expected: format!("1..={}", workspace.sequence_capacity),
+                actual: rows.len().to_string(),
+            });
+        }
+        let total_tokens = rows.iter().try_fold(0usize, |total, row| {
+            total
+                .checked_add(row.token_ids.len())
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill token count",
+                    expected: "total token count without overflow".to_string(),
+                    actual: format!("total={total} row={}", row.token_ids.len()),
+                })
+        })?;
+        if total_tokens == 0 || total_tokens > workspace.token_capacity {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 prefill token count",
+                expected: format!("1..={}", workspace.token_capacity),
+                actual: total_tokens.to_string(),
+            });
+        }
+        for row in rows.iter() {
+            if row.token_ids.is_empty() {
+                return Err(crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill row",
+                    expected: "at least one token".to_string(),
+                    actual: "0 tokens".to_string(),
+                });
+            }
+            if row.state.model_id != self.model_id {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 prefill sequence state",
+                    detail: "state was created by a different model instance".to_string(),
+                });
+            }
+            if let Some(token) = row
+                .token_ids
+                .iter()
+                .find(|&&token| token as usize >= self.manifest.vocab)
+            {
+                return Err(crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill token id",
+                    expected: format!("token < {}", self.manifest.vocab),
+                    actual: token.to_string(),
+                });
+            }
+            let end = row
+                .state
+                .position
+                .checked_add(row.token_ids.len())
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill sequence capacity",
+                    expected: "position + tokens without overflow".to_string(),
+                    actual: format!(
+                        "position={} tokens={}",
+                        row.state.position,
+                        row.token_ids.len()
+                    ),
+                })?;
+            if end > row.state.max_tokens || row.state.max_tokens > workspace.max_context_tokens {
+                return Err(crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill sequence capacity",
+                    expected: format!(
+                        "end <= sequence max_tokens <= {}",
+                        workspace.max_context_tokens
+                    ),
+                    actual: format!("end={end} max_tokens={}", row.state.max_tokens),
+                });
+            }
+            for layer in &row.state.layer_states {
+                if let Qwen36AttentionState::FullAttention(state) = &layer.attention
+                    && (state.compact_cache.len() != row.state.position
+                        || state.cache_capacity != row.state.max_tokens)
+                {
+                    return Err(crate::nvfp4::Error::Format {
+                        label: "Qwen3.6 prefill sequence state",
+                        detail: format!(
+                            "full-attention cache length/capacity {}/{} does not match sequence {}/{}",
+                            state.compact_cache.len(),
+                            state.cache_capacity,
+                            row.state.position,
+                            row.state.max_tokens
+                        ),
+                    });
+                }
+            }
+        }
+
+        workspace.host_token_ids.fill(0);
+        workspace.host_positions.fill(0);
+        workspace.host_sequence_offsets.fill(0);
+        workspace.host_sequence_lengths.fill(0);
+        let mut offset = 0usize;
+        for (sequence, row) in rows.iter().enumerate() {
+            workspace.host_sequence_offsets[sequence] = offset as u32;
+            workspace.host_sequence_lengths[sequence] = row.token_ids.len() as u32;
+            for (token_offset, &token) in row.token_ids.iter().enumerate() {
+                workspace.host_token_ids[offset + token_offset] = token;
+                workspace.host_positions[offset + token_offset] =
+                    (row.state.position + token_offset) as u32;
+            }
+            offset += row.token_ids.len();
+        }
+        workspace
+            .token_ids
+            .copy_from_host(&workspace.host_token_ids)?;
+        workspace
+            .positions
+            .copy_from_host(&workspace.host_positions)?;
+        workspace
+            .sequence_offsets
+            .copy_from_host(&workspace.host_sequence_offsets)?;
+        workspace
+            .sequence_lengths
+            .copy_from_host(&workspace.host_sequence_lengths)?;
+        workspace.linear.update_prefill_state_tables(
+            rows,
+            self.layers.len(),
+            workspace.sequence_capacity,
+        )?;
+
+        let stream = &workspace.stream;
+        copy_bf16_rows_to_f32_indexed_into_on_stream(
+            self.manifest.vocab,
+            self.manifest.hidden,
+            &self.embedding,
+            &workspace.token_ids,
+            workspace.hidden.output(),
+            stream,
+        )?;
+        for (layer_idx, block) in self.layers.iter().enumerate() {
+            rms_norm_f32_into_on_stream(
+                workspace.token_capacity,
+                self.manifest.hidden,
+                &workspace.hidden,
+                &block.input_norm,
+                workspace.normed_hidden.output(),
+                self.manifest.rms_eps,
+                stream,
+            )?;
+            let attention_output = match &block.attention {
+                Qwen36Attention::LinearAttention(weights) => {
+                    weights.enqueue_prefill_chunks(
+                        self,
+                        &mut workspace.linear,
+                        &workspace.normed_hidden,
+                        &workspace.sequence_offsets,
+                        &workspace.sequence_lengths,
+                        layer_idx,
+                        workspace.sequence_capacity,
+                        rows.len(),
+                        total_tokens,
+                        workspace.token_capacity,
+                        stream,
+                    )?;
+                    &workspace.linear.output
+                }
+                Qwen36Attention::FullAttention(weights) => {
+                    weights.enqueue_batch_pre(
+                        self,
+                        &mut workspace.full,
+                        &workspace.normed_hidden,
+                        &workspace.positions,
+                        workspace.token_capacity,
+                        stream,
+                    )?;
+                    weights.enqueue_prefill_cache(
+                        self,
+                        &mut workspace.full,
+                        rows,
+                        &workspace.host_sequence_offsets,
+                        layer_idx,
+                        stream,
+                    )?;
+                    weights.enqueue_batch_post(
+                        self,
+                        &mut workspace.full,
+                        workspace.token_capacity,
+                        stream,
+                    )?;
+                    &workspace.full.output
+                }
+            };
+            let sync = &workspace.moe_stream_sync[layer_idx];
+            block.enqueue_batch_tail(
+                self,
+                &mut workspace.moe,
+                &workspace.hidden,
+                attention_output,
+                &mut workspace.attn_residual,
+                &mut workspace.ffn_norm,
+                workspace.token_capacity,
+                stream,
+                Some(Qwen36ParallelMoe {
+                    shared_stream: &workspace.shared_moe_stream,
+                    fork: &sync.fork,
+                    join: &sync.join,
+                }),
+            )?;
+            std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+        }
+        if !self.layers.len().is_multiple_of(2) {
+            std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+        }
+        stream.synchronize()?;
+        for row in rows {
+            row.state.position += row.token_ids.len();
+        }
+        Ok(())
+    }
+
     /// Allocates shared scratch and execution plans for batched decode.
     pub fn new_decode_batch_workspace(
         &self,
@@ -633,7 +1042,7 @@ impl Qwen36TextModel {
             attn_residual: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
             ffn_norm: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
             final_hidden: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
-            linear: BatchLinearAttentionWorkspace::new(self, first_linear, capacity)?,
+            linear: BatchLinearAttentionWorkspace::new(self, first_linear, capacity, capacity)?,
             full: BatchFullAttentionWorkspace::new(self, first_full, capacity, max_context_tokens)?,
             moe: BatchMoeWorkspace::new(self, first_moe, capacity)?,
             lm_head_plan,
@@ -1145,6 +1554,185 @@ impl Qwen36LinearAttentionWeights {
             stream,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_prefill_chunks(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchLinearAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        layer_idx: usize,
+        sequence_capacity: usize,
+        sequence_count: usize,
+        total_tokens: usize,
+        row_capacity: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let linear = model
+            .manifest
+            .linear_attention
+            .expect("Qwen3.6 linear-attention configuration");
+        let value_dim = linear.value_heads * linear.value_head_dim;
+        quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+            hidden,
+            &mut workspace.hidden_quantized,
+            &mut workspace.hidden_scale,
+            row_capacity,
+            model.manifest.hidden,
+            stream,
+        )?;
+        run_fp8_batch(
+            model,
+            &self.qkv,
+            &mut workspace.qkv_plan,
+            hidden,
+            &workspace.hidden_quantized,
+            &workspace.hidden_scale,
+            &mut workspace.qkv_output,
+            row_capacity,
+            128,
+            stream,
+        )?;
+        run_fp8_batch(
+            model,
+            &self.z,
+            &mut workspace.z_plan,
+            hidden,
+            &workspace.hidden_quantized,
+            &workspace.hidden_scale,
+            &mut workspace.z_output,
+            row_capacity,
+            128,
+            stream,
+        )?;
+        bf16_linear_logits_f32_batch_into_on_stream(
+            hidden,
+            &self.alpha.weight,
+            workspace.alpha.output(),
+            row_capacity,
+            self.alpha.rows,
+            self.alpha.cols,
+            stream,
+        )?;
+        bf16_linear_logits_f32_batch_into_on_stream(
+            hidden,
+            &self.beta.weight,
+            workspace.beta_input.output(),
+            row_capacity,
+            self.beta.rows,
+            self.beta.cols,
+            stream,
+        )?;
+        if total_tokens == sequence_count {
+            qwen36_gdn_prep_batch_into_on_stream(
+                &workspace.qkv_output,
+                &self.conv_weight,
+                workspace.q.output(),
+                workspace.k.output(),
+                workspace.v.output(),
+                &workspace.conv_state_table,
+                layer_idx * sequence_capacity,
+                sequence_count,
+                linear.key_heads,
+                linear.value_heads,
+                linear.value_head_dim,
+                stream,
+            )?;
+        } else {
+            qwen36_gdn_prep_chunks_into_on_stream(
+                &workspace.qkv_output,
+                &self.conv_weight,
+                workspace.q.output(),
+                workspace.k.output(),
+                workspace.v.output(),
+                &workspace.conv_state_table,
+                layer_idx * sequence_capacity,
+                sequence_offsets,
+                sequence_lengths,
+                sequence_count,
+                total_tokens,
+                linear.key_heads,
+                linear.value_heads,
+                linear.value_head_dim,
+                stream,
+            )?;
+        }
+        qwen36_gdn_gate_batch_into_on_stream(
+            &workspace.alpha,
+            &workspace.beta_input,
+            &self.a_log,
+            &self.dt_bias,
+            workspace.gate.output(),
+            workspace.beta.output(),
+            row_capacity,
+            linear.value_heads,
+            stream,
+        )?;
+        if total_tokens == sequence_count {
+            gated_delta_net_128_f32_batch_into_on_stream(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &workspace.gate,
+                &workspace.beta,
+                &workspace.recurrent_state_table,
+                workspace.gdn_output.output(),
+                layer_idx * sequence_capacity,
+                sequence_count,
+                linear.value_heads,
+                stream,
+            )?;
+        } else {
+            gated_delta_net_128_f32_chunks_into_on_stream(
+                &workspace.q,
+                &workspace.k,
+                &workspace.v,
+                &workspace.gate,
+                &workspace.beta,
+                &workspace.recurrent_state_table,
+                layer_idx * sequence_capacity,
+                sequence_offsets,
+                sequence_lengths,
+                workspace.gdn_output.output(),
+                sequence_count,
+                total_tokens,
+                linear.value_heads,
+                stream,
+            )?;
+        }
+        gated_rms_norm_f32_into_on_stream(
+            &workspace.gdn_output,
+            &workspace.z_output,
+            &self.norm_weight,
+            workspace.normed.output(),
+            row_capacity * linear.value_heads,
+            linear.value_head_dim,
+            model.manifest.rms_eps,
+            stream,
+        )?;
+        quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+            &workspace.normed,
+            &mut workspace.value_quantized,
+            &mut workspace.value_scale,
+            row_capacity,
+            value_dim,
+            stream,
+        )?;
+        run_fp8_batch(
+            model,
+            &self.out,
+            &mut workspace.out_plan,
+            &workspace.normed,
+            &workspace.value_quantized,
+            &workspace.value_scale,
+            &mut workspace.output,
+            row_capacity,
+            256,
+            stream,
+        )
+    }
 }
 
 impl Qwen36FullAttentionWeights {
@@ -1295,6 +1883,64 @@ impl Qwen36FullAttentionWeights {
                     row * q_width,
                     stream,
                 )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_prefill_cache(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        row_offsets: &[u32],
+        layer_idx: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for (sequence, row) in rows.iter_mut().enumerate() {
+            let state = match &mut row.state.layer_states[layer_idx].attention {
+                Qwen36AttentionState::FullAttention(state) => state,
+                Qwen36AttentionState::LinearAttention(_) => {
+                    unreachable!("layer kind validated when sequence state was created")
+                }
+            };
+            let row_offset = row_offsets[sequence] as usize;
+            if row.token_ids.len() == 1 {
+                let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
+                let q_width = model.manifest.q_heads * model.manifest.head_dim;
+                let position = state.compact_cache.len();
+                state.compact_cache.append_at_offsets_on_stream(
+                    &workspace.k_rope,
+                    row_offset * kv_width,
+                    &workspace.v,
+                    row_offset * kv_width,
+                    position,
+                    stream,
+                )?;
+                workspace
+                    .compact_attention
+                    .attention_offsets_into_on_stream(
+                        &state.compact_cache,
+                        &workspace.q_rope,
+                        row_offset * q_width,
+                        workspace.attention.output(),
+                        row_offset * q_width,
+                        stream,
+                    )?;
+            } else {
+                workspace
+                    .compact_attention
+                    .append_causal_rows_at_offset_into_on_stream(
+                        &mut state.compact_cache,
+                        &workspace.q_rope,
+                        &workspace.k_rope,
+                        &workspace.v,
+                        row_offset,
+                        row.token_ids.len(),
+                        workspace.attention.output(),
+                        stream,
+                    )?;
+            }
         }
         Ok(())
     }

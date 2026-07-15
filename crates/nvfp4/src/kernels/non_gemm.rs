@@ -3795,12 +3795,12 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
         || heads == 0
         || batch_size > u32::MAX as usize
         || heads > u32::MAX as usize
-        || q.len() != vectors
-        || k.len() != vectors
-        || v.len() != vectors
-        || output.len() != vectors
-        || gate.len() != scalars
-        || beta.len() != scalars
+        || q.len() < vectors
+        || k.len() < vectors
+        || v.len() < vectors
+        || output.len() < vectors
+        || gate.len() < scalars
+        || beta.len() < scalars
         || state_table_end > state_table.len()
     {
         return Err(Error::Shape {
@@ -3832,6 +3832,100 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
                 state_table.ptr.add(state_table_offset),
                 output.buffer_mut().ptr,
                 batch_size as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues token-ordered Gated Delta Net updates for ragged prompt chunks.
+///
+/// Dense rows are flattened by sequence. `sequence_offsets` and
+/// `sequence_lengths` describe each contiguous span, while `state_table`
+/// contains one recurrent-state pointer per sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_net_128_f32_chunks_into_on_stream(
+    q: &DeviceBuffer<f32>,
+    k: &DeviceBuffer<f32>,
+    v: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    beta: &DeviceBuffer<f32>,
+    state_table: &DeviceBuffer<*mut f32>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let vectors = total_tokens
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(128))
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Gated Delta Net vectors",
+            expected: "total_tokens * heads * 128 without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} heads={heads}"),
+        })?;
+    let scalars = total_tokens
+        .checked_mul(heads)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Gated Delta Net scalars",
+            expected: "total_tokens * heads without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} heads={heads}"),
+        })?;
+    if sequence_count == 0
+        || total_tokens == 0
+        || heads == 0
+        || sequence_count > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || q.len() < vectors
+        || k.len() < vectors
+        || v.len() < vectors
+        || output.len() < vectors
+        || gate.len() < scalars
+        || beta.len() < scalars
+        || state_table_offset
+            .checked_add(sequence_count)
+            .is_none_or(|end| end > state_table.len())
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "chunked Gated Delta Net buffers",
+            expected: format!(
+                "q/k/v/output>={vectors} gate/beta>={scalars} metadata/state>={sequence_count}"
+            ),
+            actual: format!(
+                "q={} k={} v={} output={} gate={} beta={} state={} offsets={} lengths={}",
+                q.len(),
+                k.len(),
+                v.len(),
+                output.len(),
+                gate.len(),
+                beta.len(),
+                state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gated_delta_net_128_f32_chunks_on_stream",
+            ffi::infer_gated_delta_net_128_f32_chunks_on_stream(
+                q.ptr,
+                k.ptr,
+                v.ptr,
+                gate.ptr,
+                beta.ptr,
+                state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                output.buffer_mut().ptr,
+                sequence_count as u32,
                 heads as u32,
                 stream.as_raw(),
             ),
@@ -5465,11 +5559,11 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
         || batch_size > u32::MAX as usize
         || key_heads > u32::MAX as usize
         || value_heads > u32::MAX as usize
-        || qkv.len() != qkv_len
+        || qkv.len() < qkv_len
         || conv_weight_bf16.len() != conv_dim * 4
-        || q.len() != value_len
-        || k.len() != value_len
-        || v.len() != value_len
+        || q.len() < value_len
+        || k.len() < value_len
+        || v.len() < value_len
         || state_table_end > conv_state_table.len()
     {
         return Err(Error::Shape {
@@ -5500,6 +5594,119 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
                 v.buffer_mut().ptr,
                 conv_state_table.ptr.add(state_table_offset),
                 batch_size as u32,
+                key_heads as u32,
+                value_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies Qwen3.6 convolution/GDN preparation to ragged prompt chunks.
+///
+/// Each sequence's convolution state is advanced in token order. Dense rows
+/// are flattened by sequence and described by device-resident offsets and
+/// lengths.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_prep_chunks_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    conv_state_table: &DeviceBuffer<*mut f32>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let key_dim = key_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Qwen3.6 GDN prep",
+            expected: "key_heads * head_dim without overflow".to_string(),
+            actual: format!("key_heads={key_heads} head_dim={head_dim}"),
+        })?;
+    let value_dim = value_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Qwen3.6 GDN prep",
+            expected: "value_heads * head_dim without overflow".to_string(),
+            actual: format!("value_heads={value_heads} head_dim={head_dim}"),
+        })?;
+    let conv_dim = key_dim * 2 + value_dim;
+    let qkv_len = total_tokens
+        .checked_mul(conv_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Qwen3.6 GDN prep",
+            expected: "total_tokens * conv_dim without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} conv_dim={conv_dim}"),
+        })?;
+    let value_len = total_tokens
+        .checked_mul(value_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Qwen3.6 GDN prep",
+            expected: "total_tokens * value_dim without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} value_dim={value_dim}"),
+        })?;
+    if sequence_count == 0
+        || total_tokens == 0
+        || key_heads == 0
+        || value_heads == 0
+        || head_dim != 128
+        || !value_heads.is_multiple_of(key_heads)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || qkv.len() < qkv_len
+        || conv_weight_bf16.len() != conv_dim * 4
+        || q.len() < value_len
+        || k.len() < value_len
+        || v.len() < value_len
+        || state_table_offset
+            .checked_add(sequence_count)
+            .is_none_or(|end| end > conv_state_table.len())
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "chunked Qwen3.6 GDN prep buffers",
+            expected: format!(
+                "qkv>={qkv_len} conv_weight={} q/k/v>={value_len} metadata/state>={sequence_count}",
+                conv_dim * 4
+            ),
+            actual: format!(
+                "qkv={} conv_weight={} q={} k={} v={} state={} offsets={} lengths={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_prep_chunks_on_stream",
+            ffi::infer_qwen36_gdn_prep_chunks_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                sequence_count as u32,
+                total_tokens as u32,
                 key_heads as u32,
                 value_heads as u32,
                 head_dim as u32,
@@ -7914,6 +8121,183 @@ mod tests {
                 "batched GDN recurrent state",
             );
         }
+    }
+
+    #[test]
+    fn qwen36_chunked_gdn_matches_repeated_sequence_updates() {
+        let tokens = 6usize;
+        let key_heads = 1usize;
+        let value_heads = 2usize;
+        let head_dim = 128usize;
+        let key_dim = key_heads * head_dim;
+        let value_dim = value_heads * head_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let state_len = value_heads * head_dim * head_dim;
+        let qkv = (0..tokens * conv_dim)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.0078125)
+            .collect::<Vec<_>>();
+        let conv_weight = (0..conv_dim * 4)
+            .map(|idx| format::f32_to_bf16(((idx % 13) as f32 - 6.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let gate = (0..tokens * value_heads)
+            .map(|idx| -0.02 - (idx % value_heads) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let beta = (0..tokens * value_heads)
+            .map(|idx| 0.2 + (idx % value_heads) as f32 * 0.1)
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let qkv_device = DeviceBuffer::from_host(&qkv).expect("qkv");
+        let weight_device = DeviceBuffer::from_host(&conv_weight).expect("weight");
+        let gate_device = DeviceBuffer::from_host(&gate).expect("gate");
+        let beta_device = DeviceBuffer::from_host(&beta).expect("beta");
+
+        let mut chunk_conv = DeviceBuffer::<f32>::zeroed(conv_dim * 3).expect("chunk conv");
+        let mut chunk_recurrent = DeviceBuffer::<f32>::zeroed(state_len).expect("chunk recurrent");
+        let chunk_conv_table = DeviceBuffer::from_host(&[chunk_conv.as_mut_ptr().cast::<f32>()])
+            .expect("chunk conv table");
+        let chunk_recurrent_table =
+            DeviceBuffer::from_host(&[chunk_recurrent.as_mut_ptr().cast::<f32>()])
+                .expect("chunk recurrent table");
+        let offsets = DeviceBuffer::from_host(&[0u32]).expect("offsets");
+        let lengths = DeviceBuffer::from_host(&[tokens as u32]).expect("lengths");
+        let mut chunk_q = DeviceBuffer::<f32>::zeroed(tokens * value_dim).expect("chunk q");
+        let mut chunk_k = DeviceBuffer::<f32>::zeroed(tokens * value_dim).expect("chunk k");
+        let mut chunk_v = DeviceBuffer::<f32>::zeroed(tokens * value_dim).expect("chunk v");
+        let mut chunk_output =
+            DeviceBuffer::<f32>::zeroed(tokens * value_dim).expect("chunk output");
+        qwen36_gdn_prep_chunks_into_on_stream(
+            &qkv_device,
+            &weight_device,
+            chunk_q.output(),
+            chunk_k.output(),
+            chunk_v.output(),
+            &chunk_conv_table,
+            0,
+            &offsets,
+            &lengths,
+            1,
+            tokens,
+            key_heads,
+            value_heads,
+            head_dim,
+            &stream,
+        )
+        .expect("chunk prep");
+        gated_delta_net_128_f32_chunks_into_on_stream(
+            &chunk_q,
+            &chunk_k,
+            &chunk_v,
+            &gate_device,
+            &beta_device,
+            &chunk_recurrent_table,
+            0,
+            &offsets,
+            &lengths,
+            chunk_output.output(),
+            1,
+            tokens,
+            value_heads,
+            &stream,
+        )
+        .expect("chunk recurrent");
+
+        let mut repeated_conv = DeviceBuffer::<f32>::zeroed(conv_dim * 3).expect("repeated conv");
+        let mut repeated_recurrent =
+            DeviceBuffer::<f32>::zeroed(state_len).expect("repeated recurrent");
+        let mut repeated_q = Vec::with_capacity(tokens * value_dim);
+        let mut repeated_k = Vec::with_capacity(tokens * value_dim);
+        let mut repeated_v = Vec::with_capacity(tokens * value_dim);
+        let mut repeated_output = Vec::with_capacity(tokens * value_dim);
+        for token in 0..tokens {
+            let qkv_row = DeviceBuffer::from_host(&qkv[token * conv_dim..(token + 1) * conv_dim])
+                .expect("qkv row");
+            let mut q = DeviceBuffer::<f32>::zeroed(value_dim).expect("q row");
+            let mut k = DeviceBuffer::<f32>::zeroed(value_dim).expect("k row");
+            let mut v = DeviceBuffer::<f32>::zeroed(value_dim).expect("v row");
+            qwen36_gdn_prep_into_on_stream(
+                &qkv_row,
+                &weight_device,
+                q.output(),
+                k.output(),
+                v.output(),
+                repeated_conv.inout(),
+                key_heads,
+                value_heads,
+                head_dim,
+                &stream,
+            )
+            .expect("repeated prep");
+            let gate_row =
+                DeviceBuffer::from_host(&gate[token * value_heads..(token + 1) * value_heads])
+                    .expect("gate row");
+            let beta_row =
+                DeviceBuffer::from_host(&beta[token * value_heads..(token + 1) * value_heads])
+                    .expect("beta row");
+            let mut output = DeviceBuffer::<f32>::zeroed(value_dim).expect("output row");
+            gated_delta_net_128_f32_into_on_stream(
+                &q,
+                &k,
+                &v,
+                &gate_row,
+                &beta_row,
+                repeated_recurrent.inout(),
+                output.output(),
+                value_heads,
+                &stream,
+            )
+            .expect("repeated recurrent");
+            repeated_q.extend(q.copy_to_host(&stream).expect("q download"));
+            repeated_k.extend(k.copy_to_host(&stream).expect("k download"));
+            repeated_v.extend(v.copy_to_host(&stream).expect("v download"));
+            repeated_output.extend(output.copy_to_host(&stream).expect("output download"));
+        }
+
+        assert_close(
+            &chunk_q.copy_to_host(&stream).expect("chunk q download"),
+            &repeated_q,
+            1.0e-6,
+            "chunked prep q",
+        );
+        assert_close(
+            &chunk_k.copy_to_host(&stream).expect("chunk k download"),
+            &repeated_k,
+            1.0e-6,
+            "chunked prep k",
+        );
+        assert_close(
+            &chunk_v.copy_to_host(&stream).expect("chunk v download"),
+            &repeated_v,
+            1.0e-6,
+            "chunked prep v",
+        );
+        assert_close(
+            &chunk_output
+                .copy_to_host(&stream)
+                .expect("chunk output download"),
+            &repeated_output,
+            1.0e-5,
+            "chunked GDN output",
+        );
+        assert_close(
+            &chunk_conv
+                .copy_to_host(&stream)
+                .expect("chunk conv download"),
+            &repeated_conv
+                .copy_to_host(&stream)
+                .expect("repeated conv download"),
+            1.0e-6,
+            "chunked conv state",
+        );
+        assert_close(
+            &chunk_recurrent
+                .copy_to_host(&stream)
+                .expect("chunk recurrent download"),
+            &repeated_recurrent
+                .copy_to_host(&stream)
+                .expect("repeated recurrent download"),
+            1.0e-5,
+            "chunked recurrent state",
+        );
     }
 
     #[test]
