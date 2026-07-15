@@ -3754,7 +3754,8 @@ pub fn gated_delta_net_128_f32_into_on_stream(
 ///
 /// Dense inputs and outputs are row-major by sequence. `state_table` contains
 /// one persistent recurrent-state pointer per sequence, allowing batch
-/// membership to change without moving the state itself.
+/// membership to change without moving the state itself. `state_table_offset`
+/// selects the first row from a larger table.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_net_128_f32_batch_into_on_stream(
     q: &DeviceBuffer<f32>,
@@ -3764,6 +3765,7 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
     beta: &DeviceBuffer<f32>,
     state_table: &DeviceBuffer<*mut f32>,
     mut output: DeviceOutput<'_, f32>,
+    state_table_offset: usize,
     batch_size: usize,
     heads: usize,
     stream: &CudaStream,
@@ -3781,6 +3783,14 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
         expected: "batch_size * heads without overflow".to_string(),
         actual: format!("batch_size={batch_size} heads={heads}"),
     })?;
+    let state_table_end =
+        state_table_offset
+            .checked_add(batch_size)
+            .ok_or_else(|| Error::Shape {
+                label: "batched Gated Delta Net state table",
+                expected: "state_table_offset + batch_size without overflow".to_string(),
+                actual: format!("state_table_offset={state_table_offset} batch_size={batch_size}"),
+            })?;
     if batch_size == 0
         || heads == 0
         || batch_size > u32::MAX as usize
@@ -3791,12 +3801,12 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
         || output.len() != vectors
         || gate.len() != scalars
         || beta.len() != scalars
-        || state_table.len() != batch_size
+        || state_table_end > state_table.len()
     {
         return Err(Error::Shape {
             label: "batched Gated Delta Net buffers",
             expected: format!(
-                "q/k/v/output={vectors} gate/beta={scalars} state_table={batch_size}"
+                "q/k/v/output={vectors} gate/beta={scalars} state_table>={state_table_end}"
             ),
             actual: format!(
                 "q={} k={} v={} output={} gate={} beta={} state_table={}",
@@ -3819,7 +3829,7 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
                 v.ptr,
                 gate.ptr,
                 beta.ptr,
-                state_table.ptr,
+                state_table.ptr.add(state_table_offset),
                 output.buffer_mut().ptr,
                 batch_size as u32,
                 heads as u32,
@@ -5394,6 +5404,7 @@ pub fn qwen36_gdn_prep_into_on_stream(
 }
 
 /// Applies Qwen3.6 convolution/GDN preparation to a changing sequence batch.
+/// `state_table_offset` selects the first row from a larger state-pointer table.
 #[allow(clippy::too_many_arguments)]
 pub fn qwen36_gdn_prep_batch_into_on_stream(
     qkv: &DeviceBuffer<f32>,
@@ -5402,6 +5413,7 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
     mut k: DeviceOutput<'_, f32>,
     mut v: DeviceOutput<'_, f32>,
     conv_state_table: &DeviceBuffer<*mut f32>,
+    state_table_offset: usize,
     batch_size: usize,
     key_heads: usize,
     value_heads: usize,
@@ -5437,6 +5449,14 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
             expected: "batch_size * value_dim without overflow".to_string(),
             actual: format!("batch_size={batch_size} value_dim={value_dim}"),
         })?;
+    let state_table_end =
+        state_table_offset
+            .checked_add(batch_size)
+            .ok_or_else(|| Error::Shape {
+                label: "batched Qwen3.6 GDN prep state table",
+                expected: "state_table_offset + batch_size without overflow".to_string(),
+                actual: format!("state_table_offset={state_table_offset} batch_size={batch_size}"),
+            })?;
     if batch_size == 0
         || key_heads == 0
         || value_heads == 0
@@ -5450,12 +5470,12 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
         || q.len() != value_len
         || k.len() != value_len
         || v.len() != value_len
-        || conv_state_table.len() != batch_size
+        || state_table_end > conv_state_table.len()
     {
         return Err(Error::Shape {
             label: "batched Qwen3.6 GDN prep buffers",
             expected: format!(
-                "qkv={qkv_len} conv_weight={} q/k/v={value_len} state_table={batch_size}",
+                "qkv={qkv_len} conv_weight={} q/k/v={value_len} state_table>={state_table_end}",
                 conv_dim * 4
             ),
             actual: format!(
@@ -5478,7 +5498,7 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
                 q.buffer_mut().ptr,
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
-                conv_state_table.ptr,
+                conv_state_table.ptr.add(state_table_offset),
                 batch_size as u32,
                 key_heads as u32,
                 value_heads as u32,
@@ -7701,14 +7721,19 @@ mod tests {
             .iter()
             .map(|state| DeviceBuffer::from_host(state).expect("batch recurrent state"))
             .collect::<Vec<_>>();
-        let conv_ptrs = batch_conv_states
-            .iter_mut()
-            .map(|state| state.as_mut_ptr().cast::<f32>())
-            .collect::<Vec<_>>();
-        let recurrent_ptrs = batch_recurrent_states
-            .iter_mut()
-            .map(|state| state.as_mut_ptr().cast::<f32>())
-            .collect::<Vec<_>>();
+        let state_table_offset = 3;
+        let mut conv_ptrs = vec![std::ptr::null_mut(); state_table_offset];
+        conv_ptrs.extend(
+            batch_conv_states
+                .iter_mut()
+                .map(|state| state.as_mut_ptr().cast::<f32>()),
+        );
+        let mut recurrent_ptrs = vec![std::ptr::null_mut(); state_table_offset];
+        recurrent_ptrs.extend(
+            batch_recurrent_states
+                .iter_mut()
+                .map(|state| state.as_mut_ptr().cast::<f32>()),
+        );
         let conv_table = DeviceBuffer::from_host(&conv_ptrs).expect("conv table");
         let recurrent_table = DeviceBuffer::from_host(&recurrent_ptrs).expect("recurrent table");
         let mut batch_q = DeviceBuffer::zeroed(batch_size * value_dim).expect("batch q");
@@ -7725,6 +7750,7 @@ mod tests {
             batch_k.output(),
             batch_v.output(),
             &conv_table,
+            state_table_offset,
             batch_size,
             key_heads,
             value_heads,
@@ -7752,6 +7778,7 @@ mod tests {
             &batch_beta,
             &recurrent_table,
             batch_output.output(),
+            state_table_offset,
             batch_size,
             value_heads,
             &stream,
