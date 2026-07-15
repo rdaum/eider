@@ -5,7 +5,7 @@ use infer::qwen3::qwen36::Qwen36TextModel;
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::generation::GenerationConfig;
 use infer::runtime::scheduler::{Qwen36RequestId, Qwen36SchedulerConfig};
-use infer::runtime::serving::{Qwen36ChatRequest, Qwen36ChatService};
+use infer::runtime::serving::{Qwen36ChatFinished, Qwen36ChatRequest, Qwen36ChatService};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,11 +76,22 @@ struct ActiveRequest {
 
 struct SessionMetrics {
     submitted_at: Instant,
+    prompt_tokens: usize,
+    sequence_device_bytes: usize,
+    prefilled_tokens: usize,
+    last_prefill_report_at: Instant,
+    last_prefill_report_tokens: usize,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
     last_report_at: Option<Instant>,
     last_report_tokens: usize,
     generated_tokens: usize,
+}
+
+struct PrefillMetricsSnapshot {
+    prompt_position: usize,
+    interval_tokens_per_second: f64,
+    total_tokens_per_second: f64,
 }
 
 struct SessionMetricsSnapshot {
@@ -252,17 +263,65 @@ fn actor_main(
             }
         };
         let now = Instant::now();
-        for request_id in &tick.generated {
-            if let Some(request) = active.get_mut(request_id)
-                && let Some(snapshot) = request.metrics.record_token(now)
-            {
+        for admission in &tick.admitted {
+            if let Some(request) = active.get_mut(&admission.request_id) {
+                request.metrics.sequence_device_bytes = admission.sequence_device_bytes;
                 eprintln!(
-                    "session={} progress output_tokens={} interval_tok_s={:.2} decode_tok_s={:.2}",
-                    request.external_id.0,
-                    snapshot.output_tokens,
-                    snapshot.interval_tokens_per_second,
-                    snapshot.decode_tokens_per_second
+                    "session={} admitted state_bytes={} active_sequences={}",
+                    request.external_id.0, admission.sequence_device_bytes, tick.active_sequences
                 );
+            }
+        }
+        for progress in &tick.prefilled {
+            if let Some(request) = active.get_mut(&progress.request_id) {
+                let starting = request.metrics.prefilled_tokens == 0;
+                let snapshot = request
+                    .metrics
+                    .record_prefill(now, progress.prompt_position);
+                if starting {
+                    eprintln!(
+                        "session={} prefill_started prompt_tokens={} state_bytes={}",
+                        request.external_id.0,
+                        request.metrics.prompt_tokens,
+                        request.metrics.sequence_device_bytes
+                    );
+                }
+                if let Some(snapshot) = snapshot {
+                    eprintln!(
+                        "session={} prefill prompt_tokens={}/{} interval_tok_s={:.2} prefill_tok_s={:.2}",
+                        request.external_id.0,
+                        snapshot.prompt_position,
+                        request.metrics.prompt_tokens,
+                        snapshot.interval_tokens_per_second,
+                        snapshot.total_tokens_per_second
+                    );
+                }
+            }
+        }
+        for request_id in &tick.generated {
+            if let Some(request) = active.get_mut(request_id) {
+                let starting = request.metrics.first_token_at.is_none();
+                let snapshot = request.metrics.record_token(now);
+                if starting {
+                    eprintln!(
+                        "session={} decoding ttft_ms={:.1} prompt_tokens={} prefill_tok_s={:.2}",
+                        request.external_id.0,
+                        now.duration_since(request.metrics.submitted_at)
+                            .as_secs_f64()
+                            * 1000.0,
+                        request.metrics.prompt_tokens,
+                        request.metrics.prefill_tokens_per_second(now)
+                    );
+                }
+                if let Some(snapshot) = snapshot {
+                    eprintln!(
+                        "session={} progress output_tokens={} interval_tok_s={:.2} decode_tok_s={:.2}",
+                        request.external_id.0,
+                        snapshot.output_tokens,
+                        snapshot.interval_tokens_per_second,
+                        snapshot.decode_tokens_per_second
+                    );
+                }
             }
         }
         let mut disconnected = Vec::new();
@@ -279,12 +338,13 @@ fn actor_main(
         for finished in tick.finished {
             if let Some(request) = active.remove(&finished.request_id) {
                 scheduler_by_external.remove(&request.external_id);
+                let active_requests = active.len();
                 request.metrics.log_finished(
                     request.external_id,
                     now,
-                    finished.usage.prompt_tokens,
-                    finished.usage.completion_tokens,
-                    &finished.finish_reason,
+                    &finished,
+                    active_requests,
+                    tick.active_sequences,
                 );
                 let _ = request
                     .events
@@ -316,17 +376,23 @@ fn handle_command(
             events,
             submitted_at,
         } => match service.add_request(request) {
-            Ok(scheduler_id) => {
-                eprintln!("session={} admitted", id.0);
+            Ok(admission) => {
                 active.insert(
-                    scheduler_id,
+                    admission.request_id,
                     ActiveRequest {
                         external_id: id,
                         events,
-                        metrics: SessionMetrics::new(submitted_at),
+                        metrics: SessionMetrics::new(submitted_at, admission.prompt_tokens),
                     },
                 );
-                scheduler_by_external.insert(id, scheduler_id);
+                scheduler_by_external.insert(id, admission.request_id);
+                eprintln!(
+                    "session={} queued prompt_tokens={} max_output_tokens={} active_requests={}",
+                    id.0,
+                    admission.prompt_tokens,
+                    admission.max_output_tokens,
+                    active.len()
+                );
             }
             Err(error) => {
                 eprintln!("failed to admit request {}: {error}", id.0);
@@ -349,12 +415,23 @@ fn cancel_scheduler_request(
     active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
 ) {
-    service.cancel_request(scheduler_id);
+    let outcome = service.cancel_request(scheduler_id);
+    let released_sequence_device_bytes = match outcome {
+        infer::runtime::scheduler::Qwen36CancelOutcome::Cancelled(cancelled) => {
+            cancelled.released_sequence_device_bytes
+        }
+        infer::runtime::scheduler::Qwen36CancelOutcome::AlreadyFinished
+        | infer::runtime::scheduler::Qwen36CancelOutcome::NotFound => 0,
+    };
     if let Some(request) = active.remove(&scheduler_id) {
         scheduler_by_external.remove(&request.external_id);
-        request
-            .metrics
-            .log_cancelled(request.external_id, Instant::now());
+        request.metrics.log_cancelled(
+            request.external_id,
+            Instant::now(),
+            released_sequence_device_bytes,
+            active.len(),
+            service.active_sequence_count(),
+        );
     }
 }
 
@@ -370,15 +447,41 @@ fn cancel_all(
 }
 
 impl SessionMetrics {
-    fn new(submitted_at: Instant) -> Self {
+    fn new(submitted_at: Instant, prompt_tokens: usize) -> Self {
         Self {
             submitted_at,
+            prompt_tokens,
+            sequence_device_bytes: 0,
+            prefilled_tokens: 0,
+            last_prefill_report_at: submitted_at,
+            last_prefill_report_tokens: 0,
             first_token_at: None,
             last_token_at: None,
             last_report_at: None,
             last_report_tokens: 0,
             generated_tokens: 0,
         }
+    }
+
+    fn record_prefill(
+        &mut self,
+        now: Instant,
+        prompt_position: usize,
+    ) -> Option<PrefillMetricsSnapshot> {
+        self.prefilled_tokens = prompt_position;
+        let interval = now.duration_since(self.last_prefill_report_at);
+        if interval < SESSION_METRICS_INTERVAL {
+            return None;
+        }
+        let interval_tokens = prompt_position.saturating_sub(self.last_prefill_report_tokens);
+        let snapshot = PrefillMetricsSnapshot {
+            prompt_position,
+            interval_tokens_per_second: rate(interval_tokens, interval),
+            total_tokens_per_second: self.prefill_tokens_per_second(now),
+        };
+        self.last_prefill_report_at = now;
+        self.last_prefill_report_tokens = prompt_position;
+        Some(snapshot)
     }
 
     fn record_token(&mut self, now: Instant) -> Option<SessionMetricsSnapshot> {
@@ -412,33 +515,54 @@ impl SessionMetrics {
         &self,
         id: ActorRequestId,
         now: Instant,
-        prompt_tokens: usize,
-        completion_tokens: usize,
-        reason: &impl std::fmt::Debug,
+        finished: &Qwen36ChatFinished,
+        active_requests: usize,
+        active_sequences: usize,
     ) {
-        debug_assert_eq!(self.generated_tokens, completion_tokens);
+        debug_assert_eq!(self.generated_tokens, finished.usage.completion_tokens);
         let time_to_first_token = self.first_token_at.map_or(Duration::ZERO, |first| {
             first.duration_since(self.submitted_at)
         });
         eprintln!(
-            "session={} complete prompt_tokens={} output_tokens={} ttft_ms={:.1} decode_tok_s={:.2} total_tok_s={:.2} reason={reason:?}",
+            "session={} complete prompt_tokens={} output_tokens={} ttft_ms={:.1} decode_tok_s={:.2} total_tok_s={:.2} reason={:?} state_released_bytes={} active_requests={} active_sequences={}",
             id.0,
-            prompt_tokens,
-            completion_tokens,
+            finished.usage.prompt_tokens,
+            finished.usage.completion_tokens,
             time_to_first_token.as_secs_f64() * 1000.0,
             self.decode_tokens_per_second(),
-            rate(completion_tokens, now.duration_since(self.submitted_at))
+            rate(
+                finished.usage.completion_tokens,
+                now.duration_since(self.submitted_at)
+            ),
+            finished.finish_reason,
+            finished.released_sequence_device_bytes,
+            active_requests,
+            active_sequences
         );
     }
 
-    fn log_cancelled(&self, id: ActorRequestId, now: Instant) {
+    fn log_cancelled(
+        &self,
+        id: ActorRequestId,
+        now: Instant,
+        released_sequence_device_bytes: usize,
+        active_requests: usize,
+        active_sequences: usize,
+    ) {
         eprintln!(
-            "session={} cancelled output_tokens={} elapsed_ms={:.1} decode_tok_s={:.2}",
+            "session={} cancelled output_tokens={} elapsed_ms={:.1} decode_tok_s={:.2} state_released_bytes={} active_requests={} active_sequences={}",
             id.0,
             self.generated_tokens,
             now.duration_since(self.submitted_at).as_secs_f64() * 1000.0,
-            self.decode_tokens_per_second()
+            self.decode_tokens_per_second(),
+            released_sequence_device_bytes,
+            active_requests,
+            active_sequences
         );
+    }
+
+    fn prefill_tokens_per_second(&self, now: Instant) -> f64 {
+        rate(self.prefilled_tokens, now.duration_since(self.submitted_at))
     }
 
     fn decode_tokens_per_second(&self) -> f64 {
@@ -467,7 +591,7 @@ mod tests {
     fn session_metrics_report_exact_interval_and_decode_rates() {
         let submitted = Instant::now();
         let first = submitted + Duration::from_secs(1);
-        let mut metrics = SessionMetrics::new(submitted);
+        let mut metrics = SessionMetrics::new(submitted, 100);
         assert!(metrics.record_token(first).is_none());
         for seconds in 2..11 {
             assert!(
@@ -482,6 +606,31 @@ mod tests {
         assert_eq!(snapshot.output_tokens, 11);
         assert_eq!(snapshot.interval_tokens_per_second, 1.0);
         assert_eq!(snapshot.decode_tokens_per_second, 1.0);
+    }
+
+    #[test]
+    fn session_metrics_report_prefill_progress_and_rates() {
+        let submitted = Instant::now();
+        let mut metrics = SessionMetrics::new(submitted, 1_000);
+        assert!(
+            metrics
+                .record_prefill(submitted + Duration::from_secs(5), 100)
+                .is_none()
+        );
+
+        let first = metrics
+            .record_prefill(submitted + Duration::from_secs(10), 300)
+            .expect("ten-second report interval elapsed");
+        assert_eq!(first.prompt_position, 300);
+        assert_eq!(first.interval_tokens_per_second, 30.0);
+        assert_eq!(first.total_tokens_per_second, 30.0);
+
+        let second = metrics
+            .record_prefill(submitted + Duration::from_secs(20), 500)
+            .expect("second report interval elapsed");
+        assert_eq!(second.prompt_position, 500);
+        assert_eq!(second.interval_tokens_per_second, 20.0);
+        assert_eq!(second.total_tokens_per_second, 25.0);
     }
 
     #[test]

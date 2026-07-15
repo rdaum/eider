@@ -70,13 +70,19 @@ impl Qwen36DecodedBatch<'_> {
 
     /// Copies active row-major logits to the host.
     pub fn copy_logits(&self) -> Result<Vec<f32>> {
-        let mut logits = self
+        let active_logits =
+            self.rows
+                .checked_mul(self.vocab)
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 active batch logits",
+                    expected: "rows * vocabulary without overflow".to_string(),
+                    actual: format!("{} * {}", self.rows, self.vocab),
+                })?;
+        Ok(self
             .workspace
             .logits
-            .copy_to_host(&self.workspace.stream)?
-            .into_vec();
-        logits.truncate(self.rows * self.vocab);
-        Ok(logits)
+            .copy_prefix_to_host(active_logits, &self.workspace.stream)?
+            .into_vec())
     }
 
     /// Reduces each active logit row and copies the winning tokens to the host.
@@ -92,16 +98,15 @@ impl Qwen36DecodedBatch<'_> {
         let indices = self
             .workspace
             .next_indices
-            .copy_to_host(&self.workspace.stream)?;
+            .copy_prefix_to_host(self.rows, &self.workspace.stream)?;
         let values = self
             .workspace
             .next_values
-            .copy_to_host(&self.workspace.stream)?;
+            .copy_prefix_to_host(self.rows, &self.workspace.stream)?;
         Ok(indices
             .iter()
             .copied()
             .zip(values.iter().copied())
-            .take(self.rows)
             .map(|(id, value)| Qwen36NextToken { id, value })
             .collect())
     }

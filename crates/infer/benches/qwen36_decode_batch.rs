@@ -2,6 +2,7 @@ use infer::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState, Qwen36SequenceState,
     Qwen36TextModel,
 };
+use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -21,13 +22,22 @@ enum DecodeMode {
     Independent,
 }
 
+#[derive(Clone, Copy)]
+enum DecodeOutput {
+    Top1,
+    Sample,
+}
+
 struct DecodeBatchCase {
     model: Rc<Qwen36TextModel>,
     mode: DecodeMode,
+    output: DecodeOutput,
     batch: usize,
     workspace: Qwen36DecodeBatchWorkspace,
     states: Vec<Qwen36SequenceState>,
     tokens: Vec<u32>,
+    samplers: Vec<Sampler>,
+    histories: Vec<TokenHistory>,
     workspace_device_bytes: usize,
     sequence_device_bytes: usize,
     start_position: usize,
@@ -99,6 +109,7 @@ impl DecodeBatchCase {
     fn new(
         model: Rc<Qwen36TextModel>,
         mode: DecodeMode,
+        output: DecodeOutput,
         batch: usize,
         max_context_tokens: usize,
         start_position: usize,
@@ -120,13 +131,30 @@ impl DecodeBatchCase {
         let workspace_device_bytes = workspace.device_bytes();
         let sequence_device_bytes = states.iter().map(Qwen36SequenceState::device_bytes).sum();
         let tokens = seed_tokens(batch);
+        let samplers = (0..batch)
+            .map(|row| {
+                Sampler::new(SamplingConfig {
+                    seed: Some(row as u64),
+                    ..SamplingConfig::default()
+                })
+                .expect("sampling configuration")
+            })
+            .collect();
+        let histories = tokens
+            .iter()
+            .copied()
+            .map(|token| TokenHistory::from_tokens([token]))
+            .collect();
         let mut case = Self {
             model,
             mode,
+            output,
             batch,
             workspace,
             states,
             tokens,
+            samplers,
+            histories,
             workspace_device_bytes,
             sequence_device_bytes,
             start_position,
@@ -147,16 +175,36 @@ impl DecodeBatchCase {
                     .zip(self.states.iter_mut())
                     .map(|(token_id, state)| Qwen36DecodeRow { token_id, state })
                     .collect::<Vec<_>>();
-                let next = self
+                let mut decoded = self
                     .model
                     .decode_batch(&mut self.workspace, &mut rows)
-                    .and_then(|mut decoded| decoded.top1())
                     .expect("batched decode tick");
-                for (token, next) in self.tokens.iter_mut().zip(next) {
-                    *token = next.id;
+                match self.output {
+                    DecodeOutput::Top1 => {
+                        let next = decoded.top1().expect("batched top-1");
+                        for (row, (token, next)) in self.tokens.iter_mut().zip(next).enumerate() {
+                            *token = next.id;
+                            self.histories[row].push(next.id);
+                        }
+                    }
+                    DecodeOutput::Sample => {
+                        let vocab = decoded.vocab();
+                        let logits = decoded.copy_logits().expect("batched logits");
+                        for row in 0..self.batch {
+                            let next = self.samplers[row]
+                                .sample(
+                                    &logits[row * vocab..(row + 1) * vocab],
+                                    &self.histories[row],
+                                )
+                                .expect("sample batched logits");
+                            self.tokens[row] = next.id;
+                            self.histories[row].push(next.id);
+                        }
+                    }
                 }
             }
             DecodeMode::Independent => {
+                assert!(matches!(self.output, DecodeOutput::Top1));
                 for row in 0..self.batch {
                     let mut rows = [Qwen36DecodeRow {
                         token_id: self.tokens[row],
@@ -168,6 +216,7 @@ impl DecodeBatchCase {
                         .and_then(|mut decoded| decoded.top1())
                         .expect("independent decode tick");
                     self.tokens[row] = next[0].id;
+                    self.histories[row].push(next[0].id);
                 }
             }
         }
@@ -237,9 +286,15 @@ fn production_decode_sample(
         ))
 }
 
-fn validate_batch(model: &Qwen36TextModel, batch: usize, max_context_tokens: usize) {
+fn validate_batch(
+    model: &Qwen36TextModel,
+    batch: usize,
+    workspace_capacity: usize,
+    max_context_tokens: usize,
+) {
+    assert!(batch <= workspace_capacity);
     let mut batched_workspace = model
-        .new_decode_batch_workspace(batch, max_context_tokens)
+        .new_decode_batch_workspace(workspace_capacity, max_context_tokens)
         .expect("validation batched workspace");
     let mut independent_workspace = model
         .new_decode_batch_workspace(1, max_context_tokens)
@@ -283,7 +338,7 @@ fn validate_batch(model: &Qwen36TextModel, batch: usize, max_context_tokens: usi
         assert_eq!(
             &batched_logits[row * vocab..(row + 1) * vocab],
             independent_logits.as_slice(),
-            "batch {batch} row {row} logits differ from an independent call"
+            "batch {batch}/{workspace_capacity} row {row} logits differ from an independent call"
         );
         assert_eq!(batched_states[row].position(), 1);
         assert_eq!(independent_states[row].position(), 1);
@@ -334,8 +389,10 @@ fn main() {
     eprintln!("loading Qwen3.6 model from {}", path.display());
     let model = Rc::new(Qwen36TextModel::open(path).expect("load Qwen3.6 model"));
     for batch in BATCH_SIZES {
-        validate_batch(&model, batch, max_context_tokens);
+        validate_batch(&model, batch, batch, max_context_tokens);
     }
+    validate_batch(&model, 3, 4, max_context_tokens);
+    validate_batch(&model, 5, 8, max_context_tokens);
 
     let options = BenchmarkMainOptions {
         suite: Some("infer-qwen36-decode-batch".to_string()),
@@ -372,6 +429,7 @@ fn main() {
                 let batched_case = Rc::new(RefCell::new(DecodeBatchCase::new(
                     Rc::clone(&model),
                     DecodeMode::Batched,
+                    DecodeOutput::Top1,
                     batch,
                     max_context_tokens,
                     start_position,
@@ -388,6 +446,7 @@ fn main() {
                 let independent_case = Rc::new(RefCell::new(DecodeBatchCase::new(
                     Rc::clone(&model),
                     DecodeMode::Independent,
+                    DecodeOutput::Top1,
                     batch,
                     max_context_tokens,
                     start_position,
@@ -401,6 +460,23 @@ fn main() {
                     .factory(&independent_factory)
                     .bench_sample(&format!("batch_api_independent_{batch}"), decode_sample);
             }
+
+            let sampled_case = Rc::new(RefCell::new(DecodeBatchCase::new(
+                Rc::clone(&model),
+                DecodeMode::Batched,
+                DecodeOutput::Sample,
+                1,
+                max_context_tokens,
+                start_position,
+            )));
+            let sampled_factory = || DecodeBatchBench {
+                case: Rc::clone(&sampled_case),
+            };
+            group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu)
+                .factory(&sampled_factory)
+                .bench_sample("batch_api_sampled_1", decode_sample);
         });
     });
 }
