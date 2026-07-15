@@ -339,6 +339,7 @@ dependencies = [
  "micromeasure",
  "nvfp4",
  "rand",
+ "rayon",
  "serde_json",
  "tokenizers",
 ]

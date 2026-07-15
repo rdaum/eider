@@ -17,7 +17,10 @@ constexpr int kGateUp = 1024;
 constexpr int kTopK = 8;
 constexpr int kMoeBlockSize = 8;
 constexpr int kThreads = 256;
-constexpr int kDynamicSharedBytes = 57600;
+// Exact storage used by the four-stage 1x8x8 W4A16 tile: route metadata,
+// the B/reduction union, per-group scales, and the staged A tiles. Keeping the
+// launch below half of an SM's 100 KiB budget permits two resident blocks.
+constexpr int kDynamicSharedBytes = 45184;
 
 using MarlinKernel = decltype(&infer_marlin_moe::Marlin<
     vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),

@@ -25,6 +25,7 @@ pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: cudaMemcpyKind = 2;
 pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
+pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
 pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
 
@@ -1211,6 +1212,7 @@ unsafe extern "C" {
     pub(crate) fn cudaGraphDestroy(graph: cudaGraph_t) -> cudaError_t;
     pub(crate) fn cudaGraphExecDestroy(graph_exec: cudaGraphExec_t) -> cudaError_t;
     pub(crate) fn cudaEventCreate(event: *mut cudaEvent_t) -> cudaError_t;
+    pub(crate) fn cudaEventCreateWithFlags(event: *mut cudaEvent_t, flags: u32) -> cudaError_t;
     pub(crate) fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     pub(crate) fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
     pub(crate) fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError_t;

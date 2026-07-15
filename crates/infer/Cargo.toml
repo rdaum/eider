@@ -12,6 +12,7 @@ tokenizers = "0.22"
 
 [dev-dependencies]
 micromeasure.workspace = true
+rayon = "1"
 
 [[bench]]
 name = "qwen36_routed_gate_up"
@@ -19,4 +20,8 @@ harness = false
 
 [[bench]]
 name = "sampling"
+harness = false
+
+[[bench]]
+name = "qwen36_cpu_shared_expert"
 harness = false

@@ -415,6 +415,18 @@ impl CudaEvent {
         Ok(Self { event })
     }
 
+    /// Creates an event for stream ordering without timestamp collection.
+    pub fn new_sync() -> Result<Self> {
+        let mut event = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaEventCreateWithFlags",
+                ffi::cudaEventCreateWithFlags(&mut event, ffi::CUDA_EVENT_DISABLE_TIMING),
+            )?;
+        }
+        Ok(Self { event })
+    }
+
     /// Records the event on the default stream.
     pub fn record_default_stream(&self) -> Result<()> {
         unsafe {

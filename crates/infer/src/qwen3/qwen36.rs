@@ -1815,6 +1815,13 @@ pub struct Qwen36MoeStep<'a> {
     pub ffn_out: &'a DeviceBuffer<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct Qwen36ParallelMoe<'a> {
+    shared_stream: &'a CudaStream,
+    fork: &'a CudaEvent,
+    join: &'a CudaEvent,
+}
+
 impl Qwen36MoeWeights {
     /// Loads the MoE + shared-expert FFN for layer `layer`.
     pub fn load(
@@ -2739,6 +2746,24 @@ impl Qwen36MoeWeights {
         }
     }
 
+    fn enqueue_shared_branch(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_shared_gate_up(workspace, ffn_norm, stream)?;
+        silu_mul_halves_f32_into_on_stream(
+            &workspace.shared_gate_up_output,
+            workspace.shared_activated.output(),
+            self.expert_intermediate,
+            stream,
+        )?;
+        self.run_shared_down(workspace, stream)?;
+        self.shared_gate
+            .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)
+    }
+
     /// Runs only shared expert gate/up projection.
     pub fn run_shared_gate_up_only(
         &self,
@@ -2851,12 +2876,30 @@ impl Qwen36MoeWeights {
     #[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
     pub fn run_one_token<'a>(
         &'a self,
+        lt: &CublasLt,
+        workspace: &'a mut Qwen36MoeWorkspace,
+        manifest: &QwenModelManifest,
+        ffn_norm: &DeviceBuffer<f32>,
+        residual: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+        profile: Option<&mut QwenDecodeProfile>,
+        gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
+    ) -> Result<Qwen36MoeStep<'a>> {
+        self.run_one_token_impl(
+            lt, workspace, manifest, ffn_norm, residual, stream, None, profile, gpu_probe,
+        )
+    }
+
+    #[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
+    fn run_one_token_impl<'a>(
+        &'a self,
         _lt: &CublasLt,
         workspace: &'a mut Qwen36MoeWorkspace,
         manifest: &QwenModelManifest,
         ffn_norm: &DeviceBuffer<f32>,
         residual: &DeviceBuffer<f32>,
         stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
         mut profile: Option<&mut QwenDecodeProfile>,
         mut gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
     ) -> Result<Qwen36MoeStep<'a>> {
@@ -2866,6 +2909,12 @@ impl Qwen36MoeWeights {
                 expected: format!("hidden={}", manifest.hidden),
                 actual: format!("ffn_norm={} residual={}", ffn_norm.len(), residual.len()),
             });
+        }
+
+        if let Some(parallel) = parallel_moe {
+            parallel.fork.record_on_stream(stream)?;
+            parallel.shared_stream.wait_event(parallel.fork)?;
+            self.enqueue_shared_branch(workspace, ffn_norm, parallel.shared_stream)?;
         }
 
         // Router + topk — route stays device-resident, no host readback.
@@ -3377,50 +3426,55 @@ impl Qwen36MoeWeights {
         };
         let _ = used_grouped;
 
-        // Shared experts follow the layer's checkpoint format: NVFP4 uses the
-        // established W4A16 path, while mixed layers use dynamic W8A8.
-        if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || {
-                self.run_shared_gate_up(workspace, ffn_norm, stream)
-            })?;
-            profile.qwen36_shared_gate_up_ms += ms;
+        if let Some(parallel) = parallel_moe {
+            parallel.join.record_on_stream(parallel.shared_stream)?;
+            stream.wait_event(parallel.join)?;
         } else {
-            self.run_shared_gate_up(workspace, ffn_norm, stream)?;
-        }
-        if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || {
+            // Shared experts follow the layer's checkpoint format: NVFP4 uses the
+            // established W4A16 path, while mixed layers use dynamic W8A8.
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, || {
+                    self.run_shared_gate_up(workspace, ffn_norm, stream)
+                })?;
+                profile.qwen36_shared_gate_up_ms += ms;
+            } else {
+                self.run_shared_gate_up(workspace, ffn_norm, stream)?;
+            }
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, || {
+                    silu_mul_halves_f32_into_on_stream(
+                        &workspace.shared_gate_up_output,
+                        workspace.shared_activated.output(),
+                        self.expert_intermediate,
+                        stream,
+                    )
+                })?;
+                profile.qwen36_shared_silu_ms += ms;
+            } else {
                 silu_mul_halves_f32_into_on_stream(
                     &workspace.shared_gate_up_output,
                     workspace.shared_activated.output(),
                     self.expert_intermediate,
                     stream,
-                )
-            })?;
-            profile.qwen36_shared_silu_ms += ms;
-        } else {
-            silu_mul_halves_f32_into_on_stream(
-                &workspace.shared_gate_up_output,
-                workspace.shared_activated.output(),
-                self.expert_intermediate,
-                stream,
-            )?;
-        }
-        if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || self.run_shared_down(workspace, stream))?;
-            profile.qwen36_shared_down_ms += ms;
-        } else {
-            self.run_shared_down(workspace, stream)?;
-        }
+                )?;
+            }
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, || self.run_shared_down(workspace, stream))?;
+                profile.qwen36_shared_down_ms += ms;
+            } else {
+                self.run_shared_down(workspace, stream)?;
+            }
 
-        if let Some(profile) = profile.as_deref_mut() {
-            let (_, ms) = timed_cuda(stream, || {
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, || {
+                    self.shared_gate
+                        .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)
+                })?;
+                profile.qwen36_shared_gate_ms += ms;
+            } else {
                 self.shared_gate
-                    .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)
-            })?;
-            profile.qwen36_shared_gate_ms += ms;
-        } else {
-            self.shared_gate
-                .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)?;
+                    .run_into(ffn_norm, &mut workspace.shared_gate_logits, stream)?;
+            }
         }
 
         if let Some(profile) = profile.as_deref_mut() {
@@ -4047,6 +4101,7 @@ impl Qwen36LayerBlock {
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
         let attn_output = match (&self.attention, &mut workspace.attention) {
             (
@@ -4078,13 +4133,14 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        self.moe.run_one_token(
+        self.moe.run_one_token_impl(
             lt,
             &mut workspace.moe,
             manifest,
             &workspace.ffn_norm,
             &workspace.attn_residual,
             stream,
+            parallel_moe,
             None,
             None,
         )?;
@@ -4101,6 +4157,7 @@ impl Qwen36LayerBlock {
         position: &DeviceBuffer<u32>,
         cache_len: &DeviceBuffer<u32>,
         stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
         rms_norm_f32_into_on_stream(
             1,
@@ -4149,13 +4206,14 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        self.moe.run_one_token(
+        self.moe.run_one_token_impl(
             lt,
             &mut workspace.moe,
             manifest,
             &workspace.ffn_norm,
             &workspace.attn_residual,
             stream,
+            parallel_moe,
             None,
             None,
         )?;
@@ -4530,9 +4588,16 @@ enum Qwen36LayerGraphs {
     Full(CudaGraphExec),
 }
 
+struct Qwen36MoeGraphSync {
+    fork: CudaEvent,
+    join: CudaEvent,
+}
+
 /// Mutable decode state for [`Qwen36TextModel`].
 pub struct Qwen36DecodeState {
     stream: CudaStream,
+    parallel_moe_stream: Option<CudaStream>,
+    parallel_moe_sync: Vec<Qwen36MoeGraphSync>,
     token_id_device: DeviceBuffer<u32>,
     position_device: DeviceBuffer<u32>,
     cache_len_device: DeviceBuffer<u32>,
@@ -4693,8 +4758,25 @@ impl Qwen36TextModel {
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);
         }
+        let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        let enable_parallel_moe = enable_segmented_graphs;
+        let parallel_moe_stream = enable_parallel_moe
+            .then(CudaStream::new_non_blocking)
+            .transpose()?;
+        let mut parallel_moe_sync = Vec::with_capacity(self.layers.len());
+        if enable_parallel_moe {
+            for _ in &self.layers {
+                parallel_moe_sync.push(Qwen36MoeGraphSync {
+                    fork: CudaEvent::new_sync()?,
+                    join: CudaEvent::new_sync()?,
+                });
+            }
+        }
         let mut state = Qwen36DecodeState {
             stream,
+            parallel_moe_stream,
+            parallel_moe_sync,
             token_id_device: DeviceBuffer::zeroed(1)?,
             position_device: DeviceBuffer::zeroed(1)?,
             cache_len_device: DeviceBuffer::zeroed(1)?,
@@ -4714,8 +4796,6 @@ impl Qwen36TextModel {
             position: 0,
             max_tokens,
         };
-        let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
         if enable_segmented_graphs {
             state.segmented_graphs = Some(self.capture_segmented_graphs(&mut state)?);
         }
@@ -4728,6 +4808,15 @@ impl Qwen36TextModel {
     ) -> Result<Vec<Qwen36LayerGraphs>> {
         let mut graphs = Vec::with_capacity(self.layers.len());
         for (layer_idx, block) in self.layers.iter().enumerate() {
+            let parallel_moe = state
+                .parallel_moe_stream
+                .as_ref()
+                .zip(state.parallel_moe_sync.get(layer_idx))
+                .map(|(shared_stream, sync)| Qwen36ParallelMoe {
+                    shared_stream,
+                    fork: &sync.fork,
+                    join: &sync.join,
+                });
             let (previous, current) = state.layer_workspaces.split_at_mut(layer_idx);
             let hidden = if layer_idx == 0 {
                 &state.hidden
@@ -4746,6 +4835,7 @@ impl Qwen36TextModel {
                             &self.manifest,
                             hidden,
                             stream,
+                            parallel_moe,
                         )
                     })?;
                     graphs.push(Qwen36LayerGraphs::Linear(Qwen36LinearLayerGraphs { layer }));
@@ -4760,6 +4850,7 @@ impl Qwen36TextModel {
                             &state.position_device,
                             &state.cache_len_device,
                             stream,
+                            parallel_moe,
                         )
                     })?;
                     graphs.push(Qwen36LayerGraphs::Full(graph));
