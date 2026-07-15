@@ -150,9 +150,20 @@ pub struct Qwen36PrefillProgress {
     pub prompt_position: usize,
 }
 
+/// Persistent sequence state allocated for a newly admitted request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen36AdmissionProgress {
+    /// Request receiving device-resident sequence state.
+    pub request_id: Qwen36RequestId,
+    /// Exact bytes owned by the newly allocated sequence state.
+    pub sequence_device_bytes: usize,
+}
+
 /// Observable result of one scheduler tick.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Qwen36SchedulerTick {
+    /// Requests moved from the CPU waiting queue into device-resident state.
+    pub admitted: Vec<Qwen36AdmissionProgress>,
     /// Requests selected for model work, with decode rows before prefill rows.
     pub scheduled: Vec<Qwen36RequestId>,
     /// Prompt progress made by the prefill batch.
@@ -161,6 +172,8 @@ pub struct Qwen36SchedulerTick {
     pub generated: Vec<Qwen36ScheduledToken>,
     /// Requests that finished during this tick.
     pub finished: Vec<Qwen36RequestId>,
+    /// Device-resident sequences remaining after the tick.
+    pub active_sequences: usize,
 }
 
 /// Result removed from the scheduler after a request finishes.
@@ -174,6 +187,8 @@ pub struct Qwen36FinishedRequest {
     pub generated_tokens: Vec<Qwen36ScheduledToken>,
     /// Final completion reason.
     pub finish_reason: Qwen36RequestFinishReason,
+    /// Device bytes released when the request reached its terminal state.
+    pub released_sequence_device_bytes: usize,
 }
 
 /// Request data returned when active or waiting work is cancelled.
@@ -185,6 +200,8 @@ pub struct Qwen36CancelledRequest {
     pub prompt_tokens: Vec<u32>,
     /// Completion tokens produced before cancellation.
     pub generated_tokens: Vec<Qwen36ScheduledToken>,
+    /// Device bytes released by cancellation, or zero for a waiting request.
+    pub released_sequence_device_bytes: usize,
 }
 
 /// Outcome of a scheduler cancellation request.
@@ -205,6 +222,7 @@ struct Qwen36Request {
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
     sequence: Option<Box<Qwen36SequenceState>>,
+    sequence_device_bytes: usize,
     sampler: Sampler,
     history: TokenHistory,
     last_token: Option<u32>,
@@ -270,7 +288,7 @@ impl Qwen36Request {
 pub struct Qwen36Scheduler<'model> {
     model: &'model Qwen36TextModel,
     config: Qwen36SchedulerConfig,
-    decode_workspace: Qwen36DecodeBatchWorkspace,
+    decode_workspaces: Vec<Qwen36DecodeBatchWorkspace>,
     prefill_workspace: Qwen36PrefillBatchWorkspace,
     requests: BTreeMap<Qwen36RequestId, Box<Qwen36Request>>,
     waiting: VecDeque<Qwen36RequestId>,
@@ -283,11 +301,14 @@ impl<'model> Qwen36Scheduler<'model> {
     /// Creates a scheduler with explicit execution and admission limits.
     pub fn new(model: &'model Qwen36TextModel, config: Qwen36SchedulerConfig) -> Result<Self> {
         config.validate()?;
+        let decode_workspaces = decode_capacity_classes(config.decode_capacity)
+            .into_iter()
+            .map(|capacity| model.new_decode_batch_workspace(capacity, config.max_context_tokens))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             model,
             config,
-            decode_workspace: model
-                .new_decode_batch_workspace(config.decode_capacity, config.max_context_tokens)?,
+            decode_workspaces,
             prefill_workspace: model.new_prefill_batch_workspace(
                 config.prefill_sequence_capacity,
                 config.prefill_token_capacity,
@@ -362,6 +383,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 prompt_tokens,
                 prompt_position: 0,
                 sequence: None,
+                sequence_device_bytes: 0,
                 sampler,
                 history,
                 last_token: None,
@@ -377,14 +399,15 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Runs one decode-first scheduling iteration followed by bounded prefill.
     pub fn tick(&mut self) -> Result<Qwen36SchedulerTick> {
-        self.admit_waiting()?;
         let mut tick = Qwen36SchedulerTick::default();
+        self.admit_waiting(&mut tick)?;
         self.run_decode_phase(&mut tick)?;
         self.run_prefill_phase(&mut tick)?;
+        tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
 
-    fn admit_waiting(&mut self) -> Result<()> {
+    fn admit_waiting(&mut self, tick: &mut Qwen36SchedulerTick) -> Result<()> {
         while self.active_sequence_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -400,9 +423,14 @@ impl<'model> Qwen36Scheduler<'model> {
                     return Err(error);
                 }
             };
+            request.sequence_device_bytes = sequence.device_bytes();
             request.sequence = Some(Box::new(sequence));
             request.lifecycle = Qwen36RequestState::Prefilling;
             self.prefilling.push_back(id);
+            tick.admitted.push(Qwen36AdmissionProgress {
+                request_id: id,
+                sequence_device_bytes: request.sequence_device_bytes,
+            });
         }
         Ok(())
     }
@@ -491,9 +519,12 @@ impl<'model> Qwen36Scheduler<'model> {
                 Ok(Qwen36DecodeRow { token_id, state })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut decoded = self
-            .model
-            .decode_batch(&mut self.decode_workspace, &mut rows)?;
+        let workspace = self
+            .decode_workspaces
+            .iter_mut()
+            .find(|workspace| workspace.capacity() >= rows.len())
+            .expect("decode capacity classes cover the configured maximum");
+        let mut decoded = self.model.decode_batch(workspace, &mut rows)?;
         if !needs_host_logits {
             return decoded
                 .top1()
@@ -615,6 +646,7 @@ impl<'model> Qwen36Scheduler<'model> {
             id,
             prompt_tokens: request.prompt_tokens,
             generated_tokens: request.generated_tokens,
+            released_sequence_device_bytes: request.sequence_device_bytes,
         })
     }
 
@@ -630,7 +662,11 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Returns exact shared prefill and decode workspace device bytes.
     pub fn workspace_device_bytes(&self) -> usize {
-        self.decode_workspace.device_bytes() + self.prefill_workspace.device_bytes()
+        self.decode_workspaces
+            .iter()
+            .map(Qwen36DecodeBatchWorkspace::device_bytes)
+            .sum::<usize>()
+            + self.prefill_workspace.device_bytes()
     }
 
     /// Returns the number of requests retained by the scheduler.
@@ -688,8 +724,20 @@ impl<'model> Qwen36Scheduler<'model> {
             finish_reason: request
                 .finish_reason
                 .expect("finished request has a completion reason"),
+            released_sequence_device_bytes: request.sequence_device_bytes,
         })
     }
+}
+
+fn decode_capacity_classes(max_capacity: usize) -> Vec<usize> {
+    let mut classes = Vec::new();
+    let mut capacity = 1;
+    while capacity < max_capacity {
+        classes.push(capacity);
+        capacity = capacity.saturating_mul(2).min(max_capacity);
+    }
+    classes.push(max_capacity);
+    classes
 }
 
 fn sampled_top1(token: Qwen36NextToken) -> SampledToken {
@@ -726,9 +774,9 @@ fn argmax_logits(logits: &[f32]) -> Result<SampledToken> {
 mod tests {
     use super::{
         Qwen36CancelOutcome, Qwen36RequestConfig, Qwen36RequestFinishReason, Qwen36RequestState,
-        Qwen36Scheduler, Qwen36SchedulerConfig, argmax_logits,
+        Qwen36Scheduler, Qwen36SchedulerConfig, argmax_logits, decode_capacity_classes,
     };
-    use crate::qwen3::qwen36::Qwen36TextModel;
+    use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
     use crate::runtime::sampling::SamplingConfig;
     use std::path::PathBuf;
 
@@ -749,6 +797,26 @@ mod tests {
             Qwen36RequestFinishReason::Length
         );
         assert_eq!(Qwen36CancelOutcome::NotFound, Qwen36CancelOutcome::NotFound);
+    }
+
+    #[test]
+    fn decode_capacity_classes_bound_padding_and_include_the_maximum() {
+        assert_eq!(decode_capacity_classes(1), [1]);
+        assert_eq!(decode_capacity_classes(8), [1, 2, 4, 8]);
+        assert_eq!(decode_capacity_classes(6), [1, 2, 4, 6]);
+        for max_capacity in 1..=64 {
+            let classes = decode_capacity_classes(max_capacity);
+            assert_eq!(classes.last(), Some(&max_capacity));
+            assert!(classes.windows(2).all(|pair| pair[0] < pair[1]));
+            for active_rows in 1..=max_capacity {
+                let selected = classes
+                    .iter()
+                    .copied()
+                    .find(|capacity| *capacity >= active_rows)
+                    .expect("maximum capacity covers every active row count");
+                assert!(selected < active_rows.saturating_mul(2));
+            }
+        }
     }
 
     #[test]
@@ -773,6 +841,14 @@ mod tests {
             },
         )
         .expect("scheduler");
+        assert_eq!(
+            scheduler
+                .decode_workspaces
+                .iter()
+                .map(Qwen36DecodeBatchWorkspace::capacity)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
         let config = |max_new_tokens| Qwen36RequestConfig {
             sampling: SamplingConfig {
                 temperature: 0.0,

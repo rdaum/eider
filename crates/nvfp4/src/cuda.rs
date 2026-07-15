@@ -537,9 +537,25 @@ impl<T: Copy> DeviceBuffer<T> {
 
     /// Synchronizes `stream` and copies the complete device allocation back to host memory.
     pub fn copy_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, T>> {
+        self.copy_prefix_to_host(self.len, stream)
+    }
+
+    /// Synchronizes `stream` and copies the first `len` values back to host memory.
+    pub fn copy_prefix_to_host<'a>(
+        &'a self,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<HostRead<'a, T>> {
+        if len > self.len {
+            return Err(Error::Shape {
+                label: "device prefix copy to host",
+                expected: format!("at most {} values", self.len),
+                actual: format!("{len} values"),
+            });
+        }
         stream.synchronize()?;
-        let mut out = Vec::<T>::with_capacity(self.len);
-        let bytes = self.len * size_of::<T>();
+        let mut out = Vec::<T>::with_capacity(len);
+        let bytes = len * size_of::<T>();
         unsafe {
             check_cuda(
                 "cudaMemcpy(D2H)",
@@ -550,7 +566,7 @@ impl<T: Copy> DeviceBuffer<T> {
                     ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
                 ),
             )?;
-            out.set_len(self.len);
+            out.set_len(len);
         }
         Ok(HostRead {
             values: out,
@@ -629,5 +645,28 @@ impl<T> Drop for DeviceBuffer<T> {
                 let _ = ffi::cudaFree(self.ptr.cast());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CudaStream, DeviceBuffer};
+
+    #[test]
+    fn device_prefix_copy_reads_only_the_requested_values() {
+        let stream = CudaStream::new_blocking().expect("CUDA stream");
+        let device = DeviceBuffer::from_host(&[1u32, 2, 3, 4]).expect("device buffer");
+
+        assert_eq!(
+            device
+                .copy_prefix_to_host(2, &stream)
+                .expect("prefix copy")
+                .as_slice(),
+            [1, 2]
+        );
+        let error = device
+            .copy_prefix_to_host(5, &stream)
+            .expect_err("oversized prefix must fail");
+        assert!(error.to_string().contains("at most 4 values"));
     }
 }

@@ -3,8 +3,9 @@
 use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{
-    Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestConfig, Qwen36RequestFinishReason,
-    Qwen36RequestId, Qwen36RequestState, Qwen36Scheduler, Qwen36SchedulerConfig,
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestConfig,
+    Qwen36RequestFinishReason, Qwen36RequestId, Qwen36RequestState, Qwen36Scheduler,
+    Qwen36SchedulerConfig,
 };
 use super::stop::StopBuffer;
 use crate::qwen3::qwen36::Qwen36TextModel;
@@ -48,6 +49,17 @@ pub struct Qwen36ChatDelta {
     pub event: ChatOutputEvent,
 }
 
+/// Request metadata known after rendering and CPU queueing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen36ChatAdmission {
+    /// Scheduler identity assigned to the queued request.
+    pub request_id: Qwen36RequestId,
+    /// Tokens in the rendered prompt.
+    pub prompt_tokens: usize,
+    /// Maximum completion tokens requested.
+    pub max_output_tokens: usize,
+}
+
 /// Serving-level terminal reason suitable for an API response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Qwen36ChatFinishReason {
@@ -86,11 +98,15 @@ pub struct Qwen36ChatFinished {
     pub finish_reason: Qwen36ChatFinishReason,
     /// Final prompt and completion token counts.
     pub usage: Qwen36ChatUsage,
+    /// Persistent sequence-state bytes released at termination.
+    pub released_sequence_device_bytes: usize,
 }
 
 /// Observable work and output from one decode-first scheduler iteration.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Qwen36ChatTick {
+    /// Requests receiving persistent device sequence state during the tick.
+    pub admitted: Vec<Qwen36AdmissionProgress>,
     /// Requests selected for model work, preserving scheduler order.
     pub scheduled: Vec<Qwen36RequestId>,
     /// Chunked prompt progress made during the tick.
@@ -101,6 +117,8 @@ pub struct Qwen36ChatTick {
     pub output: Vec<Qwen36ChatDelta>,
     /// Requests reaching a serving-level terminal state.
     pub finished: Vec<Qwen36ChatFinished>,
+    /// Device-resident sequences remaining after serving-level termination.
+    pub active_sequences: usize,
 }
 
 struct ActiveChatRequest<'tokenizer> {
@@ -131,7 +149,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and admits a structured request to the CPU waiting queue.
-    pub fn add_request(&mut self, request: Qwen36ChatRequest) -> Result<Qwen36RequestId> {
+    pub fn add_request(&mut self, request: Qwen36ChatRequest) -> Result<Qwen36ChatAdmission> {
         validate_stop_sequences(&request.stop_sequences)?;
         let prompt = self.template.render_and_tokenize(
             &request.messages,
@@ -147,6 +165,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         )?;
         let filter = ResponseFilter::new(request.stop_sequences);
         let prompt_tokens = prompt.token_ids.len();
+        let max_output_tokens = request.generation.max_new_tokens;
         let id = self
             .scheduler
             .add_request(prompt.token_ids, request.generation)?;
@@ -162,13 +181,18 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
             },
         );
         debug_assert!(previous.is_none());
-        Ok(id)
+        Ok(Qwen36ChatAdmission {
+            request_id: id,
+            prompt_tokens,
+            max_output_tokens,
+        })
     }
 
     /// Runs one scheduler iteration and translates token output into chat deltas.
     pub fn tick(&mut self) -> Result<Qwen36ChatTick> {
         let scheduled = self.scheduler.tick()?;
         let mut tick = Qwen36ChatTick {
+            admitted: scheduled.admitted,
             scheduled: scheduled.scheduled,
             prefilled: scheduled.prefilled,
             ..Qwen36ChatTick::default()
@@ -224,7 +248,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 }
             }
 
-            self.release_scheduler_request(id)?;
+            let released_sequence_device_bytes = self.release_scheduler_request(id)?;
             let request = self
                 .requests
                 .remove(&id)
@@ -233,8 +257,10 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 request_id: id,
                 finish_reason: reason,
                 usage: request.usage,
+                released_sequence_device_bytes,
             });
         }
+        tick.active_sequences = self.scheduler.active_sequence_count();
         Ok(tick)
     }
 
@@ -261,6 +287,11 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         self.requests.len()
     }
 
+    /// Returns the number of requests currently owning device sequence state.
+    pub fn active_sequence_count(&self) -> usize {
+        self.scheduler.active_sequence_count()
+    }
+
     /// Returns a request's scheduler lifecycle state.
     pub fn request_state(&self, id: Qwen36RequestId) -> Option<Qwen36RequestState> {
         self.scheduler.request_state(id)
@@ -276,32 +307,30 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         self.scheduler.workspace_device_bytes()
     }
 
-    fn release_scheduler_request(&mut self, id: Qwen36RequestId) -> Result<()> {
+    fn release_scheduler_request(&mut self, id: Qwen36RequestId) -> Result<usize> {
         match self.scheduler.request_state(id) {
             Some(Qwen36RequestState::Finished) => {
-                self.scheduler
+                let finished = self
+                    .scheduler
                     .remove_finished(id)
                     .expect("finished scheduler request is removable");
+                Ok(finished.released_sequence_device_bytes)
             }
             Some(_) => {
-                if !matches!(
-                    self.scheduler.cancel_request(id),
-                    Qwen36CancelOutcome::Cancelled(_)
-                ) {
+                let Qwen36CancelOutcome::Cancelled(cancelled) = self.scheduler.cancel_request(id)
+                else {
                     return Err(Error::Format {
                         label: "Qwen3.6 chat service",
                         detail: format!("failed to stop request {}", id.get()),
                     });
-                }
+                };
+                Ok(cancelled.released_sequence_device_bytes)
             }
-            None => {
-                return Err(Error::Format {
-                    label: "Qwen3.6 chat service",
-                    detail: format!("terminal request {} is absent from scheduler", id.get()),
-                });
-            }
+            None => Err(Error::Format {
+                label: "Qwen3.6 chat service",
+                detail: format!("terminal request {} is absent from scheduler", id.get()),
+            }),
         }
-        Ok(())
     }
 }
 
@@ -452,7 +481,8 @@ mod tests {
                 vec![ChatMessage::user("Reply with one short greeting.")],
                 generation.clone(),
             ))
-            .expect("chat request");
+            .expect("chat request")
+            .request_id;
         assert_eq!(service.request_state(id), Some(Qwen36RequestState::Waiting));
 
         let mut finished = None;
@@ -485,7 +515,8 @@ mod tests {
                 vec![ChatMessage::user("This request will be cancelled.")],
                 generation,
             ))
-            .expect("cancellation request");
+            .expect("cancellation request")
+            .request_id;
         assert!(matches!(
             service.cancel_request(cancelled),
             Qwen36CancelOutcome::Cancelled(_)
