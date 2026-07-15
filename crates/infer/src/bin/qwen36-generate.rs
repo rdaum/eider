@@ -1,10 +1,10 @@
 use infer::nvfp4::{Error, Result};
 use infer::qwen3::qwen36::Qwen36TextModel;
+use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::runtime::generation::{GenerationConfig, Qwen36GenerationSession};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
-use tokenizers::Tokenizer;
 
 struct GenerateArgs {
     model_dir: PathBuf,
@@ -33,27 +33,23 @@ fn main() -> Result<()> {
         .frequency_penalty
         .unwrap_or(generation.sampling.frequency_penalty);
 
-    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json")).map_err(|err| {
-        Error::Format {
-            label: "tokenizer",
-            detail: err.to_string(),
-        }
-    })?;
-
+    let chat_template = CheckpointChatTemplate::from_model_dir(&args.model_dir)?;
     let model = Qwen36TextModel::open(&args.model_dir)?;
-    let prompt = render_prompt(&args.prompt);
-    let encoding = tokenizer
-        .encode(prompt.as_str(), false)
-        .map_err(|err| Error::Format {
-            label: "tokenizer encode",
-            detail: err.to_string(),
-        })?;
-    let prompt_ids = encoding.get_ids();
+    let prompt = chat_template.render_and_tokenize(
+        &[ChatMessage::user(args.prompt)],
+        &[],
+        ChatTemplateOptions::default(),
+    )?;
     let (layers, hidden, vocab) = {
         let manifest = model.manifest();
         (manifest.layers, manifest.hidden, manifest.vocab)
     };
-    let mut session = Qwen36GenerationSession::new(&model, &tokenizer, prompt_ids, generation)?;
+    let mut session = Qwen36GenerationSession::new(
+        &model,
+        chat_template.tokenizer(),
+        &prompt.token_ids,
+        generation,
+    )?;
     while let Some(token) = session.next_token()? {
         print!("{}", token.text);
         std::io::stdout().flush().ok();
@@ -69,13 +65,6 @@ fn main() -> Result<()> {
     );
 
     Ok(())
-}
-
-fn render_prompt(prompt: &str) -> String {
-    if prompt.contains("<|im_start|>") {
-        return prompt.to_string();
-    }
-    format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n")
 }
 
 fn parse_args() -> Result<GenerateArgs> {
@@ -172,23 +161,4 @@ fn parse_args() -> Result<GenerateArgs> {
         presence_penalty,
         frequency_penalty,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::render_prompt;
-
-    #[test]
-    fn plain_prompt_gets_qwen_chat_prefix() {
-        assert_eq!(
-            render_prompt("Hello"),
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
-        );
-    }
-
-    #[test]
-    fn templated_prompt_is_not_wrapped_again() {
-        let prompt = "<|im_start|>user\nHello<|im_end|>\n";
-        assert_eq!(render_prompt(prompt), prompt);
-    }
 }
