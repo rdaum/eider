@@ -102,8 +102,8 @@ implement the measured kernels underneath it.
 ```mermaid
 flowchart TD
     A[Prompt tokens] --> B[Prefill]
-    B --> C[Decode state]
-    C --> D[One-token layer loop]
+    B --> C[Runnable sequence states]
+    C --> D[Batched decode tick]
     D --> E{Layer attention type}
     E -->|Linear attention| F[QKV + GDN state + output projection]
     E -->|Full attention| G[QKV + KV-cache append + cached attention + output projection]
@@ -139,8 +139,9 @@ flowchart TD
     end
 ```
 
-CUDA graph replay captures the stable decode segments where possible; the
-KV-cache and attention state remain device-resident across iterations.
+Sequence-owned KV and recurrent state remains device-resident as requests move
+between decode batches. The canonical changing-membership batch path is eager;
+the legacy single-row reference still uses graph replay for stable segments.
 
 ## Build and run
 
@@ -255,6 +256,6 @@ model, prompt, token count, repeat count, and endpoint.
 
 Further implementation notes live in:
 
-- `docs/qwen36-batch-decode-plan.md` for the measured batch-API work that must
-  precede scheduler design.
+- `docs/qwen36-batch-decode-plan.md` for the batch contract, correctness
+  evidence, and remaining scheduler-admission measurements.
 - `docs/cutlass-sm12x-nvfp4.md` for the SM12x/CUTLASS kernel investigation.

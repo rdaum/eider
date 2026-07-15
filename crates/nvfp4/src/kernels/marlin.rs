@@ -35,6 +35,18 @@ pub struct MarlinNvfp4GateUp {
     num_tokens_past_padded: DeviceBuffer<i32>,
 }
 
+/// Reusable execution storage for batched routed Marlin gate/up.
+pub struct MarlinNvfp4GateUpBatchWorkspace {
+    capacity: usize,
+    input_bf16: DeviceBuffer<u16>,
+    output_bf16: DeviceBuffer<u16>,
+    reduce_tmp: DeviceBuffer<f32>,
+    locks: DeviceBuffer<i32>,
+    sorted_token_ids: DeviceBuffer<i32>,
+    expert_ids: DeviceBuffer<i32>,
+    num_tokens_past_padded: DeviceBuffer<i32>,
+}
+
 /// Persistent Marlin plan for one Qwen3.6 shared-expert projection.
 pub struct MarlinNvfp4Linear {
     repacked_weight: DeviceBuffer<u32>,
@@ -110,6 +122,130 @@ impl MarlinNvfp4GateUp {
     /// Returns the number of experts stored by the plan.
     pub fn experts(&self) -> usize {
         self.experts
+    }
+
+    /// Allocates batch execution storage without duplicating model weights.
+    pub fn new_batch_workspace(&self, capacity: usize) -> Result<MarlinNvfp4GateUpBatchWorkspace> {
+        const HIDDEN: usize = 2048;
+        const GATE_UP: usize = 1024;
+        const TOP_K: usize = 8;
+        const MOE_BLOCK: usize = 8;
+        if capacity == 0 || capacity > u32::MAX as usize {
+            return Err(Error::Shape {
+                label: "Marlin gate/up batch capacity",
+                expected: "1..=u32::MAX".to_string(),
+                actual: capacity.to_string(),
+            });
+        }
+        Ok(MarlinNvfp4GateUpBatchWorkspace {
+            capacity,
+            input_bf16: DeviceBuffer::zeroed(capacity * HIDDEN)?,
+            output_bf16: DeviceBuffer::zeroed(capacity * TOP_K * GATE_UP)?,
+            reduce_tmp: DeviceBuffer::zeroed(capacity * TOP_K * GATE_UP * MOE_BLOCK)?,
+            locks: DeviceBuffer::zeroed(capacity * 128)?,
+            sorted_token_ids: DeviceBuffer::zeroed(capacity * TOP_K * MOE_BLOCK)?,
+            expert_ids: DeviceBuffer::zeroed(capacity * TOP_K)?,
+            num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
+        })
+    }
+
+    /// Runs routed gate/up for a dense batch in row-major `(batch, hidden)` order.
+    pub fn run_batch_on_stream(
+        &self,
+        workspace: &MarlinNvfp4GateUpBatchWorkspace,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        const HIDDEN: usize = 2048;
+        const GATE_UP: usize = 1024;
+        const TOP_K: usize = 8;
+        let batch = workspace.capacity;
+        if indices.len() != batch * TOP_K
+            || input.len() != batch * HIDDEN
+            || output.len() != batch * TOP_K * GATE_UP
+        {
+            return Err(Error::Shape {
+                label: "Marlin Qwen3.6 batched gate/up buffers",
+                expected: format!(
+                    "indices={} input={} output={}",
+                    batch * TOP_K,
+                    batch * HIDDEN,
+                    batch * TOP_K * GATE_UP
+                ),
+                actual: format!(
+                    "indices={} input={} output={}",
+                    indices.len(),
+                    input.len(),
+                    output.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_marlin_nvfp4_gate_up_batch_on_stream",
+                ffi::infer_marlin_nvfp4_gate_up_batch_on_stream(
+                    indices.ptr,
+                    input.ptr,
+                    self.repacked_weight.ptr,
+                    self.weight_scale.ptr,
+                    self.global_scale.ptr,
+                    output.buffer_mut().ptr,
+                    workspace.input_bf16.ptr,
+                    workspace.output_bf16.ptr,
+                    workspace.reduce_tmp.ptr,
+                    workspace.locks.ptr,
+                    workspace.sorted_token_ids.ptr,
+                    workspace.expert_ids.ptr,
+                    workspace.num_tokens_past_padded.ptr,
+                    batch as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Runs batched routed gate/up while retaining Marlin's native BF16 output.
+    pub fn run_batch_bf16_on_stream(
+        &self,
+        workspace: &MarlinNvfp4GateUpBatchWorkspace,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        const HIDDEN: usize = 2048;
+        const TOP_K: usize = 8;
+        let batch = workspace.capacity;
+        if indices.len() != batch * TOP_K || input.len() != batch * HIDDEN {
+            return Err(Error::Shape {
+                label: "Marlin Qwen3.6 batched BF16 gate/up buffers",
+                expected: format!("indices={} input={}", batch * TOP_K, batch * HIDDEN),
+                actual: format!("indices={} input={}", indices.len(), input.len()),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_marlin_nvfp4_gate_up_batch_on_stream",
+                ffi::infer_marlin_nvfp4_gate_up_batch_on_stream(
+                    indices.ptr,
+                    input.ptr,
+                    self.repacked_weight.ptr,
+                    self.weight_scale.ptr,
+                    self.global_scale.ptr,
+                    std::ptr::null_mut(),
+                    workspace.input_bf16.ptr,
+                    workspace.output_bf16.ptr,
+                    workspace.reduce_tmp.ptr,
+                    workspace.locks.ptr,
+                    workspace.sorted_token_ids.ptr,
+                    workspace.expert_ids.ptr,
+                    workspace.num_tokens_past_padded.ptr,
+                    batch as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Runs routed gate/up for one token and eight device-resident expert indices.
@@ -200,6 +336,13 @@ impl MarlinNvfp4GateUp {
     }
 
     /// Returns Marlin's persistent BF16 routed gate/up output.
+    pub fn output_bf16(&self) -> &DeviceBuffer<u16> {
+        &self.output_bf16
+    }
+}
+
+impl MarlinNvfp4GateUpBatchWorkspace {
+    /// Returns Marlin's contiguous `[batch, top_k, gate_up]` BF16 output.
     pub fn output_bf16(&self) -> &DeviceBuffer<u16> {
         &self.output_bf16
     }

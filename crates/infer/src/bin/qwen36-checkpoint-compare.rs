@@ -100,6 +100,7 @@ fn run_layers(model_dir: &Path, tokens: &[u32]) -> Result<RunCapture> {
     for layer in 0..manifest.layers {
         let block = Qwen36LayerBlock::load(&model, layer)?;
         let mut workspace = block.workspace(&model, tokens.len())?;
+        let mut state = block.sequence_state(&model, tokens.len())?;
         let mut next_hidden = Vec::with_capacity(tokens.len());
         for (position, input) in hidden.iter().enumerate() {
             let input = DeviceBuffer::from_host(input)?;
@@ -107,6 +108,7 @@ fn run_layers(model_dir: &Path, tokens: &[u32]) -> Result<RunCapture> {
                 let step = block.run_one_token(
                     &lt,
                     &mut workspace,
+                    &mut state,
                     &manifest,
                     &input,
                     position,

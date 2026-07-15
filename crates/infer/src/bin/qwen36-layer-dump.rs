@@ -25,18 +25,27 @@ fn main() -> Result<()> {
     println!("emb[3710]: first={:.6} max|={:.6}", h[0], max_abs(&h));
 
     let mut layer_workspaces = Vec::with_capacity(manifest.layers);
+    let mut layer_states = Vec::with_capacity(manifest.layers);
     let mut blocks = Vec::with_capacity(manifest.layers);
     for layer in 0..manifest.layers {
         let block = Qwen36LayerBlock::load(&model, layer)?;
         let ws = block.workspace(&model, 8)?;
+        let state = block.sequence_state(&model, 8)?;
         blocks.push(block);
         layer_workspaces.push(ws);
+        layer_states.push(state);
     }
 
     let mut current = hidden;
-    for (layer, (block, ws)) in blocks.iter().zip(layer_workspaces.iter_mut()).enumerate() {
+    for (layer, ((block, ws), state)) in blocks
+        .iter()
+        .zip(layer_workspaces.iter_mut())
+        .zip(layer_states.iter_mut())
+        .enumerate()
+    {
         let out = {
-            let step = block.run_one_token(&lt, ws, &manifest, &current, 0, &stream, None, None)?;
+            let step =
+                block.run_one_token(&lt, ws, state, &manifest, &current, 0, &stream, None, None)?;
             step.output.copy_to_host(&stream)?.into_vec()
         };
         let kind = manifest

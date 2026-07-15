@@ -38,11 +38,13 @@ fn main() -> Result<()> {
     // GPU: run layer 0 block and dump MoE routing
     let block = Qwen36LayerBlock::load(&model, 0)?;
     let mut workspace = block.workspace(&model, 8)?;
+    let mut state = block.sequence_state(&model, 8)?;
 
     let gpu_hidden = DeviceBuffer::from_host(&cpu_emb)?;
     let _ = block.run_one_token(
         &lt,
         &mut workspace,
+        &mut state,
         &manifest,
         &gpu_hidden,
         0,
@@ -529,9 +531,11 @@ fn main() -> Result<()> {
     for layer in 0..target_full_layer {
         let block = Qwen36LayerBlock::load(&model, layer)?;
         let mut workspace = block.workspace(&model, 8)?;
+        let mut state = block.sequence_state(&model, 8)?;
         let step = block.run_one_token(
             &lt,
             &mut workspace,
+            &mut state,
             &manifest,
             &hidden_device,
             0,
@@ -563,8 +567,15 @@ fn main() -> Result<()> {
     let (gpu_q_proj, gpu_q_rope, gpu_attn, gpu_gated, gpu_out) = match &block3.attention {
         Qwen36Attention::FullAttention(weights) => {
             let mut workspace = model.full_attention_workspace(weights, 8)?;
-            let step =
-                weights.run_one_token(&mut workspace, &manifest, &normed_hidden, 0, &stream)?;
+            let mut state = infer::qwen3::qwen36::Qwen36FullAttentionState::new(&manifest, 8)?;
+            let step = weights.run_one_token(
+                &mut workspace,
+                &mut state,
+                &manifest,
+                &normed_hidden,
+                0,
+                &stream,
+            )?;
             (
                 step.q_proj_output.copy_to_host(&stream)?.into_vec(),
                 step.q_rope.copy_to_host(&stream)?.into_vec(),
@@ -698,11 +709,14 @@ fn seq_full_attn_bisect(
     let lt = CublasLt::new()?;
     let mut blocks = Vec::with_capacity(target_layer + 1);
     let mut workspaces = Vec::with_capacity(target_layer + 1);
+    let mut states = Vec::with_capacity(target_layer + 1);
     for layer in 0..=target_layer {
         let block = Qwen36LayerBlock::load(model, layer)?;
         let ws = block.workspace(model, context_len)?;
+        let state = block.sequence_state(model, context_len)?;
         blocks.push(block);
         workspaces.push(ws);
+        states.push(state);
     }
     let embedding_rows = token_seed
         .iter()
@@ -739,6 +753,7 @@ fn seq_full_attn_bisect(
             blocks[layer].run_one_token(
                 &lt,
                 &mut current[0],
+                &mut states[layer],
                 manifest,
                 input,
                 pos,
@@ -770,6 +785,12 @@ fn seq_full_attn_bisect(
             ) => {
                 weights.prepare_qkv_one_token(
                     ws,
+                    match &states[target_layer].attention {
+                        infer::qwen3::qwen36::Qwen36AttentionState::FullAttention(state) => state,
+                        infer::qwen3::qwen36::Qwen36AttentionState::LinearAttention(_) => {
+                            unreachable!("target layer should be full attention")
+                        }
+                    },
                     manifest,
                     &current[0].normed_hidden,
                     pos,
