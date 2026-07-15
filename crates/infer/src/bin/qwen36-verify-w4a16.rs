@@ -21,17 +21,25 @@ fn main() -> Result<()> {
 
     // Run all 40 layers
     let mut layer_workspaces = Vec::with_capacity(manifest.layers);
+    let mut layer_states = Vec::with_capacity(manifest.layers);
     let mut blocks = Vec::with_capacity(manifest.layers);
     for layer in 0..manifest.layers {
         let block = Qwen36LayerBlock::load(&model, layer)?;
         let ws = block.workspace(&model, 8)?;
+        let state = block.sequence_state(&model, 8)?;
         blocks.push(block);
         layer_workspaces.push(ws);
+        layer_states.push(state);
     }
 
     let mut current = hidden;
-    for (block, ws) in blocks.iter().zip(layer_workspaces.iter_mut()) {
-        let step = block.run_one_token(&lt, ws, &manifest, &current, 0, &stream, None, None)?;
+    for ((block, ws), state) in blocks
+        .iter()
+        .zip(layer_workspaces.iter_mut())
+        .zip(layer_states.iter_mut())
+    {
+        let step =
+            block.run_one_token(&lt, ws, state, &manifest, &current, 0, &stream, None, None)?;
         let out = step.output.copy_to_host(&stream)?;
         current = DeviceBuffer::from_host(&out)?;
     }

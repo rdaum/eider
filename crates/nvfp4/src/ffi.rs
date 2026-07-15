@@ -430,6 +430,13 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_silu_mul_halves_f32_batch_on_stream(
+        gate_up: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_fill_f32_on_stream(
         output: *mut f32,
         value: f32,
@@ -478,6 +485,21 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_full_attn_prep_f32_batch_on_stream(
+        q_full: *const f32,
+        k_raw: *const f32,
+        q_norm: *const f32,
+        k_norm: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        k: *mut f32,
+        batch_size: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_split_qkv_f32_on_stream(
         input: *const f32,
         q: *mut f32,
@@ -491,6 +513,16 @@ unsafe extern "C" {
         logits: *const f32,
         out_indices: *mut u32,
         out_weights: *mut f32,
+        experts: u32,
+        k: u32,
+        norm_topk_prob: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_topk_f32_batch_on_stream(
+        logits: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        batch_size: u32,
         experts: u32,
         k: u32,
         norm_topk_prob: i32,
@@ -586,6 +618,20 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_ffn_finalize_routed_batch_f32_on_stream(
+        indices: *const u32,
+        route_weights: *const f32,
+        routed_outputs: *const *const f32,
+        alpha_table: *const f32,
+        shared_gate_logit: *const f32,
+        shared_output: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        groups_per_row: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rope_neox_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -646,6 +692,21 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_rope_imrope_text_batch_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        positions: *const u32,
+        batch_size: u32,
+        heads_per_row: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        v0: u32,
+        v1: u32,
+        v2: u32,
+        v3: u32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rope_neox_sequence_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -695,6 +756,14 @@ unsafe extern "C" {
         input: *const u16,
         row: *const u32,
         output: *mut f32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_copy_bf16_rows_to_f32_indexed_on_stream(
+        input: *const u16,
+        rows: *const u32,
+        output: *mut f32,
+        batch_size: u32,
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -845,6 +914,14 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_argmax_f32_batch_on_stream(
+        values: *const f32,
+        out_index: *mut u32,
+        out_value: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     #[cfg(test)]
     pub(crate) fn infer_bf16_linear_logits_f32(
         input: *const f32,
@@ -857,6 +934,15 @@ unsafe extern "C" {
         input: *const f32,
         weight: *const u16,
         logits: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_bf16_linear_logits_f32_batch_on_stream(
+        input: *const f32,
+        weight: *const u16,
+        logits: *mut f32,
+        batch_size: u32,
         rows: u32,
         cols: u32,
         stream: cudaStream_t,
@@ -912,10 +998,33 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gated_delta_net_128_f32_batch_on_stream(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        state_table: *const *mut f32,
+        output: *mut f32,
+        batch_size: u32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_fp8_linear_f32_configured_on_stream(
         input: *const f32,
         weight: *const u8,
         output: *mut f32,
+        rows: u32,
+        cols: u32,
+        weight_scale: f32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_f32_batch_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        output: *mut f32,
+        batch_size: u32,
         rows: u32,
         cols: u32,
         weight_scale: f32,
@@ -1036,11 +1145,27 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_quantize_fp8_e4m3_dynamic_f32_batch_on_stream(
+        input: *const f32,
+        quantized_input: *mut u8,
+        input_scale: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_scale_channel_f32_device_scalar_on_stream(
         values: *mut f32,
         channel_scale: *const f32,
         scalar: *const f32,
         len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_scale_channel_f32_device_row_scalar_on_stream(
+        values: *mut f32,
+        channel_scale: *const f32,
+        row_scale: *const f32,
+        rows: u32,
+        channels: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_fp8_linear_w8a8_f32_on_stream(
@@ -1068,6 +1193,23 @@ unsafe extern "C" {
         sorted_token_ids: *mut i32,
         expert_ids: *mut i32,
         num_tokens_past_padded: *mut i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_marlin_nvfp4_gate_up_batch_on_stream(
+        indices: *const u32,
+        input: *const f32,
+        repacked_weight: *const u32,
+        weight_scale: *const u8,
+        global_scale: *const f32,
+        output: *mut f32,
+        input_bf16: *mut u16,
+        output_bf16: *mut u16,
+        reduce_tmp: *mut f32,
+        locks: *mut i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        num_tokens_past_padded: *mut i32,
+        batch_size: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_marlin_nvfp4_linear_on_stream(
@@ -1115,6 +1257,18 @@ unsafe extern "C" {
         warps_per_block: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream(
+        input: *const f32,
+        packed_weight: *const u8,
+        weight_scale: *const u8,
+        output: *mut f32,
+        batch_size: u32,
+        out_features: u32,
+        in_features: u32,
+        weight_scale_2: f32,
+        warps_per_block: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_nvfp4_w4a16_grouped_matvec_f32_on_stream(
         indices: *const u32,
         input: *const f32,
@@ -1155,6 +1309,19 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_prep_batch_on_stream(
+        qkv: *const f32,
+        conv_weight_bf16: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        conv_state_table: *const *mut f32,
+        batch_size: u32,
+        key_heads: u32,
+        value_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_qwen36_gdn_gate_on_stream(
         alpha: *const f32,
         beta_input: *const f32,
@@ -1162,6 +1329,17 @@ unsafe extern "C" {
         dt_bias_bf16: *const u16,
         gate: *mut f32,
         beta: *mut f32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_gate_batch_on_stream(
+        alpha: *const f32,
+        beta_input: *const f32,
+        a_log_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        gate: *mut f32,
+        beta: *mut f32,
+        batch_size: u32,
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;

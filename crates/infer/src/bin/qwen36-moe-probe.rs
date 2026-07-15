@@ -11,6 +11,7 @@ fn main() -> Result<()> {
     let manifest = model.manifest();
     let block = Qwen36LayerBlock::load(&model, 0)?;
     let mut workspace = block.workspace(&model, 8)?;
+    let mut state = block.sequence_state(&model, 8)?;
     let lt = CublasLt::new()?;
     let stream = CudaStream::new_non_blocking()?;
 
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
     let step = block.run_one_token(
         &lt,
         &mut workspace,
+        &mut state,
         manifest,
         &hidden,
         0,

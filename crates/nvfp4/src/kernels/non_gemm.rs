@@ -198,6 +198,50 @@ pub fn silu_mul_halves_f32_into_on_stream(
     }
 }
 
+/// Applies `SiLU(gate) * up` independently to row-major concatenated rows.
+pub fn silu_mul_halves_f32_batch_into_on_stream(
+    gate_up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows
+        .checked_mul(cols)
+        .and_then(|value| value.checked_mul(2))
+        .unwrap_or(usize::MAX);
+    let output_len = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || gate_up.len() != input_len
+        || output.len() != output_len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched SiLU halves buffers",
+            expected: format!("gate_up={input_len} output={output_len}"),
+            actual: format!(
+                "gate_up={} output={} rows={rows} cols={cols}",
+                gate_up.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_silu_mul_halves_f32_batch_on_stream",
+            ffi::infer_silu_mul_halves_f32_batch_on_stream(
+                gate_up.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(missing_docs)]
 pub fn fill_f32_into_on_stream(
     mut output: DeviceOutput<'_, f32>,
@@ -475,6 +519,83 @@ pub fn qwen36_full_attn_prep_f32_into_on_stream(
     }
 }
 
+/// Splits and QK-normalizes full-attention projections for a dense batch.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_full_attn_prep_f32_batch_into_on_stream(
+    q_full: &DeviceBuffer<f32>,
+    k_raw: &DeviceBuffer<f32>,
+    q_norm: &DeviceBuffer<f32>,
+    k_norm: &DeviceBuffer<f32>,
+    mut q: DeviceOutput<'_, f32>,
+    mut gate: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let q_width = q_heads.saturating_mul(head_dim);
+    let kv_width = kv_heads.saturating_mul(head_dim);
+    let q_len = rows.saturating_mul(q_width);
+    let q_full_len = q_len.saturating_mul(2);
+    let kv_len = rows.saturating_mul(kv_width);
+    if rows == 0
+        || q_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || !head_dim.is_power_of_two()
+        || head_dim > 1024
+        || q_full.len() != q_full_len
+        || k_raw.len() != kv_len
+        || q_norm.len() != head_dim
+        || k_norm.len() != head_dim
+        || q.len() != q_len
+        || gate.len() != q_len
+        || k.len() != kv_len
+        || rows > u32::MAX as usize
+        || q_heads > u32::MAX as usize
+        || kv_heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.6 batched full-attn prep buffers",
+            expected: format!("q_full={q_full_len} k={kv_len} q/gate={q_len} norms={head_dim}"),
+            actual: format!(
+                "q_full={} k_raw={} q_norm={} k_norm={} q={} gate={} k={} rows={rows}",
+                q_full.len(),
+                k_raw.len(),
+                q_norm.len(),
+                k_norm.len(),
+                q.len(),
+                gate.len(),
+                k.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_full_attn_prep_f32_batch_on_stream",
+            ffi::infer_qwen36_full_attn_prep_f32_batch_on_stream(
+                q_full.ptr,
+                k_raw.ptr,
+                q_norm.ptr,
+                k_norm.ptr,
+                q.buffer_mut().ptr,
+                gate.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                rows as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(missing_docs)]
 pub fn split_qkv_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
@@ -572,6 +693,61 @@ pub fn moe_topk_f32_into_on_stream(
                 out_indices.buffer_mut().ptr,
                 out_weights.buffer_mut().ptr,
                 logits.len() as u32,
+                k as u32,
+                i32::from(norm_topk_prob),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues independent softmax top-k routing for a row-major batch.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_topk_f32_batch_into_on_stream(
+    logits: &DeviceBuffer<f32>,
+    mut out_indices: DeviceOutput<'_, u32>,
+    mut out_weights: DeviceOutput<'_, f32>,
+    rows: usize,
+    experts: usize,
+    k: usize,
+    norm_topk_prob: bool,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = rows.saturating_mul(k);
+    let logits_len = rows.saturating_mul(experts);
+    if rows == 0
+        || experts == 0
+        || k == 0
+        || k > experts
+        || logits.len() != logits_len
+        || out_indices.len() != routes
+        || out_weights.len() != routes
+        || rows > u32::MAX as usize
+        || experts > u32::MAX as usize
+        || k > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched MoE top-k buffers",
+            expected: format!(
+                "logits={logits_len} indices={routes} weights={routes} with 0 < k <= experts"
+            ),
+            actual: format!(
+                "logits={} indices={} weights={} rows={rows} experts={experts} k={k}",
+                logits.len(),
+                out_indices.len(),
+                out_weights.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_topk_f32_batch_on_stream",
+            ffi::infer_moe_topk_f32_batch_on_stream(
+                logits.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                rows as u32,
+                experts as u32,
                 k as u32,
                 i32::from(norm_topk_prob),
                 stream.as_raw(),
@@ -1019,6 +1195,75 @@ pub fn qwen36_ffn_finalize_routed_f32_into_on_stream(
     }
 }
 
+/// Finalizes routed and shared FFNs for independent batch rows.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    routed_outputs: &DeviceBuffer<*const f32>,
+    alpha_table: &DeviceBuffer<f32>,
+    shared_gate_logit: &DeviceBuffer<f32>,
+    shared_output: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    groups_per_row: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    let groups = rows.saturating_mul(groups_per_row);
+    if rows == 0
+        || cols == 0
+        || groups_per_row == 0
+        || indices.len() != groups
+        || route_weights.len() != groups
+        || routed_outputs.len() != groups
+        || alpha_table.is_empty()
+        || shared_gate_logit.len() != rows
+        || shared_output.len() != len
+        || residual.len() != len
+        || output.len() != len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || groups_per_row > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.6 batched routed FFN finalize",
+            expected: format!("routes={groups} gate={rows} shared/residual/output={len}"),
+            actual: format!(
+                "indices={} weights={} routed={} gate={} shared={} residual={} output={} rows={rows} cols={cols} groups_per_row={groups_per_row}",
+                indices.len(),
+                route_weights.len(),
+                routed_outputs.len(),
+                shared_gate_logit.len(),
+                shared_output.len(),
+                residual.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_ffn_finalize_routed_batch_f32_on_stream",
+            ffi::infer_qwen36_ffn_finalize_routed_batch_f32_on_stream(
+                indices.ptr,
+                route_weights.ptr,
+                routed_outputs.ptr,
+                alpha_table.ptr,
+                shared_gate_logit.ptr,
+                shared_output.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                groups_per_row as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues one-position Neox RoPE into an existing output buffer on `stream`.
 pub fn rope_neox_f32_into_on_stream(
     rows: usize,
@@ -1221,6 +1466,74 @@ pub fn rope_imrope_f32_indexed_into_on_stream(
                 sections.v3 as u32,
                 positions.ptr,
                 positions.len() as u32,
+                theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies text IMRoPE using one device-resident position per batch row.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_imrope_text_batch_f32_into_on_stream(
+    rows: usize,
+    heads_per_row: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    sections: MropeSections,
+    positions: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows
+        .checked_mul(heads_per_row)
+        .and_then(|value| value.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    if rows == 0
+        || heads_per_row == 0
+        || head_dim == 0
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || positions.len() != rows
+        || input.len() != len
+        || output.len() != len
+        || rows > u32::MAX as usize
+        || heads_per_row > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || rotary_dim > u32::MAX as usize
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "batched text IMRoPE buffers",
+            expected: format!("positions={rows} input/output={len}"),
+            actual: format!(
+                "positions={} input={} output={} rows={rows} heads={heads_per_row} head_dim={head_dim} rotary_dim={rotary_dim}",
+                positions.len(),
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    sections.validate(rotary_dim)?;
+    unsafe {
+        check_cuda(
+            "infer_rope_imrope_text_batch_f32_on_stream",
+            ffi::infer_rope_imrope_text_batch_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                positions.ptr,
+                rows as u32,
+                heads_per_row as u32,
+                head_dim as u32,
+                rotary_dim as u32,
+                sections.v0 as u32,
+                sections.v1 as u32,
+                sections.v2 as u32,
+                sections.v3 as u32,
                 theta,
                 stream.as_raw(),
             ),
@@ -1599,6 +1912,60 @@ pub fn copy_bf16_row_to_f32_indexed_into_on_stream(
                 input.ptr,
                 row.ptr,
                 output.buffer_mut().ptr,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Copies one BF16 embedding row per device-resident index into a dense batch.
+pub fn copy_bf16_rows_to_f32_indexed_into_on_stream(
+    vocab_rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<u16>,
+    rows: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = vocab_rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "copy BF16 rows to f32 input",
+        expected: "vocab_rows * cols without overflow".to_string(),
+        actual: format!("vocab_rows={vocab_rows} cols={cols}"),
+    })?;
+    let output_len = rows.len().checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "copy BF16 rows to f32 output",
+        expected: "batch_size * cols without overflow".to_string(),
+        actual: format!("batch_size={} cols={cols}", rows.len()),
+    })?;
+    if vocab_rows == 0
+        || cols == 0
+        || rows.is_empty()
+        || vocab_rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || rows.len() > u32::MAX as usize
+        || input.len() != input_len
+        || output.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "copy BF16 rows to f32 buffers",
+            expected: format!("input={input_len} rows>0 output={output_len}"),
+            actual: format!(
+                "input={} rows={} output={}",
+                input.len(),
+                rows.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_copy_bf16_rows_to_f32_indexed_on_stream",
+            ffi::infer_copy_bf16_rows_to_f32_indexed_on_stream(
+                input.ptr,
+                rows.ptr,
+                output.buffer_mut().ptr,
+                rows.len() as u32,
                 cols as u32,
                 stream.as_raw(),
             ),
@@ -2823,6 +3190,50 @@ pub fn argmax_f32_into_on_stream(
     }
 }
 
+/// Enqueues one argmax reduction per row of a dense f32 matrix.
+pub fn argmax_f32_batch_into_on_stream(
+    values: &DeviceBuffer<f32>,
+    mut out_index: DeviceOutput<'_, u32>,
+    mut out_value: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || values.len() != len
+        || out_index.len() != rows
+        || out_value.len() != rows
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched argmax f32 buffers",
+            expected: format!("values={len} index/value={rows}"),
+            actual: format!(
+                "values={} index={} value={} rows={rows} cols={cols}",
+                values.len(),
+                out_index.len(),
+                out_value.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_argmax_f32_batch_on_stream",
+            ffi::infer_argmax_f32_batch_on_stream(
+                values.ptr,
+                out_index.buffer_mut().ptr,
+                out_value.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues the fused direct top-1 lm-head kernel on `stream`.
 ///
 /// Computes argmax(`weight * input`) directly without materializing a full
@@ -2982,6 +3393,68 @@ pub fn bf16_linear_logits_f32_into_on_stream(
                 input.ptr,
                 weight.ptr,
                 logits.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues a BF16-weight projection for every row in a decode batch.
+pub fn bf16_linear_logits_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
+    mut logits: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_size.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "batched BF16 linear input",
+        expected: "batch_size * cols without overflow".to_string(),
+        actual: format!("batch_size={batch_size} cols={cols}"),
+    })?;
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "batched BF16 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let output_len = batch_size.checked_mul(rows).ok_or_else(|| Error::Shape {
+        label: "batched BF16 linear output",
+        expected: "batch_size * rows without overflow".to_string(),
+        actual: format!("batch_size={batch_size} rows={rows}"),
+    })?;
+    if batch_size == 0
+        || rows == 0
+        || cols == 0
+        || batch_size > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != input_len
+        || weight.len() != weight_len
+        || logits.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "batched BF16 linear buffers",
+            expected: format!("input={input_len} weight={weight_len} output={output_len}"),
+            actual: format!(
+                "input={} weight={} output={}",
+                input.len(),
+                weight.len(),
+                logits.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_bf16_linear_logits_f32_batch_on_stream",
+            ffi::infer_bf16_linear_logits_f32_batch_on_stream(
+                input.ptr,
+                weight.ptr,
+                logits.buffer_mut().ptr,
+                batch_size as u32,
                 rows as u32,
                 cols as u32,
                 stream.as_raw(),
@@ -3277,6 +3750,85 @@ pub fn gated_delta_net_128_f32_into_on_stream(
     }
 }
 
+/// Enqueues a ragged-sequence batch of one-token Gated Delta Net updates.
+///
+/// Dense inputs and outputs are row-major by sequence. `state_table` contains
+/// one persistent recurrent-state pointer per sequence, allowing batch
+/// membership to change without moving the state itself.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_net_128_f32_batch_into_on_stream(
+    q: &DeviceBuffer<f32>,
+    k: &DeviceBuffer<f32>,
+    v: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    beta: &DeviceBuffer<f32>,
+    state_table: &DeviceBuffer<*mut f32>,
+    mut output: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let vectors = batch_size
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(128))
+        .ok_or_else(|| Error::Shape {
+            label: "batched Gated Delta Net vectors",
+            expected: "batch_size * heads * 128 without overflow".to_string(),
+            actual: format!("batch_size={batch_size} heads={heads}"),
+        })?;
+    let scalars = batch_size.checked_mul(heads).ok_or_else(|| Error::Shape {
+        label: "batched Gated Delta Net scalars",
+        expected: "batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    if batch_size == 0
+        || heads == 0
+        || batch_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || q.len() != vectors
+        || k.len() != vectors
+        || v.len() != vectors
+        || output.len() != vectors
+        || gate.len() != scalars
+        || beta.len() != scalars
+        || state_table.len() != batch_size
+    {
+        return Err(Error::Shape {
+            label: "batched Gated Delta Net buffers",
+            expected: format!(
+                "q/k/v/output={vectors} gate/beta={scalars} state_table={batch_size}"
+            ),
+            actual: format!(
+                "q={} k={} v={} output={} gate={} beta={} state_table={}",
+                q.len(),
+                k.len(),
+                v.len(),
+                output.len(),
+                gate.len(),
+                beta.len(),
+                state_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gated_delta_net_128_f32_batch_on_stream",
+            ffi::infer_gated_delta_net_128_f32_batch_on_stream(
+                q.ptr,
+                k.ptr,
+                v.ptr,
+                gate.ptr,
+                beta.ptr,
+                state_table.ptr,
+                output.buffer_mut().ptr,
+                batch_size as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues f32-input, FP8 E4M3-weight linear projection.
 ///
 /// `weight` is row-major `[rows, cols]` E4M3 bytes. The kernel dequantizes
@@ -3303,6 +3855,69 @@ pub fn fp8_linear_f32_into_on_stream(
         256,
         stream,
     )
+}
+
+/// Enqueues scalar-scaled W8A16 FP8 projections for a dense f32 batch.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    mut output: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+    weight_scale: f32,
+    threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_size.saturating_mul(cols);
+    let weight_len = rows.saturating_mul(cols);
+    let output_len = batch_size.saturating_mul(rows);
+    if batch_size == 0
+        || rows == 0
+        || cols == 0
+        || input.len() != input_len
+        || weight.len() != weight_len
+        || output.len() != output_len
+        || batch_size > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !(64..=512).contains(&threads)
+        || !threads.is_multiple_of(32)
+    {
+        return Err(Error::Shape {
+            label: "batched FP8 W8A16 linear buffers",
+            expected: format!("input={input_len} weight={weight_len} output={output_len}"),
+            actual: format!(
+                "input={} weight={} output={} batch={batch_size} rows={rows} cols={cols} threads={threads}",
+                input.len(),
+                weight.len(),
+                output.len()
+            ),
+        });
+    }
+    if !weight_scale.is_finite() {
+        return Err(Error::Format {
+            label: "batched FP8 W8A16 weight scale",
+            detail: format!("expected finite scale, got {weight_scale}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_f32_batch_on_stream",
+            ffi::infer_fp8_linear_f32_batch_on_stream(
+                input.ptr,
+                weight.ptr,
+                output.buffer_mut().ptr,
+                batch_size as u32,
+                rows as u32,
+                cols as u32,
+                weight_scale,
+                threads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
 }
 
 /// Enqueues the FP8 projection with a selected CUDA block size.
@@ -4027,6 +4642,54 @@ pub fn quantize_fp8_e4m3_dynamic_f32_into_on_stream(
     }
 }
 
+/// Dynamically quantizes each row of an f32 matrix to E4M3 independently.
+pub fn quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    quantized_input: &mut DeviceBuffer<u8>,
+    input_scale: &mut DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "batched dynamic FP8 quantization",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != len
+        || quantized_input.len() < len
+        || input_scale.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "batched dynamic FP8 quantization buffers",
+            expected: format!("input={len} quantized_input>={len} input_scale={rows}"),
+            actual: format!(
+                "input={} quantized_input={} input_scale={}",
+                input.len(),
+                quantized_input.len(),
+                input_scale.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_quantize_fp8_e4m3_dynamic_f32_batch_on_stream",
+            ffi::infer_quantize_fp8_e4m3_dynamic_f32_batch_on_stream(
+                input.ptr,
+                quantized_input.ptr,
+                input_scale.ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Multiplies each f32 value by its channel scale and one device scalar.
 pub fn scale_channel_f32_device_scalar_in_place_on_stream(
     mut values: DeviceInOut<'_, f32>,
@@ -4059,6 +4722,54 @@ pub fn scale_channel_f32_device_scalar_in_place_on_stream(
                 channel_scale.ptr,
                 scalar.ptr,
                 len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies one channel scale and one per-row device scale to a row-major matrix.
+pub fn scale_channel_f32_device_row_scalar_in_place_on_stream(
+    mut values: DeviceInOut<'_, f32>,
+    channel_scale: &DeviceBuffer<f32>,
+    row_scale: &DeviceBuffer<f32>,
+    rows: usize,
+    channels: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(channels).ok_or_else(|| Error::Shape {
+        label: "channel-scaled device-row-scalar f32",
+        expected: "rows * channels without overflow".to_string(),
+        actual: format!("rows={rows} channels={channels}"),
+    })?;
+    if rows == 0
+        || channels == 0
+        || rows > u32::MAX as usize
+        || channels > u32::MAX as usize
+        || values.len() != len
+        || channel_scale.len() != channels
+        || row_scale.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "channel-scaled device-row-scalar f32 buffers",
+            expected: format!("values={len} channel_scale={channels} row_scale={rows}"),
+            actual: format!(
+                "values={} channel_scale={} row_scale={}",
+                values.len(),
+                channel_scale.len(),
+                row_scale.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_scale_channel_f32_device_row_scalar_on_stream",
+            ffi::infer_scale_channel_f32_device_row_scalar_on_stream(
+                values.buffer_mut().ptr,
+                channel_scale.ptr,
+                row_scale.ptr,
+                rows as u32,
+                channels as u32,
                 stream.as_raw(),
             ),
         )
@@ -4278,6 +4989,74 @@ pub fn nvfp4_w4a16_matvec_f32_into_on_stream(
         8,
         stream,
     )
+}
+
+/// Enqueues one W4A16 matvec per row of a dense activation batch.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    packed_weight: &DeviceBuffer<u8>,
+    weight_scale: &DeviceBuffer<u8>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+    weight_scale_2: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let expected_input = rows.saturating_mul(in_features);
+    let expected_output = rows.saturating_mul(out_features);
+    let weight_bytes = out_features.saturating_mul(in_features / 2);
+    let scale_bytes = out_features.saturating_mul(in_features / 16);
+    if rows == 0
+        || in_features == 0
+        || !in_features.is_multiple_of(16)
+        || out_features == 0
+        || input.len() != expected_input
+        || output.len() != expected_output
+        || packed_weight.len() != weight_bytes
+        || weight_scale.len() != scale_bytes
+        || rows > u32::MAX as usize
+        || out_features > u32::MAX as usize
+        || in_features > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched NVFP4 W4A16 matvec buffers",
+            expected: format!(
+                "input={expected_input} weight={weight_bytes} scale={scale_bytes} output={expected_output}"
+            ),
+            actual: format!(
+                "input={} weight={} scale={} output={} rows={rows} out={out_features} in={in_features}",
+                input.len(),
+                packed_weight.len(),
+                weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    if !weight_scale_2.is_finite() {
+        return Err(Error::Format {
+            label: "batched NVFP4 W4A16 weight_scale_2",
+            detail: format!("expected finite scale, got {weight_scale_2}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream",
+            ffi::infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream(
+                input.ptr,
+                packed_weight.ptr,
+                weight_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                out_features as u32,
+                in_features as u32,
+                weight_scale_2,
+                8,
+                stream.as_raw(),
+            ),
+        )
+    }
 }
 
 /// Enqueues the W4A16 matvec using one warp per output row.
@@ -4614,6 +5393,102 @@ pub fn qwen36_gdn_prep_into_on_stream(
     }
 }
 
+/// Applies Qwen3.6 convolution/GDN preparation to a changing sequence batch.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_prep_batch_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    conv_state_table: &DeviceBuffer<*mut f32>,
+    batch_size: usize,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let key_dim = key_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "batched Qwen3.6 GDN prep",
+            expected: "key_heads * head_dim without overflow".to_string(),
+            actual: format!("key_heads={key_heads} head_dim={head_dim}"),
+        })?;
+    let value_dim = value_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "batched Qwen3.6 GDN prep",
+            expected: "value_heads * head_dim without overflow".to_string(),
+            actual: format!("value_heads={value_heads} head_dim={head_dim}"),
+        })?;
+    let conv_dim = key_dim * 2 + value_dim;
+    let qkv_len = batch_size
+        .checked_mul(conv_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "batched Qwen3.6 GDN prep",
+            expected: "batch_size * conv_dim without overflow".to_string(),
+            actual: format!("batch_size={batch_size} conv_dim={conv_dim}"),
+        })?;
+    let value_len = batch_size
+        .checked_mul(value_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "batched Qwen3.6 GDN prep",
+            expected: "batch_size * value_dim without overflow".to_string(),
+            actual: format!("batch_size={batch_size} value_dim={value_dim}"),
+        })?;
+    if batch_size == 0
+        || key_heads == 0
+        || value_heads == 0
+        || head_dim != 128
+        || !value_heads.is_multiple_of(key_heads)
+        || batch_size > u32::MAX as usize
+        || key_heads > u32::MAX as usize
+        || value_heads > u32::MAX as usize
+        || qkv.len() != qkv_len
+        || conv_weight_bf16.len() != conv_dim * 4
+        || q.len() != value_len
+        || k.len() != value_len
+        || v.len() != value_len
+        || conv_state_table.len() != batch_size
+    {
+        return Err(Error::Shape {
+            label: "batched Qwen3.6 GDN prep buffers",
+            expected: format!(
+                "qkv={qkv_len} conv_weight={} q/k/v={value_len} state_table={batch_size}",
+                conv_dim * 4
+            ),
+            actual: format!(
+                "qkv={} conv_weight={} q={} k={} v={} state_table={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_prep_batch_on_stream",
+            ffi::infer_qwen36_gdn_prep_batch_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state_table.ptr,
+                batch_size as u32,
+                key_heads as u32,
+                value_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Computes Qwen3.6 GDN log-decay gate and beta from alpha/beta projections.
 pub fn qwen36_gdn_gate_into_on_stream(
     alpha: &DeviceBuffer<f32>,
@@ -4658,6 +5533,67 @@ pub fn qwen36_gdn_gate_into_on_stream(
                 dt_bias_bf16.ptr,
                 gate.buffer_mut().ptr,
                 beta.buffer_mut().ptr,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Computes Qwen3.6 GDN gates for every row in a decode batch.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_gate_batch_into_on_stream(
+    alpha: &DeviceBuffer<f32>,
+    beta_input: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    mut gate: DeviceOutput<'_, f32>,
+    mut beta: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = batch_size.checked_mul(heads).ok_or_else(|| Error::Shape {
+        label: "batched Qwen3.6 GDN gate",
+        expected: "batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    if batch_size == 0
+        || heads == 0
+        || batch_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || alpha.len() != len
+        || beta_input.len() != len
+        || gate.len() != len
+        || beta.len() != len
+        || a_log_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+    {
+        return Err(Error::Shape {
+            label: "batched Qwen3.6 GDN gate buffers",
+            expected: format!("alpha/beta_input/gate/beta={len} weights={heads}"),
+            actual: format!(
+                "alpha={} beta_input={} gate={} beta={} a_log={} dt_bias={}",
+                alpha.len(),
+                beta_input.len(),
+                gate.len(),
+                beta.len(),
+                a_log_bf16.len(),
+                dt_bias_bf16.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_gate_batch_on_stream",
+            ffi::infer_qwen36_gdn_gate_batch_on_stream(
+                alpha.ptr,
+                beta_input.ptr,
+                a_log_bf16.ptr,
+                dt_bias_bf16.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                batch_size as u32,
                 heads as u32,
                 stream.as_raw(),
             ),
@@ -4967,6 +5903,73 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_full_attn_prep_batch_matches_independent_rows() {
+        let batch = 2usize;
+        let q_heads = 3usize;
+        let kv_heads = 2usize;
+        let head_dim = 8usize;
+        let q_width = q_heads * head_dim;
+        let kv_width = kv_heads * head_dim;
+        let q_full = (0..batch * q_width * 2)
+            .map(|idx| ((idx % 41) as f32 - 20.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let k_raw = (0..batch * kv_width)
+            .map(|idx| ((idx % 31) as f32 - 15.0) * 0.025)
+            .collect::<Vec<_>>();
+        let q_norm = (0..head_dim)
+            .map(|idx| 0.75 + idx as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let k_norm = (0..head_dim)
+            .map(|idx| 1.25 - idx as f32 * 0.025)
+            .collect::<Vec<_>>();
+        let q_full_device = DeviceBuffer::from_host(&q_full).expect("q full upload");
+        let k_raw_device = DeviceBuffer::from_host(&k_raw).expect("k upload");
+        let q_norm_device = DeviceBuffer::from_host(&q_norm).expect("q norm upload");
+        let k_norm_device = DeviceBuffer::from_host(&k_norm).expect("k norm upload");
+        let mut q_device = DeviceBuffer::<f32>::zeroed(batch * q_width).expect("q alloc");
+        let mut gate_device = DeviceBuffer::<f32>::zeroed(batch * q_width).expect("gate alloc");
+        let mut k_device = DeviceBuffer::<f32>::zeroed(batch * kv_width).expect("k alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        qwen36_full_attn_prep_f32_batch_into_on_stream(
+            &q_full_device,
+            &k_raw_device,
+            &q_norm_device,
+            &k_norm_device,
+            q_device.output(),
+            gate_device.output(),
+            k_device.output(),
+            batch,
+            q_heads,
+            kv_heads,
+            head_dim,
+            1.0e-6,
+            &stream,
+        )
+        .expect("batch full-attn prep");
+        let actual_q = q_device.copy_to_host(&stream).expect("q download");
+        let actual_gate = gate_device.copy_to_host(&stream).expect("gate download");
+        let actual_k = k_device.copy_to_host(&stream).expect("k download");
+        for row in 0..batch {
+            let q_range = row * q_width..(row + 1) * q_width;
+            let q_full_range = row * q_width * 2..(row + 1) * q_width * 2;
+            let k_range = row * kv_width..(row + 1) * kv_width;
+            let (expected_q, expected_gate, expected_k) = cpu_qwen36_full_attn_prep(
+                &q_full[q_full_range],
+                &k_raw[k_range.clone()],
+                &q_norm,
+                &k_norm,
+                q_heads,
+                kv_heads,
+                head_dim,
+                1.0e-6,
+            );
+            assert_close(&actual_q[q_range.clone()], &expected_q, 1.0e-6, "batch q");
+            assert_close(&actual_gate[q_range], &expected_gate, 0.0, "batch gate");
+            assert_close(&actual_k[k_range], &expected_k, 1.0e-6, "batch k");
+        }
+    }
+
+    #[test]
     fn moe_topk_f32_matches_cpu_reference() {
         let logits = [0.0f32, 3.0, 1.0, 2.0];
         let logits_device = DeviceBuffer::from_host(&logits).expect("logits upload");
@@ -5050,6 +6053,56 @@ mod tests {
         assert_eq!(indices, [3, 7, 8, 9, 10, 11, 12, 19]);
         for weight in weights.iter() {
             assert!((*weight - 0.125).abs() < 1.0e-6, "weight={weight}");
+        }
+    }
+
+    #[test]
+    fn moe_topk_batch_matches_independent_rows() {
+        let rows = 3usize;
+        let experts = 256usize;
+        let k = 8usize;
+        let logits = (0..rows * experts)
+            .map(|idx| ((idx * 37 % 509) as f32 - 254.0) / 32.0)
+            .collect::<Vec<_>>();
+        let logits_device = DeviceBuffer::from_host(&logits).expect("logits upload");
+        let mut indices = DeviceBuffer::<u32>::zeroed(rows * k).expect("indices");
+        let mut weights = DeviceBuffer::<f32>::zeroed(rows * k).expect("weights");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        moe_topk_f32_batch_into_on_stream(
+            &logits_device,
+            indices.output(),
+            weights.output(),
+            rows,
+            experts,
+            k,
+            true,
+            &stream,
+        )
+        .expect("batch top-k");
+        let indices = indices.copy_to_host(&stream).expect("indices download");
+        let weights = weights.copy_to_host(&stream).expect("weights download");
+        for row in 0..rows {
+            let row_logits = DeviceBuffer::from_host(&logits[row * experts..(row + 1) * experts])
+                .expect("row logits");
+            let mut row_indices = DeviceBuffer::<u32>::zeroed(k).expect("row indices");
+            let mut row_weights = DeviceBuffer::<f32>::zeroed(k).expect("row weights");
+            moe_topk_f32_into_on_stream(
+                &row_logits,
+                row_indices.output(),
+                row_weights.output(),
+                k,
+                true,
+                &stream,
+            )
+            .expect("row top-k");
+            assert_eq!(
+                &indices[row * k..(row + 1) * k],
+                &*row_indices.copy_to_host(&stream).expect("row indices copy")
+            );
+            assert_eq!(
+                &weights[row * k..(row + 1) * k],
+                &*row_weights.copy_to_host(&stream).expect("row weights copy")
+            );
         }
     }
 
@@ -6290,6 +7343,54 @@ mod tests {
     }
 
     #[test]
+    fn bf16_linear_batch_matches_independent_rows() {
+        let batch_size = 3usize;
+        let rows = 5usize;
+        let cols = 19usize;
+        let input = (0..batch_size * cols)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 37) as f32 - 18.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(batch_size * rows).expect("actual");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        bf16_linear_logits_f32_batch_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            batch_size,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("batched projection");
+        let actual = actual.copy_to_host(&stream).expect("actual download");
+        for batch in 0..batch_size {
+            let row_input = DeviceBuffer::from_host(&input[batch * cols..(batch + 1) * cols])
+                .expect("row input");
+            let mut expected = DeviceBuffer::zeroed(rows).expect("expected");
+            bf16_linear_logits_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                &stream,
+            )
+            .expect("row projection");
+            assert_close(
+                &actual[batch * rows..(batch + 1) * rows],
+                &expected.copy_to_host(&stream).expect("expected download"),
+                1.0e-6,
+                "batched BF16 linear",
+            );
+        }
+    }
+
+    #[test]
     fn lm_head_top1_f32_matches_cpu_reference_small() {
         // Small case: rows not a multiple of 8 to exercise the padding path.
         let rows = 17;
@@ -6543,6 +7644,252 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_batched_gdn_matches_independent_sequence_updates() {
+        let batch_size = 2usize;
+        let key_heads = 1usize;
+        let value_heads = 2usize;
+        let head_dim = 128usize;
+        let key_dim = key_heads * head_dim;
+        let value_dim = value_heads * head_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let state_len = value_heads * head_dim * head_dim;
+        let qkv = (0..batch_size * conv_dim)
+            .map(|idx| ((idx * 17 % 97) as f32 - 48.0) * 0.0025)
+            .collect::<Vec<_>>();
+        let conv_weight = (0..conv_dim * 4)
+            .map(|idx| format::f32_to_bf16(((idx * 7 % 31) as f32 - 15.0) * 0.01))
+            .collect::<Vec<_>>();
+        let alpha = (0..batch_size * value_heads)
+            .map(|idx| (idx as f32 - 1.5) * 0.125)
+            .collect::<Vec<_>>();
+        let beta_input = (0..batch_size * value_heads)
+            .map(|idx| (1.5 - idx as f32) * 0.25)
+            .collect::<Vec<_>>();
+        let a_log = (0..value_heads)
+            .map(|idx| format::f32_to_bf16(-2.0 - idx as f32 * 0.25))
+            .collect::<Vec<_>>();
+        let dt_bias = (0..value_heads)
+            .map(|idx| format::f32_to_bf16(-0.5 + idx as f32 * 0.125))
+            .collect::<Vec<_>>();
+        let conv_initial = (0..batch_size)
+            .map(|batch| {
+                (0..conv_dim * 3)
+                    .map(|idx| ((idx * 11 + batch * 13) % 89) as f32 * 0.0005)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let recurrent_initial = (0..batch_size)
+            .map(|batch| {
+                (0..state_len)
+                    .map(|idx| ((idx * 5 + batch * 19) % 101) as f32 * 0.00001)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let qkv_device = DeviceBuffer::from_host(&qkv).expect("qkv");
+        let conv_weight_device = DeviceBuffer::from_host(&conv_weight).expect("conv weight");
+        let alpha_device = DeviceBuffer::from_host(&alpha).expect("alpha");
+        let beta_input_device = DeviceBuffer::from_host(&beta_input).expect("beta input");
+        let a_log_device = DeviceBuffer::from_host(&a_log).expect("a log");
+        let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+        let mut batch_conv_states = conv_initial
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("batch conv state"))
+            .collect::<Vec<_>>();
+        let mut batch_recurrent_states = recurrent_initial
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("batch recurrent state"))
+            .collect::<Vec<_>>();
+        let conv_ptrs = batch_conv_states
+            .iter_mut()
+            .map(|state| state.as_mut_ptr().cast::<f32>())
+            .collect::<Vec<_>>();
+        let recurrent_ptrs = batch_recurrent_states
+            .iter_mut()
+            .map(|state| state.as_mut_ptr().cast::<f32>())
+            .collect::<Vec<_>>();
+        let conv_table = DeviceBuffer::from_host(&conv_ptrs).expect("conv table");
+        let recurrent_table = DeviceBuffer::from_host(&recurrent_ptrs).expect("recurrent table");
+        let mut batch_q = DeviceBuffer::zeroed(batch_size * value_dim).expect("batch q");
+        let mut batch_k = DeviceBuffer::zeroed(batch_size * value_dim).expect("batch k");
+        let mut batch_v = DeviceBuffer::zeroed(batch_size * value_dim).expect("batch v");
+        let mut batch_gate = DeviceBuffer::zeroed(batch_size * value_heads).expect("batch gate");
+        let mut batch_beta = DeviceBuffer::zeroed(batch_size * value_heads).expect("batch beta");
+        let mut batch_output = DeviceBuffer::zeroed(batch_size * value_dim).expect("batch output");
+
+        qwen36_gdn_prep_batch_into_on_stream(
+            &qkv_device,
+            &conv_weight_device,
+            batch_q.output(),
+            batch_k.output(),
+            batch_v.output(),
+            &conv_table,
+            batch_size,
+            key_heads,
+            value_heads,
+            head_dim,
+            &stream,
+        )
+        .expect("batch prep");
+        qwen36_gdn_gate_batch_into_on_stream(
+            &alpha_device,
+            &beta_input_device,
+            &a_log_device,
+            &dt_bias_device,
+            batch_gate.output(),
+            batch_beta.output(),
+            batch_size,
+            value_heads,
+            &stream,
+        )
+        .expect("batch gate");
+        gated_delta_net_128_f32_batch_into_on_stream(
+            &batch_q,
+            &batch_k,
+            &batch_v,
+            &batch_gate,
+            &batch_beta,
+            &recurrent_table,
+            batch_output.output(),
+            batch_size,
+            value_heads,
+            &stream,
+        )
+        .expect("batch recurrent update");
+
+        let batch_q_host = batch_q.copy_to_host(&stream).expect("batch q download");
+        let batch_k_host = batch_k.copy_to_host(&stream).expect("batch k download");
+        let batch_v_host = batch_v.copy_to_host(&stream).expect("batch v download");
+        let batch_gate_host = batch_gate
+            .copy_to_host(&stream)
+            .expect("batch gate download");
+        let batch_beta_host = batch_beta
+            .copy_to_host(&stream)
+            .expect("batch beta download");
+        let batch_output_host = batch_output
+            .copy_to_host(&stream)
+            .expect("batch output download");
+
+        for batch in 0..batch_size {
+            let qkv_row = DeviceBuffer::from_host(&qkv[batch * conv_dim..(batch + 1) * conv_dim])
+                .expect("row qkv");
+            let mut conv_state =
+                DeviceBuffer::from_host(&conv_initial[batch]).expect("row conv state");
+            let mut recurrent_state =
+                DeviceBuffer::from_host(&recurrent_initial[batch]).expect("row recurrent state");
+            let mut q = DeviceBuffer::zeroed(value_dim).expect("row q");
+            let mut k = DeviceBuffer::zeroed(value_dim).expect("row k");
+            let mut v = DeviceBuffer::zeroed(value_dim).expect("row v");
+            qwen36_gdn_prep_into_on_stream(
+                &qkv_row,
+                &conv_weight_device,
+                q.output(),
+                k.output(),
+                v.output(),
+                conv_state.inout(),
+                key_heads,
+                value_heads,
+                head_dim,
+                &stream,
+            )
+            .expect("row prep");
+            let alpha_row =
+                DeviceBuffer::from_host(&alpha[batch * value_heads..(batch + 1) * value_heads])
+                    .expect("row alpha");
+            let beta_input_row = DeviceBuffer::from_host(
+                &beta_input[batch * value_heads..(batch + 1) * value_heads],
+            )
+            .expect("row beta input");
+            let mut gate = DeviceBuffer::zeroed(value_heads).expect("row gate");
+            let mut beta = DeviceBuffer::zeroed(value_heads).expect("row beta");
+            qwen36_gdn_gate_into_on_stream(
+                &alpha_row,
+                &beta_input_row,
+                &a_log_device,
+                &dt_bias_device,
+                gate.output(),
+                beta.output(),
+                value_heads,
+                &stream,
+            )
+            .expect("row gate");
+            let mut output = DeviceBuffer::zeroed(value_dim).expect("row output");
+            gated_delta_net_128_f32_into_on_stream(
+                &q,
+                &k,
+                &v,
+                &gate,
+                &beta,
+                recurrent_state.inout(),
+                output.output(),
+                value_heads,
+                &stream,
+            )
+            .expect("row recurrent update");
+
+            let range = batch * value_dim..(batch + 1) * value_dim;
+            assert_close(
+                &batch_q_host[range.clone()],
+                &q.copy_to_host(&stream).expect("row q download"),
+                1.0e-6,
+                "batched GDN q",
+            );
+            assert_close(
+                &batch_k_host[range.clone()],
+                &k.copy_to_host(&stream).expect("row k download"),
+                1.0e-6,
+                "batched GDN k",
+            );
+            assert_close(
+                &batch_v_host[range.clone()],
+                &v.copy_to_host(&stream).expect("row v download"),
+                1.0e-6,
+                "batched GDN v",
+            );
+            let scalar_range = batch * value_heads..(batch + 1) * value_heads;
+            assert_close(
+                &batch_gate_host[scalar_range.clone()],
+                &gate.copy_to_host(&stream).expect("row gate download"),
+                1.0e-6,
+                "batched GDN gate",
+            );
+            assert_close(
+                &batch_beta_host[scalar_range],
+                &beta.copy_to_host(&stream).expect("row beta download"),
+                1.0e-6,
+                "batched GDN beta",
+            );
+            assert_close(
+                &batch_output_host[range],
+                &output.copy_to_host(&stream).expect("row output download"),
+                1.0e-5,
+                "batched GDN output",
+            );
+            assert_close(
+                &batch_conv_states[batch]
+                    .copy_to_host(&stream)
+                    .expect("batch conv state download"),
+                &conv_state
+                    .copy_to_host(&stream)
+                    .expect("row conv state download"),
+                1.0e-6,
+                "batched GDN conv state",
+            );
+            assert_close(
+                &batch_recurrent_states[batch]
+                    .copy_to_host(&stream)
+                    .expect("batch recurrent state download"),
+                &recurrent_state
+                    .copy_to_host(&stream)
+                    .expect("row recurrent state download"),
+                1.0e-5,
+                "batched GDN recurrent state",
+            );
+        }
+    }
+
+    #[test]
     fn fp8_linear_schedules_match_cpu_reference() {
         let rows = 5usize;
         let cols = 7usize;
@@ -6584,6 +7931,56 @@ mod tests {
                 &expected,
                 2.0e-6,
                 &format!("fp8 linear threads={threads}"),
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_linear_batch_matches_independent_rows() {
+        let batch = 3usize;
+        let rows = 5usize;
+        let cols = 7usize;
+        let input = (0..batch * cols)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.125)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::cuda_e4m3_code(((idx % 13) as f32 - 6.0) * 0.125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let mut actual = DeviceBuffer::<f32>::zeroed(batch * rows).expect("batch output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        fp8_linear_f32_batch_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            batch,
+            rows,
+            cols,
+            0.75,
+            128,
+            &stream,
+        )
+        .expect("batch FP8 linear");
+        let actual = actual.copy_to_host(&stream).expect("batch output copy");
+        for row in 0..batch {
+            let row_input =
+                DeviceBuffer::from_host(&input[row * cols..(row + 1) * cols]).expect("row input");
+            let mut expected = DeviceBuffer::<f32>::zeroed(rows).expect("row output");
+            fp8_linear_configured_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                0.75,
+                128,
+                &stream,
+            )
+            .expect("row FP8 linear");
+            assert_eq!(
+                &actual[row * rows..(row + 1) * rows],
+                &*expected.copy_to_host(&stream).expect("row output copy")
             );
         }
     }
@@ -7109,6 +8506,67 @@ mod tests {
                 .copy_to_host(&stream)
                 .expect("actual download");
             assert_close(&actual, &reference, 2.0e-5, "W4A16 warp-row schedule");
+        }
+    }
+
+    #[test]
+    fn nvfp4_w4a16_batch_matches_independent_rows() {
+        let batch = 3usize;
+        let out_features = 37usize;
+        let in_features = 128usize;
+        let input = (0..batch * in_features)
+            .map(|idx| (((idx * 11) % 29) as f32 - 14.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let mut packed = vec![0u8; out_features * in_features / 2];
+        for idx in 0..out_features * in_features {
+            let code = ((idx * 7 + 5) % 16) as u8;
+            if idx & 1 == 0 {
+                packed[idx / 2] = code;
+            } else {
+                packed[idx / 2] |= code << 4;
+            }
+        }
+        let scales = (0..out_features * (in_features / 16))
+            .map(|idx| [0x28u8, 0x30, 0x38, 0x40][idx % 4])
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let packed_device = DeviceBuffer::from_host(&packed).expect("packed weight");
+        let scale_device = DeviceBuffer::from_host(&scales).expect("weight scale");
+        let mut actual = DeviceBuffer::<f32>::zeroed(batch * out_features).expect("batch output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+            &input_device,
+            &packed_device,
+            &scale_device,
+            actual.output(),
+            batch,
+            out_features,
+            in_features,
+            0.75,
+            &stream,
+        )
+        .expect("batch W4A16");
+        let actual = actual.copy_to_host(&stream).expect("batch output copy");
+        for row in 0..batch {
+            let row_input =
+                DeviceBuffer::from_host(&input[row * in_features..(row + 1) * in_features])
+                    .expect("row input");
+            let mut expected = DeviceBuffer::<f32>::zeroed(out_features).expect("row output");
+            nvfp4_w4a16_matvec_f32_into_on_stream(
+                &row_input,
+                &packed_device,
+                &scale_device,
+                expected.output(),
+                out_features,
+                in_features,
+                0.75,
+                &stream,
+            )
+            .expect("row W4A16");
+            assert_eq!(
+                &actual[row * out_features..(row + 1) * out_features],
+                &*expected.copy_to_host(&stream).expect("row output copy")
+            );
         }
     }
 

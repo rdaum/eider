@@ -55,6 +55,34 @@ __global__ void prepare_routes_and_input_kernel(
     }
 }
 
+__global__ void prepare_routes_and_input_batch_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* __restrict__ input,
+    std::uint16_t* __restrict__ input_bf16,
+    std::int32_t* __restrict__ sorted_token_ids,
+    std::int32_t* __restrict__ expert_ids,
+    std::int32_t* __restrict__ num_tokens_past_padded,
+    std::uint32_t batch_size) {
+    const std::uint32_t batch = blockIdx.x;
+    for (int col = threadIdx.x; col < kHidden; col += blockDim.x) {
+        input_bf16[batch * kHidden + col] = __bfloat16_as_ushort(
+            __float2bfloat16_rn(input[batch * kHidden + col]));
+    }
+    if (threadIdx.x < kTopK) {
+        const std::uint32_t slot = threadIdx.x;
+        const std::uint32_t group = batch * kTopK + slot;
+        expert_ids[group] = static_cast<std::int32_t>(indices[group]);
+        for (int row = 0; row < kMoeBlockSize; ++row) {
+            sorted_token_ids[group * kMoeBlockSize + row] =
+                row == 0 ? static_cast<std::int32_t>(group)
+                         : static_cast<std::int32_t>(batch_size * kTopK);
+        }
+    }
+    if (batch == 0 && threadIdx.x == 0) {
+        num_tokens_past_padded[0] = batch_size * kTopK * kMoeBlockSize;
+    }
+}
+
 __global__ void bf16_to_f32_kernel(
     const std::uint16_t* __restrict__ input,
     float* __restrict__ output,
@@ -165,6 +193,57 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     constexpr std::uint32_t output_len = kTopK * kGateUp;
     constexpr int convert_threads = 256;
     constexpr int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
+    if (output != nullptr) {
+        bf16_to_f32_kernel<<<convert_blocks, convert_threads, 0, stream>>>(
+            output_bf16, output, output_len);
+    }
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint32_t* repacked_weight,
+    const std::uint8_t* weight_scale,
+    const float* global_scale,
+    float* output,
+    std::uint16_t* input_bf16,
+    std::uint16_t* output_bf16,
+    float* reduce_tmp,
+    std::int32_t* locks,
+    std::int32_t* sorted_token_ids,
+    std::int32_t* expert_ids,
+    std::int32_t* num_tokens_past_padded,
+    std::uint32_t batch_size,
+    cudaStream_t stream) {
+    if (indices == nullptr || input == nullptr || repacked_weight == nullptr ||
+        weight_scale == nullptr || global_scale == nullptr ||
+        input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
+        locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
+        num_tokens_past_padded == nullptr || batch_size == 0) {
+        return cudaErrorInvalidValue;
+    }
+    prepare_routes_and_input_batch_kernel<<<batch_size, kThreads, 0, stream>>>(
+        indices, input, input_bf16, sorted_token_ids, expert_ids,
+        num_tokens_past_padded, batch_size);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    auto kernel = marlin_kernel();
+    const int routed_rows = batch_size * kTopK;
+    const int grid_blocks = routed_rows * (kGateUp / 128);
+    kernel<<<grid_blocks, kThreads, kDynamicSharedBytes, stream>>>(
+        reinterpret_cast<const int4*>(input_bf16),
+        reinterpret_cast<const int4*>(repacked_weight),
+        reinterpret_cast<int4*>(output_bf16),
+        reinterpret_cast<int4*>(reduce_tmp), nullptr, nullptr,
+        reinterpret_cast<const int4*>(weight_scale), global_scale, nullptr, nullptr,
+        sorted_token_ids, expert_ids, num_tokens_past_padded, nullptr, kTopK, false,
+        kHidden / 16, batch_size, kGateUp, kHidden, locks, false, false, true);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    const std::uint32_t output_len = routed_rows * kGateUp;
+    constexpr int convert_threads = 256;
+    const int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
     if (output != nullptr) {
         bf16_to_f32_kernel<<<convert_blocks, convert_threads, 0, stream>>>(
             output_bf16, output, output_len);

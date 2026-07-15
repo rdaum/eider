@@ -1,5 +1,5 @@
 use infer::nvfp4::{CudaStream, DeviceBuffer, Error, Result, synchronize_device};
-use infer::qwen3::qwen36::Qwen36Model;
+use infer::qwen3::qwen36::{Qwen36FullAttentionState, Qwen36LinearAttentionState, Qwen36Model};
 use std::env;
 use std::path::PathBuf;
 
@@ -14,7 +14,9 @@ fn main() -> Result<()> {
     let (layer, weights) = model.load_first_linear_attention_layer()?;
     let (full_layer, full_weights) = model.load_first_full_attention_layer()?;
     let mut workspace = model.linear_attention_workspace(&weights)?;
+    let mut state = Qwen36LinearAttentionState::new(linear, &weights)?;
     let mut full_workspace = model.full_attention_workspace(&full_weights, 8)?;
+    let mut full_state = Qwen36FullAttentionState::new(manifest, 8)?;
     let first_hidden = (0..manifest.hidden)
         .map(|idx| ((idx % 31) as f32 - 15.0) * 0.003125)
         .collect::<Vec<_>>();
@@ -27,6 +29,7 @@ fn main() -> Result<()> {
     let (first_qkv, first_z, first_gdn, first_final) = {
         let step = weights.run_one_token(
             &mut workspace,
+            &mut state,
             &first_hidden_device,
             manifest.rms_eps,
             &stream,
@@ -42,6 +45,7 @@ fn main() -> Result<()> {
     let (second_qkv, second_z, second_gdn, second_final) = {
         let step = weights.run_one_token(
             &mut workspace,
+            &mut state,
             &second_hidden_device,
             manifest.rms_eps,
             &stream,
@@ -57,6 +61,7 @@ fn main() -> Result<()> {
     let (first_full_attn, first_full_gated, first_full_output) = {
         let step = full_weights.run_one_token(
             &mut full_workspace,
+            &mut full_state,
             manifest,
             &first_hidden_device,
             0,
@@ -71,6 +76,7 @@ fn main() -> Result<()> {
     let (second_full_attn, second_full_gated, second_full_output) = {
         let step = full_weights.run_one_token(
             &mut full_workspace,
+            &mut full_state,
             manifest,
             &second_hidden_device,
             1,

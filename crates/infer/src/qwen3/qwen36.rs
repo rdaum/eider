@@ -1,5 +1,9 @@
 //! Qwen3.6 / Qwen3.5-MoE hybrid execution pieces.
 
+mod batch;
+
+pub use batch::{Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodedBatch};
+
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
@@ -37,7 +41,10 @@ use super::infer::{
 use super::qwen36_cache::{ensure_layer_cache, ensure_model_cache, prepared_layer_dir};
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+static NEXT_QWEN36_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Loader scaffold for the Qwen3.6/Qwen3.5-MoE hybrid text stack.
 pub struct Qwen36Model {
@@ -75,11 +82,15 @@ pub struct Qwen36FullAttentionWorkspace {
     pub v: DeviceBuffer<f32>,
     pub q_rope: DeviceBuffer<f32>,
     pub k_rope: DeviceBuffer<f32>,
-    compact_cache: Sm12xKvCache,
     compact_attention: Sm12xKvAttentionWorkspace,
     pub attn: DeviceBuffer<f32>,
     pub gated_attn: DeviceBuffer<f32>,
     pub output: DeviceBuffer<f32>,
+}
+
+/// Persistent full-attention state owned by one generated sequence.
+pub struct Qwen36FullAttentionState {
+    compact_cache: Sm12xKvCache,
     cache_capacity: usize,
 }
 
@@ -127,13 +138,17 @@ pub struct Qwen36LinearAttentionWorkspace {
     pub q: DeviceBuffer<f32>,
     pub k: DeviceBuffer<f32>,
     pub v: DeviceBuffer<f32>,
+    pub gdn_output: DeviceBuffer<f32>,
+    pub normed: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+}
+
+/// Persistent Gated Delta Net state owned by one generated sequence.
+pub struct Qwen36LinearAttentionState {
     /// Conv recurrent state, laid out as `[conv_channel][kernel - 1]`.
     pub conv_state: DeviceBuffer<f32>,
     /// GDN recurrent state, laid out as `[value_head][col][row]`.
     pub recurrent_state: DeviceBuffer<f32>,
-    pub gdn_output: DeviceBuffer<f32>,
-    pub normed: DeviceBuffer<f32>,
-    output: DeviceBuffer<f32>,
 }
 
 /// Borrowed outputs from one linear-attention step.
@@ -533,15 +548,16 @@ impl Qwen36FullAttentionWeights {
     pub fn prepare_qkv_one_token(
         &self,
         workspace: &mut Qwen36FullAttentionWorkspace,
+        state: &Qwen36FullAttentionState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        if position >= workspace.cache_capacity {
+        if position >= state.cache_capacity {
             return Err(Error::Shape {
                 label: "Qwen3.6 full-attention preparation",
-                expected: format!("position < {}", workspace.cache_capacity),
+                expected: format!("position < {}", state.cache_capacity),
                 actual: position.to_string(),
             });
         }
@@ -582,28 +598,29 @@ impl Qwen36FullAttentionWeights {
     pub fn run_one_token<'a>(
         &'a self,
         workspace: &'a mut Qwen36FullAttentionWorkspace,
+        state: &mut Qwen36FullAttentionState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<Qwen36FullAttentionStep<'a>> {
-        if position >= workspace.cache_capacity {
+        if position >= state.cache_capacity {
             return Err(Error::Shape {
                 label: "Qwen3.6 full-attention cache",
-                expected: format!("position < {}", workspace.cache_capacity),
+                expected: format!("position < {}", state.cache_capacity),
                 actual: position.to_string(),
             });
         }
 
-        self.prepare_qkv_one_token(workspace, manifest, hidden, position, stream)?;
-        workspace.compact_cache.append_at_on_stream(
+        self.prepare_qkv_one_token(workspace, state, manifest, hidden, position, stream)?;
+        state.compact_cache.append_at_on_stream(
             &workspace.k_rope,
             &workspace.v,
             position,
             stream,
         )?;
         workspace.compact_attention.attention_into_on_stream(
-            &workspace.compact_cache,
+            &state.compact_cache,
             &workspace.q_rope,
             workspace.attn.output(),
             stream,
@@ -630,9 +647,11 @@ impl Qwen36FullAttentionWeights {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_one_token_indexed<'a>(
         &'a self,
         workspace: &'a mut Qwen36FullAttentionWorkspace,
+        state: &mut Qwen36FullAttentionState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: &DeviceBuffer<u32>,
@@ -670,7 +689,7 @@ impl Qwen36FullAttentionWeights {
             position,
             stream,
         )?;
-        workspace.compact_cache.append_indexed_on_stream(
+        state.compact_cache.append_indexed_on_stream(
             &workspace.k_rope,
             &workspace.v,
             position,
@@ -679,7 +698,7 @@ impl Qwen36FullAttentionWeights {
         workspace
             .compact_attention
             .attention_indexed_into_on_stream(
-                &workspace.compact_cache,
+                &state.compact_cache,
                 &workspace.q_rope,
                 cache_len,
                 workspace.attn.output(),
@@ -936,6 +955,7 @@ impl Qwen36LinearAttentionWeights {
     fn enqueue_pre_gdn(
         &self,
         workspace: &mut Qwen36LinearAttentionWorkspace,
+        state: &mut Qwen36LinearAttentionState,
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -947,7 +967,7 @@ impl Qwen36LinearAttentionWeights {
             workspace.q.output(),
             workspace.k.output(),
             workspace.v.output(),
-            workspace.conv_state.inout(),
+            state.conv_state.inout(),
             workspace.linear.key_heads,
             workspace.linear.value_heads,
             workspace.linear.value_head_dim,
@@ -968,6 +988,7 @@ impl Qwen36LinearAttentionWeights {
     fn enqueue_gdn(
         &self,
         workspace: &mut Qwen36LinearAttentionWorkspace,
+        state: &mut Qwen36LinearAttentionState,
         stream: &CudaStream,
     ) -> Result<()> {
         gated_delta_net_128_f32_into_on_stream(
@@ -976,7 +997,7 @@ impl Qwen36LinearAttentionWeights {
             &workspace.v,
             &workspace.gate,
             &workspace.beta,
-            workspace.recurrent_state.inout(),
+            state.recurrent_state.inout(),
             workspace.gdn_output.output(),
             workspace.linear.value_heads,
             stream,
@@ -1007,6 +1028,7 @@ impl Qwen36LinearAttentionWeights {
     pub fn run_one_token<'a>(
         &'a self,
         workspace: &'a mut Qwen36LinearAttentionWorkspace,
+        state: &mut Qwen36LinearAttentionState,
         hidden: &DeviceBuffer<f32>,
         rms_eps: f32,
         stream: &CudaStream,
@@ -1026,7 +1048,7 @@ impl Qwen36LinearAttentionWeights {
                     workspace.q.output(),
                     workspace.k.output(),
                     workspace.v.output(),
-                    workspace.conv_state.inout(),
+                    state.conv_state.inout(),
                     workspace.linear.key_heads,
                     workspace.linear.value_heads,
                     workspace.linear.value_head_dim,
@@ -1054,7 +1076,7 @@ impl Qwen36LinearAttentionWeights {
                     &workspace.v,
                     &workspace.gate,
                     &workspace.beta,
-                    workspace.recurrent_state.inout(),
+                    state.recurrent_state.inout(),
                     workspace.gdn_output.output(),
                     workspace.linear.value_heads,
                     stream,
@@ -1077,8 +1099,8 @@ impl Qwen36LinearAttentionWeights {
             let (_, ms) = timed_cuda(stream, || self.run_output_projection(workspace, stream))?;
             profile.qwen36_linear_out_ms += ms;
         } else {
-            self.enqueue_pre_gdn(workspace, hidden, stream)?;
-            self.enqueue_gdn(workspace, stream)?;
+            self.enqueue_pre_gdn(workspace, state, hidden, stream)?;
+            self.enqueue_gdn(workspace, state, stream)?;
             self.enqueue_post_gdn(workspace, rms_eps, stream)?;
         }
         Ok(Qwen36LinearAttentionStep {
@@ -1118,13 +1140,24 @@ impl Qwen36LinearAttentionWorkspace {
             q: DeviceBuffer::zeroed(value_dim)?,
             k: DeviceBuffer::zeroed(value_dim)?,
             v: DeviceBuffer::zeroed(value_dim)?,
+            gdn_output: DeviceBuffer::zeroed(value_dim)?,
+            normed: DeviceBuffer::zeroed(value_dim)?,
+            output: DeviceBuffer::zeroed(manifest.hidden)?,
+        })
+    }
+}
+
+impl Qwen36LinearAttentionState {
+    /// Allocates empty recurrent state for one generated sequence.
+    pub fn new(
+        linear: QwenLinearAttentionConfig,
+        weights: &Qwen36LinearAttentionWeights,
+    ) -> Result<Self> {
+        Ok(Self {
             conv_state: DeviceBuffer::zeroed(weights.qkv.rows * (linear.conv_kernel - 1))?,
             recurrent_state: DeviceBuffer::zeroed(
                 linear.value_heads * linear.value_head_dim * linear.value_head_dim,
             )?,
-            gdn_output: DeviceBuffer::zeroed(value_dim)?,
-            normed: DeviceBuffer::zeroed(value_dim)?,
-            output: DeviceBuffer::zeroed(manifest.hidden)?,
         })
     }
 }
@@ -1156,7 +1189,6 @@ impl Qwen36FullAttentionWorkspace {
             v: DeviceBuffer::zeroed(kv_width)?,
             q_rope: DeviceBuffer::zeroed(q_width)?,
             k_rope: DeviceBuffer::zeroed(kv_width)?,
-            compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
             compact_attention: Sm12xKvAttentionWorkspace::new(
                 cache_capacity,
                 manifest.kv_heads,
@@ -1165,6 +1197,22 @@ impl Qwen36FullAttentionWorkspace {
             attn: DeviceBuffer::zeroed(q_width)?,
             gated_attn: DeviceBuffer::zeroed(q_width)?,
             output: DeviceBuffer::zeroed(manifest.hidden)?,
+        })
+    }
+}
+
+impl Qwen36FullAttentionState {
+    /// Allocates an empty compact KV cache for one generated sequence.
+    pub fn new(manifest: &QwenModelManifest, cache_capacity: usize) -> Result<Self> {
+        if cache_capacity == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.6 full-attention state",
+                expected: "non-zero cache capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        Ok(Self {
+            compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
             cache_capacity,
         })
     }
@@ -3641,6 +3689,27 @@ impl Nvfp4DeviceLinear {
         )?;
         maybe_round_device_f32_to_bf16(output, stream)
     }
+
+    fn run_f32_batch_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        crate::nvfp4::nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+            input,
+            &self.packed_weight,
+            &self.weight_scale,
+            output.output(),
+            rows,
+            self.out_features,
+            self.in_features,
+            self.weight_scale_2,
+            stream,
+        )?;
+        maybe_round_device_f32_to_bf16(output, stream)
+    }
 }
 
 impl Sm12xDeviceLinear {
@@ -3960,6 +4029,18 @@ pub enum Qwen36AttentionWorkspace {
     FullAttention(Qwen36FullAttentionWorkspace),
 }
 
+/// Persistent attention state for one layer of one generated sequence.
+pub enum Qwen36AttentionState {
+    LinearAttention(Qwen36LinearAttentionState),
+    FullAttention(Qwen36FullAttentionState),
+}
+
+/// Persistent state for one model layer of one generated sequence.
+pub struct Qwen36LayerSequenceState {
+    pub kind: QwenLayerKind,
+    pub attention: Qwen36AttentionState,
+}
+
 /// Borrowed outputs from one layer-block step.
 pub struct Qwen36LayerBlockStep<'a> {
     /// Final block output (already includes the second residual add).
@@ -4049,9 +4130,37 @@ impl Qwen36LayerBlock {
         })
     }
 
+    /// Allocates persistent state for one layer of one generated sequence.
+    pub fn sequence_state(
+        &self,
+        model: &Qwen36Model,
+        cache_capacity: usize,
+    ) -> Result<Qwen36LayerSequenceState> {
+        let manifest = model.manifest();
+        let attention = match &self.attention {
+            Qwen36Attention::LinearAttention(weights) => {
+                let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 linear-attention state",
+                    detail: "manifest has no linear-attention configuration".to_string(),
+                })?;
+                Qwen36AttentionState::LinearAttention(Qwen36LinearAttentionState::new(
+                    linear, weights,
+                )?)
+            }
+            Qwen36Attention::FullAttention(_) => Qwen36AttentionState::FullAttention(
+                Qwen36FullAttentionState::new(manifest, cache_capacity)?,
+            ),
+        };
+        Ok(Qwen36LayerSequenceState {
+            kind: self.kind,
+            attention,
+        })
+    }
+
     fn enqueue_linear_pre_gdn(
         &self,
         workspace: &mut Qwen36LayerBlockWorkspace,
+        state: &mut Qwen36LayerSequenceState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
@@ -4065,11 +4174,21 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        match (&self.attention, &mut workspace.attention) {
+        match (
+            &self.attention,
+            &mut workspace.attention,
+            &mut state.attention,
+        ) {
             (
                 Qwen36Attention::LinearAttention(weights),
                 Qwen36AttentionWorkspace::LinearAttention(attention_workspace),
-            ) => weights.enqueue_pre_gdn(attention_workspace, &workspace.normed_hidden, stream),
+                Qwen36AttentionState::LinearAttention(attention_state),
+            ) => weights.enqueue_pre_gdn(
+                attention_workspace,
+                attention_state,
+                &workspace.normed_hidden,
+                stream,
+            ),
             _ => Err(Error::Format {
                 label: "Qwen3.6 segmented graph",
                 detail: "pre-GDN segment requires a linear-attention layer".to_string(),
@@ -4080,13 +4199,19 @@ impl Qwen36LayerBlock {
     fn enqueue_linear_gdn(
         &self,
         workspace: &mut Qwen36LayerBlockWorkspace,
+        state: &mut Qwen36LayerSequenceState,
         stream: &CudaStream,
     ) -> Result<()> {
-        match (&self.attention, &mut workspace.attention) {
+        match (
+            &self.attention,
+            &mut workspace.attention,
+            &mut state.attention,
+        ) {
             (
                 Qwen36Attention::LinearAttention(weights),
                 Qwen36AttentionWorkspace::LinearAttention(attention_workspace),
-            ) => weights.enqueue_gdn(attention_workspace, stream),
+                Qwen36AttentionState::LinearAttention(attention_state),
+            ) => weights.enqueue_gdn(attention_workspace, attention_state, stream),
             _ => Err(Error::Format {
                 label: "Qwen3.6 segmented graph",
                 detail: "direct GDN update requires a linear-attention layer".to_string(),
@@ -4152,6 +4277,7 @@ impl Qwen36LayerBlock {
         &self,
         lt: &CublasLt,
         workspace: &mut Qwen36LayerBlockWorkspace,
+        state: &mut Qwen36LayerSequenceState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: &DeviceBuffer<u32>,
@@ -4168,13 +4294,19 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        let attn_output = match (&self.attention, &mut workspace.attention) {
+        let attn_output = match (
+            &self.attention,
+            &mut workspace.attention,
+            &mut state.attention,
+        ) {
             (
                 Qwen36Attention::FullAttention(weights),
                 Qwen36AttentionWorkspace::FullAttention(attention_workspace),
+                Qwen36AttentionState::FullAttention(attention_state),
             ) => {
                 weights.run_one_token_indexed(
                     attention_workspace,
+                    attention_state,
                     manifest,
                     &workspace.normed_hidden,
                     position,
@@ -4230,6 +4362,7 @@ impl Qwen36LayerBlock {
         &'a self,
         lt: &CublasLt,
         workspace: &'a mut Qwen36LayerBlockWorkspace,
+        state: &mut Qwen36LayerSequenceState,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: usize,
@@ -4267,6 +4400,7 @@ impl Qwen36LayerBlock {
                 run_qwen36_attention(
                     &self.attention,
                     &mut workspace.attention,
+                    &mut state.attention,
                     manifest,
                     &workspace.normed_hidden,
                     position,
@@ -4285,6 +4419,7 @@ impl Qwen36LayerBlock {
             run_qwen36_attention(
                 &self.attention,
                 &mut workspace.attention,
+                &mut state.attention,
                 manifest,
                 &workspace.normed_hidden,
                 position,
@@ -4377,6 +4512,7 @@ impl Qwen36LayerBlock {
 fn run_qwen36_attention<'a>(
     attention: &'a Qwen36Attention,
     workspace: &'a mut Qwen36AttentionWorkspace,
+    state: &mut Qwen36AttentionState,
     manifest: &QwenModelManifest,
     normed_hidden: &DeviceBuffer<f32>,
     position: usize,
@@ -4384,8 +4520,12 @@ fn run_qwen36_attention<'a>(
     profile: Option<&mut QwenDecodeProfile>,
     mut gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
 ) -> Result<&'a DeviceBuffer<f32>> {
-    match (attention, workspace) {
-        (Qwen36Attention::LinearAttention(w), Qwen36AttentionWorkspace::LinearAttention(ws)) => {
+    match (attention, workspace, state) {
+        (
+            Qwen36Attention::LinearAttention(w),
+            Qwen36AttentionWorkspace::LinearAttention(ws),
+            Qwen36AttentionState::LinearAttention(sequence),
+        ) => {
             let step = if gpu_probe
                 .as_ref()
                 .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::LinearAttention))
@@ -4394,14 +4534,25 @@ fn run_qwen36_attention<'a>(
                     .as_deref_mut()
                     .expect("probe present")
                     .capture(|| {
-                        w.run_one_token(ws, normed_hidden, manifest.rms_eps, stream, None)
+                        w.run_one_token(ws, sequence, normed_hidden, manifest.rms_eps, stream, None)
                     })?
             } else {
-                w.run_one_token(ws, normed_hidden, manifest.rms_eps, stream, profile)?
+                w.run_one_token(
+                    ws,
+                    sequence,
+                    normed_hidden,
+                    manifest.rms_eps,
+                    stream,
+                    profile,
+                )?
             };
             Ok(step.output)
         }
-        (Qwen36Attention::FullAttention(w), Qwen36AttentionWorkspace::FullAttention(ws)) => {
+        (
+            Qwen36Attention::FullAttention(w),
+            Qwen36AttentionWorkspace::FullAttention(ws),
+            Qwen36AttentionState::FullAttention(sequence),
+        ) => {
             let step = if gpu_probe
                 .as_ref()
                 .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::FullAttention))
@@ -4409,9 +4560,11 @@ fn run_qwen36_attention<'a>(
                 gpu_probe
                     .as_deref_mut()
                     .expect("probe present")
-                    .capture(|| w.run_one_token(ws, manifest, normed_hidden, position, stream))?
+                    .capture(|| {
+                        w.run_one_token(ws, sequence, manifest, normed_hidden, position, stream)
+                    })?
             } else {
-                w.run_one_token(ws, manifest, normed_hidden, position, stream)?
+                w.run_one_token(ws, sequence, manifest, normed_hidden, position, stream)?
             };
             Ok(step.output)
         }
@@ -4436,12 +4589,13 @@ fn timed_cuda<T>(stream: &CudaStream, f: impl FnOnce() -> Result<T>) -> Result<(
 // Full text model: embedding + 40 layer blocks + final norm + lm_head
 // ---------------------------------------------------------------------------
 
-/// Fully loaded Qwen3.6 text model ready for one-token-at-a-time decode.
+/// Fully loaded Qwen3.6 text model ready for stateful batched decode.
 ///
 /// Holds all layer block weights, the BF16 embedding table, the final RMSNorm
 /// weight, and the quantized lm_head. Routed-expert NVFP4 weights are loaded
 /// lazily on first use.
 pub struct Qwen36TextModel {
+    model_id: u64,
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
     lt: CublasLt,
@@ -4594,6 +4748,29 @@ struct Qwen36MoeGraphSync {
 }
 
 /// Mutable decode state for [`Qwen36TextModel`].
+pub struct Qwen36SequenceState {
+    model_id: u64,
+    layer_states: Vec<Qwen36LayerSequenceState>,
+    position: usize,
+    max_tokens: usize,
+}
+
+impl Qwen36SequenceState {
+    /// Returns the next position that will be written by decode.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the allocated context capacity.
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+}
+
+/// Legacy single-row execution state.
+///
+/// Persistent sequence state is kept separately from reusable execution
+/// scratch so the canonical batched decoder can regroup sequences freely.
 pub struct Qwen36DecodeState {
     stream: CudaStream,
     parallel_moe_stream: Option<CudaStream>,
@@ -4602,12 +4779,11 @@ pub struct Qwen36DecodeState {
     position_device: DeviceBuffer<u32>,
     cache_len_device: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
+    sequence: Qwen36SequenceState,
     layer_workspaces: Vec<Qwen36LayerBlockWorkspace>,
     final_hidden: DeviceBuffer<f32>,
     lm_head: Qwen36LmHeadWorkspace,
     segmented_graphs: Option<Vec<Qwen36LayerGraphs>>,
-    position: usize,
-    max_tokens: usize,
 }
 
 /// One decoded next-token result.
@@ -4720,6 +4896,7 @@ impl Qwen36TextModel {
             });
         }
         Ok(Self {
+            model_id: NEXT_QWEN36_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             manifest,
             checkpoint,
             lt,
@@ -4741,14 +4918,33 @@ impl Qwen36TextModel {
     }
 
     /// Allocates a decode state capable of storing `max_tokens` positions.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Qwen36DecodeState> {
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Qwen36SequenceState> {
         if max_tokens == 0 {
             return Err(Error::Shape {
-                label: "Qwen3.6 decode state",
+                label: "Qwen3.6 sequence state",
                 expected: "max_tokens > 0".to_string(),
                 actual: "0".to_string(),
             });
         }
+        let model = Qwen36Model {
+            manifest: self.manifest.clone(),
+            checkpoint: self.checkpoint.clone(),
+        };
+        let mut layer_states = Vec::with_capacity(self.layers.len());
+        for block in &self.layers {
+            layer_states.push(block.sequence_state(&model, max_tokens)?);
+        }
+        Ok(Qwen36SequenceState {
+            model_id: self.model_id,
+            layer_states,
+            position: 0,
+            max_tokens,
+        })
+    }
+
+    /// Allocates the legacy single-row decode state.
+    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Qwen36DecodeState> {
+        let sequence = self.new_sequence_state(max_tokens)?;
         let stream = CudaStream::new_blocking()?;
         let mut layer_workspaces = Vec::with_capacity(self.layers.len());
         let model = Qwen36Model {
@@ -4781,6 +4977,7 @@ impl Qwen36TextModel {
             position_device: DeviceBuffer::zeroed(1)?,
             cache_len_device: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
+            sequence,
             layer_workspaces,
             final_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             lm_head: Qwen36LmHeadWorkspace {
@@ -4793,8 +4990,6 @@ impl Qwen36TextModel {
                 next_value: DeviceBuffer::zeroed(1)?,
             },
             segmented_graphs: None,
-            position: 0,
-            max_tokens,
         };
         if enable_segmented_graphs {
             state.segmented_graphs = Some(self.capture_segmented_graphs(&mut state)?);
@@ -4818,17 +5013,25 @@ impl Qwen36TextModel {
                     join: &sync.join,
                 });
             let (previous, current) = state.layer_workspaces.split_at_mut(layer_idx);
+            let (_, current_state) = state.sequence.layer_states.split_at_mut(layer_idx);
             let hidden = if layer_idx == 0 {
                 &state.hidden
             } else {
                 &previous[layer_idx - 1].moe.ffn_out
             };
             let workspace = &mut current[0];
+            let sequence = &mut current_state[0];
             match &block.attention {
                 Qwen36Attention::LinearAttention(_) => {
                     let layer = state.stream.capture(|stream| {
-                        block.enqueue_linear_pre_gdn(workspace, &self.manifest, hidden, stream)?;
-                        block.enqueue_linear_gdn(workspace, stream)?;
+                        block.enqueue_linear_pre_gdn(
+                            workspace,
+                            sequence,
+                            &self.manifest,
+                            hidden,
+                            stream,
+                        )?;
+                        block.enqueue_linear_gdn(workspace, sequence, stream)?;
                         block.enqueue_linear_post_gdn(
                             &self.lt,
                             workspace,
@@ -4845,6 +5048,7 @@ impl Qwen36TextModel {
                         block.enqueue_full_layer_indexed(
                             &self.lt,
                             workspace,
+                            sequence,
                             &self.manifest,
                             hidden,
                             &state.position_device,
@@ -4917,11 +5121,11 @@ impl Qwen36TextModel {
         mut gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
         return_logits: bool,
     ) -> Result<(Qwen36NextToken, Option<Vec<f32>>)> {
-        if state.position >= state.max_tokens {
+        if state.sequence.position >= state.sequence.max_tokens {
             return Err(Error::Shape {
                 label: "Qwen3.6 decode position",
-                expected: format!("position < {}", state.max_tokens),
-                actual: state.position.to_string(),
+                expected: format!("position < {}", state.sequence.max_tokens),
+                actual: state.sequence.position.to_string(),
             });
         }
         if (token_id as usize) >= self.manifest.vocab {
@@ -4966,10 +5170,10 @@ impl Qwen36TextModel {
         if let Some(graphs) = state.segmented_graphs.as_ref() {
             state
                 .position_device
-                .copy_from_host(&[state.position as u32])?;
+                .copy_from_host(&[state.sequence.position as u32])?;
             state
                 .cache_len_device
-                .copy_from_host(&[(state.position + 1) as u32])?;
+                .copy_from_host(&[(state.sequence.position + 1) as u32])?;
             for graph in graphs {
                 match graph {
                     Qwen36LayerGraphs::Linear(graph) => {
@@ -4981,6 +5185,7 @@ impl Qwen36TextModel {
         } else {
             for (layer_idx, block) in self.layers.iter().enumerate() {
                 let (previous, current) = state.layer_workspaces.split_at_mut(layer_idx);
+                let (_, current_state) = state.sequence.layer_states.split_at_mut(layer_idx);
                 let hidden = if layer_idx == 0 {
                     &state.hidden
                 } else {
@@ -4989,9 +5194,10 @@ impl Qwen36TextModel {
                 block.run_one_token(
                     &self.lt,
                     &mut current[0],
+                    &mut current_state[0],
                     &self.manifest,
                     hidden,
-                    state.position,
+                    state.sequence.position,
                     stream,
                     profile.as_deref_mut(),
                     gpu_probe.as_deref_mut(),
@@ -5060,7 +5266,7 @@ impl Qwen36TextModel {
             let value = state.lm_head.next_value.copy_to_host(stream)?[0];
             (id, value, None)
         };
-        state.position += 1;
+        state.sequence.position += 1;
         Ok((Qwen36NextToken { id, value }, logits))
     }
 }

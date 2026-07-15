@@ -238,6 +238,65 @@ impl Sm12xKvCache {
         Ok(())
     }
 
+    /// Enqueues one K/V append from row offsets in larger dense buffers.
+    pub fn append_at_offsets_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        key_offset: usize,
+        value: &DeviceBuffer<f32>,
+        value_offset: usize,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.kv_heads * self.head_dim;
+        if key_offset
+            .checked_add(width)
+            .is_none_or(|end| end > key.len())
+            || value_offset
+                .checked_add(width)
+                .is_none_or(|end| end > value.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV append offsets",
+                expected: format!("{width} readable values at each row offset"),
+                actual: format!(
+                    "key_len={} key_offset={key_offset} value_len={} value_offset={value_offset}",
+                    key.len(),
+                    value.len()
+                ),
+            });
+        }
+        if position >= self.max_tokens {
+            return Err(Error::Shape {
+                label: "SM12x KV append capacity",
+                expected: format!("fewer than {} rows", self.max_tokens),
+                actual: format!("{} rows", position + 1),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_on_stream(
+                    key.as_const_ptr().cast::<f32>().add(key_offset),
+                    value.as_const_ptr().cast::<f32>().add(value_offset),
+                    self.key_values.as_mut_ptr().cast(),
+                    self.key_scales.as_mut_ptr().cast(),
+                    self.value_values.as_mut_ptr().cast(),
+                    self.value_scales.as_mut_ptr().cast(),
+                    self.key_tail.as_mut_ptr().cast(),
+                    self.value_tail.as_mut_ptr().cast(),
+                    position as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.len = position + 1;
+        Ok(())
+    }
+
     /// Enqueues one K/V append using a device-resident position for CUDA graphs.
     pub fn append_indexed_on_stream(
         &mut self,
@@ -356,7 +415,7 @@ impl Sm12xKvAttentionWorkspace {
                 actual: "0".to_string(),
             });
         }
-        if cache.max_tokens != self.max_tokens
+        if cache.max_tokens > self.max_tokens
             || cache.kv_heads != self.kv_heads
             || cache.head_dim != self.head_dim
         {
@@ -399,7 +458,79 @@ impl Sm12xKvAttentionWorkspace {
                     self.probability_scales.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache.len as u32,
-                    self.max_tokens as u32,
+                    cache.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Enqueues attention from and into row offsets in larger dense buffers.
+    pub fn attention_offsets_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        query_offset: usize,
+        mut output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0
+            || cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x offset KV attention cache",
+                expected: format!(
+                    "non-empty max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "len={} max_tokens={} kv_heads={} head_dim={}",
+                    cache.len, cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let width = self.kv_heads * MMA_N * self.head_dim;
+        if query_offset
+            .checked_add(width)
+            .is_none_or(|end| end > query.len())
+            || output_offset
+                .checked_add(width)
+                .is_none_or(|end| end > output.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV attention offsets",
+                expected: format!("{width} readable/writable values at each row offset"),
+                actual: format!(
+                    "query_len={} query_offset={query_offset} output_len={} output_offset={output_offset}",
+                    query.len(),
+                    output.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_on_stream(
+                    query.as_const_ptr().cast::<f32>().add(query_offset),
+                    cache.key_values.as_const_ptr().cast(),
+                    cache.key_scales.as_const_ptr().cast(),
+                    cache.key_tail.as_const_ptr().cast(),
+                    cache.value_values.as_const_ptr().cast(),
+                    cache.value_scales.as_const_ptr().cast(),
+                    cache.value_tail.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast::<f32>().add(output_offset),
+                    cache.len as u32,
+                    cache.max_tokens as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -417,7 +548,7 @@ impl Sm12xKvAttentionWorkspace {
         mut output: DeviceOutput<'_, f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        if cache.max_tokens != self.max_tokens
+        if cache.max_tokens > self.max_tokens
             || cache.kv_heads != self.kv_heads
             || cache.head_dim != self.head_dim
         {
@@ -464,7 +595,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.probability_scales.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache_len.as_const_ptr().cast(),
-                    self.max_tokens as u32,
+                    cache.max_tokens as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -482,7 +613,7 @@ impl Sm12xKvAttentionWorkspace {
         stream: &CudaStream,
     ) -> Result<()> {
         if cache.len == 0
-            || cache.max_tokens != self.max_tokens
+            || cache.max_tokens > self.max_tokens
             || cache.kv_heads != self.kv_heads
             || cache.head_dim != self.head_dim
         {
@@ -524,7 +655,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.probability_scales.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache.len as u32,
-                    self.max_tokens as u32,
+                    cache.max_tokens as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -668,8 +799,8 @@ mod tests {
                     );
                     let tile = (head * value_dim_tiles + dim_tile) * value_token_tiles;
                     expected_value_scales[(tile * MMA_N + dim) * 4] = scale_code;
-                    for token in 0..16 {
-                        let value = value_rows[token][head * HEAD_DIM + dim_tile * 8 + dim];
+                    for (token, row) in value_rows.iter().enumerate().take(16) {
+                        let value = row[head * HEAD_DIM + dim_tile * 8 + dim];
                         let code = crate::format::e2m1_code(if scale == 0.0 {
                             0.0
                         } else {
@@ -827,5 +958,88 @@ mod tests {
             max_abs <= 0.25,
             "Qwen-shape compact FP4 attention error too large: max_abs={max_abs}"
         );
+    }
+
+    #[test]
+    fn dense_row_offsets_match_independent_cache_and_attention() {
+        const MAX_TOKENS: usize = 4;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let keys = (0..2 * kv_width)
+            .map(|index| ((index * 29 % 257) as f32 - 128.0) / 96.0)
+            .collect::<Vec<_>>();
+        let values = (0..2 * kv_width)
+            .map(|index| ((index * 43 % 251) as f32 - 125.0) / 80.0)
+            .collect::<Vec<_>>();
+        let queries = (0..2 * q_width)
+            .map(|index| ((index * 17 % 239) as f32 - 119.0) / 112.0)
+            .collect::<Vec<_>>();
+        let key_rows = DeviceBuffer::from_host(&keys).expect("dense keys");
+        let value_rows = DeviceBuffer::from_host(&values).expect("dense values");
+        let query_rows = DeviceBuffer::from_host(&queries).expect("dense queries");
+        let key = DeviceBuffer::from_host(&keys[kv_width..]).expect("key row");
+        let value = DeviceBuffer::from_host(&values[kv_width..]).expect("value row");
+        let query = DeviceBuffer::from_host(&queries[q_width..]).expect("query row");
+        let stream = CudaStream::new_blocking().expect("stream");
+
+        let mut direct_cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        direct_cache
+            .append_on_stream(&key, &value, &stream)
+            .expect("direct append");
+        let mut offset_cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        offset_cache
+            .append_at_offsets_on_stream(&key_rows, kv_width, &value_rows, kv_width, 0, &stream)
+            .expect("offset append");
+
+        assert_eq!(
+            &*direct_cache
+                .key_tail()
+                .copy_to_host(&stream)
+                .expect("direct key tail"),
+            &*offset_cache
+                .key_tail()
+                .copy_to_host(&stream)
+                .expect("offset key tail")
+        );
+        assert_eq!(
+            &*direct_cache
+                .value_tail()
+                .copy_to_host(&stream)
+                .expect("direct value tail"),
+            &*offset_cache
+                .value_tail()
+                .copy_to_host(&stream)
+                .expect("offset value tail")
+        );
+
+        let mut direct_workspace =
+            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+        let mut direct_output = DeviceBuffer::zeroed(q_width).expect("direct output");
+        direct_workspace
+            .attention_into_on_stream(&direct_cache, &query, direct_output.output(), &stream)
+            .expect("direct attention");
+        let mut offset_workspace =
+            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+        let mut offset_output = DeviceBuffer::zeroed(2 * q_width).expect("offset output");
+        offset_workspace
+            .attention_offsets_into_on_stream(
+                &offset_cache,
+                &query_rows,
+                q_width,
+                offset_output.output(),
+                q_width,
+                &stream,
+            )
+            .expect("offset attention");
+        let direct_output = direct_output
+            .copy_to_host(&stream)
+            .expect("direct output copy");
+        let offset_output = offset_output
+            .copy_to_host(&stream)
+            .expect("offset output copy");
+        assert_eq!(&*direct_output, &offset_output[q_width..]);
     }
 }
