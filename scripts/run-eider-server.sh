@@ -13,13 +13,12 @@ if [[ ! -d "$model_dir" ]]; then
   exit 1
 fi
 
-echo "building eider-serve" >&2
+echo "Building eider-serve..." >&2
 cargo build --release \
   --manifest-path "$repo_dir/Cargo.toml" \
   -p eider-api \
   --bin eider-serve
 
-echo "launching $served_model; the API will become available after model loading" >&2
 exec "$repo_dir/target/release/eider-serve" \
   "$model_dir" \
   --listen "$listen" \

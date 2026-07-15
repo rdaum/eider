@@ -3,6 +3,7 @@ use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use infer::runtime::scheduler::Qwen36SchedulerConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(about = "Serve Eider through the OpenAI Responses API")]
@@ -45,6 +46,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+    info!("Eider");
     let args = Args::parse();
     let mut actor_config = InferenceActorConfig::new(&args.model_dir);
     actor_config.scheduler = Qwen36SchedulerConfig {
@@ -62,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bearer_token: std::env::var(&args.api_key_env).ok(),
         context_window: args.max_context_tokens,
     };
-    eprintln!("serving model {} at http://{}", config.model, config.listen);
+    info!(model = %config.model, listen = %config.listen, "serving model");
     serve(actor, config).await?;
     Ok(())
 }

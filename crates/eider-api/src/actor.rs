@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -173,7 +174,7 @@ fn actor_main(
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
 ) {
-    eprintln!("loading Qwen3.6 model from {}", model_dir.display());
+    info!(model_dir = %model_dir.display(), "loading Qwen3.6 model");
     let model = match Qwen36TextModel::open(&model_dir) {
         Ok(model) => model,
         Err(error) => {
@@ -181,7 +182,7 @@ fn actor_main(
             return;
         }
     };
-    eprintln!("model weights loaded; loading chat template and generation defaults");
+    info!("model weights loaded; loading chat template and generation defaults");
     let template = match CheckpointChatTemplate::from_model_dir(&model_dir) {
         Ok(template) => template,
         Err(error) => {
@@ -196,13 +197,13 @@ fn actor_main(
             return;
         }
     };
-    eprintln!(
-        "allocating scheduler workspaces: decode={} prefill_sequences={} prefill_tokens={} active={} context={}",
-        scheduler.decode_capacity,
-        scheduler.prefill_sequence_capacity,
-        scheduler.prefill_token_capacity,
-        scheduler.max_active_sequences,
-        scheduler.max_context_tokens
+    info!(
+        decode_capacity = scheduler.decode_capacity,
+        prefill_sequence_capacity = scheduler.prefill_sequence_capacity,
+        prefill_token_capacity = scheduler.prefill_token_capacity,
+        max_active_sequences = scheduler.max_active_sequences,
+        max_context_tokens = scheduler.max_context_tokens,
+        "allocating scheduler workspaces"
     );
     let mut service = match Qwen36ChatService::new(&model, &template, scheduler) {
         Ok(service) => service,
@@ -211,7 +212,7 @@ fn actor_main(
             return;
         }
     };
-    eprintln!("inference actor ready");
+    info!("inference actor ready");
     if ready.send(Ok(defaults)).is_err() {
         return;
     }
@@ -252,7 +253,7 @@ fn actor_main(
             Ok(tick) => tick,
             Err(error) => {
                 let message = error.to_string();
-                eprintln!("inference scheduler failed: {message}");
+                error!(error = %message, "inference scheduler failed");
                 for request in active.values() {
                     let _ = request
                         .events
@@ -266,9 +267,11 @@ fn actor_main(
         for admission in &tick.admitted {
             if let Some(request) = active.get_mut(&admission.request_id) {
                 request.metrics.sequence_device_bytes = admission.sequence_device_bytes;
-                eprintln!(
-                    "session={} admitted state_bytes={} active_sequences={}",
-                    request.external_id.0, admission.sequence_device_bytes, tick.active_sequences
+                info!(
+                    session = request.external_id.0,
+                    state_bytes = admission.sequence_device_bytes,
+                    active_sequences = tick.active_sequences,
+                    "request admitted"
                 );
             }
         }
@@ -279,21 +282,21 @@ fn actor_main(
                     .metrics
                     .record_prefill(now, progress.prompt_position);
                 if starting {
-                    eprintln!(
-                        "session={} prefill_started prompt_tokens={} state_bytes={}",
-                        request.external_id.0,
-                        request.metrics.prompt_tokens,
-                        request.metrics.sequence_device_bytes
+                    info!(
+                        session = request.external_id.0,
+                        prompt_tokens = request.metrics.prompt_tokens,
+                        state_bytes = request.metrics.sequence_device_bytes,
+                        "prefill started"
                     );
                 }
                 if let Some(snapshot) = snapshot {
-                    eprintln!(
-                        "session={} prefill prompt_tokens={}/{} interval_tok_s={:.2} prefill_tok_s={:.2}",
-                        request.external_id.0,
-                        snapshot.prompt_position,
-                        request.metrics.prompt_tokens,
-                        snapshot.interval_tokens_per_second,
-                        snapshot.total_tokens_per_second
+                    info!(
+                        session = request.external_id.0,
+                        prompt_position = snapshot.prompt_position,
+                        prompt_tokens = request.metrics.prompt_tokens,
+                        interval_tok_s = snapshot.interval_tokens_per_second,
+                        prefill_tok_s = snapshot.total_tokens_per_second,
+                        "prefill progress"
                     );
                 }
             }
@@ -303,23 +306,24 @@ fn actor_main(
                 let starting = request.metrics.first_token_at.is_none();
                 let snapshot = request.metrics.record_token(now);
                 if starting {
-                    eprintln!(
-                        "session={} decoding ttft_ms={:.1} prompt_tokens={} prefill_tok_s={:.2}",
-                        request.external_id.0,
-                        now.duration_since(request.metrics.submitted_at)
+                    info!(
+                        session = request.external_id.0,
+                        ttft_ms = now
+                            .duration_since(request.metrics.submitted_at)
                             .as_secs_f64()
                             * 1000.0,
-                        request.metrics.prompt_tokens,
-                        request.metrics.prefill_tokens_per_second(now)
+                        prompt_tokens = request.metrics.prompt_tokens,
+                        prefill_tok_s = request.metrics.prefill_tokens_per_second(now),
+                        "decoding started"
                     );
                 }
                 if let Some(snapshot) = snapshot {
-                    eprintln!(
-                        "session={} progress output_tokens={} interval_tok_s={:.2} decode_tok_s={:.2}",
-                        request.external_id.0,
-                        snapshot.output_tokens,
-                        snapshot.interval_tokens_per_second,
-                        snapshot.decode_tokens_per_second
+                    info!(
+                        session = request.external_id.0,
+                        output_tokens = snapshot.output_tokens,
+                        interval_tok_s = snapshot.interval_tokens_per_second,
+                        decode_tok_s = snapshot.decode_tokens_per_second,
+                        "decode progress"
                     );
                 }
             }
@@ -386,16 +390,16 @@ fn handle_command(
                     },
                 );
                 scheduler_by_external.insert(id, admission.request_id);
-                eprintln!(
-                    "session={} queued prompt_tokens={} max_output_tokens={} active_requests={}",
-                    id.0,
-                    admission.prompt_tokens,
-                    admission.max_output_tokens,
-                    active.len()
+                info!(
+                    session = id.0,
+                    prompt_tokens = admission.prompt_tokens,
+                    max_output_tokens = admission.max_output_tokens,
+                    active_requests = active.len(),
+                    "request queued"
                 );
             }
             Err(error) => {
-                eprintln!("failed to admit request {}: {error}", id.0);
+                warn!(session = id.0, error = %error, "failed to admit request");
                 let _ = events.try_send(InferenceEvent::Error(error.to_string()));
             }
         },
@@ -523,21 +527,21 @@ impl SessionMetrics {
         let time_to_first_token = self.first_token_at.map_or(Duration::ZERO, |first| {
             first.duration_since(self.submitted_at)
         });
-        eprintln!(
-            "session={} complete prompt_tokens={} output_tokens={} ttft_ms={:.1} decode_tok_s={:.2} total_tok_s={:.2} reason={:?} state_released_bytes={} active_requests={} active_sequences={}",
-            id.0,
-            finished.usage.prompt_tokens,
-            finished.usage.completion_tokens,
-            time_to_first_token.as_secs_f64() * 1000.0,
-            self.decode_tokens_per_second(),
-            rate(
+        info!(
+            session = id.0,
+            prompt_tokens = finished.usage.prompt_tokens,
+            output_tokens = finished.usage.completion_tokens,
+            ttft_ms = time_to_first_token.as_secs_f64() * 1000.0,
+            decode_tok_s = self.decode_tokens_per_second(),
+            total_tok_s = rate(
                 finished.usage.completion_tokens,
                 now.duration_since(self.submitted_at)
             ),
-            finished.finish_reason,
-            finished.released_sequence_device_bytes,
+            finish_reason = ?finished.finish_reason,
+            state_released_bytes = finished.released_sequence_device_bytes,
             active_requests,
-            active_sequences
+            active_sequences,
+            "session complete"
         );
     }
 
@@ -549,15 +553,15 @@ impl SessionMetrics {
         active_requests: usize,
         active_sequences: usize,
     ) {
-        eprintln!(
-            "session={} cancelled output_tokens={} elapsed_ms={:.1} decode_tok_s={:.2} state_released_bytes={} active_requests={} active_sequences={}",
-            id.0,
-            self.generated_tokens,
-            now.duration_since(self.submitted_at).as_secs_f64() * 1000.0,
-            self.decode_tokens_per_second(),
-            released_sequence_device_bytes,
+        info!(
+            session = id.0,
+            output_tokens = self.generated_tokens,
+            elapsed_ms = now.duration_since(self.submitted_at).as_secs_f64() * 1000.0,
+            decode_tok_s = self.decode_tokens_per_second(),
+            state_released_bytes = released_sequence_device_bytes,
             active_requests,
-            active_sequences
+            active_sequences,
+            "session cancelled"
         );
     }
 

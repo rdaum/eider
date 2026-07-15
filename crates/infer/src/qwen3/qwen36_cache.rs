@@ -2,6 +2,7 @@ use super::infer::{QwenFfnConfig, QwenModelManifest};
 use nvfp4::{Error, ModelOptCheckpoint, Result, Sm12xFp4GemmWeight};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::info;
 
 const CACHE_DIR: &str = ".eider-cache/sm12x-down-v1";
 const CACHE_MARKER_VERSION: &str = "eider-sm12x-down-v1";
@@ -18,19 +19,20 @@ pub(crate) fn ensure_model_cache(
         return Ok(());
     }
 
-    eprintln!(
-        "preparing SM12x down cache: {} missing layer{} in {}",
-        missing.len(),
-        if missing.len() == 1 { "" } else { "s" },
-        cache_root(checkpoint).display()
+    let missing_count = missing.len();
+    let cache_root = cache_root(checkpoint);
+    info!(
+        missing_layers = missing_count,
+        cache_root = %cache_root.display(),
+        "preparing SM12x down cache"
     );
     for (completed, layer) in missing.iter().copied().enumerate() {
         build_layer_cache(checkpoint, manifest, layer)?;
-        eprintln!(
-            "prepared SM12x down cache layer {} ({}/{})",
+        info!(
             layer,
-            completed + 1,
-            missing.len()
+            completed = completed + 1,
+            total = missing_count,
+            "prepared SM12x down cache layer"
         );
     }
     Ok(())
@@ -52,7 +54,7 @@ pub(crate) fn ensure_layer_cache(
         return Ok(layer_dir(checkpoint, layer));
     }
     if !layer_cache_complete(checkpoint, manifest, layer) {
-        eprintln!("preparing SM12x down cache layer {layer}");
+        info!(layer, "preparing SM12x down cache layer");
         build_layer_cache(checkpoint, manifest, layer)?;
     }
     Ok(layer_dir(checkpoint, layer))

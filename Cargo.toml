@@ -11,7 +11,15 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-fast-telemetry = "0.4.0"
+fast-telemetry = "0.8.0"
 micromeasure = "0.9"
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nvfp4 = { path = "crates/nvfp4" }
+
+clap = { version = "4", features = ["derive"] }
+async-stream = "0.3"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }

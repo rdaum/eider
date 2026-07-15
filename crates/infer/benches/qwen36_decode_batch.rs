@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 const BATCH_SIZES: [usize; 4] = [1, 2, 4, 8];
 const DEFAULT_CONTEXT_TOKENS: usize = 4096;
@@ -378,6 +379,12 @@ fn start_position() -> usize {
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let max_context_tokens = max_context_tokens();
     let start_position = start_position();
     assert!(max_context_tokens > 0, "batch context must be non-zero");
@@ -386,7 +393,7 @@ fn main() {
         "batch starting position needs headroom for benchmark samples"
     );
     let path = model_dir();
-    eprintln!("loading Qwen3.6 model from {}", path.display());
+    info!(model_dir = %path.display(), "loading Qwen3.6 model");
     let model = Rc::new(Qwen36TextModel::open(path).expect("load Qwen3.6 model"));
     for batch in BATCH_SIZES {
         validate_batch(&model, batch, batch, max_context_tokens);

@@ -5,6 +5,7 @@ use infer::runtime::generation::{GenerationConfig, Qwen36GenerationSession};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
+use tracing::info;
 
 struct GenerateArgs {
     model_dir: PathBuf,
@@ -19,6 +20,12 @@ struct GenerateArgs {
 }
 
 fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let args = parse_args()?;
     let mut generation = GenerationConfig::from_model_dir(&args.model_dir)?;
     generation.max_new_tokens = args.max_new_tokens;
@@ -55,13 +62,13 @@ fn main() -> Result<()> {
         std::io::stdout().flush().ok();
     }
 
-    eprintln!(
-        "\n[generated {} tokens, {} layers, hidden={}, vocab={}, finish={:?}]",
-        session.generated_token_count(),
+    info!(
+        generated_tokens = session.generated_token_count(),
         layers,
         hidden,
         vocab,
-        session.finish_reason(),
+        finish_reason = ?session.finish_reason(),
+        "generation complete"
     );
 
     Ok(())
