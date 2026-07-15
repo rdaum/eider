@@ -95,6 +95,8 @@ pub struct Qwen36ChatTick {
     pub scheduled: Vec<Qwen36RequestId>,
     /// Chunked prompt progress made during the tick.
     pub prefilled: Vec<Qwen36PrefillProgress>,
+    /// One entry for each completion token selected during the tick.
+    pub generated: Vec<Qwen36RequestId>,
     /// Structured output safe to stream to API clients.
     pub output: Vec<Qwen36ChatDelta>,
     /// Requests reaching a serving-level terminal state.
@@ -174,6 +176,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         let mut terminal = BTreeMap::new();
 
         for token in scheduled.generated {
+            tick.generated.push(token.request_id);
             let request =
                 self.requests
                     .get_mut(&token.request_id)
@@ -454,10 +457,12 @@ mod tests {
 
         let mut finished = None;
         let mut saw_prefill = false;
+        let mut generated_tokens = 0;
         let mut output = Vec::new();
         for _ in 0..64 {
             let tick = service.tick().expect("chat tick");
             saw_prefill |= !tick.prefilled.is_empty();
+            generated_tokens += tick.generated.len();
             output.extend(tick.output);
             if let Some(done) = tick.finished.into_iter().next() {
                 finished = Some(done);
@@ -469,6 +474,7 @@ mod tests {
         assert_eq!(finished.request_id, id);
         assert!(finished.usage.prompt_tokens > 1);
         assert_eq!(finished.usage.completion_tokens, 4);
+        assert_eq!(generated_tokens, 4);
         assert_eq!(finished.finish_reason, Qwen36ChatFinishReason::Length);
         assert!(!output.is_empty());
         assert_eq!(service.request_count(), 0);

@@ -55,7 +55,7 @@ things I can explain and trust better.
 
 ## Workspace
 
-The workspace has two layers:
+The workspace has three layers:
 
 - `crates/nvfp4` owns device buffers, ModelOpt NVFP4/FP8 loading, cuBLASLt
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
@@ -64,6 +64,10 @@ The workspace has two layers:
   request-scoped sampling and generation, prefill/decode orchestration, CLI
   binaries, and runtime benchmarks. Its reusable execution state lives under
   `runtime/`, while model-family code lives under `qwen3/`.
+- `crates/eider-api` owns the dedicated inference actor and OpenAI Responses
+  HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
+  thread while async handlers submit, stream, and cancel requests over bounded
+  channels.
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust
 crate by its build script. CUTLASS is optional; when it is unavailable, the
@@ -76,7 +80,7 @@ The current model targets are:
 - `models/qwen3-8b-nvfp4`
 - `models/qwen3-30b-a3b-nvfp4`
 - `models/qwen3-32b-nvfp4`
-- `models/qwen3.6-35b-a3b-nvfp4`
+- `models/qwen3.6-35b-a3-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
 
@@ -160,6 +164,56 @@ Qwen3.6 smoke test:
 ```sh
 cargo run --release -p infer --bin qwen36-generate -- \
     models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
+```
+
+Responses API server:
+
+```sh
+scripts/run-eider-server.sh
+```
+
+The launcher builds the release binary, serves the local Qwen3.6 checkpoint at
+`127.0.0.1:8080`, and defaults `EIDER_API_KEY` to `local-eider`. Override its
+model, listen address, served name, or key with `EIDER_MODEL_DIR`,
+`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
+
+Run the installed Pi coding agent against the matching repo-local provider:
+
+```sh
+scripts/run-pi-eider.sh
+```
+
+Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
+
+```sh
+scripts/run-pi-eider.sh --print "Reply with one short greeting."
+```
+
+The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR`,
+selects its native `openai-responses` provider, and does not modify the user's
+global Pi configuration.
+
+Point Codex at it with a custom provider in `~/.codex/config.toml`:
+
+```toml
+model = "eider-qwen3.6"
+model_provider = "eider"
+
+[model_providers.eider]
+name = "Eider"
+base_url = "http://127.0.0.1:8080/v1"
+env_key = "EIDER_API_KEY"
+wire_api = "responses"
+```
+
+The adapter accepts Codex message and function-call history, renders function
+tools through the checkpoint chat template, streams Responses lifecycle and
+function-argument events, and cancels scheduler work when a client disconnects.
+Run the full local Codex integration test explicitly with:
+
+```sh
+QWEN36_MODEL=models/qwen3.6-35b-a3-nvfp4 \
+cargo test --release -p eider-api --test codex -- --ignored --nocapture
 ```
 
 The generator applies the checkpoint's text chat prefix and reads its sampling

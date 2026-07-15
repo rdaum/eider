@@ -1,0 +1,13 @@
+[package]
+name = "eider-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-stream = "0.3"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+infer = { path = "../infer" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }

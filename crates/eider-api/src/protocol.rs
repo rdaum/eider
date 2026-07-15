@@ -1,0 +1,750 @@
+//! Responses API request translation and streaming event construction.
+
+use infer::runtime::chat::{
+    ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatRole, ChatTemplateOptions, ChatTool,
+    ChatToolCall,
+};
+use infer::runtime::chat_output::ChatOutputEvent;
+use infer::runtime::generation::GenerationConfig;
+use infer::runtime::scheduler::Qwen36RequestConfig;
+use infer::runtime::serving::{Qwen36ChatFinishReason, Qwen36ChatRequest, Qwen36ChatUsage};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ITEM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// JSON body accepted by `POST /v1/responses`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResponseRequest {
+    pub model: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default)]
+    pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub stop: Option<OneOrMany<String>>,
+}
+
+/// A field represented as either one value or an array by compatible clients.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
+/// Stable OpenAI-style error body.
+#[derive(Clone, Debug, Serialize)]
+pub struct ErrorEnvelope {
+    pub error: ApiError,
+}
+
+/// One API request or inference failure.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiError {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub param: Option<String>,
+    pub code: Option<String>,
+}
+
+impl ApiError {
+    pub fn invalid(param: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "invalid_request_error",
+            param: Some(param.into()),
+            code: None,
+        }
+    }
+
+    pub fn server(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: "server_error",
+            param: None,
+            code: None,
+        }
+    }
+
+    pub fn envelope(self) -> ErrorEnvelope {
+        ErrorEnvelope { error: self }
+    }
+}
+
+impl ResponseRequest {
+    /// Converts a Responses request into the runtime's complete chat contract.
+    pub fn into_chat_request(
+        self,
+        defaults: &GenerationConfig,
+    ) -> Result<Qwen36ChatRequest, ApiError> {
+        if self.parallel_tool_calls == Some(true) {
+            return Err(ApiError::invalid(
+                "parallel_tool_calls",
+                "parallel tool calls are not supported",
+            ));
+        }
+        let expose_tools = validate_tool_choice(self.tool_choice.as_ref())?;
+
+        let mut messages = Vec::new();
+        if let Some(instructions) = self.instructions {
+            messages.push(ChatMessage::system(instructions));
+        }
+        messages.extend(parse_input(self.input)?);
+        messages = coalesce_system_messages(messages);
+        if messages.is_empty() {
+            return Err(ApiError::invalid("input", "input must not be empty"));
+        }
+
+        let tools = if expose_tools {
+            self.tools
+                .into_iter()
+                .filter_map(parse_tool)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let mut sampling = defaults.sampling;
+        if let Some(temperature) = self.temperature {
+            sampling.temperature = temperature;
+        }
+        if let Some(top_p) = self.top_p {
+            sampling.top_p = top_p;
+        }
+        let generation = Qwen36RequestConfig {
+            sampling,
+            max_new_tokens: self.max_output_tokens.unwrap_or(1024),
+            eos_token_ids: defaults.eos_token_ids.clone(),
+        };
+        generation
+            .validate()
+            .map_err(|error| ApiError::invalid("sampling", error.to_string()))?;
+
+        Ok(Qwen36ChatRequest {
+            messages,
+            tools,
+            template: ChatTemplateOptions::default(),
+            generation,
+            stop_sequences: self.stop.map(OneOrMany::into_vec).unwrap_or_default(),
+        })
+    }
+}
+
+fn coalesce_system_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut system = Vec::new();
+    let mut conversation = Vec::new();
+    for message in messages {
+        if message.role == ChatRole::System {
+            if let Some(content) = message.content {
+                system.push(content);
+            }
+        } else {
+            conversation.push(message);
+        }
+    }
+    if system.is_empty() {
+        return conversation;
+    }
+    let mut messages = Vec::with_capacity(conversation.len() + 1);
+    messages.push(ChatMessage::system(system.join("\n\n")));
+    messages.extend(conversation);
+    messages
+}
+
+fn validate_tool_choice(choice: Option<&Value>) -> Result<bool, ApiError> {
+    match choice {
+        None => Ok(true),
+        Some(Value::String(value)) if value == "auto" => Ok(true),
+        Some(Value::String(value)) if value == "none" => Ok(false),
+        Some(_) => Err(ApiError::invalid(
+            "tool_choice",
+            "only auto and none tool choice are supported",
+        )),
+    }
+}
+
+fn parse_tool(value: Value) -> Option<Result<ChatTool, ApiError>> {
+    let kind = value.get("type").and_then(Value::as_str)?;
+    if kind != "function" {
+        return None;
+    }
+    Some((|| {
+        let name = required_string(&value, "name", "tools")?;
+        let parameters = value
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        if !parameters.is_object() {
+            return Err(ApiError::invalid(
+                "tools",
+                format!("function {name:?} parameters must be a JSON Schema object"),
+            ));
+        }
+        Ok(ChatTool::function(ChatFunctionDefinition {
+            name,
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            parameters,
+        }))
+    })())
+}
+
+fn parse_input(input: Value) -> Result<Vec<ChatMessage>, ApiError> {
+    match input {
+        Value::String(text) => Ok(vec![ChatMessage::user(text)]),
+        Value::Array(items) => parse_input_items(items),
+        Value::Null => Ok(Vec::new()),
+        _ => Err(ApiError::invalid(
+            "input",
+            "input must be a string or an array of input items",
+        )),
+    }
+}
+
+fn parse_input_items(items: Vec<Value>) -> Result<Vec<ChatMessage>, ApiError> {
+    let mut messages = Vec::new();
+    for item in items {
+        let kind = match item.get("type").and_then(Value::as_str) {
+            Some(kind) => kind.to_string(),
+            None if item.get("role").and_then(Value::as_str).is_some() => "message".to_string(),
+            None => {
+                return Err(ApiError::invalid(
+                    "input",
+                    "input item is missing a string type field",
+                ));
+            }
+        };
+        match kind.as_str() {
+            "message" => messages.push(parse_message(&item)?),
+            "function_call" => messages.push(parse_function_call(&item)?),
+            "function_call_output" => messages.push(parse_function_output(&item)?),
+            "reasoning" => {}
+            other => {
+                return Err(ApiError::invalid(
+                    "input",
+                    format!("unsupported input item type {other:?}"),
+                ));
+            }
+        }
+    }
+    Ok(messages)
+}
+
+fn parse_message(value: &Value) -> Result<ChatMessage, ApiError> {
+    let role = match required_string(value, "role", "input")?.as_str() {
+        "developer" | "system" => ChatRole::System,
+        "user" => ChatRole::User,
+        "assistant" => ChatRole::Assistant,
+        "tool" => ChatRole::Tool,
+        other => {
+            return Err(ApiError::invalid(
+                "input",
+                format!("unsupported message role {other:?}"),
+            ));
+        }
+    };
+    let content = parse_content(value.get("content"))?;
+    if role == ChatRole::Tool {
+        let call_id = required_string(value, "tool_call_id", "input")?;
+        return Ok(ChatMessage::tool(call_id, content));
+    }
+    Ok(match role {
+        ChatRole::System => ChatMessage::system(content),
+        ChatRole::User => ChatMessage::user(content),
+        ChatRole::Assistant => ChatMessage::assistant(content),
+        ChatRole::Tool => unreachable!(),
+    })
+}
+
+fn parse_content(value: Option<&Value>) -> Result<String, ApiError> {
+    match value {
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                let kind = required_string(part, "type", "input")?;
+                match kind.as_str() {
+                    "input_text" | "output_text" => {
+                        text.push_str(&required_string(part, "text", "input")?);
+                    }
+                    other => {
+                        return Err(ApiError::invalid(
+                            "input",
+                            format!("unsupported message content type {other:?}"),
+                        ));
+                    }
+                }
+            }
+            Ok(text)
+        }
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(_) => Err(ApiError::invalid(
+            "input",
+            "message content must be text or an array of text parts",
+        )),
+    }
+}
+
+fn parse_function_call(value: &Value) -> Result<ChatMessage, ApiError> {
+    let call_id = required_string(value, "call_id", "input")?;
+    let name = required_string(value, "name", "input")?;
+    let arguments = required_string(value, "arguments", "input")?;
+    let arguments =
+        serde_json::from_str::<BTreeMap<String, Value>>(&arguments).map_err(|error| {
+            ApiError::invalid(
+                "input",
+                format!("function call {name:?} has invalid JSON arguments: {error}"),
+            )
+        })?;
+    Ok(ChatMessage::assistant_tool_calls(
+        None,
+        None,
+        vec![ChatToolCall {
+            id: call_id,
+            function: ChatFunctionCall { name, arguments },
+        }],
+    ))
+}
+
+fn parse_function_output(value: &Value) -> Result<ChatMessage, ApiError> {
+    let call_id = required_string(value, "call_id", "input")?;
+    let output = match value.get("output") {
+        Some(Value::String(output)) => output.clone(),
+        Some(output) => serde_json::to_string(output).expect("JSON value serializes"),
+        None => {
+            return Err(ApiError::invalid(
+                "input",
+                "function output is missing output",
+            ));
+        }
+    };
+    Ok(ChatMessage::tool(call_id, output))
+}
+
+fn required_string(value: &Value, key: &str, param: &str) -> Result<String, ApiError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::invalid(param, format!("missing string field {key:?}")))
+}
+
+/// One inference event delivered from the actor to an API request.
+#[derive(Clone, Debug)]
+pub enum InferenceEvent {
+    Output(ChatOutputEvent),
+    Finished(InferenceFinished),
+    Error(String),
+}
+
+/// Request terminal metadata after the actor releases runtime state.
+#[derive(Clone, Debug)]
+pub struct InferenceFinished {
+    pub finish_reason: Qwen36ChatFinishReason,
+    pub usage: Qwen36ChatUsage,
+}
+
+/// Per-response event builder and non-streaming accumulator.
+pub struct ResponseStream {
+    response_id: String,
+    model: String,
+    created_at: u64,
+    output: Vec<Value>,
+    text: Option<TextItem>,
+    completed: bool,
+}
+
+struct TextItem {
+    id: String,
+    output_index: usize,
+    text: String,
+}
+
+impl ResponseStream {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            response_id: next_id("resp", &NEXT_RESPONSE_ID),
+            model: model.into(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            output: Vec::new(),
+            text: None,
+            completed: false,
+        }
+    }
+
+    pub fn response_id(&self) -> &str {
+        &self.response_id
+    }
+
+    pub fn created(&self) -> Value {
+        event(
+            "response.created",
+            json!({"response": self.response("in_progress", None)}),
+        )
+    }
+
+    pub fn push(&mut self, inference: InferenceEvent) -> Vec<Value> {
+        match inference {
+            InferenceEvent::Output(ChatOutputEvent::Reasoning(_)) => Vec::new(),
+            InferenceEvent::Output(ChatOutputEvent::Text(delta)) => self.push_text(delta),
+            InferenceEvent::Output(ChatOutputEvent::ToolCall(call)) => self.push_tool(call),
+            InferenceEvent::Finished(finished) => self.finish(finished),
+            InferenceEvent::Error(message) => {
+                self.completed = true;
+                vec![event(
+                    "error",
+                    json!({
+                        "error": {
+                            "type": "server_error",
+                            "code": "inference_error",
+                            "message": message,
+                            "param": null
+                        }
+                    }),
+                )]
+            }
+        }
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.completed
+    }
+
+    fn push_text(&mut self, delta: String) -> Vec<Value> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if self.text.is_none() {
+            let id = next_id("msg", &NEXT_ITEM_ID);
+            let output_index = self.output.len();
+            events.push(event(
+                "response.output_item.added",
+                json!({
+                    "output_index": output_index,
+                    "item": message_item(&id, "in_progress", "")
+                }),
+            ));
+            events.push(event(
+                "response.content_part.added",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": output_text("")
+                }),
+            ));
+            self.text = Some(TextItem {
+                id,
+                output_index,
+                text: String::new(),
+            });
+        }
+        let text = self.text.as_mut().expect("text item exists");
+        text.text.push_str(&delta);
+        events.push(event(
+            "response.output_text.delta",
+            json!({
+                "item_id": text.id,
+                "output_index": text.output_index,
+                "content_index": 0,
+                "delta": delta
+            }),
+        ));
+        events
+    }
+
+    fn close_text(&mut self) -> Vec<Value> {
+        let Some(text) = self.text.take() else {
+            return Vec::new();
+        };
+        let item = message_item(&text.id, "completed", &text.text);
+        self.output.push(item.clone());
+        vec![
+            event(
+                "response.output_text.done",
+                json!({
+                    "item_id": text.id,
+                    "output_index": text.output_index,
+                    "content_index": 0,
+                    "text": text.text
+                }),
+            ),
+            event(
+                "response.content_part.done",
+                json!({
+                    "item_id": text.id,
+                    "output_index": text.output_index,
+                    "content_index": 0,
+                    "part": output_text(&text.text)
+                }),
+            ),
+            event(
+                "response.output_item.done",
+                json!({"output_index": text.output_index, "item": item}),
+            ),
+        ]
+    }
+
+    fn push_tool(&mut self, call: ChatToolCall) -> Vec<Value> {
+        let mut events = self.close_text();
+        let id = next_id("fc", &NEXT_ITEM_ID);
+        let output_index = self.output.len();
+        let arguments = serde_json::to_string(&call.function.arguments)
+            .expect("tool arguments are serializable");
+        let in_progress = function_item(&id, &call.id, &call.function.name, "", "in_progress");
+        let completed = function_item(&id, &call.id, &call.function.name, &arguments, "completed");
+        events.extend([
+            event(
+                "response.output_item.added",
+                json!({"output_index": output_index, "item": in_progress}),
+            ),
+            event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "delta": arguments
+                }),
+            ),
+            event(
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "name": call.function.name,
+                    "arguments": arguments
+                }),
+            ),
+            event(
+                "response.output_item.done",
+                json!({"output_index": output_index, "item": completed.clone()}),
+            ),
+        ]);
+        self.output.push(completed);
+        events
+    }
+
+    fn finish(&mut self, finished: InferenceFinished) -> Vec<Value> {
+        let mut events = self.close_text();
+        self.completed = true;
+        let incomplete = matches!(finished.finish_reason, Qwen36ChatFinishReason::Length)
+            .then(|| json!({"reason": "max_output_tokens"}));
+        let status = if incomplete.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let event_type = if incomplete.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        events.push(event(
+            event_type,
+            json!({"response": self.response(status, Some((&finished.usage, incomplete)))}),
+        ));
+        events
+    }
+
+    fn response(&self, status: &str, terminal: Option<(&Qwen36ChatUsage, Option<Value>)>) -> Value {
+        let (usage, incomplete_details) =
+            terminal.map_or((Value::Null, Value::Null), |(usage, incomplete)| {
+                (
+                    json!({
+                        "input_tokens": usage.prompt_tokens,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": usage.completion_tokens,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": usage.total_tokens()
+                    }),
+                    incomplete.unwrap_or(Value::Null),
+                )
+            });
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "error": null,
+            "incomplete_details": incomplete_details,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": self.model,
+            "output": self.output,
+            "parallel_tool_calls": false,
+            "previous_response_id": null,
+            "reasoning": null,
+            "store": false,
+            "temperature": null,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": null,
+            "truncation": "disabled",
+            "usage": usage,
+            "user": null,
+            "metadata": {}
+        })
+    }
+}
+
+fn event(kind: &str, fields: Value) -> Value {
+    let mut object = match fields {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    object.insert("type".to_string(), Value::String(kind.to_string()));
+    Value::Object(object)
+}
+
+fn message_item(id: &str, status: &str, text: &str) -> Value {
+    let content = if status == "in_progress" {
+        Vec::new()
+    } else {
+        vec![output_text(text)]
+    };
+    json!({
+        "id": id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": content
+    })
+}
+
+fn output_text(text: &str) -> Value {
+    json!({"type": "output_text", "text": text, "annotations": [], "logprobs": []})
+}
+
+fn function_item(id: &str, call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
+    json!({
+        "id": id,
+        "type": "function_call",
+        "status": status,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments
+    })
+}
+
+fn next_id(prefix: &str, counter: &AtomicU64) -> String {
+    format!("{prefix}_{:016x}", counter.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> GenerationConfig {
+        GenerationConfig {
+            max_new_tokens: 64,
+            ..GenerationConfig::default()
+        }
+    }
+
+    #[test]
+    fn codex_request_maps_messages_functions_and_ignores_builtin_tools() {
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "instructions": "be concise",
+            "input": [
+                {"role":"developer","content":"rules"},
+                {"role":"user","content":[{"type":"input_text","text":"run it"}]},
+                {"type":"function_call","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"/tmp"}
+            ],
+            "tools": [
+                {"type":"function","name":"exec_command","description":"run","parameters":{"type":"object"}},
+                {"type":"namespace","name":"mcp"},
+                {"type":"web_search","external_web_access":false}
+            ],
+            "parallel_tool_calls": false,
+            "temperature": 0,
+            "max_output_tokens": 12
+        })).unwrap();
+        let chat = request.into_chat_request(&defaults()).unwrap();
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.tools.len(), 1);
+        assert_eq!(chat.generation.max_new_tokens, 12);
+        assert_eq!(chat.generation.sampling.temperature, 0.0);
+        assert!(
+            chat.messages[0]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("be concise\n\nrules")
+        );
+        assert_eq!(chat.messages[2].tool_calls[0].id, "call_1");
+        assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn response_events_follow_text_and_tool_lifecycle() {
+        let mut stream = ResponseStream::new("eider");
+        assert_eq!(stream.created()["type"], "response.created");
+        let text = stream.push(InferenceEvent::Output(ChatOutputEvent::Text("hi".into())));
+        assert_eq!(text.len(), 3);
+        assert_eq!(text[2]["type"], "response.output_text.delta");
+        let tool = stream.push(InferenceEvent::Output(ChatOutputEvent::ToolCall(
+            ChatToolCall {
+                id: "call_7".into(),
+                function: ChatFunctionCall {
+                    name: "exec_command".into(),
+                    arguments: BTreeMap::from([("cmd".into(), json!("pwd"))]),
+                },
+            },
+        )));
+        assert_eq!(tool[0]["type"], "response.output_text.done");
+        assert_eq!(tool[3]["type"], "response.output_item.added");
+        let finished = InferenceFinished {
+            finish_reason: Qwen36ChatFinishReason::ToolCalls,
+            usage: Qwen36ChatUsage {
+                prompt_tokens: 8,
+                completion_tokens: 4,
+            },
+        };
+        let done = stream.push(InferenceEvent::Finished(finished));
+        assert_eq!(done.last().unwrap()["type"], "response.completed");
+        assert_eq!(
+            done.last().unwrap()["response"]["output"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}
