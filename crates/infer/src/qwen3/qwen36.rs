@@ -2,7 +2,10 @@
 
 mod batch;
 
-pub use batch::{Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodedBatch};
+pub use batch::{
+    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace,
+    Qwen36PrefillRow,
+};
 
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,

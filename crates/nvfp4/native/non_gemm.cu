@@ -3916,6 +3916,87 @@ extern "C" cudaError_t infer_gated_delta_net_128_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_gated_delta_net_128_f32_chunks_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* const* state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    float* output,
+    std::uint32_t heads) {
+    constexpr std::uint32_t kState = 128;
+    const std::uint32_t sequence = blockIdx.x / heads;
+    const std::uint32_t head = blockIdx.x % heads;
+    const std::uint32_t col = blockIdx.y;
+    const std::uint32_t row = threadIdx.x;
+    if (col >= kState || row >= kState) return;
+
+    const std::uint32_t offset = sequence_offsets[sequence];
+    const std::uint32_t length = sequence_lengths[sequence];
+    const std::uint32_t state_base = head * kState * kState + col * kState;
+    float* state = state_table[sequence];
+    float state_value = state[state_base + row];
+    __shared__ float partial[128];
+
+    for (std::uint32_t token = 0; token < length; ++token) {
+        const std::uint32_t vector_base = ((offset + token) * heads + head) * kState;
+        const float q_value = q[vector_base + row];
+        const float k_value = k[vector_base + row];
+        partial[row] = state_value * k_value;
+        __syncthreads();
+        for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
+            if (row < stride) partial[row] += partial[row + stride];
+            __syncthreads();
+        }
+
+        const float decay = expf(gate[(offset + token) * heads + head]);
+        const float state_dot_k = partial[0];
+        __syncthreads();
+        const float delta =
+            (v[vector_base + col] - decay * state_dot_k) *
+            beta[(offset + token) * heads + head];
+        state_value = decay * state_value + k_value * delta;
+        partial[row] = state_value * q_value;
+        __syncthreads();
+        for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
+            if (row < stride) partial[row] += partial[row + stride];
+            __syncthreads();
+        }
+        if (row == 0) {
+            output[vector_base + col] = partial[0] * 0.08838834764831845f;
+        }
+        __syncthreads();
+    }
+    state[state_base + row] = state_value;
+}
+
+extern "C" cudaError_t infer_gated_delta_net_128_f32_chunks_on_stream(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* const* state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    float* output,
+    std::uint32_t sequence_count,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (q == nullptr || k == nullptr || v == nullptr || gate == nullptr || beta == nullptr ||
+        state_table == nullptr || sequence_offsets == nullptr || sequence_lengths == nullptr ||
+        output == nullptr || sequence_count == 0 || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(sequence_count * heads, 128, 1);
+    infer_gated_delta_net_128_f32_chunks_kernel<<<grid, 128, 0, stream>>>(
+        q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
+    return cudaGetLastError();
+}
+
 __global__ void infer_fp8_linear_f32_kernel(const float* input,
                                                   const std::uint8_t* weight,
                                                   float* output,
@@ -4979,6 +5060,117 @@ extern "C" cudaError_t infer_qwen36_gdn_prep_batch_on_stream(
     if (status != cudaSuccess) return status;
     infer_l2_norm_heads_128_kernel<<<batch_size * value_heads, 128, 0, stream>>>(
         k, batch_size * value_heads);
+    return cudaGetLastError();
+}
+
+__global__ void infer_qwen36_gdn_prep_chunks_kernel(
+    const float* qkv,
+    const std::uint16_t* conv_weight_bf16,
+    float* q,
+    float* k,
+    float* v,
+    float* const* conv_state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_dim,
+    std::uint32_t conv_dim) {
+    const std::uint32_t sequence = blockIdx.y;
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= conv_dim) return;
+    const std::uint32_t key_dim = key_heads * head_dim;
+    const std::uint32_t value_dim = value_heads * head_dim;
+    const std::uint32_t offset = sequence_offsets[sequence];
+    const std::uint32_t length = sequence_lengths[sequence];
+    float* conv_state = conv_state_table[sequence];
+    float s0 = conv_state[idx * 3 + 0];
+    float s1 = conv_state[idx * 3 + 1];
+    float s2 = conv_state[idx * 3 + 2];
+
+    const float w0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+        conv_weight_bf16 + idx * 4 + 0));
+    const float w1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+        conv_weight_bf16 + idx * 4 + 1));
+    const float w2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+        conv_weight_bf16 + idx * 4 + 2));
+    const float w3 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+        conv_weight_bf16 + idx * 4 + 3));
+
+    for (std::uint32_t token = 0; token < length; ++token) {
+        const std::uint32_t row = offset + token;
+        const float input = qkv[row * conv_dim + idx];
+        float mixed = input * w3;
+        mixed += s0 * w0;
+        mixed += s1 * w1;
+        mixed += s2 * w2;
+        const float activated = mixed / (1.0f + expf(-mixed));
+        s0 = s1;
+        s1 = s2;
+        s2 = input;
+        const std::uint32_t output_base = row * value_dim;
+        if (idx < key_dim) {
+            for (std::uint32_t repeat = 0; repeat < value_heads / key_heads; ++repeat) {
+                q[output_base + repeat * key_dim + idx] = activated;
+            }
+        } else if (idx < key_dim * 2) {
+            const std::uint32_t k_idx = idx - key_dim;
+            for (std::uint32_t repeat = 0; repeat < value_heads / key_heads; ++repeat) {
+                k[output_base + repeat * key_dim + k_idx] = activated;
+            }
+        } else {
+            const std::uint32_t v_idx = idx - key_dim * 2;
+            const std::uint32_t v_k_head = v_idx / head_dim;
+            const std::uint32_t v_sub = v_idx % head_dim;
+            const std::uint32_t v_per_k = value_heads / key_heads;
+            const std::uint32_t k_head = v_k_head / v_per_k;
+            const std::uint32_t v_sub_idx = v_k_head % v_per_k;
+            const std::uint32_t tiled_v_idx =
+                v_sub_idx * key_heads * head_dim + k_head * head_dim + v_sub;
+            v[output_base + tiled_v_idx] = activated;
+        }
+    }
+    conv_state[idx * 3 + 0] = s0;
+    conv_state[idx * 3 + 1] = s1;
+    conv_state[idx * 3 + 2] = s2;
+}
+
+extern "C" cudaError_t infer_qwen36_gdn_prep_chunks_on_stream(
+    const float* qkv,
+    const std::uint16_t* conv_weight_bf16,
+    float* q,
+    float* k,
+    float* v,
+    float* const* conv_state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (qkv == nullptr || conv_weight_bf16 == nullptr || q == nullptr || k == nullptr ||
+        v == nullptr || conv_state_table == nullptr || sequence_offsets == nullptr ||
+        sequence_lengths == nullptr || sequence_count == 0 || total_tokens == 0 ||
+        key_heads == 0 || value_heads == 0 || head_dim != 128 ||
+        value_heads % key_heads != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t conv_dim = key_heads * head_dim * 2 + value_heads * head_dim;
+    infer_qwen36_gdn_prep_chunks_kernel<<<
+        dim3((conv_dim + kThreads - 1) / kThreads, sequence_count, 1), kThreads, 0, stream>>>(
+        qkv, conv_weight_bf16, q, k, v, conv_state_table, sequence_offsets,
+        sequence_lengths, key_heads, value_heads, head_dim, conv_dim);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_l2_norm_heads_128_kernel<<<total_tokens * value_heads, 128, 0, stream>>>(
+        q, total_tokens * value_heads);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_l2_norm_heads_128_kernel<<<total_tokens * value_heads, 128, 0, stream>>>(
+        k, total_tokens * value_heads);
     return cudaGetLastError();
 }
 

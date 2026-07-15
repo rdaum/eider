@@ -307,6 +307,79 @@ impl Sm12xKvCache {
         Ok(())
     }
 
+    /// Enqueues a contiguous set of device-resident K/V rows.
+    ///
+    /// Input rows are read from larger row-major buffers beginning at
+    /// `input_row_offset`. The cache is extended from its current logical
+    /// length and compact tiles are finalized as their boundaries are crossed.
+    pub fn append_rows_at_offset_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.kv_heads * self.head_dim;
+        let input_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(width))
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x KV row append",
+                expected: "input row range without overflow".to_string(),
+                actual: format!("input_row_offset={input_row_offset} rows={rows} width={width}"),
+            })?;
+        let cache_end = self.len.checked_add(rows).ok_or_else(|| Error::Shape {
+            label: "SM12x KV row append",
+            expected: "cache row range without overflow".to_string(),
+            actual: format!("len={} rows={rows}", self.len),
+        })?;
+        if rows == 0
+            || rows > u32::MAX as usize
+            || input_row_offset > u32::MAX as usize
+            || input_end > key.len()
+            || input_end > value.len()
+            || cache_end > self.max_tokens
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV row append",
+                expected: format!(
+                    "non-empty rows through cache capacity {} and input buffers >= {input_end}",
+                    self.max_tokens
+                ),
+                actual: format!(
+                    "rows={rows} cache_end={cache_end} key={} value={}",
+                    key.len(),
+                    value.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_rows_on_stream(
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    self.key_values.as_mut_ptr().cast(),
+                    self.key_scales.as_mut_ptr().cast(),
+                    self.value_values.as_mut_ptr().cast(),
+                    self.value_scales.as_mut_ptr().cast(),
+                    self.key_tail.as_mut_ptr().cast(),
+                    self.value_tail.as_mut_ptr().cast(),
+                    input_row_offset as u32,
+                    self.len as u32,
+                    rows as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.len = cache_end;
+        Ok(())
+    }
+
     /// Enqueues one K/V append using a device-resident position for CUDA graphs.
     pub fn append_indexed_on_stream(
         &mut self,
@@ -484,6 +557,120 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             )
         }
+    }
+
+    /// Appends a prompt chunk and computes each row's causal compact-cache
+    /// attention before advancing to the next row.
+    ///
+    /// Query, key, value, and output buffers are row-major. `input_row_offset`
+    /// selects a contiguous chunk in larger flattened prompt buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_causal_rows_at_offset_into_on_stream(
+        &mut self,
+        cache: &mut Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x causal row attention cache",
+                expected: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let q_width = self.kv_heads * MMA_N * self.head_dim;
+        let kv_width = self.kv_heads * self.head_dim;
+        let row_end = input_row_offset
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x causal row attention",
+                expected: "input row range without overflow".to_string(),
+                actual: format!("input_row_offset={input_row_offset} rows={rows}"),
+            })?;
+        let q_end = row_end.checked_mul(q_width).ok_or_else(|| Error::Shape {
+            label: "SM12x causal row attention",
+            expected: "query row range without overflow".to_string(),
+            actual: format!("row_end={row_end} q_width={q_width}"),
+        })?;
+        let kv_end = row_end.checked_mul(kv_width).ok_or_else(|| Error::Shape {
+            label: "SM12x causal row attention",
+            expected: "KV row range without overflow".to_string(),
+            actual: format!("row_end={row_end} kv_width={kv_width}"),
+        })?;
+        let cache_end = cache.len.checked_add(rows).ok_or_else(|| Error::Shape {
+            label: "SM12x causal row attention",
+            expected: "cache row range without overflow".to_string(),
+            actual: format!("len={} rows={rows}", cache.len),
+        })?;
+        if rows == 0
+            || rows > u32::MAX as usize
+            || input_row_offset > u32::MAX as usize
+            || q_end > query.len()
+            || q_end > output.len()
+            || kv_end > key.len()
+            || kv_end > value.len()
+            || cache_end > cache.max_tokens
+        {
+            return Err(Error::Shape {
+                label: "SM12x causal row attention buffers",
+                expected: format!(
+                    "rows through cache capacity {}, q/output >= {q_end}, k/v >= {kv_end}",
+                    cache.max_tokens
+                ),
+                actual: format!(
+                    "rows={rows} cache_end={cache_end} query={} key={} value={} output={}",
+                    query.len(),
+                    key.len(),
+                    value.len(),
+                    output.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_append_causal_attention_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_append_causal_attention_rows_on_stream(
+                    query.as_const_ptr().cast(),
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    cache.key_values.as_mut_ptr().cast(),
+                    cache.key_scales.as_mut_ptr().cast(),
+                    cache.value_values.as_mut_ptr().cast(),
+                    cache.value_scales.as_mut_ptr().cast(),
+                    cache.key_tail.as_mut_ptr().cast(),
+                    cache.value_tail.as_mut_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    input_row_offset as u32,
+                    cache.len as u32,
+                    rows as u32,
+                    cache.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        cache.len = cache_end;
+        Ok(())
     }
 
     /// Enqueues attention from and into row offsets in larger dense buffers.
@@ -754,6 +941,19 @@ mod tests {
             cache.append(&key, &value).expect("append");
         }
 
+        let key_dense =
+            DeviceBuffer::from_host(&key_rows.iter().flatten().copied().collect::<Vec<_>>())
+                .expect("dense keys");
+        let value_dense =
+            DeviceBuffer::from_host(&value_rows.iter().flatten().copied().collect::<Vec<_>>())
+                .expect("dense values");
+        let mut rows_cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("row cache");
+        let rows_stream = CudaStream::new_non_blocking().expect("row append stream");
+        rows_cache
+            .append_rows_at_offset_on_stream(&key_dense, &value_dense, 0, TOKENS, &rows_stream)
+            .expect("row append");
+        rows_stream.synchronize().expect("row append sync");
+
         assert_eq!(cache.len(), TOKENS);
         assert_eq!(cache.compact_key_tokens(), 16);
         assert_eq!(cache.compact_value_tokens(), 16);
@@ -765,6 +965,35 @@ mod tests {
         let key_scales = cache.key_scales.copy_to_host(&stream).expect("K scales");
         let value_values = cache.value_values.copy_to_host(&stream).expect("V values");
         let value_scales = cache.value_scales.copy_to_host(&stream).expect("V scales");
+        assert_eq!(rows_cache.len(), cache.len());
+        assert_eq!(
+            &*rows_cache
+                .key_values
+                .copy_to_host(&stream)
+                .expect("row K values"),
+            &*key_values
+        );
+        assert_eq!(
+            &*rows_cache
+                .key_scales
+                .copy_to_host(&stream)
+                .expect("row K scales"),
+            &*key_scales
+        );
+        assert_eq!(
+            &*rows_cache
+                .value_values
+                .copy_to_host(&stream)
+                .expect("row V values"),
+            &*value_values
+        );
+        assert_eq!(
+            &*rows_cache
+                .value_scales
+                .copy_to_host(&stream)
+                .expect("row V scales"),
+            &*value_scales
+        );
 
         let key_token_tiles = MAX_TOKENS.div_ceil(K_TOKEN_TILE);
         let mut expected_key_values = vec![0u8; key_values.len()];
@@ -840,6 +1069,20 @@ mod tests {
 
         let key_tail = cache.key_tail.copy_to_host(&stream).expect("K tail");
         let value_tail = cache.value_tail.copy_to_host(&stream).expect("V tail");
+        assert_eq!(
+            &*rows_cache
+                .key_tail
+                .copy_to_host(&stream)
+                .expect("row K tail"),
+            &*key_tail
+        );
+        assert_eq!(
+            &*rows_cache
+                .value_tail
+                .copy_to_host(&stream)
+                .expect("row V tail"),
+            &*value_tail
+        );
         for slot in 0..V_TOKEN_BLOCK {
             let source_token = if slot == 0 { 16 } else { slot };
             assert_eq!(
@@ -851,6 +1094,115 @@ mod tests {
                 &value_rows[source_token]
             );
         }
+    }
+
+    #[test]
+    fn compact_causal_rows_match_repeated_append_and_attention() {
+        const MAX_TOKENS: usize = 32;
+        const TOKENS: usize = 6;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let key = DeviceBuffer::from_host(
+            &(0..TOKENS * kv_width)
+                .map(|idx| ((idx * 17 % 251) as f32 - 125.0) / 384.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("key");
+        let value = DeviceBuffer::from_host(
+            &(0..TOKENS * kv_width)
+                .map(|idx| ((idx * 29 % 257) as f32 - 128.0) / 448.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("value");
+        let query = DeviceBuffer::from_host(
+            &(0..TOKENS * q_width)
+                .map(|idx| ((idx * 31 % 263) as f32 - 131.0) / 512.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut chunk_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("chunk cache");
+        let mut chunk_workspace = Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM)
+            .expect("chunk workspace");
+        let mut chunk_output = DeviceBuffer::<f32>::zeroed(TOKENS * q_width).expect("chunk output");
+        chunk_workspace
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut chunk_cache,
+                &query,
+                &key,
+                &value,
+                0,
+                TOKENS,
+                chunk_output.output(),
+                &stream,
+            )
+            .expect("chunk attention");
+
+        let mut repeated_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("repeated cache");
+        let mut repeated_workspace = Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM)
+            .expect("repeated workspace");
+        let mut repeated_output =
+            DeviceBuffer::<f32>::zeroed(TOKENS * q_width).expect("repeated output");
+        for token in 0..TOKENS {
+            repeated_cache
+                .append_at_offsets_on_stream(
+                    &key,
+                    token * kv_width,
+                    &value,
+                    token * kv_width,
+                    token,
+                    &stream,
+                )
+                .expect("repeated append");
+            repeated_workspace
+                .attention_offsets_into_on_stream(
+                    &repeated_cache,
+                    &query,
+                    token * q_width,
+                    repeated_output.output(),
+                    token * q_width,
+                    &stream,
+                )
+                .expect("repeated attention");
+        }
+
+        let chunk = chunk_output.copy_to_host(&stream).expect("chunk download");
+        let repeated = repeated_output
+            .copy_to_host(&stream)
+            .expect("repeated download");
+        let max_abs = chunk
+            .iter()
+            .zip(repeated.iter())
+            .map(|(chunk, repeated)| (chunk - repeated).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1.0e-6, "causal row max_abs={max_abs}");
+        assert_eq!(chunk_cache.len(), repeated_cache.len());
+        assert_eq!(
+            &*chunk_cache
+                .key_tail()
+                .copy_to_host(&stream)
+                .expect("chunk K tail"),
+            &*repeated_cache
+                .key_tail()
+                .copy_to_host(&stream)
+                .expect("repeated K tail")
+        );
+        assert_eq!(
+            &*chunk_cache
+                .value_tail()
+                .copy_to_host(&stream)
+                .expect("chunk V tail"),
+            &*repeated_cache
+                .value_tail()
+                .copy_to_host(&stream)
+                .expect("repeated V tail")
+        );
     }
 
     #[test]
