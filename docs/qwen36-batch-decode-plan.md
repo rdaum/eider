@@ -1,367 +1,203 @@
-# Qwen3.6 batched decode plan
+# Qwen3.6 batched decode
 
 ## Decision
 
-Build and measure a real batched decode API before designing the request
-scheduler. The scheduler must consume a proven model primitive; it must not
-define batch compatibility, state layout, or performance assumptions on the
-model's behalf.
+Eider owns a model-level batched decode primitive before it owns a request
+scheduler. The scheduler selects runnable sequences; the model API defines how
+their persistent state is advanced and how shared execution storage is reused.
 
-The first target is homogeneous greedy decode for a small fixed batch. Prompt
-setup may remain sequential, but the decode tick must execute as one batched
-model operation. A loop over `decode_one_token` is a correctness scaffold, not
-a batch implementation and must not be benchmarked or presented as one.
+The API does not expose fixed slots, equal cache lengths, greedy-only output,
+or a homogeneous context-capacity requirement. Those would turn current kernel
+details into scheduler policy.
 
-Scheduler and OpenAI-compatible HTTP work begin only after the batch API has:
+## Decode contract
 
-- a stable ownership and state contract;
-- correctness against independent single-sequence decode;
-- measured memory use;
-- measured aggregate throughput and per-sequence latency; and
-- at least one batch size greater than one that produces a repeatable aggregate
-  throughput improvement.
-
-## Current baseline
-
-The current Qwen3.6 path is specialized for one token and one sequence:
+Persistent sequence state and reusable batch execution storage are separate:
 
 ```rust
-pub fn decode_one_token(
-    &self,
-    state: &mut Qwen36DecodeState,
-    token_id: u32,
-) -> Result<Qwen36NextToken>;
-```
-
-`Qwen36DecodeState` owns one CUDA stream, one set of per-layer workspaces, ten
-full-attention K/V caches, thirty Gated Delta Net recurrent states, token and
-position scalars, LM-head scratch, and decode graphs captured against those
-addresses.
-
-The relevant model shape is:
-
-| Property | Qwen3.6 value |
-| --- | ---: |
-| Layers | 40 |
-| Linear-attention layers | 30 |
-| Full-attention layers | 10 |
-| Hidden width | 2,048 |
-| KV heads | 2 |
-| Attention head width | 256 |
-| Routed experts | 256 |
-| Experts per token | 8 |
-| Expert intermediate width | 512 |
-| Vocabulary | 248,320 |
-
-The single-sequence path remains the reference implementation throughout this
-work. It should not be removed or generalized prematurely.
-
-## Initial batch contract
-
-The first public experiment should be deliberately narrow:
-
-- batch capacities `1`, `2`, `4`, and `8`;
-- active rows are the dense prefix `0..batch_size`;
-- all rows have the same cache length;
-- all rows use greedy GPU top-1 output;
-- every row has the same maximum context capacity;
-- prompt setup runs per slot before timed decode; and
-- decode state uses stable, batch-native allocations.
-
-A starting API shape is:
-
-```rust
-pub struct Qwen36DecodeBatchState {
-    max_batch: usize,
-    max_tokens: usize,
-    // Batch-native device state and workspaces.
+pub struct Qwen36DecodeRow<'a> {
+    pub token_id: u32,
+    pub state: &'a mut Qwen36SequenceState,
 }
 
 impl Qwen36TextModel {
-    pub fn new_decode_batch_state(
+    pub fn new_sequence_state(
         &self,
-        max_batch: usize,
         max_tokens: usize,
-    ) -> Result<Qwen36DecodeBatchState>;
+    ) -> Result<Qwen36SequenceState>;
 
-    pub fn prefill_batch_slot(
+    pub fn new_decode_batch_workspace(
         &self,
-        state: &mut Qwen36DecodeBatchState,
-        slot: usize,
-        prompt: &[u32],
-    ) -> Result<Qwen36NextToken>;
+        capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<Qwen36DecodeBatchWorkspace>;
 
-    pub fn decode_batch_top1(
+    pub fn decode_batch<'w>(
         &self,
-        state: &mut Qwen36DecodeBatchState,
-        token_ids: &[u32],
-    ) -> Result<Vec<Qwen36NextToken>>;
+        workspace: &'w mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+    ) -> Result<Qwen36DecodedBatch<'w>>;
 }
 ```
 
-The exact Rust surface may change as kernel constraints become concrete. The
-important invariants are that state is batch-native, decode receives all rows
-in one call, and batch size is explicit.
+Each call has the following semantics:
 
-Do not start with `&mut [&mut Qwen36DecodeState]`. That shape preserves
-independent allocations and captured graphs, encouraging pointer-table loops
-instead of contiguous batched work. The eventual scheduler should own slots in
-a batch-state pool rather than N unrelated decode states.
+- rows may be added, removed, or reordered between ticks;
+- every row carries its own position and context capacity;
+- a sequence capacity may be smaller than the workspace context capacity;
+- output rows preserve the caller's row order;
+- launch padding up to workspace capacity is private execution state;
+- logits remain device-resident until the caller requests full host logits or
+  batched GPU top-1; and
+- sequence positions advance only for rows included in the call.
 
-## State layout
+Sequence state and workspaces are tied to the model instance that created them.
+The call rejects foreign state, foreign workspaces, invalid tokens, context
+overflow, inconsistent full-attention cache state, empty batches, and batches
+larger than workspace capacity before model execution.
 
-Use the slot dimension explicitly in persistent and scratch storage:
+## Ownership and layout
 
-| State | Proposed logical layout |
-| --- | --- |
-| Input token IDs | `[B]` |
-| Positions/cache lengths | `[B]` |
-| Hidden and residual rows | `[B, hidden]` |
-| GDN convolution state | `[linear_layer, B, qkv_width, conv_history]` |
-| GDN recurrent state | `[linear_layer, B, value_head, d, d]` |
-| Full-attention K/V | `[full_layer, B, max_tokens, kv_width]` |
-| Router output | `[B, experts]` |
-| Routed slots | `[B, top_k]` |
-| Routed gate/up | `[B, top_k, 2 * intermediate]` |
-| Routed down inputs | `[B, top_k, intermediate]` |
-| LM-head scratch/results | `[B, ...]` |
+`Qwen36SequenceState` owns only state that persists for one request:
 
-`[B, max_tokens, kv_width]` keeps each sequence's cache rows contiguous and is
-compatible with a future slot/block table. Do not introduce a paged cache in
-the first implementation; expose enough shape metadata that replacing the
-backing layout later does not affect the decode call.
+- the logical decode position and maximum context;
+- thirty per-layer convolution and Gated Delta Net recurrent states; and
+- ten per-layer compact SM12x FP4 K/V caches.
 
-Add an exact `device_bytes()` or allocation report for the batch state. Batch
-capacity and context capacity must be visible costs, not implicit multipliers.
+`Qwen36DecodeBatchWorkspace` owns storage shared by whichever rows a scheduler
+selects for the current tick:
 
-## Measurement phase 0: establish the baseline
+- token and position vectors;
+- row-major hidden, residual, normalization, projection, and LM-head buffers;
+- FP8 and NVFP4 activation scratch;
+- GDN state-pointer tables assembled from the selected sequence rows;
+- routed-MoE route, Marlin gate/up, SM12x down, and shared-expert storage; and
+- one compact-attention scratch workspace reused serially across active rows.
 
-Before changing kernels, record the current single-sequence release baseline:
+Workspace creation performs all recurring host and device allocation. The
+decode hot path reuses host token, position, and GDN pointer arrays; it does not
+allocate a vector per tick or per layer.
+
+## Execution path
+
+One call executes the model in layer order:
+
+1. batched BF16 embedding gather;
+2. row-wise RMSNorm;
+3. batched linear-attention projections and GDN state updates, or batched
+   full-attention projections followed by per-sequence compact-cache append and
+   attention;
+4. row-wise residual and FFN normalization;
+5. batched router top-k, Marlin routed gate/up, SM12x routed down, shared
+   expert, and fused FFN finalization;
+6. final RMSNorm and the batched LM head; and
+7. either device logits, host logits for sampling, or GPU top-1 results.
+
+The existing generation session remains on the graph-captured single-row path
+until the batch path has throughput measurements and batched implementations
+for every supported expert-storage variant. The scheduler can consume the new
+contract directly for the fast NVFP4 model plan.
+
+## Correctness evidence
+
+Focused CUDA tests compare batched operations with independent rows for:
+
+- BF16 projections;
+- scalar-scaled FP8 W8A16 projections;
+- NVFP4 W4A16 projections;
+- full-attention Q/K normalization and gate splitting;
+- MoE top-k routing;
+- convolution and GDN recurrent updates; and
+- compact K/V append and attention from offsets in larger dense buffers.
+
+The model-level probe intentionally changes the schedule while comparing each
+active sequence with an independently executed capacity-one batch:
 
 ```sh
-cargo run --release -p infer --bin qwen-bench -- \
-    --model models/qwen3.6-35b-a3-nvfp4 \
-    --prompt "Hello world, this is a benchmark." \
-    --decode-tokens 200 \
-    --warmup-repeats 1 \
-    --repeats 3 \
-    --temperature 0
+cargo run --release -p infer --bin qwen36-batch-probe -- \
+    models/qwen3.6-35b-a3-nvfp4 9707,3710 4 4
 ```
 
-Record both the normal end-to-end result and `--profile-decode` stage timings.
-The profiled result is diagnostic and must not be compared directly with the
-normal throughput result.
+The four ticks cover two distinct inputs, a dropped sequence, ragged positions,
+row reordering, and re-admission. All active logits match the independent
+canonical path exactly, including after divergent state evolution and
+re-admission.
 
-The baseline report should include:
+The canonical batch kernels do not always produce bit-identical logits to the
+older graph-captured single-row path because projection and MoE reduction
+schedules differ. Current spot checks preserve top-1, but longer numerical and
+generation-quality validation is still required before treating that as the
+complete quality gate.
 
-- median and range of decode tokens/sec;
-- median milliseconds per token;
-- stage timing proportions;
-- process/device allocation requested by model and decode state; and
-- exact commit and environment.
+## Batch measurements
 
-## Measurement phase 1: kernel viability
+`qwen36_decode_batch` measures one complete scheduler-visible tick, including
+GPU top-1 and synchronization. It validates every batched logit row against an
+independent capacity-one decode before timing. The measured rows follow their
+own greedy outputs, so routing is model-selected rather than synthetically
+fixed.
 
-Add focused micromeasures before integrating each batched kernel. Every bench
-must run batch sizes `1`, `2`, `4`, and `8`, validate output before timing, and
-report both tick latency and aggregate rows/sec.
+On GB10 with the local `qwen3.6-35b-a3-nvfp4` checkpoint, 4,096-token sequence
+capacity, a starting decode position of 128, and the worktree based on
+`30e2543`:
 
-### Linear-attention projections
+The graph-captured production `decode_one_token()` path reaches 76.46 tokens/s
+with a 12.871 ms median tick. The capacity-one batch API is not that baseline:
+it is an eager execution path used to isolate the benefit of batching.
 
-Measure the real Qwen3.6 FP8 projection shapes with an `[B, hidden]` input.
-Start with the QKV, Z, and output projections because their weight reuse is
-shared by every sequence regardless of expert routing.
+| Batch | Batched tick | Batched tokens/s | Canonical independent tick | Canonical independent tokens/s | Canonical speedup | Production speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 17.393 ms | 57.81 | 17.138 ms | 58.41 | 0.99x | 0.76x |
+| 2 | 24.471 ms | 81.85 | 33.908 ms | 58.37 | 1.40x | 1.07x |
+| 4 | 38.942 ms | 101.92 | 67.034 ms | 59.88 | 1.70x | 1.33x |
+| 8 | 67.498 ms | 118.93 | 133.436 ms | 59.97 | 1.98x | 1.56x |
 
-Evidence gate:
+Exact owned device allocations were:
 
-- confirm the implementation performs one batched matrix operation;
-- compare batch-1 output against the current vector path;
-- compare all batch rows against repeated CPU/reference projections; and
-- retain the batched path only if aggregate rows/sec improves.
+| Batch | Shared batch workspace | Request-owned sequence state |
+| ---: | ---: | ---: |
+| 1 | 4,424,732 bytes | 90,112,000 bytes |
+| 2 | 8,345,396 bytes | 180,224,000 bytes |
+| 4 | 16,252,260 bytes | 360,448,000 bytes |
+| 8 | 32,065,988 bytes | 720,896,000 bytes |
 
-### Gated Delta Net kernels
+Sequence state is 90,112,000 bytes per request at this context capacity. The
+workspace grows by about 4 MB per batch row and is small beside persistent
+request state. Batch 8 is therefore the throughput default, but its current
+gain over optimized single-sequence production decode is 1.56x rather than the
+1.98x canonical-batch amortization figure. Batch 4 remains a useful policy
+point when a roughly 39 ms tick matters more than maximum aggregate throughput.
 
-Extend QKV preparation, convolution update, gate preparation, recurrent update,
-gated RMSNorm, and output preparation with a slot dimension. State writes must
-be disjoint by slot.
+The batch implementation is currently eager. Recovering production-path graph
+and launch efficiency is a later optimization because the scheduler contract
+deliberately permits changing row membership, order, and positions.
 
-Evidence gate:
+The current workspace constructor supports the normal Marlin NVFP4 routed
+gate/up, SM12x routed down, and NVFP4 shared-expert plan. Add true batched paths
+for grouped or FP8 experts before moving mixed-storage Unsloth checkpoints off
+the single-row decoder; do not implement that support as a host loop over
+sequences.
 
-- run at least 100 recurrent decode steps;
-- compare every slot against an independent single-sequence state;
-- permute input rows and verify the same permutation in outputs; and
-- include a reset/reuse test to catch state leakage between requests.
+## Scheduler handoff
 
-### Full attention
+The scheduler may rely on these semantic facts now:
 
-Add batch and per-slot position/cache-length inputs to the indexed attention
-path. The first version may require equal cache lengths, but it must store
-positions as a vector so ragged support does not require changing the public
-decode contract.
+- sequence state is independent of batch membership and row order;
+- positions and cache lengths may be ragged;
+- requests may leave and later rejoin a batch without moving state;
+- workspace capacity is an execution limit, not a persistent slot layout; and
+- greedy and sampled generation share the same decode operation.
 
-Evidence gate:
+The initial admission policy can use capacity 8, select available work without
+waiting to fill the batch, and rotate runnable requests between ticks. This
+captures the measured throughput gain without adding an artificial batching
+delay or allowing a long-lived request to pin a workspace row.
 
-- compare short and long cache lengths with the single-sequence path;
-- verify K/V appends land in the correct slot and position;
-- test different token data in every row; and
-- include a cross-slot contamination test.
-
-### Routed MoE
-
-This is the least predictable batching stage because each token may select a
-different set of eight experts.
-
-Extend the route and workspace layout from `top_k` routed entries to
-`B * top_k`. Benchmark at least two routing distributions:
-
-1. maximum overlap, where rows select the same experts; and
-2. low overlap, using routes from real prompts or deterministic disjoint sets.
-
-The Marlin gate/up path, SiLU/quantization, SM12x down path, and weighted
-accumulation must all consume the full routed batch. Do not claim a MoE batch
-win from the maximum-overlap case alone.
-
-Evidence gate:
-
-- exact route/result correspondence for every row;
-- correctness with repeated and distinct expert IDs;
-- batch-1 parity with the current routed path;
-- separate overlap and low-overlap performance results; and
-- no per-token host dispatch inside the timed region.
-
-### LM head
-
-Add a batched greedy top-1 operation over `[B, hidden]`. It should reduce one
-token and logit per row without materializing `[B, vocab]` logits.
-
-Full-logit output for temperature/top-p sampling is a later mode. Keep greedy
-and sampled batch contracts distinct until a device sampler exists.
-
-## Integration phase 2: batch-native layer execution
-
-Create `crates/infer/src/qwen3/qwen36_batch.rs` rather than adding another
-large section to `qwen36.rs`.
-
-Integrate in model order:
-
-1. batched embedding gather;
-2. per-layer input normalization;
-3. linear-attention or full-attention batched step;
-4. residual and FFN normalization;
-5. batched router and routed MoE;
-6. shared expert and final residual;
-7. final normalization; and
-8. batched LM-head top-1.
-
-Keep eager execution until end-to-end correctness and timing are established.
-CUDA graph capture is phase 3 because graphs constrain addresses, active batch
-sizes, and launch structure. Capture one graph per proven fixed batch size only
-after eager execution wins.
-
-## Correctness plan
-
-### Batch-1 equivalence
-
-For the same model, prompt, token, and position:
-
-- compare the chosen token and winning logit;
-- compare hidden output after each layer within the established tolerance;
-- compare full-attention K/V append rows;
-- compare GDN convolution and recurrent states; and
-- compare router indices and weights.
-
-Batch 1 must remain within the current numerical contract before larger batches
-are evaluated.
-
-### N independent sequences
-
-For `B = 2, 4, 8`, initialize B independent single-sequence states and one
-batch state from the same prompts. Decode them for at least 100 tokens and
-compare each step.
-
-Cover:
-
-- identical prompts;
-- different prompts with equal tokenized length;
-- different generated routes;
-- EOS in one row while other rows continue, once active masks are added; and
-- batch-state reset followed by a second unrelated request set.
-
-### Failure and bounds
-
-Test zero batch, batch greater than capacity, token outside vocabulary, context
-overflow, duplicate slot assignment, invalid active rows, and mismatched input
-lengths. Fail before launching CUDA work.
-
-## End-to-end micromeasure
-
-Add `crates/infer/benches/qwen36_decode_batch.rs` using `micromeasure`.
-
-The timed region begins after model loading, prompt setup, cache allocation,
-and correctness validation. Run enough decode ticks for stable CUDA-event and
-wall-clock measurements.
-
-Report:
-
-| Metric | Meaning |
-| --- | --- |
-| Tick latency | Wall/CUDA time for one batch decode step |
-| Aggregate tokens/sec | `B / tick_seconds` |
-| Per-sequence tokens/sec | `1 / tick_seconds` |
-| Speedup over B independent calls | Actual amortization from batching |
-| State bytes | Persistent batch-state allocation |
-| Peak process/device memory | End-to-end capacity cost |
-
-The result table must include batch `1`, the current single-token API, and each
-candidate larger batch. Compare normal eager execution separately from any
-later graph-captured path.
-
-## Scheduler handoff contract
-
-Do not begin scheduler implementation until the batch work answers:
-
-- supported and worthwhile batch sizes;
-- whether cache lengths must be homogeneous;
-- whether active rows must be dense;
-- whether rows can finish independently;
-- state allocation and reset cost;
-- graph/address stability requirements;
-- greedy versus sampled output modes; and
-- the memory admission formula.
-
-Write these answers into this document as measured results. They become the
-scheduler's compatibility and admission rules.
-
-The scheduler can then adopt the useful `tinfer` shape:
+The scheduler can then use the usual lifecycle:
 
 ```text
 Waiting -> Prefilling -> Decoding -> Finished
 ```
 
-but it will group and admit requests according to the proven Eider batch
-contract rather than assumptions inherited from the CPU implementation.
-
-## Stop conditions
-
-Stop or redirect the batch work when evidence shows any of the following:
-
-- no batch size greater than one improves aggregate end-to-end throughput;
-- improvements occur only in isolated kernels and disappear end to end;
-- state memory makes the batch unusable within the GB10 unified-memory budget;
-- low-overlap MoE routing erases the gain seen in synthetic overlap cases; or
-- per-sequence latency exceeds the intended interactive service target without
-  a compensating aggregate-throughput requirement.
-
-In that case, retain the single-sequence decoder, build a serialized API worker,
-and revisit batching only with a more specific kernel or serving workload.
-
-## Deliverables
-
-1. Single-sequence baseline report.
-2. Focused batch micromeasures for projections, GDN, attention, MoE, and LM
-   head.
-3. `Qwen36DecodeBatchState` with allocation reporting and reset coverage.
-4. End-to-end `decode_batch_top1` with batch-1 and N-sequence correctness tests.
-5. `qwen36_decode_batch` micromeasure and result table.
-6. Documented scheduler handoff contract based on measured behavior.
-7. Only then, a scheduler and OpenAI-compatible serving plan.
+without inheriting a fixed-slot or equal-length restriction from the first
+kernel implementation.
