@@ -1,6 +1,7 @@
 //! Axum HTTP and SSE surface for the Responses API.
 
 use crate::actor::{ActorRequestId, InferenceActor};
+use crate::metrics::{ServerEndpoint, StreamingMode, metrics as server_metrics};
 use crate::protocol::{ApiError, ErrorEnvelope, ResponseRequest, ResponseStream};
 use axum::Json;
 use axum::Router;
@@ -9,10 +10,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use infer::metrics::metrics as infer_metrics;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 /// HTTP-facing configuration independent of model execution limits.
@@ -59,19 +61,45 @@ pub async fn serve_listener(
 fn router(actor: InferenceActor, config: ApiConfig) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
         .with_state(ApiState { actor, config })
 }
 
 async fn health() -> Json<Value> {
+    server_metrics().requests.inc(ServerEndpoint::Healthz);
+    let _request_duration = RequestDuration::start();
     Json(json!({"status": "ok"}))
+}
+
+/// Prometheus text exposition endpoint.
+///
+/// Always enabled. Returns all registered metrics from the eider-api and infer
+/// crates in Prometheus text format (`text/plain; version=0.0.4`).
+async fn metrics() -> Response {
+    server_metrics().requests.inc(ServerEndpoint::Metrics);
+    let _request_duration = RequestDuration::start();
+    let mut output = String::new();
+    server_metrics().export_prometheus(&mut output);
+    infer_metrics().export_prometheus(&mut output);
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        output,
+    )
+        .into_response()
 }
 
 async fn models(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiFailure> {
+    server_metrics().requests.inc(ServerEndpoint::Models);
+    let _request_duration = RequestDuration::start();
     authorise(&state.config, &headers)?;
     let model = &state.config.model;
     let context_window = state.config.context_window;
@@ -134,8 +162,13 @@ async fn responses(
     headers: HeaderMap,
     Json(request): Json<ResponseRequest>,
 ) -> Result<Response, ApiFailure> {
+    server_metrics().requests.inc(ServerEndpoint::Responses);
+    let _request_duration = RequestDuration::start();
     authorise(&state.config, &headers)?;
     if request.model != state.config.model {
+        server_metrics()
+            .request_errors
+            .inc(ServerEndpoint::Responses);
         return Err(ApiFailure::bad_request(ApiError::invalid(
             "model",
             format!(
@@ -148,8 +181,25 @@ async fn responses(
     let model = request.model.clone();
     let chat = request
         .into_chat_request(state.actor.generation_defaults())
-        .map_err(ApiFailure::bad_request)?;
-    let response = state.actor.submit(chat).map_err(ApiFailure::server)?;
+        .map_err(|e| {
+            server_metrics()
+                .request_errors
+                .inc(ServerEndpoint::Responses);
+            ApiFailure::bad_request(e)
+        })?;
+    let response = state.actor.submit(chat).map_err(|e| {
+        server_metrics()
+            .request_errors
+            .inc(ServerEndpoint::Responses);
+        ApiFailure::server(e)
+    })?;
+    server_metrics()
+        .responses_submitted
+        .inc(if stream_requested {
+            StreamingMode::Stream
+        } else {
+            StreamingMode::NonStream
+        });
     let stream = ResponseStream::new(model);
 
     if stream_requested {
@@ -302,4 +352,28 @@ impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
         (self.status, Json(ErrorEnvelope { error: self.error })).into_response()
     }
+}
+
+struct RequestDuration {
+    started: Instant,
+}
+
+impl RequestDuration {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RequestDuration {
+    fn drop(&mut self) {
+        server_metrics()
+            .request_duration_us
+            .record(duration_us(self.started.elapsed()));
+    }
+}
+
+fn duration_us(elapsed: Duration) -> u64 {
+    elapsed.as_micros().min(u128::from(u64::MAX)) as u64
 }

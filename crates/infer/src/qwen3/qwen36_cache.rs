@@ -1,4 +1,5 @@
 use super::infer::{QwenFfnConfig, QwenModelManifest};
+use crate::metrics::metrics;
 use nvfp4::{Error, ModelOptCheckpoint, Result, Sm12xFp4GemmWeight};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,7 +28,11 @@ pub(crate) fn ensure_model_cache(
         "preparing SM12x down cache"
     );
     for (completed, layer) in missing.iter().copied().enumerate() {
-        build_layer_cache(checkpoint, manifest, layer)?;
+        if let Err(error) = build_layer_cache(checkpoint, manifest, layer) {
+            metrics().sm12x_cache_errors.inc();
+            return Err(error);
+        }
+        metrics().sm12x_cache_layers_prepared.inc();
         info!(
             layer,
             completed = completed + 1,
@@ -55,7 +60,11 @@ pub(crate) fn ensure_layer_cache(
     }
     if !layer_cache_complete(checkpoint, manifest, layer) {
         info!(layer, "preparing SM12x down cache layer");
-        build_layer_cache(checkpoint, manifest, layer)?;
+        if let Err(error) = build_layer_cache(checkpoint, manifest, layer) {
+            metrics().sm12x_cache_errors.inc();
+            return Err(error);
+        }
+        metrics().sm12x_cache_layers_prepared.inc();
     }
     Ok(layer_dir(checkpoint, layer))
 }

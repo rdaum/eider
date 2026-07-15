@@ -14,6 +14,9 @@ pub use runtime::kv_cache;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Runtime and cache metrics.
+pub mod metrics;
+
 /// Returns the currently linked NVFP4 backend label.
 pub fn backend_name() -> &'static str {
     "eider-nvfp4"

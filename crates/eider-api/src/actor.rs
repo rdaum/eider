@@ -1,11 +1,15 @@
 //! Dedicated inference thread owning all CUDA and scheduler state.
 
+use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
+use infer::metrics::metrics as infer_metrics;
 use infer::qwen3::qwen36::Qwen36TextModel;
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::{Qwen36RequestId, Qwen36SchedulerConfig};
-use infer::runtime::serving::{Qwen36ChatFinished, Qwen36ChatRequest, Qwen36ChatService};
+use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, Qwen36SchedulerConfig};
+use infer::runtime::serving::{
+    Qwen36ChatFinishReason, Qwen36ChatFinished, Qwen36ChatRequest, Qwen36ChatService,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -249,24 +253,41 @@ fn actor_main(
             continue;
         }
 
+        let tick_start = Instant::now();
         let tick = match service.tick() {
             Ok(tick) => tick,
             Err(error) => {
                 let message = error.to_string();
                 error!(error = %message, "inference scheduler failed");
+                server_metrics()
+                    .request_errors
+                    .add(ServerEndpoint::Responses, active.len() as isize);
                 for request in active.values() {
                     let _ = request
                         .events
                         .try_send(InferenceEvent::Error(message.clone()));
                 }
-                cancel_all(&mut service, &mut active, &mut scheduler_by_external);
+                fail_all(
+                    &mut service,
+                    &mut active,
+                    &mut scheduler_by_external,
+                    &message,
+                );
                 continue;
             }
         };
         let now = Instant::now();
+        let tick_us = duration_us(now.duration_since(tick_start));
+        if !tick.prefilled.is_empty() {
+            infer_metrics().prefill_tick_us.record(tick_us);
+        }
+        if !tick.generated.is_empty() {
+            infer_metrics().decode_tick_us.record(tick_us);
+        }
         for admission in &tick.admitted {
             if let Some(request) = active.get_mut(&admission.request_id) {
                 request.metrics.sequence_device_bytes = admission.sequence_device_bytes;
+                infer_metrics().requests_admitted.inc();
                 info!(
                     session = request.external_id.0,
                     state_bytes = admission.sequence_device_bytes,
@@ -278,6 +299,10 @@ fn actor_main(
         for progress in &tick.prefilled {
             if let Some(request) = active.get_mut(&progress.request_id) {
                 let starting = request.metrics.prefilled_tokens == 0;
+                let prefill_delta = progress
+                    .prompt_position
+                    .saturating_sub(request.metrics.prefilled_tokens);
+                infer_metrics().prefill_tokens.add(prefill_delta as isize);
                 let snapshot = request
                     .metrics
                     .record_prefill(now, progress.prompt_position);
@@ -305,13 +330,13 @@ fn actor_main(
             if let Some(request) = active.get_mut(request_id) {
                 let starting = request.metrics.first_token_at.is_none();
                 let snapshot = request.metrics.record_token(now);
+                infer_metrics().generated_tokens.inc();
                 if starting {
+                    let ttft = now.duration_since(request.metrics.submitted_at);
+                    infer_metrics().ttft_us.record(duration_us(ttft));
                     info!(
                         session = request.external_id.0,
-                        ttft_ms = now
-                            .duration_since(request.metrics.submitted_at)
-                            .as_secs_f64()
-                            * 1000.0,
+                        ttft_ms = ttft.as_secs_f64() * 1000.0,
                         prompt_tokens = request.metrics.prompt_tokens,
                         prefill_tok_s = request.metrics.prefill_tokens_per_second(now),
                         "decoding started"
@@ -343,6 +368,18 @@ fn actor_main(
             if let Some(request) = active.remove(&finished.request_id) {
                 scheduler_by_external.remove(&request.external_id);
                 let active_requests = active.len();
+                infer_metrics().requests_completed.inc();
+                let reason = map_finish_reason(&finished.finish_reason);
+                server_metrics().responses_completed.inc(reason);
+                server_metrics()
+                    .completion_tokens
+                    .add(finished.usage.completion_tokens as isize);
+                server_metrics()
+                    .decode_tokens_per_second
+                    .record(request.metrics.decode_tokens_per_second() as u64);
+                server_metrics()
+                    .prefill_tokens_per_second
+                    .record(request.metrics.prefill_tokens_per_second(now) as u64);
                 request.metrics.log_finished(
                     request.external_id,
                     now,
@@ -363,6 +400,7 @@ fn actor_main(
         for id in disconnected {
             cancel_scheduler_request(id, &mut service, &mut active, &mut scheduler_by_external);
         }
+        update_current_counts(&service, &active);
     }
     cancel_all(&mut service, &mut active, &mut scheduler_by_external);
 }
@@ -390,6 +428,10 @@ fn handle_command(
                     },
                 );
                 scheduler_by_external.insert(id, admission.request_id);
+                server_metrics().active_requests.set(active.len() as i64);
+                server_metrics()
+                    .prompt_tokens
+                    .add(admission.prompt_tokens as isize);
                 info!(
                     session = id.0,
                     prompt_tokens = admission.prompt_tokens,
@@ -400,6 +442,7 @@ fn handle_command(
             }
             Err(error) => {
                 warn!(session = id.0, error = %error, "failed to admit request");
+                server_metrics().responses_admission_errors.inc();
                 let _ = events.try_send(InferenceEvent::Error(error.to_string()));
             }
         },
@@ -421,14 +464,16 @@ fn cancel_scheduler_request(
 ) {
     let outcome = service.cancel_request(scheduler_id);
     let released_sequence_device_bytes = match outcome {
-        infer::runtime::scheduler::Qwen36CancelOutcome::Cancelled(cancelled) => {
-            cancelled.released_sequence_device_bytes
-        }
-        infer::runtime::scheduler::Qwen36CancelOutcome::AlreadyFinished
-        | infer::runtime::scheduler::Qwen36CancelOutcome::NotFound => 0,
+        Qwen36CancelOutcome::Cancelled(cancelled) => cancelled.released_sequence_device_bytes,
+        Qwen36CancelOutcome::AlreadyFinished | Qwen36CancelOutcome::NotFound => 0,
     };
     if let Some(request) = active.remove(&scheduler_id) {
         scheduler_by_external.remove(&request.external_id);
+        server_metrics().active_requests.set(active.len() as i64);
+        infer_metrics().requests_cancelled.inc();
+        server_metrics()
+            .responses_completed
+            .inc(FinishReason::Cancelled);
         request.metrics.log_cancelled(
             request.external_id,
             Instant::now(),
@@ -437,6 +482,39 @@ fn cancel_scheduler_request(
             service.active_sequence_count(),
         );
     }
+    update_current_counts(service, active);
+}
+
+fn fail_all(
+    service: &mut Qwen36ChatService<'_, '_>,
+    active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
+    error: &str,
+) {
+    let ids = active.keys().copied().collect::<Vec<_>>();
+    for id in ids {
+        let outcome = service.cancel_request(id);
+        let released_sequence_device_bytes = match outcome {
+            Qwen36CancelOutcome::Cancelled(cancelled) => cancelled.released_sequence_device_bytes,
+            Qwen36CancelOutcome::AlreadyFinished | Qwen36CancelOutcome::NotFound => 0,
+        };
+        if let Some(request) = active.remove(&id) {
+            scheduler_by_external.remove(&request.external_id);
+            infer_metrics().requests_failed.inc();
+            server_metrics()
+                .responses_completed
+                .inc(FinishReason::Error);
+            request.metrics.log_failed(
+                request.external_id,
+                Instant::now(),
+                released_sequence_device_bytes,
+                active.len(),
+                service.active_sequence_count(),
+                error,
+            );
+        }
+    }
+    update_current_counts(service, active);
 }
 
 fn cancel_all(
@@ -448,6 +526,16 @@ fn cancel_all(
     for id in ids {
         cancel_scheduler_request(id, service, active, scheduler_by_external);
     }
+}
+
+fn update_current_counts(
+    service: &Qwen36ChatService<'_, '_>,
+    active: &BTreeMap<Qwen36RequestId, ActiveRequest>,
+) {
+    server_metrics().active_requests.set(active.len() as i64);
+    infer_metrics()
+        .active_sequences
+        .set(service.active_sequence_count() as i64);
 }
 
 impl SessionMetrics {
@@ -565,6 +653,28 @@ impl SessionMetrics {
         );
     }
 
+    fn log_failed(
+        &self,
+        id: ActorRequestId,
+        now: Instant,
+        released_sequence_device_bytes: usize,
+        active_requests: usize,
+        active_sequences: usize,
+        error: &str,
+    ) {
+        warn!(
+            session = id.0,
+            output_tokens = self.generated_tokens,
+            elapsed_ms = now.duration_since(self.submitted_at).as_secs_f64() * 1000.0,
+            decode_tok_s = self.decode_tokens_per_second(),
+            state_released_bytes = released_sequence_device_bytes,
+            active_requests,
+            active_sequences,
+            error,
+            "session failed"
+        );
+    }
+
     fn prefill_tokens_per_second(&self, now: Instant) -> f64 {
         rate(self.prefilled_tokens, now.duration_since(self.submitted_at))
     }
@@ -585,6 +695,19 @@ fn rate(tokens: usize, elapsed: Duration) -> f64 {
         return 0.0;
     }
     tokens as f64 / elapsed.as_secs_f64()
+}
+
+fn duration_us(elapsed: Duration) -> u64 {
+    elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn map_finish_reason(reason: &Qwen36ChatFinishReason) -> FinishReason {
+    match reason {
+        Qwen36ChatFinishReason::Eos => FinishReason::Eos,
+        Qwen36ChatFinishReason::Length => FinishReason::Length,
+        Qwen36ChatFinishReason::Stop(_) => FinishReason::Stop,
+        Qwen36ChatFinishReason::ToolCalls => FinishReason::ToolCalls,
+    }
 }
 
 #[cfg(test)]
