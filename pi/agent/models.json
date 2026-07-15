@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "eider": {
+      "name": "Eider",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-responses",
+      "apiKey": "$EIDER_API_KEY",
+      "authHeader": true,
+      "compat": {
+        "supportsDeveloperRole": false,
+        "sendSessionIdHeader": false
+      },
+      "models": [
+        {
+          "id": "eider-qwen3.6",
+          "name": "Qwen3.6 35B-A3B NVFP4",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}
