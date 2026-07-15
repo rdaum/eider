@@ -1,73 +1,75 @@
 # Eider
 
 > ... the eider duck: a small northern creature with an unreasonable amount of
-insulation (ahem)
+> insulation (ahem)
 
-'tis my small Rust-first inference-engine laboratory for NVIDIA DGX
-Spark (GB10, Grace Blackwell) running NVFP4 models. (Specifically
-really just Qwen3.6 MoE models for now).
+This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
+Blackwell) running Qwen3.6 MoE models in NVFP4. It includes an OpenAI
+API-compatible server with a scheduler, chunked prefill, batched decode, and a
+compact FP4 KV cache, on top of some (hopefully) finely tuned CUDA kernels.
 
-This started as a way to learn some of the hardware bit on my own
-Spark -- which I've had for months without really taking full
-advantage of -- but without putting a pile of tensor frameworks and
-abstraction between me and the interesting bits.
+This started as a personal research project and is crawling towards more of a
+production engine -- most parts of the kernel layer are agent-written; see the
+authorship note below. It also contains a self-contained Rust crate with NVFP4 /
+GB10 specific kernels that others may potentially reuse in their projects.
 
-This machine is different from a datacentre GPU despite the marketing:
-it is an aarch64 host with 128 GiB of unified memory and shared LPDDR5
-bandwidth. Those constraints make memory traffic, launch overhead, and
-the host/device boundary important parts of the design. Decode tends
-to become a bandwidth problem before it becomes a compute problem.
+### Why... ?
 
-Anyways, this is a bit of research project, not a production engine,
-and I'm pretty new to this stuff, so be easy on me if you happen to
-look at it.
+Mainly, I wanted to learn more about how an inference runtime is structured, and
+I wanted to understand more about the Spark's architecture, and I got annoyed by
+how heavy weight vLLM is, and I got frustrated by the state (or lack of it) of
+NVFP4 in `llama.cpp`.
 
-That said, it is currently pretty competitive. The Qwen3.6-35B-A3B NVFP4 path
-reaches about 77.5 tokens/sec for batch-one greedy decode on my GB10. This is
-about the same as (or a bit better than) what I get with vLLM for the same
-model/quant.
+The Spark is not a datacentre GPU (despite the marketing.) The SM12x Blackwell
+in it is not the same as the heavy duty "grown up" version. So I have a personal
+suspicion that it will likely be better served in the medium term by a bespoke
+runtime than by work being done on the vLLM mainline.
 
-And so I will likely continue to iterate on improving both performance
-and runtime surface (likely adding a more robust KVCache and OpenAI
-API frontend.) 
+### Performance
 
-I think a thing like this could become useful for people who want an
-easy-packaged and fast simple deployment for Qwen 3.6 on the Spark,
-for example.
+Qwen3.6-35B-A3B NVFP4 path reaches about 77.5 tokens/sec for batch-one greedy
+decode on GB10, roughly matching (or slightly beating) vLLM for the same model
+and quant.
 
-It's also an attempt to have a bit of a nicely self-contained Rust
-crate with some NVFP4 / GB10 specific kernels and bits that maybe
-others can re-use in their own projects once it grows up.
+However, in the actual serving runtime through the scheduler I'm only currently
+seeing 50-60 toks/sec -- though I am working to get that number back up.
+
+Chances are if you find the right knobs to twiddle in vLLM you'll get higher
+performance, but I do believe my memory usage and startup times are better. And
+this is a far smaller and easier to run package than that.
 
 ### A note about authorship
 
-The opening shape of this project was substantially written by me
+The opening shape of this project was substantially written by hand
 because the point was to understand the hardware rather than treat it
 as a black box. As the work moved into FFI boilerplate, format
 conversions, CUDA wrappers, and benchmark harnesses, AI assistance
-became a larger part of the implementation. Once I got into heavy
-performance tuning, things started to get really agent driven.
+became a larger part of the implementation, and the performance tuning
+is heavily agent driven.
 
-Anyways, that boundary is deliberately mentioned rather than hidden
-and I do not yet claim to understand every detail of every kernel;
-part of the next phase of work here is turning those pieces back into
-things I can explain and trust better.
+That boundary is deliberate and visible rather than hidden. Not every
+detail of every kernel is something I can yet explain from scratch, and
+turning those pieces back into things I can explain and trust better is
+part of the ongoing work here.
 
 ## Workspace
 
-The workspace has three layers:
+The workspace has three crates:
 
 - `crates/nvfp4` owns device buffers, ModelOpt NVFP4/FP8 loading, cuBLASLt
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
 - `crates/infer` owns model loading, Qwen layer execution, KV-cache state,
-  request-scoped sampling and generation, prefill/decode orchestration, CLI
+  request-scoped sampling and generation, the tokenized Qwen3.6 scheduler
+  (chunked prefill and batched decode), prefill/decode orchestration, CLI
   binaries, and runtime benchmarks. Its reusable execution state lives under
   `runtime/`, while model-family code lives under `qwen3/`.
 - `crates/eider-api` owns the dedicated inference actor and OpenAI Responses
   HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
   thread while async handlers submit, stream, and cancel requests over bounded
-  channels.
+  channels. It also exposes Prometheus and optional DogStatsD metrics for HTTP
+  requests, scheduler activity, token usage, throughput, and SM12x cache
+  preparation.
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust
 crate by its build script. CUTLASS is optional; when it is unavailable, the
@@ -75,12 +77,10 @@ build uses the cuBLASLt or stub fallback where supported.
 
 ## Models
 
-The current model targets are:
+Checkpoints kept under `models/`:
 
-- `models/qwen3-8b-nvfp4`
 - `models/qwen3-30b-a3b-nvfp4`
-- `models/qwen3-32b-nvfp4`
-- `models/qwen3.6-35b-a3-nvfp4`
+- `models/qwen3.6-35b-a3b-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
 
@@ -88,7 +88,9 @@ Models are expected to use the repository's supported ModelOpt or
 compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
 tokenizer files. The Unsloth Fast checkpoint keeps its MoE experts in NVFP4;
 the accuracy-oriented Unsloth checkpoint uses channel-scaled FP8 experts and
-shared experts in layers 32-39.
+shared experts in layers 32-39. The dense Qwen3 checkpoints (`qwen3-8b`,
+`qwen3-32b`) are still supported by the loader and the dense GEMV/CUTLASS
+path but are not kept on this machine.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -96,6 +98,118 @@ down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Mixed-precision
 checkpoints build it only for layers whose down weights are NVFP4. Cache files
 are written atomically and incomplete layers are resumed on the next startup;
 later runs validate and reuse the completed cache automatically.
+
+## Running the server
+Start the OpenAI Responses server with:
+
+```sh
+scripts/run-eider-server.sh
+```
+
+The launcher builds the release binary, serves the local Qwen3.6 checkpoint at
+`127.0.0.1:8080`, and defaults the API key to `local-eider`. Override its
+model, listen address, served name, or key with `EIDER_MODEL_DIR`,
+`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`. The server exposes
+Prometheus text at `/metrics` and health at `/healthz`; set
+`EIDER_DOGSTATSD_ENDPOINT` (with optional `EIDER_DOGSTATSD_INTERVAL_SECS`) to
+additionally push metrics over UDP. The `eider-serve` binary also takes
+`--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
+`--max-active-sequences`, and `--max-context-tokens` flags that map directly to
+the scheduler admission limits.
+
+Run the installed Pi coding agent against the matching repo-local provider:
+
+```sh
+scripts/run-pi-eider.sh
+```
+
+Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
+
+```sh
+scripts/run-pi-eider.sh --print "Reply with one short greeting."
+```
+
+The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR`,
+selects its native `openai-responses` provider, and does not modify the user's
+global Pi configuration.
+
+Point Codex at it with a custom provider in `~/.codex/config.toml`:
+
+```toml
+model = "eider-qwen3.6"
+model_provider = "eider"
+
+[model_providers.eider]
+name = "Eider"
+base_url = "http://127.0.0.1:8080/v1"
+env_key = "EIDER_API_KEY"
+wire_api = "responses"
+```
+
+The adapter accepts Codex message and function-call history, renders function
+tools through the checkpoint chat template, streams Responses lifecycle and
+function-argument events, and cancels scheduler work when a client disconnects.
+Run the full local Codex integration test explicitly with:
+
+```sh
+QWEN36_MODEL=models/qwen3.6-35b-a3-nvfp4 \
+cargo test --release -p eider-api --test codex -- --ignored --nocapture
+```
+
+## Build and run
+
+Requirements are Rust, CUDA 13.x, cuBLASLt, and an `nvcc` capable of compiling
+`sm_121` code. Build and test with:
+
+```sh
+cargo build -p infer
+cargo build --release -p infer
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+### Smoke test and benchmarks
+
+Qwen3.6 smoke test:
+
+```sh
+cargo run --release -p infer --bin qwen36-generate -- \
+    models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
+```
+
+The generator applies the checkpoint's text chat prefix and reads its sampling
+defaults from `generation_config.json` (`temperature`, `top_k`, `top_p`, and
+EOS token IDs). Positional overrides follow the token count in this order:
+temperature, top-k, top-p, seed, presence penalty, and frequency penalty. Pass
+`0` as the temperature to use the faster deterministic GPU top-1 path:
+
+```sh
+cargo run --release -p infer --bin qwen36-generate -- \
+    models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30 0
+```
+
+Throughput benchmark:
+
+```sh
+cargo run --release -p infer --bin qwen-bench -- \
+    --model models/qwen3.6-35b-a3-nvfp4 \
+    --prompt "What is the meaning of life?" \
+    --decode-tokens 512 \
+    --warmup-repeats 1 \
+    --repeats 3 \
+    --temperature 0
+```
+
+On 2026-07-14 at revision `1f445ce`, that run used a seven-token prompt and
+reported a median 6,602.8 ms for 512 decode tokens, or 77.54 tokens/sec.
+
+Use `--profile-decode` for stage timings. It synchronizes between stage groups,
+so its throughput is diagnostic and is not directly comparable with the normal
+CUDA-graph benchmark.
+
+For decode correctness isolation, set `EIDER_DISABLE_DECODE_GRAPHS=1` to run
+the same model path without segmented CUDA graph replay. This is a diagnostic
+comparison, not the fast default.
 
 ## Runtime shape
 
@@ -147,113 +261,10 @@ Sequence-owned KV and recurrent state remains device-resident as requests move
 between decode batches. The canonical changing-membership batch path is eager;
 the legacy single-row reference still uses graph replay for stable segments.
 
-## Build and run
-
-Requirements are Rust, CUDA 13.x, cuBLASLt, and an `nvcc` capable of compiling
-`sm_121` code. Build and test with:
-
-```sh
-cargo build -p infer
-cargo build --release -p infer
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Qwen3.6 smoke test:
-
-```sh
-cargo run --release -p infer --bin qwen36-generate -- \
-    models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
-```
-
-Responses API server:
-
-```sh
-scripts/run-eider-server.sh
-```
-
-The launcher builds the release binary, serves the local Qwen3.6 checkpoint at
-`127.0.0.1:8080`, and defaults `EIDER_API_KEY` to `local-eider`. Override its
-model, listen address, served name, or key with `EIDER_MODEL_DIR`,
-`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
-
-Run the installed Pi coding agent against the matching repo-local provider:
-
-```sh
-scripts/run-pi-eider.sh
-```
-
-Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
-
-```sh
-scripts/run-pi-eider.sh --print "Reply with one short greeting."
-```
-
-The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR`,
-selects its native `openai-responses` provider, and does not modify the user's
-global Pi configuration.
-
-Point Codex at it with a custom provider in `~/.codex/config.toml`:
-
-```toml
-model = "eider-qwen3.6"
-model_provider = "eider"
-
-[model_providers.eider]
-name = "Eider"
-base_url = "http://127.0.0.1:8080/v1"
-env_key = "EIDER_API_KEY"
-wire_api = "responses"
-```
-
-The adapter accepts Codex message and function-call history, renders function
-tools through the checkpoint chat template, streams Responses lifecycle and
-function-argument events, and cancels scheduler work when a client disconnects.
-Run the full local Codex integration test explicitly with:
-
-```sh
-QWEN36_MODEL=models/qwen3.6-35b-a3-nvfp4 \
-cargo test --release -p eider-api --test codex -- --ignored --nocapture
-```
-
-The generator applies the checkpoint's text chat prefix and reads its sampling
-defaults from `generation_config.json` (`temperature`, `top_k`, `top_p`, and
-EOS token IDs). Positional overrides follow the token count in this order:
-temperature, top-k, top-p, seed, presence penalty, and frequency penalty. Pass
-`0` as the temperature to use the faster deterministic GPU top-1 path:
-
-```sh
-cargo run --release -p infer --bin qwen36-generate -- \
-    models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30 0
-```
-
-Throughput benchmark:
-
-```sh
-cargo run --release -p infer --bin qwen-bench -- \
-    --model models/qwen3.6-35b-a3-nvfp4 \
-    --prompt "What is the meaning of life?" \
-    --decode-tokens 512 \
-    --warmup-repeats 1 \
-    --repeats 3 \
-    --temperature 0
-```
-
-On 2026-07-14 at revision `1f445ce`, that run used a seven-token prompt and
-reported a median 6,602.8 ms for 512 decode tokens, or 77.54 tokens/sec.
-
-Use `--profile-decode` for stage timings. It synchronizes between stage groups,
-so its throughput is diagnostic and is not directly comparable with the normal
-CUDA-graph benchmark.
-
-For decode correctness isolation, set `EIDER_DISABLE_DECODE_GRAPHS=1` to run
-the same model path without segmented CUDA graph replay. This is a diagnostic
-comparison, not the fast default.
-
 ## CUTLASS setup
 
 CUTLASS is needed when using the dense Qwen GEMV backend or running the
-CUTLASS-specific low-level tests and benchmarks. 
+CUTLASS-specific low-level tests and benchmarks.
 
 You do not need CUTLASS for the normal Qwen3.6 path. Its Marlin gate/up and
 SM12x down kernels build and run without a CUTLASS checkout.
@@ -281,12 +292,19 @@ Useful current targets include:
 
 ```sh
 cargo bench -p nvfp4 --bench marlin_routed_gate_up
-cargo bench -p infer --bench qwen36_routed_gate_up
+cargo bench -p nvfp4 --bench marlin_shared_expert
 cargo bench -p nvfp4 --bench lm_head_top1
 cargo bench -p nvfp4 --bench sm12x_indexed_gemv
+cargo bench -p nvfp4 --bench nvfp4_kv_attention
 cargo bench -p nvfp4 --bench fp8_routed_moe
+cargo bench -p nvfp4 --bench fp8_linear
 cargo bench -p nvfp4 --bench fp4_cublaslt
 cargo bench -p nvfp4 --bench fp4_quantization
+cargo bench -p nvfp4 --bench moe_topk
+cargo bench -p nvfp4 --bench gated_delta_net
+cargo bench -p infer --bench qwen36_routed_gate_up
+cargo bench -p infer --bench qwen36_decode_batch
+cargo bench -p infer --bench qwen36_prefill
 cargo bench -p infer --bench qwen36_cpu_shared_expert
 cargo bench -p infer --bench sampling
 ```
