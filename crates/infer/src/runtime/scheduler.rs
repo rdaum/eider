@@ -5,7 +5,7 @@ use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36NextToken, Qwen36PrefillBatchWorkspace,
     Qwen36PrefillRow, Qwen36SequenceState, Qwen36TextModel,
 };
-use nvfp4::{Error, Result};
+use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Stable scheduler identity for one request.
@@ -222,6 +222,7 @@ struct Qwen36Request {
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
     sequence: Option<Box<Qwen36SequenceState>>,
+    device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     sampler: Sampler,
     history: TokenHistory,
@@ -383,6 +384,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 prompt_tokens,
                 prompt_position: 0,
                 sequence: None,
+                device_token_counts: None,
                 sequence_device_bytes: 0,
                 sampler,
                 history,
@@ -423,8 +425,21 @@ impl<'model> Qwen36Scheduler<'model> {
                     return Err(error);
                 }
             };
-            request.sequence_device_bytes = sequence.device_bytes();
+            let device_token_counts = if request.config.sampling.supports_gpu_sampling()
+                && request.config.sampling.uses_history_penalties()
+            {
+                Some(DeviceBuffer::from_host(
+                    &request.history.dense_counts(self.model.manifest().vocab),
+                )?)
+            } else {
+                None
+            };
+            request.sequence_device_bytes = sequence.device_bytes()
+                + device_token_counts
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::device_bytes);
             request.sequence = Some(Box::new(sequence));
+            request.device_token_counts = device_token_counts;
             request.lifecycle = Qwen36RequestState::Prefilling;
             self.prefilling.push_back(id);
             tick.admitted.push(Qwen36AdmissionProgress {
@@ -489,6 +504,7 @@ impl<'model> Qwen36Scheduler<'model> {
             tick.generated.push(token);
             if request.lifecycle == Qwen36RequestState::Finished {
                 request.sequence.take();
+                request.device_token_counts.take();
                 tick.finished.push(request.id);
             } else {
                 self.decoding.push_back(request.id);
@@ -501,7 +517,10 @@ impl<'model> Qwen36Scheduler<'model> {
     fn execute_decode(&mut self, selected: &mut [Box<Qwen36Request>]) -> Result<Vec<SampledToken>> {
         let needs_host_logits = selected
             .iter()
-            .any(|request| !request.sampler.config().uses_fast_argmax());
+            .any(|request| !request.sampler.config().supports_gpu_sampling());
+        let all_fast_argmax = selected
+            .iter()
+            .all(|request| request.sampler.config().uses_fast_argmax());
         let mut rows = selected
             .iter_mut()
             .map(|request| {
@@ -525,14 +544,47 @@ impl<'model> Qwen36Scheduler<'model> {
             .find(|workspace| workspace.capacity() >= rows.len())
             .expect("decode capacity classes cover the configured maximum");
         let mut decoded = self.model.decode_batch(workspace, &mut rows)?;
-        if !needs_host_logits {
+        if all_fast_argmax {
             return decoded
                 .top1()
                 .map(|tokens| tokens.into_iter().map(sampled_top1).collect());
         }
+        if !needs_host_logits {
+            drop(rows);
+            let mut sampling_rows = selected
+                .iter_mut()
+                .map(|request| {
+                    let config = request.sampler.config();
+                    let draw = if config.temperature == 0.0 || config.top_k == 1 {
+                        0.0
+                    } else {
+                        request.sampler.next_gpu_draw()
+                    };
+                    GpuSamplingRow {
+                        temperature: config.temperature,
+                        top_k: config.top_k,
+                        top_p: config.top_p,
+                        presence_penalty: config.presence_penalty,
+                        frequency_penalty: config.frequency_penalty,
+                        draw,
+                        token_counts: request.device_token_counts.as_mut(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            return decoded.sample_topk_topp(&mut sampling_rows).map(|samples| {
+                samples
+                    .into_iter()
+                    .map(|sample| SampledToken {
+                        id: sample.id,
+                        logit: sample.logit,
+                        adjusted_logit: sample.adjusted_logit,
+                    })
+                    .collect()
+            });
+        }
         let vocab = decoded.vocab();
         let logits = decoded.copy_logits()?;
-        selected
+        let samples = selected
             .iter_mut()
             .enumerate()
             .map(|(row, request)| {
@@ -542,7 +594,16 @@ impl<'model> Qwen36Scheduler<'model> {
                 }
                 request.sampler.sample(row_logits, &request.history)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        for (request, sample) in selected.iter_mut().zip(&samples) {
+            let Some(counts) = request.device_token_counts.as_mut() else {
+                continue;
+            };
+            let mut dense = request.history.dense_counts(vocab);
+            dense[sample.id as usize] += 1;
+            counts.copy_from_host(&dense)?;
+        }
+        Ok(samples)
     }
 
     fn run_prefill_phase(&mut self, tick: &mut Qwen36SchedulerTick) -> Result<()> {
@@ -706,8 +767,8 @@ impl<'model> Qwen36Scheduler<'model> {
         self.requests.get(&id).map(|request| {
             request
                 .sequence
-                .as_deref()
-                .map_or(0, Qwen36SequenceState::device_bytes)
+                .as_ref()
+                .map_or(0, |_| request.sequence_device_bytes)
         })
     }
 

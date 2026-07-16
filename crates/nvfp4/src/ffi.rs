@@ -963,6 +963,17 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sample_topk_topp_f32_batch_on_stream(
+        logits: *const f32,
+        params: *const c_void,
+        stage_one_keys: *mut u64,
+        stage_two_keys: *mut u64,
+        top_keys: *mut u64,
+        results: *mut c_void,
+        rows: u32,
+        vocab: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     #[cfg(test)]
     pub(crate) fn infer_bf16_linear_logits_f32(
         input: *const f32,

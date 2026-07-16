@@ -1,3 +1,4 @@
+use infer::nvfp4::GpuSamplingRow;
 use infer::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState, Qwen36SequenceState,
     Qwen36TextModel,
@@ -26,7 +27,8 @@ enum DecodeMode {
 #[derive(Clone, Copy)]
 enum DecodeOutput {
     Top1,
-    Sample,
+    CpuSample,
+    GpuSample,
 }
 
 struct DecodeBatchCase {
@@ -188,7 +190,7 @@ impl DecodeBatchCase {
                             self.histories[row].push(next.id);
                         }
                     }
-                    DecodeOutput::Sample => {
+                    DecodeOutput::CpuSample => {
                         let vocab = decoded.vocab();
                         let logits = decoded.copy_logits().expect("batched logits");
                         for row in 0..self.batch {
@@ -199,6 +201,26 @@ impl DecodeBatchCase {
                                 )
                                 .expect("sample batched logits");
                             self.tokens[row] = next.id;
+                            self.histories[row].push(next.id);
+                        }
+                    }
+                    DecodeOutput::GpuSample => {
+                        let mut sampling_rows = (0..self.batch)
+                            .map(|_| GpuSamplingRow {
+                                temperature: 1.0,
+                                top_k: 20,
+                                top_p: 0.95,
+                                presence_penalty: 0.0,
+                                frequency_penalty: 0.0,
+                                draw: 0.5,
+                                token_counts: None,
+                            })
+                            .collect::<Vec<_>>();
+                        let next = decoded
+                            .sample_topk_topp(&mut sampling_rows)
+                            .expect("GPU-sampled batched logits");
+                        for (row, (token, next)) in self.tokens.iter_mut().zip(next).enumerate() {
+                            *token = next.id;
                             self.histories[row].push(next.id);
                         }
                     }
@@ -471,7 +493,7 @@ fn main() {
             let sampled_case = Rc::new(RefCell::new(DecodeBatchCase::new(
                 Rc::clone(&model),
                 DecodeMode::Batched,
-                DecodeOutput::Sample,
+                DecodeOutput::CpuSample,
                 1,
                 max_context_tokens,
                 start_position,
@@ -483,7 +505,24 @@ fn main() {
                 .throughput(Throughput::per_operation(1, "tokens"))
                 .measurement_domain(MeasurementDomain::Gpu)
                 .factory(&sampled_factory)
-                .bench_sample("batch_api_sampled_1", decode_sample);
+                .bench_sample("batch_api_sampled_cpu_1", decode_sample);
+
+            let gpu_sampled_case = Rc::new(RefCell::new(DecodeBatchCase::new(
+                Rc::clone(&model),
+                DecodeMode::Batched,
+                DecodeOutput::GpuSample,
+                1,
+                max_context_tokens,
+                start_position,
+            )));
+            let gpu_sampled_factory = || DecodeBatchBench {
+                case: Rc::clone(&gpu_sampled_case),
+            };
+            group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu)
+                .factory(&gpu_sampled_factory)
+                .bench_sample("batch_api_sampled_gpu_1", decode_sample);
         });
     });
 }

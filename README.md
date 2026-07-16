@@ -27,16 +27,23 @@ runtime than by work being done on the vLLM mainline.
 
 ### Performance
 
-Qwen3.6-35B-A3B NVFP4 path reaches about 77.5 tokens/sec for batch-one greedy
-decode on GB10, roughly matching (or slightly beating) vLLM for the same model
-and quant.
+Eider's OpenAI-compatible API sustains about 72.7 decode tokens/sec with
+Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
+comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
+with the same model using BF16 KV and greedy sampling.
 
-However, in the actual serving runtime through the scheduler I'm only currently
-seeing 50-60 toks/sec -- though I am working to get that number back up.
+Compared with the current vLLM setup, the more consequential differences are
+operational. Eider starts substantially faster and has a smaller idle footprint
+because sequence state is allocated on demand rather than as a large up-front
+KV pool. It also supports a compact NVFP4 KV cache directly on SM121; current
+vLLM builds cannot use their NVFP4 KV path for this model on GB10 and fall back
+to BF16.
 
-Chances are if you find the right knobs to twiddle in vLLM you'll get higher
-performance, but I do believe my memory usage and startup times are better. And
-this is a far smaller and easier to run package than that.
+Both advantages leave more of the Spark's 128 GB unified memory available for
+longer contexts and concurrent requests. In particular, the smaller NVFP4 KV
+cache leaves more room for model weights and could raise the practical
+model-size ceiling relative to a runtime using BF16 KV. Finding the largest
+useful checkpoint that fits on one Spark is a planned next test.
 
 ### A note about authorship
 
@@ -233,8 +240,12 @@ flowchart TD
     J -->|FP8| L[Grouped W8A8 gate/up + down]
     K --> M[Shared expert + weighted combine]
     L --> M
-    M --> N[Final RMSNorm + lm-head top-1]
-    N --> O[Next token]
+    M --> N[Final RMSNorm + lm-head logits]
+    N --> P{Sampling policy}
+    P -->|Greedy| Q[GPU top-1]
+    P -->|Bounded top-k/top-p| R[Hierarchical GPU top-k + sampling]
+    Q --> O[Selected token]
+    R --> O
     O --> C
 
     subgraph Host[Host orchestration]

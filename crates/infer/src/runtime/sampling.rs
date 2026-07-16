@@ -1,6 +1,6 @@
-//! Request-scoped token sampling over CPU-visible model logits.
+//! Request-scoped token sampling policies and CPU reference implementation.
 
-use nvfp4::{Error, Result};
+use nvfp4::{Error, GPU_SAMPLING_MAX_TOP_K, Result};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 
@@ -59,6 +59,16 @@ impl SamplingConfig {
             && self.presence_penalty == 0.0
             && self.frequency_penalty == 0.0
     }
+
+    /// Returns true when the bounded device sampler can preserve this policy.
+    pub fn supports_gpu_sampling(self) -> bool {
+        self.temperature == 0.0 || (self.top_k > 0 && self.top_k <= GPU_SAMPLING_MAX_TOP_K)
+    }
+
+    /// Returns true when sampling needs request token occurrence counts.
+    pub fn uses_history_penalties(self) -> bool {
+        self.presence_penalty != 0.0 || self.frequency_penalty != 0.0
+    }
 }
 
 fn validate_penalty(label: &'static str, value: f32) -> Result<()> {
@@ -113,6 +123,17 @@ impl TokenHistory {
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
     }
+
+    /// Materializes vocabulary-sized occurrence counts for device sampling.
+    pub(crate) fn dense_counts(&self, vocab: usize) -> Vec<u32> {
+        let mut dense = vec![0u32; vocab];
+        for (&token, &count) in &self.counts {
+            if let Some(slot) = dense.get_mut(token as usize) {
+                *slot = count;
+            }
+        }
+        dense
+    }
 }
 
 /// One token selected from a logits vector.
@@ -150,6 +171,11 @@ impl Sampler {
     /// Selects one token using the sampler's request-scoped RNG.
     pub fn sample(&mut self, logits: &[f32], history: &TokenHistory) -> Result<SampledToken> {
         sample_next_token(logits, self.config, history, &mut self.rng)
+    }
+
+    /// Produces the next uniform draw consumed by device-resident sampling.
+    pub(crate) fn next_gpu_draw(&mut self) -> f32 {
+        self.rng.random::<f32>()
     }
 }
 
@@ -352,6 +378,26 @@ mod tests {
                 ..SamplingConfig::default()
             }
             .uses_fast_argmax()
+        );
+    }
+
+    #[test]
+    fn bounded_top_k_and_greedy_policies_support_gpu_sampling() {
+        assert!(SamplingConfig::default().supports_gpu_sampling());
+        assert!(
+            SamplingConfig {
+                temperature: 0.0,
+                top_k: 0,
+                ..SamplingConfig::default()
+            }
+            .supports_gpu_sampling()
+        );
+        assert!(
+            !SamplingConfig {
+                top_k: nvfp4::GPU_SAMPLING_MAX_TOP_K + 1,
+                ..SamplingConfig::default()
+            }
+            .supports_gpu_sampling()
         );
     }
 }

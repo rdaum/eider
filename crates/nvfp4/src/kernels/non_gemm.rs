@@ -3234,6 +3234,229 @@ pub fn argmax_f32_batch_into_on_stream(
     }
 }
 
+/// Largest top-k candidate set supported by the low-latency GPU sampler.
+pub const GPU_SAMPLING_MAX_TOP_K: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeviceSamplingParams {
+    temperature: f32,
+    top_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    draw: f32,
+    top_k: u32,
+    token_counts: u64,
+}
+
+/// One compact token result produced by device-resident sampling.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuSampledToken {
+    /// Selected vocabulary ID.
+    pub id: u32,
+    /// Original model logit before penalties and temperature.
+    pub logit: f32,
+    /// Logit after presence and frequency penalties.
+    pub adjusted_logit: f32,
+    status: u32,
+}
+
+/// Per-row sampling inputs consumed by [`GpuTokenSampler`].
+pub struct GpuSamplingRow<'a> {
+    /// Softmax temperature. Zero selects the adjusted argmax.
+    pub temperature: f32,
+    /// Maximum candidates retained before nucleus sampling.
+    pub top_k: usize,
+    /// Cumulative probability retained by nucleus sampling.
+    pub top_p: f32,
+    /// One-time penalty for tokens already present.
+    pub presence_penalty: f32,
+    /// Per-occurrence token penalty.
+    pub frequency_penalty: f32,
+    /// Uniform random draw in `[0, 1)` for this row.
+    pub draw: f32,
+    /// Optional vocabulary-sized occurrence counts updated after sampling.
+    pub token_counts: Option<&'a mut DeviceBuffer<u32>>,
+}
+
+/// Reusable device and host storage for batched top-k/top-p token sampling.
+pub struct GpuTokenSampler {
+    capacity: usize,
+    vocab: usize,
+    host_params: Vec<DeviceSamplingParams>,
+    params: DeviceBuffer<DeviceSamplingParams>,
+    stage_one_keys: DeviceBuffer<u64>,
+    stage_two_keys: DeviceBuffer<u64>,
+    top_keys: DeviceBuffer<u64>,
+    results: DeviceBuffer<GpuSampledToken>,
+}
+
+impl GpuTokenSampler {
+    /// Allocates sampling metadata and hierarchical top-k storage.
+    pub fn new(capacity: usize, vocab: usize) -> Result<Self> {
+        const ITEMS_PER_BLOCK: usize = 1024;
+        const MAX_VOCAB: usize = ITEMS_PER_BLOCK * ITEMS_PER_BLOCK;
+        if capacity == 0 || vocab == 0 || vocab > MAX_VOCAB {
+            return Err(Error::Shape {
+                label: "GPU token sampler shape",
+                expected: format!("capacity > 0 and vocab=1..={MAX_VOCAB}"),
+                actual: format!("capacity={capacity} vocab={vocab}"),
+            });
+        }
+        let stage_one_chunks = vocab.div_ceil(ITEMS_PER_BLOCK);
+        let stage_one_count = stage_one_chunks * GPU_SAMPLING_MAX_TOP_K;
+        let stage_two_chunks = stage_one_count.div_ceil(ITEMS_PER_BLOCK);
+        let stage_two_count = stage_two_chunks * GPU_SAMPLING_MAX_TOP_K;
+        let empty = DeviceSamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            draw: 0.0,
+            top_k: 1,
+            token_counts: 0,
+        };
+        Ok(Self {
+            capacity,
+            vocab,
+            host_params: vec![empty; capacity],
+            params: DeviceBuffer::zeroed(capacity)?,
+            stage_one_keys: DeviceBuffer::zeroed(capacity * stage_one_count)?,
+            stage_two_keys: DeviceBuffer::zeroed(capacity * stage_two_count)?,
+            top_keys: DeviceBuffer::zeroed(capacity * GPU_SAMPLING_MAX_TOP_K)?,
+            results: DeviceBuffer::zeroed(capacity)?,
+        })
+    }
+
+    /// Returns the device bytes owned by reusable sampling storage.
+    pub fn device_bytes(&self) -> usize {
+        self.params.device_bytes()
+            + self.stage_one_keys.device_bytes()
+            + self.stage_two_keys.device_bytes()
+            + self.top_keys.device_bytes()
+            + self.results.device_bytes()
+    }
+
+    /// Samples one token per active logit row and copies only compact results.
+    pub fn sample(
+        &mut self,
+        logits: &DeviceBuffer<f32>,
+        rows: &mut [GpuSamplingRow<'_>],
+        vocab: usize,
+        stream: &CudaStream,
+    ) -> Result<Vec<GpuSampledToken>> {
+        if rows.is_empty()
+            || rows.len() > self.capacity
+            || self.capacity > u32::MAX as usize
+            || vocab != self.vocab
+            || logits.len() != self.capacity.saturating_mul(vocab)
+            || vocab > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "GPU token sampling buffers",
+                expected: format!(
+                    "rows=1..={} logits={} vocab>0",
+                    self.capacity,
+                    self.capacity.saturating_mul(vocab)
+                ),
+                actual: format!("rows={} logits={} vocab={vocab}", rows.len(), logits.len()),
+            });
+        }
+        self.host_params.fill(DeviceSamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            draw: 0.0,
+            top_k: 1,
+            token_counts: 0,
+        });
+        for (slot, row) in rows.iter_mut().enumerate() {
+            let effective_top_k = if row.temperature == 0.0 { 1 } else { row.top_k };
+            if !row.temperature.is_finite()
+                || row.temperature < 0.0
+                || !row.top_p.is_finite()
+                || row.top_p <= 0.0
+                || row.top_p > 1.0
+                || !row.presence_penalty.is_finite()
+                || !row.frequency_penalty.is_finite()
+                || !row.draw.is_finite()
+                || !(0.0..1.0).contains(&row.draw)
+            {
+                return Err(Error::Format {
+                    label: "GPU token sampling parameters",
+                    detail: format!("invalid parameters for row {slot}"),
+                });
+            }
+            if effective_top_k == 0 || effective_top_k > GPU_SAMPLING_MAX_TOP_K {
+                return Err(Error::Shape {
+                    label: "GPU token sampling top-k",
+                    expected: format!("1..={GPU_SAMPLING_MAX_TOP_K}"),
+                    actual: effective_top_k.to_string(),
+                });
+            }
+            let token_counts = match row.token_counts.as_deref_mut() {
+                Some(counts) if counts.len() == vocab => counts.ptr as usize as u64,
+                Some(counts) => {
+                    return Err(Error::Shape {
+                        label: "GPU sampling token counts",
+                        expected: format!("{vocab} values"),
+                        actual: format!("{} values", counts.len()),
+                    });
+                }
+                None => 0,
+            };
+            self.host_params[slot] = DeviceSamplingParams {
+                temperature: row.temperature,
+                top_p: row.top_p,
+                presence_penalty: row.presence_penalty,
+                frequency_penalty: row.frequency_penalty,
+                draw: row.draw,
+                top_k: effective_top_k as u32,
+                token_counts,
+            };
+        }
+        self.params.copy_from_host(&self.host_params)?;
+        unsafe {
+            check_cuda(
+                "infer_sample_topk_topp_f32_batch_on_stream",
+                ffi::infer_sample_topk_topp_f32_batch_on_stream(
+                    logits.ptr,
+                    self.params.ptr.cast(),
+                    self.stage_one_keys.ptr,
+                    self.stage_two_keys.ptr,
+                    self.top_keys.ptr,
+                    self.results.ptr.cast(),
+                    rows.len() as u32,
+                    vocab as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        let results = self
+            .results
+            .copy_prefix_to_host(rows.len(), stream)?
+            .into_vec();
+        if let Some((row, result)) = results
+            .iter()
+            .enumerate()
+            .find(|(_, result)| result.status != 0)
+        {
+            let detail = match result.status {
+                1 => "no finite logits",
+                2 => "invalid probability mass",
+                _ => "unknown device sampling failure",
+            };
+            return Err(Error::Format {
+                label: "GPU token sampling",
+                detail: format!("row {row}: {detail}"),
+            });
+        }
+        Ok(results)
+    }
+}
+
 /// Enqueues the fused direct top-1 lm-head kernel on `stream`.
 ///
 /// Computes argmax(`weight * input`) directly without materializing a full
@@ -5886,6 +6109,139 @@ pub fn gated_rms_norm_f32_into_on_stream(
 mod tests {
     use super::*;
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn gpu_token_sampler_keeps_logits_on_device_and_applies_penalties() {
+        let vocab = 64usize;
+        let mut logits = vec![-20.0f32; 2 * vocab];
+        logits[1] = 4.0;
+        logits[2] = 5.0;
+        logits[vocab + 7] = 3.0;
+        logits[vocab + 9] = 2.0;
+        logits[vocab + 11] = 1.0;
+        let logits = DeviceBuffer::from_host(&logits).expect("logits");
+        let mut counts = vec![0u32; vocab];
+        counts[2] = 2;
+        let mut counts = DeviceBuffer::from_host(&counts).expect("counts");
+        let mut sampler = GpuTokenSampler::new(2, vocab).expect("sampler");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let sampled = sampler
+            .sample(
+                &logits,
+                &mut [
+                    GpuSamplingRow {
+                        temperature: 0.0,
+                        top_k: 20,
+                        top_p: 0.95,
+                        presence_penalty: 1.0,
+                        frequency_penalty: 1.0,
+                        draw: 0.25,
+                        token_counts: Some(&mut counts),
+                    },
+                    GpuSamplingRow {
+                        temperature: 1.0,
+                        top_k: 3,
+                        top_p: 1.0,
+                        presence_penalty: 0.0,
+                        frequency_penalty: 0.0,
+                        draw: 0.999,
+                        token_counts: None,
+                    },
+                ],
+                vocab,
+                &stream,
+            )
+            .expect("sample");
+        assert_eq!(sampled[0].id, 1);
+        assert_eq!(sampled[0].logit, 4.0);
+        assert_eq!(sampled[0].adjusted_logit, 4.0);
+        assert_eq!(sampled[1].id, 11);
+        assert_eq!(sampled[1].logit, 1.0);
+        let counts = counts.copy_to_host(&stream).expect("counts readback");
+        assert_eq!(counts[1], 1);
+        assert_eq!(counts[2], 2);
+    }
+
+    #[test]
+    fn gpu_token_sampler_reduces_candidates_across_multiple_stages() {
+        let vocab = 35_000usize;
+        let mut logits = vec![-100.0f32; 2 * vocab];
+        let candidate_ids = (0..32).map(|slot| 17 + slot * 1_051).collect::<Vec<_>>();
+        for (slot, &id) in candidate_ids.iter().enumerate() {
+            logits[id] = 10.0 - slot as f32 * 0.25;
+        }
+        logits[vocab + 9_001] = 7.0;
+        logits[vocab + 2_001] = 7.0;
+        logits[vocab + 34_001] = 6.0;
+
+        let logits = DeviceBuffer::from_host(&logits).expect("logits");
+        let mut sampler = GpuTokenSampler::new(2, vocab).expect("sampler");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let draw = 0.73f32;
+        let sampled = sampler
+            .sample(
+                &logits,
+                &mut [
+                    GpuSamplingRow {
+                        temperature: 0.8,
+                        top_k: 32,
+                        top_p: 0.83,
+                        presence_penalty: 0.0,
+                        frequency_penalty: 0.0,
+                        draw,
+                        token_counts: None,
+                    },
+                    GpuSamplingRow {
+                        temperature: 0.0,
+                        top_k: 0,
+                        top_p: 1.0,
+                        presence_penalty: 0.0,
+                        frequency_penalty: 0.0,
+                        draw: 0.0,
+                        token_counts: None,
+                    },
+                ],
+                vocab,
+                &stream,
+            )
+            .expect("sample");
+
+        let values = candidate_ids
+            .iter()
+            .enumerate()
+            .map(|(slot, &id)| (id as u32, 10.0 - slot as f32 * 0.25))
+            .collect::<Vec<_>>();
+        let weights = values
+            .iter()
+            .map(|(_, value)| ((*value - values[0].1) / 0.8).exp())
+            .collect::<Vec<_>>();
+        let total = weights.iter().sum::<f32>();
+        let retained = weights
+            .iter()
+            .scan(0.0, |sum, weight| {
+                *sum += weight / total;
+                Some(*sum)
+            })
+            .position(|sum| sum >= 0.83)
+            .map_or(weights.len(), |slot| slot + 1);
+        let retained_weight = weights[..retained].iter().sum::<f32>();
+        let mut target = draw * retained_weight;
+        let expected = weights[..retained]
+            .iter()
+            .position(|weight| {
+                if target < *weight {
+                    true
+                } else {
+                    target -= *weight;
+                    false
+                }
+            })
+            .unwrap_or(retained - 1);
+
+        assert_eq!(sampled[0].id, values[expected].0);
+        assert_eq!(sampled[0].logit, values[expected].1);
+        assert_eq!(sampled[1].id, 2_001, "equal logits prefer the lower ID");
+    }
 
     #[test]
     fn rms_norm_f32_matches_cpu_reference() {

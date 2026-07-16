@@ -7,14 +7,14 @@ use super::{
 };
 use crate::nvfp4::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
-    MarlinNvfp4GateUpBatchWorkspace, MropeSections, Result, Sm12xKvAttentionWorkspace,
-    add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    fill_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
-    gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
-    gated_rms_norm_f32_into_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_topk_f32_batch_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    GpuSampledToken, GpuSamplingRow, GpuTokenSampler, MarlinNvfp4GateUpBatchWorkspace,
+    MropeSections, Result, Sm12xKvAttentionWorkspace, add_f32_into_on_stream,
+    argmax_f32_batch_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, fill_f32_into_on_stream,
+    fp8_linear_f32_batch_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
+    gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_topk_f32_batch_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
     qwen36_full_attn_prep_f32_batch_into_on_stream, qwen36_gdn_gate_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_into_on_stream,
@@ -109,6 +109,26 @@ impl Qwen36DecodedBatch<'_> {
             .zip(values.iter().copied())
             .map(|(id, value)| Qwen36NextToken { id, value })
             .collect())
+    }
+
+    /// Samples active rows on the decode stream and returns compact token results.
+    pub fn sample_topk_topp(
+        &mut self,
+        rows: &mut [GpuSamplingRow<'_>],
+    ) -> Result<Vec<GpuSampledToken>> {
+        if rows.len() != self.rows {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 sampling rows",
+                expected: format!("{} active rows", self.rows),
+                actual: format!("{} rows", rows.len()),
+            });
+        }
+        self.workspace.sampler.sample(
+            &self.workspace.logits,
+            rows,
+            self.vocab,
+            &self.workspace.stream,
+        )
     }
 }
 
@@ -610,6 +630,7 @@ pub struct Qwen36DecodeBatchWorkspace {
     logits: DeviceBuffer<f32>,
     next_indices: DeviceBuffer<u32>,
     next_values: DeviceBuffer<f32>,
+    sampler: GpuTokenSampler,
 }
 
 impl Qwen36DecodeBatchWorkspace {
@@ -644,6 +665,7 @@ impl Qwen36DecodeBatchWorkspace {
             + self.logits.device_bytes()
             + self.next_indices.device_bytes()
             + self.next_values.device_bytes()
+            + self.sampler.device_bytes()
     }
 }
 
@@ -1056,6 +1078,7 @@ impl Qwen36TextModel {
             logits: DeviceBuffer::zeroed(capacity * self.manifest.vocab)?,
             next_indices: DeviceBuffer::zeroed(capacity)?,
             next_values: DeviceBuffer::zeroed(capacity)?,
+            sampler: GpuTokenSampler::new(capacity, self.manifest.vocab)?,
         };
         let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));

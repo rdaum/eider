@@ -3408,6 +3408,268 @@ extern "C" cudaError_t infer_argmax_f32_on_stream(const float* values,
 }
 
 // =============================================================================
+// Device-resident token sampling.
+
+constexpr std::uint32_t kInferSamplingThreads = 256;
+constexpr std::uint32_t kInferSamplingItemsPerThread = 4;
+constexpr std::uint32_t kInferSamplingItemsPerBlock =
+    kInferSamplingThreads * kInferSamplingItemsPerThread;
+constexpr std::uint32_t kInferSamplingMaxTopK = 32;
+
+struct InferSamplingParams {
+    float temperature;
+    float top_p;
+    float presence_penalty;
+    float frequency_penalty;
+    float draw;
+    std::uint32_t top_k;
+    std::uint64_t token_counts;
+};
+
+struct InferSamplingResult {
+    std::uint32_t id;
+    float logit;
+    float adjusted_logit;
+    std::uint32_t status;
+};
+
+__device__ __forceinline__ std::uint64_t infer_sampling_key(
+    float value,
+    std::uint32_t id) {
+    const std::uint32_t bits = __float_as_uint(value);
+    const std::uint32_t ordered =
+        (bits & 0x80000000U) != 0 ? ~bits : bits ^ 0x80000000U;
+    return (static_cast<std::uint64_t>(ordered) << 32) |
+           static_cast<std::uint64_t>(UINT32_MAX - id);
+}
+
+__device__ __forceinline__ std::uint32_t infer_sampling_key_id(
+    std::uint64_t key) {
+    return UINT32_MAX - static_cast<std::uint32_t>(key);
+}
+
+__device__ __forceinline__ float infer_sampling_key_value(std::uint64_t key) {
+    const std::uint32_t ordered = static_cast<std::uint32_t>(key >> 32);
+    const std::uint32_t bits =
+        (ordered & 0x80000000U) != 0 ? ordered ^ 0x80000000U : ~ordered;
+    return __uint_as_float(bits);
+}
+
+using InferSamplingBlockSort = cub::BlockRadixSort<
+    std::uint64_t,
+    kInferSamplingThreads,
+    kInferSamplingItemsPerThread>;
+
+// Each block sorts 1,024 vocabulary entries and emits its best 32. Later
+// stages repeat the same reduction over those compact candidate lists.
+__global__ void infer_sampling_logits_topk_kernel(
+    const float* logits,
+    const InferSamplingParams* params,
+    std::uint64_t* output_keys,
+    std::uint32_t vocab,
+    std::uint32_t chunks_per_row) {
+    const std::uint32_t row = blockIdx.x / chunks_per_row;
+    const std::uint32_t chunk = blockIdx.x % chunks_per_row;
+    const InferSamplingParams config = params[row];
+    const auto* counts = reinterpret_cast<const std::uint32_t*>(config.token_counts);
+    const float* row_logits = logits + static_cast<std::size_t>(row) * vocab;
+    const std::uint32_t chunk_start = chunk * kInferSamplingItemsPerBlock;
+
+    std::uint64_t keys[kInferSamplingItemsPerThread];
+    #pragma unroll
+    for (std::uint32_t item = 0; item < kInferSamplingItemsPerThread; ++item) {
+        const std::uint32_t id = chunk_start + threadIdx.x + item * blockDim.x;
+        std::uint64_t key = 0;
+        if (id < vocab) {
+            const float logit = row_logits[id];
+            if (isfinite(logit)) {
+                const std::uint32_t count = counts == nullptr ? 0U : counts[id];
+                const float adjusted = logit -
+                    (count == 0U ? 0.0f : config.presence_penalty) -
+                    config.frequency_penalty * static_cast<float>(count);
+                key = infer_sampling_key(adjusted, id);
+            }
+        }
+        keys[item] = key;
+    }
+
+    __shared__ typename InferSamplingBlockSort::TempStorage sort_storage;
+    InferSamplingBlockSort(sort_storage).SortDescending(keys);
+    const std::uint32_t output_base =
+        (row * chunks_per_row + chunk) * kInferSamplingMaxTopK;
+    #pragma unroll
+    for (std::uint32_t item = 0; item < kInferSamplingItemsPerThread; ++item) {
+        const std::uint32_t rank = threadIdx.x * kInferSamplingItemsPerThread + item;
+        if (rank < kInferSamplingMaxTopK) {
+            output_keys[output_base + rank] = keys[item];
+        }
+    }
+}
+
+__global__ void infer_sampling_keys_topk_kernel(
+    const std::uint64_t* input_keys,
+    std::uint64_t* output_keys,
+    std::uint32_t input_count_per_row,
+    std::uint32_t output_chunks_per_row) {
+    const std::uint32_t row = blockIdx.x / output_chunks_per_row;
+    const std::uint32_t chunk = blockIdx.x % output_chunks_per_row;
+    const std::uint32_t chunk_start = chunk * kInferSamplingItemsPerBlock;
+    const std::uint64_t* row_input =
+        input_keys + static_cast<std::size_t>(row) * input_count_per_row;
+
+    std::uint64_t keys[kInferSamplingItemsPerThread];
+    #pragma unroll
+    for (std::uint32_t item = 0; item < kInferSamplingItemsPerThread; ++item) {
+        const std::uint32_t index = chunk_start + threadIdx.x + item * blockDim.x;
+        keys[item] = index < input_count_per_row ? row_input[index] : 0;
+    }
+
+    __shared__ typename InferSamplingBlockSort::TempStorage sort_storage;
+    InferSamplingBlockSort(sort_storage).SortDescending(keys);
+    const std::uint32_t output_base =
+        (row * output_chunks_per_row + chunk) * kInferSamplingMaxTopK;
+    #pragma unroll
+    for (std::uint32_t item = 0; item < kInferSamplingItemsPerThread; ++item) {
+        const std::uint32_t rank = threadIdx.x * kInferSamplingItemsPerThread + item;
+        if (rank < kInferSamplingMaxTopK) {
+            output_keys[output_base + rank] = keys[item];
+        }
+    }
+}
+
+__global__ void infer_sampling_finalize_kernel(
+    const float* logits,
+    const InferSamplingParams* params,
+    const std::uint64_t* top_keys,
+    InferSamplingResult* results,
+    std::uint32_t vocab) {
+    const std::uint32_t row = blockIdx.x;
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const InferSamplingParams config = params[row];
+    const std::uint32_t k = config.temperature == 0.0f ? 1U : config.top_k;
+    const std::uint64_t* row_keys = top_keys + row * kInferSamplingMaxTopK;
+    const float* row_logits = logits + static_cast<std::size_t>(row) * vocab;
+
+    InferSamplingResult result{};
+    if (row_keys[0] == 0) {
+        result.id = UINT32_MAX;
+        result.status = 1;
+        results[row] = result;
+        return;
+    }
+
+    std::uint32_t selected_slot = 0;
+    if (config.temperature != 0.0f) {
+        float weights[kInferSamplingMaxTopK];
+        float total = 0.0f;
+        const float best_value = infer_sampling_key_value(row_keys[0]);
+        for (std::uint32_t slot = 0; slot < k && row_keys[slot] != 0; ++slot) {
+            const float weight = expf(
+                (infer_sampling_key_value(row_keys[slot]) - best_value) /
+                config.temperature);
+            weights[slot] = weight;
+            total += weight;
+        }
+        if (!isfinite(total) || total <= 0.0f) {
+            result.id = UINT32_MAX;
+            result.status = 2;
+            results[row] = result;
+            return;
+        }
+
+        float cumulative = 0.0f;
+        std::uint32_t retained = 0;
+        while (retained < k && row_keys[retained] != 0) {
+            cumulative += weights[retained] / total;
+            ++retained;
+            if (cumulative >= config.top_p) {
+                break;
+            }
+        }
+        float retained_weight = 0.0f;
+        for (std::uint32_t slot = 0; slot < retained; ++slot) {
+            retained_weight += weights[slot];
+        }
+        float draw = fminf(fmaxf(config.draw, 0.0f), 0x1.fffffep-1f) * retained_weight;
+        selected_slot = retained - 1;
+        for (std::uint32_t slot = 0; slot < retained; ++slot) {
+            if (draw < weights[slot]) {
+                selected_slot = slot;
+                break;
+            }
+            draw -= weights[slot];
+        }
+    }
+
+    result.id = infer_sampling_key_id(row_keys[selected_slot]);
+    result.logit = row_logits[result.id];
+    result.adjusted_logit = infer_sampling_key_value(row_keys[selected_slot]);
+    result.status = 0;
+    results[row] = result;
+    const auto* counts = reinterpret_cast<const std::uint32_t*>(config.token_counts);
+    if (counts != nullptr) {
+        auto* mutable_counts = const_cast<std::uint32_t*>(counts);
+        mutable_counts[result.id] += 1U;
+    }
+}
+
+extern "C" cudaError_t infer_sample_topk_topp_f32_batch_on_stream(
+    const float* logits,
+    const InferSamplingParams* params,
+    std::uint64_t* stage_one_keys,
+    std::uint64_t* stage_two_keys,
+    std::uint64_t* top_keys,
+    InferSamplingResult* results,
+    std::uint32_t rows,
+    std::uint32_t vocab,
+    cudaStream_t stream) {
+    if (logits == nullptr || params == nullptr || stage_one_keys == nullptr ||
+        stage_two_keys == nullptr || top_keys == nullptr || results == nullptr ||
+        rows == 0 || vocab == 0 || vocab > 1024U * 1024U) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t stage_one_chunks =
+        (vocab + kInferSamplingItemsPerBlock - 1) / kInferSamplingItemsPerBlock;
+    const std::uint32_t stage_one_count = stage_one_chunks * kInferSamplingMaxTopK;
+    const std::uint32_t stage_two_chunks =
+        (stage_one_count + kInferSamplingItemsPerBlock - 1) /
+        kInferSamplingItemsPerBlock;
+
+    infer_sampling_logits_topk_kernel<<<
+        rows * stage_one_chunks, kInferSamplingThreads, 0, stream>>>(
+        logits, params, stage_one_keys, vocab, stage_one_chunks);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (stage_two_chunks == 1) {
+        infer_sampling_keys_topk_kernel<<<rows, kInferSamplingThreads, 0, stream>>>(
+            stage_one_keys, top_keys, stage_one_count, 1);
+    } else {
+        infer_sampling_keys_topk_kernel<<<
+            rows * stage_two_chunks, kInferSamplingThreads, 0, stream>>>(
+            stage_one_keys, stage_two_keys, stage_one_count, stage_two_chunks);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+        const std::uint32_t stage_two_count =
+            stage_two_chunks * kInferSamplingMaxTopK;
+        infer_sampling_keys_topk_kernel<<<rows, kInferSamplingThreads, 0, stream>>>(
+            stage_two_keys, top_keys, stage_two_count, 1);
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    infer_sampling_finalize_kernel<<<rows, 32, 0, stream>>>(
+        logits, params, top_keys, results, vocab);
+    return cudaGetLastError();
+}
+
+// =============================================================================
 // Direct top-1 lm-head path.
 //
 // Shape: weight is [VOCAB, HIDDEN] row-major BF16, input is [HIDDEN] f32.
