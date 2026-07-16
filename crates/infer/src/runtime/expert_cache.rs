@@ -2,7 +2,7 @@
 
 use crate::nvfp4::{
     CudaEvent, CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result,
-    remap_expert_indices_into_on_stream,
+    remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
 };
 
 /// One logical expert that must be loaded into a selected resident slot.
@@ -186,6 +186,21 @@ impl ExpertSlotCache {
     ) -> Result<()> {
         remap_expert_indices_into_on_stream(
             expert_ids,
+            &self.device_map,
+            self.slot_indices.output(),
+            stream,
+        )
+    }
+
+    pub fn remap_at_offset_on_stream(
+        &mut self,
+        expert_ids: &DeviceBuffer<u32>,
+        expert_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        remap_expert_indices_at_offset_into_on_stream(
+            expert_ids,
+            expert_offset,
             &self.device_map,
             self.slot_indices.output(),
             stream,

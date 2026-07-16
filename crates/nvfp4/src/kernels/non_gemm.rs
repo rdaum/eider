@@ -786,6 +786,53 @@ pub fn step35_sigmoid_top8_f32_into_on_stream(
     }
 }
 
+/// Enqueues independent Step sigmoid routing with biased top-8 selection.
+pub fn step35_sigmoid_top8_f32_batch_into_on_stream(
+    logits: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    mut out_indices: DeviceOutput<'_, u32>,
+    mut out_weights: DeviceOutput<'_, f32>,
+    rows: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let logits_len = rows.saturating_mul(bias.len());
+    let routes = rows.saturating_mul(8);
+    if rows == 0
+        || bias.len() < 8
+        || logits.len() != logits_len
+        || out_indices.len() != routes
+        || out_weights.len() != routes
+        || rows > u32::MAX as usize
+        || bias.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched Step sigmoid top-8 buffers",
+            expected: format!("logits={logits_len} bias>=8 indices={routes} weights={routes}"),
+            actual: format!(
+                "logits={} bias={} indices={} weights={} rows={rows}",
+                logits.len(),
+                bias.len(),
+                out_indices.len(),
+                out_weights.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_step35_sigmoid_top8_f32_batch_on_stream",
+            ffi::infer_step35_sigmoid_top8_f32_batch_on_stream(
+                logits.ptr,
+                bias.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                rows as u32,
+                bias.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Remaps logical expert indices through a device-resident slot table.
 ///
 /// Missing or out-of-range experts produce `u32::MAX` in the corresponding
@@ -793,20 +840,39 @@ pub fn step35_sigmoid_top8_f32_into_on_stream(
 pub fn remap_expert_indices_into_on_stream(
     expert_indices: &DeviceBuffer<u32>,
     expert_to_slot: &DeviceBuffer<u32>,
+    slot_indices: DeviceOutput<'_, u32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    remap_expert_indices_at_offset_into_on_stream(
+        expert_indices,
+        0,
+        expert_to_slot,
+        slot_indices,
+        stream,
+    )
+}
+
+/// Remaps a contiguous logical-expert range through a device-resident slot table.
+pub fn remap_expert_indices_at_offset_into_on_stream(
+    expert_indices: &DeviceBuffer<u32>,
+    expert_offset: usize,
+    expert_to_slot: &DeviceBuffer<u32>,
     mut slot_indices: DeviceOutput<'_, u32>,
     stream: &CudaStream,
 ) -> Result<()> {
-    if expert_indices.is_empty()
+    let expert_end = expert_offset.saturating_add(slot_indices.len());
+    if slot_indices.is_empty()
         || expert_to_slot.is_empty()
-        || slot_indices.len() != expert_indices.len()
-        || expert_indices.len() > u32::MAX as usize
+        || expert_end > expert_indices.len()
+        || expert_offset > u32::MAX as usize
+        || slot_indices.len() > u32::MAX as usize
         || expert_to_slot.len() > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "expert slot remap",
-            expected: "non-empty equally-sized input/output and non-empty expert table".to_string(),
+            expected: "non-empty in-range source/output and non-empty expert table".to_string(),
             actual: format!(
-                "indices={} slots={} table={}",
+                "indices={} offset={expert_offset} slots={} table={}",
                 expert_indices.len(),
                 slot_indices.len(),
                 expert_to_slot.len()
@@ -820,7 +886,8 @@ pub fn remap_expert_indices_into_on_stream(
                 expert_indices.ptr,
                 expert_to_slot.ptr,
                 slot_indices.buffer_mut().ptr,
-                expert_indices.len() as u32,
+                expert_offset as u32,
+                slot_indices.len() as u32,
                 expert_to_slot.len() as u32,
                 stream.as_raw(),
             ),
@@ -1870,23 +1937,53 @@ pub fn rope_neox_inv_freq_sequence_f32_into_on_stream(
     rotary_dim: usize,
     input: &DeviceBuffer<f32>,
     inv_freq: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     start_position: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    let len = tokens.saturating_mul(heads).saturating_mul(head_dim);
+    rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
+        tokens,
+        heads,
+        head_dim,
+        rotary_dim,
+        input,
+        inv_freq,
+        output,
+        0,
+        start_position,
+        stream,
+    )
+}
+
+/// Enqueues inverse-frequency sequence NeoX RoPE at a token offset in dense buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    inv_freq: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    input_token_offset: usize,
+    start_position: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let end_tokens = input_token_offset.saturating_add(tokens);
+    let required = end_tokens.saturating_mul(heads).saturating_mul(head_dim);
     if tokens == 0
         || heads == 0
         || rotary_dim == 0
         || rotary_dim > head_dim
         || !rotary_dim.is_multiple_of(2)
-        || input.len() != len
-        || output.len() != len
+        || input.len() < required
+        || output.len() < required
         || inv_freq.len() != rotary_dim / 2
         || tokens > u32::MAX as usize
         || heads > u32::MAX as usize
         || head_dim > u32::MAX as usize
         || rotary_dim > u32::MAX as usize
+        || input_token_offset > u32::MAX as usize
         || start_position > u32::MAX as usize
     {
         return Err(Error::Shape {
@@ -1894,7 +1991,7 @@ pub fn rope_neox_inv_freq_sequence_f32_into_on_stream(
             expected: "matching non-empty sequence, head, rotary, and frequency dimensions"
                 .to_string(),
             actual: format!(
-                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} inv_freq={} start_position={start_position}",
+                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} inv_freq={} input_token_offset={input_token_offset} start_position={start_position}",
                 input.len(),
                 output.len(),
                 inv_freq.len()
@@ -1912,6 +2009,7 @@ pub fn rope_neox_inv_freq_sequence_f32_into_on_stream(
                 heads as u32,
                 head_dim as u32,
                 rotary_dim as u32,
+                input_token_offset as u32,
                 start_position as u32,
                 stream.as_raw(),
             ),
@@ -4071,6 +4169,35 @@ pub fn bf16_matrix_to_f32_into_on_stream(
                 matrix.data_ptr().cast_mut(),
                 output.buffer_mut().ptr,
                 len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Converts device-resident f32 values to BF16 storage on `stream`.
+pub fn f32_to_bf16_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u16>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty() || input.len() > u32::MAX as usize || output.len() < input.len() {
+        return Err(Error::Shape {
+            label: "F32 to BF16 buffers",
+            expected: format!(
+                "input in 1..=u32::MAX values and output >= input ({})",
+                input.len()
+            ),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_f32_to_bf16_on_stream",
+            ffi::infer_f32_to_bf16_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                input.len() as u32,
                 stream.as_raw(),
             ),
         )
@@ -6433,6 +6560,20 @@ mod tests {
     }
 
     #[test]
+    fn expert_indices_remap_accepts_source_offset() {
+        let indices = DeviceBuffer::from_host(&[99u32, 3, 0, 4, 9, 99]).expect("indices");
+        let map = DeviceBuffer::from_host(&[7u32, u32::MAX, 2, 5, 1]).expect("map");
+        let mut slots = DeviceBuffer::zeroed(4).expect("slots");
+        let stream = CudaStream::new_blocking().expect("stream");
+        remap_expert_indices_at_offset_into_on_stream(&indices, 1, &map, slots.output(), &stream)
+            .expect("offset remap");
+        assert_eq!(
+            slots.copy_to_host(&stream).expect("readback"),
+            [5, 7, 1, u32::MAX]
+        );
+    }
+
+    #[test]
     fn gpu_token_sampler_keeps_logits_on_device_and_applies_penalties() {
         let vocab = 64usize;
         let mut logits = vec![-20.0f32; 2 * vocab];
@@ -6987,6 +7128,66 @@ mod tests {
         );
         for (&actual, &expected) in actual_weights.iter().zip(&expected_weights) {
             assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn step35_sigmoid_top8_batch_matches_independent_rows() {
+        const EXPERTS: usize = 288;
+        const ROWS: usize = 2;
+        let first = (0..EXPERTS)
+            .map(|expert| ((expert * 37 % 101) as f32 - 50.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let second = (0..EXPERTS)
+            .map(|expert| ((expert * 53 % 127) as f32 - 63.0) * 0.025)
+            .collect::<Vec<_>>();
+        let bias = (0..EXPERTS)
+            .map(|expert| ((expert * 19 % 47) as f32 - 23.0) * 0.002)
+            .collect::<Vec<_>>();
+        let mut logits = first.clone();
+        logits.extend_from_slice(&second);
+        let logits = DeviceBuffer::from_host(&logits).expect("logits upload");
+        let bias = DeviceBuffer::from_host(&bias).expect("bias upload");
+        let mut indices = DeviceBuffer::zeroed(ROWS * 8).expect("indices");
+        let mut weights = DeviceBuffer::zeroed(ROWS * 8).expect("weights");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        step35_sigmoid_top8_f32_batch_into_on_stream(
+            &logits,
+            &bias,
+            indices.output(),
+            weights.output(),
+            ROWS,
+            &stream,
+        )
+        .expect("batch router");
+        let actual_indices = indices.copy_to_host(&stream).expect("indices download");
+        let actual_weights = weights.copy_to_host(&stream).expect("weights download");
+        for (row, row_logits) in [first, second].iter().enumerate() {
+            let row_logits = DeviceBuffer::from_host(row_logits).expect("row logits");
+            let mut row_indices = DeviceBuffer::zeroed(8).expect("row indices");
+            let mut row_weights = DeviceBuffer::zeroed(8).expect("row weights");
+            step35_sigmoid_top8_f32_into_on_stream(
+                &row_logits,
+                &bias,
+                row_indices.output(),
+                row_weights.output(),
+                &stream,
+            )
+            .expect("independent router");
+            assert_eq!(
+                &actual_indices[row * 8..(row + 1) * 8],
+                row_indices
+                    .copy_to_host(&stream)
+                    .expect("row indices download")
+                    .as_slice()
+            );
+            assert_eq!(
+                &actual_weights[row * 8..(row + 1) * 8],
+                row_weights
+                    .copy_to_host(&stream)
+                    .expect("row weights download")
+                    .as_slice()
+            );
         }
     }
 

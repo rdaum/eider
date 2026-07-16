@@ -25,8 +25,8 @@ mod safetensors;
 mod tensor;
 
 pub use cublaslt::{
-    CublasLt, CutlassFp4GroupedGemvF32Plan, Fp4TnMatmul, Fp4TnMatmulPlan, Fp4TnPlanMetadata,
-    Fp8TnMatmulPlan, GemmShape, InferenceGemm, Nvfp4TnInputs,
+    Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemvF32Plan, Fp4TnMatmul, Fp4TnMatmulPlan,
+    Fp4TnPlanMetadata, Fp8TnMatmulPlan, GemmShape, InferenceGemm, Nvfp4TnInputs,
 };
 pub use cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
@@ -49,7 +49,8 @@ pub use kernels::non_gemm::{
     cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     cached_gqa_attention_nvfp4_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
+    f32_to_bf16_into_on_stream, fill_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream,
@@ -81,10 +82,11 @@ pub use kernels::non_gemm::{
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_batch_into_on_stream,
     qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_batch_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, qwen36_gdn_prep_into_on_stream,
-    remap_expert_indices_into_on_stream, rms_norm_f32_into_on_stream,
-    rms_norm_rope_neox_f32_indexed_into_on_stream, rope_imrope_f32_indexed_into_on_stream,
-    rope_imrope_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
-    rope_neox_f32_indexed_into_on_stream, rope_neox_f32_into_on_stream,
+    remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
+    rms_norm_f32_into_on_stream, rms_norm_rope_neox_f32_indexed_into_on_stream,
+    rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
+    rope_imrope_text_batch_f32_into_on_stream, rope_neox_f32_indexed_into_on_stream,
+    rope_neox_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream,
     rope_neox_inv_freq_sequence_f32_into_on_stream, rope_neox_partial_f32_into_on_stream,
     rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_into_on_stream, scale_channel_f32_device_row_scalar_in_place_on_stream,
@@ -94,7 +96,7 @@ pub use kernels::non_gemm::{
     silu_mul_halves_f32_batch_into_on_stream, silu_mul_halves_f32_into_on_stream,
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
     split_q_gate_f32_into_on_stream, split_qkv_f32_into_on_stream,
-    step35_sigmoid_top8_f32_into_on_stream,
+    step35_sigmoid_top8_f32_batch_into_on_stream, step35_sigmoid_top8_f32_into_on_stream,
 };
 pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache};
 pub use kernels::sm12x_mma::{

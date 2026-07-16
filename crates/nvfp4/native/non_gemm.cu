@@ -1065,6 +1065,10 @@ __global__ void infer_step35_sigmoid_top8_f32_kernel(
     std::uint32_t* out_indices,
     float* out_weights,
     std::uint32_t experts) {
+    const std::uint32_t batch = blockIdx.x;
+    logits += static_cast<std::size_t>(batch) * experts;
+    out_indices += static_cast<std::size_t>(batch) * 8;
+    out_weights += static_cast<std::size_t>(batch) * 8;
     constexpr int kThreads = 256;
     constexpr int kItems = 2;
     std::uint64_t keys[kItems];
@@ -1218,6 +1222,23 @@ extern "C" cudaError_t infer_step35_sigmoid_top8_f32_on_stream(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t infer_step35_sigmoid_top8_f32_batch_on_stream(
+    const float* logits,
+    const float* bias,
+    std::uint32_t* out_indices,
+    float* out_weights,
+    std::uint32_t batch_size,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (logits == nullptr || bias == nullptr || out_indices == nullptr ||
+        out_weights == nullptr || batch_size == 0 || experts < 8) {
+        return cudaErrorInvalidValue;
+    }
+    infer_step35_sigmoid_top8_f32_kernel<<<batch_size, 256, 0, stream>>>(
+        logits, bias, out_indices, out_weights, experts);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_moe_topk_f32_batch_on_stream(
     const float* logits,
     std::uint32_t* out_indices,
@@ -1258,6 +1279,7 @@ extern "C" cudaError_t infer_remap_expert_indices_on_stream(
     const std::uint32_t* expert_indices,
     const std::uint32_t* expert_to_slot,
     std::uint32_t* slot_indices,
+    std::uint32_t expert_offset,
     std::uint32_t count,
     std::uint32_t experts,
     cudaStream_t stream) {
@@ -1267,7 +1289,7 @@ extern "C" cudaError_t infer_remap_expert_indices_on_stream(
     }
     constexpr std::uint32_t kThreads = 128;
     infer_remap_expert_indices_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        expert_indices, expert_to_slot, slot_indices, count, experts);
+        expert_indices + expert_offset, expert_to_slot, slot_indices, count, experts);
     return cudaGetLastError();
 }
 
@@ -2272,6 +2294,7 @@ __global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t rotary_dim,
+    std::uint32_t input_token_offset,
     std::uint32_t start_position) {
     const std::uint32_t half = rotary_dim / 2;
     const std::uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2280,7 +2303,7 @@ __global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
     const std::uint32_t i = pair_idx % half;
     const std::uint32_t row = pair_idx / half;
     const std::uint32_t token = row / heads;
-    const std::uint32_t row_start = row * head_dim;
+    const std::uint32_t row_start = (input_token_offset * heads + row) * head_dim;
     float sin_value;
     float cos_value;
     sincosf(static_cast<float>(start_position + token) * inv_freq[i], &sin_value, &cos_value);
@@ -2298,6 +2321,7 @@ extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t rotary_dim,
+    std::uint32_t input_token_offset,
     std::uint32_t start_position,
     cudaStream_t stream) {
     if (input == nullptr || inv_freq == nullptr || output == nullptr || tokens == 0 ||
@@ -2305,14 +2329,18 @@ extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
         (rotary_dim % 2) != 0) {
         return cudaErrorInvalidValue;
     }
+    const std::size_t value_offset =
+        static_cast<std::size_t>(input_token_offset) * heads * head_dim;
     const std::size_t bytes = static_cast<std::size_t>(tokens) * heads * head_dim * sizeof(float);
-    cudaError_t status = cudaMemcpyAsync(output, input, bytes, cudaMemcpyDeviceToDevice, stream);
+    cudaError_t status = cudaMemcpyAsync(
+        output + value_offset, input + value_offset, bytes, cudaMemcpyDeviceToDevice, stream);
     if (status != cudaSuccess) return status;
     constexpr int kThreads = 256;
     const std::uint32_t total_pairs = tokens * heads * (rotary_dim / 2);
     const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
     infer_rope_neox_inv_freq_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
-        input, inv_freq, output, tokens, heads, head_dim, rotary_dim, start_position);
+        input, inv_freq, output, tokens, heads, head_dim, rotary_dim,
+        input_token_offset, start_position);
     return cudaGetLastError();
 }
 
@@ -4246,6 +4274,31 @@ extern "C" cudaError_t infer_bf16_to_f32_on_stream(const std::uint16_t* input,
     constexpr int kThreads = 256;
     const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
     infer_bf16_to_f32_kernel<<<blocks, kThreads, 0, stream>>>(input, output, len);
+    return cudaGetLastError();
+}
+
+__global__ void infer_f32_to_bf16_kernel(const float* input,
+                                         std::uint16_t* output,
+                                         std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    const __nv_bfloat16 value = __float2bfloat16_rn(input[idx]);
+    output[idx] = *reinterpret_cast<const std::uint16_t*>(&value);
+}
+
+extern "C" cudaError_t infer_f32_to_bf16_on_stream(const float* input,
+                                                     std::uint16_t* output,
+                                                     std::uint32_t len,
+                                                     cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_f32_to_bf16_kernel<<<blocks, kThreads, 0, stream>>>(input, output, len);
     return cudaGetLastError();
 }
 
