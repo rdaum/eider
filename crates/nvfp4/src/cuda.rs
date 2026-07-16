@@ -515,19 +515,21 @@ impl<T: Copy> DeviceBuffer<T> {
 
     /// Allocates `len` elements of device memory and initializes them to zero.
     pub fn zeroed(len: usize) -> Result<Self> {
-        let zeros = vec![0u8; len * size_of::<T>()];
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device zeroed allocation",
+                expected: "len * element size without overflow".to_string(),
+                actual: format!("len={len} element_size={}", size_of::<T>()),
+            })?;
         let mut raw = null_mut();
         unsafe {
-            check_cuda("cudaMalloc", ffi::cudaMalloc(&mut raw, zeros.len()))?;
-            check_cuda(
-                "cudaMemcpy(H2D zero)",
-                ffi::cudaMemcpy(
-                    raw,
-                    zeros.as_ptr().cast(),
-                    zeros.len(),
-                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
-                ),
-            )?;
+            check_cuda("cudaMalloc", ffi::cudaMalloc(&mut raw, bytes))?;
+            check_cuda("cudaMemset", ffi::cudaMemset(raw, 0, bytes))?;
+            // cudaMemset may complete asynchronously on the default stream.
+            // A non-blocking stream does not inherit the default-stream order,
+            // so establish initialization before returning the allocation.
+            check_cuda("cudaDeviceSynchronize", ffi::cudaDeviceSynchronize())?;
         }
         Ok(Self {
             ptr: raw.cast(),
@@ -597,6 +599,36 @@ impl<T: Copy> DeviceBuffer<T> {
         }
     }
 
+    /// Copies raw host bytes into a byte range of this existing allocation.
+    pub fn copy_bytes_from_host(&mut self, byte_offset: usize, values: &[u8]) -> Result<()> {
+        let allocation_bytes = self.device_bytes();
+        let end = byte_offset
+            .checked_add(values.len())
+            .ok_or_else(|| Error::Shape {
+                label: "device byte-range copy",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={byte_offset} length={}", values.len()),
+            })?;
+        if end > allocation_bytes {
+            return Err(Error::Shape {
+                label: "device byte-range copy",
+                expected: format!("end <= {allocation_bytes}"),
+                actual: format!("offset={byte_offset} length={} end={end}", values.len()),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(H2D byte range)",
+                ffi::cudaMemcpy(
+                    self.ptr.cast::<u8>().add(byte_offset).cast(),
+                    values.as_ptr().cast(),
+                    values.len(),
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )
+        }
+    }
+
     /// Returns the number of elements in this device allocation.
     pub fn len(&self) -> usize {
         self.len
@@ -651,6 +683,20 @@ impl<T> Drop for DeviceBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::{CudaStream, DeviceBuffer};
+    use crate::fill_f32_into_on_stream;
+
+    #[test]
+    fn zeroed_allocation_is_ready_for_a_non_blocking_stream() {
+        let stream = CudaStream::new_non_blocking().expect("CUDA stream");
+        for _ in 0..16 {
+            let mut device = DeviceBuffer::zeroed(1 << 20).expect("zeroed device buffer");
+            fill_f32_into_on_stream(device.output(), 7.0, &stream).expect("fill on stream");
+            let values = device
+                .copy_prefix_to_host(1, &stream)
+                .expect("filled value");
+            assert_eq!(values.as_slice(), [7.0]);
+        }
+    }
 
     #[test]
     fn device_prefix_copy_reads_only_the_requested_values() {

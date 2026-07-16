@@ -423,6 +423,17 @@ pub struct Sm12xFp4DeviceGemmVector {
 }
 
 impl Sm12xFp4GemmWeight {
+    /// Serializes the native tile and scale payload without a cache-file header.
+    pub fn payload_bytes(&self) -> Vec<u8> {
+        let tile_bytes = self.tiles.to_bytes();
+        let mut payload = Vec::with_capacity(tile_bytes.len() + self.scales.len() * 4);
+        payload.extend_from_slice(&tile_bytes);
+        for scale in &self.scales {
+            payload.extend_from_slice(&scale.to_le_bytes());
+        }
+        payload
+    }
+
     #[allow(dead_code)]
     pub fn quantize_f32_row_major_m16_k16(
         m: usize,

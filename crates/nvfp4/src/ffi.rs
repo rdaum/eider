@@ -1259,6 +1259,8 @@ unsafe extern "C" {
         sorted_token_ids: *mut i32,
         expert_ids: *mut i32,
         num_tokens_past_padded: *mut i32,
+        gate_up_features: u32,
+        hidden_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_marlin_nvfp4_gate_up_batch_on_stream(
@@ -1276,6 +1278,8 @@ unsafe extern "C" {
         expert_ids: *mut i32,
         num_tokens_past_padded: *mut i32,
         batch_size: u32,
+        gate_up_features: u32,
+        hidden_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_marlin_nvfp4_linear_on_stream(
@@ -1444,6 +1448,7 @@ unsafe extern "C" {
         count: usize,
         kind: cudaMemcpyKind,
     ) -> cudaError_t;
+    pub(crate) fn cudaMemset(dev_ptr: *mut c_void, value: i32, count: usize) -> cudaError_t;
     pub(crate) fn cudaDeviceSynchronize() -> cudaError_t;
     pub(crate) fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: u32) -> cudaError_t;
     pub(crate) fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
