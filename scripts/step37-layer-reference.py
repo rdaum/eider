@@ -18,7 +18,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-LAYERS = (0, 1, 3, 4)
+LAYERS = (0, 1, 3, 4, 43, 44)
 TOKENS = 8
 HIDDEN = 4096
 TOP_K = 8
@@ -178,9 +178,18 @@ def attention_reference(checkpoint, config, modeling, layer: int, normed: torch.
     return checkpoint.linear(f"{prefix}.o_proj", attention), attention, inv_freq
 
 
-def dense_ffn(checkpoint: Checkpoint, prefix: str, inputs: torch.Tensor) -> torch.Tensor:
-    gate = F.silu(checkpoint.linear(f"{prefix}.gate_proj", inputs))
+def dense_ffn(
+    checkpoint: Checkpoint,
+    prefix: str,
+    inputs: torch.Tensor,
+    limit: float | None,
+) -> torch.Tensor:
     up = checkpoint.linear(f"{prefix}.up_proj", inputs)
+    gate = checkpoint.linear(f"{prefix}.gate_proj", inputs)
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    gate = F.silu(gate)
     return checkpoint.linear(f"{prefix}.down_proj", gate * up)
 
 
@@ -196,16 +205,30 @@ def moe_ffn(checkpoint: Checkpoint, config, layer: int, inputs: torch.Tensor):
     weights = weights * config.moe_router_scaling_factor
 
     routed = torch.zeros_like(inputs)
+    limit = swiglu_limit(config.swiglu_limits, layer)
     for slot, expert in enumerate(indices[0].tolist()):
-        gate = F.silu(checkpoint.linear(f"{prefix}.gate_proj", inputs, expert))
         up = checkpoint.linear(f"{prefix}.up_proj", inputs, expert)
+        gate = checkpoint.linear(f"{prefix}.gate_proj", inputs, expert)
+        if limit is not None:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        gate = F.silu(gate)
         down = checkpoint.linear(f"{prefix}.down_proj", gate * up, expert)
         routed.add_(down * weights[0, slot])
 
     shared = dense_ffn(
-        checkpoint, f"model.language_model.layers.{layer}.share_expert", inputs
+        checkpoint,
+        f"model.language_model.layers.{layer}.share_expert",
+        inputs,
+        swiglu_limit(config.swiglu_limits_shared, layer),
     )
     return routed + shared, logits, indices.float(), weights
+
+
+def swiglu_limit(limits, layer: int) -> float | None:
+    if not limits or not limits[layer]:
+        return None
+    return float(limits[layer])
 
 
 def layer_reference(checkpoint, config, modeling, layer: int):
@@ -228,7 +251,12 @@ def layer_reference(checkpoint, config, modeling, layer: int):
         f"layer_{layer}.ffn_input": ffn_input.cpu(),
     }
     if layer < 3:
-        ffn = dense_ffn(checkpoint, f"{prefix}.mlp", ffn_input)
+        ffn = dense_ffn(
+            checkpoint,
+            f"{prefix}.mlp",
+            ffn_input,
+            swiglu_limit(config.swiglu_limits_shared, layer),
+        )
     else:
         ffn, logits, indices, weights = moe_ffn(checkpoint, config, layer, ffn_input)
         result[f"layer_{layer}.router_logits"] = logits.cpu()

@@ -1134,6 +1134,7 @@ pub fn moe_silu_quantize_slots_residual_on_stream(
     gate_up_alpha_table: &DeviceBuffer<f32>,
     rows: usize,
     groups: usize,
+    swiglu_limit: f32,
     stream: &CudaStream,
 ) -> Result<()> {
     let k_tiles = rows / 64;
@@ -1147,6 +1148,8 @@ pub fn moe_silu_quantize_slots_residual_on_stream(
         || residual_tiles.len() < groups * k_tiles * TILE_BYTES
         || residual_scales.len() < groups * k_tiles
         || gate_up_alpha_table.is_empty()
+        || !swiglu_limit.is_finite()
+        || swiglu_limit < 0.0
         || rows > u32::MAX as usize
         || groups > u32::MAX as usize
     {
@@ -1179,6 +1182,7 @@ pub fn moe_silu_quantize_slots_residual_on_stream(
                 gate_up_alpha_table.as_const_ptr().cast(),
                 rows as u32,
                 groups as u32,
+                swiglu_limit,
                 stream.as_raw(),
             ),
         )
@@ -2599,6 +2603,7 @@ mod tests {
         let m = 16usize;
         let k = 128usize;
         let groups = 2usize;
+        let swiglu_limit = 2.0f32;
         let gate_up_host = (0..groups)
             .map(|group| {
                 let gate = (0..k)
@@ -2648,6 +2653,7 @@ mod tests {
             &unity,
             k,
             groups,
+            swiglu_limit,
             &stream,
         )
         .expect("residual quantize");
@@ -2751,7 +2757,11 @@ mod tests {
             let expected = gate_up_host[group][..k]
                 .iter()
                 .zip(&gate_up_host[group][k..])
-                .map(|(&gate, &up)| gate * (1.0 / (1.0 + (-gate).exp())) * up)
+                .map(|(&gate, &up)| {
+                    let gate = gate.min(swiglu_limit);
+                    let up = up.clamp(-swiglu_limit, swiglu_limit);
+                    gate * (1.0 / (1.0 + (-gate).exp())) * up
+                })
                 .sum::<f32>();
             let primary_error = (primary[0] - expected).abs();
             let residual_error = (primary[0] + residual[0] - expected).abs();

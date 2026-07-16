@@ -3,7 +3,8 @@ use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, GemmShape, append_rows_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, f32_to_bf16_into_on_stream,
     rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream, step37_sigmoid_top8_f32_batch_into_on_stream,
+    silu_mul_halves_clamped_f32_batch_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    step37_sigmoid_top8_f32_batch_into_on_stream,
 };
 use std::collections::HashMap;
 
@@ -585,13 +586,24 @@ fn run_mlp_prefill<'a>(
         capacity,
         stream,
     )?;
-    silu_mul_halves_f32_batch_into_on_stream(
-        &workspace.gate_up,
-        workspace.activated.output(),
-        capacity,
-        mlp.intermediate,
-        stream,
-    )?;
+    if let Some(limit) = mlp.swiglu_limit {
+        silu_mul_halves_clamped_f32_batch_into_on_stream(
+            &workspace.gate_up,
+            workspace.activated.output(),
+            capacity,
+            mlp.intermediate,
+            limit,
+            stream,
+        )?;
+    } else {
+        silu_mul_halves_f32_batch_into_on_stream(
+            &workspace.gate_up,
+            workspace.activated.output(),
+            capacity,
+            mlp.intermediate,
+            stream,
+        )?;
+    }
     linear.run(
         &mlp.down,
         &workspace.activated,

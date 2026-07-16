@@ -28,6 +28,24 @@ pub enum ChatRole {
     Tool,
 }
 
+/// Step reasoning budget rendered into checkpoint system prompts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ChatReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// One function invocation retained in conversation history.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChatToolCall {
@@ -160,6 +178,8 @@ pub struct ChatTemplateOptions {
     pub enable_thinking: bool,
     /// Preserve reasoning from assistant messages before the latest user turn.
     pub preserve_thinking: bool,
+    /// Optional checkpoint-native reasoning budget.
+    pub reasoning_effort: Option<ChatReasoningEffort>,
 }
 
 impl Default for ChatTemplateOptions {
@@ -168,6 +188,7 @@ impl Default for ChatTemplateOptions {
             add_generation_prompt: true,
             enable_thinking: true,
             preserve_thinking: false,
+            reasoning_effort: None,
         }
     }
 }
@@ -200,10 +221,17 @@ impl CheckpointChatTemplate {
         let (source, template_path) = load_template_source(model_dir)?;
         let environment = build_environment(source)?;
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| Error::Format {
-            label: "tokenizer.json",
-            detail: format!("{}: {error}", tokenizer_path.display()),
-        })?;
+        let mut tokenizer =
+            Tokenizer::from_file(&tokenizer_path).map_err(|error| Error::Format {
+                label: "tokenizer.json",
+                detail: format!("{}: {error}", tokenizer_path.display()),
+            })?;
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| Error::Format {
+                label: "tokenizer.json truncation",
+                detail: error.to_string(),
+            })?;
         let tokenizer_config_path = model_dir.join("tokenizer_config.json");
         let tokenizer_config = std::fs::read_to_string(&tokenizer_config_path)
             .ok()
@@ -441,6 +469,11 @@ fn render_with_environment(
     bos_token: &str,
     eos_token: &str,
 ) -> Result<String> {
+    let reasoning_effort = options
+        .reasoning_effort
+        .map(ChatReasoningEffort::as_str)
+        .map(TemplateValue::from)
+        .unwrap_or(TemplateValue::UNDEFINED);
     environment
         .get_template(TEMPLATE_NAME)
         .map_err(template_error)?
@@ -450,6 +483,7 @@ fn render_with_environment(
             add_generation_prompt => options.add_generation_prompt,
             enable_thinking => options.enable_thinking,
             preserve_thinking => options.preserve_thinking,
+            reasoning_effort => reasoning_effort,
             add_vision_id => false,
             bos_token => bos_token,
             eos_token => eos_token,
@@ -505,6 +539,7 @@ mod tests {
                 add_generation_prompt: true,
                 enable_thinking: false,
                 preserve_thinking: true,
+                reasoning_effort: None,
             },
             "<bos>",
             "<eos>",
@@ -558,11 +593,16 @@ mod tests {
             .render(
                 &[ChatMessage::user("hello")],
                 &[tool_definition()],
-                ChatTemplateOptions::default(),
+                ChatTemplateOptions {
+                    reasoning_effort: Some(ChatReasoningEffort::Low),
+                    ..ChatTemplateOptions::default()
+                },
             )
             .unwrap();
         assert!(
-            rendered.starts_with("<｜begin▁of▁sentence｜><|im_start|>system\n# Tools"),
+            rendered.starts_with(
+                "<｜begin▁of▁sentence｜><|im_start|>system\nReasoning: low\n\n# Tools"
+            ),
             "{rendered:?}"
         );
         assert!(
@@ -574,6 +614,23 @@ mod tests {
             "{rendered:?}"
         );
         assert!(rendered.contains("<tools>"), "{rendered:?}");
+
+        let long_prompt = template
+            .render_and_tokenize(
+                &[ChatMessage::user("word ".repeat(3_000))],
+                &[tool_definition()],
+                ChatTemplateOptions {
+                    reasoning_effort: Some(ChatReasoningEffort::Low),
+                    ..ChatTemplateOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(long_prompt.token_ids.len() > 2_048);
+        assert!(
+            long_prompt
+                .text
+                .ends_with("<|im_start|>assistant\n<think>\n")
+        );
     }
 
     #[test]

@@ -28,7 +28,12 @@
         {
           "id": "eider-step3.7",
           "name": "Step-3.7-Flash NVFP4",
-          "reasoning": false,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "xhigh": "high"
+          },
           "input": ["text"],
           "contextWindow": 32768,
           "maxTokens": 4096,

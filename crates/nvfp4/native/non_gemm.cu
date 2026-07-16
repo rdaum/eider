@@ -504,6 +504,35 @@ extern "C" cudaError_t infer_silu_mul_halves_f32_on_stream(const float* gate_up,
     return cudaGetLastError();
 }
 
+__global__ void infer_silu_mul_halves_clamped_f32_kernel(
+    const float* gate_up,
+    float* output,
+    std::uint32_t len,
+    float limit) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const float gate = fminf(gate_up[idx], limit);
+    const float up = fminf(fmaxf(gate_up[len + idx], -limit), limit);
+    output[idx] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+extern "C" cudaError_t infer_silu_mul_halves_clamped_f32_on_stream(
+    const float* gate_up,
+    float* output,
+    std::uint32_t len,
+    float limit,
+    cudaStream_t stream) {
+    if (gate_up == nullptr || output == nullptr || len == 0 ||
+        !isfinite(limit) || limit <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_silu_mul_halves_clamped_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        gate_up, output, len, limit);
+    return cudaGetLastError();
+}
+
 __global__ void infer_silu_mul_halves_f32_batch_kernel(
     const float* gate_up,
     float* output,
@@ -533,6 +562,42 @@ extern "C" cudaError_t infer_silu_mul_halves_f32_batch_on_stream(
     const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
     infer_silu_mul_halves_f32_batch_kernel<<<blocks, kThreads, 0, stream>>>(
         gate_up, output, rows, cols);
+    return cudaGetLastError();
+}
+
+__global__ void infer_silu_mul_halves_clamped_f32_batch_kernel(
+    const float* gate_up,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float limit) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = rows * cols;
+    if (idx >= len) return;
+    const std::uint32_t row = idx / cols;
+    const std::uint32_t col = idx - row * cols;
+    const std::uint32_t base = row * cols * 2;
+    const float gate = fminf(gate_up[base + col], limit);
+    const float up = fminf(fmaxf(gate_up[base + cols + col], -limit), limit);
+    output[idx] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+extern "C" cudaError_t infer_silu_mul_halves_clamped_f32_batch_on_stream(
+    const float* gate_up,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float limit,
+    cudaStream_t stream) {
+    if (gate_up == nullptr || output == nullptr || rows == 0 || cols == 0 ||
+        !isfinite(limit) || limit <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t len = static_cast<std::uint64_t>(rows) * cols;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_silu_mul_halves_clamped_f32_batch_kernel<<<blocks, kThreads, 0, stream>>>(
+        gate_up, output, rows, cols, limit);
     return cudaGetLastError();
 }
 

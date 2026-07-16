@@ -76,11 +76,16 @@ impl GenerationConfig {
         } else {
             eos_token_ids
         };
+        let do_sample = value["do_sample"].as_bool().unwrap_or(false);
         let config = Self {
             sampling: SamplingConfig {
-                temperature: value["temperature"]
-                    .as_f64()
-                    .map_or(defaults.temperature, |value| value as f32),
+                temperature: if do_sample {
+                    value["temperature"]
+                        .as_f64()
+                        .map_or(defaults.temperature, |value| value as f32)
+                } else {
+                    0.0
+                },
                 top_k: value["top_k"]
                     .as_u64()
                     .map_or(defaults.top_k, |value| value as usize),
@@ -345,7 +350,7 @@ mod tests {
         fs::create_dir_all(&directory).expect("create config directory");
         fs::write(
             directory.join("generation_config.json"),
-            r#"{"temperature":0.7,"top_k":40,"top_p":0.8,"eos_token_id":[1,2]}"#,
+            r#"{"do_sample":true,"temperature":0.7,"top_k":40,"top_p":0.8,"eos_token_id":[1,2]}"#,
         )
         .expect("write generation config");
 
@@ -378,6 +383,7 @@ mod tests {
         .expect("write model config");
 
         let config = GenerationConfig::from_model_dir(&directory).expect("generation config");
+        assert_eq!(config.sampling.temperature, 0.0);
         assert_eq!(
             config.eos_token_ids.into_iter().collect::<Vec<_>>(),
             [1, 2, 128007]
