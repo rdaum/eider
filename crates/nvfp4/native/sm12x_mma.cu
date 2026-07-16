@@ -2097,7 +2097,8 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_residual_kernel(
     const float* __restrict__ gate_up_alpha_table,
     std::uint32_t rows,
     std::uint32_t k_tiles,
-    std::uint32_t groups)
+    std::uint32_t groups,
+    float swiglu_limit)
 {
     const std::uint32_t slot = blockIdx.x;
     const std::uint32_t kt = blockIdx.y;
@@ -2129,8 +2130,12 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_residual_kernel(
     if (lane < 16) {
         const std::uint32_t row = kt * 64 + scale_group * 16 + lane;
         if (row < rows) {
-            const float gate_value = gate_up[row] * gate_up_alpha;
-            const float up_value = gate_up[rows + row] * gate_up_alpha;
+            float gate_value = gate_up[row] * gate_up_alpha;
+            float up_value = gate_up[rows + row] * gate_up_alpha;
+            if (swiglu_limit > 0.0f) {
+                gate_value = fminf(gate_value, swiglu_limit);
+                up_value = fminf(fmaxf(up_value, -swiglu_limit), swiglu_limit);
+            }
             const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
             value = gate_value * sigmoid * up_value;
         }
@@ -2209,12 +2214,13 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_residual_on_stream(
     const float* gate_up_alpha_table,
     std::uint32_t rows,
     std::uint32_t groups,
+    float swiglu_limit,
     cudaStream_t stream)
 {
     if (indices == nullptr || gate_up_table == nullptr ||
         primary_tiles == nullptr || primary_scales == nullptr ||
         residual_tiles == nullptr || residual_scales == nullptr ||
-        gate_up_alpha_table == nullptr ||
+        gate_up_alpha_table == nullptr || !isfinite(swiglu_limit) ||
         rows == 0 || groups == 0 || (rows % 64) != 0) {
         return cudaErrorInvalidValue;
     }
@@ -2223,7 +2229,7 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_residual_on_stream(
         dim3(groups, k_tiles, 1), 128, 0, stream>>>(
         indices, gate_up_table, primary_tiles, primary_scales,
         residual_tiles, residual_scales, gate_up_alpha_table, rows, k_tiles,
-        groups);
+        groups, swiglu_limit);
     return cudaGetLastError();
 }
 

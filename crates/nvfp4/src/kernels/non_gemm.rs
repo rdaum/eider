@@ -198,6 +198,41 @@ pub fn silu_mul_halves_f32_into_on_stream(
     }
 }
 
+/// Applies the Step SwiGLU clamp followed by `SiLU(gate) * up`.
+pub fn silu_mul_halves_clamped_f32_into_on_stream(
+    gate_up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    limit: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    if gate_up.len() != len * 2 || output.len() != len || len == 0 || len > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "clamped SiLU multiply halves",
+            expected: format!("gate_up={} output={len}", len * 2),
+            actual: format!("gate_up={} output={}", gate_up.len(), output.len()),
+        });
+    }
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(Error::Format {
+            label: "clamped SiLU multiply halves limit",
+            detail: format!("expected a positive finite limit, got {limit}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_silu_mul_halves_clamped_f32_on_stream",
+            ffi::infer_silu_mul_halves_clamped_f32_on_stream(
+                gate_up.ptr,
+                output.buffer_mut().ptr,
+                len as u32,
+                limit,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies `SiLU(gate) * up` independently to row-major concatenated rows.
 pub fn silu_mul_halves_f32_batch_into_on_stream(
     gate_up: &DeviceBuffer<f32>,
@@ -236,6 +271,58 @@ pub fn silu_mul_halves_f32_batch_into_on_stream(
                 output.buffer_mut().ptr,
                 rows as u32,
                 cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies the Step SwiGLU clamp to row-major concatenated gate/up rows.
+pub fn silu_mul_halves_clamped_f32_batch_into_on_stream(
+    gate_up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    limit: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows
+        .checked_mul(cols)
+        .and_then(|value| value.checked_mul(2))
+        .unwrap_or(usize::MAX);
+    let output_len = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || gate_up.len() != input_len
+        || output.len() != output_len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched clamped SiLU halves buffers",
+            expected: format!("gate_up={input_len} output={output_len}"),
+            actual: format!(
+                "gate_up={} output={} rows={rows} cols={cols}",
+                gate_up.len(),
+                output.len()
+            ),
+        });
+    }
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(Error::Format {
+            label: "batched clamped SiLU halves limit",
+            detail: format!("expected a positive finite limit, got {limit}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_silu_mul_halves_clamped_f32_batch_on_stream",
+            ffi::infer_silu_mul_halves_clamped_f32_batch_on_stream(
+                gate_up.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                limit,
                 stream.as_raw(),
             ),
         )
@@ -6544,6 +6631,52 @@ pub fn gated_rms_norm_f32_into_on_stream(
 mod tests {
     use super::*;
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn clamped_silu_halves_matches_step_reference_for_single_and_batch_rows() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let limit = 7.0f32;
+        let rows = [10.0f32, -10.0, 20.0, -20.0, 2.0, 8.0, -3.0, 9.0];
+        let input = DeviceBuffer::from_host(&rows).expect("gate/up");
+        let mut batch = DeviceBuffer::zeroed(4).expect("batch output");
+        silu_mul_halves_clamped_f32_batch_into_on_stream(
+            &input,
+            batch.output(),
+            2,
+            2,
+            limit,
+            &stream,
+        )
+        .expect("batched clamped SwiGLU");
+
+        let first = DeviceBuffer::from_host(&rows[..4]).expect("first row");
+        let mut single = DeviceBuffer::zeroed(2).expect("single output");
+        silu_mul_halves_clamped_f32_into_on_stream(&first, single.output(), 2, limit, &stream)
+            .expect("single clamped SwiGLU");
+
+        let expected = [[10.0f32, -10.0, 20.0, -20.0], [2.0, 8.0, -3.0, 9.0]]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let expected = expected
+            .chunks_exact(4)
+            .flat_map(|row| {
+                (0..2).map(|column| {
+                    let gate = row[column].min(limit);
+                    let up = row[2 + column].clamp(-limit, limit);
+                    (gate / (1.0 + (-gate).exp())) * up
+                })
+            })
+            .collect::<Vec<_>>();
+        let actual = batch.copy_to_host(&stream).expect("batch readback");
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert!((actual - expected).abs() <= 1.0e-6);
+        }
+        assert_eq!(
+            single.copy_to_host(&stream).expect("single readback"),
+            actual[..2]
+        );
+    }
 
     #[test]
     fn expert_indices_remap_through_device_slot_table() {

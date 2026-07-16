@@ -8,10 +8,10 @@ use std::path::Path;
 
 use crate::step37::{
     Step37Attention, Step37Linear, Step37Mlp, Step37PagedExpertWorkspace, Step37PagedExperts,
-    Step37RmsNorm, Step37Router, step37_inverse_frequencies,
+    Step37RmsNorm, Step37Router, step37_inverse_frequencies, step37_shared_swiglu_limit,
 };
 
-const LAYERS: [usize; 4] = [0, 1, 3, 4];
+const LAYERS: [usize; 6] = [0, 1, 3, 4, 43, 44];
 const TOKENS: usize = 8;
 const HIDDEN: usize = 4096;
 const TOP_K: usize = 8;
@@ -24,7 +24,7 @@ struct Route {
     router: Step37Router,
 }
 
-/// Validates layers 0, 1, 3, and 4 against generated Python reference tensors.
+/// Validates representative attention variants and the final clamped FFN layers.
 pub fn validate_reference_layers(
     model_dir: impl AsRef<Path>,
     reference_path: impl AsRef<Path>,
@@ -97,7 +97,13 @@ fn validate_layer(
     )?;
 
     let ffn = if layer < 3 {
-        run_mlp(checkpoint, &format!("{prefix}.mlp"), &ffn_input, &stream)?
+        run_mlp(
+            checkpoint,
+            &format!("{prefix}.mlp"),
+            &ffn_input,
+            step37_shared_swiglu_limit(layer),
+            &stream,
+        )?
     } else {
         run_moe(checkpoint, reference, layer, &ffn_input, &stream)?
     };
@@ -144,9 +150,10 @@ fn run_mlp(
     checkpoint: &ModelOptCheckpoint,
     prefix: &str,
     input: &DeviceBuffer<f32>,
+    swiglu_limit: Option<f32>,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let mlp = Step37Mlp::load(checkpoint, prefix)?;
+    let mlp = Step37Mlp::load(checkpoint, prefix, swiglu_limit)?;
     let mut workspace = mlp.new_workspace()?;
     mlp.run(&mut workspace, input, stream)?;
     Ok(workspace.into_output())
@@ -237,6 +244,7 @@ fn run_moe(
         checkpoint,
         &format!("{TEXT_PREFIX}.layers.{layer}.share_expert"),
         input,
+        step37_shared_swiglu_limit(layer),
         stream,
     )?;
     let mut output = DeviceBuffer::zeroed(HIDDEN)?;

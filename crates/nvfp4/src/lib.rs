@@ -93,6 +93,7 @@ pub use kernels::non_gemm::{
     scale_channel_f32_device_scalar_in_place_on_stream, scaled_add_f32_into_on_stream,
     sigmoid_mul_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    silu_mul_halves_clamped_f32_batch_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream, silu_mul_halves_f32_into_on_stream,
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
     split_q_gate_f32_into_on_stream, split_qkv_f32_into_on_stream,

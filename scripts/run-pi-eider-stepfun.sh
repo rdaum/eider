@@ -6,6 +6,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pi_bin="${PI_BIN:-pi}"
 provider="${PI_EIDER_PROVIDER:-eider}"
 model="${EIDER_SERVED_MODEL:-eider-step3.7}"
+thinking="${PI_EIDER_THINKING:-low}"
 health_url="${EIDER_HEALTH_URL:-http://127.0.0.1:8080/healthz}"
 export EIDER_API_KEY="${EIDER_API_KEY:-local-eider}"
 export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$repo_dir/pi/agent}"
@@ -25,4 +26,5 @@ fi
 exec "$pi_bin" \
   --provider "$provider" \
   --model "$model" \
+  --thinking "$thinking" \
   "$@"

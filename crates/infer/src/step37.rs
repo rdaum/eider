@@ -14,8 +14,8 @@ use nvfp4::{
     modelopt_m16_k64_row_scale_words, moe_silu_quantize_slots_residual_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
-    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
-    step37_sigmoid_top8_f32_into_on_stream,
+    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
+    silu_mul_halves_f32_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
 };
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
@@ -39,6 +39,9 @@ pub const FIXED_TENSOR_BYTES: usize = 5_359_999_296;
 pub const RMS_EPS: f32 = 1.0e-5;
 pub const KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
+const CLAMPED_SWIGLU_FIRST_LAYER: usize = 43;
+const ROUTED_SWIGLU_LIMIT: f32 = 7.0;
+const SHARED_SWIGLU_LIMIT: f32 = 16.0;
 const RESIDENT_INPUT_MULTIPLIER: f32 = 128.0;
 const TEXT_PREFIX: &str = "model.language_model";
 
@@ -53,6 +56,14 @@ const DOWN_SCALE_BYTES: usize = HIDDEN * INTERMEDIATE / 16;
 pub const EXPERT_RECORD_BYTES: usize =
     GATE_WEIGHT_BYTES + GATE_SCALE_BYTES + DOWN_TILE_BYTES + DOWN_SCALE_BYTES;
 const LAYER_FILE_BYTES: usize = HEADER_BYTES + EXPERTS * EXPERT_RECORD_BYTES;
+
+pub(crate) fn step37_routed_swiglu_limit(layer: usize) -> Option<f32> {
+    (layer >= CLAMPED_SWIGLU_FIRST_LAYER).then_some(ROUTED_SWIGLU_LIMIT)
+}
+
+pub(crate) fn step37_shared_swiglu_limit(layer: usize) -> Option<f32> {
+    (layer >= CLAMPED_SWIGLU_FIRST_LAYER).then_some(SHARED_SWIGLU_LIMIT)
+}
 
 #[derive(Clone, Copy)]
 struct ExpertMetadata {
@@ -203,6 +214,7 @@ pub struct Step37PagedExperts {
     uploads: ExpertUploadCoordinator,
     staging: Vec<Step37ExpertStaging>,
     stats: Step37PagingStats,
+    swiglu_limit: Option<f32>,
 }
 
 struct Step37DownSlot {
@@ -559,6 +571,7 @@ pub struct Step37Mlp {
     gate_up: Step37Linear,
     down: Step37Linear,
     intermediate: usize,
+    swiglu_limit: Option<f32>,
 }
 
 /// Allocation-free execution scratch for [`Step37Mlp`].
@@ -585,7 +598,11 @@ impl Step37MlpWorkspace {
 }
 
 impl Step37Mlp {
-    pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
+    pub fn load(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        swiglu_limit: Option<f32>,
+    ) -> Result<Self> {
         let gate_up = Step37Linear::load_concat(
             checkpoint,
             &format!("{prefix}.gate_proj"),
@@ -608,6 +625,7 @@ impl Step37Mlp {
             gate_up,
             down,
             intermediate,
+            swiglu_limit,
         })
     }
 
@@ -634,12 +652,22 @@ impl Step37Mlp {
             &mut workspace.gate_up,
             stream,
         )?;
-        silu_mul_halves_f32_into_on_stream(
-            &workspace.gate_up,
-            workspace.activated.output(),
-            self.intermediate,
-            stream,
-        )?;
+        if let Some(limit) = self.swiglu_limit {
+            silu_mul_halves_clamped_f32_into_on_stream(
+                &workspace.gate_up,
+                workspace.activated.output(),
+                self.intermediate,
+                limit,
+                stream,
+            )?;
+        } else {
+            silu_mul_halves_f32_into_on_stream(
+                &workspace.gate_up,
+                workspace.activated.output(),
+                self.intermediate,
+                stream,
+            )?;
+        }
         workspace
             .activated_quantized
             .quantize(&workspace.activated, stream)?;
@@ -1238,6 +1266,7 @@ impl Step37PagedExperts {
                 .map(|_| Step37ExpertStaging::new())
                 .collect::<Result<Vec<_>>>()?,
             stats: Step37PagingStats::default(),
+            swiglu_limit: step37_routed_swiglu_limit(layer),
         })
     }
 
@@ -1403,6 +1432,7 @@ impl Step37PagedExperts {
             &self.gate_up_unity_alphas,
             INTERMEDIATE,
             8,
+            self.swiglu_limit.unwrap_or(0.0),
             stream,
         )?;
         indexed_grouped_gemv_row_scales_residual_on_stream(
@@ -1570,10 +1600,18 @@ impl Step37Layer {
     ) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
         let ffn = if layer < FIRST_MOE_LAYER {
-            Step37LayerFfn::Dense(Step37Mlp::load(checkpoint, &format!("{prefix}.mlp"))?)
+            Step37LayerFfn::Dense(Step37Mlp::load(
+                checkpoint,
+                &format!("{prefix}.mlp"),
+                step37_shared_swiglu_limit(layer),
+            )?)
         } else {
             Step37LayerFfn::Moe {
-                shared: Step37Mlp::load(checkpoint, &format!("{prefix}.share_expert"))?,
+                shared: Step37Mlp::load(
+                    checkpoint,
+                    &format!("{prefix}.share_expert"),
+                    step37_shared_swiglu_limit(layer),
+                )?,
                 router: Step37Router::load(checkpoint, layer)?,
                 paged: Box::new(Step37PagedExperts::load(
                     checkpoint.root(),

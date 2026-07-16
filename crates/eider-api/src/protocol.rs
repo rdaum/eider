@@ -1,8 +1,8 @@
 //! Responses API request translation and streaming event construction.
 
 use infer::runtime::chat::{
-    ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatRole, ChatTemplateOptions, ChatTool,
-    ChatToolCall,
+    ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatReasoningEffort, ChatRole,
+    ChatTemplateOptions, ChatTool, ChatToolCall,
 };
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
@@ -48,6 +48,8 @@ pub struct ResponseRequest {
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
+    pub reasoning: Option<ResponseReasoning>,
+    #[serde(default)]
     pub stop: Option<OneOrMany<String>>,
 }
 
@@ -57,6 +59,12 @@ pub struct ResponseRequest {
 pub enum OneOrMany<T> {
     One(T),
     Many(Vec<T>),
+}
+
+/// Reasoning controls accepted from Responses-compatible clients.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResponseReasoning {
+    pub effort: Option<String>,
 }
 
 impl<T> OneOrMany<T> {
@@ -165,13 +173,35 @@ impl ResponseRequest {
             .validate()
             .map_err(|error| ApiError::invalid("sampling", error.to_string()))?;
 
+        let reasoning_effort = self
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref())
+            .map(parse_reasoning_effort)
+            .transpose()?;
+
         Ok(ChatRequest {
             messages,
             tools,
-            template: ChatTemplateOptions::default(),
+            template: ChatTemplateOptions {
+                reasoning_effort,
+                ..ChatTemplateOptions::default()
+            },
             generation,
             stop_sequences: self.stop.map(OneOrMany::into_vec).unwrap_or_default(),
         })
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<ChatReasoningEffort, ApiError> {
+    match value {
+        "low" => Ok(ChatReasoningEffort::Low),
+        "medium" => Ok(ChatReasoningEffort::Medium),
+        "high" => Ok(ChatReasoningEffort::High),
+        _ => Err(ApiError::invalid(
+            "reasoning.effort",
+            "reasoning effort must be low, medium, or high",
+        )),
     }
 }
 
@@ -716,6 +746,7 @@ mod tests {
             "seed": 42,
             "presence_penalty": 0.2,
             "frequency_penalty": 0.1,
+            "reasoning": {"effort":"low","summary":"auto"},
             "max_output_tokens": 12
         })).unwrap();
         let chat = request.into_chat_request(&defaults()).unwrap();
@@ -728,6 +759,10 @@ mod tests {
         assert_eq!(chat.generation.sampling.seed, Some(42));
         assert_eq!(chat.generation.sampling.presence_penalty, 0.2);
         assert_eq!(chat.generation.sampling.frequency_penalty, 0.1);
+        assert_eq!(
+            chat.template.reasoning_effort,
+            Some(ChatReasoningEffort::Low)
+        );
         assert!(
             chat.messages[0]
                 .content

@@ -440,6 +440,7 @@ unsafe extern "C" {
         gate_up_alpha_table: *const f32,
         rows: u32,
         groups: u32,
+        swiglu_limit: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
@@ -586,11 +587,26 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_silu_mul_halves_clamped_f32_on_stream(
+        gate_up: *const f32,
+        output: *mut f32,
+        len: u32,
+        limit: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_silu_mul_halves_f32_batch_on_stream(
         gate_up: *const f32,
         output: *mut f32,
         rows: u32,
         cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_silu_mul_halves_clamped_f32_batch_on_stream(
+        gate_up: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        limit: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_fill_f32_on_stream(
