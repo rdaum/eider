@@ -682,7 +682,7 @@ unsafe extern "C" {
         norm_topk_prob: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_step35_sigmoid_top8_f32_on_stream(
+    pub(crate) fn infer_step37_sigmoid_top8_f32_on_stream(
         logits: *const f32,
         bias: *const f32,
         out_indices: *mut u32,
@@ -690,7 +690,7 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_step35_sigmoid_top8_f32_batch_on_stream(
+    pub(crate) fn infer_step37_sigmoid_top8_f32_batch_on_stream(
         logits: *const f32,
         bias: *const f32,
         out_indices: *mut u32,

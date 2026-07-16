@@ -4,44 +4,44 @@ use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{RequestFinishReason, RequestState, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::step35_scheduler::{
-    Step35AdmissionProgress, Step35CancelOutcome, Step35PrefillProgress, Step35RequestId,
-    Step35Scheduler,
+use super::step37_scheduler::{
+    Step37AdmissionProgress, Step37CancelOutcome, Step37PrefillProgress, Step37RequestId,
+    Step37Scheduler,
 };
 use super::stop::StopBuffer;
-use crate::step35::Step35TextModel;
+use crate::step37::Step37TextModel;
 use nvfp4::{Error, Result};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Step35ChatDelta {
-    pub request_id: Step35RequestId,
+pub struct Step37ChatDelta {
+    pub request_id: Step37RequestId,
     pub event: ChatOutputEvent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Step35ChatAdmission {
-    pub request_id: Step35RequestId,
+pub struct Step37ChatAdmission {
+    pub request_id: Step37RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Step35ChatFinished {
-    pub request_id: Step35RequestId,
+pub struct Step37ChatFinished {
+    pub request_id: Step37RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
     pub released_sequence_device_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Step35ChatTick {
-    pub admitted: Vec<Step35AdmissionProgress>,
-    pub scheduled: Vec<Step35RequestId>,
-    pub prefilled: Vec<Step35PrefillProgress>,
-    pub generated: Vec<Step35RequestId>,
-    pub output: Vec<Step35ChatDelta>,
-    pub finished: Vec<Step35ChatFinished>,
+pub struct Step37ChatTick {
+    pub admitted: Vec<Step37AdmissionProgress>,
+    pub scheduled: Vec<Step37RequestId>,
+    pub prefilled: Vec<Step37PrefillProgress>,
+    pub generated: Vec<Step37RequestId>,
+    pub output: Vec<Step37ChatDelta>,
+    pub finished: Vec<Step37ChatFinished>,
     pub active_sequences: usize,
 }
 
@@ -51,26 +51,26 @@ struct ActiveChatRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
-pub struct Step35ChatService<'template> {
+pub struct Step37ChatService<'template> {
     template: &'template CheckpointChatTemplate,
-    scheduler: Step35Scheduler,
-    requests: BTreeMap<Step35RequestId, ActiveChatRequest<'template>>,
+    scheduler: Step37Scheduler,
+    requests: BTreeMap<Step37RequestId, ActiveChatRequest<'template>>,
 }
 
-impl<'template> Step35ChatService<'template> {
+impl<'template> Step37ChatService<'template> {
     pub fn new(
-        model: Step35TextModel,
+        model: Step37TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
         Ok(Self {
             template,
-            scheduler: Step35Scheduler::new(model, scheduler)?,
+            scheduler: Step37Scheduler::new(model, scheduler)?,
             requests: BTreeMap::new(),
         })
     }
 
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Step35ChatAdmission> {
+    pub fn add_request(&mut self, request: ChatRequest) -> Result<Step37ChatAdmission> {
         validate_stop_sequences(&request.stop_sequences)?;
         let prompt = self.template.render_and_tokenize(
             &request.messages,
@@ -102,20 +102,20 @@ impl<'template> Step35ChatService<'template> {
             },
         );
         debug_assert!(previous.is_none());
-        Ok(Step35ChatAdmission {
+        Ok(Step37ChatAdmission {
             request_id: id,
             prompt_tokens,
             max_output_tokens,
         })
     }
 
-    pub fn tick(&mut self) -> Result<Step35ChatTick> {
+    pub fn tick(&mut self) -> Result<Step37ChatTick> {
         let scheduled = self.scheduler.tick()?;
-        let mut tick = Step35ChatTick {
+        let mut tick = Step37ChatTick {
             admitted: scheduled.admitted,
             scheduled: scheduled.scheduled,
             prefilled: scheduled.prefilled,
-            ..Step35ChatTick::default()
+            ..Step37ChatTick::default()
         };
         let mut terminal = BTreeMap::new();
 
@@ -169,7 +169,7 @@ impl<'template> Step35ChatService<'template> {
                 .requests
                 .remove(&id)
                 .expect("terminal request retained");
-            tick.finished.push(Step35ChatFinished {
+            tick.finished.push(Step37ChatFinished {
                 request_id: id,
                 finish_reason: reason,
                 usage: request.usage,
@@ -180,17 +180,17 @@ impl<'template> Step35ChatService<'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: Step35RequestId) -> Step35CancelOutcome {
+    pub fn cancel_request(&mut self, id: Step37RequestId) -> Step37CancelOutcome {
         let outcome = self.scheduler.cancel_request(id);
         match &outcome {
-            Step35CancelOutcome::Cancelled(_) => {
+            Step37CancelOutcome::Cancelled(_) => {
                 self.requests.remove(&id);
             }
-            Step35CancelOutcome::AlreadyFinished => {
+            Step37CancelOutcome::AlreadyFinished => {
                 self.scheduler.remove_finished(id);
                 self.requests.remove(&id);
             }
-            Step35CancelOutcome::NotFound => {
+            Step37CancelOutcome::NotFound => {
                 self.requests.remove(&id);
             }
         }
@@ -201,7 +201,7 @@ impl<'template> Step35ChatService<'template> {
         self.scheduler.active_sequence_count()
     }
 
-    fn release_scheduler_request(&mut self, id: Step35RequestId) -> Result<usize> {
+    fn release_scheduler_request(&mut self, id: Step37RequestId) -> Result<usize> {
         match self.scheduler.request_state(id) {
             Some(RequestState::Finished) => Ok(self
                 .scheduler
@@ -209,7 +209,7 @@ impl<'template> Step35ChatService<'template> {
                 .expect("finished scheduler request is removable")
                 .released_sequence_device_bytes),
             Some(_) => {
-                let Step35CancelOutcome::Cancelled(cancelled) = self.scheduler.cancel_request(id)
+                let Step37CancelOutcome::Cancelled(cancelled) = self.scheduler.cancel_request(id)
                 else {
                     return Err(Error::Format {
                         label: "Step-3.7 chat service",
@@ -241,19 +241,19 @@ impl ResponseFilter {
 
     fn apply(
         &mut self,
-        request_id: Step35RequestId,
+        request_id: Step37RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Step35ChatDelta>,
+        output: &mut Vec<Step37ChatDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => output.push(Step35ChatDelta { request_id, event }),
+                ChatOutputEvent::Reasoning(_) => output.push(Step37ChatDelta { request_id, event }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Step35ChatDelta {
+                        output.push(Step37ChatDelta {
                             request_id,
                             event: ChatOutputEvent::Text(stopped.text),
                         });
@@ -264,7 +264,7 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Step35ChatDelta { request_id, event });
+                    output.push(Step37ChatDelta { request_id, event });
                     self.saw_tool_calls = true;
                 }
             }
@@ -276,10 +276,10 @@ impl ResponseFilter {
         self.saw_tool_calls
     }
 
-    fn flush(&mut self, request_id: Step35RequestId, output: &mut Vec<Step35ChatDelta>) {
+    fn flush(&mut self, request_id: Step37RequestId, output: &mut Vec<Step37ChatDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Step35ChatDelta {
+            output.push(Step37ChatDelta {
                 request_id,
                 event: ChatOutputEvent::Text(text),
             });

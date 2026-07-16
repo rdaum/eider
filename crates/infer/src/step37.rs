@@ -15,7 +15,7 @@ use nvfp4::{
     moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
     sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
-    step35_sigmoid_top8_f32_into_on_stream,
+    step37_sigmoid_top8_f32_into_on_stream,
 };
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 mod batch;
-pub use batch::{Step35PrefillBatchWorkspace, Step35PrefillRow};
+pub use batch::{Step37PrefillBatchWorkspace, Step37PrefillRow};
 
 pub const LAYERS: usize = 42;
 pub const FIRST_MOE_LAYER: usize = 3;
@@ -69,14 +69,14 @@ struct PreparedHeader {
 }
 
 /// One Step-3.7 prepared expert record and its scalar execution metadata.
-pub struct Step35PreparedExpertRecord {
+pub struct Step37PreparedExpertRecord {
     bytes: Vec<u8>,
     pub gate_global_scale: f32,
     pub down_input_scale: f32,
     pub down_alpha: f32,
 }
 
-impl Step35PreparedExpertRecord {
+impl Step37PreparedExpertRecord {
     pub fn gate_weight_bytes(&self) -> &[u8] {
         &self.bytes[..GATE_WEIGHT_BYTES]
     }
@@ -97,13 +97,13 @@ impl Step35PreparedExpertRecord {
 }
 
 /// Random-access source for Step-3.7's fixed-size prepared expert records.
-pub struct Step35ExpertRecordSource {
+pub struct Step37ExpertRecordSource {
     file: File,
     direct_file: File,
     header: PreparedHeader,
 }
 
-impl Step35ExpertRecordSource {
+impl Step37ExpertRecordSource {
     pub fn open(model_dir: impl AsRef<Path>, layer: usize) -> Result<Self> {
         if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
             return Err(Error::Shape {
@@ -160,8 +160,8 @@ impl Step35ExpertRecordSource {
     }
 }
 
-impl ExpertRecordSource for Step35ExpertRecordSource {
-    type Record = Step35PreparedExpertRecord;
+impl ExpertRecordSource for Step37ExpertRecordSource {
+    type Record = Step37PreparedExpertRecord;
 
     fn read_record(&self, expert: usize) -> Result<Self::Record> {
         if expert >= EXPERTS {
@@ -181,7 +181,7 @@ impl ExpertRecordSource for Step35ExpertRecordSource {
                 label: "Step-3.7 prepared expert",
                 detail: format!("failed to read expert {expert}: {error}"),
             })?;
-        Ok(Step35PreparedExpertRecord {
+        Ok(Step37PreparedExpertRecord {
             bytes,
             gate_global_scale: self.header.gate_global_scales[expert],
             down_input_scale: self.header.down_input_scales[expert],
@@ -191,26 +191,26 @@ impl ExpertRecordSource for Step35ExpertRecordSource {
 }
 
 /// Bounded routed-expert slots for one Step-3.7 MoE layer.
-pub struct Step35PagedExperts {
-    source: Step35ExpertRecordSource,
+pub struct Step37PagedExperts {
+    source: Step37ExpertRecordSource,
     gate_up: MarlinNvfp4GateUp,
-    down: Vec<Step35DownSlot>,
+    down: Vec<Step37DownSlot>,
     down_values: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
     down_weight_scale_2: DeviceBuffer<f32>,
     gate_up_unity_alphas: DeviceBuffer<f32>,
     slots: ExpertSlotCache,
     uploads: ExpertUploadCoordinator,
-    staging: Vec<Step35ExpertStaging>,
-    stats: Step35PagingStats,
+    staging: Vec<Step37ExpertStaging>,
+    stats: Step37PagingStats,
 }
 
-struct Step35DownSlot {
+struct Step37DownSlot {
     tiles: DeviceBuffer<u8>,
     row_scales: DeviceBuffer<u32>,
 }
 
-struct Step35ExpertStaging {
+struct Step37ExpertStaging {
     slot: usize,
     record: PinnedHostBuffer<u8>,
     gate_global_scale: PinnedHostBuffer<f32>,
@@ -218,7 +218,7 @@ struct Step35ExpertStaging {
 }
 
 /// Mutable routed-expert execution workspace for one Step-3.7 token.
-pub struct Step35PagedExpertWorkspace {
+pub struct Step37PagedExpertWorkspace {
     gate_up_output: DeviceBuffer<f32>,
     gate_up_table: DeviceBuffer<*const f32>,
     down_input_tiles: DeviceBuffer<u8>,
@@ -233,20 +233,20 @@ pub struct Step35PagedExpertWorkspace {
 
 /// One resident-slot lookup result.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Step35PageResolution {
+pub struct Step37PageResolution {
     pub hits: usize,
     pub misses: usize,
     pub bytes_read: usize,
 }
 
-struct Step35PendingPageResolution {
+struct Step37PendingPageResolution {
     misses: Vec<ExpertSlotMiss>,
-    resolution: Step35PageResolution,
+    resolution: Step37PageResolution,
 }
 
 /// Cumulative expert-cache activity across paged Step layers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Step35PagingStats {
+pub struct Step37PagingStats {
     /// Expert route lookups served by an already-resident slot.
     pub hits: u64,
     /// Expert route lookups that loaded a prepared record.
@@ -256,7 +256,7 @@ pub struct Step35PagingStats {
 }
 
 /// Persistent BF16 projection and device route workspace for one Step MoE layer.
-pub struct Step35Router {
+pub struct Step37Router {
     weight: DeviceBuffer<u16>,
     bias: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
@@ -265,13 +265,13 @@ pub struct Step35Router {
 }
 
 /// Resident ModelOpt NVFP4 linear used by Step attention and non-routed FFNs.
-pub struct Step35Linear {
-    weight: Step35LinearWeight,
+pub struct Step37Linear {
+    weight: Step37LinearWeight,
     out_features: usize,
     in_features: usize,
 }
 
-enum Step35LinearWeight {
+enum Step37LinearWeight {
     Nvfp4 {
         native_tiles: DeviceBuffer<u8>,
         row_scales: DeviceBuffer<u32>,
@@ -281,7 +281,7 @@ enum Step35LinearWeight {
 }
 
 /// Reusable SM12x FP4 activation rows for resident Step linears.
-struct Step35QuantizedRows {
+struct Step37QuantizedRows {
     native_tiles: DeviceBuffer<u8>,
     scales: DeviceBuffer<u32>,
     residual_tiles: DeviceBuffer<u8>,
@@ -292,7 +292,7 @@ struct Step35QuantizedRows {
     features: usize,
 }
 
-impl Step35QuantizedRows {
+impl Step37QuantizedRows {
     fn new(rows: usize, features: usize) -> Result<Self> {
         if rows == 0 || features == 0 || !features.is_multiple_of(64) {
             return Err(Error::Shape {
@@ -340,14 +340,14 @@ impl Step35QuantizedRows {
     }
 }
 
-impl Step35Linear {
+impl Step37Linear {
     pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
         let tensor = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&tensor)?;
         if info.dtype == "BF16" {
             let (weight, out_features, in_features) = read_bf16_linear(checkpoint, prefix)?;
             return Ok(Self {
-                weight: Step35LinearWeight::Bf16(DeviceBuffer::from_host(&weight)?),
+                weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&weight)?),
                 out_features,
                 in_features,
             });
@@ -375,7 +375,7 @@ impl Step35Linear {
             }
             first.extend_from_slice(&second);
             return Ok(Self {
-                weight: Step35LinearWeight::Bf16(DeviceBuffer::from_host(&first)?),
+                weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&first)?),
                 out_features: first_out + second_out,
                 in_features: input,
             });
@@ -401,7 +401,7 @@ impl Step35Linear {
             &weight.weight_scale,
         )?;
         Ok(Self {
-            weight: Step35LinearWeight::Nvfp4 {
+            weight: Step37LinearWeight::Nvfp4 {
                 native_tiles: DeviceBuffer::from_host(&native_tiles.to_bytes())?,
                 row_scales: DeviceBuffer::from_host(&row_scales)?,
                 weight_scale_2: weight.weight_scale_2,
@@ -430,12 +430,12 @@ impl Step35Linear {
             });
         }
         match &self.weight {
-            Step35LinearWeight::Nvfp4 { .. } => {
-                let mut quantized = Step35QuantizedRows::new(rows, self.in_features)?;
+            Step37LinearWeight::Nvfp4 { .. } => {
+                let mut quantized = Step37QuantizedRows::new(rows, self.in_features)?;
                 quantized.quantize(input, stream)?;
                 self.run_with_quantized_into(input, &quantized, output, stream)
             }
-            Step35LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
+            Step37LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
                 input,
                 weight,
                 output.output(),
@@ -450,7 +450,7 @@ impl Step35Linear {
     fn run_with_quantized_into(
         &self,
         input_f32: &DeviceBuffer<f32>,
-        input: &Step35QuantizedRows,
+        input: &Step37QuantizedRows,
         output: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -466,7 +466,7 @@ impl Step35Linear {
             });
         }
         match &self.weight {
-            Step35LinearWeight::Nvfp4 {
+            Step37LinearWeight::Nvfp4 {
                 native_tiles,
                 row_scales,
                 weight_scale_2,
@@ -486,7 +486,7 @@ impl Step35Linear {
                 *weight_scale_2 / RESIDENT_INPUT_MULTIPLIER,
                 stream,
             ),
-            Step35LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
+            Step37LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
                 input_f32,
                 weight,
                 output.output(),
@@ -504,12 +504,12 @@ impl Step35Linear {
 
     pub fn device_bytes(&self) -> usize {
         match &self.weight {
-            Step35LinearWeight::Nvfp4 {
+            Step37LinearWeight::Nvfp4 {
                 native_tiles,
                 row_scales,
                 ..
             } => native_tiles.device_bytes() + row_scales.device_bytes(),
-            Step35LinearWeight::Bf16(weight) => weight.device_bytes(),
+            Step37LinearWeight::Bf16(weight) => weight.device_bytes(),
         }
     }
 }
@@ -550,27 +550,27 @@ fn read_bf16_linear(
 }
 
 /// Resident zero-centred RMSNorm weight used by Step layers.
-pub struct Step35RmsNorm {
+pub struct Step37RmsNorm {
     weight: DeviceBuffer<f32>,
 }
 
 /// Resident gate/up/down weights for a dense or shared Step SwiGLU FFN.
-pub struct Step35Mlp {
-    gate_up: Step35Linear,
-    down: Step35Linear,
+pub struct Step37Mlp {
+    gate_up: Step37Linear,
+    down: Step37Linear,
     intermediate: usize,
 }
 
-/// Allocation-free execution scratch for [`Step35Mlp`].
-pub struct Step35MlpWorkspace {
-    input_quantized: Step35QuantizedRows,
+/// Allocation-free execution scratch for [`Step37Mlp`].
+pub struct Step37MlpWorkspace {
+    input_quantized: Step37QuantizedRows,
     gate_up: DeviceBuffer<f32>,
     activated: DeviceBuffer<f32>,
-    activated_quantized: Step35QuantizedRows,
+    activated_quantized: Step37QuantizedRows,
     output: DeviceBuffer<f32>,
 }
 
-impl Step35MlpWorkspace {
+impl Step37MlpWorkspace {
     pub fn into_output(self) -> DeviceBuffer<f32> {
         self.output
     }
@@ -584,15 +584,15 @@ impl Step35MlpWorkspace {
     }
 }
 
-impl Step35Mlp {
+impl Step37Mlp {
     pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
-        let gate_up = Step35Linear::load_concat(
+        let gate_up = Step37Linear::load_concat(
             checkpoint,
             &format!("{prefix}.gate_proj"),
             &format!("{prefix}.up_proj"),
             &format!("{prefix}.gate_up"),
         )?;
-        let down = Step35Linear::load(checkpoint, &format!("{prefix}.down_proj"))?;
+        let down = Step37Linear::load(checkpoint, &format!("{prefix}.down_proj"))?;
         let (gate_up_features, hidden) = gate_up.shape();
         let intermediate = gate_up_features / 2;
         if !gate_up_features.is_multiple_of(2) || down.shape() != (hidden, intermediate) {
@@ -611,19 +611,19 @@ impl Step35Mlp {
         })
     }
 
-    pub fn new_workspace(&self) -> Result<Step35MlpWorkspace> {
-        Ok(Step35MlpWorkspace {
-            input_quantized: Step35QuantizedRows::new(1, HIDDEN)?,
+    pub fn new_workspace(&self) -> Result<Step37MlpWorkspace> {
+        Ok(Step37MlpWorkspace {
+            input_quantized: Step37QuantizedRows::new(1, HIDDEN)?,
             gate_up: DeviceBuffer::zeroed(self.intermediate * 2)?,
             activated: DeviceBuffer::zeroed(self.intermediate)?,
-            activated_quantized: Step35QuantizedRows::new(1, self.intermediate)?,
+            activated_quantized: Step37QuantizedRows::new(1, self.intermediate)?,
             output: DeviceBuffer::zeroed(HIDDEN)?,
         })
     }
 
     pub fn run<'a>(
         &self,
-        workspace: &'a mut Step35MlpWorkspace,
+        workspace: &'a mut Step37MlpWorkspace,
         input: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
@@ -658,24 +658,24 @@ impl Step35Mlp {
 }
 
 /// Resident weights for one Step grouped-query attention variant.
-pub struct Step35Attention {
-    q: Step35Linear,
-    k: Step35Linear,
-    v: Step35Linear,
-    q_norm: Step35RmsNorm,
-    k_norm: Step35RmsNorm,
-    gate: Step35Linear,
-    output: Step35Linear,
+pub struct Step37Attention {
+    q: Step37Linear,
+    k: Step37Linear,
+    v: Step37Linear,
+    q_norm: Step37RmsNorm,
+    k_norm: Step37RmsNorm,
+    gate: Step37Linear,
+    output: Step37Linear,
     inv_freq: DeviceBuffer<f32>,
     q_heads: usize,
     rotary_dim: usize,
     window: Option<usize>,
 }
 
-/// Reusable sequence scratch for [`Step35Attention`].
-pub struct Step35AttentionWorkspace {
+/// Reusable sequence scratch for [`Step37Attention`].
+pub struct Step37AttentionWorkspace {
     tokens: usize,
-    input_quantized: Step35QuantizedRows,
+    input_quantized: Step37QuantizedRows,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -686,14 +686,14 @@ pub struct Step35AttentionWorkspace {
     query: DeviceBuffer<f32>,
     attended: DeviceBuffer<f32>,
     last_input: DeviceBuffer<f32>,
-    last_input_quantized: Step35QuantizedRows,
+    last_input_quantized: Step37QuantizedRows,
     gate: DeviceBuffer<f32>,
     gated: DeviceBuffer<f32>,
-    gated_quantized: Step35QuantizedRows,
+    gated_quantized: Step37QuantizedRows,
     output: DeviceBuffer<f32>,
 }
 
-impl Step35AttentionWorkspace {
+impl Step37AttentionWorkspace {
     pub fn into_output(self) -> DeviceBuffer<f32> {
         self.output
     }
@@ -718,20 +718,20 @@ impl Step35AttentionWorkspace {
     }
 }
 
-impl Step35Attention {
+impl Step37Attention {
     pub fn load(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}.self_attn");
         let q_heads = if layer.is_multiple_of(4) { 64 } else { 96 };
         let rotary_dim = if layer.is_multiple_of(4) { 64 } else { 128 };
-        let inv_freq = step35_inverse_frequencies(layer);
+        let inv_freq = step37_inverse_frequencies(layer);
         Ok(Self {
-            q: Step35Linear::load(checkpoint, &format!("{prefix}.q_proj"))?,
-            k: Step35Linear::load(checkpoint, &format!("{prefix}.k_proj"))?,
-            v: Step35Linear::load(checkpoint, &format!("{prefix}.v_proj"))?,
-            q_norm: Step35RmsNorm::load(checkpoint, &format!("{prefix}.q_norm.weight"), HEAD_DIM)?,
-            k_norm: Step35RmsNorm::load(checkpoint, &format!("{prefix}.k_norm.weight"), HEAD_DIM)?,
-            gate: Step35Linear::load(checkpoint, &format!("{prefix}.g_proj"))?,
-            output: Step35Linear::load(checkpoint, &format!("{prefix}.o_proj"))?,
+            q: Step37Linear::load(checkpoint, &format!("{prefix}.q_proj"))?,
+            k: Step37Linear::load(checkpoint, &format!("{prefix}.k_proj"))?,
+            v: Step37Linear::load(checkpoint, &format!("{prefix}.v_proj"))?,
+            q_norm: Step37RmsNorm::load(checkpoint, &format!("{prefix}.q_norm.weight"), HEAD_DIM)?,
+            k_norm: Step37RmsNorm::load(checkpoint, &format!("{prefix}.k_norm.weight"), HEAD_DIM)?,
+            gate: Step37Linear::load(checkpoint, &format!("{prefix}.g_proj"))?,
+            output: Step37Linear::load(checkpoint, &format!("{prefix}.o_proj"))?,
             inv_freq: DeviceBuffer::from_host(&inv_freq)?,
             q_heads,
             rotary_dim,
@@ -739,12 +739,12 @@ impl Step35Attention {
         })
     }
 
-    pub fn new_workspace(&self, tokens: usize) -> Result<Step35AttentionWorkspace> {
+    pub fn new_workspace(&self, tokens: usize) -> Result<Step37AttentionWorkspace> {
         let q_width = self.q_heads * HEAD_DIM;
         let kv_width = KV_HEADS * HEAD_DIM;
-        Ok(Step35AttentionWorkspace {
+        Ok(Step37AttentionWorkspace {
             tokens,
-            input_quantized: Step35QuantizedRows::new(tokens, HIDDEN)?,
+            input_quantized: Step37QuantizedRows::new(tokens, HIDDEN)?,
             q: DeviceBuffer::zeroed(tokens * q_width)?,
             k: DeviceBuffer::zeroed(tokens * kv_width)?,
             v: DeviceBuffer::zeroed(tokens * kv_width)?,
@@ -755,17 +755,17 @@ impl Step35Attention {
             query: DeviceBuffer::zeroed(q_width)?,
             attended: DeviceBuffer::zeroed(q_width)?,
             last_input: DeviceBuffer::zeroed(HIDDEN)?,
-            last_input_quantized: Step35QuantizedRows::new(1, HIDDEN)?,
+            last_input_quantized: Step37QuantizedRows::new(1, HIDDEN)?,
             gate: DeviceBuffer::zeroed(self.q_heads)?,
             gated: DeviceBuffer::zeroed(q_width)?,
-            gated_quantized: Step35QuantizedRows::new(1, q_width)?,
+            gated_quantized: Step37QuantizedRows::new(1, q_width)?,
             output: DeviceBuffer::zeroed(HIDDEN)?,
         })
     }
 
     pub fn run<'a>(
         &self,
-        workspace: &'a mut Step35AttentionWorkspace,
+        workspace: &'a mut Step37AttentionWorkspace,
         input: &DeviceBuffer<f32>,
         start_position: usize,
         stream: &CudaStream,
@@ -885,7 +885,7 @@ impl Step35Attention {
     /// Runs one decode token while appending K/V to a persistent layer cache.
     pub fn run_decode<'a>(
         &self,
-        workspace: &'a mut Step35AttentionWorkspace,
+        workspace: &'a mut Step37AttentionWorkspace,
         input: &DeviceBuffer<f32>,
         cache: &mut Sm12xKvCache,
         compact_attention: &mut Sm12xKvAttentionWorkspace,
@@ -1007,7 +1007,7 @@ impl Step35Attention {
         Ok(&workspace.output)
     }
 
-    pub fn gated<'a>(&self, workspace: &'a Step35AttentionWorkspace) -> &'a DeviceBuffer<f32> {
+    pub fn gated<'a>(&self, workspace: &'a Step37AttentionWorkspace) -> &'a DeviceBuffer<f32> {
         &workspace.gated
     }
 
@@ -1023,7 +1023,7 @@ impl Step35Attention {
     }
 }
 
-pub(crate) fn step35_inverse_frequencies(layer: usize) -> Vec<f32> {
+pub(crate) fn step37_inverse_frequencies(layer: usize) -> Vec<f32> {
     let rotary_dim = if layer.is_multiple_of(4) { 64 } else { 128 };
     let theta = if layer.is_multiple_of(4) {
         5_000_000.0f32
@@ -1050,7 +1050,7 @@ pub(crate) fn step35_inverse_frequencies(layer: usize) -> Vec<f32> {
     frequencies
 }
 
-impl Step35RmsNorm {
+impl Step37RmsNorm {
     pub fn load(checkpoint: &ModelOptCheckpoint, tensor: &str, cols: usize) -> Result<Self> {
         let mut weight = checkpoint
             .open_shard_for_tensor(tensor)?
@@ -1094,7 +1094,7 @@ impl Step35RmsNorm {
     }
 }
 
-impl Step35Router {
+impl Step37Router {
     pub fn load(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}.moe");
         let tensor = format!("{prefix}.gate.weight");
@@ -1149,7 +1149,7 @@ impl Step35Router {
             HIDDEN,
             stream,
         )?;
-        step35_sigmoid_top8_f32_into_on_stream(
+        step37_sigmoid_top8_f32_into_on_stream(
             &self.logits,
             &self.bias,
             self.indices.output(),
@@ -1179,7 +1179,7 @@ impl Step35Router {
     }
 }
 
-impl Step35ExpertStaging {
+impl Step37ExpertStaging {
     fn new() -> Result<Self> {
         Ok(Self {
             slot: 0,
@@ -1189,7 +1189,7 @@ impl Step35ExpertStaging {
         })
     }
 
-    fn read(&mut self, source: &Step35ExpertRecordSource, miss: ExpertSlotMiss) -> Result<()> {
+    fn read(&mut self, source: &Step37ExpertRecordSource, miss: ExpertSlotMiss) -> Result<()> {
         source.read_record_direct(miss.expert, &mut self.record)?;
         self.slot = miss.slot;
         self.gate_global_scale
@@ -1200,14 +1200,14 @@ impl Step35ExpertStaging {
     }
 }
 
-impl Step35PagedExperts {
+impl Step37PagedExperts {
     /// Allocates `capacity` routed-expert slots for `layer`.
     pub fn load(model_dir: impl AsRef<Path>, layer: usize, capacity: usize) -> Result<Self> {
-        let source = Step35ExpertRecordSource::open(model_dir, layer)?;
+        let source = Step37ExpertRecordSource::open(model_dir, layer)?;
         let gate_up = MarlinNvfp4GateUp::new_empty_slots(capacity, GATE_UP, HIDDEN)?;
         let mut down = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            down.push(Step35DownSlot {
+            down.push(Step37DownSlot {
                 tiles: DeviceBuffer::zeroed(DOWN_TILE_BYTES)?,
                 row_scales: DeviceBuffer::zeroed(DOWN_SCALE_BYTES / 4)?,
             });
@@ -1235,9 +1235,9 @@ impl Step35PagedExperts {
             slots: ExpertSlotCache::new(EXPERTS, capacity, 8)?,
             uploads: ExpertUploadCoordinator::new()?,
             staging: (0..8)
-                .map(|_| Step35ExpertStaging::new())
+                .map(|_| Step37ExpertStaging::new())
                 .collect::<Result<Vec<_>>>()?,
-            stats: Step35PagingStats::default(),
+            stats: Step37PagingStats::default(),
         })
     }
 
@@ -1247,7 +1247,7 @@ impl Step35PagedExperts {
         expert_ids: &[u32],
         device_expert_ids: &DeviceBuffer<u32>,
         stream: &CudaStream,
-    ) -> Result<Step35PageResolution> {
+    ) -> Result<Step37PageResolution> {
         self.resolve_at_offset(expert_ids, device_expert_ids, 0, stream)
     }
 
@@ -1257,7 +1257,7 @@ impl Step35PagedExperts {
         device_expert_ids: &DeviceBuffer<u32>,
         expert_offset: usize,
         stream: &CudaStream,
-    ) -> Result<Step35PageResolution> {
+    ) -> Result<Step37PageResolution> {
         if expert_offset
             .checked_add(8)
             .is_none_or(|end| end > device_expert_ids.len())
@@ -1276,7 +1276,7 @@ impl Step35PagedExperts {
         &mut self,
         expert_ids: &[u32],
         stream: &CudaStream,
-    ) -> Result<Step35PendingPageResolution> {
+    ) -> Result<Step37PendingPageResolution> {
         self.uploads.wait_for_staging_reuse()?;
         let plan = self.slots.plan(expert_ids)?;
         let hits = plan.hits;
@@ -1284,9 +1284,9 @@ impl Step35PagedExperts {
         if misses != 0 {
             self.uploads.begin(stream)?;
         }
-        Ok(Step35PendingPageResolution {
+        Ok(Step37PendingPageResolution {
             misses: plan.misses,
-            resolution: Step35PageResolution {
+            resolution: Step37PageResolution {
                 hits,
                 misses,
                 bytes_read: misses * EXPERT_RECORD_BYTES,
@@ -1296,11 +1296,11 @@ impl Step35PagedExperts {
 
     fn finish_resolve(
         &mut self,
-        pending: Step35PendingPageResolution,
+        pending: Step37PendingPageResolution,
         device_expert_ids: &DeviceBuffer<u32>,
         expert_offset: usize,
         stream: &CudaStream,
-    ) -> Result<Step35PageResolution> {
+    ) -> Result<Step37PageResolution> {
         let misses = pending.misses.len();
         if misses != 0 {
             std::thread::scope(|scope| {
@@ -1374,7 +1374,7 @@ impl Step35PagedExperts {
     /// Runs the currently resolved top-8 route.
     pub fn run_routed<'a>(
         &self,
-        workspace: &'a mut Step35PagedExpertWorkspace,
+        workspace: &'a mut Step37PagedExpertWorkspace,
         input: &DeviceBuffer<f32>,
         route_weights: &DeviceBuffer<f32>,
         stream: &CudaStream,
@@ -1443,12 +1443,12 @@ impl Step35PagedExperts {
     }
 
     /// Returns cumulative lookup and miss-I/O counters.
-    pub fn stats(&self) -> Step35PagingStats {
+    pub fn stats(&self) -> Step37PagingStats {
         self.stats
     }
 }
 
-impl Step35PagedExpertWorkspace {
+impl Step37PagedExpertWorkspace {
     pub fn new() -> Result<Self> {
         let gate_up_output = DeviceBuffer::zeroed(8 * GATE_UP)?;
         let gate_up_base = gate_up_output.as_const_ptr().cast::<f32>();
@@ -1502,52 +1502,52 @@ impl Step35PagedExpertWorkspace {
     }
 }
 
-enum Step35LayerFfn {
-    Dense(Step35Mlp),
+enum Step37LayerFfn {
+    Dense(Step37Mlp),
     Moe {
-        shared: Step35Mlp,
-        router: Step35Router,
-        paged: Box<Step35PagedExperts>,
+        shared: Step37Mlp,
+        router: Step37Router,
+        paged: Box<Step37PagedExperts>,
     },
 }
 
-enum Step35LayerFfnWorkspace {
-    Dense(Step35MlpWorkspace),
+enum Step37LayerFfnWorkspace {
+    Dense(Step37MlpWorkspace),
     Moe {
-        shared: Step35MlpWorkspace,
-        paged: Box<Step35PagedExpertWorkspace>,
+        shared: Step37MlpWorkspace,
+        paged: Box<Step37PagedExpertWorkspace>,
         combined: DeviceBuffer<f32>,
     },
 }
 
 /// Resident fixed weights plus bounded routed experts for one Step layer.
-pub struct Step35Layer {
+pub struct Step37Layer {
     layer: usize,
-    input_norm: Step35RmsNorm,
-    attention: Step35Attention,
-    post_attention_norm: Step35RmsNorm,
-    ffn: Step35LayerFfn,
+    input_norm: Step37RmsNorm,
+    attention: Step37Attention,
+    post_attention_norm: Step37RmsNorm,
+    ffn: Step37LayerFfn,
 }
 
-/// Reusable one-token execution scratch for [`Step35Layer`].
-pub struct Step35LayerWorkspace {
+/// Reusable one-token execution scratch for [`Step37Layer`].
+pub struct Step37LayerWorkspace {
     normed: DeviceBuffer<f32>,
-    attention: Step35AttentionWorkspace,
+    attention: Step37AttentionWorkspace,
     post_attention: DeviceBuffer<f32>,
     ffn_input: DeviceBuffer<f32>,
-    ffn: Step35LayerFfnWorkspace,
+    ffn: Step37LayerFfnWorkspace,
     output: DeviceBuffer<f32>,
 }
 
-impl Step35LayerWorkspace {
+impl Step37LayerWorkspace {
     fn output(&self) -> &DeviceBuffer<f32> {
         &self.output
     }
 
     fn device_bytes(&self) -> usize {
         let ffn = match &self.ffn {
-            Step35LayerFfnWorkspace::Dense(mlp) => mlp.device_bytes(),
-            Step35LayerFfnWorkspace::Moe {
+            Step37LayerFfnWorkspace::Dense(mlp) => mlp.device_bytes(),
+            Step37LayerFfnWorkspace::Moe {
                 shared,
                 paged,
                 combined,
@@ -1562,7 +1562,7 @@ impl Step35LayerWorkspace {
     }
 }
 
-impl Step35Layer {
+impl Step37Layer {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
         layer: usize,
@@ -1570,12 +1570,12 @@ impl Step35Layer {
     ) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
         let ffn = if layer < FIRST_MOE_LAYER {
-            Step35LayerFfn::Dense(Step35Mlp::load(checkpoint, &format!("{prefix}.mlp"))?)
+            Step37LayerFfn::Dense(Step37Mlp::load(checkpoint, &format!("{prefix}.mlp"))?)
         } else {
-            Step35LayerFfn::Moe {
-                shared: Step35Mlp::load(checkpoint, &format!("{prefix}.share_expert"))?,
-                router: Step35Router::load(checkpoint, layer)?,
-                paged: Box::new(Step35PagedExperts::load(
+            Step37LayerFfn::Moe {
+                shared: Step37Mlp::load(checkpoint, &format!("{prefix}.share_expert"))?,
+                router: Step37Router::load(checkpoint, layer)?,
+                paged: Box::new(Step37PagedExperts::load(
                     checkpoint.root(),
                     layer,
                     expert_capacity,
@@ -1584,13 +1584,13 @@ impl Step35Layer {
         };
         Ok(Self {
             layer,
-            input_norm: Step35RmsNorm::load(
+            input_norm: Step37RmsNorm::load(
                 checkpoint,
                 &format!("{prefix}.input_layernorm.weight"),
                 HIDDEN,
             )?,
-            attention: Step35Attention::load(checkpoint, layer)?,
-            post_attention_norm: Step35RmsNorm::load(
+            attention: Step37Attention::load(checkpoint, layer)?,
+            post_attention_norm: Step37RmsNorm::load(
                 checkpoint,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 HIDDEN,
@@ -1599,16 +1599,16 @@ impl Step35Layer {
         })
     }
 
-    pub fn new_workspace(&self) -> Result<Step35LayerWorkspace> {
+    pub fn new_workspace(&self) -> Result<Step37LayerWorkspace> {
         let ffn = match &self.ffn {
-            Step35LayerFfn::Dense(mlp) => Step35LayerFfnWorkspace::Dense(mlp.new_workspace()?),
-            Step35LayerFfn::Moe { shared, .. } => Step35LayerFfnWorkspace::Moe {
+            Step37LayerFfn::Dense(mlp) => Step37LayerFfnWorkspace::Dense(mlp.new_workspace()?),
+            Step37LayerFfn::Moe { shared, .. } => Step37LayerFfnWorkspace::Moe {
                 shared: shared.new_workspace()?,
-                paged: Box::new(Step35PagedExpertWorkspace::new()?),
+                paged: Box::new(Step37PagedExpertWorkspace::new()?),
                 combined: DeviceBuffer::zeroed(HIDDEN)?,
             },
         };
-        Ok(Step35LayerWorkspace {
+        Ok(Step37LayerWorkspace {
             normed: DeviceBuffer::zeroed(HIDDEN)?,
             attention: self.attention.new_workspace(1)?,
             post_attention: DeviceBuffer::zeroed(HIDDEN)?,
@@ -1620,7 +1620,7 @@ impl Step35Layer {
 
     pub fn run_one<'a>(
         &'a mut self,
-        workspace: &'a mut Step35LayerWorkspace,
+        workspace: &'a mut Step37LayerWorkspace,
         input: &DeviceBuffer<f32>,
         cache: &mut Sm12xKvCache,
         compact_attention: &mut Sm12xKvAttentionWorkspace,
@@ -1646,16 +1646,16 @@ impl Step35Layer {
             stream,
         )?;
         let ffn = match (&mut self.ffn, &mut workspace.ffn) {
-            (Step35LayerFfn::Dense(mlp), Step35LayerFfnWorkspace::Dense(mlp_workspace)) => {
+            (Step37LayerFfn::Dense(mlp), Step37LayerFfnWorkspace::Dense(mlp_workspace)) => {
                 mlp.run(mlp_workspace, &workspace.ffn_input, stream)?
             }
             (
-                Step35LayerFfn::Moe {
+                Step37LayerFfn::Moe {
                     shared,
                     router,
                     paged,
                 },
-                Step35LayerFfnWorkspace::Moe {
+                Step37LayerFfnWorkspace::Moe {
                     shared: shared_workspace,
                     paged: paged_workspace,
                     combined,
@@ -1693,8 +1693,8 @@ impl Step35Layer {
 
     pub fn device_bytes(&self) -> usize {
         let ffn = match &self.ffn {
-            Step35LayerFfn::Dense(mlp) => mlp.device_bytes(),
-            Step35LayerFfn::Moe {
+            Step37LayerFfn::Dense(mlp) => mlp.device_bytes(),
+            Step37LayerFfn::Moe {
                 shared,
                 router,
                 paged,
@@ -1706,29 +1706,29 @@ impl Step35Layer {
             + ffn
     }
 
-    fn paging_stats(&self) -> Option<Step35PagingStats> {
+    fn paging_stats(&self) -> Option<Step37PagingStats> {
         match &self.ffn {
-            Step35LayerFfn::Moe { paged, .. } => Some(paged.stats()),
-            Step35LayerFfn::Dense(_) => None,
+            Step37LayerFfn::Moe { paged, .. } => Some(paged.stats()),
+            Step37LayerFfn::Dense(_) => None,
         }
     }
 }
 
 /// Fully loaded Step-3.7 model with nonresident routed experts.
-pub struct Step35TextModel {
-    layers: Vec<Step35Layer>,
+pub struct Step37TextModel {
+    layers: Vec<Step37Layer>,
     embedding: DeviceBuffer<u16>,
-    final_norm: Step35RmsNorm,
+    final_norm: Step37RmsNorm,
     lm_head: DeviceBuffer<u16>,
     vocab: usize,
     stream: CudaStream,
 }
 
 /// Mutable scratch and persistent KV state for one Step decode session.
-pub struct Step35DecodeState {
+pub struct Step37DecodeState {
     token: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
-    layers: Vec<Step35LayerWorkspace>,
+    layers: Vec<Step37LayerWorkspace>,
     kv_cache: Vec<Sm12xKvCache>,
     kv_attention: Vec<Sm12xKvAttentionWorkspace>,
     final_hidden: DeviceBuffer<f32>,
@@ -1739,12 +1739,12 @@ pub struct Step35DecodeState {
 }
 
 /// One Step next-token argmax result.
-pub struct Step35NextToken {
+pub struct Step37NextToken {
     pub id: u32,
     pub value: f32,
 }
 
-impl Step35TextModel {
+impl Step37TextModel {
     pub fn open(model_dir: impl AsRef<Path>, expert_capacity: usize) -> Result<Self> {
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let vocab = 128_896;
@@ -1755,15 +1755,15 @@ impl Step35TextModel {
             HIDDEN,
         )?;
         let final_norm =
-            Step35RmsNorm::load(&checkpoint, &format!("{TEXT_PREFIX}.norm.weight"), HIDDEN)?;
+            Step37RmsNorm::load(&checkpoint, &format!("{TEXT_PREFIX}.norm.weight"), HIDDEN)?;
         let lm_head = read_bf16_matrix(&checkpoint, "lm_head.weight", vocab, HIDDEN)?;
         let mut layers = Vec::with_capacity(45);
         for layer in 0..45 {
-            layers.push(Step35Layer::load(&checkpoint, layer, expert_capacity)?);
+            layers.push(Step37Layer::load(&checkpoint, layer, expert_capacity)?);
             let bytes = embedding.device_bytes()
                 + final_norm.device_bytes()
                 + lm_head.device_bytes()
-                + layers.iter().map(Step35Layer::device_bytes).sum::<usize>();
+                + layers.iter().map(Step37Layer::device_bytes).sum::<usize>();
             info!(
                 layer,
                 device_weight_gib = bytes as f64 / (1u64 << 30) as f64,
@@ -1780,14 +1780,14 @@ impl Step35TextModel {
         })
     }
 
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Step35DecodeState> {
-        Ok(Step35DecodeState {
+    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Step37DecodeState> {
+        Ok(Step37DecodeState {
             token: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(HIDDEN)?,
             layers: self
                 .layers
                 .iter()
-                .map(Step35Layer::new_workspace)
+                .map(Step37Layer::new_workspace)
                 .collect::<Result<Vec<_>>>()?,
             kv_cache: (0..self.layers.len())
                 .map(|_| Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM))
@@ -1818,14 +1818,14 @@ impl Step35TextModel {
     }
 
     /// Advances one sequence token without selecting from the resulting logits.
-    pub fn consume_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
+    pub fn consume_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
         self.forward_hidden(state, token)
     }
 
     /// Advances one sequence token and samples from its device-resident logits.
     pub fn sample_one(
         &mut self,
-        state: &mut Step35DecodeState,
+        state: &mut Step37DecodeState,
         token: u32,
         sampling: &mut GpuSamplingRow<'_>,
     ) -> Result<GpuSampledToken> {
@@ -1847,16 +1847,16 @@ impl Step35TextModel {
     }
 
     /// Advances one sequence token and copies the resulting logits to the host.
-    pub fn logits_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<Vec<f32>> {
+    pub fn logits_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<Vec<f32>> {
         self.forward_one(state, token)?;
         Ok(state.logits.copy_to_host(&self.stream)?.into_vec())
     }
 
     pub fn decode_one(
         &mut self,
-        state: &mut Step35DecodeState,
+        state: &mut Step37DecodeState,
         token: u32,
-    ) -> Result<Step35NextToken> {
+    ) -> Result<Step37NextToken> {
         self.forward_one(state, token)?;
         argmax_f32_into_on_stream(
             &state.logits,
@@ -1864,13 +1864,13 @@ impl Step35TextModel {
             state.next_value.output(),
             &self.stream,
         )?;
-        Ok(Step35NextToken {
+        Ok(Step37NextToken {
             id: state.next_index.copy_to_host(&self.stream)?[0],
             value: state.next_value.copy_to_host(&self.stream)?[0],
         })
     }
 
-    fn forward_hidden(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
+    fn forward_hidden(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
         if token as usize >= self.vocab {
             return Err(Error::Shape {
                 label: "Step-3.7 token",
@@ -1914,7 +1914,7 @@ impl Step35TextModel {
         Ok(())
     }
 
-    fn forward_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
+    fn forward_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
         self.forward_hidden(state, token)?;
         let last = state
             .layers
@@ -1937,11 +1937,11 @@ impl Step35TextModel {
     }
 
     /// Returns cumulative paging activity across all routed-expert layers.
-    pub fn expert_paging_stats(&self) -> Step35PagingStats {
+    pub fn expert_paging_stats(&self) -> Step37PagingStats {
         self.layers
             .iter()
-            .filter_map(Step35Layer::paging_stats)
-            .fold(Step35PagingStats::default(), |mut total, layer| {
+            .filter_map(Step37Layer::paging_stats)
+            .fold(Step37PagingStats::default(), |mut total, layer| {
                 total.hits += layer.hits;
                 total.misses += layer.misses;
                 total.bytes_read += layer.bytes_read;
@@ -1950,7 +1950,7 @@ impl Step35TextModel {
     }
 }
 
-impl Step35DecodeState {
+impl Step37DecodeState {
     /// Returns the number of tokens retained in this sequence's KV cache.
     pub fn len(&self) -> usize {
         self.kv_cache.first().map_or(0, Sm12xKvCache::len)
@@ -1968,7 +1968,7 @@ impl Step35DecodeState {
             + self
                 .layers
                 .iter()
-                .map(Step35LayerWorkspace::device_bytes)
+                .map(Step37LayerWorkspace::device_bytes)
                 .sum::<usize>()
             + self
                 .kv_cache
@@ -2018,7 +2018,7 @@ fn read_bf16_matrix(
 }
 
 /// Device allocations holding every prepared routed expert plus fixed-weight headroom.
-pub struct Step35ResidentExperts {
+pub struct Step37ResidentExperts {
     _fixed_reservation: DeviceBuffer<u8>,
     layers: Vec<ResidentLayer>,
 }
@@ -2034,7 +2034,7 @@ struct ResidentLayer {
     bytes: usize,
 }
 
-impl Step35ResidentExperts {
+impl Step37ResidentExperts {
     /// Loads all prepared experts and reserves the checkpoint's non-routed tensor bytes.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();

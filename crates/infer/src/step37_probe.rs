@@ -6,9 +6,9 @@ use nvfp4::{
 };
 use std::path::Path;
 
-use crate::step35::{
-    Step35Attention, Step35Linear, Step35Mlp, Step35PagedExpertWorkspace, Step35PagedExperts,
-    Step35RmsNorm, Step35Router, step35_inverse_frequencies,
+use crate::step37::{
+    Step37Attention, Step37Linear, Step37Mlp, Step37PagedExpertWorkspace, Step37PagedExperts,
+    Step37RmsNorm, Step37Router, step37_inverse_frequencies,
 };
 
 const LAYERS: [usize; 4] = [0, 1, 3, 4];
@@ -21,7 +21,7 @@ struct Route {
     indices: Vec<u32>,
     weights: Vec<f32>,
     logits: Vec<f32>,
-    router: Step35Router,
+    router: Step37Router,
 }
 
 /// Validates layers 0, 1, 3, and 4 against generated Python reference tensors.
@@ -115,8 +115,8 @@ fn run_attention(
     normed: &DeviceBuffer<f32>,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let attention = Step35Attention::load(checkpoint, layer)?;
-    let inverse_frequencies = step35_inverse_frequencies(layer);
+    let attention = Step37Attention::load(checkpoint, layer)?;
+    let inverse_frequencies = step37_inverse_frequencies(layer);
     let expected_inv_freq =
         reference_values(reference, layer, "inv_freq", inverse_frequencies.len())?;
     require_similarity(
@@ -146,7 +146,7 @@ fn run_mlp(
     input: &DeviceBuffer<f32>,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let mlp = Step35Mlp::load(checkpoint, prefix)?;
+    let mlp = Step37Mlp::load(checkpoint, prefix)?;
     let mut workspace = mlp.new_workspace()?;
     mlp.run(&mut workspace, input, stream)?;
     Ok(workspace.into_output())
@@ -190,8 +190,8 @@ fn run_moe(
         1.0e-4,
     )?;
 
-    let mut paged = Step35PagedExperts::load(checkpoint.root(), layer, TOP_K)?;
-    let mut paged_workspace = Step35PagedExpertWorkspace::new()?;
+    let mut paged = Step37PagedExperts::load(checkpoint.root(), layer, TOP_K)?;
+    let mut paged_workspace = Step37PagedExpertWorkspace::new()?;
     paged.resolve(&route.indices, route.router.indices(), stream)?;
     let routed = paged
         .run_routed(&mut paged_workspace, input, route.router.weights(), stream)?
@@ -250,7 +250,7 @@ fn route(
     input: &DeviceBuffer<f32>,
     stream: &CudaStream,
 ) -> Result<Route> {
-    let mut router = Step35Router::load(checkpoint, layer)?;
+    let mut router = Step37Router::load(checkpoint, layer)?;
     router.run(input, stream)?;
     let logits = router.logits().copy_to_host(stream)?.into_vec();
     let indices = router.indices().copy_to_host(stream)?.into_vec();
@@ -271,7 +271,7 @@ fn run_expert_linear(
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
     let weight = checkpoint.load_nvfp4_expert_linear(prefix, expert)?;
-    let weight = Step35Linear::from_modelopt(weight)?;
+    let weight = Step37Linear::from_modelopt(weight)?;
     let (out_features, in_features) = weight.shape();
     if input.len() != in_features {
         return Err(Error::Shape {
@@ -294,7 +294,7 @@ fn run_norm(
     cols: usize,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let weight = Step35RmsNorm::load(checkpoint, tensor, cols)?;
+    let weight = Step37RmsNorm::load(checkpoint, tensor, cols)?;
     let mut output = DeviceBuffer::zeroed(rows * cols)?;
     weight.run_into(input, &mut output, rows, cols, stream)?;
     stream.synchronize()?;

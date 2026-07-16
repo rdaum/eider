@@ -1,7 +1,7 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
 use infer::nvfp4::{Error, Result};
-use infer::step35::{Step35PagingStats, Step35TextModel};
+use infer::step37::{Step37PagingStats, Step37TextModel};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -56,14 +56,14 @@ fn main() -> Result<()> {
     }
 
     let load_started = Instant::now();
-    let mut model = Step35TextModel::open(model_dir, capacity as usize)?;
+    let mut model = Step37TextModel::open(model_dir, capacity as usize)?;
     let load_elapsed = load_started.elapsed();
     for pass in 0..passes {
         let mut state = model.new_decode_state(tokens as usize)?;
         let pass_start_stats = model.expert_paging_stats();
         let decode_started = Instant::now();
         let mut input = token;
-        let mut first_token_stats = Step35PagingStats::default();
+        let mut first_token_stats = Step37PagingStats::default();
         let mut window_started = Instant::now();
         let mut window_start_stats = pass_start_stats;
         for step in 0..tokens {
@@ -139,8 +139,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn subtract_stats(total: Step35PagingStats, start: Step35PagingStats) -> Step35PagingStats {
-    Step35PagingStats {
+fn subtract_stats(total: Step37PagingStats, start: Step37PagingStats) -> Step37PagingStats {
+    Step37PagingStats {
         hits: total.hits - start.hits,
         misses: total.misses - start.misses,
         bytes_read: total.bytes_read - start.bytes_read,

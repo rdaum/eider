@@ -1059,7 +1059,7 @@ __global__ void infer_moe_topk_f32_kernel(const float* logits,
     }
 }
 
-__global__ void infer_step35_sigmoid_top8_f32_kernel(
+__global__ void infer_step37_sigmoid_top8_f32_kernel(
     const float* logits,
     const float* bias,
     std::uint32_t* out_indices,
@@ -1206,7 +1206,7 @@ extern "C" cudaError_t infer_moe_topk_f32_on_stream(const float* logits,
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t infer_step35_sigmoid_top8_f32_on_stream(
+extern "C" cudaError_t infer_step37_sigmoid_top8_f32_on_stream(
     const float* logits,
     const float* bias,
     std::uint32_t* out_indices,
@@ -1217,12 +1217,12 @@ extern "C" cudaError_t infer_step35_sigmoid_top8_f32_on_stream(
         out_weights == nullptr || experts < 8) {
         return cudaErrorInvalidValue;
     }
-    infer_step35_sigmoid_top8_f32_kernel<<<1, 256, 0, stream>>>(
+    infer_step37_sigmoid_top8_f32_kernel<<<1, 256, 0, stream>>>(
         logits, bias, out_indices, out_weights, experts);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t infer_step35_sigmoid_top8_f32_batch_on_stream(
+extern "C" cudaError_t infer_step37_sigmoid_top8_f32_batch_on_stream(
     const float* logits,
     const float* bias,
     std::uint32_t* out_indices,
@@ -1234,7 +1234,7 @@ extern "C" cudaError_t infer_step35_sigmoid_top8_f32_batch_on_stream(
         out_weights == nullptr || batch_size == 0 || experts < 8) {
         return cudaErrorInvalidValue;
     }
-    infer_step35_sigmoid_top8_f32_kernel<<<batch_size, 256, 0, stream>>>(
+    infer_step37_sigmoid_top8_f32_kernel<<<batch_size, 256, 0, stream>>>(
         logits, bias, out_indices, out_weights, experts);
     return cudaGetLastError();
 }

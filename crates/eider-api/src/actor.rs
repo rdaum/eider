@@ -9,9 +9,9 @@ use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
 use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, SchedulerConfig};
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
-use infer::runtime::step35_scheduler::{Step35CancelOutcome, Step35RequestId};
-use infer::runtime::step35_serving::Step35ChatService;
-use infer::step35::Step35TextModel;
+use infer::runtime::step37_scheduler::{Step37CancelOutcome, Step37RequestId};
+use infer::runtime::step37_serving::Step37ChatService;
+use infer::step37::Step37TextModel;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -249,14 +249,14 @@ fn actor_main(
                 expert_capacity = step_expert_capacity,
                 "loading Step-3.7 model"
             );
-            let model = match Step35TextModel::open(&model_dir, step_expert_capacity) {
+            let model = match Step37TextModel::open(&model_dir, step_expert_capacity) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
                     return;
                 }
             };
-            let service = match Step35ChatService::new(model, &template, scheduler) {
+            let service = match Step37ChatService::new(model, &template, scheduler) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -449,12 +449,12 @@ impl ActorService for QwenActorService<'_, '_> {
 }
 
 struct StepActorService<'template> {
-    inner: Step35ChatService<'template>,
-    ids: BTreeMap<u64, Step35RequestId>,
+    inner: Step37ChatService<'template>,
+    ids: BTreeMap<u64, Step37RequestId>,
 }
 
 impl<'template> StepActorService<'template> {
-    fn new(inner: Step35ChatService<'template>) -> Self {
+    fn new(inner: Step37ChatService<'template>) -> Self {
         Self {
             inner,
             ids: BTreeMap::new(),
@@ -501,7 +501,7 @@ impl ActorService for StepActorService<'_> {
             generated: tick
                 .generated
                 .into_iter()
-                .map(Step35RequestId::get)
+                .map(Step37RequestId::get)
                 .collect(),
             output: tick
                 .output
@@ -534,11 +534,11 @@ impl ActorService for StepActorService<'_> {
             return EngineCancelOutcome::NotFound;
         };
         match self.inner.cancel_request(inner_id) {
-            Step35CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
+            Step37CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
                 released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
             },
-            Step35CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
-            Step35CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+            Step37CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
+            Step37CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 

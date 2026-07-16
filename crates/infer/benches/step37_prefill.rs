@@ -1,4 +1,4 @@
-use infer::step35::{Step35PrefillBatchWorkspace, Step35PrefillRow, Step35TextModel};
+use infer::step37::{Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,
@@ -13,8 +13,8 @@ const VALIDATION_TOKENS: usize = 8;
 const MAX_CONTEXT_TOKENS: usize = 256;
 
 struct PrefillCase {
-    model: Step35TextModel,
-    workspace: Step35PrefillBatchWorkspace,
+    model: Step37TextModel,
+    workspace: Step37PrefillBatchWorkspace,
     prompt: Vec<u32>,
 }
 
@@ -73,7 +73,7 @@ fn batch_sample(
         let PrefillCase {
             model, workspace, ..
         } = &mut *case;
-        let mut rows = [Step35PrefillRow {
+        let mut rows = [Step37PrefillRow {
             token_ids: &prompt,
             state: &mut state,
         }];
@@ -110,7 +110,7 @@ fn validate(case: &mut PrefillCase) {
         .model
         .new_decode_state(MAX_CONTEXT_TOKENS)
         .expect("batch validation state");
-    let mut rows = [Step35PrefillRow {
+    let mut rows = [Step37PrefillRow {
         token_ids: &prompt,
         state: &mut batch,
     }];
@@ -151,7 +151,7 @@ fn validate(case: &mut PrefillCase) {
         .new_decode_state(MAX_CONTEXT_TOKENS)
         .expect("split validation state");
     for chunk in [&prompt[..3], &prompt[3..]] {
-        let mut rows = [Step35PrefillRow {
+        let mut rows = [Step37PrefillRow {
             token_ids: chunk,
             state: &mut split,
         }];
@@ -193,11 +193,11 @@ fn validate(case: &mut PrefillCase) {
         .new_decode_state(MAX_CONTEXT_TOKENS)
         .expect("second ragged validation state");
     let mut rows = [
-        Step35PrefillRow {
+        Step37PrefillRow {
             token_ids: &prompt,
             state: &mut first_ragged,
         },
-        Step35PrefillRow {
+        Step37PrefillRow {
             token_ids: &second_prompt,
             state: &mut second_ragged,
         },
@@ -240,7 +240,7 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(240);
-    let model = Step35TextModel::open(model_dir(), capacity).expect("load Step-3.7 model");
+    let model = Step37TextModel::open(model_dir(), capacity).expect("load Step-3.7 model");
     let workspace = model
         .new_prefill_batch_workspace(2, TOKEN_CAPACITY, MAX_CONTEXT_TOKENS)
         .expect("prefill workspace");

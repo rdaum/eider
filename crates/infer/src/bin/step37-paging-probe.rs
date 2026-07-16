@@ -2,8 +2,8 @@
 
 use infer::nvfp4::Result;
 use infer::runtime::expert_cache::{ExpertSlotCache, read_expert_misses};
-use infer::step35::{
-    EXPERTS, FIRST_MOE_LAYER, GATE_UP, HIDDEN, INTERMEDIATE, Step35ExpertRecordSource,
+use infer::step37::{
+    EXPERTS, FIRST_MOE_LAYER, GATE_UP, HIDDEN, INTERMEDIATE, Step37ExpertRecordSource,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -23,7 +23,7 @@ fn main() -> Result<()> {
         })?
         .unwrap_or(FIRST_MOE_LAYER);
 
-    let source = Step35ExpertRecordSource::open(model_dir, layer)?;
+    let source = Step37ExpertRecordSource::open(model_dir, layer)?;
     let mut slots = ExpertSlotCache::new(EXPERTS, 8, 8)?;
     let plan = slots.plan(&(0..8).map(|expert| expert as u32).collect::<Vec<_>>())?;
     let started = Instant::now();

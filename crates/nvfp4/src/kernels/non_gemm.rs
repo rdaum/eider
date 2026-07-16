@@ -746,7 +746,7 @@ pub fn moe_topk_f32_into_on_stream(
 ///
 /// Selection ranks `sigmoid(logit) + bias`; output weights use the original
 /// selected sigmoid probabilities, normalized to sum to 3.
-pub fn step35_sigmoid_top8_f32_into_on_stream(
+pub fn step37_sigmoid_top8_f32_into_on_stream(
     logits: &DeviceBuffer<f32>,
     bias: &DeviceBuffer<f32>,
     mut out_indices: DeviceOutput<'_, u32>,
@@ -773,8 +773,8 @@ pub fn step35_sigmoid_top8_f32_into_on_stream(
     }
     unsafe {
         check_cuda(
-            "infer_step35_sigmoid_top8_f32_on_stream",
-            ffi::infer_step35_sigmoid_top8_f32_on_stream(
+            "infer_step37_sigmoid_top8_f32_on_stream",
+            ffi::infer_step37_sigmoid_top8_f32_on_stream(
                 logits.ptr,
                 bias.ptr,
                 out_indices.buffer_mut().ptr,
@@ -787,7 +787,7 @@ pub fn step35_sigmoid_top8_f32_into_on_stream(
 }
 
 /// Enqueues independent Step sigmoid routing with biased top-8 selection.
-pub fn step35_sigmoid_top8_f32_batch_into_on_stream(
+pub fn step37_sigmoid_top8_f32_batch_into_on_stream(
     logits: &DeviceBuffer<f32>,
     bias: &DeviceBuffer<f32>,
     mut out_indices: DeviceOutput<'_, u32>,
@@ -819,8 +819,8 @@ pub fn step35_sigmoid_top8_f32_batch_into_on_stream(
     }
     unsafe {
         check_cuda(
-            "infer_step35_sigmoid_top8_f32_batch_on_stream",
-            ffi::infer_step35_sigmoid_top8_f32_batch_on_stream(
+            "infer_step37_sigmoid_top8_f32_batch_on_stream",
+            ffi::infer_step37_sigmoid_top8_f32_batch_on_stream(
                 logits.ptr,
                 bias.ptr,
                 out_indices.buffer_mut().ptr,
@@ -7076,7 +7076,7 @@ mod tests {
     }
 
     #[test]
-    fn step35_sigmoid_top8_matches_cpu_reference() {
+    fn step37_sigmoid_top8_matches_cpu_reference() {
         let logits = (0..288)
             .map(|expert| ((expert * 37 % 101) as f32 - 50.0) * 0.03125)
             .collect::<Vec<_>>();
@@ -7109,7 +7109,7 @@ mod tests {
         let mut indices = DeviceBuffer::zeroed(8).expect("indices alloc");
         let mut weights = DeviceBuffer::zeroed(8).expect("weights alloc");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        step35_sigmoid_top8_f32_into_on_stream(
+        step37_sigmoid_top8_f32_into_on_stream(
             &logits,
             &bias,
             indices.output(),
@@ -7132,7 +7132,7 @@ mod tests {
     }
 
     #[test]
-    fn step35_sigmoid_top8_batch_matches_independent_rows() {
+    fn step37_sigmoid_top8_batch_matches_independent_rows() {
         const EXPERTS: usize = 288;
         const ROWS: usize = 2;
         let first = (0..EXPERTS)
@@ -7151,7 +7151,7 @@ mod tests {
         let mut indices = DeviceBuffer::zeroed(ROWS * 8).expect("indices");
         let mut weights = DeviceBuffer::zeroed(ROWS * 8).expect("weights");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        step35_sigmoid_top8_f32_batch_into_on_stream(
+        step37_sigmoid_top8_f32_batch_into_on_stream(
             &logits,
             &bias,
             indices.output(),
@@ -7166,7 +7166,7 @@ mod tests {
             let row_logits = DeviceBuffer::from_host(row_logits).expect("row logits");
             let mut row_indices = DeviceBuffer::zeroed(8).expect("row indices");
             let mut row_weights = DeviceBuffer::zeroed(8).expect("row weights");
-            step35_sigmoid_top8_f32_into_on_stream(
+            step37_sigmoid_top8_f32_into_on_stream(
                 &row_logits,
                 &bias,
                 row_indices.output(),

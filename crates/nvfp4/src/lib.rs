@@ -96,7 +96,7 @@ pub use kernels::non_gemm::{
     silu_mul_halves_f32_batch_into_on_stream, silu_mul_halves_f32_into_on_stream,
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
     split_q_gate_f32_into_on_stream, split_qkv_f32_into_on_stream,
-    step35_sigmoid_top8_f32_batch_into_on_stream, step35_sigmoid_top8_f32_into_on_stream,
+    step37_sigmoid_top8_f32_batch_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
 };
 pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache};
 pub use kernels::sm12x_mma::{
