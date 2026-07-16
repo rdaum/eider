@@ -1,7 +1,7 @@
 //! Prepare and inspect the Step-3.7 routed-expert cache.
 
 use infer::nvfp4::{Error, Result};
-use infer::step35::{FIRST_MOE_LAYER, Step35ResidentExperts, prepare_all, prepare_one};
+use infer::step37::{FIRST_MOE_LAYER, Step37ResidentExperts, prepare_all, prepare_one};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
         "prepare" if layer.is_none() => prepare_all(&model_dir),
         "prepare-layer" => prepare_one(&model_dir, layer.unwrap_or(FIRST_MOE_LAYER)),
         "residency" if layer.is_none() => {
-            let resident = Step35ResidentExperts::load(&model_dir)?;
+            let resident = Step37ResidentExperts::load(&model_dir)?;
             println!(
                 "full prepared residency succeeded: {:.3} GiB",
                 resident.device_bytes() as f64 / (1u64 << 30) as f64

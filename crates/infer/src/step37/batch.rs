@@ -3,7 +3,7 @@ use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, GemmShape, append_rows_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, f32_to_bf16_into_on_stream,
     rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream, step35_sigmoid_top8_f32_batch_into_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream, step37_sigmoid_top8_f32_batch_into_on_stream,
 };
 use std::collections::HashMap;
 
@@ -11,18 +11,18 @@ const CUBLAS_WORKSPACE_LIMIT: u64 = 32 << 20;
 const MAX_Q_HEADS: usize = 96;
 
 /// One ragged prompt chunk and its persistent Step sequence state.
-pub struct Step35PrefillRow<'tokens, 'state> {
+pub struct Step37PrefillRow<'tokens, 'state> {
     pub token_ids: &'tokens [u32],
-    pub state: &'state mut Step35DecodeState,
+    pub state: &'state mut Step37DecodeState,
 }
 
-struct Step35BatchLinearWorkspace {
+struct Step37BatchLinearWorkspace {
     lt: CublasLt,
     input_bf16: DeviceBuffer<u16>,
     plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
 }
 
-impl Step35BatchLinearWorkspace {
+impl Step37BatchLinearWorkspace {
     fn new(token_capacity: usize, max_input_features: usize) -> Result<Self> {
         Ok(Self {
             lt: CublasLt::new()?,
@@ -69,14 +69,14 @@ impl Step35BatchLinearWorkspace {
 
     fn run(
         &mut self,
-        linear: &Step35Linear,
+        linear: &Step37Linear,
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
         rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         match &linear.weight {
-            Step35LinearWeight::Bf16(weight) => self.run_bf16(
+            Step37LinearWeight::Bf16(weight) => self.run_bf16(
                 weight,
                 linear.out_features,
                 linear.in_features,
@@ -85,12 +85,12 @@ impl Step35BatchLinearWorkspace {
                 rows,
                 stream,
             ),
-            Step35LinearWeight::Nvfp4 { .. } => linear.run_into(input, output, rows, stream),
+            Step37LinearWeight::Nvfp4 { .. } => linear.run_into(input, output, rows, stream),
         }
     }
 }
 
-struct Step35BatchAttentionWorkspace {
+struct Step37BatchAttentionWorkspace {
     q_heads: usize,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
@@ -105,7 +105,7 @@ struct Step35BatchAttentionWorkspace {
     output: DeviceBuffer<f32>,
 }
 
-impl Step35BatchAttentionWorkspace {
+impl Step37BatchAttentionWorkspace {
     fn new(token_capacity: usize, q_heads: usize) -> Result<Self> {
         let q_values = token_capacity * q_heads * HEAD_DIM;
         let kv_values = token_capacity * KV_HEADS * HEAD_DIM;
@@ -126,13 +126,13 @@ impl Step35BatchAttentionWorkspace {
     }
 }
 
-struct Step35BatchMlpWorkspace {
+struct Step37BatchMlpWorkspace {
     gate_up: DeviceBuffer<f32>,
     activated: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
 }
 
-impl Step35BatchMlpWorkspace {
+impl Step37BatchMlpWorkspace {
     fn new(token_capacity: usize, intermediate: usize) -> Result<Self> {
         Ok(Self {
             gate_up: DeviceBuffer::zeroed(token_capacity * intermediate * 2)?,
@@ -143,7 +143,7 @@ impl Step35BatchMlpWorkspace {
 }
 
 /// Reusable layer-major Step prompt workspace shared across all active sessions.
-pub struct Step35PrefillBatchWorkspace {
+pub struct Step37PrefillBatchWorkspace {
     sequence_capacity: usize,
     token_capacity: usize,
     max_context_tokens: usize,
@@ -151,11 +151,11 @@ pub struct Step35PrefillBatchWorkspace {
     hidden: DeviceBuffer<f32>,
     layer_output: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
-    full_attention: Step35BatchAttentionWorkspace,
-    sliding_attention: Step35BatchAttentionWorkspace,
+    full_attention: Step37BatchAttentionWorkspace,
+    sliding_attention: Step37BatchAttentionWorkspace,
     post_attention: DeviceBuffer<f32>,
     ffn_input: DeviceBuffer<f32>,
-    mlp: HashMap<usize, Step35BatchMlpWorkspace>,
+    mlp: HashMap<usize, Step37BatchMlpWorkspace>,
     router_logits: DeviceBuffer<f32>,
     router_indices: DeviceBuffer<u32>,
     router_weights: DeviceBuffer<f32>,
@@ -163,17 +163,17 @@ pub struct Step35PrefillBatchWorkspace {
     combined: DeviceBuffer<f32>,
     token_ffn_input: DeviceBuffer<f32>,
     token_route_weights: DeviceBuffer<f32>,
-    paged: Step35PagedExpertWorkspace,
-    linear: Step35BatchLinearWorkspace,
+    paged: Step37PagedExpertWorkspace,
+    linear: Step37BatchLinearWorkspace,
 }
 
-impl Step35TextModel {
+impl Step37TextModel {
     pub fn new_prefill_batch_workspace(
         &self,
         sequence_capacity: usize,
         token_capacity: usize,
         max_context_tokens: usize,
-    ) -> Result<Step35PrefillBatchWorkspace> {
+    ) -> Result<Step37PrefillBatchWorkspace> {
         if sequence_capacity == 0 || token_capacity == 0 || max_context_tokens == 0 {
             return Err(Error::Shape {
                 label: "Step-3.7 prefill workspace",
@@ -187,8 +187,8 @@ impl Step35TextModel {
             .layers
             .iter()
             .map(|layer| match &layer.ffn {
-                Step35LayerFfn::Dense(mlp) => mlp.intermediate,
-                Step35LayerFfn::Moe { shared, .. } => shared.intermediate,
+                Step37LayerFfn::Dense(mlp) => mlp.intermediate,
+                Step37LayerFfn::Moe { shared, .. } => shared.intermediate,
             })
             .collect::<Vec<_>>();
         intermediates.sort_unstable();
@@ -202,11 +202,11 @@ impl Step35TextModel {
         let mlp = intermediates
             .into_iter()
             .map(|intermediate| {
-                Step35BatchMlpWorkspace::new(token_capacity, intermediate)
+                Step37BatchMlpWorkspace::new(token_capacity, intermediate)
                     .map(|workspace| (intermediate, workspace))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        Ok(Step35PrefillBatchWorkspace {
+        Ok(Step37PrefillBatchWorkspace {
             sequence_capacity,
             token_capacity,
             max_context_tokens,
@@ -214,8 +214,8 @@ impl Step35TextModel {
             hidden: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             layer_output: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             normed: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
-            full_attention: Step35BatchAttentionWorkspace::new(token_capacity, 64)?,
-            sliding_attention: Step35BatchAttentionWorkspace::new(token_capacity, 96)?,
+            full_attention: Step37BatchAttentionWorkspace::new(token_capacity, 64)?,
+            sliding_attention: Step37BatchAttentionWorkspace::new(token_capacity, 96)?,
             post_attention: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             ffn_input: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             mlp,
@@ -226,16 +226,16 @@ impl Step35TextModel {
             combined: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             token_ffn_input: DeviceBuffer::zeroed(HIDDEN)?,
             token_route_weights: DeviceBuffer::zeroed(8)?,
-            paged: Step35PagedExpertWorkspace::new()?,
-            linear: Step35BatchLinearWorkspace::new(token_capacity, max_input_features)?,
+            paged: Step37PagedExpertWorkspace::new()?,
+            linear: Step37BatchLinearWorkspace::new(token_capacity, max_input_features)?,
         })
     }
 
     /// Advances ragged prompt chunks with layer-major resident projection batching.
     pub fn prefill_batch(
         &mut self,
-        workspace: &mut Step35PrefillBatchWorkspace,
-        rows: &mut [Step35PrefillRow<'_, '_>],
+        workspace: &mut Step37PrefillBatchWorkspace,
+        rows: &mut [Step37PrefillRow<'_, '_>],
     ) -> Result<()> {
         if rows.is_empty() || rows.len() > workspace.sequence_capacity {
             return Err(Error::Shape {
@@ -337,10 +337,10 @@ impl Step35TextModel {
 }
 
 fn run_layer_prefill(
-    layer: &mut Step35Layer,
+    layer: &mut Step37Layer,
     layer_index: usize,
-    workspace: &mut Step35PrefillBatchWorkspace,
-    rows: &mut [Step35PrefillRow<'_, '_>],
+    workspace: &mut Step37PrefillBatchWorkspace,
+    rows: &mut [Step37PrefillRow<'_, '_>],
     total_tokens: usize,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -382,7 +382,7 @@ fn run_layer_prefill(
     )?;
 
     let ffn = match &mut layer.ffn {
-        Step35LayerFfn::Dense(mlp) => run_mlp_prefill(
+        Step37LayerFfn::Dense(mlp) => run_mlp_prefill(
             mlp,
             &mut workspace.mlp,
             &mut workspace.linear,
@@ -390,7 +390,7 @@ fn run_layer_prefill(
             capacity,
             stream,
         )?,
-        Step35LayerFfn::Moe {
+        Step37LayerFfn::Moe {
             shared,
             router,
             paged,
@@ -404,7 +404,7 @@ fn run_layer_prefill(
                 capacity,
                 stream,
             )?;
-            step35_sigmoid_top8_f32_batch_into_on_stream(
+            step37_sigmoid_top8_f32_batch_into_on_stream(
                 &workspace.router_logits,
                 &router.bias,
                 workspace.router_indices.output(),
@@ -477,11 +477,11 @@ fn run_layer_prefill(
 
 #[allow(clippy::too_many_arguments)]
 fn run_attention_prefill(
-    attention: &Step35Attention,
-    workspace: &mut Step35BatchAttentionWorkspace,
-    linear: &mut Step35BatchLinearWorkspace,
+    attention: &Step37Attention,
+    workspace: &mut Step37BatchAttentionWorkspace,
+    linear: &mut Step37BatchLinearWorkspace,
     input: &DeviceBuffer<f32>,
-    rows: &mut [Step35PrefillRow<'_, '_>],
+    rows: &mut [Step37PrefillRow<'_, '_>],
     layer_index: usize,
     capacity: usize,
     stream: &CudaStream,
@@ -568,9 +568,9 @@ fn run_attention_prefill(
 }
 
 fn run_mlp_prefill<'a>(
-    mlp: &Step35Mlp,
-    workspaces: &'a mut HashMap<usize, Step35BatchMlpWorkspace>,
-    linear: &mut Step35BatchLinearWorkspace,
+    mlp: &Step37Mlp,
+    workspaces: &'a mut HashMap<usize, Step37BatchMlpWorkspace>,
+    linear: &mut Step37BatchLinearWorkspace,
     input: &DeviceBuffer<f32>,
     capacity: usize,
     stream: &CudaStream,

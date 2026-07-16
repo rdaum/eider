@@ -1,7 +1,7 @@
 //! Compare representative Step-3.7 layers with the Python reference.
 
 use infer::nvfp4::Result;
-use infer::step35_probe::validate_reference_layers;
+use infer::step37_probe::validate_reference_layers;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

@@ -2,17 +2,17 @@
 
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestFinishReason, RequestState, SchedulerConfig};
-use crate::step35::{
-    Step35DecodeState, Step35PrefillBatchWorkspace, Step35PrefillRow, Step35TextModel,
+use crate::step37::{
+    Step37DecodeState, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
 };
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, VecDeque};
 
 /// Stable scheduler identity for one Step request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Step35RequestId(u64);
+pub struct Step37RequestId(u64);
 
-impl Step35RequestId {
+impl Step37RequestId {
     /// Returns the numeric request identity.
     pub fn get(self) -> u64 {
         self.0
@@ -21,8 +21,8 @@ impl Step35RequestId {
 
 /// One completion token produced by a Step scheduler tick.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Step35ScheduledToken {
-    pub request_id: Step35RequestId,
+pub struct Step37ScheduledToken {
+    pub request_id: Step37RequestId,
     pub id: u32,
     pub logit: f32,
     pub finish_reason: Option<RequestFinishReason>,
@@ -30,74 +30,74 @@ pub struct Step35ScheduledToken {
 
 /// Prompt progress made for one Step request during a scheduler tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Step35PrefillProgress {
-    pub request_id: Step35RequestId,
+pub struct Step37PrefillProgress {
+    pub request_id: Step37RequestId,
     pub tokens: usize,
     pub prompt_position: usize,
 }
 
 /// Persistent sequence state allocated for a newly admitted Step request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Step35AdmissionProgress {
-    pub request_id: Step35RequestId,
+pub struct Step37AdmissionProgress {
+    pub request_id: Step37RequestId,
     pub sequence_device_bytes: usize,
 }
 
 /// Observable result of one multi-session Step scheduler iteration.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Step35SchedulerTick {
-    pub admitted: Vec<Step35AdmissionProgress>,
-    pub scheduled: Vec<Step35RequestId>,
-    pub prefilled: Vec<Step35PrefillProgress>,
-    pub generated: Vec<Step35ScheduledToken>,
-    pub finished: Vec<Step35RequestId>,
+pub struct Step37SchedulerTick {
+    pub admitted: Vec<Step37AdmissionProgress>,
+    pub scheduled: Vec<Step37RequestId>,
+    pub prefilled: Vec<Step37PrefillProgress>,
+    pub generated: Vec<Step37ScheduledToken>,
+    pub finished: Vec<Step37RequestId>,
     pub active_sequences: usize,
 }
 
 /// Result removed after a Step request finishes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Step35FinishedRequest {
-    pub id: Step35RequestId,
+pub struct Step37FinishedRequest {
+    pub id: Step37RequestId,
     pub prompt_tokens: Vec<u32>,
-    pub generated_tokens: Vec<Step35ScheduledToken>,
+    pub generated_tokens: Vec<Step37ScheduledToken>,
     pub finish_reason: RequestFinishReason,
     pub released_sequence_device_bytes: usize,
 }
 
 /// Request data returned when active or waiting Step work is cancelled.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Step35CancelledRequest {
-    pub id: Step35RequestId,
+pub struct Step37CancelledRequest {
+    pub id: Step37RequestId,
     pub prompt_tokens: Vec<u32>,
-    pub generated_tokens: Vec<Step35ScheduledToken>,
+    pub generated_tokens: Vec<Step37ScheduledToken>,
     pub released_sequence_device_bytes: usize,
 }
 
 /// Outcome of cancelling a Step request.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Step35CancelOutcome {
-    Cancelled(Step35CancelledRequest),
+pub enum Step37CancelOutcome {
+    Cancelled(Step37CancelledRequest),
     AlreadyFinished,
     NotFound,
 }
 
-struct Step35Request {
-    id: Step35RequestId,
+struct Step37Request {
+    id: Step37RequestId,
     lifecycle: RequestState,
     config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
-    sequence: Option<Box<Step35DecodeState>>,
+    sequence: Option<Box<Step37DecodeState>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     sampler: Sampler,
     history: TokenHistory,
     last_token: Option<u32>,
-    generated_tokens: Vec<Step35ScheduledToken>,
+    generated_tokens: Vec<Step37ScheduledToken>,
     finish_reason: Option<RequestFinishReason>,
 }
 
-impl Step35Request {
+impl Step37Request {
     fn max_tokens(&self) -> usize {
         self.prompt_tokens.len() + self.config.max_new_tokens
     }
@@ -120,7 +120,7 @@ impl Step35Request {
         })
     }
 
-    fn apply_sample(&mut self, sampled: SampledToken) -> Step35ScheduledToken {
+    fn apply_sample(&mut self, sampled: SampledToken) -> Step37ScheduledToken {
         if self.remaining_prompt_tokens() == 1 {
             self.prompt_position += 1;
         }
@@ -140,7 +140,7 @@ impl Step35Request {
             RequestState::Decoding
         };
         self.finish_reason = finish_reason;
-        let token = Step35ScheduledToken {
+        let token = Step37ScheduledToken {
             request_id: self.id,
             id: sampled.id,
             logit: sampled.logit,
@@ -152,19 +152,19 @@ impl Step35Request {
 }
 
 /// Decode-first scheduler sharing one paged expert cache across independent sequences.
-pub struct Step35Scheduler {
-    model: Step35TextModel,
-    prefill_workspace: Step35PrefillBatchWorkspace,
+pub struct Step37Scheduler {
+    model: Step37TextModel,
+    prefill_workspace: Step37PrefillBatchWorkspace,
     config: SchedulerConfig,
-    requests: BTreeMap<Step35RequestId, Box<Step35Request>>,
-    waiting: VecDeque<Step35RequestId>,
-    prefilling: VecDeque<Step35RequestId>,
-    decoding: VecDeque<Step35RequestId>,
+    requests: BTreeMap<Step37RequestId, Box<Step37Request>>,
+    waiting: VecDeque<Step37RequestId>,
+    prefilling: VecDeque<Step37RequestId>,
+    decoding: VecDeque<Step37RequestId>,
     next_id: u64,
 }
 
-impl Step35Scheduler {
-    pub fn new(model: Step35TextModel, config: SchedulerConfig) -> Result<Self> {
+impl Step37Scheduler {
+    pub fn new(model: Step37TextModel, config: SchedulerConfig) -> Result<Self> {
         config.validate()?;
         let prefill_workspace = model.new_prefill_batch_workspace(
             config.prefill_sequence_capacity,
@@ -187,7 +187,7 @@ impl Step35Scheduler {
         &mut self,
         prompt_tokens: Vec<u32>,
         config: RequestConfig,
-    ) -> Result<Step35RequestId> {
+    ) -> Result<Step37RequestId> {
         config.validate()?;
         if prompt_tokens.is_empty() {
             return Err(Error::Format {
@@ -220,7 +220,7 @@ impl Step35Scheduler {
                 actual: max_tokens.to_string(),
             });
         }
-        let id = Step35RequestId(self.next_id);
+        let id = Step37RequestId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
             label: "Step-3.7 scheduler request ID",
             detail: "request ID space exhausted".to_string(),
@@ -235,7 +235,7 @@ impl Step35Scheduler {
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
         self.requests.insert(
             id,
-            Box::new(Step35Request {
+            Box::new(Step37Request {
                 id,
                 lifecycle,
                 config,
@@ -257,8 +257,8 @@ impl Step35Scheduler {
         Ok(id)
     }
 
-    pub fn tick(&mut self) -> Result<Step35SchedulerTick> {
-        let mut tick = Step35SchedulerTick::default();
+    pub fn tick(&mut self) -> Result<Step37SchedulerTick> {
+        let mut tick = Step37SchedulerTick::default();
         self.admit_waiting(&mut tick)?;
         self.run_decode_phase(&mut tick)?;
         self.run_prefill_phase(&mut tick)?;
@@ -266,7 +266,7 @@ impl Step35Scheduler {
         Ok(tick)
     }
 
-    fn admit_waiting(&mut self, tick: &mut Step35SchedulerTick) -> Result<()> {
+    fn admit_waiting(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
         while self.active_sequence_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -299,7 +299,7 @@ impl Step35Scheduler {
             request.device_token_counts = device_token_counts;
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
-            tick.admitted.push(Step35AdmissionProgress {
+            tick.admitted.push(Step37AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
             });
@@ -307,7 +307,7 @@ impl Step35Scheduler {
         Ok(())
     }
 
-    fn run_decode_phase(&mut self, tick: &mut Step35SchedulerTick) -> Result<()> {
+    fn run_decode_phase(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
         let mut selected = Vec::with_capacity(self.config.decode_capacity);
         while selected.len() < self.config.decode_capacity {
             let Some(id) = self.decoding.pop_front() else {
@@ -371,7 +371,7 @@ impl Step35Scheduler {
         Ok(())
     }
 
-    fn execute_decode(&mut self, request: &mut Step35Request) -> Result<SampledToken> {
+    fn execute_decode(&mut self, request: &mut Step37Request) -> Result<SampledToken> {
         let token = request.decode_input_token()?;
         let state = request
             .sequence
@@ -410,7 +410,7 @@ impl Step35Scheduler {
         request.sampler.sample(&logits, &request.history)
     }
 
-    fn run_prefill_phase(&mut self, tick: &mut Step35SchedulerTick) -> Result<()> {
+    fn run_prefill_phase(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
         let eligible = self
             .prefilling
             .iter()
@@ -461,7 +461,7 @@ impl Step35Scheduler {
                 .map(|(request, chunk)| {
                     let start = request.prompt_position;
                     let end = start + chunk;
-                    Step35PrefillRow {
+                    Step37PrefillRow {
                         token_ids: &request.prompt_tokens[start..end],
                         state: request
                             .sequence
@@ -482,7 +482,7 @@ impl Step35Scheduler {
         }
         for (mut request, (_, chunk)) in requests.into_iter().zip(selected) {
             request.prompt_position += chunk;
-            tick.prefilled.push(Step35PrefillProgress {
+            tick.prefilled.push(Step37PrefillProgress {
                 request_id: request.id,
                 tokens: chunk,
                 prompt_position: request.prompt_position,
@@ -493,12 +493,12 @@ impl Step35Scheduler {
         Ok(())
     }
 
-    pub fn cancel_request(&mut self, id: Step35RequestId) -> Step35CancelOutcome {
+    pub fn cancel_request(&mut self, id: Step37RequestId) -> Step37CancelOutcome {
         let Some(request) = self.requests.get(&id) else {
-            return Step35CancelOutcome::NotFound;
+            return Step37CancelOutcome::NotFound;
         };
         if request.lifecycle == RequestState::Finished {
-            return Step35CancelOutcome::AlreadyFinished;
+            return Step37CancelOutcome::AlreadyFinished;
         }
         self.waiting.retain(|queued| *queued != id);
         self.prefilling.retain(|queued| *queued != id);
@@ -507,7 +507,7 @@ impl Step35Scheduler {
             .requests
             .remove(&id)
             .expect("cancellation target retained");
-        Step35CancelOutcome::Cancelled(Step35CancelledRequest {
+        Step37CancelOutcome::Cancelled(Step37CancelledRequest {
             id,
             prompt_tokens: request.prompt_tokens,
             generated_tokens: request.generated_tokens,
@@ -519,16 +519,16 @@ impl Step35Scheduler {
         self.prefilling.len() + self.decoding.len()
     }
 
-    pub fn request_state(&self, id: Step35RequestId) -> Option<RequestState> {
+    pub fn request_state(&self, id: Step37RequestId) -> Option<RequestState> {
         self.requests.get(&id).map(|request| request.lifecycle)
     }
 
-    pub fn remove_finished(&mut self, id: Step35RequestId) -> Option<Step35FinishedRequest> {
+    pub fn remove_finished(&mut self, id: Step37RequestId) -> Option<Step37FinishedRequest> {
         if self.request_state(id) != Some(RequestState::Finished) {
             return None;
         }
         let request = self.requests.remove(&id)?;
-        Some(Step35FinishedRequest {
+        Some(Step37FinishedRequest {
             id,
             prompt_tokens: request.prompt_tokens,
             generated_tokens: request.generated_tokens,
