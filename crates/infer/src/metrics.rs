@@ -6,7 +6,9 @@
 //! server exports them via Prometheus and optional DogStatsD.
 
 use fast_telemetry::{Counter, ExportMetrics, Gauge, Histogram};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 const DEFAULT_SHARDS: usize = 4;
 const LATENCY_BUCKETS_US: &[u64] = &[
@@ -15,6 +17,10 @@ const LATENCY_BUCKETS_US: &[u64] = &[
 ];
 
 static METRICS: LazyLock<InferMetrics> = LazyLock::new(|| InferMetrics::new(DEFAULT_SHARDS));
+static EXPERT_GAUGE_LOCK: Mutex<()> = Mutex::new(());
+static EXPERT_RESIDENT_SLOTS: AtomicI64 = AtomicI64::new(0);
+static EXPERT_SLOT_CAPACITY: AtomicI64 = AtomicI64::new(0);
+static EXPERT_RESIDENT_BYTES: AtomicI64 = AtomicI64::new(0);
 
 #[derive(ExportMetrics)]
 #[metric_prefix = "eider_infer"]
@@ -46,6 +52,27 @@ pub struct InferMetrics {
     #[help = "Currently active sequences retaining device state"]
     pub active_sequences: Gauge,
 
+    #[help = "Routed-expert lookups served by a resident device slot"]
+    pub expert_cache_hits: Counter,
+
+    #[help = "Routed experts loaded into device slots"]
+    pub expert_page_ins: Counter,
+
+    #[help = "Resident routed experts evicted from device slots"]
+    pub expert_evictions: Counter,
+
+    #[help = "Prepared routed-expert bytes read for page-ins"]
+    pub expert_page_in_bytes: Counter,
+
+    #[help = "Device slots currently holding routed experts"]
+    pub expert_resident_slots: Gauge,
+
+    #[help = "Device slots allocated for paged routed experts"]
+    pub expert_slot_capacity: Gauge,
+
+    #[help = "Device bytes allocated for paged routed-expert slots"]
+    pub expert_resident_bytes: Gauge,
+
     #[help = "Time to first token in microseconds"]
     pub ttft_us: Histogram,
 
@@ -54,6 +81,18 @@ pub struct InferMetrics {
 
     #[help = "Prefill tick latency in microseconds"]
     pub prefill_tick_us: Histogram,
+
+    #[help = "Wall time spent reading one batch of routed-expert page-ins in microseconds"]
+    pub expert_page_read_us: Histogram,
+
+    #[help = "CUDA time spent uploading one batch of routed-expert page-ins in microseconds"]
+    pub expert_page_upload_us: Histogram,
+
+    #[help = "Wall time spent resolving one batch of routed-expert page-ins in microseconds"]
+    pub expert_page_resolve_us: Histogram,
+
+    #[help = "Host time blocked waiting to reuse routed-expert staging buffers in microseconds"]
+    pub expert_staging_wait_us: Histogram,
 }
 
 impl InferMetrics {
@@ -68,13 +107,177 @@ impl InferMetrics {
             requests_cancelled: Counter::new(shard_count),
             requests_failed: Counter::new(shard_count),
             active_sequences: Gauge::new(),
+            expert_cache_hits: Counter::new(shard_count),
+            expert_page_ins: Counter::new(shard_count),
+            expert_evictions: Counter::new(shard_count),
+            expert_page_in_bytes: Counter::new(shard_count),
+            expert_resident_slots: Gauge::new(),
+            expert_slot_capacity: Gauge::new(),
+            expert_resident_bytes: Gauge::new(),
             ttft_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             decode_tick_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             prefill_tick_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            expert_page_read_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            expert_page_upload_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            expert_page_resolve_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            expert_staging_wait_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
         }
     }
 }
 
 pub fn metrics() -> &'static InferMetrics {
     &METRICS
+}
+
+/// Process-wide accounting for one paged routed-expert cache.
+pub(crate) struct ExpertPagingMetricHandle {
+    capacity: i64,
+    resident_bytes: i64,
+    resident_slots: i64,
+}
+
+impl ExpertPagingMetricHandle {
+    pub(crate) fn new(capacity: usize, resident_bytes: usize) -> Self {
+        let capacity = metric_value(capacity);
+        let resident_bytes = metric_value(resident_bytes);
+        adjust_expert_gauges(0, capacity, resident_bytes);
+        Self {
+            capacity,
+            resident_bytes,
+            resident_slots: 0,
+        }
+    }
+
+    pub(crate) fn record_cache_activity(
+        &mut self,
+        hits: usize,
+        page_ins: usize,
+        evictions: usize,
+        bytes_read: usize,
+        resident_slots: usize,
+    ) {
+        let infer = metrics();
+        infer.expert_cache_hits.add(metric_count(hits));
+        infer.expert_page_ins.add(metric_count(page_ins));
+        infer.expert_evictions.add(metric_count(evictions));
+        infer.expert_page_in_bytes.add(metric_count(bytes_read));
+
+        let resident_slots = metric_value(resident_slots);
+        let delta = resident_slots - self.resident_slots;
+        if delta != 0 {
+            adjust_expert_gauges(delta, 0, 0);
+            self.resident_slots = resident_slots;
+        }
+    }
+
+    pub(crate) fn record_page_read(&self, elapsed: Duration) {
+        metrics().expert_page_read_us.record(duration_us(elapsed));
+    }
+
+    pub(crate) fn record_page_upload(&self, elapsed: Duration) {
+        metrics().expert_page_upload_us.record(duration_us(elapsed));
+    }
+
+    pub(crate) fn record_page_resolve(&self, elapsed: Duration) {
+        metrics()
+            .expert_page_resolve_us
+            .record(duration_us(elapsed));
+    }
+
+    pub(crate) fn record_staging_wait(&self, elapsed: Duration) {
+        metrics()
+            .expert_staging_wait_us
+            .record(duration_us(elapsed));
+    }
+}
+
+impl Drop for ExpertPagingMetricHandle {
+    fn drop(&mut self) {
+        adjust_expert_gauges(-self.resident_slots, -self.capacity, -self.resident_bytes);
+    }
+}
+
+fn adjust_expert_gauges(resident_slots: i64, capacity: i64, resident_bytes: i64) {
+    let _guard = EXPERT_GAUGE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let resident_slots =
+        EXPERT_RESIDENT_SLOTS.fetch_add(resident_slots, Ordering::Relaxed) + resident_slots;
+    let capacity = EXPERT_SLOT_CAPACITY.fetch_add(capacity, Ordering::Relaxed) + capacity;
+    let resident_bytes =
+        EXPERT_RESIDENT_BYTES.fetch_add(resident_bytes, Ordering::Relaxed) + resident_bytes;
+    let infer = metrics();
+    infer.expert_resident_slots.set(resident_slots);
+    infer.expert_slot_capacity.set(capacity);
+    infer.expert_resident_bytes.set(resident_bytes);
+}
+
+fn metric_value(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
+}
+
+fn metric_count(value: usize) -> isize {
+    value.min(isize::MAX as usize) as isize
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paging_metrics_are_included_in_prometheus_export() {
+        let metrics = InferMetrics::new(1);
+        metrics.expert_cache_hits.inc();
+        metrics.expert_page_ins.inc();
+        metrics.expert_evictions.inc();
+        metrics.expert_page_in_bytes.add(1024);
+        metrics.expert_resident_slots.set(8);
+        metrics.expert_slot_capacity.set(16);
+        metrics.expert_resident_bytes.set(4096);
+        metrics.expert_page_read_us.record(10);
+        metrics.expert_page_upload_us.record(20);
+        metrics.expert_page_resolve_us.record(30);
+        metrics.expert_staging_wait_us.record(40);
+
+        let mut output = String::new();
+        metrics.export_prometheus(&mut output);
+        for name in [
+            "eider_infer_expert_cache_hits",
+            "eider_infer_expert_page_ins",
+            "eider_infer_expert_evictions",
+            "eider_infer_expert_page_in_bytes",
+            "eider_infer_expert_resident_slots",
+            "eider_infer_expert_slot_capacity",
+            "eider_infer_expert_resident_bytes",
+            "eider_infer_expert_page_read_us",
+            "eider_infer_expert_page_upload_us",
+            "eider_infer_expert_page_resolve_us",
+            "eider_infer_expert_staging_wait_us",
+        ] {
+            assert!(output.contains(name), "missing {name}: {output}");
+        }
+
+        let mut dogstatsd = String::new();
+        let mut state = InferMetricsDogStatsDState::new();
+        metrics.export_dogstatsd_delta(&mut dogstatsd, &[], &mut state);
+        for name in [
+            "eider_infer.expert_cache_hits",
+            "eider_infer.expert_page_ins",
+            "eider_infer.expert_evictions",
+            "eider_infer.expert_page_in_bytes",
+            "eider_infer.expert_resident_slots",
+            "eider_infer.expert_slot_capacity",
+            "eider_infer.expert_resident_bytes",
+            "eider_infer.expert_page_read_us",
+            "eider_infer.expert_page_upload_us",
+            "eider_infer.expert_page_resolve_us",
+            "eider_infer.expert_staging_wait_us",
+        ] {
+            assert!(dogstatsd.contains(name), "missing {name}: {dogstatsd}");
+        }
+    }
 }
