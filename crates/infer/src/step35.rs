@@ -1,4 +1,4 @@
-//! Prepared expert storage for the Step-3.5-Flash NVFP4 checkpoint.
+//! Step-3.7-Flash text runtime and prepared expert storage.
 
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
@@ -7,14 +7,15 @@ use nvfp4::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear,
     PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace, Sm12xKvCache,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, gemv_row_scales_residual2_batch_on_stream,
-    indexed_grouped_gemv_row_scales_residual_on_stream, modelopt_m16_k64_row_scale_words,
-    moe_silu_quantize_slots_residual_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    quantize_dynamic_vectors_residual2_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_inv_freq_sequence_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
-    silu_mul_halves_f32_into_on_stream, step35_sigmoid_top8_f32_into_on_stream,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    gemv_row_scales_residual2_batch_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
+    modelopt_m16_k64_row_scale_words, moe_silu_quantize_slots_residual_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
+    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
+    step35_sigmoid_top8_f32_into_on_stream,
 };
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
@@ -23,6 +24,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 pub const LAYERS: usize = 42;
 pub const FIRST_MOE_LAYER: usize = 3;
@@ -35,10 +37,11 @@ pub const RMS_EPS: f32 = 1.0e-5;
 pub const KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
 const RESIDENT_INPUT_MULTIPLIER: f32 = 128.0;
+const TEXT_PREFIX: &str = "model.language_model";
 
-const CACHE_DIR: &str = ".eider-cache/step35-experts-v5";
-const MAGIC: &[u8; 8] = b"EIDSTEP5";
-const VERSION: u32 = 5;
+const CACHE_DIR: &str = ".eider-cache/step37-experts-v1";
+const MAGIC: &[u8; 8] = b"EIDST371";
+const VERSION: u32 = 1;
 const HEADER_BYTES: usize = 4096;
 const GATE_WEIGHT_BYTES: usize = GATE_UP * HIDDEN / 2;
 const GATE_SCALE_BYTES: usize = GATE_UP * HIDDEN / 16;
@@ -62,7 +65,7 @@ struct PreparedHeader {
     down_alphas: Vec<f32>,
 }
 
-/// One Step-3.5 prepared expert record and its scalar execution metadata.
+/// One Step-3.7 prepared expert record and its scalar execution metadata.
 pub struct Step35PreparedExpertRecord {
     bytes: Vec<u8>,
     pub gate_global_scale: f32,
@@ -90,7 +93,7 @@ impl Step35PreparedExpertRecord {
     }
 }
 
-/// Random-access source for Step-3.5's fixed-size prepared expert records.
+/// Random-access source for Step-3.7's fixed-size prepared expert records.
 pub struct Step35ExpertRecordSource {
     file: File,
     direct_file: File,
@@ -101,7 +104,7 @@ impl Step35ExpertRecordSource {
     pub fn open(model_dir: impl AsRef<Path>, layer: usize) -> Result<Self> {
         if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
             return Err(Error::Shape {
-                label: "Step-3.5 prepared expert layer",
+                label: "Step-3.7 prepared expert layer",
                 expected: format!("{FIRST_MOE_LAYER}..{}", FIRST_MOE_LAYER + LAYERS),
                 actual: layer.to_string(),
             });
@@ -111,7 +114,7 @@ impl Step35ExpertRecordSource {
         let header = read_header(&file, &path)?;
         if header.layer != layer {
             return Err(Error::Format {
-                label: "Step-3.5 prepared expert layer",
+                label: "Step-3.7 prepared expert layer",
                 detail: format!("{} contains layer {}", path.display(), header.layer),
             });
         }
@@ -130,7 +133,7 @@ impl Step35ExpertRecordSource {
     fn read_record_direct(&self, expert: usize, target: &mut PinnedHostBuffer<u8>) -> Result<()> {
         if expert >= EXPERTS || target.as_slice().len() != EXPERT_RECORD_BYTES {
             return Err(Error::Shape {
-                label: "Step-3.5 direct expert record",
+                label: "Step-3.7 direct expert record",
                 expected: format!("expert < {EXPERTS}, target={EXPERT_RECORD_BYTES} bytes"),
                 actual: format!("expert={expert} target={} bytes", target.as_slice().len()),
             });
@@ -138,7 +141,7 @@ impl Step35ExpertRecordSource {
         let address = target.as_slice().as_ptr() as usize;
         if !address.is_multiple_of(4096) {
             return Err(Error::Format {
-                label: "Step-3.5 direct expert record",
+                label: "Step-3.7 direct expert record",
                 detail: format!("pinned staging address 0x{address:x} is not page aligned"),
             });
         }
@@ -148,7 +151,7 @@ impl Step35ExpertRecordSource {
                 (HEADER_BYTES + expert * EXPERT_RECORD_BYTES) as u64,
             )
             .map_err(|error| Error::Format {
-                label: "Step-3.5 direct expert record",
+                label: "Step-3.7 direct expert record",
                 detail: format!("failed to read expert {expert}: {error}"),
             })
     }
@@ -160,7 +163,7 @@ impl ExpertRecordSource for Step35ExpertRecordSource {
     fn read_record(&self, expert: usize) -> Result<Self::Record> {
         if expert >= EXPERTS {
             return Err(Error::Shape {
-                label: "Step-3.5 prepared expert",
+                label: "Step-3.7 prepared expert",
                 expected: format!("expert < {EXPERTS}"),
                 actual: expert.to_string(),
             });
@@ -172,7 +175,7 @@ impl ExpertRecordSource for Step35ExpertRecordSource {
                 (HEADER_BYTES + expert * EXPERT_RECORD_BYTES) as u64,
             )
             .map_err(|error| Error::Format {
-                label: "Step-3.5 prepared expert",
+                label: "Step-3.7 prepared expert",
                 detail: format!("failed to read expert {expert}: {error}"),
             })?;
         Ok(Step35PreparedExpertRecord {
@@ -184,7 +187,7 @@ impl ExpertRecordSource for Step35ExpertRecordSource {
     }
 }
 
-/// Bounded routed-expert slots for one Step-3.5 MoE layer.
+/// Bounded routed-expert slots for one Step-3.7 MoE layer.
 pub struct Step35PagedExperts {
     source: Step35ExpertRecordSource,
     gate_up: MarlinNvfp4GateUp,
@@ -211,7 +214,7 @@ struct Step35ExpertStaging {
     down_weight_scale_2: PinnedHostBuffer<f32>,
 }
 
-/// Mutable routed-expert execution workspace for one Step-3.5 token.
+/// Mutable routed-expert execution workspace for one Step-3.7 token.
 pub struct Step35PagedExpertWorkspace {
     gate_up_output: DeviceBuffer<f32>,
     gate_up_table: DeviceBuffer<*const f32>,
@@ -260,11 +263,18 @@ pub struct Step35Router {
 
 /// Resident ModelOpt NVFP4 linear used by Step attention and non-routed FFNs.
 pub struct Step35Linear {
-    native_tiles: DeviceBuffer<u8>,
-    row_scales: DeviceBuffer<u32>,
-    weight_scale_2: f32,
+    weight: Step35LinearWeight,
     out_features: usize,
     in_features: usize,
+}
+
+enum Step35LinearWeight {
+    Nvfp4 {
+        native_tiles: DeviceBuffer<u8>,
+        row_scales: DeviceBuffer<u32>,
+        weight_scale_2: f32,
+    },
+    Bf16(DeviceBuffer<u16>),
 }
 
 /// Reusable SM12x FP4 activation rows for resident Step linears.
@@ -283,7 +293,7 @@ impl Step35QuantizedRows {
     fn new(rows: usize, features: usize) -> Result<Self> {
         if rows == 0 || features == 0 || !features.is_multiple_of(64) {
             return Err(Error::Shape {
-                label: "Step-3.5 quantized activation",
+                label: "Step-3.7 quantized activation",
                 expected: "nonzero rows and features multiple of 64".to_string(),
                 actual: format!("rows={rows} features={features}"),
             });
@@ -329,11 +339,54 @@ impl Step35QuantizedRows {
 
 impl Step35Linear {
     pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
+        let tensor = format!("{prefix}.weight");
+        let info = checkpoint.tensor_info(&tensor)?;
+        if info.dtype == "BF16" {
+            let (weight, out_features, in_features) = read_bf16_linear(checkpoint, prefix)?;
+            return Ok(Self {
+                weight: Step35LinearWeight::Bf16(DeviceBuffer::from_host(&weight)?),
+                out_features,
+                in_features,
+            });
+        }
         let weight = checkpoint.load_nvfp4_linear(prefix)?;
         Self::from_modelopt(weight)
     }
 
-    fn from_modelopt(weight: ModelOptNvfp4Linear) -> Result<Self> {
+    fn load_concat(
+        checkpoint: &ModelOptCheckpoint,
+        first_prefix: &str,
+        second_prefix: &str,
+        combined_prefix: &str,
+    ) -> Result<Self> {
+        let first_tensor = format!("{first_prefix}.weight");
+        if checkpoint.tensor_info(&first_tensor)?.dtype == "BF16" {
+            let (mut first, first_out, input) = read_bf16_linear(checkpoint, first_prefix)?;
+            let (second, second_out, second_input) = read_bf16_linear(checkpoint, second_prefix)?;
+            if second_input != input {
+                return Err(Error::Shape {
+                    label: "Step BF16 linear concat",
+                    expected: format!("input features {input}"),
+                    actual: format!("input features {second_input}"),
+                });
+            }
+            first.extend_from_slice(&second);
+            return Ok(Self {
+                weight: Step35LinearWeight::Bf16(DeviceBuffer::from_host(&first)?),
+                out_features: first_out + second_out,
+                in_features: input,
+            });
+        }
+        let first = checkpoint.load_nvfp4_linear(first_prefix)?;
+        let second = checkpoint.load_nvfp4_linear(second_prefix)?;
+        Self::from_modelopt(ModelOptNvfp4Linear::concat_out_features(
+            combined_prefix,
+            &first,
+            &second,
+        )?)
+    }
+
+    pub(crate) fn from_modelopt(weight: ModelOptNvfp4Linear) -> Result<Self> {
         let native_tiles = Sm12xFp4TileSet::from_packed_row_major_mxk(
             weight.out_features,
             weight.in_features,
@@ -345,9 +398,11 @@ impl Step35Linear {
             &weight.weight_scale,
         )?;
         Ok(Self {
-            native_tiles: DeviceBuffer::from_host(&native_tiles.to_bytes())?,
-            row_scales: DeviceBuffer::from_host(&row_scales)?,
-            weight_scale_2: weight.weight_scale_2,
+            weight: Step35LinearWeight::Nvfp4 {
+                native_tiles: DeviceBuffer::from_host(&native_tiles.to_bytes())?,
+                row_scales: DeviceBuffer::from_host(&row_scales)?,
+                weight_scale_2: weight.weight_scale_2,
+            },
             out_features: weight.out_features,
             in_features: weight.in_features,
         })
@@ -362,7 +417,7 @@ impl Step35Linear {
     ) -> Result<()> {
         if input.len() != rows * self.in_features || output.len() != rows * self.out_features {
             return Err(Error::Shape {
-                label: "Step-3.5 linear buffers",
+                label: "Step-3.7 linear buffers",
                 expected: format!(
                     "input={} output={}",
                     rows * self.in_features,
@@ -371,20 +426,34 @@ impl Step35Linear {
                 actual: format!("input={} output={}", input.len(), output.len()),
             });
         }
-        let mut quantized = Step35QuantizedRows::new(rows, self.in_features)?;
-        quantized.quantize(input, stream)?;
-        self.run_quantized_into(&quantized, output, stream)
+        match &self.weight {
+            Step35LinearWeight::Nvfp4 { .. } => {
+                let mut quantized = Step35QuantizedRows::new(rows, self.in_features)?;
+                quantized.quantize(input, stream)?;
+                self.run_with_quantized_into(input, &quantized, output, stream)
+            }
+            Step35LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
+                input,
+                weight,
+                output.output(),
+                rows,
+                self.out_features,
+                self.in_features,
+                stream,
+            ),
+        }
     }
 
-    fn run_quantized_into(
+    fn run_with_quantized_into(
         &self,
+        input_f32: &DeviceBuffer<f32>,
         input: &Step35QuantizedRows,
         output: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
         if input.features != self.in_features || output.len() != input.rows * self.out_features {
             return Err(Error::Shape {
-                label: "Step-3.5 native linear buffers",
+                label: "Step-3.7 native linear buffers",
                 expected: format!(
                     "input features={} output={}",
                     self.in_features,
@@ -393,22 +462,37 @@ impl Step35Linear {
                 actual: format!("input features={} output={}", input.features, output.len()),
             });
         }
-        gemv_row_scales_residual2_batch_on_stream(
-            &self.native_tiles,
-            &self.row_scales,
-            &input.native_tiles,
-            &input.scales,
-            &input.residual_tiles,
-            &input.residual_scales,
-            &input.residual2_tiles,
-            &input.residual2_scales,
-            output.output(),
-            input.rows,
-            self.out_features / 16,
-            self.in_features / 64,
-            self.weight_scale_2 / RESIDENT_INPUT_MULTIPLIER,
-            stream,
-        )
+        match &self.weight {
+            Step35LinearWeight::Nvfp4 {
+                native_tiles,
+                row_scales,
+                weight_scale_2,
+            } => gemv_row_scales_residual2_batch_on_stream(
+                native_tiles,
+                row_scales,
+                &input.native_tiles,
+                &input.scales,
+                &input.residual_tiles,
+                &input.residual_scales,
+                &input.residual2_tiles,
+                &input.residual2_scales,
+                output.output(),
+                input.rows,
+                self.out_features / 16,
+                self.in_features / 64,
+                *weight_scale_2 / RESIDENT_INPUT_MULTIPLIER,
+                stream,
+            ),
+            Step35LinearWeight::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
+                input_f32,
+                weight,
+                output.output(),
+                input.rows,
+                self.out_features,
+                self.in_features,
+                stream,
+            ),
+        }
     }
 
     pub fn shape(&self) -> (usize, usize) {
@@ -416,8 +500,50 @@ impl Step35Linear {
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.native_tiles.device_bytes() + self.row_scales.device_bytes()
+        match &self.weight {
+            Step35LinearWeight::Nvfp4 {
+                native_tiles,
+                row_scales,
+                ..
+            } => native_tiles.device_bytes() + row_scales.device_bytes(),
+            Step35LinearWeight::Bf16(weight) => weight.device_bytes(),
+        }
     }
+}
+
+fn read_bf16_linear(
+    checkpoint: &ModelOptCheckpoint,
+    prefix: &str,
+) -> Result<(Vec<u16>, usize, usize)> {
+    let tensor = format!("{prefix}.weight");
+    let info = checkpoint.tensor_info(&tensor)?;
+    if info.dtype != "BF16" || info.shape.len() != 2 {
+        return Err(Error::Shape {
+            label: "Step BF16 linear weight",
+            expected: "dtype=BF16 shape=[out,in]".to_string(),
+            actual: format!("dtype={} shape={:?} for {tensor}", info.dtype, info.shape),
+        });
+    }
+    let out_features = info.shape[0];
+    let in_features = info.shape[1];
+    let bytes = checkpoint
+        .open_shard_for_tensor(&tensor)?
+        .read_tensor_bytes(&tensor)?;
+    if bytes.len() != out_features * in_features * 2 {
+        return Err(Error::Shape {
+            label: "Step BF16 linear weight",
+            expected: format!("{} bytes", out_features * in_features * 2),
+            actual: format!("{} bytes for {tensor}", bytes.len()),
+        });
+    }
+    Ok((
+        bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect(),
+        out_features,
+        in_features,
+    ))
 }
 
 /// Resident zero-centred RMSNorm weight used by Step layers.
@@ -457,29 +583,26 @@ impl Step35MlpWorkspace {
 
 impl Step35Mlp {
     pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
-        let gate = checkpoint.load_nvfp4_linear(&format!("{prefix}.gate_proj"))?;
-        let up = checkpoint.load_nvfp4_linear(&format!("{prefix}.up_proj"))?;
+        let gate_up = Step35Linear::load_concat(
+            checkpoint,
+            &format!("{prefix}.gate_proj"),
+            &format!("{prefix}.up_proj"),
+            &format!("{prefix}.gate_up"),
+        )?;
         let down = Step35Linear::load(checkpoint, &format!("{prefix}.down_proj"))?;
-        let (intermediate, hidden) = (gate.out_features, gate.in_features);
-        if (up.out_features, up.in_features) != (intermediate, hidden)
-            || down.shape() != (hidden, intermediate)
-        {
+        let (gate_up_features, hidden) = gate_up.shape();
+        let intermediate = gate_up_features / 2;
+        if !gate_up_features.is_multiple_of(2) || down.shape() != (hidden, intermediate) {
             return Err(Error::Shape {
-                label: "Step-3.5 MLP weights",
+                label: "Step-3.7 MLP weights",
                 expected: format!(
                     "gate/up=[{intermediate}, {hidden}] down=[{hidden}, {intermediate}]"
                 ),
-                actual: format!(
-                    "up={:?} down={:?}",
-                    (up.out_features, up.in_features),
-                    down.shape()
-                ),
+                actual: format!("gate_up={:?} down={:?}", gate_up.shape(), down.shape()),
             });
         }
-        let gate_up =
-            ModelOptNvfp4Linear::concat_out_features(format!("{prefix}.gate_up"), &gate, &up)?;
         Ok(Self {
-            gate_up: Step35Linear::from_modelopt(gate_up)?,
+            gate_up,
             down,
             intermediate,
         })
@@ -502,7 +625,8 @@ impl Step35Mlp {
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         workspace.input_quantized.quantize(input, stream)?;
-        self.gate_up.run_quantized_into(
+        self.gate_up.run_with_quantized_into(
+            input,
             &workspace.input_quantized,
             &mut workspace.gate_up,
             stream,
@@ -516,7 +640,8 @@ impl Step35Mlp {
         workspace
             .activated_quantized
             .quantize(&workspace.activated, stream)?;
-        self.down.run_quantized_into(
+        self.down.run_with_quantized_into(
+            &workspace.activated,
             &workspace.activated_quantized,
             &mut workspace.output,
             stream,
@@ -541,6 +666,7 @@ pub struct Step35Attention {
     inv_freq: DeviceBuffer<f32>,
     q_heads: usize,
     rotary_dim: usize,
+    window: Option<usize>,
 }
 
 /// Reusable sequence scratch for [`Step35Attention`].
@@ -591,7 +717,7 @@ impl Step35AttentionWorkspace {
 
 impl Step35Attention {
     pub fn load(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<Self> {
-        let prefix = format!("model.layers.{layer}.self_attn");
+        let prefix = format!("{TEXT_PREFIX}.layers.{layer}.self_attn");
         let q_heads = if layer.is_multiple_of(4) { 64 } else { 96 };
         let rotary_dim = if layer.is_multiple_of(4) { 64 } else { 128 };
         let inv_freq = step35_inverse_frequencies(layer);
@@ -606,6 +732,7 @@ impl Step35Attention {
             inv_freq: DeviceBuffer::from_host(&inv_freq)?,
             q_heads,
             rotary_dim,
+            window: (!layer.is_multiple_of(4)).then_some(512),
         })
     }
 
@@ -643,12 +770,24 @@ impl Step35Attention {
         let tokens = workspace.tokens;
         let q_width = self.q_heads * HEAD_DIM;
         workspace.input_quantized.quantize(input, stream)?;
-        self.q
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.q, stream)?;
-        self.k
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.k, stream)?;
-        self.v
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.v, stream)?;
+        self.q.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.q,
+            stream,
+        )?;
+        self.k.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.k,
+            stream,
+        )?;
+        self.v.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.v,
+            stream,
+        )?;
         self.q_norm.run_into(
             &workspace.q,
             &mut workspace.q_normed,
@@ -715,7 +854,8 @@ impl Step35Attention {
         workspace
             .last_input_quantized
             .quantize(&workspace.last_input, stream)?;
-        self.gate.run_quantized_into(
+        self.gate.run_with_quantized_into(
+            &workspace.last_input,
             &workspace.last_input_quantized,
             &mut workspace.gate,
             stream,
@@ -730,7 +870,8 @@ impl Step35Attention {
         workspace
             .gated_quantized
             .quantize(&workspace.gated, stream)?;
-        self.output.run_quantized_into(
+        self.output.run_with_quantized_into(
+            &workspace.gated,
             &workspace.gated_quantized,
             &mut workspace.output,
             stream,
@@ -750,14 +891,14 @@ impl Step35Attention {
     ) -> Result<&'a DeviceBuffer<f32>> {
         if workspace.tokens != 1 {
             return Err(Error::Shape {
-                label: "Step-3.5 decode attention workspace",
+                label: "Step-3.7 decode attention workspace",
                 expected: "one token".to_string(),
                 actual: format!("{} tokens", workspace.tokens),
             });
         }
         if cache.len() != position {
             return Err(Error::Shape {
-                label: "Step-3.5 decode attention position",
+                label: "Step-3.7 decode attention position",
                 expected: format!("position {}", cache.len()),
                 actual: position.to_string(),
             });
@@ -765,12 +906,24 @@ impl Step35Attention {
 
         let q_width = self.q_heads * HEAD_DIM;
         workspace.input_quantized.quantize(input, stream)?;
-        self.q
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.q, stream)?;
-        self.k
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.k, stream)?;
-        self.v
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.v, stream)?;
+        self.q.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.q,
+            stream,
+        )?;
+        self.k.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.k,
+            stream,
+        )?;
+        self.v.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.v,
+            stream,
+        )?;
         self.q_norm.run_into(
             &workspace.q,
             &mut workspace.q_normed,
@@ -808,14 +961,29 @@ impl Step35Attention {
             stream,
         )?;
         cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
-        compact_attention.attention_into_on_stream(
-            cache,
-            &workspace.q_rope,
-            workspace.attended.output(),
+        if let Some(window) = self.window {
+            let window_start = cache.len().saturating_sub(window);
+            compact_attention.attention_window_into_on_stream(
+                cache,
+                &workspace.q_rope,
+                workspace.attended.output(),
+                window_start,
+                stream,
+            )?;
+        } else {
+            compact_attention.attention_into_on_stream(
+                cache,
+                &workspace.q_rope,
+                workspace.attended.output(),
+                stream,
+            )?;
+        }
+        self.gate.run_with_quantized_into(
+            input,
+            &workspace.input_quantized,
+            &mut workspace.gate,
             stream,
         )?;
-        self.gate
-            .run_quantized_into(&workspace.input_quantized, &mut workspace.gate, stream)?;
         sigmoid_scale_heads_f32_into_on_stream(
             &workspace.gate,
             &workspace.attended,
@@ -826,7 +994,8 @@ impl Step35Attention {
         workspace
             .gated_quantized
             .quantize(&workspace.gated, stream)?;
-        self.output.run_quantized_into(
+        self.output.run_with_quantized_into(
+            &workspace.gated,
             &workspace.gated_quantized,
             &mut workspace.output,
             stream,
@@ -885,7 +1054,7 @@ impl Step35RmsNorm {
             .read_float_tensor_as_f32(tensor)?;
         if weight.len() != cols {
             return Err(Error::Shape {
-                label: "Step-3.5 RMSNorm weight",
+                label: "Step-3.7 RMSNorm weight",
                 expected: format!("{cols} values"),
                 actual: format!("{} values for {tensor}", weight.len()),
             });
@@ -924,7 +1093,7 @@ impl Step35RmsNorm {
 
 impl Step35Router {
     pub fn load(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<Self> {
-        let prefix = format!("model.layers.{layer}.moe");
+        let prefix = format!("{TEXT_PREFIX}.layers.{layer}.moe");
         let tensor = format!("{prefix}.gate.weight");
         let shard = checkpoint.open_shard_for_tensor(&tensor)?;
         let info = shard.require_tensor(&tensor)?;
@@ -934,7 +1103,7 @@ impl Step35Router {
             || bytes.len() != EXPERTS * HIDDEN * 2
         {
             return Err(Error::Shape {
-                label: "Step-3.5 router weight",
+                label: "Step-3.7 router weight",
                 expected: format!("BF16 [{EXPERTS}, {HIDDEN}]"),
                 actual: format!(
                     "dtype={} shape={:?} bytes={}",
@@ -954,7 +1123,7 @@ impl Step35Router {
             .read_float_tensor_as_f32(&bias_tensor)?;
         if bias.len() != EXPERTS {
             return Err(Error::Shape {
-                label: "Step-3.5 router bias",
+                label: "Step-3.7 router bias",
                 expected: format!("{EXPERTS} values"),
                 actual: format!("{} values", bias.len()),
             });
@@ -1088,7 +1257,7 @@ impl Step35PagedExperts {
     ) -> Result<Step35PendingPageResolution> {
         if device_expert_ids.len() != 8 {
             return Err(Error::Shape {
-                label: "Step-3.5 device expert route",
+                label: "Step-3.7 device expert route",
                 expected: "8 expert IDs".to_string(),
                 actual: format!("{} expert IDs", device_expert_ids.len()),
             });
@@ -1130,7 +1299,7 @@ impl Step35PagedExperts {
                     .collect::<Vec<_>>();
                 for handle in handles {
                     handle.join().map_err(|_| Error::Format {
-                        label: "Step-3.5 direct expert record",
+                        label: "Step-3.7 direct expert record",
                         detail: "prepared-record reader panicked".to_string(),
                     })??;
                 }
@@ -1195,7 +1364,7 @@ impl Step35PagedExperts {
     ) -> Result<&'a DeviceBuffer<f32>> {
         if input.len() != HIDDEN || route_weights.len() != 8 {
             return Err(Error::Shape {
-                label: "Step-3.5 paged expert inputs",
+                label: "Step-3.7 paged expert inputs",
                 expected: format!("input={HIDDEN} route_weights=8"),
                 actual: format!(
                     "input={} route_weights={}",
@@ -1382,7 +1551,7 @@ impl Step35Layer {
         layer: usize,
         expert_capacity: usize,
     ) -> Result<Self> {
-        let prefix = format!("model.layers.{layer}");
+        let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
         let ffn = if layer < FIRST_MOE_LAYER {
             Step35LayerFfn::Dense(Step35Mlp::load(checkpoint, &format!("{prefix}.mlp"))?)
         } else {
@@ -1491,7 +1660,7 @@ impl Step35Layer {
             }
             _ => {
                 return Err(Error::Format {
-                    label: "Step-3.5 layer workspace",
+                    label: "Step-3.7 layer workspace",
                     detail: format!("layer {} FFN/workspace variant mismatch", self.layer),
                 });
             }
@@ -1528,7 +1697,7 @@ impl Step35Layer {
     }
 }
 
-/// Fully loaded Step-3.5 model with nonresident routed experts.
+/// Fully loaded Step-3.7 model with nonresident routed experts.
 pub struct Step35TextModel {
     layers: Vec<Step35Layer>,
     embedding: DeviceBuffer<u16>,
@@ -1562,8 +1731,14 @@ impl Step35TextModel {
     pub fn open(model_dir: impl AsRef<Path>, expert_capacity: usize) -> Result<Self> {
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let vocab = 128_896;
-        let embedding = read_bf16_matrix(&checkpoint, "model.embed_tokens.weight", vocab, HIDDEN)?;
-        let final_norm = Step35RmsNorm::load(&checkpoint, "model.norm.weight", HIDDEN)?;
+        let embedding = read_bf16_matrix(
+            &checkpoint,
+            &format!("{TEXT_PREFIX}.embed_tokens.weight"),
+            vocab,
+            HIDDEN,
+        )?;
+        let final_norm =
+            Step35RmsNorm::load(&checkpoint, &format!("{TEXT_PREFIX}.norm.weight"), HIDDEN)?;
         let lm_head = read_bf16_matrix(&checkpoint, "lm_head.weight", vocab, HIDDEN)?;
         let mut layers = Vec::with_capacity(45);
         for layer in 0..45 {
@@ -1572,9 +1747,10 @@ impl Step35TextModel {
                 + final_norm.device_bytes()
                 + lm_head.device_bytes()
                 + layers.iter().map(Step35Layer::device_bytes).sum::<usize>();
-            println!(
-                "loaded Step layer {layer:02}: {:.3} GiB device weights",
-                bytes as f64 / (1u64 << 30) as f64
+            info!(
+                layer,
+                device_weight_gib = bytes as f64 / (1u64 << 30) as f64,
+                "loaded Step layer"
             );
         }
         Ok(Self {
@@ -1648,7 +1824,7 @@ impl Step35TextModel {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Format {
-                label: "Step-3.5 GPU sampling",
+                label: "Step-3.7 GPU sampling",
                 detail: "sampler returned no token".to_string(),
             })
     }
@@ -1680,7 +1856,7 @@ impl Step35TextModel {
     fn forward_hidden(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
         if token as usize >= self.vocab {
             return Err(Error::Shape {
-                label: "Step-3.5 token",
+                label: "Step-3.7 token",
                 expected: format!("token < {}", self.vocab),
                 actual: token.to_string(),
             });
@@ -1689,7 +1865,7 @@ impl Step35TextModel {
             .kv_cache
             .first()
             .ok_or_else(|| Error::Format {
-                label: "Step-3.5 decode state",
+                label: "Step-3.7 decode state",
                 detail: "model has no KV caches".to_string(),
             })?
             .len();
@@ -1727,7 +1903,7 @@ impl Step35TextModel {
             .layers
             .last()
             .ok_or_else(|| Error::Format {
-                label: "Step-3.5 model",
+                label: "Step-3.7 model",
                 detail: "model has no layers".to_string(),
             })?
             .output();
@@ -1806,7 +1982,7 @@ fn read_bf16_matrix(
     let bytes = shard.read_tensor_bytes(tensor)?;
     if info.dtype != "BF16" || info.shape != [rows, cols] || bytes.len() != rows * cols * 2 {
         return Err(Error::Shape {
-            label: "Step-3.5 BF16 matrix",
+            label: "Step-3.7 BF16 matrix",
             expected: format!("BF16 [{rows}, {cols}]"),
             actual: format!(
                 "tensor={tensor} dtype={} shape={:?} bytes={}",
@@ -1848,16 +2024,17 @@ impl Step35ResidentExperts {
         let fixed_reservation = DeviceBuffer::zeroed(FIXED_TENSOR_BYTES)?;
         let mut layers = Vec::with_capacity(LAYERS);
         let mut loaded = fixed_reservation.device_bytes();
-        println!(
-            "reserved fixed tensors: {:.3} GiB",
-            loaded as f64 / (1u64 << 30) as f64
+        info!(
+            device_weight_gib = loaded as f64 / (1u64 << 30) as f64,
+            "reserved fixed Step tensors"
         );
         for layer in FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS {
             let resident = ResidentLayer::load(&layer_path(model_dir, layer), layer)?;
             loaded += resident.bytes;
-            println!(
-                "loaded layer {layer:02}: cumulative {:.3} GiB",
-                loaded as f64 / (1u64 << 30) as f64
+            info!(
+                layer,
+                device_weight_gib = loaded as f64 / (1u64 << 30) as f64,
+                "loaded resident Step expert layer"
             );
             layers.push(resident);
         }
@@ -1880,7 +2057,7 @@ impl ResidentLayer {
         let header = read_header(&file, path)?;
         if header.layer != expected_layer {
             return Err(Error::Format {
-                label: "Step-3.5 expert cache layer",
+                label: "Step-3.7 expert cache layer",
                 detail: format!(
                     "{} contains layer {}, expected {expected_layer}",
                     path.display(),
@@ -1956,7 +2133,7 @@ pub fn prepare_all(model_dir: impl AsRef<Path>) -> Result<()> {
 pub fn prepare_one(model_dir: impl AsRef<Path>, layer: usize) -> Result<()> {
     if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
         return Err(Error::Shape {
-            label: "Step-3.5 expert preparation layer",
+            label: "Step-3.7 expert preparation layer",
             expected: format!("{FIRST_MOE_LAYER}..{}", FIRST_MOE_LAYER + LAYERS),
             actual: layer.to_string(),
         });
@@ -1971,7 +2148,7 @@ pub fn prepare_one(model_dir: impl AsRef<Path>, layer: usize) -> Result<()> {
 fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
     let path = layer_path(checkpoint.root(), layer);
     if cache_matches(&path, layer) {
-        println!("prepared layer {layer:02}: already complete");
+        info!(layer, "Step expert cache layer is already complete");
         return Ok(());
     }
 
@@ -1994,7 +2171,12 @@ fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
         .map(|count| count.get())
         .unwrap_or(1)
         .min(8);
-    println!("preparing layer {layer:02}: {EXPERTS} experts with {workers} workers");
+    info!(
+        layer,
+        experts = EXPERTS,
+        workers,
+        "preparing Step expert cache layer"
+    );
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -2020,7 +2202,12 @@ fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
                         Some(expert_metadata);
                     let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if count.is_multiple_of(32) || count == EXPERTS {
-                        println!("  layer {layer:02}: {count}/{EXPERTS}");
+                        info!(
+                            layer,
+                            completed = count,
+                            total = EXPERTS,
+                            "preparing Step expert cache layer"
+                        );
                     }
                 }
                 Ok(())
@@ -2028,7 +2215,7 @@ fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
         }
         for handle in handles {
             handle.join().map_err(|_| Error::Format {
-                label: "Step-3.5 expert preparation",
+                label: "Step-3.7 expert preparation",
                 detail: format!("layer {layer} worker panicked"),
             })??;
         }
@@ -2043,7 +2230,7 @@ fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
         .enumerate()
         .map(|(expert, value)| {
             value.ok_or_else(|| Error::Format {
-                label: "Step-3.5 expert preparation",
+                label: "Step-3.7 expert preparation",
                 detail: format!("layer {layer} expert {expert} has no metadata"),
             })
         })
@@ -2055,9 +2242,10 @@ fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
         .map_err(|error| cache_io_error("sync", &temporary, error))?;
     drop(file);
     std::fs::rename(&temporary, &path).map_err(|error| cache_io_error("rename", &path, error))?;
-    println!(
-        "prepared layer {layer:02}: {:.3} GiB",
-        LAYER_FILE_BYTES as f64 / (1u64 << 30) as f64
+    info!(
+        layer,
+        cache_gib = LAYER_FILE_BYTES as f64 / (1u64 << 30) as f64,
+        "prepared Step expert cache layer"
     );
     Ok(())
 }
@@ -2067,12 +2255,15 @@ fn prepare_expert(
     layer: usize,
     expert: usize,
 ) -> Result<(Vec<u8>, ExpertMetadata)> {
-    let prefix = format!("model.layers.{layer}.moe.experts.{expert}");
-    let gate = checkpoint.load_nvfp4_linear(&format!("{prefix}.gate_proj"))?;
-    let up = checkpoint.load_nvfp4_linear(&format!("{prefix}.up_proj"))?;
-    let down = checkpoint.load_nvfp4_linear(&format!("{prefix}.down_proj"))?;
-    let gate_up =
-        ModelOptNvfp4Linear::concat_out_features(format!("{prefix}.gate_up"), &gate, &up)?;
+    let prefix = format!("{TEXT_PREFIX}.layers.{layer}.moe");
+    let gate = checkpoint.load_nvfp4_expert_linear(&format!("{prefix}.gate_proj"), expert)?;
+    let up = checkpoint.load_nvfp4_expert_linear(&format!("{prefix}.up_proj"), expert)?;
+    let down = checkpoint.load_nvfp4_expert_linear(&format!("{prefix}.down_proj"), expert)?;
+    let gate_up = ModelOptNvfp4Linear::concat_out_features(
+        format!("{prefix}.gate_up[{expert}]"),
+        &gate,
+        &up,
+    )?;
     let marlin = MarlinNvfp4HostWeight::from_modelopt(&gate_up)?;
     let down_tiles =
         Sm12xFp4TileSet::from_packed_row_major_mxk(HIDDEN, INTERMEDIATE, &down.packed_weight)?
@@ -2090,7 +2281,7 @@ fn prepare_expert(
     }
     if record.len() != EXPERT_RECORD_BYTES {
         return Err(Error::Shape {
-            label: "Step-3.5 prepared expert record",
+            label: "Step-3.7 prepared expert record",
             expected: format!("{EXPERT_RECORD_BYTES} bytes"),
             actual: format!("{} bytes", record.len()),
         });
@@ -2108,7 +2299,7 @@ fn prepare_expert(
 fn encode_header(layer: usize, metadata: &[ExpertMetadata]) -> Result<Vec<u8>> {
     if metadata.len() != EXPERTS {
         return Err(Error::Shape {
-            label: "Step-3.5 expert cache metadata",
+            label: "Step-3.7 expert cache metadata",
             expected: format!("{EXPERTS} experts"),
             actual: format!("{} experts", metadata.len()),
         });
@@ -2142,7 +2333,7 @@ fn read_header(file: &File, path: &Path) -> Result<PreparedHeader> {
         .map_err(|error| cache_io_error("inspect", path, error))?;
     if metadata.len() != LAYER_FILE_BYTES as u64 {
         return Err(Error::Format {
-            label: "Step-3.5 expert cache size",
+            label: "Step-3.7 expert cache size",
             detail: format!(
                 "{} has {} bytes, expected {LAYER_FILE_BYTES}",
                 path.display(),
@@ -2173,7 +2364,7 @@ fn read_header(file: &File, path: &Path) -> Result<PreparedHeader> {
         || file_bytes != LAYER_FILE_BYTES
     {
         return Err(Error::Format {
-            label: "Step-3.5 expert cache header",
+            label: "Step-3.7 expert cache header",
             detail: format!(
                 "{} has magic={magic:?} version={version} experts={experts} hidden={hidden} intermediate={intermediate} gate_up={gate_up} record_bytes={record_bytes} file_bytes={file_bytes}",
                 path.display()
@@ -2207,7 +2398,7 @@ fn layer_path(model_dir: &Path, layer: usize) -> PathBuf {
 
 fn cache_io_error(action: &'static str, path: &Path, error: std::io::Error) -> Error {
     Error::Format {
-        label: "Step-3.5 expert cache",
+        label: "Step-3.7 expert cache",
         detail: format!("failed to {action} {}: {error}", path.display()),
     }
 }
@@ -2226,11 +2417,11 @@ fn push_f32(bytes: &mut Vec<u8>, value: f32) {
 
 fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = cursor.checked_add(len).ok_or_else(|| Error::Format {
-        label: "Step-3.5 expert cache header",
+        label: "Step-3.7 expert cache header",
         detail: "header cursor overflow".to_string(),
     })?;
     let value = bytes.get(*cursor..end).ok_or_else(|| Error::Format {
-        label: "Step-3.5 expert cache header",
+        label: "Step-3.7 expert cache header",
         detail: "truncated header".to_string(),
     })?;
     *cursor = end;

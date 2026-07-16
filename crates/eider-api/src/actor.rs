@@ -29,7 +29,7 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub scheduler: SchedulerConfig,
-    pub step35_expert_capacity: usize,
+    pub step_expert_capacity: usize,
     pub event_capacity: usize,
 }
 
@@ -38,7 +38,7 @@ impl InferenceActorConfig {
         Self {
             model_dir: model_dir.into(),
             scheduler: SchedulerConfig::default(),
-            step35_expert_capacity: 240,
+            step_expert_capacity: 240,
             event_capacity: 256,
         }
     }
@@ -122,14 +122,14 @@ impl InferenceActor {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let model_dir = config.model_dir.clone();
         let scheduler = config.scheduler;
-        let step35_expert_capacity = config.step35_expert_capacity;
+        let step_expert_capacity = config.step_expert_capacity;
         thread::Builder::new()
             .name("eider-inference".to_string())
             .spawn(move || {
                 actor_main(
                     model_dir,
                     scheduler,
-                    step35_expert_capacity,
+                    step_expert_capacity,
                     commands_rx,
                     ready_tx,
                 )
@@ -189,7 +189,7 @@ impl Drop for ActorInner {
 fn actor_main(
     model_dir: PathBuf,
     scheduler: SchedulerConfig,
-    step35_expert_capacity: usize,
+    step_expert_capacity: usize,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
 ) {
@@ -243,13 +243,13 @@ fn actor_main(
             let mut service = QwenActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
-        CheckpointArchitecture::Step35 => {
+        CheckpointArchitecture::Step37 => {
             info!(
                 model_dir = %model_dir.display(),
-                expert_capacity = step35_expert_capacity,
-                "loading Step-3.5 model"
+                expert_capacity = step_expert_capacity,
+                "loading Step-3.7 model"
             );
-            let model = match Step35TextModel::open(&model_dir, step35_expert_capacity) {
+            let model = match Step35TextModel::open(&model_dir, step_expert_capacity) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -272,7 +272,7 @@ fn actor_main(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointArchitecture {
     Qwen36,
-    Step35,
+    Step37,
 }
 
 #[derive(Deserialize)]
@@ -288,7 +288,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     match config.model_type.as_str() {
         "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
-        "step3p5" => Ok(CheckpointArchitecture::Step35),
+        "step3p7" => Ok(CheckpointArchitecture::Step37),
         other => Err(format!(
             "unsupported model_type {other:?} in {}",
             path.display()
@@ -1097,11 +1097,11 @@ mod tests {
             std::thread::current().id()
         ));
         fs::create_dir_all(&directory).expect("create checkpoint directory");
-        fs::write(directory.join("config.json"), r#"{"model_type":"step3p5"}"#)
+        fs::write(directory.join("config.json"), r#"{"model_type":"step3p7"}"#)
             .expect("write Step config");
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
-            CheckpointArchitecture::Step35
+            CheckpointArchitecture::Step37
         );
         fs::write(
             directory.join("config.json"),

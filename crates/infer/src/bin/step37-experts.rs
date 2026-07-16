@@ -1,13 +1,21 @@
+//! Prepare and inspect the Step-3.7 routed-expert cache.
+
 use infer::nvfp4::{Error, Result};
 use infer::step35::{FIRST_MOE_LAYER, Step35ResidentExperts, prepare_all, prepare_one};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let mut args = std::env::args_os();
     let program = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .unwrap_or_else(|| "step35-experts".to_string());
+        .unwrap_or_else(|| "step37-experts".to_string());
     let command = args.next().and_then(|value| value.into_string().ok());
     let model_dir = args.next().map(PathBuf::from);
     let layer = args
@@ -33,7 +41,7 @@ fn main() -> Result<()> {
         return usage(&program);
     };
     let model_dir = model_dir.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.5-flash-nvfp4")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.7-flash-nvfp4")
     });
     match command.as_str() {
         "prepare" if layer.is_none() => prepare_all(&model_dir),

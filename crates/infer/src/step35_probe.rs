@@ -1,4 +1,4 @@
-//! Focused Step-3.5 layer validation against the checkpoint's Python model.
+//! Focused Step-3.7 text-layer validation against the checkpoint's Python model.
 
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, SafeTensorShard,
@@ -15,6 +15,7 @@ const LAYERS: [usize; 4] = [0, 1, 3, 4];
 const TOKENS: usize = 8;
 const HIDDEN: usize = 4096;
 const TOP_K: usize = 8;
+const TEXT_PREFIX: &str = "model.language_model";
 
 struct Route {
     indices: Vec<u32>,
@@ -31,7 +32,7 @@ pub fn validate_reference_layers(
     let checkpoint = ModelOptCheckpoint::open(model_dir)?;
     let reference = SafeTensorShard::open(reference_path)?;
     for layer in LAYERS {
-        println!("validating Step-3.5 layer {layer}");
+        println!("validating Step-3.7 layer {layer}");
         validate_layer(&checkpoint, &reference, layer)?;
     }
     Ok(())
@@ -45,7 +46,7 @@ fn validate_layer(
     let stream = CudaStream::new_non_blocking()?;
     let input = reference_values(reference, layer, "input", TOKENS * HIDDEN)?;
     let input_device = DeviceBuffer::from_host(&input)?;
-    let prefix = format!("model.layers.{layer}");
+    let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
     let normed = run_norm(
         checkpoint,
         &format!("{prefix}.input_layernorm.weight"),
@@ -196,21 +197,22 @@ fn run_moe(
         .run_routed(&mut paged_workspace, input, route.router.weights(), stream)?
         .copy_to_host(stream)?
         .into_vec();
-    let gate_prefix = format!("model.layers.{layer}.moe.experts.{}", route.indices[0]);
-    let expected_gate = run_linear(
+    let expert = route.indices[0] as usize;
+    let moe_prefix = format!("{TEXT_PREFIX}.layers.{layer}.moe");
+    let expected_gate = run_expert_linear(
         checkpoint,
-        &format!("{gate_prefix}.gate_proj"),
+        &format!("{moe_prefix}.gate_proj"),
+        expert,
         input,
-        1,
         stream,
     )?
     .copy_to_host(stream)?
     .into_vec();
-    let expected_up = run_linear(
+    let expected_up = run_expert_linear(
         checkpoint,
-        &format!("{gate_prefix}.up_proj"),
+        &format!("{moe_prefix}.up_proj"),
+        expert,
         input,
-        1,
         stream,
     )?
     .copy_to_host(stream)?
@@ -233,7 +235,7 @@ fn run_moe(
     let routed = DeviceBuffer::from_host(&routed)?;
     let shared = run_mlp(
         checkpoint,
-        &format!("model.layers.{layer}.share_expert"),
+        &format!("{TEXT_PREFIX}.layers.{layer}.share_expert"),
         input,
         stream,
     )?;
@@ -261,24 +263,25 @@ fn route(
     })
 }
 
-fn run_linear(
+fn run_expert_linear(
     checkpoint: &ModelOptCheckpoint,
     prefix: &str,
+    expert: usize,
     input: &DeviceBuffer<f32>,
-    rows: usize,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let weight = Step35Linear::load(checkpoint, prefix)?;
+    let weight = checkpoint.load_nvfp4_expert_linear(prefix, expert)?;
+    let weight = Step35Linear::from_modelopt(weight)?;
     let (out_features, in_features) = weight.shape();
-    if input.len() != rows * in_features {
+    if input.len() != in_features {
         return Err(Error::Shape {
-            label: "Step probe linear input",
-            expected: format!("{} values", rows * in_features),
-            actual: format!("{} values for {prefix}", input.len()),
+            label: "Step probe expert linear input",
+            expected: format!("{in_features} values"),
+            actual: format!("{} values for {prefix}[{expert}]", input.len()),
         });
     }
-    let mut output = DeviceBuffer::zeroed(rows * out_features)?;
-    weight.run_into(input, &mut output, rows, stream)?;
+    let mut output = DeviceBuffer::zeroed(out_features)?;
+    weight.run_into(input, &mut output, 1, stream)?;
     stream.synchronize()?;
     Ok(output)
 }

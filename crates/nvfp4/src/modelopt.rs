@@ -574,6 +574,73 @@ impl ModelOptCheckpoint {
         })
     }
 
+    /// Imports one expert from a stacked ModelOpt NVFP4 linear.
+    ///
+    /// Stacked MoE checkpoints store the packed weight and block scales as
+    /// `[experts, out, in / 2]` and `[experts, out, in / 16]`, with one pair
+    /// of scalar scales per expert. This reads only the selected expert's byte
+    /// ranges instead of materializing the complete stacked tensor.
+    pub fn load_nvfp4_expert_linear(
+        &self,
+        prefix: &str,
+        expert: usize,
+    ) -> Result<ModelOptNvfp4Linear> {
+        let weight_name = format!("{prefix}.weight");
+        let scale_name = format!("{prefix}.weight_scale");
+        let weight_scale_2_name = format!("{prefix}.weight_scale_2");
+        let input_scale_name = format!("{prefix}.input_scale");
+        let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+        let scale_shard = self.open_shard_for_tensor(&scale_name)?;
+        let weight_scale_2_shard = self.open_shard_for_tensor(&weight_scale_2_name)?;
+        let input_scale_shard = self.open_shard_for_tensor(&input_scale_name)?;
+
+        let weight_info = weight_shard.require_tensor(&weight_name)?;
+        let scale_info = scale_shard.require_tensor(&scale_name)?;
+        let (experts, out_features, in_features) = validate_modelopt_expert_weight(weight_info)?;
+        validate_modelopt_expert_scale(scale_info, experts, out_features, in_features)?;
+        if expert >= experts {
+            return Err(Error::Shape {
+                label: "ModelOpt NVFP4 expert index",
+                expected: format!("expert < {experts}"),
+                actual: expert.to_string(),
+            });
+        }
+
+        let weight_bytes = out_features * in_features / 2;
+        let scale_bytes = out_features * in_features / 16;
+        let weight_scale_2 = weight_scale_2_shard.read_float_tensor_as_f32(&weight_scale_2_name)?;
+        let input_scale = input_scale_shard.read_float_tensor_as_f32(&input_scale_name)?;
+        if weight_scale_2.len() != experts || input_scale.len() != experts {
+            return Err(Error::Shape {
+                label: "ModelOpt NVFP4 expert scalar scales",
+                expected: format!("{experts} weight and input scales"),
+                actual: format!(
+                    "weight_scale_2={} input_scale={}",
+                    weight_scale_2.len(),
+                    input_scale.len()
+                ),
+            });
+        }
+
+        Ok(ModelOptNvfp4Linear {
+            prefix: format!("{prefix}[{expert}]"),
+            out_features,
+            in_features,
+            packed_weight: weight_shard.read_tensor_byte_range(
+                &weight_name,
+                (expert * weight_bytes) as u64,
+                weight_bytes,
+            )?,
+            weight_scale: scale_shard.read_tensor_byte_range(
+                &scale_name,
+                (expert * scale_bytes) as u64,
+                scale_bytes,
+            )?,
+            weight_scale_2: weight_scale_2[expert],
+            input_scale: input_scale[expert],
+        })
+    }
+
     /// Reads only the global weight and input scales for an NVFP4 linear.
     ///
     /// This avoids faulting the packed weight and block-scale payloads when a
@@ -771,6 +838,32 @@ fn validate_modelopt_weight(info: &SafeTensorInfo) -> Result<(usize, usize)> {
     Ok((out_features, in_features))
 }
 
+fn validate_modelopt_expert_weight(info: &SafeTensorInfo) -> Result<(usize, usize, usize)> {
+    if info.dtype != "U8" || info.shape.len() != 3 {
+        return Err(Error::Shape {
+            label: "ModelOpt NVFP4 expert weight",
+            expected: "dtype=U8 shape=[experts,out,in/2]".to_string(),
+            actual: format!("dtype={} shape={:?}", info.dtype, info.shape),
+        });
+    }
+    let experts = info.shape[0];
+    let out_features = info.shape[1];
+    let in_features = info.shape[2] * 2;
+    let expected_bytes = experts * out_features * in_features / 2;
+    if experts == 0
+        || out_features == 0
+        || in_features == 0
+        || info.byte_len() != expected_bytes as u64
+    {
+        return Err(Error::Shape {
+            label: "ModelOpt NVFP4 expert weight bytes",
+            expected: expected_bytes.to_string(),
+            actual: info.byte_len().to_string(),
+        });
+    }
+    Ok((experts, out_features, in_features))
+}
+
 fn validate_modelopt_fp8_weight(info: &SafeTensorInfo) -> Result<(usize, usize)> {
     if info.dtype != "F8_E4M3" || info.shape.len() != 2 {
         return Err(Error::Shape {
@@ -812,6 +905,31 @@ fn validate_modelopt_scale(
             label: "ModelOpt NVFP4 weight_scale bytes",
             expected: format!("{expected_bytes}"),
             actual: format!("{}", info.byte_len()),
+        });
+    }
+    Ok(())
+}
+
+fn validate_modelopt_expert_scale(
+    info: &SafeTensorInfo,
+    experts: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<()> {
+    let expected_shape = [experts, out_features, in_features / 16];
+    if info.dtype != "F8_E4M3" || info.shape != expected_shape {
+        return Err(Error::Shape {
+            label: "ModelOpt NVFP4 expert weight_scale",
+            expected: format!("dtype=F8_E4M3 shape={expected_shape:?}"),
+            actual: format!("dtype={} shape={:?}", info.dtype, info.shape),
+        });
+    }
+    let expected_bytes = experts * out_features * in_features / 16;
+    if info.byte_len() != expected_bytes as u64 {
+        return Err(Error::Shape {
+            label: "ModelOpt NVFP4 expert weight_scale bytes",
+            expected: expected_bytes.to_string(),
+            actual: info.byte_len().to_string(),
         });
     }
     Ok(())

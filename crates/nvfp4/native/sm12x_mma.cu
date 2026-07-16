@@ -1267,6 +1267,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
     float* __restrict__ scores,
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
+    std::uint32_t window_start,
     std::uint32_t max_tokens,
     std::uint32_t q_heads,
     std::uint32_t kv_heads,
@@ -1281,6 +1282,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
     const std::uint32_t query_base =
         kv_head * queries_per_kv + (group % query_tiles_per_kv) * 8;
     const std::uint32_t token_tile = blockIdx.y;
+    if (token_tile * 8 + 7 < window_start) return;
     const std::uint32_t complete_tiles = cache_len / 8;
     const bool compact = token_tile < complete_tiles;
     const std::uint32_t tail_len = cache_len & 7u;
@@ -1366,8 +1368,12 @@ __global__ void infer_sm12x_kv_qk_kernel(
     const std::uint32_t q_head = query_base + row;
     const std::uint32_t token0 = token_tile * 8 + col;
     if (q_head < (kv_head + 1) * queries_per_kv) {
-        if (token0 < cache_len) scores[q_head * max_tokens + token0] = d0 * scale;
-        if (token0 + 1 < cache_len) scores[q_head * max_tokens + token0 + 1] = d1 * scale;
+        if (token0 >= window_start && token0 < cache_len) {
+            scores[q_head * max_tokens + token0] = d0 * scale;
+        }
+        if (token0 + 1 >= window_start && token0 + 1 < cache_len) {
+            scores[q_head * max_tokens + token0 + 1] = d1 * scale;
+        }
     }
 }
 
@@ -1387,13 +1393,14 @@ __device__ __forceinline__ InferOnlineSoftmaxState infer_softmax_combine(
 
 __global__ void infer_sm12x_kv_softmax_kernel(
     float* scores, std::uint32_t cache_len, const std::uint32_t* cache_len_device,
-    std::uint32_t max_tokens) {
+    std::uint32_t window_start, std::uint32_t max_tokens) {
     if (cache_len_device != nullptr) cache_len = *cache_len_device;
     __shared__ float maxima[256];
     __shared__ float sums[256];
     InferOnlineSoftmaxState state = {-INFINITY, 0.0f};
     float* row = scores + blockIdx.x * max_tokens;
-    for (std::uint32_t token = threadIdx.x; token < cache_len; token += blockDim.x) {
+    for (std::uint32_t token = window_start + threadIdx.x; token < cache_len;
+         token += blockDim.x) {
         const float value = row[token];
         state = infer_softmax_combine(state, {value, 1.0f});
     }
@@ -1412,7 +1419,8 @@ __global__ void infer_sm12x_kv_softmax_kernel(
     }
     const float maximum = maxima[0];
     const float inverse_sum = 1.0f / sums[0];
-    for (std::uint32_t token = threadIdx.x; token < cache_len; token += blockDim.x) {
+    for (std::uint32_t token = window_start + threadIdx.x; token < cache_len;
+         token += blockDim.x) {
         row[token] = expf(row[token] - maximum) * inverse_sum;
     }
 }
@@ -1423,6 +1431,7 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
     std::uint32_t* __restrict__ probability_scales,
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
+    std::uint32_t window_start,
     std::uint32_t max_tokens,
     std::uint32_t q_heads,
     std::uint32_t kv_heads)
@@ -1437,7 +1446,8 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
     const std::uint32_t k_tile = blockIdx.y;
     const std::uint32_t context_tiles = (max_tokens + 63) / 64;
     if (k_tile >= (cache_len + 63) / 64) return;
-    const float amplification = infer_probability_amplification(cache_len);
+    if (k_tile * 64 + 63 < window_start) return;
+    const float amplification = infer_probability_amplification(cache_len - window_start);
     std::uint8_t* tile = probability_tiles + (group * context_tiles + k_tile) * 512;
     __shared__ std::uint8_t scale_codes[8][4];
     if (threadIdx.x < 32) {
@@ -1446,7 +1456,7 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
             float max_value = 0.0f;
             for (int offset = 0; offset < 16; ++offset) {
                 const std::uint32_t token = k_tile * 64 + kb * 16 + offset;
-                if (token < cache_len) {
+                if (token >= window_start && token < cache_len) {
                     const std::uint32_t q_head = query_base + row;
                     if (q_head < (kv_head + 1) * queries_per_kv) {
                         max_value = fmaxf(max_value, scores[q_head * max_tokens + token]);
@@ -1473,7 +1483,8 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
             const std::uint32_t token = k_tile * 64 + col;
             float value = 0.0f;
             const std::uint32_t q_head = query_base + row;
-            if (row < 8 && q_head < (kv_head + 1) * queries_per_kv && token < cache_len) {
+            if (row < 8 && q_head < (kv_head + 1) * queries_per_kv &&
+                token >= window_start && token < cache_len) {
                 value = scores[q_head * max_tokens + token];
             }
             const float scale = row < 8 ? infer_e4m3_value(scale_codes[row][col / 16]) : 0.0f;
@@ -1498,6 +1509,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
     float* __restrict__ output,
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
+    std::uint32_t window_start,
     std::uint32_t max_tokens,
     std::uint32_t q_heads,
     std::uint32_t kv_heads,
@@ -1517,13 +1529,14 @@ __global__ void infer_sm12x_kv_pv_kernel(
     const std::uint32_t full_tokens = cache_len / 16 * 16;
     const std::uint32_t tail_len = cache_len & 15u;
     const std::uint32_t width = kv_heads * head_dim;
-    const float probability_correction = infer_probability_amplification(cache_len);
+    const float probability_correction =
+        infer_probability_amplification(cache_len - window_start);
     float d0 = 0.0f;
     float d1 = 0.0f;
     float d2 = 0.0f;
     float d3 = 0.0f;
 
-    for (std::uint32_t kt = 0; kt < context_tiles; ++kt) {
+    for (std::uint32_t kt = window_start / 64; kt < context_tiles; ++kt) {
         const std::uint8_t* a_tile = probability_tiles + (group * max_context_tiles + kt) * 512;
         const std::uint32_t value_tile_index =
             (kv_head * (head_dim / 8) + dim_tile) * max_context_tiles + kt;
@@ -1595,7 +1608,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
     }
 }
 
-extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
+static cudaError_t infer_sm12x_kv_attention_impl(
     const float* query,
     const std::uint8_t* key_values,
     const std::uint8_t* key_scales,
@@ -1610,6 +1623,7 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
     std::uint32_t* probability_scales,
     float* output,
     std::uint32_t cache_len,
+    std::uint32_t window_start,
     std::uint32_t max_tokens,
     std::uint32_t q_heads,
     std::uint32_t kv_heads,
@@ -1620,7 +1634,8 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
         value_values == nullptr || value_scales == nullptr || value_tail == nullptr ||
         query_tiles == nullptr || query_scales == nullptr || scores == nullptr ||
         probability_tiles == nullptr || probability_scales == nullptr || output == nullptr ||
-        cache_len == 0 || cache_len > max_tokens || q_heads == 0 || kv_heads == 0 ||
+        cache_len == 0 || cache_len > max_tokens || window_start >= cache_len ||
+        q_heads == 0 || kv_heads == 0 ||
         (q_heads % kv_heads) != 0 || head_dim == 0 || (head_dim % 64) != 0) {
         return cudaErrorInvalidValue;
     }
@@ -1634,22 +1649,51 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_qk_kernel<<<dim3(query_groups, token_tiles, 1), 32, 0, stream>>>(
         query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-        cache_len, nullptr, max_tokens, q_heads, kv_heads, head_dim);
+        cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_softmax_kernel<<<q_heads, 256, 0, stream>>>(
-        scores, cache_len, nullptr, max_tokens);
+        scores, cache_len, nullptr, window_start, max_tokens);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_quantize_probability_kernel<<<dim3(query_groups, context_tiles, 1), 128, 0, stream>>>(
-        scores, probability_tiles, probability_scales, cache_len, nullptr, max_tokens,
+        scores, probability_tiles, probability_scales, cache_len, nullptr, window_start, max_tokens,
         q_heads, kv_heads);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, cache_len, nullptr, max_tokens, q_heads, kv_heads, head_dim);
+        output, cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim);
     return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
+    const float* query, const std::uint8_t* key_values, const std::uint8_t* key_scales,
+    const float* key_tail, const std::uint8_t* value_values,
+    const std::uint8_t* value_scales, const float* value_tail,
+    std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
+    std::uint8_t* probability_tiles, std::uint32_t* probability_scales, float* output,
+    std::uint32_t cache_len, std::uint32_t max_tokens, std::uint32_t q_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim, cudaStream_t stream) {
+    return infer_sm12x_kv_attention_impl(
+        query, key_values, key_scales, key_tail, value_values, value_scales, value_tail,
+        query_tiles, query_scales, scores, probability_tiles, probability_scales, output,
+        cache_len, 0, max_tokens, q_heads, kv_heads, head_dim, stream);
+}
+
+extern "C" cudaError_t infer_sm12x_kv_attention_window_on_stream(
+    const float* query, const std::uint8_t* key_values, const std::uint8_t* key_scales,
+    const float* key_tail, const std::uint8_t* value_values,
+    const std::uint8_t* value_scales, const float* value_tail,
+    std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
+    std::uint8_t* probability_tiles, std::uint32_t* probability_scales, float* output,
+    std::uint32_t cache_len, std::uint32_t window_start, std::uint32_t max_tokens,
+    std::uint32_t q_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    cudaStream_t stream) {
+    return infer_sm12x_kv_attention_impl(
+        query, key_values, key_scales, key_tail, value_values, value_scales, value_tail,
+        query_tiles, query_scales, scores, probability_tiles, probability_scales, output,
+        cache_len, window_start, max_tokens, q_heads, kv_heads, head_dim, stream);
 }
 
 extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
@@ -1720,22 +1764,22 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, token_tiles, 1), 32, 0, stream>>>(
             query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-            cache_len, nullptr, max_tokens, kv_heads * 8, kv_heads, head_dim);
+            cache_len, nullptr, 0, max_tokens, kv_heads * 8, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
-            scores, cache_len, nullptr, max_tokens);
+            scores, cache_len, nullptr, 0, max_tokens);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_quantize_probability_kernel<<<
             dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
             scores, probability_tiles, probability_scales, cache_len, nullptr,
-            max_tokens, kv_heads * 8, kv_heads);
+            0, max_tokens, kv_heads * 8, kv_heads);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
             probability_tiles, probability_scales, value_values, value_scales, value_tail,
-            output + input_row * q_width, cache_len, nullptr, max_tokens,
+            output + input_row * q_width, cache_len, nullptr, 0, max_tokens,
             kv_heads * 8, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
@@ -1780,21 +1824,21 @@ extern "C" cudaError_t infer_sm12x_kv_attention_indexed_on_stream(
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, max_token_tiles, 1), 32, 0, stream>>>(
         query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-        0, cache_len, max_tokens, kv_heads * 8, kv_heads, head_dim);
+        0, cache_len, 0, max_tokens, kv_heads * 8, kv_heads, head_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
-        scores, 0, cache_len, max_tokens);
+        scores, 0, cache_len, 0, max_tokens);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_quantize_probability_kernel<<<dim3(kv_heads, max_context_tiles, 1), 128, 0, stream>>>(
-        scores, probability_tiles, probability_scales, 0, cache_len, max_tokens,
+        scores, probability_tiles, probability_scales, 0, cache_len, 0, max_tokens,
         kv_heads * 8, kv_heads);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, 0, cache_len, max_tokens, kv_heads * 8, kv_heads, head_dim);
+        output, 0, cache_len, 0, max_tokens, kv_heads * 8, kv_heads, head_dim);
     return cudaGetLastError();
 }
 
@@ -1822,12 +1866,12 @@ extern "C" cudaError_t infer_sm12x_kv_pv_from_probabilities_on_stream(
     const std::uint32_t context_tiles = (cache_len + 63) / 64;
     infer_sm12x_kv_quantize_probability_kernel<<<dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
         probabilities, probability_tiles, probability_scales, cache_len, nullptr,
-        max_tokens, kv_heads * 8, kv_heads);
+        0, max_tokens, kv_heads * 8, kv_heads);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, cache_len, nullptr, max_tokens, kv_heads * 8, kv_heads, head_dim);
+        output, cache_len, nullptr, 0, max_tokens, kv_heads * 8, kv_heads, head_dim);
     return cudaGetLastError();
 }
 
