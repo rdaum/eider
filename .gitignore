@@ -19,5 +19,9 @@
 *.so
 *.dylib
 
+# Python probe byproducts.
+__pycache__/
+*.pyc
+
 # Local third-party dependency checkouts/builds.
 /.deps/
