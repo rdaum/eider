@@ -3,7 +3,7 @@ use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
-use infer::runtime::scheduler::Qwen36SchedulerConfig;
+use infer::runtime::scheduler::SchedulerConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ const TOKEN_RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Parser)]
 #[command(about = "Serve Eider through the OpenAI Responses API")]
 struct Args {
-    /// Qwen3.6 checkpoint directory.
+    /// Supported checkpoint directory.
     model_dir: PathBuf,
 
     /// Address exposed by the HTTP server.
@@ -47,6 +47,10 @@ struct Args {
     #[arg(long, default_value_t = 32_768)]
     max_context_tokens: usize,
 
+    /// Resident expert slots per routed Step-3.5 layer.
+    #[arg(long, default_value_t = 240)]
+    step35_expert_capacity: usize,
+
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
     api_key_env: String,
@@ -75,13 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Eider");
     let args = Args::parse();
     let mut actor_config = InferenceActorConfig::new(&args.model_dir);
-    actor_config.scheduler = Qwen36SchedulerConfig {
+    actor_config.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,
         prefill_token_capacity: args.prefill_token_capacity,
         max_active_sequences: args.max_active_sequences,
         max_context_tokens: args.max_context_tokens,
     };
+    actor_config.step35_expert_capacity = args.step35_expert_capacity;
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
     let config = ApiConfig {

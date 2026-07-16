@@ -4,17 +4,17 @@ use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, F32Matrix, MarlinNvfp4GateUp, MarlinNvfp4HostWeight,
-    ModelOptCheckpoint, ModelOptNvfp4Linear, PinnedHostBuffer, Result, Sm12xFp4TileSet,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gemv_row_scales_residual2_batch_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
-    modelopt_m16_k64_row_scale_words, moe_silu_quantize_slots_residual_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
-    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
-    step35_sigmoid_top8_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
+    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear,
+    PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, gemv_row_scales_residual2_batch_on_stream,
+    indexed_grouped_gemv_row_scales_residual_on_stream, modelopt_m16_k64_row_scale_words,
+    moe_silu_quantize_slots_residual_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    quantize_dynamic_vectors_residual2_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_inv_freq_sequence_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
+    silu_mul_halves_f32_into_on_stream, step35_sigmoid_top8_f32_into_on_stream,
 };
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
@@ -316,6 +316,15 @@ impl Step35QuantizedRows {
             stream,
         )
     }
+
+    fn device_bytes(&self) -> usize {
+        self.native_tiles.device_bytes()
+            + self.scales.device_bytes()
+            + self.residual_tiles.device_bytes()
+            + self.residual_scales.device_bytes()
+            + self.residual2_tiles.device_bytes()
+            + self.residual2_scales.device_bytes()
+    }
 }
 
 impl Step35Linear {
@@ -436,6 +445,14 @@ impl Step35MlpWorkspace {
     pub fn into_output(self) -> DeviceBuffer<f32> {
         self.output
     }
+
+    fn device_bytes(&self) -> usize {
+        self.input_quantized.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.activated_quantized.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 impl Step35Mlp {
@@ -550,6 +567,25 @@ pub struct Step35AttentionWorkspace {
 impl Step35AttentionWorkspace {
     pub fn into_output(self) -> DeviceBuffer<f32> {
         self.output
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.input_quantized.device_bytes()
+            + self.q.device_bytes()
+            + self.k.device_bytes()
+            + self.v.device_bytes()
+            + self.q_normed.device_bytes()
+            + self.k_normed.device_bytes()
+            + self.q_rope.device_bytes()
+            + self.k_rope.device_bytes()
+            + self.query.device_bytes()
+            + self.attended.device_bytes()
+            + self.last_input.device_bytes()
+            + self.last_input_quantized.device_bytes()
+            + self.gate.device_bytes()
+            + self.gated.device_bytes()
+            + self.gated_quantized.device_bytes()
+            + self.output.device_bytes()
     }
 }
 
@@ -1261,6 +1297,23 @@ impl Step35PagedExpertWorkspace {
     pub(crate) fn gate_up_output(&self) -> &DeviceBuffer<f32> {
         &self.gate_up_output
     }
+
+    fn device_bytes(&self) -> usize {
+        self.gate_up_output.device_bytes()
+            + self.gate_up_table.device_bytes()
+            + self.down_input_tiles.device_bytes()
+            + self.down_input_scales.device_bytes()
+            + self.down_residual_tiles.device_bytes()
+            + self.down_residual_scales.device_bytes()
+            + self
+                ._down_outputs
+                .iter()
+                .map(F32Matrix::device_bytes)
+                .sum::<usize>()
+            + self.down_output_table.device_bytes()
+            + self.down_result_table.device_bytes()
+            + self.aggregate.device_bytes()
+    }
 }
 
 enum Step35LayerFfn {
@@ -1303,6 +1356,23 @@ pub struct Step35LayerWorkspace {
 impl Step35LayerWorkspace {
     fn output(&self) -> &DeviceBuffer<f32> {
         &self.output
+    }
+
+    fn device_bytes(&self) -> usize {
+        let ffn = match &self.ffn {
+            Step35LayerFfnWorkspace::Dense(mlp) => mlp.device_bytes(),
+            Step35LayerFfnWorkspace::Moe {
+                shared,
+                paged,
+                combined,
+            } => shared.device_bytes() + paged.device_bytes() + combined.device_bytes(),
+        };
+        self.normed.device_bytes()
+            + self.attention.device_bytes()
+            + self.post_attention.device_bytes()
+            + self.ffn_input.device_bytes()
+            + ffn
+            + self.output.device_bytes()
     }
 }
 
@@ -1465,11 +1535,11 @@ pub struct Step35TextModel {
     final_norm: Step35RmsNorm,
     lm_head: DeviceBuffer<u16>,
     vocab: usize,
+    stream: CudaStream,
 }
 
 /// Mutable scratch and persistent KV state for one Step decode session.
 pub struct Step35DecodeState {
-    stream: CudaStream,
     token: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Step35LayerWorkspace>,
@@ -1479,6 +1549,7 @@ pub struct Step35DecodeState {
     logits: DeviceBuffer<f32>,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
+    sampler: GpuTokenSampler,
 }
 
 /// One Step next-token argmax result.
@@ -1512,12 +1583,12 @@ impl Step35TextModel {
             final_norm,
             lm_head,
             vocab,
+            stream: CudaStream::new_non_blocking()?,
         })
     }
 
     pub fn new_decode_state(&self, max_tokens: usize) -> Result<Step35DecodeState> {
         Ok(Step35DecodeState {
-            stream: CudaStream::new_non_blocking()?,
             token: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(HIDDEN)?,
             layers: self
@@ -1544,7 +1615,48 @@ impl Step35TextModel {
             logits: DeviceBuffer::zeroed(self.vocab)?,
             next_index: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
+            sampler: GpuTokenSampler::new(1, self.vocab)?,
         })
+    }
+
+    /// Returns the checkpoint vocabulary size.
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Advances one sequence token without selecting from the resulting logits.
+    pub fn consume_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
+        self.forward_hidden(state, token)
+    }
+
+    /// Advances one sequence token and samples from its device-resident logits.
+    pub fn sample_one(
+        &mut self,
+        state: &mut Step35DecodeState,
+        token: u32,
+        sampling: &mut GpuSamplingRow<'_>,
+    ) -> Result<GpuSampledToken> {
+        self.forward_one(state, token)?;
+        state
+            .sampler
+            .sample(
+                &state.logits,
+                std::slice::from_mut(sampling),
+                self.vocab,
+                &self.stream,
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Format {
+                label: "Step-3.5 GPU sampling",
+                detail: "sampler returned no token".to_string(),
+            })
+    }
+
+    /// Advances one sequence token and copies the resulting logits to the host.
+    pub fn logits_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<Vec<f32>> {
+        self.forward_one(state, token)?;
+        Ok(state.logits.copy_to_host(&self.stream)?.into_vec())
     }
 
     pub fn decode_one(
@@ -1552,6 +1664,20 @@ impl Step35TextModel {
         state: &mut Step35DecodeState,
         token: u32,
     ) -> Result<Step35NextToken> {
+        self.forward_one(state, token)?;
+        argmax_f32_into_on_stream(
+            &state.logits,
+            state.next_index.output(),
+            state.next_value.output(),
+            &self.stream,
+        )?;
+        Ok(Step35NextToken {
+            id: state.next_index.copy_to_host(&self.stream)?[0],
+            value: state.next_value.copy_to_host(&self.stream)?[0],
+        })
+    }
+
+    fn forward_hidden(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
         if token as usize >= self.vocab {
             return Err(Error::Shape {
                 label: "Step-3.5 token",
@@ -1574,7 +1700,7 @@ impl Step35TextModel {
             &self.embedding,
             &state.token,
             state.hidden.output(),
-            &state.stream,
+            &self.stream,
         )?;
         for layer in 0..self.layers.len() {
             let (previous, current) = state.layers.split_at_mut(layer);
@@ -1589,9 +1715,14 @@ impl Step35TextModel {
                 &mut state.kv_cache[layer],
                 &mut state.kv_attention[layer],
                 position,
-                &state.stream,
+                &self.stream,
             )?;
         }
+        Ok(())
+    }
+
+    fn forward_one(&mut self, state: &mut Step35DecodeState, token: u32) -> Result<()> {
+        self.forward_hidden(state, token)?;
         let last = state
             .layers
             .last()
@@ -1601,25 +1732,15 @@ impl Step35TextModel {
             })?
             .output();
         self.final_norm
-            .run_into(last, &mut state.final_hidden, 1, HIDDEN, &state.stream)?;
+            .run_into(last, &mut state.final_hidden, 1, HIDDEN, &self.stream)?;
         bf16_linear_logits_f32_into_on_stream(
             &state.final_hidden,
             &self.lm_head,
             state.logits.output(),
             self.vocab,
             HIDDEN,
-            &state.stream,
-        )?;
-        argmax_f32_into_on_stream(
-            &state.logits,
-            state.next_index.output(),
-            state.next_value.output(),
-            &state.stream,
-        )?;
-        Ok(Step35NextToken {
-            id: state.next_index.copy_to_host(&state.stream)?[0],
-            value: state.next_value.copy_to_host(&state.stream)?[0],
-        })
+            &self.stream,
+        )
     }
 
     /// Returns cumulative paging activity across all routed-expert layers.
@@ -1633,6 +1754,44 @@ impl Step35TextModel {
                 total.bytes_read += layer.bytes_read;
                 total
             })
+    }
+}
+
+impl Step35DecodeState {
+    /// Returns the number of tokens retained in this sequence's KV cache.
+    pub fn len(&self) -> usize {
+        self.kv_cache.first().map_or(0, Sm12xKvCache::len)
+    }
+
+    /// Returns whether this sequence has not consumed any tokens.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns exact device bytes owned by this sequence state and its scratch.
+    pub fn device_bytes(&self) -> usize {
+        self.token.device_bytes()
+            + self.hidden.device_bytes()
+            + self
+                .layers
+                .iter()
+                .map(Step35LayerWorkspace::device_bytes)
+                .sum::<usize>()
+            + self
+                .kv_cache
+                .iter()
+                .map(Sm12xKvCache::device_bytes)
+                .sum::<usize>()
+            + self
+                .kv_attention
+                .iter()
+                .map(Sm12xKvAttentionWorkspace::device_bytes)
+                .sum::<usize>()
+            + self.final_hidden.device_bytes()
+            + self.logits.device_bytes()
+            + self.next_index.device_bytes()
+            + self.next_value.device_bytes()
+            + self.sampler.device_bytes()
     }
 }
 

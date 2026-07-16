@@ -60,6 +60,22 @@ impl GenerationConfig {
             detail: error.to_string(),
         })?;
         let defaults = SamplingConfig::default();
+        let eos_token_ids = parse_eos_token_ids(&value)?;
+        let eos_token_ids = if eos_token_ids.is_empty() {
+            let config_path = model_dir.as_ref().join("config.json");
+            let contents =
+                std::fs::read_to_string(&config_path).map_err(|error| Error::Format {
+                    label: "config.json",
+                    detail: format!("{}: {error}", config_path.display()),
+                })?;
+            let model: Value = serde_json::from_str(&contents).map_err(|error| Error::Format {
+                label: "config.json",
+                detail: error.to_string(),
+            })?;
+            parse_eos_token_ids(&model)?
+        } else {
+            eos_token_ids
+        };
         let config = Self {
             sampling: SamplingConfig {
                 temperature: value["temperature"]
@@ -79,7 +95,7 @@ impl GenerationConfig {
                     .as_f64()
                     .map_or(0.0, |value| value as f32),
             },
-            eos_token_ids: parse_eos_token_ids(&value)?,
+            eos_token_ids,
             ..Self::default()
         };
         config.validate()?;
@@ -338,6 +354,34 @@ mod tests {
         assert_eq!(config.sampling.top_k, 40);
         assert_eq!(config.sampling.top_p, 0.8);
         assert_eq!(config.eos_token_ids.into_iter().collect::<Vec<_>>(), [1, 2]);
+
+        fs::remove_dir_all(directory).expect("remove config directory");
+    }
+
+    #[test]
+    fn model_config_supplies_eos_when_generation_config_omits_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "eider-generation-model-config-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).expect("create config directory");
+        fs::write(
+            directory.join("generation_config.json"),
+            r#"{"temperature":0.6,"top_p":0.95}"#,
+        )
+        .expect("write generation config");
+        fs::write(
+            directory.join("config.json"),
+            r#"{"eos_token_id":[1,2,128007]}"#,
+        )
+        .expect("write model config");
+
+        let config = GenerationConfig::from_model_dir(&directory).expect("generation config");
+        assert_eq!(
+            config.eos_token_ids.into_iter().collect::<Vec<_>>(),
+            [1, 2, 128007]
+        );
 
         fs::remove_dir_all(directory).expect("remove config directory");
     }

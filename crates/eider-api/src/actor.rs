@@ -5,11 +5,14 @@ use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::metrics::metrics as infer_metrics;
 use infer::qwen3::qwen36::Qwen36TextModel;
 use infer::runtime::chat::CheckpointChatTemplate;
+use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, Qwen36SchedulerConfig};
-use infer::runtime::serving::{
-    Qwen36ChatFinishReason, Qwen36ChatFinished, Qwen36ChatRequest, Qwen36ChatService,
-};
+use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, SchedulerConfig};
+use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
+use infer::runtime::step35_scheduler::{Step35CancelOutcome, Step35RequestId};
+use infer::runtime::step35_serving::Step35ChatService;
+use infer::step35::Step35TextModel;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,7 +28,8 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
-    pub scheduler: Qwen36SchedulerConfig,
+    pub scheduler: SchedulerConfig,
+    pub step35_expert_capacity: usize,
     pub event_capacity: usize,
 }
 
@@ -33,7 +37,8 @@ impl InferenceActorConfig {
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
         Self {
             model_dir: model_dir.into(),
-            scheduler: Qwen36SchedulerConfig::default(),
+            scheduler: SchedulerConfig::default(),
+            step35_expert_capacity: 240,
             event_capacity: 256,
         }
     }
@@ -65,7 +70,7 @@ struct ActorInner {
 enum ActorCommand {
     Submit {
         id: ActorRequestId,
-        request: Qwen36ChatRequest,
+        request: ChatRequest,
         events: mpsc::Sender<InferenceEvent>,
         submitted_at: Instant,
     },
@@ -117,9 +122,18 @@ impl InferenceActor {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let model_dir = config.model_dir.clone();
         let scheduler = config.scheduler;
+        let step35_expert_capacity = config.step35_expert_capacity;
         thread::Builder::new()
             .name("eider-inference".to_string())
-            .spawn(move || actor_main(model_dir, scheduler, commands_rx, ready_tx))
+            .spawn(move || {
+                actor_main(
+                    model_dir,
+                    scheduler,
+                    step35_expert_capacity,
+                    commands_rx,
+                    ready_tx,
+                )
+            })
             .map_err(|error| {
                 ApiError::server(format!("failed to start inference actor: {error}"))
             })?;
@@ -142,7 +156,7 @@ impl InferenceActor {
     }
 
     /// Queues a request without blocking an async executor on CUDA work.
-    pub fn submit(&self, request: Qwen36ChatRequest) -> Result<ActorResponse, ApiError> {
+    pub fn submit(&self, request: ChatRequest) -> Result<ActorResponse, ApiError> {
         let id = ActorRequestId(self.inner.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (events_tx, events_rx) = mpsc::channel(self.inner.event_capacity);
         self.inner
@@ -174,19 +188,18 @@ impl Drop for ActorInner {
 
 fn actor_main(
     model_dir: PathBuf,
-    scheduler: Qwen36SchedulerConfig,
+    scheduler: SchedulerConfig,
+    step35_expert_capacity: usize,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
 ) {
-    info!(model_dir = %model_dir.display(), "loading Qwen3.6 model");
-    let model = match Qwen36TextModel::open(&model_dir) {
-        Ok(model) => model,
+    let architecture = match checkpoint_architecture(&model_dir) {
+        Ok(architecture) => architecture,
         Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
+            let _ = ready.send(Err(error));
             return;
         }
     };
-    info!("model weights loaded; loading chat template and generation defaults");
     let template = match CheckpointChatTemplate::from_model_dir(&model_dir) {
         Ok(template) => template,
         Err(error) => {
@@ -209,43 +222,357 @@ fn actor_main(
         max_context_tokens = scheduler.max_context_tokens,
         "allocating scheduler workspaces"
     );
-    let mut service = match Qwen36ChatService::new(&model, &template, scheduler) {
-        Ok(service) => service,
-        Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
-            return;
+
+    match architecture {
+        CheckpointArchitecture::Qwen36 => {
+            info!(model_dir = %model_dir.display(), "loading Qwen3.6 model");
+            let model = match Qwen36TextModel::open(&model_dir) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let service = match Qwen36ChatService::new(&model, &template, scheduler) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut service = QwenActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
-    };
+        CheckpointArchitecture::Step35 => {
+            info!(
+                model_dir = %model_dir.display(),
+                expert_capacity = step35_expert_capacity,
+                "loading Step-3.5 model"
+            );
+            let model = match Step35TextModel::open(&model_dir, step35_expert_capacity) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let service = match Step35ChatService::new(model, &template, scheduler) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut service = StepActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointArchitecture {
+    Qwen36,
+    Step35,
+}
+
+#[derive(Deserialize)]
+struct CheckpointConfig {
+    model_type: String,
+}
+
+fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArchitecture, String> {
+    let path = model_dir.join("config.json");
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let config: CheckpointConfig = serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    match config.model_type.as_str() {
+        "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
+        "step3p5" => Ok(CheckpointArchitecture::Step35),
+        other => Err(format!(
+            "unsupported model_type {other:?} in {}",
+            path.display()
+        )),
+    }
+}
+
+struct EngineAdmission {
+    request_id: u64,
+    prompt_tokens: usize,
+    max_output_tokens: usize,
+}
+
+struct EngineAdmissionProgress {
+    request_id: u64,
+    sequence_device_bytes: usize,
+}
+
+struct EnginePrefillProgress {
+    request_id: u64,
+    prompt_position: usize,
+}
+
+struct EngineDelta {
+    request_id: u64,
+    event: ChatOutputEvent,
+}
+
+struct EngineFinished {
+    request_id: u64,
+    finish_reason: ChatFinishReason,
+    usage: ChatUsage,
+    released_sequence_device_bytes: usize,
+}
+
+#[derive(Default)]
+struct EngineTick {
+    admitted: Vec<EngineAdmissionProgress>,
+    prefilled: Vec<EnginePrefillProgress>,
+    generated: Vec<u64>,
+    output: Vec<EngineDelta>,
+    finished: Vec<EngineFinished>,
+    active_sequences: usize,
+}
+
+enum EngineCancelOutcome {
+    Cancelled {
+        released_sequence_device_bytes: usize,
+    },
+    AlreadyFinished,
+    NotFound,
+}
+
+trait ActorService {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission>;
+    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick>;
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
+    fn active_sequence_count(&self) -> usize;
+}
+
+struct QwenActorService<'model, 'template> {
+    inner: Qwen36ChatService<'model, 'template>,
+    ids: BTreeMap<u64, Qwen36RequestId>,
+}
+
+impl<'model, 'template> QwenActorService<'model, 'template> {
+    fn new(inner: Qwen36ChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for QwenActorService<'_, '_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
+        let tick = self.inner.tick()?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            admitted: tick
+                .admitted
+                .into_iter()
+                .map(|progress| EngineAdmissionProgress {
+                    request_id: progress.request_id.get(),
+                    sequence_device_bytes: progress.sequence_device_bytes,
+                })
+                .collect(),
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Qwen36RequestId::get)
+                .collect(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Qwen36CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
+            },
+            Qwen36CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
+            Qwen36CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+struct StepActorService<'template> {
+    inner: Step35ChatService<'template>,
+    ids: BTreeMap<u64, Step35RequestId>,
+}
+
+impl<'template> StepActorService<'template> {
+    fn new(inner: Step35ChatService<'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for StepActorService<'_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
+        let tick = self.inner.tick()?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            admitted: tick
+                .admitted
+                .into_iter()
+                .map(|progress| EngineAdmissionProgress {
+                    request_id: progress.request_id.get(),
+                    sequence_device_bytes: progress.sequence_device_bytes,
+                })
+                .collect(),
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Step35RequestId::get)
+                .collect(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Step35CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
+            },
+            Step35CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
+            Step35CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+fn run_actor_loop(
+    service: &mut dyn ActorService,
+    commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
+    ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
+    defaults: GenerationConfig,
+) {
     info!("inference actor ready");
     if ready.send(Ok(defaults)).is_err() {
         return;
     }
 
-    let mut active = BTreeMap::<Qwen36RequestId, ActiveRequest>::new();
-    let mut scheduler_by_external = BTreeMap::<ActorRequestId, Qwen36RequestId>::new();
+    let mut active = BTreeMap::<u64, ActiveRequest>::new();
+    let mut scheduler_by_external = BTreeMap::<ActorRequestId, u64>::new();
     loop {
         if active.is_empty() {
             let Some(command) = commands.blocking_recv() else {
                 break;
             };
-            if !handle_command(
-                command,
-                &mut service,
-                &mut active,
-                &mut scheduler_by_external,
-            ) {
+            if !handle_command(command, service, &mut active, &mut scheduler_by_external) {
                 break;
             }
         }
 
         while let Ok(command) = commands.try_recv() {
-            if !handle_command(
-                command,
-                &mut service,
-                &mut active,
-                &mut scheduler_by_external,
-            ) {
-                cancel_all(&mut service, &mut active, &mut scheduler_by_external);
+            if !handle_command(command, service, &mut active, &mut scheduler_by_external) {
+                cancel_all(service, &mut active, &mut scheduler_by_external);
                 return;
             }
         }
@@ -267,12 +594,7 @@ fn actor_main(
                         .events
                         .try_send(InferenceEvent::Error(message.clone()));
                 }
-                fail_all(
-                    &mut service,
-                    &mut active,
-                    &mut scheduler_by_external,
-                    &message,
-                );
+                fail_all(service, &mut active, &mut scheduler_by_external, &message);
                 continue;
             }
         };
@@ -398,18 +720,18 @@ fn actor_main(
         disconnected.sort_unstable();
         disconnected.dedup();
         for id in disconnected {
-            cancel_scheduler_request(id, &mut service, &mut active, &mut scheduler_by_external);
+            cancel_scheduler_request(id, service, &mut active, &mut scheduler_by_external);
         }
-        update_current_counts(&service, &active);
+        update_current_counts(service, &active);
     }
-    cancel_all(&mut service, &mut active, &mut scheduler_by_external);
+    cancel_all(service, &mut active, &mut scheduler_by_external);
 }
 
 fn handle_command(
     command: ActorCommand,
-    service: &mut Qwen36ChatService<'_, '_>,
-    active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
+    service: &mut dyn ActorService,
+    active: &mut BTreeMap<u64, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) -> bool {
     match command {
         ActorCommand::Submit {
@@ -457,15 +779,17 @@ fn handle_command(
 }
 
 fn cancel_scheduler_request(
-    scheduler_id: Qwen36RequestId,
-    service: &mut Qwen36ChatService<'_, '_>,
-    active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
+    scheduler_id: u64,
+    service: &mut dyn ActorService,
+    active: &mut BTreeMap<u64, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) {
     let outcome = service.cancel_request(scheduler_id);
     let released_sequence_device_bytes = match outcome {
-        Qwen36CancelOutcome::Cancelled(cancelled) => cancelled.released_sequence_device_bytes,
-        Qwen36CancelOutcome::AlreadyFinished | Qwen36CancelOutcome::NotFound => 0,
+        EngineCancelOutcome::Cancelled {
+            released_sequence_device_bytes,
+        } => released_sequence_device_bytes,
+        EngineCancelOutcome::AlreadyFinished | EngineCancelOutcome::NotFound => 0,
     };
     if let Some(request) = active.remove(&scheduler_id) {
         scheduler_by_external.remove(&request.external_id);
@@ -486,17 +810,19 @@ fn cancel_scheduler_request(
 }
 
 fn fail_all(
-    service: &mut Qwen36ChatService<'_, '_>,
-    active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
+    service: &mut dyn ActorService,
+    active: &mut BTreeMap<u64, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
     error: &str,
 ) {
     let ids = active.keys().copied().collect::<Vec<_>>();
     for id in ids {
         let outcome = service.cancel_request(id);
         let released_sequence_device_bytes = match outcome {
-            Qwen36CancelOutcome::Cancelled(cancelled) => cancelled.released_sequence_device_bytes,
-            Qwen36CancelOutcome::AlreadyFinished | Qwen36CancelOutcome::NotFound => 0,
+            EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => released_sequence_device_bytes,
+            EngineCancelOutcome::AlreadyFinished | EngineCancelOutcome::NotFound => 0,
         };
         if let Some(request) = active.remove(&id) {
             scheduler_by_external.remove(&request.external_id);
@@ -518,9 +844,9 @@ fn fail_all(
 }
 
 fn cancel_all(
-    service: &mut Qwen36ChatService<'_, '_>,
-    active: &mut BTreeMap<Qwen36RequestId, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, Qwen36RequestId>,
+    service: &mut dyn ActorService,
+    active: &mut BTreeMap<u64, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) {
     let ids = active.keys().copied().collect::<Vec<_>>();
     for id in ids {
@@ -528,10 +854,7 @@ fn cancel_all(
     }
 }
 
-fn update_current_counts(
-    service: &Qwen36ChatService<'_, '_>,
-    active: &BTreeMap<Qwen36RequestId, ActiveRequest>,
-) {
+fn update_current_counts(service: &dyn ActorService, active: &BTreeMap<u64, ActiveRequest>) {
     server_metrics().active_requests.set(active.len() as i64);
     infer_metrics()
         .active_sequences
@@ -607,7 +930,7 @@ impl SessionMetrics {
         &self,
         id: ActorRequestId,
         now: Instant,
-        finished: &Qwen36ChatFinished,
+        finished: &EngineFinished,
         active_requests: usize,
         active_sequences: usize,
     ) {
@@ -701,18 +1024,19 @@ fn duration_us(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-fn map_finish_reason(reason: &Qwen36ChatFinishReason) -> FinishReason {
+fn map_finish_reason(reason: &ChatFinishReason) -> FinishReason {
     match reason {
-        Qwen36ChatFinishReason::Eos => FinishReason::Eos,
-        Qwen36ChatFinishReason::Length => FinishReason::Length,
-        Qwen36ChatFinishReason::Stop(_) => FinishReason::Stop,
-        Qwen36ChatFinishReason::ToolCalls => FinishReason::ToolCalls,
+        ChatFinishReason::Eos => FinishReason::Eos,
+        ChatFinishReason::Length => FinishReason::Length,
+        ChatFinishReason::Stop(_) => FinishReason::Stop,
+        ChatFinishReason::ToolCalls => FinishReason::ToolCalls,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn session_metrics_report_exact_interval_and_decode_rates() {
@@ -763,5 +1087,31 @@ mod tests {
     #[test]
     fn zero_duration_has_no_rate() {
         assert_eq!(rate(1, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn checkpoint_architecture_selects_supported_model_families() {
+        let directory = std::env::temp_dir().join(format!(
+            "eider-actor-model-type-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).expect("create checkpoint directory");
+        fs::write(directory.join("config.json"), r#"{"model_type":"step3p5"}"#)
+            .expect("write Step config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Step35
+        );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"qwen3_5_moe"}"#,
+        )
+        .expect("write Qwen config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Qwen36
+        );
+        fs::remove_dir_all(directory).expect("remove checkpoint directory");
     }
 }

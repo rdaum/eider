@@ -113,7 +113,7 @@ async fn models(
     let codex_model = json!({
             "slug": model,
             "display_name": model,
-            "description": "Eider local Qwen model",
+            "description": "Eider local model",
             "default_reasoning_level": "none",
             "supported_reasoning_levels": [{"effort": "none", "description": "Model default"}],
             "shell_type": "unified_exec",
