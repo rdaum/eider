@@ -12,8 +12,6 @@
 
 namespace {
 
-constexpr int kHidden = 2048;
-constexpr int kGateUp = 1024;
 constexpr int kTopK = 8;
 constexpr int kMoeBlockSize = 8;
 constexpr int kThreads = 256;
@@ -38,8 +36,9 @@ __global__ void prepare_routes_and_input_kernel(
     std::uint16_t* __restrict__ input_bf16,
     std::int32_t* __restrict__ sorted_token_ids,
     std::int32_t* __restrict__ expert_ids,
-    std::int32_t* __restrict__ num_tokens_past_padded) {
-    for (int col = threadIdx.x; col < kHidden; col += blockDim.x) {
+    std::int32_t* __restrict__ num_tokens_past_padded,
+    std::uint32_t hidden_features) {
+    for (std::uint32_t col = threadIdx.x; col < hidden_features; col += blockDim.x) {
         input_bf16[col] = __bfloat16_as_ushort(__float2bfloat16_rn(input[col]));
     }
     if (threadIdx.x < kTopK) {
@@ -62,11 +61,12 @@ __global__ void prepare_routes_and_input_batch_kernel(
     std::int32_t* __restrict__ sorted_token_ids,
     std::int32_t* __restrict__ expert_ids,
     std::int32_t* __restrict__ num_tokens_past_padded,
-    std::uint32_t batch_size) {
+    std::uint32_t batch_size,
+    std::uint32_t hidden_features) {
     const std::uint32_t batch = blockIdx.x;
-    for (int col = threadIdx.x; col < kHidden; col += blockDim.x) {
-        input_bf16[batch * kHidden + col] = __bfloat16_as_ushort(
-            __float2bfloat16_rn(input[batch * kHidden + col]));
+    for (std::uint32_t col = threadIdx.x; col < hidden_features; col += blockDim.x) {
+        input_bf16[batch * hidden_features + col] = __bfloat16_as_ushort(
+            __float2bfloat16_rn(input[batch * hidden_features + col]));
     }
     if (threadIdx.x < kTopK) {
         const std::uint32_t slot = threadIdx.x;
@@ -143,25 +143,29 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     std::int32_t* sorted_token_ids,
     std::int32_t* expert_ids,
     std::int32_t* num_tokens_past_padded,
+    std::uint32_t gate_up_features,
+    std::uint32_t hidden_features,
     cudaStream_t stream) {
     if (indices == nullptr || input == nullptr || repacked_weight == nullptr ||
         weight_scale == nullptr || global_scale == nullptr ||
         input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
         locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
-        num_tokens_past_padded == nullptr) {
+        num_tokens_past_padded == nullptr || gate_up_features == 0 ||
+        hidden_features == 0 || gate_up_features % 128 != 0 ||
+        hidden_features % 16 != 0) {
         return cudaErrorInvalidValue;
     }
 
     prepare_routes_and_input_kernel<<<1, kThreads, 0, stream>>>(
         indices, input, input_bf16, sorted_token_ids, expert_ids,
-        num_tokens_past_padded);
+        num_tokens_past_padded, hidden_features);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
 
     auto kernel = marlin_kernel();
     // Eight expert blocks times eight N tiles. One CUDA block per complete
     // MN tile avoids split-K reduction for the batch-one top-8 shape.
-    constexpr int grid_blocks = kTopK * (kGateUp / 128);
+    const int grid_blocks = kTopK * (gate_up_features / 128);
     kernel<<<grid_blocks, kThreads, kDynamicSharedBytes, stream>>>(
         reinterpret_cast<const int4*>(input_bf16),
         reinterpret_cast<const int4*>(repacked_weight),
@@ -179,10 +183,10 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
         nullptr,
         kTopK,
         false,
-        kHidden / 16,
+        hidden_features / 16,
         1,
-        kGateUp,
-        kHidden,
+        gate_up_features,
+        hidden_features,
         locks,
         false,
         false,
@@ -190,9 +194,9 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
 
-    constexpr std::uint32_t output_len = kTopK * kGateUp;
+    const std::uint32_t output_len = kTopK * gate_up_features;
     constexpr int convert_threads = 256;
-    constexpr int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
+    const int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
     if (output != nullptr) {
         bf16_to_f32_kernel<<<convert_blocks, convert_threads, 0, stream>>>(
             output_bf16, output, output_len);
@@ -215,22 +219,26 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
     std::int32_t* expert_ids,
     std::int32_t* num_tokens_past_padded,
     std::uint32_t batch_size,
+    std::uint32_t gate_up_features,
+    std::uint32_t hidden_features,
     cudaStream_t stream) {
     if (indices == nullptr || input == nullptr || repacked_weight == nullptr ||
         weight_scale == nullptr || global_scale == nullptr ||
         input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
         locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
-        num_tokens_past_padded == nullptr || batch_size == 0) {
+        num_tokens_past_padded == nullptr || batch_size == 0 ||
+        gate_up_features == 0 || hidden_features == 0 ||
+        gate_up_features % 128 != 0 || hidden_features % 16 != 0) {
         return cudaErrorInvalidValue;
     }
     prepare_routes_and_input_batch_kernel<<<batch_size, kThreads, 0, stream>>>(
         indices, input, input_bf16, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, batch_size);
+        num_tokens_past_padded, batch_size, hidden_features);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     auto kernel = marlin_kernel();
     const int routed_rows = batch_size * kTopK;
-    const int grid_blocks = routed_rows * (kGateUp / 128);
+    const int grid_blocks = routed_rows * (gate_up_features / 128);
     kernel<<<grid_blocks, kThreads, kDynamicSharedBytes, stream>>>(
         reinterpret_cast<const int4*>(input_bf16),
         reinterpret_cast<const int4*>(repacked_weight),
@@ -238,10 +246,11 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
         reinterpret_cast<int4*>(reduce_tmp), nullptr, nullptr,
         reinterpret_cast<const int4*>(weight_scale), global_scale, nullptr, nullptr,
         sorted_token_ids, expert_ids, num_tokens_past_padded, nullptr, kTopK, false,
-        kHidden / 16, batch_size, kGateUp, kHidden, locks, false, false, true);
+        hidden_features / 16, batch_size, gate_up_features, hidden_features,
+        locks, false, false, true);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    const std::uint32_t output_len = routed_rows * kGateUp;
+    const std::uint32_t output_len = routed_rows * gate_up_features;
     constexpr int convert_threads = 256;
     const int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
     if (output != nullptr) {

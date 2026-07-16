@@ -14,6 +14,9 @@ pub use runtime::kv_cache;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Step-3.5 expert preparation and residency experiments.
+pub mod step35;
+
 /// Runtime and cache metrics.
 pub mod metrics;
 
