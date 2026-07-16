@@ -12,6 +12,7 @@ tokenizers = "0.22"
 minijinja = { version = "2.21.0", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 minijinja-contrib = { version = "2.21.0", features = ["pycompat"] }
+libc = "0.2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

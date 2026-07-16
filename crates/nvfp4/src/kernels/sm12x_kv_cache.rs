@@ -38,6 +38,7 @@ pub struct Sm12xKvAttentionWorkspace {
     probability_tiles: DeviceBuffer<u8>,
     probability_scales: DeviceBuffer<u32>,
     max_tokens: usize,
+    q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
 }
@@ -444,18 +445,38 @@ impl Sm12xKvCache {
 impl Sm12xKvAttentionWorkspace {
     /// Allocates scratch for a cache with the given shape.
     pub fn new(max_tokens: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
-        if max_tokens == 0 || kv_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(MMA_K) {
+        Self::new_gqa(max_tokens, kv_heads * MMA_N, kv_heads, head_dim)
+    }
+
+    /// Allocates scratch for an explicit grouped-query attention shape.
+    pub fn new_gqa(
+        max_tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        if max_tokens == 0
+            || q_heads == 0
+            || kv_heads == 0
+            || !q_heads.is_multiple_of(kv_heads)
+            || head_dim == 0
+            || !head_dim.is_multiple_of(MMA_K)
+        {
             return Err(Error::Shape {
                 label: "SM12x KV attention workspace",
                 expected: "non-zero sizes and head_dim multiple of 64".to_string(),
-                actual: format!("max_tokens={max_tokens} kv_heads={kv_heads} head_dim={head_dim}"),
+                actual: format!(
+                    "max_tokens={max_tokens} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}"
+                ),
             });
         }
         let head_k_tiles = head_dim / MMA_K;
         let context_tiles = max_tokens.div_ceil(MMA_K);
-        let query_tile_count = checked_product("SM12x KV query tiles", &[kv_heads, head_k_tiles])?;
+        let query_groups = kv_heads * (q_heads / kv_heads).div_ceil(MMA_N);
+        let query_tile_count =
+            checked_product("SM12x KV query tiles", &[query_groups, head_k_tiles])?;
         let probability_tile_count =
-            checked_product("SM12x KV probability tiles", &[kv_heads, context_tiles])?;
+            checked_product("SM12x KV probability tiles", &[query_groups, context_tiles])?;
         Ok(Self {
             query_tiles: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV query tile bytes",
@@ -467,7 +488,7 @@ impl Sm12xKvAttentionWorkspace {
             )?)?,
             scores: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV scores",
-                &[kv_heads, MMA_N, max_tokens],
+                &[q_heads, max_tokens],
             )?)?,
             probability_tiles: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV probability tile bytes",
@@ -478,6 +499,7 @@ impl Sm12xKvAttentionWorkspace {
                 &[probability_tile_count, MMA_N],
             )?)?,
             max_tokens,
+            q_heads,
             kv_heads,
             head_dim,
         })
@@ -523,7 +545,7 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
-        let output_values = self.kv_heads * MMA_N * self.head_dim;
+        let output_values = self.q_heads * self.head_dim;
         if query.len() != output_values || output.len() != output_values {
             return Err(Error::Shape {
                 label: "SM12x KV attention query/output",
@@ -551,6 +573,7 @@ impl Sm12xKvAttentionWorkspace {
                     output.as_mut_ptr().cast(),
                     cache.len as u32,
                     cache.max_tokens as u32,
+                    self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -700,7 +723,7 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
-        let width = self.kv_heads * MMA_N * self.head_dim;
+        let width = self.q_heads * self.head_dim;
         if query_offset
             .checked_add(width)
             .is_none_or(|end| end > query.len())
@@ -737,6 +760,7 @@ impl Sm12xKvAttentionWorkspace {
                     output.as_mut_ptr().cast::<f32>().add(output_offset),
                     cache.len as u32,
                     cache.max_tokens as u32,
+                    self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -1211,7 +1235,7 @@ mod tests {
         const TOKENS: usize = 17;
         const KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 64;
-        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        const Q_HEADS: usize = KV_HEADS * 12;
         let width = KV_HEADS * HEAD_DIM;
         let key_host = (0..TOKENS * width)
             .map(|index| ((index * 31 % 251) as f32 - 125.0) / 512.0)
@@ -1251,7 +1275,8 @@ mod tests {
         .expect("f32 attention");
         let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
         let mut workspace =
-            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("workspace");
         workspace
             .attention_into_on_stream(&cache, &query, actual.output(), &stream)
             .expect("compact attention");

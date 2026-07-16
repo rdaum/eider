@@ -26,6 +26,11 @@ pub struct PinnedHostBuffer<T> {
     len: usize,
 }
 
+// A pinned allocation has unique ownership, and CUDA permits it to be used by
+// a different host thread. Moving the owner is therefore equivalent to moving
+// a Vec<T> when T is Send.
+unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
+
 impl<T: Copy> PinnedHostBuffer<T> {
     /// Allocates `len` zero-initialized values in pinned host memory.
     pub fn zeroed(len: usize) -> Result<Self> {
@@ -85,6 +90,11 @@ impl<T: Copy> PinnedHostBuffer<T> {
     /// Returns the pinned values.
     pub fn as_slice(&self) -> &[T] {
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Returns the pinned values mutably for direct record decoding.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     /// Replaces the allocation contents without changing its address.
@@ -762,6 +772,58 @@ impl<T: Copy> DeviceBuffer<T> {
                     self.ptr.add(element_offset).cast(),
                     values.ptr.cast(),
                     values.len * size_of::<T>(),
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Enqueues a byte range from a pinned allocation into this allocation.
+    pub fn copy_bytes_from_pinned_range_on_stream(
+        &mut self,
+        device_byte_offset: usize,
+        values: &PinnedHostBuffer<u8>,
+        source_byte_offset: usize,
+        bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let device_bytes = self
+            .len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device asynchronous byte range",
+                expected: "device length in bytes without overflow".to_string(),
+                actual: format!("len={} element_size={}", self.len, size_of::<T>()),
+            })?;
+        let device_end = device_byte_offset
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "device asynchronous byte range",
+                expected: "device offset + length without overflow".to_string(),
+                actual: format!("offset={device_byte_offset} bytes={bytes}"),
+            })?;
+        let source_end = source_byte_offset
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "pinned asynchronous byte range",
+                expected: "source offset + length without overflow".to_string(),
+                actual: format!("offset={source_byte_offset} bytes={bytes}"),
+            })?;
+        if device_end > device_bytes || source_end > values.len {
+            return Err(Error::Shape {
+                label: "asynchronous pinned byte range",
+                expected: format!("device end <= {device_bytes}, source end <= {}", values.len),
+                actual: format!("device_end={device_end} source_end={source_end}"),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(H2D byte range)",
+                ffi::cudaMemcpyAsync(
+                    self.ptr.cast::<u8>().add(device_byte_offset).cast(),
+                    values.ptr.add(source_byte_offset).cast(),
+                    bytes,
                     ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
                     stream.as_raw(),
                 ),

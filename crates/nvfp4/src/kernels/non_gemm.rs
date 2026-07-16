@@ -379,6 +379,47 @@ pub fn sigmoid_mul_f32_into_on_stream(
     }
 }
 
+/// Broadcasts one sigmoid gate per attention head across its head dimension.
+pub fn sigmoid_scale_heads_f32_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if gate.is_empty()
+        || head_dim == 0
+        || input.len() != gate.len() * head_dim
+        || output.len() != input.len()
+        || gate.len() > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "sigmoid head-gate buffers",
+            expected: "input/output=heads*head_dim with one gate per head".to_string(),
+            actual: format!(
+                "gate={} input={} output={} head_dim={head_dim}",
+                gate.len(),
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sigmoid_scale_heads_f32_on_stream",
+            ffi::infer_sigmoid_scale_heads_f32_on_stream(
+                gate.ptr,
+                input.ptr,
+                output.buffer_mut().ptr,
+                gate.len() as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Computes `output = input * sigmoid(gate_logit[0])` elementwise, reading a
 /// single scalar gate and broadcasting it. Used for the Qwen3.6 shared-expert
 /// gate, replacing a host readback + broadcast + sigmoid_mul sequence.
@@ -695,6 +736,50 @@ pub fn moe_topk_f32_into_on_stream(
                 logits.len() as u32,
                 k as u32,
                 i32::from(norm_topk_prob),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues Step-3.5 sigmoid routing with biased top-8 selection.
+///
+/// Selection ranks `sigmoid(logit) + bias`; output weights use the original
+/// selected sigmoid probabilities, normalized to sum to 3.
+pub fn step35_sigmoid_top8_f32_into_on_stream(
+    logits: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    mut out_indices: DeviceOutput<'_, u32>,
+    mut out_weights: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if logits.len() < 8
+        || logits.len() != bias.len()
+        || out_indices.len() != 8
+        || out_weights.len() != 8
+        || logits.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "Step-3.5 sigmoid top-8 buffers",
+            expected: "matching logits/bias with at least 8 experts and top-8 outputs".to_string(),
+            actual: format!(
+                "logits={} bias={} indices={} weights={}",
+                logits.len(),
+                bias.len(),
+                out_indices.len(),
+                out_weights.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_step35_sigmoid_top8_f32_on_stream",
+            ffi::infer_step35_sigmoid_top8_f32_on_stream(
+                logits.ptr,
+                bias.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                logits.len() as u32,
                 stream.as_raw(),
             ),
         )
@@ -1068,6 +1153,51 @@ pub fn moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
                 scales_table,
                 buffers.input_scale_table.ptr,
                 buffers.gate_up_alpha_table.ptr,
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues per-slot `silu(gate) * up` into f32 output vectors.
+pub fn moe_silu_slots_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<*const f32>,
+    output_table: &DeviceBuffer<*mut f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = indices.len();
+    if rows == 0
+        || groups == 0
+        || gate_up_table.len() != groups
+        || output_table.len() != groups
+        || gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "MoE slot f32 SiLU buffers",
+            expected: "non-empty rows, matching slot tables, and expert alpha table".to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} gate_up={} output={} alphas={}",
+                gate_up_table.len(),
+                output_table.len(),
+                gate_up_alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_silu_slots_f32_on_stream",
+            ffi::infer_moe_silu_slots_f32_on_stream(
+                indices.ptr,
+                gate_up_table.ptr,
+                output_table.ptr,
+                gate_up_alpha_table.ptr,
                 rows as u32,
                 groups as u32,
                 stream.as_raw(),
@@ -1725,6 +1855,64 @@ pub fn rope_neox_sequence_f32_into_on_stream(
                 head_dim as u32,
                 start_position as u32,
                 theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues sequence NeoX RoPE using a device-resident inverse-frequency table.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_inv_freq_sequence_f32_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    inv_freq: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    start_position: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = tokens.saturating_mul(heads).saturating_mul(head_dim);
+    if tokens == 0
+        || heads == 0
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || input.len() != len
+        || output.len() != len
+        || inv_freq.len() != rotary_dim / 2
+        || tokens > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || rotary_dim > u32::MAX as usize
+        || start_position > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "inverse-frequency sequence RoPE",
+            expected: "matching non-empty sequence, head, rotary, and frequency dimensions"
+                .to_string(),
+            actual: format!(
+                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} inv_freq={} start_position={start_position}",
+                input.len(),
+                output.len(),
+                inv_freq.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rope_neox_inv_freq_sequence_f32_on_stream",
+            ffi::infer_rope_neox_inv_freq_sequence_f32_on_stream(
+                input.ptr,
+                inv_freq.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                rotary_dim as u32,
+                start_position as u32,
                 stream.as_raw(),
             ),
         )
@@ -5561,6 +5749,84 @@ pub fn nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
     }
 }
 
+/// Enqueues device-routed grouped W4A16 matvecs with one f32 input per route.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input_table: &DeviceBuffer<*const f32>,
+    packed_weight_table: &DeviceBuffer<*const u8>,
+    weight_scale_table: &DeviceBuffer<*const u8>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<*mut f32>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = indices.len();
+    let table_len = packed_weight_table.len();
+    let shared_memory_bytes = in_features
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Shape {
+            label: "NVFP4 grouped-input W4A16 shared memory",
+            expected: "in_features * sizeof(f32) without overflow".to_string(),
+            actual: format!("in_features={in_features}"),
+        })?;
+    if groups == 0
+        || table_len == 0
+        || input_table.len() != groups
+        || weight_scale_table.len() != table_len
+        || weight_scale_2_table.len() != table_len
+        || output_table.len() != groups
+        || out_features == 0
+        || in_features == 0
+        || !in_features.is_multiple_of(16)
+        || groups > u32::MAX as usize
+        || table_len > u32::MAX as usize
+        || out_features > u32::MAX as usize
+        || in_features > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "NVFP4 grouped-input W4A16 matvec buffers",
+            expected: "matching non-empty input, expert, route, and output tables".to_string(),
+            actual: format!(
+                "indices={} inputs={} weights={} scales={} weight_scale_2={} outputs={} out={out_features} in={in_features}",
+                groups,
+                input_table.len(),
+                table_len,
+                weight_scale_table.len(),
+                weight_scale_2_table.len(),
+                output_table.len(),
+            ),
+        });
+    }
+    let max_shared_memory_bytes = max_shared_memory_per_block()?;
+    if shared_memory_bytes > max_shared_memory_bytes {
+        return Err(Error::Shape {
+            label: "NVFP4 grouped-input W4A16 shared memory",
+            expected: format!("at most {max_shared_memory_bytes} bytes per block"),
+            actual: format!("{shared_memory_bytes} bytes for in_features={in_features}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream",
+            ffi::infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
+                indices.ptr,
+                input_table.ptr,
+                packed_weight_table.ptr,
+                weight_scale_table.ptr,
+                weight_scale_2_table.ptr,
+                output_table.ptr,
+                table_len as u32,
+                groups as u32,
+                out_features as u32,
+                in_features as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Enqueues fused NVFP4 W4A16 matvec plus top-1 selection without writing logits.
 pub fn nvfp4_w4a16_top1_f32_into_on_stream(
@@ -6665,6 +6931,62 @@ mod tests {
                 (actual - expected).abs() < 1.0e-6,
                 "actual={actual} expected={expected}"
             );
+        }
+    }
+
+    #[test]
+    fn step35_sigmoid_top8_matches_cpu_reference() {
+        let logits = (0..288)
+            .map(|expert| ((expert * 37 % 101) as f32 - 50.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let bias = (0..288)
+            .map(|expert| ((expert * 19 % 47) as f32 - 23.0) * 0.002)
+            .collect::<Vec<_>>();
+        let probabilities = logits
+            .iter()
+            .map(|value| 1.0 / (1.0 + (-value).exp()))
+            .collect::<Vec<_>>();
+        let mut expected_indices = (0..288).collect::<Vec<_>>();
+        expected_indices.sort_unstable_by(|&left, &right| {
+            (probabilities[right] + bias[right])
+                .partial_cmp(&(probabilities[left] + bias[left]))
+                .expect("finite score")
+                .then_with(|| left.cmp(&right))
+        });
+        let expected_indices = expected_indices[..8].to_vec();
+        let selected_sum = expected_indices
+            .iter()
+            .map(|&expert| probabilities[expert])
+            .sum::<f32>();
+        let expected_weights = expected_indices
+            .iter()
+            .map(|&expert| probabilities[expert] / selected_sum * 3.0)
+            .collect::<Vec<_>>();
+
+        let logits = DeviceBuffer::from_host(&logits).expect("logits upload");
+        let bias = DeviceBuffer::from_host(&bias).expect("bias upload");
+        let mut indices = DeviceBuffer::zeroed(8).expect("indices alloc");
+        let mut weights = DeviceBuffer::zeroed(8).expect("weights alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        step35_sigmoid_top8_f32_into_on_stream(
+            &logits,
+            &bias,
+            indices.output(),
+            weights.output(),
+            &stream,
+        )
+        .expect("Step router launch");
+        let actual_indices = indices.copy_to_host(&stream).expect("indices download");
+        let actual_weights = weights.copy_to_host(&stream).expect("weights download");
+        assert_eq!(
+            actual_indices.as_ref(),
+            expected_indices
+                .iter()
+                .map(|&expert| expert as u32)
+                .collect::<Vec<_>>()
+        );
+        for (&actual, &expected) in actual_weights.iter().zip(&expected_weights) {
+            assert!((actual - expected).abs() < 1.0e-6);
         }
     }
 

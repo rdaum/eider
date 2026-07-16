@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         );
         assert_eq!(
             loaded.record.down_scale_bytes().len(),
-            (HIDDEN / 16) * (INTERMEDIATE / 64) * 4
+            HIDDEN * INTERMEDIATE / 16
         );
     }
     println!(

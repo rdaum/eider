@@ -234,6 +234,62 @@ impl MarlinNvfp4GateUp {
             .copy_range_from_pinned_on_stream(slot, global_scale, stream)
     }
 
+    /// Enqueues replacement of one slot from byte ranges in a pinned record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_slot_from_pinned_record_on_stream(
+        &mut self,
+        slot: usize,
+        record: &PinnedHostBuffer<u8>,
+        weight_offset: usize,
+        weight_bytes: usize,
+        scale_offset: usize,
+        scale_bytes: usize,
+        global_scale: &PinnedHostBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if slot >= self.experts {
+            return Err(Error::Shape {
+                label: "Marlin gate/up pinned-record slot",
+                expected: format!("slot < {}", self.experts),
+                actual: slot.to_string(),
+            });
+        }
+        let expected_weight_bytes = self.gate_up * self.hidden / 2;
+        let expected_scale_bytes = self.gate_up * self.hidden / 16;
+        if weight_bytes != expected_weight_bytes
+            || scale_bytes != expected_scale_bytes
+            || global_scale.as_slice().len() != 1
+        {
+            return Err(Error::Shape {
+                label: "Marlin gate/up pinned-record ranges",
+                expected: format!(
+                    "weight={expected_weight_bytes} scales={expected_scale_bytes} global_scale=1"
+                ),
+                actual: format!(
+                    "weight={weight_bytes} scales={scale_bytes} global_scale={}",
+                    global_scale.as_slice().len()
+                ),
+            });
+        }
+        self.repacked_weight
+            .copy_bytes_from_pinned_range_on_stream(
+                slot * expected_weight_bytes,
+                record,
+                weight_offset,
+                weight_bytes,
+                stream,
+            )?;
+        self.weight_scale.copy_bytes_from_pinned_range_on_stream(
+            slot * expected_scale_bytes,
+            record,
+            scale_offset,
+            scale_bytes,
+            stream,
+        )?;
+        self.global_scale
+            .copy_range_from_pinned_on_stream(slot, global_scale, stream)
+    }
+
     /// Returns the bytes occupied by resident expert weights and scales.
     pub fn expert_device_bytes(&self) -> usize {
         self.repacked_weight.device_bytes()

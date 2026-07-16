@@ -681,6 +681,7 @@ name = "infer"
 version = "0.1.0"
 dependencies = [
  "fast-telemetry",
+ "libc",
  "micromeasure",
  "minijinja",
  "minijinja-contrib",
