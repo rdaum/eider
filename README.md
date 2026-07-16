@@ -4,7 +4,7 @@
 > insulation (ahem)
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6 and Step-3.5-Flash MoE models in NVFP4. It includes
+Blackwell) running Qwen3.6 and Step-3.7-Flash MoE models. It includes
 an OpenAI API-compatible server with continuous multi-session scheduling and a
 compact FP4 KV cache, on top of some (hopefully) finely tuned CUDA kernels.
 
@@ -32,11 +32,11 @@ Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
 comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
 with the same model using BF16 KV and greedy sampling.
 
-Step-3.5-Flash uses the same API with disk-backed expert paging. With 240 of
-288 experts resident per routed layer, a warm API session decodes at about
-18.7 tokens/sec; two concurrent sessions sustain about 16.8 tokens/sec in
-aggregate. Request KV state remains independent while the expert cache is
-shared across sessions.
+The 198B Step-3.7-Flash checkpoint uses the same API with disk-backed expert
+paging. With 240 of 288 experts resident per routed layer, the current warm
+path reaches about 12.6 decode tokens/sec for one session and 11.2 tokens/sec
+in aggregate for two concurrent sessions. Request KV state remains independent
+while the expert cache is shared across sessions.
 
 Compared with the current vLLM setup, the more consequential differences are
 operational. Eider starts substantially faster and has a smaller idle footprint
@@ -73,10 +73,10 @@ The workspace has three crates:
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
 - `crates/infer` owns model loading, model execution, KV-cache state,
-  request-scoped sampling and generation, Qwen3.6 and Step-3.5 scheduling,
+  request-scoped sampling and generation, Qwen3.6 and Step-3.7 scheduling,
   prefill/decode orchestration, CLI binaries, and runtime benchmarks. Its
   reusable execution state lives under `runtime/`.
-- `crates/eider-api` owns the dedicated inference actor and OpenAI Responses
+- `crates/eider-api` owns the dedicated inference actor and OpenAI-compatible
   HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
   thread while async handlers submit, stream, and cancel requests over bounded
   channels. It also exposes Prometheus and optional DogStatsD metrics for HTTP
@@ -95,7 +95,7 @@ Checkpoints kept under `models/`:
 - `models/qwen3.6-35b-a3b-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
-- `models/step-3.5-flash-nvfp4`
+- `models/step-3.7-flash-nvfp4`
 
 Models are expected to use the repository's supported ModelOpt or
 compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
@@ -113,41 +113,42 @@ are written atomically and incomplete layers are resumed on the next startup;
 later runs validate and reuse the completed cache automatically.
 
 ## Running the server
-Start the OpenAI Responses server with:
+Start the Qwen3.6 server with:
 
 ```sh
-scripts/run-eider-server.sh
+scripts/run-eider-qwen-server.sh
 ```
 
-The launcher builds the release binary, serves the local Qwen3.6 checkpoint at
-`127.0.0.1:8080`, and defaults the API key to `local-eider`. Override its
-model, listen address, served name, or key with `EIDER_MODEL_DIR`,
-`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`. The server exposes
-Prometheus text at `/metrics` and health at `/healthz`; set
+Start Step-3.7 with:
+
+```sh
+scripts/run-eider-stepfun-server.sh
+```
+
+The StepFun launcher prepares or validates the disk-backed expert cache before
+starting the server and defaults to 240 resident experts per routed layer. Set
+`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. Both launchers build the
+release server, listen on `127.0.0.1:8080`, and default the API key to
+`local-eider`. Override their model, listen address, served name, or key with
+`EIDER_MODEL_DIR`, `EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
+The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 `EIDER_DOGSTATSD_ENDPOINT` (with optional `EIDER_DOGSTATSD_INTERVAL_SECS`) to
 additionally push metrics over UDP. The `eider-serve` binary also takes
 `--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
 `--max-active-sequences`, and `--max-context-tokens` flags that map directly to
-the scheduler admission limits. The server selects Qwen3.6 or Step-3.5 from the
-checkpoint metadata. To serve Step-3.5 directly:
+the scheduler admission limits.
+
+Run Pi against the matching server with:
 
 ```sh
-cargo run --release -p eider-api --bin eider-serve -- \
-    models/step-3.5-flash-nvfp4 \
-    --served-model-name eider-step35 \
-    --step35-expert-capacity 240
-```
-
-Run the installed Pi coding agent against the matching repo-local provider:
-
-```sh
-scripts/run-pi-eider.sh
+scripts/run-pi-eider-qwen.sh
+scripts/run-pi-eider-stepfun.sh
 ```
 
 Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
 
 ```sh
-scripts/run-pi-eider.sh --print "Reply with one short greeting."
+scripts/run-pi-eider-stepfun.sh --print "Reply with one short greeting."
 ```
 
 The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR`,

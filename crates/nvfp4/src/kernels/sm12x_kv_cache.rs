@@ -582,6 +582,76 @@ impl Sm12xKvAttentionWorkspace {
         }
     }
 
+    /// Enqueues compact attention over `window_start..cache.len()`.
+    pub fn attention_window_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        window_start: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0 || window_start >= cache.len {
+            return Err(Error::Shape {
+                label: "SM12x KV attention window",
+                expected: format!("window_start < nonzero cache length {}", cache.len),
+                actual: window_start.to_string(),
+            });
+        }
+        if cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV attention cache",
+                expected: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let output_values = self.q_heads * self.head_dim;
+        if query.len() != output_values || output.len() != output_values {
+            return Err(Error::Shape {
+                label: "SM12x KV attention query/output",
+                expected: format!("{output_values} values"),
+                actual: format!("query={} output={}", query.len(), output.len()),
+            });
+        }
+
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_window_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_window_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values.as_const_ptr().cast(),
+                    cache.key_scales.as_const_ptr().cast(),
+                    cache.key_tail.as_const_ptr().cast(),
+                    cache.value_values.as_const_ptr().cast(),
+                    cache.value_scales.as_const_ptr().cast(),
+                    cache.value_tail.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    window_start as u32,
+                    cache.max_tokens as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Appends a prompt chunk and computes each row's causal compact-cache
     /// attention before advancing to the next row.
     ///
@@ -1290,6 +1360,72 @@ mod tests {
         assert!(
             max_abs <= 0.25,
             "compact FP4 attention error too large: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn compact_mma_attention_window_ignores_older_tokens() {
+        const MAX_TOKENS: usize = 64;
+        const TOKENS: usize = 17;
+        const WINDOW_START: usize = 5;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = KV_HEADS * 12;
+        let width = KV_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * width)
+            .map(|index| ((index * 31 % 251) as f32 - 125.0) / 512.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * width)
+            .map(|index| ((index * 47 % 257) as f32 - 128.0) / 384.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 19 % 239) as f32 - 119.0) / 448.0)
+            .collect::<Vec<_>>();
+
+        let mut cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        for token in 0..TOKENS {
+            let key = DeviceBuffer::from_host(&key_host[token * width..(token + 1) * width])
+                .expect("key row");
+            let value = DeviceBuffer::from_host(&value_host[token * width..(token + 1) * width])
+                .expect("value row");
+            cache.append(&key, &value).expect("append");
+        }
+
+        let stream = CudaStream::new_blocking().expect("stream");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let key_f32 = DeviceBuffer::from_host(&key_host[WINDOW_START * width..]).expect("K window");
+        let value_f32 =
+            DeviceBuffer::from_host(&value_host[WINDOW_START * width..]).expect("V window");
+        let mut expected = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("f32 output");
+        crate::cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key_f32,
+            &value_f32,
+            expected.output(),
+            TOKENS - WINDOW_START,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("f32 window attention");
+        let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("workspace");
+        workspace
+            .attention_window_into_on_stream(&cache, &query, actual.output(), WINDOW_START, &stream)
+            .expect("compact window attention");
+        let expected = expected.copy_to_host(&stream).expect("f32 copy");
+        let actual = actual.copy_to_host(&stream).expect("FP4 copy");
+        let max_abs = expected
+            .iter()
+            .zip(actual.iter())
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.25,
+            "compact FP4 window attention error too large: max_abs={max_abs}"
         );
     }
 

@@ -1,6 +1,10 @@
 //! Checkpoint-driven chat prompt rendering and tokenization.
 
-use minijinja::{Environment, Error as TemplateError, ErrorKind, UndefinedBehavior, context};
+use minijinja::value::Kwargs;
+use minijinja::{
+    Environment, Error as TemplateError, ErrorKind, UndefinedBehavior, Value as TemplateValue,
+    context,
+};
 use nvfp4::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -364,6 +368,7 @@ fn build_environment(source: String) -> Result<Environment<'static>> {
     environment.set_lstrip_blocks(true);
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    environment.add_filter("tojson", tojson_compat);
     environment.add_function(
         "raise_exception",
         |message: String| -> std::result::Result<String, TemplateError> {
@@ -374,6 +379,58 @@ fn build_environment(source: String) -> Result<Environment<'static>> {
         .add_template_owned(TEMPLATE_NAME, source)
         .map_err(template_error)?;
     Ok(environment)
+}
+
+fn tojson_compat(
+    value: &TemplateValue,
+    indent: Option<TemplateValue>,
+    kwargs: Kwargs,
+) -> std::result::Result<TemplateValue, TemplateError> {
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    if ensure_ascii == Some(true) {
+        return Err(TemplateError::new(
+            ErrorKind::InvalidOperation,
+            "tojson ensure_ascii=true is not supported",
+        ));
+    }
+    let indent = match indent {
+        Some(indent) => Some(indent),
+        None => kwargs.get("indent")?,
+    };
+    kwargs.assert_all_used()?;
+    let indent = match indent {
+        None => None,
+        Some(value) => match bool::try_from(value.clone()).ok() {
+            Some(true) => Some(2),
+            Some(false) => None,
+            None => Some(usize::try_from(value)?),
+        },
+    };
+    let serialized = if let Some(indent) = indent {
+        let mut output = Vec::new();
+        let whitespace = " ".repeat(indent);
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(whitespace.as_bytes());
+        let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
+        serde::Serialize::serialize(value, &mut serializer)
+            .map(|()| String::from_utf8(output).expect("serde_json emitted valid UTF-8"))
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| {
+        TemplateError::new(ErrorKind::InvalidOperation, "cannot serialize to JSON")
+            .with_source(error)
+    })?;
+    let mut safe = String::with_capacity(serialized.len());
+    for character in serialized.chars() {
+        match character {
+            '<' => safe.push_str("\\u003c"),
+            '>' => safe.push_str("\\u003e"),
+            '&' => safe.push_str("\\u0026"),
+            '\'' => safe.push_str("\\u0027"),
+            _ => safe.push(character),
+        }
+    }
+    Ok(TemplateValue::from_safe_string(safe))
 }
 
 fn render_with_environment(
@@ -459,6 +516,24 @@ mod tests {
     }
 
     #[test]
+    fn tojson_accepts_jinja_ensure_ascii_false() {
+        let environment =
+            build_environment("{{ tools[0] | tojson(ensure_ascii=False) }}".to_string()).unwrap();
+        let mut tool = tool_definition();
+        tool.function.description = Some("Read café paths".to_string());
+        let rendered = render_with_environment(
+            &environment,
+            &[ChatMessage::user("hello")],
+            &[tool],
+            ChatTemplateOptions::default(),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert!(rendered.contains("café"), "{rendered}");
+    }
+
+    #[test]
     fn checkpoint_special_tokens_reach_the_template() {
         let environment = build_environment("{{ bos_token }}x{{ eos_token }}".to_string()).unwrap();
         let rendered = render_with_environment(
@@ -474,26 +549,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local Step-3.5 checkpoint"]
-    fn local_step35_template_renders_generation_prefix() {
+    #[ignore = "requires the local Step-3.7 checkpoint"]
+    fn local_step37_template_renders_generation_prefix() {
         let model_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.5-flash-nvfp4");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.7-flash-nvfp4");
         let template = CheckpointChatTemplate::from_model_dir(model_dir).unwrap();
         let rendered = template
             .render(
                 &[ChatMessage::user("hello")],
-                &[],
+                &[tool_definition()],
                 ChatTemplateOptions::default(),
             )
             .unwrap();
         assert!(
-            rendered.starts_with("<｜begin▁of▁sentence｜><|im_start|>user\nhello"),
+            rendered.starts_with("<｜begin▁of▁sentence｜><|im_start|>system\n# Tools"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("<|im_start|>user\nhello<|im_end|>"),
             "{rendered:?}"
         );
         assert!(
             rendered.ends_with("<|im_start|>assistant\n<think>\n"),
             "{rendered:?}"
         );
+        assert!(rendered.contains("<tools>"), "{rendered:?}");
     }
 
     #[test]

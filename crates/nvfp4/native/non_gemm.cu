@@ -3505,8 +3505,8 @@ __global__ void infer_bf16_matvec_logits_batch_kernel(
     std::uint32_t rows,
     std::uint32_t cols) {
     extern __shared__ float partial[];
-    const std::uint32_t batch = blockIdx.x / rows;
-    const std::uint32_t row = blockIdx.x % rows;
+    const std::uint32_t batch = blockIdx.y;
+    const std::uint32_t row = blockIdx.x;
     if (batch >= batch_size) return;
     const float* row_input = input + static_cast<std::size_t>(batch) * cols;
     float* input_sh = partial + blockDim.x;
@@ -3947,6 +3947,28 @@ __device__ inline float infer_bf16_row_dot_warp(const std::uint16_t* row_weight,
     return acc;
 }
 
+__global__ void infer_bf16_matvec_logits_warp_rows_kernel(
+    const float* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    float* __restrict__ logits,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    extern __shared__ float input_sh[];
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t warps = blockDim.x >> 5u;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+    const float value = infer_bf16_row_dot_warp(
+        weight + static_cast<std::size_t>(row) * cols, input_sh, cols);
+    if (lane == 0) logits[row] = value;
+}
+
 __global__ void infer_lm_head_top1_pass1_kernel(
     const float* __restrict__ input,
     const std::uint16_t* __restrict__ weight,
@@ -4141,11 +4163,28 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_batch_on_stream(
         return cudaErrorInvalidValue;
     }
     constexpr int kThreads = 256;
+    if ((cols & 3u) != 0u) {
+        const std::size_t shmem =
+            kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+        infer_bf16_matvec_logits_batch_kernel<<<dim3(rows, batch_size, 1), kThreads, shmem, stream>>>(
+            input, weight, logits, batch_size, rows, cols);
+        return cudaGetLastError();
+    }
     const std::size_t shmem =
-        kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
-    infer_bf16_matvec_logits_batch_kernel<<<batch_size * rows, kThreads, shmem, stream>>>(
-        input, weight, logits, batch_size, rows, cols);
-    return cudaGetLastError();
+        static_cast<std::size_t>(cols) * sizeof(float);
+    const std::uint32_t warps = kThreads / 32;
+    for (std::uint32_t batch = 0; batch < batch_size; ++batch) {
+        infer_bf16_matvec_logits_warp_rows_kernel<<<
+            (rows + warps - 1) / warps, kThreads, shmem, stream>>>(
+            input + static_cast<std::size_t>(batch) * cols,
+            weight,
+            logits + static_cast<std::size_t>(batch) * rows,
+            rows,
+            cols);
+        const cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    return cudaSuccess;
 }
 
 extern "C" cudaError_t infer_bf16_linear_pair_logits_f32_on_stream(

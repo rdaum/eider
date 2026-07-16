@@ -1,4 +1,4 @@
-//! Structured chat serving over the multi-session Step-3.5 scheduler.
+//! Structured chat serving over the multi-session Step-3.7 scheduler.
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
@@ -125,7 +125,7 @@ impl<'template> Step35ChatService<'template> {
                 self.requests
                     .get_mut(&token.request_id)
                     .ok_or_else(|| Error::Format {
-                        label: "Step-3.5 chat service",
+                        label: "Step-3.7 chat service",
                         detail: format!(
                             "scheduler emitted token for unknown request {}",
                             token.request_id.get()
@@ -212,14 +212,14 @@ impl<'template> Step35ChatService<'template> {
                 let Step35CancelOutcome::Cancelled(cancelled) = self.scheduler.cancel_request(id)
                 else {
                     return Err(Error::Format {
-                        label: "Step-3.5 chat service",
+                        label: "Step-3.7 chat service",
                         detail: format!("failed to stop request {}", id.get()),
                     });
                 };
                 Ok(cancelled.released_sequence_device_bytes)
             }
             None => Err(Error::Format {
-                label: "Step-3.5 chat service",
+                label: "Step-3.7 chat service",
                 detail: format!("terminal request {} is absent from scheduler", id.get()),
             }),
         }

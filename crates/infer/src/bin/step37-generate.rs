@@ -1,16 +1,24 @@
+//! Decode throughput probe for Step-3.7-Flash.
+
 use infer::nvfp4::{Error, Result};
 use infer::step35::{Step35PagingStats, Step35TextModel};
 use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let mut args = std::env::args_os();
     let program = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .unwrap_or_else(|| "step35-generate".to_string());
+        .unwrap_or_else(|| "step37-generate".to_string());
     let model_dir = args.next().map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.5-flash-nvfp4")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.7-flash-nvfp4")
     });
     let capacity = args
         .next()
@@ -66,7 +74,7 @@ fn main() -> Result<()> {
             let token_stats = subtract_stats(model.expert_paging_stats(), token_start_stats);
             if tokens <= 64 {
                 println!(
-                    "Step-3.5 pass={pass} decode {step:03}: {input} -> {} (logit {:.6}) ms={:.3} misses={}",
+                    "Step-3.7 pass={pass} decode {step:03}: {input} -> {} (logit {:.6}) ms={:.3} misses={}",
                     next.id,
                     next.value,
                     token_elapsed.as_secs_f64() * 1_000.0,
@@ -87,7 +95,7 @@ fn main() -> Result<()> {
                     completed % 64
                 };
                 println!(
-                    "Step-3.5 pass={pass} window_end={completed} tokens={window_tokens} decode_s={:.3} decode_tps={:.3} misses={}",
+                    "Step-3.7 pass={pass} window_end={completed} tokens={window_tokens} decode_s={:.3} decode_tps={:.3} misses={}",
                     window_elapsed.as_secs_f64(),
                     window_tokens as f64 / window_elapsed.as_secs_f64(),
                     window_stats.misses,
@@ -113,7 +121,7 @@ fn main() -> Result<()> {
             later_hits as f64 * 100.0 / later_lookups as f64
         };
         println!(
-            "Step-3.5 pass={pass} capacity={capacity} tokens={tokens} load_s={:.3} decode_s={:.3} decode_tps={:.3}",
+            "Step-3.7 pass={pass} capacity={capacity} tokens={tokens} load_s={:.3} decode_s={:.3} decode_tps={:.3}",
             load_elapsed.as_secs_f64(),
             decode_elapsed.as_secs_f64(),
             tokens as f64 / decode_elapsed.as_secs_f64(),

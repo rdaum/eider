@@ -1,3 +1,5 @@
+//! Measure direct reads from the Step-3.7 prepared expert cache.
+
 use infer::nvfp4::Result;
 use infer::runtime::expert_cache::{ExpertSlotCache, read_expert_misses};
 use infer::step35::{
@@ -10,13 +12,13 @@ fn main() -> Result<()> {
     let model_dir = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/step-3.5-flash-nvfp4"));
+        .unwrap_or_else(|| PathBuf::from("models/step-3.7-flash-nvfp4"));
     let layer = std::env::args()
         .nth(2)
         .map(|value| value.parse::<usize>())
         .transpose()
         .map_err(|error| infer::nvfp4::Error::Format {
-            label: "Step-3.5 paging probe layer",
+            label: "Step-3.7 paging probe layer",
             detail: error.to_string(),
         })?
         .unwrap_or(FIRST_MOE_LAYER);
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
         );
     }
     println!(
-        "Step-3.5 layer {layer}: read {} misses ({:.3} MiB) in {:.3} ms",
+        "Step-3.7 layer {layer}: read {} misses ({:.3} MiB) in {:.3} ms",
         loaded.len(),
         loaded
             .iter()

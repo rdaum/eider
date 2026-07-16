@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate focused Step-3.5 layer references from the checkpoint's Python model."""
+"""Generate focused Step-3.7 text-layer references from the official checkpoint."""
 
 from __future__ import annotations
 
@@ -25,12 +25,12 @@ TOP_K = 8
 
 
 def load_remote_code(model_dir: Path):
-    package_name = "step35_checkpoint"
+    package_name = "step37_checkpoint"
     package = types.ModuleType(package_name)
     package.__path__ = [str(model_dir)]
     sys.modules[package_name] = package
     modules = {}
-    for name in ("configuration_step3p5", "modeling_step3p5"):
+    for name in ("configuration_step3p7", "vision_encoder", "modeling_step3p7"):
         spec = importlib.util.spec_from_file_location(
             f"{package_name}.{name}", model_dir / f"{name}.py"
         )
@@ -40,7 +40,7 @@ def load_remote_code(model_dir: Path):
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         modules[name] = module
-    return modules["configuration_step3p5"], modules["modeling_step3p5"]
+    return modules["configuration_step3p7"], modules["modeling_step3p7"]
 
 
 class Checkpoint:
@@ -50,16 +50,37 @@ class Checkpoint:
         with (model_dir / "model.safetensors.index.json").open() as source:
             self.weight_map = json.load(source)["weight_map"]
 
-    def tensor(self, name: str, device: torch.device | None = None) -> torch.Tensor:
+    def tensor(
+        self,
+        name: str,
+        device: torch.device | None = None,
+        expert: int | None = None,
+    ) -> torch.Tensor:
         shard = self.model_dir / self.weight_map[name]
         with safe_open(shard, framework="pt", device="cpu") as source:
-            value = source.get_tensor(name)
+            value = source.get_tensor(name) if expert is None else source.get_slice(name)[expert]
         return value.to(device if device is not None else self.device)
 
-    def linear(self, prefix: str, inputs: torch.Tensor) -> torch.Tensor:
-        packed = self.tensor(f"{prefix}.weight_packed")
-        scales = self.tensor(f"{prefix}.weight_scale").float()
-        divisor = self.tensor(f"{prefix}.weight_global_scale").float().item()
+    def linear(
+        self,
+        prefix: str,
+        inputs: torch.Tensor,
+        expert: int | None = None,
+    ) -> torch.Tensor:
+        weight_name = f"{prefix}.weight"
+        weight = self.tensor(weight_name, expert=expert)
+        if weight.dtype == torch.bfloat16:
+            output = inputs.float() @ weight.float().t()
+            del weight
+            torch.cuda.empty_cache()
+            return output
+        if weight.dtype != torch.uint8:
+            raise RuntimeError(f"unsupported {weight_name} dtype {weight.dtype}")
+        packed = weight
+        scales = self.tensor(f"{prefix}.weight_scale", expert=expert).float()
+        weight_scale_2 = self.tensor(
+            f"{prefix}.weight_scale_2", expert=expert
+        ).float().item()
         low = packed & 0x0F
         high = packed >> 4
         codes = torch.stack((low, high), dim=-1).reshape(packed.shape[0], -1)
@@ -69,9 +90,9 @@ class Checkpoint:
             device=self.device,
         )
         weights = lookup[codes.long()]
-        weights.mul_(scales.repeat_interleave(16, dim=1)).div_(divisor)
+        weights.mul_(scales.repeat_interleave(16, dim=1)).mul_(weight_scale_2)
         output = inputs.float() @ weights.t()
-        del packed, scales, low, high, codes, lookup, weights
+        del weight, packed, scales, low, high, codes, lookup, weights
         torch.cuda.empty_cache()
         return output
 
@@ -108,7 +129,7 @@ def rotary(config, modeling, layer: int, inputs: torch.Tensor, q: torch.Tensor, 
         embedding = torch.cat((freqs, freqs), dim=-1).unsqueeze(0)
         q, k = modeling.apply_rotary_pos_emb(q, k, embedding.cos(), embedding.sin())
         return q, k, inv_freq
-    rotary_embedding = modeling.Step3p5RotaryEmbedding(
+    rotary_embedding = modeling.Step3p7RotaryEmbedding(
         config, device=inputs.device, layer_idx=layer
     ).to(inputs.device)
     cos, sin = rotary_embedding(inputs.unsqueeze(0), positions)
@@ -117,7 +138,7 @@ def rotary(config, modeling, layer: int, inputs: torch.Tensor, q: torch.Tensor, 
 
 
 def attention_reference(checkpoint, config, modeling, layer: int, normed: torch.Tensor):
-    prefix = f"model.layers.{layer}.self_attn"
+    prefix = f"model.language_model.layers.{layer}.self_attn"
     if config.layer_types[layer] == "sliding_attention":
         q_heads = config.attention_other_setting["num_attention_heads"]
         kv_heads = config.attention_other_setting["num_attention_groups"]
@@ -164,7 +185,7 @@ def dense_ffn(checkpoint: Checkpoint, prefix: str, inputs: torch.Tensor) -> torc
 
 
 def moe_ffn(checkpoint: Checkpoint, config, layer: int, inputs: torch.Tensor):
-    prefix = f"model.layers.{layer}.moe"
+    prefix = f"model.language_model.layers.{layer}.moe"
     router = checkpoint.tensor(f"{prefix}.gate.weight").float()
     bias = checkpoint.tensor(f"{prefix}.router_bias").float()
     logits = inputs.float() @ router.t()
@@ -176,20 +197,19 @@ def moe_ffn(checkpoint: Checkpoint, config, layer: int, inputs: torch.Tensor):
 
     routed = torch.zeros_like(inputs)
     for slot, expert in enumerate(indices[0].tolist()):
-        expert_prefix = f"{prefix}.experts.{expert}"
-        gate = F.silu(checkpoint.linear(f"{expert_prefix}.gate_proj", inputs))
-        up = checkpoint.linear(f"{expert_prefix}.up_proj", inputs)
-        down = checkpoint.linear(f"{expert_prefix}.down_proj", gate * up)
+        gate = F.silu(checkpoint.linear(f"{prefix}.gate_proj", inputs, expert))
+        up = checkpoint.linear(f"{prefix}.up_proj", inputs, expert)
+        down = checkpoint.linear(f"{prefix}.down_proj", gate * up, expert)
         routed.add_(down * weights[0, slot])
 
     shared = dense_ffn(
-        checkpoint, f"model.layers.{layer}.share_expert", inputs
+        checkpoint, f"model.language_model.layers.{layer}.share_expert", inputs
     )
     return routed + shared, logits, indices.float(), weights
 
 
 def layer_reference(checkpoint, config, modeling, layer: int):
-    prefix = f"model.layers.{layer}"
+    prefix = f"model.language_model.layers.{layer}"
     inputs = layer_input(layer, checkpoint.device)
     input_norm = checkpoint.tensor(f"{prefix}.input_layernorm.weight")
     normed = rms_norm(inputs, input_norm, config.rms_norm_eps)
@@ -231,7 +251,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda")
     configuration, modeling = load_remote_code(args.model_dir.resolve())
-    config = configuration.Step3p5Config.from_pretrained(args.model_dir)
+    config = configuration.Step3p7Config.from_pretrained(args.model_dir).text_config
     checkpoint = Checkpoint(args.model_dir, device)
 
     tensors = {}
@@ -241,7 +261,7 @@ def main() -> None:
             tensors.update(layer_reference(checkpoint, config, modeling, layer))
             torch.cuda.empty_cache()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, args.output, metadata={"format": "eider-step35-layer-reference-v1"})
+    save_file(tensors, args.output, metadata={"format": "eider-step37-layer-reference-v1"})
     print(f"wrote {args.output}")
 
 

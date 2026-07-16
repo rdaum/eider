@@ -47,9 +47,9 @@ struct Args {
     #[arg(long, default_value_t = 32_768)]
     max_context_tokens: usize,
 
-    /// Resident expert slots per routed Step-3.5 layer.
+    /// Resident expert slots per routed Step layer.
     #[arg(long, default_value_t = 240)]
-    step35_expert_capacity: usize,
+    step_expert_capacity: usize,
 
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_active_sequences: args.max_active_sequences,
         max_context_tokens: args.max_context_tokens,
     };
-    actor_config.step35_expert_capacity = args.step35_expert_capacity;
+    actor_config.step_expert_capacity = args.step_expert_capacity;
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
     let config = ApiConfig {

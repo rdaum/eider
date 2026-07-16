@@ -1,4 +1,4 @@
-//! Multi-session scheduling for the paged Step-3.5 runtime.
+//! Multi-session scheduling for the paged Step-3.7 runtime.
 
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestFinishReason, RequestState, SchedulerConfig};
@@ -113,7 +113,7 @@ impl Step35Request {
             return Ok(self.prompt_tokens[self.prompt_position]);
         }
         self.last_token.ok_or_else(|| Error::Format {
-            label: "Step-3.5 scheduled request",
+            label: "Step-3.7 scheduled request",
             detail: format!("request {} has no decode input token", self.id.get()),
         })
     }
@@ -182,7 +182,7 @@ impl Step35Scheduler {
         config.validate()?;
         if prompt_tokens.is_empty() {
             return Err(Error::Format {
-                label: "Step-3.5 scheduler prompt",
+                label: "Step-3.7 scheduler prompt",
                 detail: "prompt must contain at least one token".to_string(),
             });
         }
@@ -191,7 +191,7 @@ impl Step35Scheduler {
             .find(|&&token| token as usize >= self.model.vocab())
         {
             return Err(Error::Shape {
-                label: "Step-3.5 scheduler prompt token",
+                label: "Step-3.7 scheduler prompt token",
                 expected: format!("token < {}", self.model.vocab()),
                 actual: token.to_string(),
             });
@@ -200,20 +200,20 @@ impl Step35Scheduler {
             .len()
             .checked_add(config.max_new_tokens)
             .ok_or_else(|| Error::Shape {
-                label: "Step-3.5 scheduler request capacity",
+                label: "Step-3.7 scheduler request capacity",
                 expected: "prompt + completion length without overflow".to_string(),
                 actual: format!("{} + {}", prompt_tokens.len(), config.max_new_tokens),
             })?;
         if max_tokens > self.config.max_context_tokens {
             return Err(Error::Shape {
-                label: "Step-3.5 scheduler request capacity",
+                label: "Step-3.7 scheduler request capacity",
                 expected: format!("at most {} tokens", self.config.max_context_tokens),
                 actual: max_tokens.to_string(),
             });
         }
         let id = Step35RequestId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
-            label: "Step-3.5 scheduler request ID",
+            label: "Step-3.7 scheduler request ID",
             detail: "request ID space exhausted".to_string(),
         })?;
         let lifecycle = if config.max_new_tokens == 0 {
@@ -368,7 +368,7 @@ impl Step35Scheduler {
             .sequence
             .as_deref_mut()
             .ok_or_else(|| Error::Format {
-                label: "Step-3.5 scheduled decode",
+                label: "Step-3.7 scheduled decode",
                 detail: format!(
                     "request {} has no admitted sequence state",
                     request.id.get()
