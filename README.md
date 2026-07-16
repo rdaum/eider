@@ -4,9 +4,10 @@
 > insulation (ahem)
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6 and Step-3.7-Flash MoE models. It includes
-an OpenAI API-compatible server with continuous multi-session scheduling and a
-compact FP4 KV cache, on top of some (hopefully) finely tuned CUDA kernels.
+Blackwell) running Qwen3.6, Qwen3.5-MoE fine-tunes such as Agents-A1, and
+Step-3.7-Flash. It includes an OpenAI API-compatible server with continuous
+multi-session scheduling and a compact FP4 KV cache, on top of some
+(hopefully) finely tuned CUDA kernels.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -31,6 +32,12 @@ Eider's OpenAI-compatible API sustains about 72.7 decode tokens/sec with
 Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
 comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
 with the same model using BF16 KV and greedy sampling.
+
+Agents-A1 is a 35B Qwen3.5-MoE agentic fine-tune whose ModelOpt checkpoint
+keeps attention projections and the LM head in BF16 while quantizing its MoE
+weights to NVFP4. In a local API comparison using the same 200-token request
+for each runtime, Eider reached 44.9 decode tokens/sec and vLLM reached 37.2
+tokens/sec.
 
 The 198B Step-3.7-Flash checkpoint uses the same API with disk-backed expert
 paging. With 240 of 288 experts resident per routed layer, the current warm
@@ -97,6 +104,7 @@ Checkpoints kept under `models/`:
 - `models/qwen3.6-35b-a3b-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
+- `models/agents-a1-nvfp4`
 - `models/step-3.7-flash-nvfp4`
 
 Models are expected to use the repository's supported ModelOpt or
@@ -107,6 +115,10 @@ shared experts in layers 32-39. The dense Qwen3 checkpoints (`qwen3-8b`,
 `qwen3-32b`) are still supported by the loader and the dense GEMV/CUTLASS
 path but are not kept on this machine.
 
+Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6, with BF16 attention
+projections and a BF16 LM head alongside its NVFP4 experts. The checkpoint
+also contains a vision tower, but Eider currently serves its text path only.
+
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
 down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Mixed-precision
@@ -115,10 +127,17 @@ are written atomically and incomplete layers are resumed on the next startup;
 later runs validate and reuse the completed cache automatically.
 
 ## Running the server
+
 Start the Qwen3.6 server with:
 
 ```sh
 scripts/run-eider-qwen-server.sh
+```
+
+Start Agents-A1 with:
+
+```sh
+scripts/run-eider-agents-a1-server.sh
 ```
 
 Start Step-3.7 with:
@@ -129,8 +148,11 @@ scripts/run-eider-stepfun-server.sh
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
-`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. Both launchers build the
-release server, listen on `127.0.0.1:8080`, and default the API key to
+`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. The Agents-A1 server
+accepts the checkpoint's full 262,144-token context; override it with
+`EIDER_MAX_CONTEXT_TOKENS`. Its Pi entry advertises a 131,072-token working
+window so compaction starts well before that hard limit. The launchers build
+the release server, listen on `127.0.0.1:8080`, and default the API key to
 `local-eider`. Override their model, listen address, served name, or key with
 `EIDER_MODEL_DIR`, `EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
@@ -144,6 +166,7 @@ Run Pi against the matching server with:
 
 ```sh
 scripts/run-pi-eider-qwen.sh
+scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
 ```
 

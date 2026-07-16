@@ -155,7 +155,11 @@ impl<'template> Step37ChatService<'template> {
                 .get_mut(&id)
                 .expect("terminal request retained");
             if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
-                let events = request.output.finish()?;
+                let events = if matches!(reason, ChatFinishReason::Length) {
+                    request.output.finish_truncated()?
+                } else {
+                    request.output.finish()?
+                };
                 if let Some(protocol_reason) = request.filter.apply(id, events, &mut tick.output) {
                     reason = protocol_reason;
                 } else if request.filter.saw_tool_calls() {

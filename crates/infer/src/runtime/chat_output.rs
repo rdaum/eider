@@ -92,11 +92,24 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
 
     /// Finishes protocol parsing and flushes safe pending text.
     pub fn finish(&mut self) -> Result<Vec<ChatOutputEvent>> {
+        self.finish_with_truncation(false)
+    }
+
+    /// Finishes a length-truncated stream, discarding any partial tool call.
+    pub fn finish_truncated(&mut self) -> Result<Vec<ChatOutputEvent>> {
+        self.finish_with_truncation(true)
+    }
+
+    fn finish_with_truncation(&mut self, truncated: bool) -> Result<Vec<ChatOutputEvent>> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
-        self.parser.finish()
+        if truncated {
+            self.parser.finish_truncated()
+        } else {
+            self.parser.finish()
+        }
     }
 }
 
@@ -173,6 +186,14 @@ impl ChatOutputParser {
     }
 
     fn finish(&mut self) -> Result<Vec<ChatOutputEvent>> {
+        self.finish_with_truncation(false)
+    }
+
+    fn finish_truncated(&mut self) -> Result<Vec<ChatOutputEvent>> {
+        self.finish_with_truncation(true)
+    }
+
+    fn finish_with_truncation(&mut self, truncated: bool) -> Result<Vec<ChatOutputEvent>> {
         if self.finished {
             return Ok(Vec::new());
         }
@@ -180,6 +201,7 @@ impl ChatOutputParser {
         match self.mode {
             OutputMode::Reasoning => Ok(take_event(&mut self.pending, ChatOutputEvent::Reasoning)),
             OutputMode::Text => Ok(take_event(&mut self.pending, ChatOutputEvent::Text)),
+            OutputMode::ToolCall if truncated => Ok(Vec::new()),
             OutputMode::ToolCall => Err(Error::Format {
                 label: "chat tool call",
                 detail: "generation ended inside an unterminated <tool_call>".to_string(),
@@ -561,6 +583,16 @@ mod tests {
             |event| !matches!(event, ChatOutputEvent::Text(text) if text.contains("tool_call"))
         ));
         assert!(parser.finish().is_err());
+    }
+
+    #[test]
+    fn length_truncation_discards_unfinished_tool_markup() {
+        let mut parser = ChatOutputParser::new(&tools(), false).unwrap();
+        let events = parser
+            .push_text("hello <tool_call><function=write_file>")
+            .unwrap();
+        assert_eq!(events, [ChatOutputEvent::Text("hello ".to_string())]);
+        assert!(parser.finish_truncated().unwrap().is_empty());
     }
 
     #[test]

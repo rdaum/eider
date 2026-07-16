@@ -26,6 +26,25 @@
           }
         },
         {
+          "id": "eider-agents-a1",
+          "name": "Agents-A1 35B-A3B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-step3.7",
           "name": "Step-3.7-Flash NVFP4",
           "reasoning": true,

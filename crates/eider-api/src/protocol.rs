@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
+
 static NEXT_RESPONSE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ITEM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -166,7 +168,7 @@ impl ResponseRequest {
         }
         let generation = RequestConfig {
             sampling,
-            max_new_tokens: self.max_output_tokens.unwrap_or(1024),
+            max_new_tokens: self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
             eos_token_ids: defaults.eos_token_ids.clone(),
         };
         generation
@@ -721,6 +723,17 @@ mod tests {
             max_new_tokens: 64,
             ..GenerationConfig::default()
         }
+    }
+
+    #[test]
+    fn omitted_max_output_tokens_uses_api_default() {
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "hello"
+        }))
+        .unwrap();
+        let chat = request.into_chat_request(&defaults()).unwrap();
+        assert_eq!(chat.generation.max_new_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     }
 
     #[test]

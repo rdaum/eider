@@ -5,7 +5,7 @@ use crate::metrics::{ServerEndpoint, StreamingMode, metrics as server_metrics};
 use crate::protocol::{ApiError, ErrorEnvelope, ResponseRequest, ResponseStream};
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -16,6 +16,9 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+
+const MIN_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const REQUEST_BODY_BYTES_PER_CONTEXT_TOKEN: usize = 32;
 
 /// HTTP-facing configuration independent of model execution limits.
 #[derive(Clone, Debug)]
@@ -59,12 +62,22 @@ pub async fn serve_listener(
 }
 
 fn router(actor: InferenceActor, config: ApiConfig) -> Router {
+    let request_body_limit = request_body_limit(config.context_window);
     Router::new()
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
+        .route(
+            "/v1/responses",
+            post(responses).layer(DefaultBodyLimit::max(request_body_limit)),
+        )
         .with_state(ApiState { actor, config })
+}
+
+fn request_body_limit(context_window: usize) -> usize {
+    context_window
+        .saturating_mul(REQUEST_BODY_BYTES_PER_CONTEXT_TOKEN)
+        .max(MIN_REQUEST_BODY_BYTES)
 }
 
 async fn health() -> Json<Value> {
@@ -376,4 +389,16 @@ impl Drop for RequestDuration {
 
 fn duration_us(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_body_limit_scales_with_context_window() {
+        assert_eq!(request_body_limit(32_768), 2 * 1024 * 1024);
+        assert_eq!(request_body_limit(131_072), 4 * 1024 * 1024);
+        assert_eq!(request_body_limit(262_144), 8 * 1024 * 1024);
+    }
 }
