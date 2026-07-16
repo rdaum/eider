@@ -666,6 +666,7 @@ impl Sm12xKvAttentionWorkspace {
         value: &DeviceBuffer<f32>,
         input_row_offset: usize,
         rows: usize,
+        window_tokens: Option<usize>,
         mut output: DeviceOutput<'_, f32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -685,7 +686,7 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
-        let q_width = self.kv_heads * MMA_N * self.head_dim;
+        let q_width = self.q_heads * self.head_dim;
         let kv_width = self.kv_heads * self.head_dim;
         let row_end = input_row_offset
             .checked_add(rows)
@@ -717,6 +718,7 @@ impl Sm12xKvAttentionWorkspace {
             || kv_end > key.len()
             || kv_end > value.len()
             || cache_end > cache.max_tokens
+            || window_tokens.is_some_and(|window| window == 0 || window > u32::MAX as usize)
         {
             return Err(Error::Shape {
                 label: "SM12x causal row attention buffers",
@@ -756,8 +758,10 @@ impl Sm12xKvAttentionWorkspace {
                     cache.len as u32,
                     rows as u32,
                     cache.max_tokens as u32,
+                    self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
+                    window_tokens.unwrap_or(0) as u32,
                     stream.as_raw(),
                 ),
             )?;
@@ -1232,6 +1236,7 @@ mod tests {
                 &value,
                 0,
                 TOKENS,
+                None,
                 chunk_output.output(),
                 &stream,
             )
@@ -1297,6 +1302,94 @@ mod tests {
                 .copy_to_host(&stream)
                 .expect("repeated V tail")
         );
+    }
+
+    #[test]
+    fn compact_causal_rows_support_step_sliding_gqa() {
+        const MAX_TOKENS: usize = 32;
+        const TOKENS: usize = 7;
+        const WINDOW: usize = 4;
+        const KV_HEADS: usize = 8;
+        const Q_HEADS: usize = 96;
+        const HEAD_DIM: usize = 128;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * kv_width)
+            .map(|idx| ((idx * 17 % 251) as f32 - 125.0) / 384.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * kv_width)
+            .map(|idx| ((idx * 29 % 257) as f32 - 128.0) / 448.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..TOKENS * q_width)
+            .map(|idx| ((idx * 31 % 263) as f32 - 131.0) / 512.0)
+            .collect::<Vec<_>>();
+        let key = DeviceBuffer::from_host(&key_host).expect("key");
+        let value = DeviceBuffer::from_host(&value_host).expect("value");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut chunk_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("chunk cache");
+        let mut chunk_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("chunk workspace");
+        let mut chunk_output = DeviceBuffer::<f32>::zeroed(TOKENS * q_width).expect("chunk output");
+        chunk_workspace
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut chunk_cache,
+                &query,
+                &key,
+                &value,
+                0,
+                TOKENS,
+                Some(WINDOW),
+                chunk_output.output(),
+                &stream,
+            )
+            .expect("chunk attention");
+
+        let mut repeated_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("repeated cache");
+        let mut repeated_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("repeated workspace");
+        let mut repeated = Vec::with_capacity(TOKENS * q_width);
+        for token in 0..TOKENS {
+            repeated_cache
+                .append_at_offsets_on_stream(
+                    &key,
+                    token * kv_width,
+                    &value,
+                    token * kv_width,
+                    token,
+                    &stream,
+                )
+                .expect("repeated append");
+            let query_row =
+                DeviceBuffer::from_host(&query_host[token * q_width..(token + 1) * q_width])
+                    .expect("query row");
+            let mut output = DeviceBuffer::zeroed(q_width).expect("output row");
+            let window_start = repeated_cache.len().saturating_sub(WINDOW);
+            repeated_workspace
+                .attention_window_into_on_stream(
+                    &repeated_cache,
+                    &query_row,
+                    output.output(),
+                    window_start,
+                    &stream,
+                )
+                .expect("repeated attention");
+            repeated.extend_from_slice(&output.copy_to_host(&stream).expect("output download"));
+        }
+
+        let chunk = chunk_output.copy_to_host(&stream).expect("chunk download");
+        let max_abs = chunk
+            .iter()
+            .zip(&repeated)
+            .map(|(chunk, repeated)| (chunk - repeated).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1.0e-6, "sliding causal row max_abs={max_abs}");
+        assert_eq!(chunk_cache.len(), repeated_cache.len());
     }
 
     #[test]

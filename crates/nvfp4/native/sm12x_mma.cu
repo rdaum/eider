@@ -1716,8 +1716,10 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
     std::uint32_t start_position,
     std::uint32_t rows,
     std::uint32_t max_tokens,
+    std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
+    std::uint32_t window_tokens,
     cudaStream_t stream)
 {
     if (query == nullptr || key == nullptr || value == nullptr || key_values == nullptr ||
@@ -1726,12 +1728,14 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
         query_scales == nullptr || scores == nullptr || probability_tiles == nullptr ||
         probability_scales == nullptr || output == nullptr || rows == 0 ||
         start_position >= max_tokens || rows > max_tokens - start_position ||
-        kv_heads == 0 || head_dim == 0 || (head_dim % 64) != 0) {
+        q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0 ||
+        head_dim == 0 || (head_dim % 64) != 0) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t kv_width = kv_heads * head_dim;
-    const std::uint32_t q_width = kv_heads * 8 * head_dim;
+    const std::uint32_t q_width = q_heads * head_dim;
     const std::uint32_t head_k_tiles = head_dim / 64;
+    const std::uint32_t query_groups = kv_heads * ((q_heads / kv_heads + 7) / 8);
     for (std::uint32_t row = 0; row < rows; ++row) {
         const std::uint32_t position = start_position + row;
         const std::uint32_t input_row = input_row_offset + row;
@@ -1754,33 +1758,36 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
         }
 
         const std::uint32_t cache_len = position + 1;
+        const std::uint32_t window_start = window_tokens == 0 || cache_len <= window_tokens
+            ? 0
+            : cache_len - window_tokens;
         const std::uint32_t token_tiles = (cache_len + 7) / 8;
         const std::uint32_t context_tiles = (cache_len + 63) / 64;
         infer_sm12x_kv_quantize_query_kernel<<<
-            dim3(kv_heads, head_k_tiles, 1), 128, 0, stream>>>(
+            dim3(query_groups, head_k_tiles, 1), 128, 0, stream>>>(
             query + input_row * q_width, query_tiles, query_scales,
-            kv_heads * 8, kv_heads, head_dim);
+            q_heads, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
-        infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, token_tiles, 1), 32, 0, stream>>>(
+        infer_sm12x_kv_qk_kernel<<<dim3(query_groups, token_tiles, 1), 32, 0, stream>>>(
             query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-            cache_len, nullptr, 0, max_tokens, kv_heads * 8, kv_heads, head_dim);
+            cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
-        infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
-            scores, cache_len, nullptr, 0, max_tokens);
+        infer_sm12x_kv_softmax_kernel<<<q_heads, 256, 0, stream>>>(
+            scores, cache_len, nullptr, window_start, max_tokens);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_quantize_probability_kernel<<<
-            dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
+            dim3(query_groups, context_tiles, 1), 128, 0, stream>>>(
             scores, probability_tiles, probability_scales, cache_len, nullptr,
-            0, max_tokens, kv_heads * 8, kv_heads);
+            window_start, max_tokens, q_heads, kv_heads);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
-        infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
+        infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, 1), 32, 0, stream>>>(
             probability_tiles, probability_scales, value_values, value_scales, value_tail,
-            output + input_row * q_width, cache_len, nullptr, 0, max_tokens,
-            kv_heads * 8, kv_heads, head_dim);
+            output + input_row * q_width, cache_len, nullptr, window_start, max_tokens,
+            q_heads, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
     }

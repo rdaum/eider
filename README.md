@@ -36,7 +36,9 @@ The 198B Step-3.7-Flash checkpoint uses the same API with disk-backed expert
 paging. With 240 of 288 experts resident per routed layer, the current warm
 path reaches about 12.6 decode tokens/sec for one session and 11.2 tokens/sec
 in aggregate for two concurrent sessions. Request KV state remains independent
-while the expert cache is shared across sessions.
+while the expert cache is shared across sessions. A 2,048-token agent prompt
+prefills at about 48.9 tokens/sec with a warm expert cache and 35.7 tokens/sec
+on the first request while the cache is populated.
 
 Compared with the current vLLM setup, the more consequential differences are
 operational. Eider starts substantially faster and has a smaller idle footprint
@@ -331,6 +333,7 @@ cargo bench -p nvfp4 --bench gated_delta_net
 cargo bench -p infer --bench qwen36_routed_gate_up
 cargo bench -p infer --bench qwen36_decode_batch
 cargo bench -p infer --bench qwen36_prefill
+cargo bench -p infer --bench step37_prefill
 cargo bench -p infer --bench qwen36_cpu_shared_expert
 cargo bench -p infer --bench sampling
 ```

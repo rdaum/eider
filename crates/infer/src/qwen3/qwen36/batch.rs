@@ -1967,6 +1967,7 @@ impl Qwen36FullAttentionWeights {
                         &workspace.v,
                         row_offset,
                         row.token_ids.len(),
+                        None,
                         workspace.attention.output(),
                         stream,
                     )?;

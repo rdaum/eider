@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+mod batch;
+pub use batch::{Step35PrefillBatchWorkspace, Step35PrefillRow};
+
 pub const LAYERS: usize = 42;
 pub const FIRST_MOE_LAYER: usize = 3;
 pub const EXPERTS: usize = 288;
@@ -1245,23 +1248,35 @@ impl Step35PagedExperts {
         device_expert_ids: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<Step35PageResolution> {
-        let pending = self.begin_resolve(expert_ids, device_expert_ids, stream)?;
-        self.finish_resolve(pending, device_expert_ids, stream)
+        self.resolve_at_offset(expert_ids, device_expert_ids, 0, stream)
+    }
+
+    fn resolve_at_offset(
+        &mut self,
+        expert_ids: &[u32],
+        device_expert_ids: &DeviceBuffer<u32>,
+        expert_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<Step35PageResolution> {
+        if expert_offset
+            .checked_add(8)
+            .is_none_or(|end| end > device_expert_ids.len())
+        {
+            return Err(Error::Shape {
+                label: "Step-3.7 device expert route",
+                expected: format!("8 expert IDs at offset {expert_offset}"),
+                actual: format!("{} expert IDs", device_expert_ids.len()),
+            });
+        }
+        let pending = self.begin_resolve(expert_ids, stream)?;
+        self.finish_resolve(pending, device_expert_ids, expert_offset, stream)
     }
 
     fn begin_resolve(
         &mut self,
         expert_ids: &[u32],
-        device_expert_ids: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<Step35PendingPageResolution> {
-        if device_expert_ids.len() != 8 {
-            return Err(Error::Shape {
-                label: "Step-3.7 device expert route",
-                expected: "8 expert IDs".to_string(),
-                actual: format!("{} expert IDs", device_expert_ids.len()),
-            });
-        }
         self.uploads.wait_for_staging_reuse()?;
         let plan = self.slots.plan(expert_ids)?;
         let hits = plan.hits;
@@ -1283,6 +1298,7 @@ impl Step35PagedExperts {
         &mut self,
         pending: Step35PendingPageResolution,
         device_expert_ids: &DeviceBuffer<u32>,
+        expert_offset: usize,
         stream: &CudaStream,
     ) -> Result<Step35PageResolution> {
         let misses = pending.misses.len();
@@ -1346,7 +1362,8 @@ impl Step35PagedExperts {
             self.slots.enqueue_mapping_upload(self.uploads.stream())?;
             self.uploads.finish(stream)?;
         }
-        self.slots.remap_on_stream(device_expert_ids, stream)?;
+        self.slots
+            .remap_at_offset_on_stream(device_expert_ids, expert_offset, stream)?;
         let resolution = pending.resolution;
         self.stats.hits += resolution.hits as u64;
         self.stats.misses += resolution.misses as u64;
@@ -1646,9 +1663,9 @@ impl Step35Layer {
             ) => {
                 router.run(&workspace.ffn_input, stream)?;
                 let indices = router.indices().copy_to_host(stream)?.into_vec();
-                let pending = paged.begin_resolve(&indices, router.indices(), stream)?;
+                let pending = paged.begin_resolve(&indices, stream)?;
                 let shared = shared.run(shared_workspace, &workspace.ffn_input, stream)?;
-                paged.finish_resolve(pending, router.indices(), stream)?;
+                paged.finish_resolve(pending, router.indices(), 0, stream)?;
                 let routed = paged.run_routed(
                     paged_workspace,
                     &workspace.ffn_input,

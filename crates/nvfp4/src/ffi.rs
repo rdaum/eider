@@ -379,8 +379,10 @@ unsafe extern "C" {
         start_position: u32,
         rows: u32,
         max_tokens: u32,
+        q_heads: u32,
         kv_heads: u32,
         head_dim: u32,
+        window_tokens: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_attention_indexed_on_stream(
@@ -688,6 +690,15 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_step35_sigmoid_top8_f32_batch_on_stream(
+        logits: *const f32,
+        bias: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        batch_size: u32,
+        experts: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_moe_topk_f32_batch_on_stream(
         logits: *const f32,
         out_indices: *mut u32,
@@ -702,6 +713,7 @@ unsafe extern "C" {
         expert_indices: *const u32,
         expert_to_slot: *const u32,
         slot_indices: *mut u32,
+        expert_offset: u32,
         count: u32,
         experts: u32,
         stream: cudaStream_t,
@@ -912,6 +924,7 @@ unsafe extern "C" {
         heads: u32,
         head_dim: u32,
         rotary_dim: u32,
+        input_token_offset: u32,
         start_position: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -1182,6 +1195,12 @@ unsafe extern "C" {
     pub(crate) fn infer_bf16_to_f32_on_stream(
         input: *const u16,
         output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_f32_to_bf16_on_stream(
+        input: *const f32,
+        output: *mut u16,
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;

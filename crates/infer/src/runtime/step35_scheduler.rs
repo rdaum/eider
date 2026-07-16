@@ -2,7 +2,9 @@
 
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestFinishReason, RequestState, SchedulerConfig};
-use crate::step35::{Step35DecodeState, Step35TextModel};
+use crate::step35::{
+    Step35DecodeState, Step35PrefillBatchWorkspace, Step35PrefillRow, Step35TextModel,
+};
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -152,6 +154,7 @@ impl Step35Request {
 /// Decode-first scheduler sharing one paged expert cache across independent sequences.
 pub struct Step35Scheduler {
     model: Step35TextModel,
+    prefill_workspace: Step35PrefillBatchWorkspace,
     config: SchedulerConfig,
     requests: BTreeMap<Step35RequestId, Box<Step35Request>>,
     waiting: VecDeque<Step35RequestId>,
@@ -163,8 +166,14 @@ pub struct Step35Scheduler {
 impl Step35Scheduler {
     pub fn new(model: Step35TextModel, config: SchedulerConfig) -> Result<Self> {
         config.validate()?;
+        let prefill_workspace = model.new_prefill_batch_workspace(
+            config.prefill_sequence_capacity,
+            config.prefill_token_capacity,
+            config.max_context_tokens,
+        )?;
         Ok(Self {
             model,
+            prefill_workspace,
             config,
             requests: BTreeMap::new(),
             waiting: VecDeque::new(),
@@ -433,41 +442,53 @@ impl Step35Scheduler {
             slots_remaining -= 1;
             selected.push((id, chunk));
         }
-        let mut selected = selected.into_iter();
-        while let Some((id, chunk)) = selected.next() {
-            let mut request = self
-                .requests
-                .remove(&id)
-                .expect("prefilling request retained");
-            tick.scheduled.push(id);
-            let start = request.prompt_position;
-            let end = start + chunk;
-            let result = {
-                let state = request
-                    .sequence
-                    .as_deref_mut()
-                    .expect("prefilling request has admitted sequence state");
-                request.prompt_tokens[start..end]
-                    .iter()
-                    .try_for_each(|&token| self.model.consume_one(state, token))
-            };
-            if let Err(error) = result {
-                self.requests.insert(id, request);
-                let mut restore = vec![id];
-                restore.extend(selected.map(|(id, _)| id));
-                for id in restore.into_iter().rev() {
-                    self.prefilling.push_front(id);
-                }
-                return Err(error);
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let mut requests = selected
+            .iter()
+            .map(|(id, _)| {
+                self.requests
+                    .remove(id)
+                    .expect("prefilling request retained")
+            })
+            .collect::<Vec<_>>();
+        tick.scheduled.extend(selected.iter().map(|(id, _)| *id));
+        let result = {
+            let mut rows = requests
+                .iter_mut()
+                .zip(selected.iter().map(|(_, chunk)| *chunk))
+                .map(|(request, chunk)| {
+                    let start = request.prompt_position;
+                    let end = start + chunk;
+                    Step35PrefillRow {
+                        token_ids: &request.prompt_tokens[start..end],
+                        state: request
+                            .sequence
+                            .as_deref_mut()
+                            .expect("prefilling request has admitted sequence state"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.model
+                .prefill_batch(&mut self.prefill_workspace, &mut rows)
+        };
+        if let Err(error) = result {
+            for request in requests.into_iter().rev() {
+                self.prefilling.push_front(request.id);
+                self.requests.insert(request.id, request);
             }
-            request.prompt_position = end;
+            return Err(error);
+        }
+        for (mut request, (_, chunk)) in requests.into_iter().zip(selected) {
+            request.prompt_position += chunk;
             tick.prefilled.push(Step35PrefillProgress {
-                request_id: id,
+                request_id: request.id,
                 tokens: chunk,
-                prompt_position: end,
+                prompt_position: request.prompt_position,
             });
-            self.prefilling.push_back(id);
-            self.requests.insert(id, request);
+            self.prefilling.push_back(request.id);
+            self.requests.insert(request.id, request);
         }
         Ok(())
     }
