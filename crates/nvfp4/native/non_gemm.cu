@@ -635,6 +635,34 @@ extern "C" cudaError_t infer_sigmoid_mul_f32_on_stream(const float* gate,
     return cudaGetLastError();
 }
 
+__global__ void infer_sigmoid_scale_heads_f32_kernel(
+    const float* gate,
+    const float* input,
+    float* output,
+    std::uint32_t head_dim,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    output[idx] = input[idx] * (1.0f / (1.0f + expf(-gate[idx / head_dim])));
+}
+
+extern "C" cudaError_t infer_sigmoid_scale_heads_f32_on_stream(
+    const float* gate,
+    const float* input,
+    float* output,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (gate == nullptr || input == nullptr || output == nullptr || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t len = heads * head_dim;
+    constexpr int kThreads = 256;
+    infer_sigmoid_scale_heads_f32_kernel<<<(len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        gate, input, output, head_dim, len);
+    return cudaGetLastError();
+}
+
 // Fused shared-expert gate: reads a single scalar logit from `gate_logit[0]`,
 // computes sigmoid(scalar), and multiplies it element-wise into `input`,
 // writing `shared_gated`. Replaces a host readback + broadcast + sigmoid_mul
@@ -1031,6 +1059,64 @@ __global__ void infer_moe_topk_f32_kernel(const float* logits,
     }
 }
 
+__global__ void infer_step35_sigmoid_top8_f32_kernel(
+    const float* logits,
+    const float* bias,
+    std::uint32_t* out_indices,
+    float* out_weights,
+    std::uint32_t experts) {
+    constexpr int kThreads = 256;
+    constexpr int kItems = 2;
+    std::uint64_t keys[kItems];
+    float probs[kItems];
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const std::uint32_t expert = threadIdx.x + item * kThreads;
+        if (expert < experts) {
+            const float prob = 1.0f / (1.0f + expf(-logits[expert]));
+            float score = prob + bias[expert];
+            if (isnan(score)) score = -INFINITY;
+            const std::uint32_t bits = __float_as_uint(score);
+            const std::uint32_t ordered =
+                (bits & 0x80000000u) != 0 ? ~bits : bits ^ 0x80000000u;
+            keys[item] = (static_cast<std::uint64_t>(ordered) << 32) |
+                static_cast<std::uint64_t>(UINT32_MAX - expert);
+            probs[item] = prob;
+        } else {
+            keys[item] = 0;
+            probs[item] = 0.0f;
+        }
+    }
+
+    using BlockSort = cub::BlockRadixSort<std::uint64_t, kThreads, kItems, float>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    __shared__ float top_probs[8];
+    __shared__ std::uint32_t top_indices[8];
+    BlockSort(sort_storage).SortDescending(keys, probs);
+    __syncthreads();
+
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const int rank = threadIdx.x * kItems + item;
+        if (rank < 8) {
+            top_probs[rank] = probs[item];
+            top_indices[rank] = UINT32_MAX - static_cast<std::uint32_t>(keys[item]);
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float selected_sum = 0.0f;
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) selected_sum += top_probs[slot];
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            out_indices[slot] = top_indices[slot];
+            out_weights[slot] = top_probs[slot] / selected_sum * 3.0f;
+        }
+    }
+}
+
 __global__ void infer_moe_top8_norm256_f32_kernel(const float* logits,
                                                         std::uint32_t* out_indices,
                                                         float* out_weights) {
@@ -1113,6 +1199,22 @@ extern "C" cudaError_t infer_moe_topk_f32_on_stream(const float* logits,
     const int threads = norm_topk_prob != 0 ? 1 : 256;
     infer_moe_topk_f32_kernel<<<1, threads, 0, stream>>>(
         logits, out_indices, out_weights, experts, k, norm_topk_prob != 0);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_step35_sigmoid_top8_f32_on_stream(
+    const float* logits,
+    const float* bias,
+    std::uint32_t* out_indices,
+    float* out_weights,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (logits == nullptr || bias == nullptr || out_indices == nullptr ||
+        out_weights == nullptr || experts < 8) {
+        return cudaErrorInvalidValue;
+    }
+    infer_step35_sigmoid_top8_f32_kernel<<<1, 256, 0, stream>>>(
+        logits, bias, out_indices, out_weights, experts);
     return cudaGetLastError();
 }
 
@@ -1482,6 +1584,43 @@ extern "C" cudaError_t infer_moe_silu_quantize_slots_nvfp4_simple_scales_on_stre
     }
     infer_moe_silu_quantize_slots_nvfp4_simple_scales_kernel<<<dim3(groups, (rows + 15) / 16), 1, 0, stream>>>(
         indices, gate_up_table, packed_table, scales_table, input_scale_table, gate_up_alpha_table, rows, groups);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_silu_slots_f32_kernel(
+    const std::uint32_t* indices,
+    const float* const* gate_up_table,
+    float* const* output_table,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups) {
+    const std::uint32_t slot = blockIdx.x;
+    if (slot >= groups) return;
+    const std::uint32_t expert = indices[slot];
+    const float alpha = gate_up_alpha_table[expert];
+    const float* gate_up = gate_up_table[slot];
+    float* output = output_table[slot];
+    for (std::uint32_t row = threadIdx.x; row < rows; row += blockDim.x) {
+        const float gate = gate_up[row] * alpha;
+        const float up = gate_up[rows + row] * alpha;
+        output[row] = gate * (1.0f / (1.0f + expf(-gate))) * up;
+    }
+}
+
+extern "C" cudaError_t infer_moe_silu_slots_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* const* gate_up_table,
+    float* const* output_table,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups,
+    cudaStream_t stream) {
+    if (indices == nullptr || gate_up_table == nullptr || output_table == nullptr ||
+        gate_up_alpha_table == nullptr || rows == 0 || groups == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_moe_silu_slots_f32_kernel<<<groups, 256, 0, stream>>>(
+        indices, gate_up_table, output_table, gate_up_alpha_table, rows, groups);
     return cudaGetLastError();
 }
 
@@ -2122,6 +2261,58 @@ extern "C" cudaError_t infer_rope_neox_sequence_f32_on_stream(
     const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
     infer_rope_neox_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, tokens, heads, head_dim, start_position, theta);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
+    const float* input,
+    const float* inv_freq,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t start_position) {
+    const std::uint32_t half = rotary_dim / 2;
+    const std::uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total_pairs = tokens * heads * half;
+    if (pair_idx >= total_pairs) return;
+    const std::uint32_t i = pair_idx % half;
+    const std::uint32_t row = pair_idx / half;
+    const std::uint32_t token = row / heads;
+    const std::uint32_t row_start = row * head_dim;
+    float sin_value;
+    float cos_value;
+    sincosf(static_cast<float>(start_position + token) * inv_freq[i], &sin_value, &cos_value);
+    const float a = input[row_start + i];
+    const float b = input[row_start + i + half];
+    output[row_start + i] = a * cos_value - b * sin_value;
+    output[row_start + i + half] = a * sin_value + b * cos_value;
+}
+
+extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
+    const float* input,
+    const float* inv_freq,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t start_position,
+    cudaStream_t stream) {
+    if (input == nullptr || inv_freq == nullptr || output == nullptr || tokens == 0 ||
+        heads == 0 || head_dim == 0 || rotary_dim == 0 || rotary_dim > head_dim ||
+        (rotary_dim % 2) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t bytes = static_cast<std::size_t>(tokens) * heads * head_dim * sizeof(float);
+    cudaError_t status = cudaMemcpyAsync(output, input, bytes, cudaMemcpyDeviceToDevice, stream);
+    if (status != cudaSuccess) return status;
+    constexpr int kThreads = 256;
+    const std::uint32_t total_pairs = tokens * heads * (rotary_dim / 2);
+    const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
+    infer_rope_neox_inv_freq_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, inv_freq, output, tokens, heads, head_dim, rotary_dim, start_position);
     return cudaGetLastError();
 }
 
@@ -5858,6 +6049,45 @@ __global__ void infer_nvfp4_w4a16_grouped_matvec_f32_kernel(
     }
 }
 
+__global__ void infer_nvfp4_w4a16_grouped_inputs_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* const* __restrict__ input_table,
+    const std::uint8_t* const* __restrict__ packed_weight_table,
+    const std::uint8_t* const* __restrict__ weight_scale_table,
+    const float* __restrict__ weight_scale_2_table,
+    float* const* __restrict__ output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    const std::uint32_t group = blockIdx.y;
+    if (group >= groups) return;
+    const float* input = input_table[group];
+    extern __shared__ float input_sh[];
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= out_features) return;
+    const std::uint32_t expert = indices[group];
+    if (expert >= table_len) return;
+    const std::uint8_t* packed_weight = packed_weight_table[expert];
+    const std::uint8_t* weight_scale = weight_scale_table[expert];
+    const std::uint32_t row_byte_base = row * (in_features / 2);
+    const std::uint32_t row_scale_base = row * (in_features / 16);
+    const float value = infer_nvfp4_row_dot_warp(
+        packed_weight + row_byte_base,
+        weight_scale + row_scale_base,
+        input_sh,
+        in_features) * weight_scale_2_table[expert];
+    if (lane == 0) output_table[group][row] = value;
+}
+
 __device__ inline float infer_nvfp4_row_dot_warp(
     const std::uint8_t* packed_row,
     const std::uint8_t* row_scale,
@@ -6046,6 +6276,35 @@ extern "C" cudaError_t infer_nvfp4_w4a16_grouped_matvec_f32_on_stream(
         grid, kThreads, shmem_bytes, stream>>>(
         indices, input, packed_weight_table, weight_scale_table, weight_scale_2_table,
         output_table, table_len, groups, out_features, in_features);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* const* input_table,
+    const std::uint8_t* const* packed_weight_table,
+    const std::uint8_t* const* weight_scale_table,
+    const float* weight_scale_2_table,
+    float* const* output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (indices == nullptr || input_table == nullptr || packed_weight_table == nullptr ||
+        weight_scale_table == nullptr || weight_scale_2_table == nullptr ||
+        output_table == nullptr || table_len == 0 || groups == 0 ||
+        out_features == 0 || in_features == 0 || (in_features % 16) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const std::uint32_t grid_x = (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const std::size_t shared_bytes = static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_nvfp4_w4a16_grouped_inputs_matvec_f32_kernel<<<
+        dim3(grid_x, groups), kThreads, shared_bytes, stream>>>(
+        indices, input_table, packed_weight_table, weight_scale_table,
+        weight_scale_2_table, output_table, table_len, groups, out_features, in_features);
     return cudaGetLastError();
 }
 

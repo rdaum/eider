@@ -42,6 +42,10 @@ name = "step35_expert"
 harness = false
 
 [[bench]]
+name = "step35_resident_linear"
+harness = false
+
+[[bench]]
 name = "lm_head_top1"
 harness = false
 

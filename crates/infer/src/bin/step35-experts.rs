@@ -1,5 +1,5 @@
 use infer::nvfp4::{Error, Result};
-use infer::step35::{Step35ResidentExperts, prepare_all};
+use infer::step35::{FIRST_MOE_LAYER, Step35ResidentExperts, prepare_all, prepare_one};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -10,6 +10,22 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "step35-experts".to_string());
     let command = args.next().and_then(|value| value.into_string().ok());
     let model_dir = args.next().map(PathBuf::from);
+    let layer = args
+        .next()
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| Error::Format {
+                    label: "usage",
+                    detail: format!("{program}: layer must be UTF-8"),
+                })?
+                .parse::<usize>()
+                .map_err(|error| Error::Format {
+                    label: "usage",
+                    detail: format!("{program}: invalid layer: {error}"),
+                })
+        })
+        .transpose()?;
     if args.next().is_some() {
         return usage(&program);
     }
@@ -20,8 +36,9 @@ fn main() -> Result<()> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.5-flash-nvfp4")
     });
     match command.as_str() {
-        "prepare" => prepare_all(&model_dir),
-        "residency" => {
+        "prepare" if layer.is_none() => prepare_all(&model_dir),
+        "prepare-layer" => prepare_one(&model_dir, layer.unwrap_or(FIRST_MOE_LAYER)),
+        "residency" if layer.is_none() => {
             let resident = Step35ResidentExperts::load(&model_dir)?;
             println!(
                 "full prepared residency succeeded: {:.3} GiB",
@@ -36,6 +53,6 @@ fn main() -> Result<()> {
 fn usage(program: &str) -> Result<()> {
     Err(Error::Format {
         label: "usage",
-        detail: format!("{program} <prepare|residency> [model-dir]"),
+        detail: format!("{program} <prepare|prepare-layer|residency> [model-dir] [layer]"),
     })
 }

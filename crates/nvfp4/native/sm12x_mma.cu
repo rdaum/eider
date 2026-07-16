@@ -40,6 +40,12 @@ __device__ __forceinline__ std::uint8_t infer_e2m1_code(float value) {
     return static_cast<std::uint8_t>(best | (sign < 0.0f ? 0x8 : 0x0));
 }
 
+__device__ __forceinline__ float infer_e2m1_value(std::uint8_t code) {
+    const float levels[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float value = levels[code & 0x7];
+    return (code & 0x8) == 0 ? value : -value;
+}
+
 __device__ __forceinline__ float infer_e4m3_value(std::uint8_t code) {
     const std::uint32_t sign = static_cast<std::uint32_t>(code & 0x80) << 24;
     const std::uint32_t exp = (code >> 3) & 0x0f;
@@ -646,40 +652,56 @@ __global__ void infer_sm12x_quantize_dynamic_vector_kernel(
     const float* input, std::uint32_t k_tiles, std::uint8_t* b_native_tiles,
     std::uint32_t* sfb) {
     const std::uint32_t kt = blockIdx.x;
+    const std::uint32_t row = blockIdx.y;
     if (kt >= k_tiles) return;
+    input += row * k_tiles * 64;
+    b_native_tiles += row * k_tiles * 512;
+    sfb += row * k_tiles;
+    __shared__ std::uint8_t codes[64];
+    __shared__ std::uint8_t scale_codes[4];
+    __shared__ float scales[4];
     std::uint8_t* tile = b_native_tiles + kt * 512;
     for (int index = threadIdx.x; index < 512; index += blockDim.x) tile[index] = 0;
-    __syncthreads();
-    if (threadIdx.x != 0) return;
-    std::uint8_t codes[64];
-    std::uint8_t scale_codes[4];
-    for (int block = 0; block < 4; ++block) {
-        float max_abs = 0.0f;
-        for (int offset = 0; offset < 16; ++offset) {
-            max_abs = fmaxf(max_abs, fabsf(input[kt * 64 + block * 16 + offset]));
-        }
-        scale_codes[block] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+    const int scale_group = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    float value = 0.0f;
+    if (lane < 16) {
+        value = input[kt * 64 + scale_group * 16 + lane];
+    }
+    float max_abs = lane < 16 && isfinite(value) ? fabsf(value) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
             __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-        const float scale = infer_e4m3_value(scale_codes[block]);
-        for (int offset = 0; offset < 16; ++offset) {
-            const float value = input[kt * 64 + block * 16 + offset];
-            codes[block * 16 + offset] = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
-        }
+        scale_codes[scale_group] = scale_code;
+        scales[scale_group] = infer_e4m3_value(scale_code);
     }
-    for (int lane = 0; lane < 32; ++lane) {
-        const int t0 = lane & 3;
-        const int t1 = lane >> 2;
-        for (int v = 0; v < 16; ++v) {
-            const int v0 = v & 7;
-            const int v1 = (v >> 3) & 1;
-            const int col = t0 * 8 + v0 + 32 * v1;
-            infer_set_packed_nibble(tile, lane * 32 + v, codes[col]);
-        }
+    __syncthreads();
+    if (lane < 16) {
+        const float scale = scales[scale_group];
+        codes[scale_group * 16 + lane] =
+            infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
     }
-    sfb[kt] = static_cast<std::uint32_t>(scale_codes[0])
-        | (static_cast<std::uint32_t>(scale_codes[1]) << 8)
-        | (static_cast<std::uint32_t>(scale_codes[2]) << 16)
-        | (static_cast<std::uint32_t>(scale_codes[3]) << 24);
+    __syncthreads();
+    for (int packed_idx = threadIdx.x; packed_idx < 256; packed_idx += blockDim.x) {
+        const int output_lane = packed_idx >> 3;
+        const int pair = packed_idx & 7;
+        const int v = pair << 1;
+        const int t0 = output_lane & 3;
+        const int col0 = t0 * 8 + (v & 7) + 32 * ((v >> 3) & 1);
+        const int next_v = v + 1;
+        const int col1 = t0 * 8 + (next_v & 7) + 32 * ((next_v >> 3) & 1);
+        tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            codes[col0] | (codes[col1] << 4));
+    }
+    if (threadIdx.x == 0) {
+        sfb[kt] = static_cast<std::uint32_t>(scale_codes[0])
+            | (static_cast<std::uint32_t>(scale_codes[1]) << 8)
+            | (static_cast<std::uint32_t>(scale_codes[2]) << 16)
+            | (static_cast<std::uint32_t>(scale_codes[3]) << 24);
+    }
 }
 
 extern "C" cudaError_t infer_sm12x_quantize_dynamic_vector_on_stream(
@@ -689,6 +711,175 @@ extern "C" cudaError_t infer_sm12x_quantize_dynamic_vector_on_stream(
         return cudaErrorInvalidValue;
     }
     infer_sm12x_quantize_dynamic_vector_kernel<<<k / 64, 128, 0, stream>>>(input, k / 64, b_native_tiles, sfb);
+    return cudaGetLastError();
+}
+
+__global__ void infer_sm12x_quantize_dynamic_vectors_residual2_kernel(
+    const float* __restrict__ input,
+    std::uint32_t k_tiles,
+    std::uint8_t* __restrict__ primary_tiles,
+    std::uint32_t* __restrict__ primary_scales,
+    std::uint8_t* __restrict__ residual_tiles,
+    std::uint32_t* __restrict__ residual_scales,
+    std::uint8_t* __restrict__ residual2_tiles,
+    std::uint32_t* __restrict__ residual2_scales,
+    float input_multiplier)
+{
+    const std::uint32_t kt = blockIdx.x;
+    const std::uint32_t row = blockIdx.y;
+    if (kt >= k_tiles) return;
+    input += row * k_tiles * 64;
+    primary_tiles += row * k_tiles * 512;
+    primary_scales += row * k_tiles;
+    residual_tiles += row * k_tiles * 512;
+    residual_scales += row * k_tiles;
+    residual2_tiles += row * k_tiles * 512;
+    residual2_scales += row * k_tiles;
+
+    __shared__ float values[64];
+    __shared__ float residuals[64];
+    __shared__ std::uint8_t primary_codes[64];
+    __shared__ std::uint8_t residual_codes[64];
+    __shared__ std::uint8_t residual2_codes[64];
+    __shared__ std::uint8_t primary_scale_codes[4];
+    __shared__ std::uint8_t residual_scale_codes[4];
+    __shared__ std::uint8_t residual2_scale_codes[4];
+    __shared__ float primary_scale_values[4];
+    __shared__ float residual_scale_values[4];
+    __shared__ float residual2_scale_values[4];
+    std::uint8_t* primary_tile = primary_tiles + kt * 512;
+    std::uint8_t* residual_tile = residual_tiles + kt * 512;
+    std::uint8_t* residual2_tile = residual2_tiles + kt * 512;
+    for (int index = threadIdx.x; index < 512; index += blockDim.x) {
+        primary_tile[index] = 0;
+        residual_tile[index] = 0;
+        residual2_tile[index] = 0;
+    }
+
+    const int scale_group = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    float value = 0.0f;
+    if (lane < 16) {
+        value = input[kt * 64 + scale_group * 16 + lane] * input_multiplier;
+        values[scale_group * 16 + lane] = value;
+    }
+    float max_abs = lane < 16 && isfinite(value) ? fabsf(value) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        primary_scale_codes[scale_group] = code;
+        primary_scale_values[scale_group] = infer_e4m3_value(code);
+    }
+    __syncthreads();
+
+    float residual = 0.0f;
+    if (lane < 16) {
+        const float scale = primary_scale_values[scale_group];
+        const std::uint8_t code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
+        primary_codes[scale_group * 16 + lane] = code;
+        residual = value - infer_e2m1_value(code) * scale;
+        residuals[scale_group * 16 + lane] = residual;
+    }
+    float residual_max = lane < 16 && isfinite(residual) ? fabsf(residual) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        residual_max = fmaxf(
+            residual_max,
+            __shfl_down_sync(0xffffffffu, residual_max, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t code = residual_max == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(residual_max / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        residual_scale_codes[scale_group] = code;
+        residual_scale_values[scale_group] = infer_e4m3_value(code);
+    }
+    __syncthreads();
+    float residual2 = 0.0f;
+    if (lane < 16) {
+        const float scale = residual_scale_values[scale_group];
+        const std::uint8_t code =
+            infer_e2m1_code(scale == 0.0f ? 0.0f : residual / scale);
+        residual_codes[scale_group * 16 + lane] = code;
+        residual2 = residual - infer_e2m1_value(code) * scale;
+    }
+    float residual2_max = lane < 16 && isfinite(residual2) ? fabsf(residual2) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        residual2_max = fmaxf(
+            residual2_max,
+            __shfl_down_sync(0xffffffffu, residual2_max, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t code = residual2_max == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(residual2_max / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        residual2_scale_codes[scale_group] = code;
+        residual2_scale_values[scale_group] = infer_e4m3_value(code);
+    }
+    __syncthreads();
+    if (lane < 16) {
+        const float scale = residual2_scale_values[scale_group];
+        residual2_codes[scale_group * 16 + lane] =
+            infer_e2m1_code(scale == 0.0f ? 0.0f : residual2 / scale);
+    }
+    __syncthreads();
+
+    for (int packed_idx = threadIdx.x; packed_idx < 256; packed_idx += blockDim.x) {
+        const int output_lane = packed_idx >> 3;
+        const int pair = packed_idx & 7;
+        const int v = pair << 1;
+        const int t0 = output_lane & 3;
+        const int col0 = t0 * 8 + (v & 7) + 32 * ((v >> 3) & 1);
+        const int next_v = v + 1;
+        const int col1 = t0 * 8 + (next_v & 7) + 32 * ((next_v >> 3) & 1);
+        primary_tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            primary_codes[col0] | (primary_codes[col1] << 4));
+        residual_tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            residual_codes[col0] | (residual_codes[col1] << 4));
+        residual2_tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            residual2_codes[col0] | (residual2_codes[col1] << 4));
+    }
+    if (threadIdx.x == 0) {
+        primary_scales[kt] = static_cast<std::uint32_t>(primary_scale_codes[0])
+            | (static_cast<std::uint32_t>(primary_scale_codes[1]) << 8)
+            | (static_cast<std::uint32_t>(primary_scale_codes[2]) << 16)
+            | (static_cast<std::uint32_t>(primary_scale_codes[3]) << 24);
+        residual_scales[kt] = static_cast<std::uint32_t>(residual_scale_codes[0])
+            | (static_cast<std::uint32_t>(residual_scale_codes[1]) << 8)
+            | (static_cast<std::uint32_t>(residual_scale_codes[2]) << 16)
+            | (static_cast<std::uint32_t>(residual_scale_codes[3]) << 24);
+        residual2_scales[kt] = static_cast<std::uint32_t>(residual2_scale_codes[0])
+            | (static_cast<std::uint32_t>(residual2_scale_codes[1]) << 8)
+            | (static_cast<std::uint32_t>(residual2_scale_codes[2]) << 16)
+            | (static_cast<std::uint32_t>(residual2_scale_codes[3]) << 24);
+    }
+}
+
+extern "C" cudaError_t infer_sm12x_quantize_dynamic_vectors_residual2_on_stream(
+    const float* input,
+    std::uint32_t rows,
+    std::uint32_t k,
+    std::uint8_t* primary_tiles,
+    std::uint32_t* primary_scales,
+    std::uint8_t* residual_tiles,
+    std::uint32_t* residual_scales,
+    std::uint8_t* residual2_tiles,
+    std::uint32_t* residual2_scales,
+    float input_multiplier,
+    cudaStream_t stream)
+{
+    if (input == nullptr || primary_tiles == nullptr || primary_scales == nullptr ||
+        residual_tiles == nullptr || residual_scales == nullptr ||
+        residual2_tiles == nullptr || residual2_scales == nullptr ||
+        rows == 0 || k == 0 || (k % 64) != 0 ||
+        input_multiplier <= 0.0f || !isfinite(input_multiplier)) {
+        return cudaErrorInvalidValue;
+    }
+    infer_sm12x_quantize_dynamic_vectors_residual2_kernel<<<
+        dim3(k / 64, rows), 128, 0, stream>>>(
+        input, k / 64, primary_tiles, primary_scales,
+        residual_tiles, residual_scales, residual2_tiles, residual2_scales,
+        input_multiplier);
     return cudaGetLastError();
 }
 
@@ -1008,10 +1199,17 @@ __global__ void infer_sm12x_kv_quantize_query_kernel(
     const float* __restrict__ query,
     std::uint8_t* __restrict__ query_tiles,
     std::uint32_t* __restrict__ query_scales,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
     std::uint32_t head_dim)
 {
     const std::uint32_t group = blockIdx.x;
     const std::uint32_t k_tile = blockIdx.y;
+    const std::uint32_t queries_per_kv = q_heads / kv_heads;
+    const std::uint32_t query_tiles_per_kv = (queries_per_kv + 7) / 8;
+    const std::uint32_t kv_head = group / query_tiles_per_kv;
+    const std::uint32_t query_base =
+        kv_head * queries_per_kv + (group % query_tiles_per_kv) * 8;
     std::uint8_t* tile = query_tiles + (group * (head_dim / 64) + k_tile) * 512;
     __shared__ std::uint8_t scale_codes[8][4];
     if (threadIdx.x < 32) {
@@ -1019,7 +1217,10 @@ __global__ void infer_sm12x_kv_quantize_query_kernel(
         const int kb = threadIdx.x & 3;
             float max_abs = 0.0f;
             for (int offset = 0; offset < 16; ++offset) {
-                const float value = query[(group * 8 + row) * head_dim + k_tile * 64 + kb * 16 + offset];
+                const std::uint32_t q_head = query_base + row;
+                const float value = q_head < (kv_head + 1) * queries_per_kv
+                    ? query[q_head * head_dim + k_tile * 64 + kb * 16 + offset]
+                    : 0.0f;
                 if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
             }
         scale_codes[row][kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
@@ -1041,8 +1242,9 @@ __global__ void infer_sm12x_kv_quantize_query_kernel(
             const int col = t0 * 8 + v0 + 32 * v2;
             const int kb = col / 16;
             float value = 0.0f;
-            if (row < 8) {
-                value = query[(group * 8 + row) * head_dim + k_tile * 64 + col];
+            const std::uint32_t q_head = query_base + row;
+            if (row < 8 && q_head < (kv_head + 1) * queries_per_kv) {
+                value = query[q_head * head_dim + k_tile * 64 + col];
             }
             const float scale = row < 8 ? infer_e4m3_value(scale_codes[row][kb]) : 0.0f;
             packed |= infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale) << (nibble * 4);
@@ -1066,12 +1268,18 @@ __global__ void infer_sm12x_kv_qk_kernel(
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
     std::uint32_t max_tokens,
+    std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim)
 {
     if (cache_len_device != nullptr) cache_len = *cache_len_device;
     __shared__ __align__(16) std::uint8_t b_smem[512];
     const std::uint32_t group = blockIdx.x;
+    const std::uint32_t queries_per_kv = q_heads / kv_heads;
+    const std::uint32_t query_tiles_per_kv = (queries_per_kv + 7) / 8;
+    const std::uint32_t kv_head = group / query_tiles_per_kv;
+    const std::uint32_t query_base =
+        kv_head * queries_per_kv + (group % query_tiles_per_kv) * 8;
     const std::uint32_t token_tile = blockIdx.y;
     const std::uint32_t complete_tiles = cache_len / 8;
     const bool compact = token_tile < complete_tiles;
@@ -1094,7 +1302,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
         const std::uint8_t* compact_tile = nullptr;
         std::uint32_t tile = 0;
         if (compact) {
-            tile = (group * max_token_tiles + token_tile) * head_k_tiles + kt;
+            tile = (kv_head * max_token_tiles + token_tile) * head_k_tiles + kt;
             compact_tile = key_values + tile * 256;
         }
         __syncthreads();
@@ -1108,7 +1316,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
             for (int kb = 0; kb < 4; ++kb) {
                 float max_abs = 0.0f;
                 for (int offset = 0; offset < 16; ++offset) {
-                    const float value = key_tail[(tail_start + row) * width + group * head_dim + kt * 64 + kb * 16 + offset];
+                    const float value = key_tail[(tail_start + row) * width + kv_head * head_dim + kt * 64 + kb * 16 + offset];
                     if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
                 }
                 tail_scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
@@ -1124,7 +1332,7 @@ __global__ void infer_sm12x_kv_qk_kernel(
             if (compact) {
                 code = infer_get_packed_nibble(compact_tile, row * 64 + col);
             } else if (static_cast<std::uint32_t>(row) < tail_len) {
-                const float value = key_tail[(tail_start + row) * width + group * head_dim + kt * 64 + col];
+                const float value = key_tail[(tail_start + row) * width + kv_head * head_dim + kt * 64 + col];
                 const float scale = tail_scales[col / 16];
                 code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
             }
@@ -1155,10 +1363,12 @@ __global__ void infer_sm12x_kv_qk_kernel(
     const int row = threadIdx.x >> 2;
     const int col = (threadIdx.x & 3) * 2;
     const float scale = rsqrtf(static_cast<float>(head_dim));
-    const std::uint32_t q_head = group * 8 + row;
+    const std::uint32_t q_head = query_base + row;
     const std::uint32_t token0 = token_tile * 8 + col;
-    if (token0 < cache_len) scores[q_head * max_tokens + token0] = d0 * scale;
-    if (token0 + 1 < cache_len) scores[q_head * max_tokens + token0 + 1] = d1 * scale;
+    if (q_head < (kv_head + 1) * queries_per_kv) {
+        if (token0 < cache_len) scores[q_head * max_tokens + token0] = d0 * scale;
+        if (token0 + 1 < cache_len) scores[q_head * max_tokens + token0 + 1] = d1 * scale;
+    }
 }
 
 struct InferOnlineSoftmaxState {
@@ -1213,10 +1423,17 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
     std::uint32_t* __restrict__ probability_scales,
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
-    std::uint32_t max_tokens)
+    std::uint32_t max_tokens,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads)
 {
     if (cache_len_device != nullptr) cache_len = *cache_len_device;
     const std::uint32_t group = blockIdx.x;
+    const std::uint32_t queries_per_kv = q_heads / kv_heads;
+    const std::uint32_t query_tiles_per_kv = (queries_per_kv + 7) / 8;
+    const std::uint32_t kv_head = group / query_tiles_per_kv;
+    const std::uint32_t query_base =
+        kv_head * queries_per_kv + (group % query_tiles_per_kv) * 8;
     const std::uint32_t k_tile = blockIdx.y;
     const std::uint32_t context_tiles = (max_tokens + 63) / 64;
     if (k_tile >= (cache_len + 63) / 64) return;
@@ -1230,7 +1447,10 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
             for (int offset = 0; offset < 16; ++offset) {
                 const std::uint32_t token = k_tile * 64 + kb * 16 + offset;
                 if (token < cache_len) {
-                    max_value = fmaxf(max_value, scores[(group * 8 + row) * max_tokens + token]);
+                    const std::uint32_t q_head = query_base + row;
+                    if (q_head < (kv_head + 1) * queries_per_kv) {
+                        max_value = fmaxf(max_value, scores[q_head * max_tokens + token]);
+                    }
                 }
             }
         scale_codes[row][kb] = max_value == 0.0f ? 0 : static_cast<std::uint8_t>(
@@ -1252,8 +1472,9 @@ __global__ void infer_sm12x_kv_quantize_probability_kernel(
             const int col = t0 * 8 + v0 + 32 * v2;
             const std::uint32_t token = k_tile * 64 + col;
             float value = 0.0f;
-            if (row < 8 && token < cache_len) {
-                value = scores[(group * 8 + row) * max_tokens + token];
+            const std::uint32_t q_head = query_base + row;
+            if (row < 8 && q_head < (kv_head + 1) * queries_per_kv && token < cache_len) {
+                value = scores[q_head * max_tokens + token];
             }
             const float scale = row < 8 ? infer_e4m3_value(scale_codes[row][col / 16]) : 0.0f;
             packed |= infer_e2m1_code(scale == 0.0f ? 0.0f : value * amplification / scale)
@@ -1278,12 +1499,18 @@ __global__ void infer_sm12x_kv_pv_kernel(
     std::uint32_t cache_len,
     const std::uint32_t* cache_len_device,
     std::uint32_t max_tokens,
+    std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim)
 {
     if (cache_len_device != nullptr) cache_len = *cache_len_device;
     __shared__ __align__(16) std::uint8_t b_smem[512];
     const std::uint32_t group = blockIdx.x;
+    const std::uint32_t queries_per_kv = q_heads / kv_heads;
+    const std::uint32_t query_tiles_per_kv = (queries_per_kv + 7) / 8;
+    const std::uint32_t kv_head = group / query_tiles_per_kv;
+    const std::uint32_t query_base =
+        kv_head * queries_per_kv + (group % query_tiles_per_kv) * 8;
     const std::uint32_t dim_tile = blockIdx.y;
     const std::uint32_t context_tiles = (cache_len + 63) / 64;
     const std::uint32_t max_context_tiles = (max_tokens + 63) / 64;
@@ -1299,7 +1526,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
     for (std::uint32_t kt = 0; kt < context_tiles; ++kt) {
         const std::uint8_t* a_tile = probability_tiles + (group * max_context_tiles + kt) * 512;
         const std::uint32_t value_tile_index =
-            (group * (head_dim / 8) + dim_tile) * max_context_tiles + kt;
+            (kv_head * (head_dim / 8) + dim_tile) * max_context_tiles + kt;
         const std::uint8_t* compact_tile = value_values + value_tile_index * 256;
         for (int index = threadIdx.x; index < 512; index += blockDim.x) {
             b_smem[index] = 0;
@@ -1318,7 +1545,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
             } else if (block_start == full_tokens && tail_len != 0) {
                 float max_abs = 0.0f;
                 for (std::uint32_t token = 0; token < tail_len; ++token) {
-                    const float value = value_tail[token * width + group * head_dim + dim_tile * 8 + dim];
+                    const float value = value_tail[token * width + kv_head * head_dim + dim_tile * 8 + dim];
                     if (isfinite(value)) max_abs = fmaxf(max_abs, fabsf(value));
                 }
                 b_scale_codes[kb] = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
@@ -1335,7 +1562,7 @@ __global__ void infer_sm12x_kv_pv_kernel(
             if (token < full_tokens) {
                 code = infer_get_packed_nibble(compact_tile, dim * 64 + col);
             } else if (token < cache_len) {
-                const float value = value_tail[(token - full_tokens) * width + group * head_dim + dim_tile * 8 + dim];
+                const float value = value_tail[(token - full_tokens) * width + kv_head * head_dim + dim_tile * 8 + dim];
                 const float scale = tail_scales[col / 16];
                 code = infer_e2m1_code(scale == 0.0f ? 0.0f : value / scale);
             }
@@ -1361,9 +1588,11 @@ __global__ void infer_sm12x_kv_pv_kernel(
 
     const int row = threadIdx.x >> 2;
     const int col = (threadIdx.x & 3) * 2;
-    const std::uint32_t q_head = group * 8 + row;
-    output[q_head * head_dim + dim_tile * 8 + col] = d0 / probability_correction;
-    output[q_head * head_dim + dim_tile * 8 + col + 1] = d1 / probability_correction;
+    const std::uint32_t q_head = query_base + row;
+    if (q_head < (kv_head + 1) * queries_per_kv) {
+        output[q_head * head_dim + dim_tile * 8 + col] = d0 / probability_correction;
+        output[q_head * head_dim + dim_tile * 8 + col + 1] = d1 / probability_correction;
+    }
 }
 
 extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
@@ -1382,6 +1611,7 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
     float* output,
     std::uint32_t cache_len,
     std::uint32_t max_tokens,
+    std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
     cudaStream_t stream)
@@ -1390,33 +1620,35 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
         value_values == nullptr || value_scales == nullptr || value_tail == nullptr ||
         query_tiles == nullptr || query_scales == nullptr || scores == nullptr ||
         probability_tiles == nullptr || probability_scales == nullptr || output == nullptr ||
-        cache_len == 0 || cache_len > max_tokens || kv_heads == 0 || head_dim == 0 ||
-        (head_dim % 64) != 0) {
+        cache_len == 0 || cache_len > max_tokens || q_heads == 0 || kv_heads == 0 ||
+        (q_heads % kv_heads) != 0 || head_dim == 0 || (head_dim % 64) != 0) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t head_k_tiles = head_dim / 64;
     const std::uint32_t token_tiles = (cache_len + 7) / 8;
     const std::uint32_t context_tiles = (cache_len + 63) / 64;
-    infer_sm12x_kv_quantize_query_kernel<<<dim3(kv_heads, head_k_tiles, 1), 128, 0, stream>>>(
-        query, query_tiles, query_scales, head_dim);
+    const std::uint32_t query_groups = kv_heads * ((q_heads / kv_heads + 7) / 8);
+    infer_sm12x_kv_quantize_query_kernel<<<dim3(query_groups, head_k_tiles, 1), 128, 0, stream>>>(
+        query, query_tiles, query_scales, q_heads, kv_heads, head_dim);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, token_tiles, 1), 32, 0, stream>>>(
+    infer_sm12x_kv_qk_kernel<<<dim3(query_groups, token_tiles, 1), 32, 0, stream>>>(
         query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-        cache_len, nullptr, max_tokens, kv_heads, head_dim);
+        cache_len, nullptr, max_tokens, q_heads, kv_heads, head_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
+    infer_sm12x_kv_softmax_kernel<<<q_heads, 256, 0, stream>>>(
         scores, cache_len, nullptr, max_tokens);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_quantize_probability_kernel<<<dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
-        scores, probability_tiles, probability_scales, cache_len, nullptr, max_tokens);
+    infer_sm12x_kv_quantize_probability_kernel<<<dim3(query_groups, context_tiles, 1), 128, 0, stream>>>(
+        scores, probability_tiles, probability_scales, cache_len, nullptr, max_tokens,
+        q_heads, kv_heads);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
+    infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, cache_len, nullptr, max_tokens, kv_heads, head_dim);
+        output, cache_len, nullptr, max_tokens, q_heads, kv_heads, head_dim);
     return cudaGetLastError();
 }
 
@@ -1482,12 +1714,13 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
         const std::uint32_t context_tiles = (cache_len + 63) / 64;
         infer_sm12x_kv_quantize_query_kernel<<<
             dim3(kv_heads, head_k_tiles, 1), 128, 0, stream>>>(
-            query + input_row * q_width, query_tiles, query_scales, head_dim);
+            query + input_row * q_width, query_tiles, query_scales,
+            kv_heads * 8, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, token_tiles, 1), 32, 0, stream>>>(
             query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-            cache_len, nullptr, max_tokens, kv_heads, head_dim);
+            cache_len, nullptr, max_tokens, kv_heads * 8, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
@@ -1496,12 +1729,14 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_quantize_probability_kernel<<<
             dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
-            scores, probability_tiles, probability_scales, cache_len, nullptr, max_tokens);
+            scores, probability_tiles, probability_scales, cache_len, nullptr,
+            max_tokens, kv_heads * 8, kv_heads);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
             probability_tiles, probability_scales, value_values, value_scales, value_tail,
-            output + input_row * q_width, cache_len, nullptr, max_tokens, kv_heads, head_dim);
+            output + input_row * q_width, cache_len, nullptr, max_tokens,
+            kv_heads * 8, kv_heads, head_dim);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
     }
@@ -1540,12 +1775,12 @@ extern "C" cudaError_t infer_sm12x_kv_attention_indexed_on_stream(
     const std::uint32_t max_token_tiles = (max_tokens + 7) / 8;
     const std::uint32_t max_context_tiles = (max_tokens + 63) / 64;
     infer_sm12x_kv_quantize_query_kernel<<<dim3(kv_heads, head_k_tiles, 1), 128, 0, stream>>>(
-        query, query_tiles, query_scales, head_dim);
+        query, query_tiles, query_scales, kv_heads * 8, kv_heads, head_dim);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_qk_kernel<<<dim3(kv_heads, max_token_tiles, 1), 32, 0, stream>>>(
         query_tiles, query_scales, key_values, key_scales, key_tail, scores,
-        0, cache_len, max_tokens, kv_heads, head_dim);
+        0, cache_len, max_tokens, kv_heads * 8, kv_heads, head_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_softmax_kernel<<<kv_heads * 8, 256, 0, stream>>>(
@@ -1553,12 +1788,13 @@ extern "C" cudaError_t infer_sm12x_kv_attention_indexed_on_stream(
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_quantize_probability_kernel<<<dim3(kv_heads, max_context_tiles, 1), 128, 0, stream>>>(
-        scores, probability_tiles, probability_scales, 0, cache_len, max_tokens);
+        scores, probability_tiles, probability_scales, 0, cache_len, max_tokens,
+        kv_heads * 8, kv_heads);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, 0, cache_len, max_tokens, kv_heads, head_dim);
+        output, 0, cache_len, max_tokens, kv_heads * 8, kv_heads, head_dim);
     return cudaGetLastError();
 }
 
@@ -1585,12 +1821,13 @@ extern "C" cudaError_t infer_sm12x_kv_pv_from_probabilities_on_stream(
     }
     const std::uint32_t context_tiles = (cache_len + 63) / 64;
     infer_sm12x_kv_quantize_probability_kernel<<<dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
-        probabilities, probability_tiles, probability_scales, cache_len, nullptr, max_tokens);
+        probabilities, probability_tiles, probability_scales, cache_len, nullptr,
+        max_tokens, kv_heads * 8, kv_heads);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
-        output, cache_len, nullptr, max_tokens, kv_heads, head_dim);
+        output, cache_len, nullptr, max_tokens, kv_heads * 8, kv_heads, head_dim);
     return cudaGetLastError();
 }
 
@@ -1799,6 +2036,146 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_sm12x_moe_silu_quantize_slots_residual_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* const* __restrict__ gate_up_table,
+    std::uint8_t* __restrict__ primary_tiles,
+    std::uint32_t* __restrict__ primary_scales,
+    std::uint8_t* __restrict__ residual_tiles,
+    std::uint32_t* __restrict__ residual_scales,
+    const float* __restrict__ gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t k_tiles,
+    std::uint32_t groups)
+{
+    const std::uint32_t slot = blockIdx.x;
+    const std::uint32_t kt = blockIdx.y;
+    if (slot >= groups || kt >= k_tiles) return;
+
+    __shared__ float values[64];
+    __shared__ float residuals[64];
+    __shared__ std::uint8_t primary_codes[64];
+    __shared__ std::uint8_t residual_codes[64];
+    __shared__ std::uint8_t primary_scale_codes[4];
+    __shared__ std::uint8_t residual_scale_codes[4];
+    __shared__ float primary_scale_values[4];
+    __shared__ float residual_scale_values[4];
+
+    std::uint8_t* primary_tile = primary_tiles + (slot * k_tiles + kt) * 512;
+    std::uint8_t* residual_tile = residual_tiles + (slot * k_tiles + kt) * 512;
+    for (int index = threadIdx.x; index < 512; index += blockDim.x) {
+        primary_tile[index] = 0;
+        residual_tile[index] = 0;
+    }
+
+    const std::uint32_t expert = indices[slot];
+    const float gate_up_alpha = gate_up_alpha_table[expert];
+    const float* gate_up = gate_up_table[slot];
+    const int scale_group = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    float value = 0.0f;
+    if (lane < 16) {
+        const std::uint32_t row = kt * 64 + scale_group * 16 + lane;
+        if (row < rows) {
+            const float gate_value = gate_up[row] * gate_up_alpha;
+            const float up_value = gate_up[rows + row] * gate_up_alpha;
+            const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+            value = gate_value * sigmoid * up_value;
+        }
+        values[scale_group * 16 + lane] = value;
+    }
+
+    float max_abs = lane < 16 && isfinite(value) ? fabsf(value) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        primary_scale_codes[scale_group] = scale_code;
+        primary_scale_values[scale_group] = infer_e4m3_value(scale_code);
+    }
+    __syncthreads();
+
+    float residual = 0.0f;
+    if (lane < 16) {
+        const int index = scale_group * 16 + lane;
+        const float scale = primary_scale_values[scale_group];
+        const std::uint8_t code = infer_e2m1_code(
+            scale == 0.0f ? 0.0f : values[index] / scale);
+        primary_codes[index] = code;
+        residual = values[index] - infer_e2m1_value(code) * scale;
+        residuals[index] = residual;
+    }
+
+    max_abs = lane < 16 && isfinite(residual) ? fabsf(residual) : 0.0f;
+    for (int delta = 8; delta > 0; delta >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffffu, max_abs, delta));
+    }
+    if (lane == 0) {
+        const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        residual_scale_codes[scale_group] = scale_code;
+        residual_scale_values[scale_group] = infer_e4m3_value(scale_code);
+    }
+    __syncthreads();
+
+    if (lane < 16) {
+        const int index = scale_group * 16 + lane;
+        const float scale = residual_scale_values[scale_group];
+        residual_codes[index] = infer_e2m1_code(
+            scale == 0.0f ? 0.0f : residuals[index] / scale);
+    }
+    __syncthreads();
+
+    for (int packed_idx = threadIdx.x; packed_idx < 256; packed_idx += blockDim.x) {
+        const int output_lane = packed_idx >> 3;
+        const int pair = packed_idx & 7;
+        const int v = pair << 1;
+        const int t0 = output_lane & 3;
+        const int col0 = t0 * 8 + (v & 7) + 32 * ((v >> 3) & 1);
+        const int next_v = v + 1;
+        const int col1 = t0 * 8 + (next_v & 7) + 32 * ((next_v >> 3) & 1);
+        primary_tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            primary_codes[col0] | (primary_codes[col1] << 4));
+        residual_tile[output_lane * 16 + pair] = static_cast<std::uint8_t>(
+            residual_codes[col0] | (residual_codes[col1] << 4));
+    }
+    if (threadIdx.x == 0) {
+        primary_scales[slot * k_tiles + kt] = infer_scale_word(primary_scale_codes);
+        residual_scales[slot * k_tiles + kt] = infer_scale_word(residual_scale_codes);
+    }
+}
+
+extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_residual_on_stream(
+    const std::uint32_t* indices,
+    const float* const* gate_up_table,
+    std::uint8_t* primary_tiles,
+    std::uint32_t* primary_scales,
+    std::uint8_t* residual_tiles,
+    std::uint32_t* residual_scales,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || gate_up_table == nullptr ||
+        primary_tiles == nullptr || primary_scales == nullptr ||
+        residual_tiles == nullptr || residual_scales == nullptr ||
+        gate_up_alpha_table == nullptr ||
+        rows == 0 || groups == 0 || (rows % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t k_tiles = rows / 64;
+    infer_sm12x_moe_silu_quantize_slots_residual_kernel<<<
+        dim3(groups, k_tiles, 1), 128, 0, stream>>>(
+        indices, gate_up_table, primary_tiles, primary_scales,
+        residual_tiles, residual_scales, gate_up_alpha_table, rows, k_tiles,
+        groups);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_sm12x_moe_silu_quantize_bf16_slots_on_stream(
     const std::uint32_t* indices,
     const std::uint16_t* gate_up_bf16,
@@ -2003,5 +2380,439 @@ extern "C" cudaError_t infer_sm12x_indexed_grouped_gemv_on_stream(
     }
     dim3 grid(m_tiles, groups, 1);
     infer_sm12x_indexed_grouped_gemv_kernel<<<grid, 32, 0, stream>>>(indices, a_native_tiles_table, a_scales_table, table_len, b_native_tiles, sfb, d, m_tiles, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+template <bool AddResidual>
+__global__ void infer_sm12x_indexed_grouped_gemv_row_scales_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const std::uint8_t* const* __restrict__ a_native_tiles_table,
+    const std::uint32_t* const* __restrict__ a_row_scales_table,
+    std::uint32_t table_len,
+    const std::uint8_t* __restrict__ b_native_tiles,
+    const std::uint32_t* __restrict__ sfb,
+    const std::uint8_t* __restrict__ residual_native_tiles,
+    const std::uint32_t* __restrict__ residual_sfb,
+    float* const* __restrict__ d,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    std::uint32_t groups)
+{
+    const std::uint32_t m_tile = blockIdx.x;
+    const std::uint32_t group = blockIdx.y;
+    if (m_tile >= m_tiles || group >= groups) return;
+    const std::uint32_t expert = indices[group];
+    if (expert >= table_len) return;
+
+    const std::uint8_t* a_native_tiles = a_native_tiles_table[expert];
+    const std::uint32_t* row_scales = a_row_scales_table[expert];
+    float* out = d[group];
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+    const std::uint16_t bid = 0;
+    const std::uint16_t tid = 0;
+    const std::uint32_t scale_lane = threadIdx.x & 3;
+    const std::uint32_t scale_row = (threadIdx.x >> 2) + (scale_lane == 1 ? 8 : 0);
+
+    for (std::uint32_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
+        const std::uint8_t* a_tile = a_native_tiles + (m_tile * k_tiles + k_tile) * 512;
+        const std::uint8_t* b_tile = b_native_tiles + (group * k_tiles + k_tile) * 512;
+        const std::uint32_t* a_regs = reinterpret_cast<const std::uint32_t*>(a_tile + threadIdx.x * 16);
+        const std::uint32_t* b_regs = reinterpret_cast<const std::uint32_t*>(b_tile + threadIdx.x * 16);
+        const std::uint32_t a0 = a_regs[0];
+        const std::uint32_t a1 = a_regs[1];
+        const std::uint32_t a2 = a_regs[2];
+        const std::uint32_t a3 = a_regs[3];
+        const std::uint32_t b0 = b_regs[0];
+        const std::uint32_t b1 = b_regs[1];
+        const std::uint32_t sfa = scale_lane < 2
+            ? row_scales[(m_tile * k_tiles + k_tile) * 16 + scale_row]
+            : 0;
+        float nd0 = 0.0f;
+        float nd1 = 0.0f;
+        float nd2 = 0.0f;
+        float nd3 = 0.0f;
+        asm volatile(
+            "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+            "{%0, %1, %2, %3},"
+            "{%4, %5, %6, %7},"
+            "{%8, %9},"
+            "{%10, %11, %12, %13},"
+            "{%14},"
+            "{%15, %16},"
+            "{%17},"
+            "{%18, %19};\n"
+            : "=f"(nd0), "=f"(nd1), "=f"(nd2), "=f"(nd3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+              "r"(b0), "r"(b1),
+              "f"(d0), "f"(d1), "f"(d2), "f"(d3),
+              "r"(sfa), "h"(bid), "h"(tid),
+              "r"(sfb[group * k_tiles + k_tile]), "h"(bid), "h"(tid));
+        if constexpr (AddResidual) {
+            const std::uint8_t* residual_tile =
+                residual_native_tiles + (group * k_tiles + k_tile) * 512;
+            const std::uint32_t* residual_regs =
+                reinterpret_cast<const std::uint32_t*>(residual_tile + threadIdx.x * 16);
+            const std::uint32_t residual_b0 = residual_regs[0];
+            const std::uint32_t residual_b1 = residual_regs[1];
+            float rd0 = 0.0f;
+            float rd1 = 0.0f;
+            float rd2 = 0.0f;
+            float rd3 = 0.0f;
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0, %1, %2, %3},"
+                "{%4, %5, %6, %7},"
+                "{%8, %9},"
+                "{%10, %11, %12, %13},"
+                "{%14},"
+                "{%15, %16},"
+                "{%17},"
+                "{%18, %19};\n"
+                : "=f"(rd0), "=f"(rd1), "=f"(rd2), "=f"(rd3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                  "r"(residual_b0), "r"(residual_b1),
+                  "f"(nd0), "f"(nd1), "f"(nd2), "f"(nd3),
+                  "r"(sfa), "h"(bid), "h"(tid),
+                  "r"(residual_sfb[group * k_tiles + k_tile]), "h"(bid), "h"(tid));
+            d0 = rd0;
+            d1 = rd1;
+            d2 = rd2;
+            d3 = rd3;
+        } else {
+            d0 = nd0;
+            d1 = nd1;
+            d2 = nd2;
+            d3 = nd3;
+        }
+    }
+
+    if ((threadIdx.x & 3) == 0) {
+        const int row_base = threadIdx.x >> 2;
+        const int out_base = static_cast<int>(m_tile) * 16;
+        out[out_base + row_base] = d0;
+        out[out_base + row_base + 8] = d2;
+    }
+}
+
+extern "C" cudaError_t infer_sm12x_indexed_grouped_gemv_row_scales_on_stream(
+    const std::uint32_t* indices,
+    const std::uint8_t* const* a_native_tiles_table,
+    const std::uint32_t* const* a_row_scales_table,
+    std::uint32_t table_len,
+    const std::uint8_t* b_native_tiles,
+    const std::uint32_t* sfb,
+    float* const* d,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || a_native_tiles_table == nullptr ||
+        a_row_scales_table == nullptr || b_native_tiles == nullptr ||
+        sfb == nullptr || d == nullptr || table_len == 0 || m_tiles == 0 ||
+        k_tiles == 0 || groups == 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(m_tiles, groups, 1);
+    infer_sm12x_indexed_grouped_gemv_row_scales_kernel<false><<<grid, 32, 0, stream>>>(
+        indices, a_native_tiles_table, a_row_scales_table, table_len,
+        b_native_tiles, sfb, nullptr, nullptr, d, m_tiles, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream(
+    const std::uint32_t* indices,
+    const std::uint8_t* const* a_native_tiles_table,
+    const std::uint32_t* const* a_row_scales_table,
+    std::uint32_t table_len,
+    const std::uint8_t* b_native_tiles,
+    const std::uint32_t* sfb,
+    const std::uint8_t* residual_native_tiles,
+    const std::uint32_t* residual_sfb,
+    float* const* d,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || a_native_tiles_table == nullptr ||
+        a_row_scales_table == nullptr || b_native_tiles == nullptr ||
+        sfb == nullptr || residual_native_tiles == nullptr ||
+        residual_sfb == nullptr || d == nullptr || table_len == 0 ||
+        m_tiles == 0 || k_tiles == 0 || groups == 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(m_tiles, groups, 1);
+    infer_sm12x_indexed_grouped_gemv_row_scales_kernel<true><<<grid, 32, 0, stream>>>(
+        indices, a_native_tiles_table, a_row_scales_table, table_len,
+        b_native_tiles, sfb, residual_native_tiles, residual_sfb, d,
+        m_tiles, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+template <int Terms>
+__global__ void infer_sm12x_gemv_row_scales_kernel(
+    const std::uint8_t* __restrict__ a_native_tiles,
+    const std::uint32_t* __restrict__ a_row_scales,
+    const std::uint8_t* __restrict__ b_native_tiles,
+    const std::uint32_t* __restrict__ sfb,
+    const std::uint8_t* __restrict__ residual_native_tiles,
+    const std::uint32_t* __restrict__ residual_sfb,
+    const std::uint8_t* __restrict__ residual2_native_tiles,
+    const std::uint32_t* __restrict__ residual2_sfb,
+    float* __restrict__ output,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    std::uint32_t k_splits,
+    float alpha)
+{
+    const std::uint32_t m_tile = blockIdx.x;
+    const std::uint32_t row = blockIdx.y;
+    const std::uint32_t split = blockIdx.z;
+    if (m_tile >= m_tiles) return;
+    b_native_tiles += row * k_tiles * 512;
+    sfb += row * k_tiles;
+    if constexpr (Terms >= 2) {
+        residual_native_tiles += row * k_tiles * 512;
+        residual_sfb += row * k_tiles;
+    }
+    if constexpr (Terms >= 3) {
+        residual2_native_tiles += row * k_tiles * 512;
+        residual2_sfb += row * k_tiles;
+    }
+    output += (row * k_splits + split) * m_tiles * 16;
+
+    float d0 = 0.0f;
+    float d1 = 0.0f;
+    float d2 = 0.0f;
+    float d3 = 0.0f;
+    const std::uint16_t bid = 0;
+    const std::uint16_t tid = 0;
+    const std::uint32_t scale_lane = threadIdx.x & 3;
+    const std::uint32_t scale_row = (threadIdx.x >> 2) + (scale_lane == 1 ? 8 : 0);
+
+    const std::uint32_t k_begin = k_tiles * split / k_splits;
+    const std::uint32_t k_end = k_tiles * (split + 1) / k_splits;
+    for (std::uint32_t k_tile = k_begin; k_tile < k_end; ++k_tile) {
+        const std::uint8_t* a_tile =
+            a_native_tiles + (m_tile * k_tiles + k_tile) * 512;
+        const std::uint8_t* b_tile = b_native_tiles + k_tile * 512;
+        const std::uint32_t* a_regs =
+            reinterpret_cast<const std::uint32_t*>(a_tile + threadIdx.x * 16);
+        const std::uint32_t* b_regs =
+            reinterpret_cast<const std::uint32_t*>(b_tile + threadIdx.x * 16);
+        const std::uint32_t sfa = scale_lane < 2
+            ? a_row_scales[(m_tile * k_tiles + k_tile) * 16 + scale_row]
+            : 0;
+        float nd0 = 0.0f;
+        float nd1 = 0.0f;
+        float nd2 = 0.0f;
+        float nd3 = 0.0f;
+        asm volatile(
+            "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+            "{%0, %1, %2, %3},"
+            "{%4, %5, %6, %7},"
+            "{%8, %9},"
+            "{%10, %11, %12, %13},"
+            "{%14},"
+            "{%15, %16},"
+            "{%17},"
+            "{%18, %19};\n"
+            : "=f"(nd0), "=f"(nd1), "=f"(nd2), "=f"(nd3)
+            : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+              "r"(b_regs[0]), "r"(b_regs[1]),
+              "f"(d0), "f"(d1), "f"(d2), "f"(d3),
+              "r"(sfa), "h"(bid), "h"(tid),
+              "r"(sfb[k_tile]), "h"(bid), "h"(tid));
+        if constexpr (Terms >= 2) {
+            const std::uint8_t* residual_tile = residual_native_tiles + k_tile * 512;
+            const std::uint32_t* residual_regs = reinterpret_cast<const std::uint32_t*>(
+                residual_tile + threadIdx.x * 16);
+            float rd0 = 0.0f;
+            float rd1 = 0.0f;
+            float rd2 = 0.0f;
+            float rd3 = 0.0f;
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0, %1, %2, %3},"
+                "{%4, %5, %6, %7},"
+                "{%8, %9},"
+                "{%10, %11, %12, %13},"
+                "{%14},"
+                "{%15, %16},"
+                "{%17},"
+                "{%18, %19};\n"
+                : "=f"(rd0), "=f"(rd1), "=f"(rd2), "=f"(rd3)
+                : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+                  "r"(residual_regs[0]), "r"(residual_regs[1]),
+                  "f"(nd0), "f"(nd1), "f"(nd2), "f"(nd3),
+                  "r"(sfa), "h"(bid), "h"(tid),
+                  "r"(residual_sfb[k_tile]), "h"(bid), "h"(tid));
+            if constexpr (Terms >= 3) {
+                const std::uint8_t* residual2_tile = residual2_native_tiles + k_tile * 512;
+                const std::uint32_t* residual2_regs = reinterpret_cast<const std::uint32_t*>(
+                    residual2_tile + threadIdx.x * 16);
+                float td0 = 0.0f;
+                float td1 = 0.0f;
+                float td2 = 0.0f;
+                float td3 = 0.0f;
+                asm volatile(
+                    "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                    "{%0, %1, %2, %3},"
+                    "{%4, %5, %6, %7},"
+                    "{%8, %9},"
+                    "{%10, %11, %12, %13},"
+                    "{%14},"
+                    "{%15, %16},"
+                    "{%17},"
+                    "{%18, %19};\n"
+                    : "=f"(td0), "=f"(td1), "=f"(td2), "=f"(td3)
+                    : "r"(a_regs[0]), "r"(a_regs[1]), "r"(a_regs[2]), "r"(a_regs[3]),
+                      "r"(residual2_regs[0]), "r"(residual2_regs[1]),
+                      "f"(rd0), "f"(rd1), "f"(rd2), "f"(rd3),
+                      "r"(sfa), "h"(bid), "h"(tid),
+                      "r"(residual2_sfb[k_tile]), "h"(bid), "h"(tid));
+                d0 = td0;
+                d1 = td1;
+                d2 = td2;
+                d3 = td3;
+            } else {
+                d0 = rd0;
+                d1 = rd1;
+                d2 = rd2;
+                d3 = rd3;
+            }
+        } else {
+            d0 = nd0;
+            d1 = nd1;
+            d2 = nd2;
+            d3 = nd3;
+        }
+    }
+
+    if ((threadIdx.x & 3) == 0) {
+        const int row_base = threadIdx.x >> 2;
+        const int out_base = static_cast<int>(m_tile) * 16;
+        output[out_base + row_base] = d0 * alpha;
+        output[out_base + row_base + 8] = d2 * alpha;
+    }
+}
+
+extern "C" cudaError_t infer_sm12x_gemv_row_scales_residual_batch_on_stream(
+    const std::uint8_t* a_native_tiles,
+    const std::uint32_t* a_row_scales,
+    const std::uint8_t* b_native_tiles,
+    const std::uint32_t* sfb,
+    const std::uint8_t* residual_native_tiles,
+    const std::uint32_t* residual_sfb,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    float alpha,
+    cudaStream_t stream)
+{
+    if (a_native_tiles == nullptr || a_row_scales == nullptr ||
+        b_native_tiles == nullptr || sfb == nullptr ||
+        residual_native_tiles == nullptr || residual_sfb == nullptr ||
+        output == nullptr || rows == 0 || m_tiles == 0 || k_tiles == 0 ||
+        !isfinite(alpha)) {
+        return cudaErrorInvalidValue;
+    }
+    infer_sm12x_gemv_row_scales_kernel<2><<<dim3(m_tiles, rows), 32, 0, stream>>>(
+        a_native_tiles, a_row_scales, b_native_tiles, sfb,
+        residual_native_tiles, residual_sfb, nullptr, nullptr,
+        output, m_tiles, k_tiles, 1, alpha);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_gemv_row_scales_residual2_batch_on_stream(
+    const std::uint8_t* a_native_tiles,
+    const std::uint32_t* a_row_scales,
+    const std::uint8_t* b_native_tiles,
+    const std::uint32_t* sfb,
+    const std::uint8_t* residual_native_tiles,
+    const std::uint32_t* residual_sfb,
+    const std::uint8_t* residual2_native_tiles,
+    const std::uint32_t* residual2_sfb,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    float alpha,
+    cudaStream_t stream)
+{
+    if (a_native_tiles == nullptr || a_row_scales == nullptr ||
+        b_native_tiles == nullptr || sfb == nullptr ||
+        residual_native_tiles == nullptr || residual_sfb == nullptr ||
+        residual2_native_tiles == nullptr || residual2_sfb == nullptr ||
+        output == nullptr || rows == 0 || m_tiles == 0 || k_tiles == 0 ||
+        !isfinite(alpha)) {
+        return cudaErrorInvalidValue;
+    }
+    infer_sm12x_gemv_row_scales_kernel<3><<<dim3(m_tiles, rows), 32, 0, stream>>>(
+        a_native_tiles, a_row_scales, b_native_tiles, sfb,
+        residual_native_tiles, residual_sfb, residual2_native_tiles,
+        residual2_sfb, output, m_tiles, k_tiles, 1, alpha);
+    return cudaGetLastError();
+}
+
+__global__ void infer_sm12x_reduce_gemv_partials_kernel(
+    const float* __restrict__ partials,
+    float* __restrict__ output,
+    std::uint32_t values,
+    std::uint32_t splits)
+{
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = blockIdx.y;
+    if (index >= values) return;
+    float sum = 0.0f;
+    for (std::uint32_t split = 0; split < splits; ++split) {
+        sum += partials[(row * splits + split) * values + index];
+    }
+    output[row * values + index] = sum;
+}
+
+extern "C" cudaError_t infer_sm12x_gemv_row_scales_residual2_splitk_batch_on_stream(
+    const std::uint8_t* a_native_tiles,
+    const std::uint32_t* a_row_scales,
+    const std::uint8_t* b_native_tiles,
+    const std::uint32_t* sfb,
+    const std::uint8_t* residual_native_tiles,
+    const std::uint32_t* residual_sfb,
+    const std::uint8_t* residual2_native_tiles,
+    const std::uint32_t* residual2_sfb,
+    float* partials,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t m_tiles,
+    std::uint32_t k_tiles,
+    std::uint32_t k_splits,
+    float alpha,
+    cudaStream_t stream)
+{
+    if (a_native_tiles == nullptr || a_row_scales == nullptr ||
+        b_native_tiles == nullptr || sfb == nullptr ||
+        residual_native_tiles == nullptr || residual_sfb == nullptr ||
+        residual2_native_tiles == nullptr || residual2_sfb == nullptr ||
+        partials == nullptr || output == nullptr || rows == 0 ||
+        m_tiles == 0 || k_tiles == 0 || k_splits < 2 ||
+        k_splits > k_tiles || !isfinite(alpha)) {
+        return cudaErrorInvalidValue;
+    }
+    infer_sm12x_gemv_row_scales_kernel<3><<<
+        dim3(m_tiles, rows, k_splits), 32, 0, stream>>>(
+        a_native_tiles, a_row_scales, b_native_tiles, sfb,
+        residual_native_tiles, residual_sfb, residual2_native_tiles,
+        residual2_sfb, partials, m_tiles, k_tiles, k_splits, alpha);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    const std::uint32_t values = m_tiles * 16;
+    infer_sm12x_reduce_gemv_partials_kernel<<<
+        dim3((values + 255) / 256, rows), 256, 0, stream>>>(
+        partials, output, values, k_splits);
     return cudaGetLastError();
 }

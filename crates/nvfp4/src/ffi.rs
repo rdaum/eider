@@ -256,6 +256,19 @@ unsafe extern "C" {
         sfb: *mut u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_quantize_dynamic_vectors_residual2_on_stream(
+        input: *const f32,
+        rows: u32,
+        k: u32,
+        primary_tiles: *mut u8,
+        primary_scales: *mut u32,
+        residual_tiles: *mut u8,
+        residual_scales: *mut u32,
+        residual2_tiles: *mut u8,
+        residual2_scales: *mut u32,
+        input_multiplier: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_cache_append_on_stream(
         key: *const f32,
         value: *const f32,
@@ -319,6 +332,7 @@ unsafe extern "C" {
         output: *mut f32,
         cache_len: u32,
         max_tokens: u32,
+        q_heads: u32,
         kv_heads: u32,
         head_dim: u32,
         stream: cudaStream_t,
@@ -392,6 +406,18 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_moe_silu_quantize_slots_residual_on_stream(
+        indices: *const u32,
+        gate_up_table: *const *const f32,
+        primary_tiles: *mut u8,
+        primary_scales: *mut u32,
+        residual_tiles: *mut u8,
+        residual_scales: *mut u32,
+        gate_up_alpha_table: *const f32,
+        rows: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
         indices: *const u32,
         gate_up_table: *const *const f32,
@@ -438,6 +464,69 @@ unsafe extern "C" {
         m_tiles: u32,
         k_tiles: u32,
         groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_indexed_grouped_gemv_row_scales_on_stream(
+        indices: *const u32,
+        a_native_tiles_table: *const *const u8,
+        a_row_scales_table: *const *const u32,
+        table_len: u32,
+        b_native_tiles: *const u8,
+        sfb: *const u32,
+        d: *const *mut f32,
+        m_tiles: u32,
+        k_tiles: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream(
+        indices: *const u32,
+        a_native_tiles_table: *const *const u8,
+        a_row_scales_table: *const *const u32,
+        table_len: u32,
+        b_native_tiles: *const u8,
+        sfb: *const u32,
+        residual_native_tiles: *const u8,
+        residual_sfb: *const u32,
+        d: *const *mut f32,
+        m_tiles: u32,
+        k_tiles: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub(crate) fn infer_sm12x_gemv_row_scales_residual2_batch_on_stream(
+        a_native_tiles: *const u8,
+        a_row_scales: *const u32,
+        b_native_tiles: *const u8,
+        sfb: *const u32,
+        residual_native_tiles: *const u8,
+        residual_sfb: *const u32,
+        residual2_native_tiles: *const u8,
+        residual2_sfb: *const u32,
+        output: *mut f32,
+        rows: u32,
+        m_tiles: u32,
+        k_tiles: u32,
+        alpha: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_gemv_row_scales_residual2_splitk_batch_on_stream(
+        a_native_tiles: *const u8,
+        a_row_scales: *const u32,
+        b_native_tiles: *const u8,
+        sfb: *const u32,
+        residual_native_tiles: *const u8,
+        residual_sfb: *const u32,
+        residual2_native_tiles: *const u8,
+        residual2_sfb: *const u32,
+        partials: *mut f32,
+        output: *mut f32,
+        rows: u32,
+        m_tiles: u32,
+        k_tiles: u32,
+        k_splits: u32,
+        alpha: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_rms_norm_f32_on_stream(
@@ -507,6 +596,14 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sigmoid_scale_heads_f32_on_stream(
+        gate: *const f32,
+        input: *const f32,
+        output: *mut f32,
+        heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sigmoid_scale_scalar_f32_on_stream(
         gate_logit: *const f32,
         input: *const f32,
@@ -559,6 +656,14 @@ unsafe extern "C" {
         experts: u32,
         k: u32,
         norm_topk_prob: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_step35_sigmoid_top8_f32_on_stream(
+        logits: *const f32,
+        bias: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_moe_topk_f32_batch_on_stream(
@@ -632,6 +737,15 @@ unsafe extern "C" {
         packed_table: *const *mut u8,
         scales_table: *const *mut u8,
         input_scale_table: *const f32,
+        gate_up_alpha_table: *const f32,
+        rows: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_silu_slots_f32_on_stream(
+        indices: *const u32,
+        gate_up_table: *const *const f32,
+        output_table: *const *mut f32,
         gate_up_alpha_table: *const f32,
         rows: u32,
         groups: u32,
@@ -766,6 +880,17 @@ unsafe extern "C" {
         head_dim: u32,
         start_position: u32,
         theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rope_neox_inv_freq_sequence_f32_on_stream(
+        input: *const f32,
+        inv_freq: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        start_position: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_add_f32_on_stream(
@@ -1352,6 +1477,19 @@ unsafe extern "C" {
     pub(crate) fn infer_nvfp4_w4a16_grouped_matvec_f32_on_stream(
         indices: *const u32,
         input: *const f32,
+        packed_weight_table: *const *const u8,
+        weight_scale_table: *const *const u8,
+        weight_scale_2_table: *const f32,
+        output_table: *const *mut f32,
+        table_len: u32,
+        groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
+        indices: *const u32,
+        input_table: *const *const f32,
         packed_weight_table: *const *const u8,
         weight_scale_table: *const *const u8,
         weight_scale_2_table: *const f32,

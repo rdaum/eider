@@ -97,6 +97,46 @@ pub fn modelopt_m16_k64_scale_words(
     Ok(words)
 }
 
+/// Packs ModelOpt's per-row K16 scales for lane-specific SM12x scale operands.
+///
+/// The output order is `[m_tile, k_tile, row_in_m16]`; each word contains the
+/// four K16 UE4M3 scales consumed by one row of an M16K64 tile.
+pub fn modelopt_m16_k64_row_scale_words(
+    m: usize,
+    k: usize,
+    row_major_scales: &[u8],
+) -> Result<Vec<u32>> {
+    if m == 0
+        || k == 0
+        || !m.is_multiple_of(16)
+        || !k.is_multiple_of(64)
+        || row_major_scales.len() != m * (k / 16)
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x ModelOpt row scale words",
+            expected: "M multiple of 16, K multiple of 64, scales len M*K/16".to_string(),
+            actual: format!("M={m}, K={k}, scales={}", row_major_scales.len()),
+        });
+    }
+    let m_tiles = m / 16;
+    let k_blocks = k / 16;
+    let k_tiles = k / 64;
+    let mut words = Vec::with_capacity(m * k_tiles);
+    for mt in 0..m_tiles {
+        for kt in 0..k_tiles {
+            for row in mt * 16..mt * 16 + 16 {
+                let start = row * k_blocks + kt * 4;
+                words.push(pack_ue4m3_k16_scale_word(
+                    row_major_scales[start..start + 4]
+                        .try_into()
+                        .expect("four scale bytes"),
+                ));
+            }
+        }
+    }
+    Ok(words)
+}
+
 #[allow(dead_code)]
 pub struct Sm12xRequantizedWeight {
     pub weight: Sm12xFp4GemmWeight,
@@ -303,7 +343,8 @@ impl Sm12xFp4TileSet {
         }
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
+    /// Returns all native tiles as one contiguous byte payload.
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.tiles.len() * TILE_BYTES);
         for tile in &self.tiles {
             bytes.extend_from_slice(tile.as_slice());
@@ -933,6 +974,74 @@ pub fn quantize_dynamic_vector_on_stream(
     }
 }
 
+/// Dynamically quantizes f32 rows as primary and residual SM12x FP4 vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_dynamic_vectors_residual2_on_stream(
+    input: &DeviceBuffer<f32>,
+    rows: usize,
+    features: usize,
+    primary_tiles: &mut DeviceBuffer<u8>,
+    primary_scales: &mut DeviceBuffer<u32>,
+    residual_tiles: &mut DeviceBuffer<u8>,
+    residual_scales: &mut DeviceBuffer<u32>,
+    residual2_tiles: &mut DeviceBuffer<u8>,
+    residual2_scales: &mut DeviceBuffer<u32>,
+    input_multiplier: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k_tiles = features / 64;
+    let tile_bytes = rows * k_tiles * TILE_BYTES;
+    let scale_words = rows * k_tiles;
+    if rows == 0
+        || features == 0
+        || !features.is_multiple_of(64)
+        || input.len() != rows * features
+        || primary_tiles.len() != tile_bytes
+        || primary_scales.len() != scale_words
+        || residual_tiles.len() != tile_bytes
+        || residual_scales.len() != scale_words
+        || residual2_tiles.len() != tile_bytes
+        || residual2_scales.len() != scale_words
+        || rows > u32::MAX as usize
+        || features > u32::MAX as usize
+        || input_multiplier <= 0.0
+        || !input_multiplier.is_finite()
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x dynamic residual vector batch quantization",
+            expected: "input [rows,K] and three FP4 vectors [rows,K/64]".to_string(),
+            actual: format!(
+                "input={} rows={rows} K={features} primary={}/{} residual={}/{} residual2={}/{} multiplier={input_multiplier}",
+                input.len(),
+                primary_tiles.len(),
+                primary_scales.len(),
+                residual_tiles.len(),
+                residual_scales.len(),
+                residual2_tiles.len(),
+                residual2_scales.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_quantize_dynamic_vectors_residual2_on_stream",
+            crate::ffi::infer_sm12x_quantize_dynamic_vectors_residual2_on_stream(
+                input.as_const_ptr().cast(),
+                rows as u32,
+                features as u32,
+                primary_tiles.as_mut_ptr().cast(),
+                primary_scales.as_mut_ptr().cast(),
+                residual_tiles.as_mut_ptr().cast(),
+                residual_scales.as_mut_ptr().cast(),
+                residual2_tiles.as_mut_ptr().cast(),
+                residual2_scales.as_mut_ptr().cast(),
+                input_multiplier,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Takes ownership of native SM12x FP4 vector buffers.
 pub fn device_vector_from_native_parts(
     tiles: DeviceBuffer<u8>,
@@ -1003,6 +1112,70 @@ pub fn moe_silu_quantize_slots_on_stream(
                 b_native_tiles.as_mut_ptr().cast(),
                 sfb.as_mut_ptr().cast(),
                 input_scale_table.as_const_ptr().cast(),
+                gate_up_alpha_table.as_const_ptr().cast(),
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies SiLU to routed gate/up slots and quantizes each activation as the
+/// sum of a primary and residual native FP4 vector.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_slots_residual_on_stream(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<*const f32>,
+    primary_tiles: &mut DeviceBuffer<u8>,
+    primary_scales: &mut DeviceBuffer<u32>,
+    residual_tiles: &mut DeviceBuffer<u8>,
+    residual_scales: &mut DeviceBuffer<u32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k_tiles = rows / 64;
+    if rows == 0
+        || !rows.is_multiple_of(64)
+        || groups == 0
+        || indices.len() != groups
+        || gate_up_table.len() != groups
+        || primary_tiles.len() < groups * k_tiles * TILE_BYTES
+        || primary_scales.len() < groups * k_tiles
+        || residual_tiles.len() < groups * k_tiles * TILE_BYTES
+        || residual_scales.len() < groups * k_tiles
+        || gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x MoE residual SiLU quantize slots",
+            expected: "rows multiple of 64, slot tables, and two grouped native FP4 vectors"
+                .to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} indices={} gate_up={} primary={}/{} residual={}/{} gate_up_alphas={}",
+                indices.len(),
+                gate_up_table.len(),
+                primary_tiles.len(),
+                primary_scales.len(),
+                residual_tiles.len(),
+                residual_scales.len(),
+                gate_up_alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_moe_silu_quantize_slots_residual_on_stream",
+            crate::ffi::infer_sm12x_moe_silu_quantize_slots_residual_on_stream(
+                indices.as_const_ptr().cast(),
+                gate_up_table.as_const_ptr().cast(),
+                primary_tiles.as_mut_ptr().cast(),
+                primary_scales.as_mut_ptr().cast(),
+                residual_tiles.as_mut_ptr().cast(),
+                residual_scales.as_mut_ptr().cast(),
                 gate_up_alpha_table.as_const_ptr().cast(),
                 rows as u32,
                 groups as u32,
@@ -1245,6 +1418,306 @@ pub fn indexed_grouped_gemv_on_stream(
                 m_tiles as u32,
                 k_tiles as u32,
                 groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs grouped indexed SM12x GEMV with one K16 scale vector per output row.
+///
+/// `a_row_scales_table` entries use the
+/// `[m_tile, k_tile, row_in_m16]` order produced by
+/// [`modelopt_m16_k64_row_scale_words`].
+#[allow(clippy::too_many_arguments)]
+pub fn indexed_grouped_gemv_row_scales_on_stream(
+    indices: &DeviceBuffer<u32>,
+    a_native_tiles_table: &DeviceBuffer<*const u8>,
+    a_row_scales_table: &DeviceBuffer<*const u32>,
+    table_len: usize,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    d: &DeviceBuffer<*mut f32>,
+    m_tiles: usize,
+    k_tiles: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if indices.len() != groups
+        || d.len() != groups
+        || a_native_tiles_table.len() != table_len
+        || a_row_scales_table.len() != table_len
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || table_len > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x indexed grouped row-scaled GEMV buffers",
+            expected: "expert tables, route indices, grouped B vectors, and output pointers"
+                .to_string(),
+            actual: format!(
+                "indices={} D={} A={} SFA={} table_len={table_len} B={} SFB={} m_tiles={m_tiles} k_tiles={k_tiles} groups={groups}",
+                indices.len(),
+                d.len(),
+                a_native_tiles_table.len(),
+                a_row_scales_table.len(),
+                b_native_tiles.len(),
+                sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_indexed_grouped_gemv_row_scales_on_stream",
+            crate::ffi::infer_sm12x_indexed_grouped_gemv_row_scales_on_stream(
+                indices.as_const_ptr().cast(),
+                a_native_tiles_table.as_const_ptr().cast(),
+                a_row_scales_table.as_const_ptr().cast(),
+                table_len as u32,
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                d.as_const_ptr().cast(),
+                m_tiles as u32,
+                k_tiles as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs grouped row-scaled GEMV for the sum of primary and residual FP4 inputs.
+///
+/// Each weight tile is loaded once and applied to both input representations
+/// before the result is written.
+#[allow(clippy::too_many_arguments)]
+pub fn indexed_grouped_gemv_row_scales_residual_on_stream(
+    indices: &DeviceBuffer<u32>,
+    a_native_tiles_table: &DeviceBuffer<*const u8>,
+    a_row_scales_table: &DeviceBuffer<*const u32>,
+    table_len: usize,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    residual_native_tiles: &DeviceBuffer<u8>,
+    residual_sfb: &DeviceBuffer<u32>,
+    d: &DeviceBuffer<*mut f32>,
+    m_tiles: usize,
+    k_tiles: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if indices.len() != groups
+        || d.len() != groups
+        || a_native_tiles_table.len() != table_len
+        || a_row_scales_table.len() != table_len
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || residual_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || residual_sfb.len() < groups * k_tiles
+        || table_len > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x indexed grouped row-scaled residual GEMV buffers",
+            expected: "expert tables, two grouped B vectors, and output pointers".to_string(),
+            actual: format!(
+                "indices={} D={} A={} SFA={} table_len={table_len} B={}/{} residual={}/{} m_tiles={m_tiles} k_tiles={k_tiles} groups={groups}",
+                indices.len(),
+                d.len(),
+                a_native_tiles_table.len(),
+                a_row_scales_table.len(),
+                b_native_tiles.len(),
+                sfb.len(),
+                residual_native_tiles.len(),
+                residual_sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream",
+            crate::ffi::infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream(
+                indices.as_const_ptr().cast(),
+                a_native_tiles_table.as_const_ptr().cast(),
+                a_row_scales_table.as_const_ptr().cast(),
+                table_len as u32,
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                residual_native_tiles.as_const_ptr().cast(),
+                residual_sfb.as_const_ptr().cast(),
+                d.as_const_ptr().cast(),
+                m_tiles as u32,
+                k_tiles as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs a row-scaled SM12x GEMV over primary plus residual FP4 rows.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_row_scales_residual2_batch_on_stream(
+    a_native_tiles: &DeviceBuffer<u8>,
+    a_row_scales: &DeviceBuffer<u32>,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    residual_native_tiles: &DeviceBuffer<u8>,
+    residual_sfb: &DeviceBuffer<u32>,
+    residual2_native_tiles: &DeviceBuffer<u8>,
+    residual2_sfb: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    m_tiles: usize,
+    k_tiles: usize,
+    alpha: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_tile_bytes = rows * k_tiles * TILE_BYTES;
+    let input_scale_words = rows * k_tiles;
+    if rows == 0
+        || m_tiles == 0
+        || k_tiles == 0
+        || a_native_tiles.len() != m_tiles * k_tiles * TILE_BYTES
+        || a_row_scales.len() != m_tiles * k_tiles * 16
+        || b_native_tiles.len() != input_tile_bytes
+        || sfb.len() != input_scale_words
+        || residual_native_tiles.len() != input_tile_bytes
+        || residual_sfb.len() != input_scale_words
+        || residual2_native_tiles.len() != input_tile_bytes
+        || residual2_sfb.len() != input_scale_words
+        || output.len() != rows * m_tiles * 16
+        || rows > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || !alpha.is_finite()
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x row-scaled residual GEMV batch buffers",
+            expected: "A [M/16,K/64], three B vectors [rows,K/64], and output [rows,M]".to_string(),
+            actual: format!(
+                "A={} SFA={} primary={}/{} residual={}/{} residual2={}/{} output={} rows={rows} m_tiles={m_tiles} k_tiles={k_tiles} alpha={alpha}",
+                a_native_tiles.len(),
+                a_row_scales.len(),
+                b_native_tiles.len(),
+                sfb.len(),
+                residual_native_tiles.len(),
+                residual_sfb.len(),
+                residual2_native_tiles.len(),
+                residual2_sfb.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_gemv_row_scales_residual2_batch_on_stream",
+            crate::ffi::infer_sm12x_gemv_row_scales_residual2_batch_on_stream(
+                a_native_tiles.as_const_ptr().cast(),
+                a_row_scales.as_const_ptr().cast(),
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                residual_native_tiles.as_const_ptr().cast(),
+                residual_sfb.as_const_ptr().cast(),
+                residual2_native_tiles.as_const_ptr().cast(),
+                residual2_sfb.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                m_tiles as u32,
+                k_tiles as u32,
+                alpha,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs three-term row-scaled SM12x GEMVs with independent K partials.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_row_scales_residual2_splitk_batch_on_stream(
+    a_native_tiles: &DeviceBuffer<u8>,
+    a_row_scales: &DeviceBuffer<u32>,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    residual_native_tiles: &DeviceBuffer<u8>,
+    residual_sfb: &DeviceBuffer<u32>,
+    residual2_native_tiles: &DeviceBuffer<u8>,
+    residual2_sfb: &DeviceBuffer<u32>,
+    partials: &mut DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    m_tiles: usize,
+    k_tiles: usize,
+    k_splits: usize,
+    alpha: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_tile_bytes = rows * k_tiles * TILE_BYTES;
+    let input_scale_words = rows * k_tiles;
+    let output_values = rows * m_tiles * 16;
+    if rows == 0
+        || m_tiles == 0
+        || k_tiles == 0
+        || k_splits < 2
+        || k_splits > k_tiles
+        || a_native_tiles.len() != m_tiles * k_tiles * TILE_BYTES
+        || a_row_scales.len() != m_tiles * k_tiles * 16
+        || b_native_tiles.len() != input_tile_bytes
+        || sfb.len() != input_scale_words
+        || residual_native_tiles.len() != input_tile_bytes
+        || residual_sfb.len() != input_scale_words
+        || residual2_native_tiles.len() != input_tile_bytes
+        || residual2_sfb.len() != input_scale_words
+        || partials.len() < output_values * k_splits
+        || output.len() != output_values
+        || rows > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || k_splits > u32::MAX as usize
+        || !alpha.is_finite()
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x split-K residual GEMV batch buffers",
+            expected: "three B vectors, partials [rows,splits,M], and output [rows,M]".to_string(),
+            actual: format!(
+                "A={} SFA={} primary={}/{} residual={}/{} residual2={}/{} partials={} output={} rows={rows} m_tiles={m_tiles} k_tiles={k_tiles} splits={k_splits} alpha={alpha}",
+                a_native_tiles.len(),
+                a_row_scales.len(),
+                b_native_tiles.len(),
+                sfb.len(),
+                residual_native_tiles.len(),
+                residual_sfb.len(),
+                residual2_native_tiles.len(),
+                residual2_sfb.len(),
+                partials.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_gemv_row_scales_residual2_splitk_batch_on_stream",
+            crate::ffi::infer_sm12x_gemv_row_scales_residual2_splitk_batch_on_stream(
+                a_native_tiles.as_const_ptr().cast(),
+                a_row_scales.as_const_ptr().cast(),
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                residual_native_tiles.as_const_ptr().cast(),
+                residual_sfb.as_const_ptr().cast(),
+                residual2_native_tiles.as_const_ptr().cast(),
+                residual2_sfb.as_const_ptr().cast(),
+                partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                m_tiles as u32,
+                k_tiles as u32,
+                k_splits as u32,
+                alpha,
                 stream.as_raw(),
             ),
         )
@@ -2007,6 +2480,303 @@ mod tests {
         scales[4] = 0x40;
         let err = modelopt_m16_k64_scale_words(16, 64, &scales).expect_err("non-uniform scales");
         assert!(format!("{err}").contains("non-uniform scale"));
+    }
+
+    #[test]
+    fn sm12x_modelopt_row_scale_words_preserve_each_m16_row() {
+        let m = 32;
+        let k = 128;
+        let k_blocks = k / 16;
+        let scales = (0..m * k_blocks)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let words = modelopt_m16_k64_row_scale_words(m, k, &scales).expect("row scales");
+        assert_eq!(words.len(), m * (k / 64));
+        for mt in 0..m / 16 {
+            for kt in 0..k / 64 {
+                for row in 0..16 {
+                    let source = (mt * 16 + row) * k_blocks + kt * 4;
+                    let expected = pack_ue4m3_k16_scale_word(
+                        scales[source..source + 4].try_into().expect("four scales"),
+                    );
+                    assert_eq!(words[(mt * (k / 64) + kt) * 16 + row], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sm12x_row_scaled_grouped_gemv_matches_per_row_cpu_reference() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let m = 32;
+        let k = 128;
+        let groups = 2;
+        let scaled_weight = (0..m * k)
+            .map(|index| crate::format::e2m1_value(((index * 5 + 3) % 15 + 1) as u8))
+            .collect::<Vec<_>>();
+        let packed_weight = crate::format::pack_e2m1(&scaled_weight);
+        let weight_tiles = Sm12xFp4TileSet::from_packed_row_major_mxk(m, k, &packed_weight)
+            .expect("weight tiles")
+            .to_bytes();
+        let k_blocks = k / 16;
+        let row_scale_bytes = (0..m * k_blocks)
+            .map(|index| crate::format::ue4m3_code(0.125 * ((index % 11) + 1) as f32))
+            .collect::<Vec<_>>();
+        let row_scale_words =
+            modelopt_m16_k64_row_scale_words(m, k, &row_scale_bytes).expect("row scales");
+
+        let mut b_tile_bytes = Vec::new();
+        let mut b_scale_words = Vec::new();
+        let mut quantized_inputs = Vec::new();
+        for group in 0..groups {
+            let input = (0..k)
+                .map(|index| (((index * (group + 7)) % 23) as f32 - 11.0) * 0.0625)
+                .collect::<Vec<_>>();
+            let vector = Sm12xFp4GemmVector::quantize_f32_k16(k, &input).expect("vector");
+            b_tile_bytes.extend_from_slice(&vector.vector.tiles.to_bytes());
+            b_scale_words.extend_from_slice(&vector.vector.scales);
+            quantized_inputs.push(vector.dequantized);
+        }
+
+        let weight_tiles = DeviceBuffer::from_host(&weight_tiles).expect("weight tiles device");
+        let row_scale_words = DeviceBuffer::from_host(&row_scale_words).expect("row scales device");
+        let a_tiles =
+            DeviceBuffer::from_host(&[weight_tiles.as_const_ptr().cast()]).expect("weight table");
+        let a_scales = DeviceBuffer::from_host(&[row_scale_words.as_const_ptr().cast::<u32>()])
+            .expect("scale table");
+        let b_tiles = DeviceBuffer::from_host(&b_tile_bytes).expect("input tiles");
+        let b_scales = DeviceBuffer::from_host(&b_scale_words).expect("input scales");
+        let mut outputs = (0..groups)
+            .map(|_| F32Matrix::zeroed(m, 1))
+            .collect::<Result<Vec<_>>>()
+            .expect("outputs");
+        let output_table = DeviceBuffer::from_host(
+            &outputs
+                .iter_mut()
+                .map(|output| output.data_mut_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("output table");
+        let indices = DeviceBuffer::from_host(&vec![0u32; groups]).expect("indices");
+        indexed_grouped_gemv_row_scales_on_stream(
+            &indices,
+            &a_tiles,
+            &a_scales,
+            1,
+            &b_tiles,
+            &b_scales,
+            &output_table,
+            m / 16,
+            k / 64,
+            groups,
+            &stream,
+        )
+        .expect("row-scaled grouped gemv");
+
+        for group in 0..groups {
+            let actual = outputs[group].data().copy_to_host(&stream).expect("copy");
+            for row in 0..m {
+                let expected = (0..k)
+                    .map(|column| {
+                        let scale_code = row_scale_bytes[row * k_blocks + column / 16];
+                        let weight =
+                            scaled_weight[row * k + column] * crate::format::e4m3_value(scale_code);
+                        weight * quantized_inputs[group][column]
+                    })
+                    .sum::<f32>();
+                assert!(
+                    (actual[row] - expected).abs() <= 1.0e-3,
+                    "group={group} row={row} actual={} expected={expected}",
+                    actual[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sm12x_residual_activation_improves_grouped_gemv_accuracy() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let m = 16usize;
+        let k = 128usize;
+        let groups = 2usize;
+        let gate_up_host = (0..groups)
+            .map(|group| {
+                let gate = (0..k)
+                    .map(|index| {
+                        let base = (((index * (group + 11)) % 41) as f32 - 20.0) * 0.125;
+                        if index.is_multiple_of(31) {
+                            base * 8.0
+                        } else {
+                            base
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let up = (0..k)
+                    .map(|index| (((index * (group + 5)) % 37) as f32 - 18.0) * 0.09375)
+                    .collect::<Vec<_>>();
+                gate.into_iter().chain(up).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let gate_up = gate_up_host
+            .iter()
+            .map(|values| DeviceBuffer::from_host(values))
+            .collect::<Result<Vec<_>>>()
+            .expect("gate/up");
+        let gate_up_table = DeviceBuffer::from_host(
+            &gate_up
+                .iter()
+                .map(|values| values.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("gate/up table");
+        let indices =
+            DeviceBuffer::from_host(&(0..groups as u32).collect::<Vec<_>>()).expect("indices");
+        let unity = DeviceBuffer::from_host(&vec![1.0f32; groups]).expect("alphas");
+        let vector_bytes = groups * (k / 64) * TILE_BYTES;
+        let vector_scales = groups * (k / 64);
+        let mut primary_tiles = DeviceBuffer::zeroed(vector_bytes).expect("primary tiles");
+        let mut primary_scales = DeviceBuffer::zeroed(vector_scales).expect("primary scales");
+        let mut residual_tiles = DeviceBuffer::zeroed(vector_bytes).expect("residual tiles");
+        let mut residual_scales = DeviceBuffer::zeroed(vector_scales).expect("residual scales");
+        moe_silu_quantize_slots_residual_on_stream(
+            &indices,
+            &gate_up_table,
+            &mut primary_tiles,
+            &mut primary_scales,
+            &mut residual_tiles,
+            &mut residual_scales,
+            &unity,
+            k,
+            groups,
+            &stream,
+        )
+        .expect("residual quantize");
+
+        let scaled_weight = vec![1.0f32; m * k];
+        let packed_weight = crate::format::pack_e2m1(&scaled_weight);
+        let weight_tiles = Sm12xFp4TileSet::from_packed_row_major_mxk(m, k, &packed_weight)
+            .expect("weight tiles")
+            .to_bytes();
+        let weight_tiles = DeviceBuffer::from_host(&weight_tiles).expect("weight device");
+        let row_scales =
+            DeviceBuffer::from_host(&vec![0x38383838u32; m * (k / 64)]).expect("row scales");
+        let weight_table =
+            DeviceBuffer::from_host(&vec![weight_tiles.as_const_ptr().cast::<u8>(); groups])
+                .expect("weight table");
+        let scale_table =
+            DeviceBuffer::from_host(&vec![row_scales.as_const_ptr().cast::<u32>(); groups])
+                .expect("scale table");
+        let mut primary_outputs = (0..groups)
+            .map(|_| F32Matrix::zeroed(m, 1))
+            .collect::<Result<Vec<_>>>()
+            .expect("primary outputs");
+        let primary_output_table = DeviceBuffer::from_host(
+            &primary_outputs
+                .iter_mut()
+                .map(|output| output.data_mut_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("primary output table");
+        let mut residual_outputs = (0..groups)
+            .map(|_| F32Matrix::zeroed(m, 1))
+            .collect::<Result<Vec<_>>>()
+            .expect("residual outputs");
+        let residual_output_table = DeviceBuffer::from_host(
+            &residual_outputs
+                .iter_mut()
+                .map(|output| output.data_mut_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("residual output table");
+        for (tiles, scales, outputs) in [
+            (&primary_tiles, &primary_scales, &primary_output_table),
+            (&residual_tiles, &residual_scales, &residual_output_table),
+        ] {
+            indexed_grouped_gemv_row_scales_on_stream(
+                &indices,
+                &weight_table,
+                &scale_table,
+                groups,
+                tiles,
+                scales,
+                outputs,
+                m / 16,
+                k / 64,
+                groups,
+                &stream,
+            )
+            .expect("grouped gemv");
+        }
+        let mut fused_outputs = (0..groups)
+            .map(|_| F32Matrix::zeroed(m, 1))
+            .collect::<Result<Vec<_>>>()
+            .expect("fused outputs");
+        let fused_output_table = DeviceBuffer::from_host(
+            &fused_outputs
+                .iter_mut()
+                .map(|output| output.data_mut_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("fused output table");
+        indexed_grouped_gemv_row_scales_residual_on_stream(
+            &indices,
+            &weight_table,
+            &scale_table,
+            groups,
+            &primary_tiles,
+            &primary_scales,
+            &residual_tiles,
+            &residual_scales,
+            &fused_output_table,
+            m / 16,
+            k / 64,
+            groups,
+            &stream,
+        )
+        .expect("fused residual grouped gemv");
+
+        for group in 0..groups {
+            let primary = primary_outputs[group]
+                .data()
+                .copy_to_host(&stream)
+                .expect("primary copy");
+            let residual = residual_outputs[group]
+                .data()
+                .copy_to_host(&stream)
+                .expect("residual copy");
+            let fused = fused_outputs[group]
+                .data()
+                .copy_to_host(&stream)
+                .expect("fused copy");
+            let expected = gate_up_host[group][..k]
+                .iter()
+                .zip(&gate_up_host[group][k..])
+                .map(|(&gate, &up)| gate * (1.0 / (1.0 + (-gate).exp())) * up)
+                .sum::<f32>();
+            let primary_error = (primary[0] - expected).abs();
+            let residual_error = (primary[0] + residual[0] - expected).abs();
+            assert!(
+                residual_error < primary_error,
+                "group={group} primary_error={primary_error} residual_error={residual_error}"
+            );
+            assert!(
+                residual_error <= expected.abs().max(1.0) * 0.05,
+                "group={group} actual={} expected={expected}",
+                primary[0] + residual[0]
+            );
+            for row in 1..m {
+                assert_eq!(primary[row], primary[0]);
+                assert_eq!(residual[row], residual[0]);
+            }
+            for row in 0..m {
+                assert!(
+                    (fused[row] - (primary[row] + residual[row])).abs() <= 1.0e-3,
+                    "group={group} row={row} fused={} separate={}",
+                    fused[row],
+                    primary[row] + residual[row]
+                );
+            }
+        }
     }
 
     #[test]
