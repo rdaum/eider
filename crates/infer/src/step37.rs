@@ -1,5 +1,6 @@
 //! Step-3.7-Flash text runtime and prepared expert storage.
 
+use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
@@ -24,6 +25,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::info;
 
 mod batch;
@@ -214,6 +216,7 @@ pub struct Step37PagedExperts {
     uploads: ExpertUploadCoordinator,
     staging: Vec<Step37ExpertStaging>,
     stats: Step37PagingStats,
+    paging_metrics: ExpertPagingMetricHandle,
     swiglu_limit: Option<f32>,
 }
 
@@ -254,6 +257,8 @@ pub struct Step37PageResolution {
 struct Step37PendingPageResolution {
     misses: Vec<ExpertSlotMiss>,
     resolution: Step37PageResolution,
+    evictions: usize,
+    resident_slots: usize,
 }
 
 /// Cumulative expert-cache activity across paged Step layers.
@@ -1252,20 +1257,31 @@ impl Step37PagedExperts {
                 .map(|slot| slot.row_scales.as_const_ptr().cast())
                 .collect::<Vec<_>>(),
         )?;
+        let down_weight_scale_2 = DeviceBuffer::zeroed(capacity)?;
+        let expert_device_bytes = gate_up.expert_device_bytes()
+            + down
+                .iter()
+                .map(|slot| slot.tiles.device_bytes() + slot.row_scales.device_bytes())
+                .sum::<usize>()
+            + down_weight_scale_2.device_bytes();
+        let slots = ExpertSlotCache::new(EXPERTS, capacity, 8)?;
+        let uploads = ExpertUploadCoordinator::new()?;
+        let staging = (0..8)
+            .map(|_| Step37ExpertStaging::new())
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             source,
             gate_up,
             down,
             down_values,
             down_scales,
-            down_weight_scale_2: DeviceBuffer::zeroed(capacity)?,
+            down_weight_scale_2,
             gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; capacity])?,
-            slots: ExpertSlotCache::new(EXPERTS, capacity, 8)?,
-            uploads: ExpertUploadCoordinator::new()?,
-            staging: (0..8)
-                .map(|_| Step37ExpertStaging::new())
-                .collect::<Result<Vec<_>>>()?,
+            slots,
+            uploads,
+            staging,
             stats: Step37PagingStats::default(),
+            paging_metrics: ExpertPagingMetricHandle::new(capacity, expert_device_bytes),
             swiglu_limit: step37_routed_swiglu_limit(layer),
         })
     }
@@ -1306,7 +1322,10 @@ impl Step37PagedExperts {
         expert_ids: &[u32],
         stream: &CudaStream,
     ) -> Result<Step37PendingPageResolution> {
-        self.uploads.wait_for_staging_reuse()?;
+        if let Some(timing) = self.uploads.wait_for_staging_reuse()? {
+            self.paging_metrics.record_page_upload(timing.upload);
+            self.paging_metrics.record_staging_wait(timing.staging_wait);
+        }
         let plan = self.slots.plan(expert_ids)?;
         let hits = plan.hits;
         let misses = plan.misses.len();
@@ -1320,6 +1339,8 @@ impl Step37PagedExperts {
                 misses,
                 bytes_read: misses * EXPERT_RECORD_BYTES,
             },
+            evictions: plan.evictions,
+            resident_slots: plan.resident_slots,
         })
     }
 
@@ -1331,7 +1352,9 @@ impl Step37PagedExperts {
         stream: &CudaStream,
     ) -> Result<Step37PageResolution> {
         let misses = pending.misses.len();
+        let resolve_started = (misses != 0).then(Instant::now);
         if misses != 0 {
+            let read_started = Instant::now();
             std::thread::scope(|scope| {
                 let handles = self
                     .staging
@@ -1350,6 +1373,7 @@ impl Step37PagedExperts {
                 }
                 Ok::<(), Error>(())
             })?;
+            self.paging_metrics.record_page_read(read_started.elapsed());
             let gate_scale_offset = GATE_WEIGHT_BYTES;
             let down_tile_offset = gate_scale_offset + GATE_SCALE_BYTES;
             let down_scale_offset = down_tile_offset + DOWN_TILE_BYTES;
@@ -1397,6 +1421,16 @@ impl Step37PagedExperts {
         self.stats.hits += resolution.hits as u64;
         self.stats.misses += resolution.misses as u64;
         self.stats.bytes_read += resolution.bytes_read as u64;
+        self.paging_metrics.record_cache_activity(
+            resolution.hits,
+            resolution.misses,
+            pending.evictions,
+            resolution.bytes_read,
+            pending.resident_slots,
+        );
+        if let Some(started) = resolve_started {
+            self.paging_metrics.record_page_resolve(started.elapsed());
+        }
         Ok(resolution)
     }
 

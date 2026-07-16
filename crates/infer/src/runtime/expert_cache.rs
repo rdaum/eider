@@ -4,6 +4,7 @@ use crate::nvfp4::{
     CudaEvent, CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result,
     remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
 };
+use std::time::{Duration, Instant};
 
 /// One logical expert that must be loaded into a selected resident slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +19,8 @@ pub struct ExpertSlotPlan {
     pub slots: Vec<u32>,
     pub hits: usize,
     pub misses: Vec<ExpertSlotMiss>,
+    pub evictions: usize,
+    pub resident_slots: usize,
 }
 
 /// Model-specific source of independently addressable prepared expert records.
@@ -126,6 +129,7 @@ impl ExpertSlotCache {
         let mut slots = Vec::with_capacity(expert_ids.len());
         let mut misses = Vec::with_capacity(expert_ids.len());
         let mut hits = 0;
+        let mut evictions = 0;
         for &expert in expert_ids {
             let expert = expert as usize;
             let slot = if let Some(slot) = self.expert_to_slot[expert] {
@@ -150,6 +154,7 @@ impl ExpertSlotCache {
                     })?;
                 if let Some(evicted) = self.slot_to_expert[slot] {
                     self.expert_to_slot[evicted] = None;
+                    evictions += 1;
                 }
                 self.expert_to_slot[expert] = Some(slot);
                 self.slot_to_expert[slot] = Some(expert);
@@ -165,6 +170,8 @@ impl ExpertSlotCache {
             slots,
             hits,
             misses,
+            evictions,
+            resident_slots: self.slot_to_expert.iter().flatten().count(),
         })
     }
 
@@ -220,8 +227,15 @@ impl ExpertSlotCache {
 pub struct ExpertUploadCoordinator {
     stream: CudaStream,
     slots_released: CudaEvent,
+    upload_started: CudaEvent,
     uploads_ready: CudaEvent,
     inflight: bool,
+}
+
+/// Timing collected when a completed upload's staging buffers are reused.
+pub struct ExpertUploadTiming {
+    pub upload: Duration,
+    pub staging_wait: Duration,
 }
 
 impl ExpertUploadCoordinator {
@@ -229,22 +243,33 @@ impl ExpertUploadCoordinator {
         Ok(Self {
             stream: CudaStream::new_non_blocking()?,
             slots_released: CudaEvent::new_sync()?,
-            uploads_ready: CudaEvent::new_sync()?,
+            upload_started: CudaEvent::new()?,
+            uploads_ready: CudaEvent::new()?,
             inflight: false,
         })
     }
 
-    pub fn wait_for_staging_reuse(&mut self) -> Result<()> {
+    pub fn wait_for_staging_reuse(&mut self) -> Result<Option<ExpertUploadTiming>> {
         if self.inflight {
+            let wait_started = Instant::now();
             self.uploads_ready.synchronize()?;
+            let staging_wait = wait_started.elapsed();
+            let upload = Duration::from_secs_f64(
+                self.upload_started.elapsed_ms_until(&self.uploads_ready)? as f64 / 1_000.0,
+            );
             self.inflight = false;
+            return Ok(Some(ExpertUploadTiming {
+                upload,
+                staging_wait,
+            }));
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn begin(&self, inference_stream: &CudaStream) -> Result<()> {
         self.slots_released.record_on_stream(inference_stream)?;
-        self.stream.wait_event(&self.slots_released)
+        self.stream.wait_event(&self.slots_released)?;
+        self.upload_started.record_on_stream(&self.stream)
     }
 
     pub fn stream(&self) -> &CudaStream {
@@ -261,17 +286,51 @@ impl ExpertUploadCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::ExpertSlotCache;
+    use super::{ExpertSlotCache, ExpertUploadCoordinator};
+    use crate::nvfp4::CudaStream;
 
     #[test]
     fn lru_plan_protects_current_route() {
         let mut cache = ExpertSlotCache::new(8, 2, 2).expect("cache");
-        assert_eq!(cache.plan(&[0, 1]).expect("first").misses.len(), 2);
+        let first = cache.plan(&[0, 1]).expect("first");
+        assert_eq!(first.misses.len(), 2);
+        assert_eq!(first.evictions, 0);
+        assert_eq!(first.resident_slots, 2);
         let second = cache.plan(&[1, 2]).expect("second");
         assert_eq!(second.hits, 1);
+        assert_eq!(second.evictions, 1);
+        assert_eq!(second.resident_slots, 2);
         let third = cache.plan(&[0, 2]).expect("third");
         assert_eq!(third.hits, 1);
         assert_eq!(third.misses.len(), 1);
+        assert_eq!(third.evictions, 1);
+        assert_eq!(third.resident_slots, 2);
         assert_eq!(third.slots[1], second.slots[1]);
+    }
+
+    #[test]
+    fn upload_coordinator_reports_deferred_cuda_timing() {
+        let stream = CudaStream::new_non_blocking().expect("inference stream");
+        let mut uploads = ExpertUploadCoordinator::new().expect("upload coordinator");
+        assert!(
+            uploads
+                .wait_for_staging_reuse()
+                .expect("empty timing")
+                .is_none()
+        );
+
+        uploads.begin(&stream).expect("begin upload");
+        uploads.finish(&stream).expect("finish upload");
+        let timing = uploads
+            .wait_for_staging_reuse()
+            .expect("completed timing")
+            .expect("in-flight upload timing");
+        assert!(timing.upload.as_nanos() > 0);
+        assert!(
+            uploads
+                .wait_for_staging_reuse()
+                .expect("collected timing")
+                .is_none()
+        );
     }
 }

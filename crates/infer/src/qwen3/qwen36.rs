@@ -7,6 +7,7 @@ pub use batch::{
     Qwen36PrefillRow,
 };
 
+use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
@@ -1767,6 +1768,7 @@ pub struct Qwen36ExpertPager {
     stats: Qwen36PagingStats,
     uploads: ExpertUploadCoordinator,
     staging_pool: Vec<Qwen36ExpertStaging>,
+    paging_metrics: ExpertPagingMetricHandle,
 }
 
 struct Qwen36ExpertStaging {
@@ -2094,26 +2096,39 @@ impl Qwen36ExpertPager {
                 .map(Sm12xFp4DeviceGemmWeight::scales_ptr)
                 .collect::<Vec<_>>(),
         )?;
+        let down_input_scales = DeviceBuffer::zeroed(capacity)?;
+        let down_alphas = DeviceBuffer::zeroed(capacity)?;
+        let expert_device_bytes = gate_up.expert_device_bytes()
+            + down
+                .iter()
+                .map(Sm12xFp4DeviceGemmWeight::device_bytes)
+                .sum::<usize>()
+            + down_input_scales.device_bytes()
+            + down_alphas.device_bytes();
+        let slots = ExpertSlotCache::new(experts, capacity, top_k)?;
+        let uploads = ExpertUploadCoordinator::new()?;
+        let staging_pool = (0..top_k)
+            .map(|_| Qwen36ExpertStaging::new(intermediate * 2, manifest.hidden, intermediate))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             cache_dir,
             gate_up,
             down,
             down_tiles,
             down_scales,
-            down_input_scales: DeviceBuffer::zeroed(capacity)?,
-            down_alphas: DeviceBuffer::zeroed(capacity)?,
+            down_input_scales,
+            down_alphas,
             gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; capacity])?,
-            slots: ExpertSlotCache::new(experts, capacity, top_k)?,
+            slots,
             down_input_scales_host,
             down_alphas_host,
             hidden: manifest.hidden,
             intermediate,
             top_k,
             stats: Qwen36PagingStats::default(),
-            uploads: ExpertUploadCoordinator::new()?,
-            staging_pool: (0..top_k)
-                .map(|_| Qwen36ExpertStaging::new(intermediate * 2, manifest.hidden, intermediate))
-                .collect::<Result<Vec<_>>>()?,
+            uploads,
+            staging_pool,
+            paging_metrics: ExpertPagingMetricHandle::new(capacity, expert_device_bytes),
         })
     }
 
@@ -2131,21 +2146,29 @@ impl Qwen36ExpertPager {
                 actual: format!("{} device expert IDs", device_expert_ids.len()),
             });
         }
-        self.uploads.wait_for_staging_reuse()?;
+        if let Some(timing) = self.uploads.wait_for_staging_reuse()? {
+            self.paging_metrics.record_page_upload(timing.upload);
+            self.paging_metrics.record_staging_wait(timing.staging_wait);
+        }
         let plan = self.slots.plan(expert_ids)?;
         let slots = plan.slots;
         let hits = plan.hits;
+        let evictions = plan.evictions;
+        let resident_slots = plan.resident_slots;
         let pending = plan.misses;
         let misses = pending.len();
 
         let mut bytes_read = 0;
+        let resolve_started = (!pending.is_empty()).then(Instant::now);
         if !pending.is_empty() {
             self.uploads.begin(stream)?;
 
             let source = Qwen36ExpertRecordSource {
                 cache_dir: &self.cache_dir,
             };
+            let read_started = Instant::now();
             let loaded = read_expert_misses(&source, &pending)?;
+            self.paging_metrics.record_page_read(read_started.elapsed());
 
             for (staged, loaded) in self.staging_pool.iter_mut().zip(loaded) {
                 let expert = loaded.expert;
@@ -2199,6 +2222,16 @@ impl Qwen36ExpertPager {
         self.stats.hits += hits as u64;
         self.stats.misses += misses as u64;
         self.stats.bytes_read += bytes_read as u64;
+        self.paging_metrics.record_cache_activity(
+            hits,
+            misses,
+            evictions,
+            bytes_read,
+            resident_slots,
+        );
+        if let Some(started) = resolve_started {
+            self.paging_metrics.record_page_resolve(started.elapsed());
+        }
         Ok(Qwen36PageResolution {
             slots,
             hits,
