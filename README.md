@@ -4,8 +4,8 @@
 > insulation (ahem)
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6 MoE models in NVFP4. It includes an OpenAI
-API-compatible server with a scheduler, chunked prefill, batched decode, and a
+Blackwell) running Qwen3.6 and Step-3.5-Flash MoE models in NVFP4. It includes
+an OpenAI API-compatible server with continuous multi-session scheduling and a
 compact FP4 KV cache, on top of some (hopefully) finely tuned CUDA kernels.
 
 This started as a personal research project and is crawling towards more of a
@@ -31,6 +31,12 @@ Eider's OpenAI-compatible API sustains about 72.7 decode tokens/sec with
 Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
 comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
 with the same model using BF16 KV and greedy sampling.
+
+Step-3.5-Flash uses the same API with disk-backed expert paging. With 240 of
+288 experts resident per routed layer, a warm API session decodes at about
+18.7 tokens/sec; two concurrent sessions sustain about 16.8 tokens/sec in
+aggregate. Request KV state remains independent while the expert cache is
+shared across sessions.
 
 Compared with the current vLLM setup, the more consequential differences are
 operational. Eider starts substantially faster and has a smaller idle footprint
@@ -66,11 +72,10 @@ The workspace has three crates:
 - `crates/nvfp4` owns device buffers, ModelOpt NVFP4/FP8 loading, cuBLASLt
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
-- `crates/infer` owns model loading, Qwen layer execution, KV-cache state,
-  request-scoped sampling and generation, the tokenized Qwen3.6 scheduler
-  (chunked prefill and batched decode), prefill/decode orchestration, CLI
-  binaries, and runtime benchmarks. Its reusable execution state lives under
-  `runtime/`, while model-family code lives under `qwen3/`.
+- `crates/infer` owns model loading, model execution, KV-cache state,
+  request-scoped sampling and generation, Qwen3.6 and Step-3.5 scheduling,
+  prefill/decode orchestration, CLI binaries, and runtime benchmarks. Its
+  reusable execution state lives under `runtime/`.
 - `crates/eider-api` owns the dedicated inference actor and OpenAI Responses
   HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
   thread while async handlers submit, stream, and cancel requests over bounded
@@ -90,6 +95,7 @@ Checkpoints kept under `models/`:
 - `models/qwen3.6-35b-a3b-nvfp4`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
+- `models/step-3.5-flash-nvfp4`
 
 Models are expected to use the repository's supported ModelOpt or
 compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
@@ -122,7 +128,15 @@ Prometheus text at `/metrics` and health at `/healthz`; set
 additionally push metrics over UDP. The `eider-serve` binary also takes
 `--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
 `--max-active-sequences`, and `--max-context-tokens` flags that map directly to
-the scheduler admission limits.
+the scheduler admission limits. The server selects Qwen3.6 or Step-3.5 from the
+checkpoint metadata. To serve Step-3.5 directly:
+
+```sh
+cargo run --release -p eider-api --bin eider-serve -- \
+    models/step-3.5-flash-nvfp4 \
+    --served-model-name eider-step35 \
+    --step35-expert-capacity 240
+```
 
 Run the installed Pi coding agent against the matching repo-local provider:
 

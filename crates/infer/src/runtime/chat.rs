@@ -182,6 +182,8 @@ pub struct CheckpointChatTemplate {
     environment: Environment<'static>,
     tokenizer: Tokenizer,
     template_path: PathBuf,
+    bos_token: String,
+    eos_token: String,
 }
 
 impl CheckpointChatTemplate {
@@ -198,10 +200,17 @@ impl CheckpointChatTemplate {
             label: "tokenizer.json",
             detail: format!("{}: {error}", tokenizer_path.display()),
         })?;
+        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
+        let tokenizer_config = std::fs::read_to_string(&tokenizer_config_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+            .unwrap_or(Value::Null);
         Ok(Self {
             environment,
             tokenizer,
             template_path,
+            bos_token: special_token_content(&tokenizer_config["bos_token"]),
+            eos_token: special_token_content(&tokenizer_config["eos_token"]),
         })
     }
 
@@ -223,7 +232,14 @@ impl CheckpointChatTemplate {
         options: ChatTemplateOptions,
     ) -> Result<String> {
         validate_chat(messages, tools)?;
-        render_with_environment(&self.environment, messages, tools, options)
+        render_with_environment(
+            &self.environment,
+            messages,
+            tools,
+            options,
+            &self.bos_token,
+            &self.eos_token,
+        )
     }
 
     /// Renders and tokenizes a chat prompt without adding another special-token layer.
@@ -344,6 +360,8 @@ fn load_template_source(model_dir: &Path) -> Result<(String, PathBuf)> {
 
 fn build_environment(source: String) -> Result<Environment<'static>> {
     let mut environment = Environment::new();
+    environment.set_trim_blocks(true);
+    environment.set_lstrip_blocks(true);
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     environment.add_function(
@@ -363,6 +381,8 @@ fn render_with_environment(
     messages: &[ChatMessage],
     tools: &[ChatTool],
     options: ChatTemplateOptions,
+    bos_token: &str,
+    eos_token: &str,
 ) -> Result<String> {
     environment
         .get_template(TEMPLATE_NAME)
@@ -374,8 +394,18 @@ fn render_with_environment(
             enable_thinking => options.enable_thinking,
             preserve_thinking => options.preserve_thinking,
             add_vision_id => false,
+            bos_token => bos_token,
+            eos_token => eos_token,
         })
         .map_err(template_error)
+}
+
+fn special_token_content(value: &Value) -> String {
+    value
+        .as_str()
+        .or_else(|| value["content"].as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn template_error(error: TemplateError) -> Error {
@@ -419,11 +449,51 @@ mod tests {
                 enable_thinking: false,
                 preserve_thinking: true,
             },
+            "<bos>",
+            "<eos>",
         )
         .unwrap();
         assert!(rendered.starts_with("user:hello|"));
         assert!(rendered.contains(r#""name":"read_file""#));
         assert!(rendered.ends_with("|true:false:true"));
+    }
+
+    #[test]
+    fn checkpoint_special_tokens_reach_the_template() {
+        let environment = build_environment("{{ bos_token }}x{{ eos_token }}".to_string()).unwrap();
+        let rendered = render_with_environment(
+            &environment,
+            &[ChatMessage::user("hello")],
+            &[],
+            ChatTemplateOptions::default(),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(rendered, "<bos>x<eos>");
+    }
+
+    #[test]
+    #[ignore = "requires the local Step-3.5 checkpoint"]
+    fn local_step35_template_renders_generation_prefix() {
+        let model_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/step-3.5-flash-nvfp4");
+        let template = CheckpointChatTemplate::from_model_dir(model_dir).unwrap();
+        let rendered = template
+            .render(
+                &[ChatMessage::user("hello")],
+                &[],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            rendered.starts_with("<｜begin▁of▁sentence｜><|im_start|>user\nhello"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>\n"),
+            "{rendered:?}"
+        );
     }
 
     #[test]

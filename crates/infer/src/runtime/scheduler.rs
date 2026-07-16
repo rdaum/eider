@@ -26,7 +26,7 @@ impl Qwen36RequestId {
 
 /// Request lifecycle visible to a serving frontend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Qwen36RequestState {
+pub enum RequestState {
     /// Accepted on the CPU but not yet allocated persistent GPU state.
     Waiting,
     /// Consuming all but the final prompt token into persistent model state.
@@ -39,7 +39,7 @@ pub enum Qwen36RequestState {
 
 /// Execution and admission limits for one scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen36SchedulerConfig {
+pub struct SchedulerConfig {
     /// Maximum independent rows in one latency-sensitive decode batch.
     pub decode_capacity: usize,
     /// Maximum independent prompt chunks in one prefill batch.
@@ -52,7 +52,7 @@ pub struct Qwen36SchedulerConfig {
     pub max_context_tokens: usize,
 }
 
-impl Default for Qwen36SchedulerConfig {
+impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             decode_capacity: 8,
@@ -64,8 +64,8 @@ impl Default for Qwen36SchedulerConfig {
     }
 }
 
-impl Qwen36SchedulerConfig {
-    fn validate(self) -> Result<()> {
+impl SchedulerConfig {
+    pub(crate) fn validate(self) -> Result<()> {
         if self.decode_capacity == 0
             || self.prefill_sequence_capacity == 0
             || self.prefill_token_capacity == 0
@@ -91,7 +91,7 @@ impl Qwen36SchedulerConfig {
 
 /// Token-level generation policy for a scheduled request.
 #[derive(Clone, Debug)]
-pub struct Qwen36RequestConfig {
+pub struct RequestConfig {
     /// Token selection policy.
     pub sampling: SamplingConfig,
     /// Maximum number of completion tokens.
@@ -100,7 +100,7 @@ pub struct Qwen36RequestConfig {
     pub eos_token_ids: BTreeSet<u32>,
 }
 
-impl Default for Qwen36RequestConfig {
+impl Default for RequestConfig {
     fn default() -> Self {
         Self {
             sampling: SamplingConfig::default(),
@@ -110,7 +110,7 @@ impl Default for Qwen36RequestConfig {
     }
 }
 
-impl Qwen36RequestConfig {
+impl RequestConfig {
     /// Validates token-selection parameters.
     pub fn validate(&self) -> Result<()> {
         self.sampling.validate()
@@ -119,7 +119,7 @@ impl Qwen36RequestConfig {
 
 /// Why a tokenized scheduled request completed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Qwen36RequestFinishReason {
+pub enum RequestFinishReason {
     /// The model selected a configured EOS token.
     Eos,
     /// The request reached its completion-token limit.
@@ -136,7 +136,7 @@ pub struct Qwen36ScheduledToken {
     /// Original model logit for the selected ID.
     pub logit: f32,
     /// Present when this token finishes the request.
-    pub finish_reason: Option<Qwen36RequestFinishReason>,
+    pub finish_reason: Option<RequestFinishReason>,
 }
 
 /// Prompt progress made for one request during a scheduler tick.
@@ -186,7 +186,7 @@ pub struct Qwen36FinishedRequest {
     /// Generated completion tokens and logits.
     pub generated_tokens: Vec<Qwen36ScheduledToken>,
     /// Final completion reason.
-    pub finish_reason: Qwen36RequestFinishReason,
+    pub finish_reason: RequestFinishReason,
     /// Device bytes released when the request reached its terminal state.
     pub released_sequence_device_bytes: usize,
 }
@@ -217,8 +217,8 @@ pub enum Qwen36CancelOutcome {
 
 struct Qwen36Request {
     id: Qwen36RequestId,
-    lifecycle: Qwen36RequestState,
-    config: Qwen36RequestConfig,
+    lifecycle: RequestState,
+    config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
     sequence: Option<Box<Qwen36SequenceState>>,
@@ -228,7 +228,7 @@ struct Qwen36Request {
     history: TokenHistory,
     last_token: Option<u32>,
     generated_tokens: Vec<Qwen36ScheduledToken>,
-    finish_reason: Option<Qwen36RequestFinishReason>,
+    finish_reason: Option<RequestFinishReason>,
 }
 
 impl Qwen36Request {
@@ -262,16 +262,16 @@ impl Qwen36Request {
         self.history.push(sampled.id);
         let generated_count = self.generated_tokens.len() + 1;
         let finish_reason = if self.config.eos_token_ids.contains(&sampled.id) {
-            Some(Qwen36RequestFinishReason::Eos)
+            Some(RequestFinishReason::Eos)
         } else if generated_count == self.config.max_new_tokens {
-            Some(Qwen36RequestFinishReason::Length)
+            Some(RequestFinishReason::Length)
         } else {
             None
         };
         self.lifecycle = if finish_reason.is_some() {
-            Qwen36RequestState::Finished
+            RequestState::Finished
         } else {
-            Qwen36RequestState::Decoding
+            RequestState::Decoding
         };
         self.finish_reason = finish_reason;
         let token = Qwen36ScheduledToken {
@@ -288,7 +288,7 @@ impl Qwen36Request {
 /// Decode-first continuous scheduler with deferred GPU admission.
 pub struct Qwen36Scheduler<'model> {
     model: &'model Qwen36TextModel,
-    config: Qwen36SchedulerConfig,
+    config: SchedulerConfig,
     decode_workspaces: Vec<Qwen36DecodeBatchWorkspace>,
     prefill_workspace: Qwen36PrefillBatchWorkspace,
     requests: BTreeMap<Qwen36RequestId, Box<Qwen36Request>>,
@@ -300,7 +300,7 @@ pub struct Qwen36Scheduler<'model> {
 
 impl<'model> Qwen36Scheduler<'model> {
     /// Creates a scheduler with explicit execution and admission limits.
-    pub fn new(model: &'model Qwen36TextModel, config: Qwen36SchedulerConfig) -> Result<Self> {
+    pub fn new(model: &'model Qwen36TextModel, config: SchedulerConfig) -> Result<Self> {
         config.validate()?;
         let decode_workspaces = decode_capacity_classes(config.decode_capacity)
             .into_iter()
@@ -327,7 +327,7 @@ impl<'model> Qwen36Scheduler<'model> {
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
-        config: Qwen36RequestConfig,
+        config: RequestConfig,
     ) -> Result<Qwen36RequestId> {
         config.validate()?;
         if prompt_tokens.is_empty() {
@@ -367,12 +367,11 @@ impl<'model> Qwen36Scheduler<'model> {
             detail: "request ID space exhausted".to_string(),
         })?;
         let lifecycle = if config.max_new_tokens == 0 {
-            Qwen36RequestState::Finished
+            RequestState::Finished
         } else {
-            Qwen36RequestState::Waiting
+            RequestState::Waiting
         };
-        let finish_reason =
-            (config.max_new_tokens == 0).then_some(Qwen36RequestFinishReason::Length);
+        let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
         self.requests.insert(
@@ -393,7 +392,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 finish_reason,
             }),
         );
-        if lifecycle == Qwen36RequestState::Waiting {
+        if lifecycle == RequestState::Waiting {
             self.waiting.push_back(id);
         }
         Ok(id)
@@ -440,7 +439,7 @@ impl<'model> Qwen36Scheduler<'model> {
                     .map_or(0, DeviceBuffer::device_bytes);
             request.sequence = Some(Box::new(sequence));
             request.device_token_counts = device_token_counts;
-            request.lifecycle = Qwen36RequestState::Prefilling;
+            request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
             tick.admitted.push(Qwen36AdmissionProgress {
                 request_id: id,
@@ -488,7 +487,7 @@ impl<'model> Qwen36Scheduler<'model> {
             Ok(samples) => samples,
             Err(error) => {
                 for request in selected.into_iter().rev() {
-                    let queue = if request.lifecycle == Qwen36RequestState::Decoding {
+                    let queue = if request.lifecycle == RequestState::Decoding {
                         &mut self.decoding
                     } else {
                         &mut self.prefilling
@@ -502,7 +501,7 @@ impl<'model> Qwen36Scheduler<'model> {
         for (mut request, sample) in selected.into_iter().zip(samples) {
             let token = request.apply_sample(sample);
             tick.generated.push(token);
-            if request.lifecycle == Qwen36RequestState::Finished {
+            if request.lifecycle == RequestState::Finished {
                 request.sequence.take();
                 request.device_token_counts.take();
                 tick.finished.push(request.id);
@@ -693,7 +692,7 @@ impl<'model> Qwen36Scheduler<'model> {
         let Some(request) = self.requests.get(&id) else {
             return Qwen36CancelOutcome::NotFound;
         };
-        if request.lifecycle == Qwen36RequestState::Finished {
+        if request.lifecycle == RequestState::Finished {
             return Qwen36CancelOutcome::AlreadyFinished;
         }
         self.waiting.retain(|queued| *queued != id);
@@ -712,7 +711,7 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 
     /// Returns the configured scheduler limits.
-    pub fn config(&self) -> Qwen36SchedulerConfig {
+    pub fn config(&self) -> SchedulerConfig {
         self.config
     }
 
@@ -751,7 +750,7 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 
     /// Returns a request's current lifecycle state.
-    pub fn request_state(&self, id: Qwen36RequestId) -> Option<Qwen36RequestState> {
+    pub fn request_state(&self, id: Qwen36RequestId) -> Option<RequestState> {
         self.requests.get(&id).map(|request| request.lifecycle)
     }
 
@@ -774,7 +773,7 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Removes and returns a finished request.
     pub fn remove_finished(&mut self, id: Qwen36RequestId) -> Option<Qwen36FinishedRequest> {
-        if self.request_state(id) != Some(Qwen36RequestState::Finished) {
+        if self.request_state(id) != Some(RequestState::Finished) {
             return None;
         }
         let request = self.requests.remove(&id)?;
@@ -834,8 +833,8 @@ fn argmax_logits(logits: &[f32]) -> Result<SampledToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen36CancelOutcome, Qwen36RequestConfig, Qwen36RequestFinishReason, Qwen36RequestState,
-        Qwen36Scheduler, Qwen36SchedulerConfig, argmax_logits, decode_capacity_classes,
+        Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
+        SchedulerConfig, argmax_logits, decode_capacity_classes,
     };
     use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
     use crate::runtime::sampling::SamplingConfig;
@@ -850,13 +849,10 @@ mod tests {
 
     #[test]
     fn lifecycle_finish_and_cancellation_are_distinct_public_states() {
-        assert_ne!(Qwen36RequestState::Waiting, Qwen36RequestState::Prefilling);
-        assert_ne!(Qwen36RequestState::Prefilling, Qwen36RequestState::Decoding);
-        assert_ne!(Qwen36RequestState::Decoding, Qwen36RequestState::Finished);
-        assert_ne!(
-            Qwen36RequestFinishReason::Eos,
-            Qwen36RequestFinishReason::Length
-        );
+        assert_ne!(RequestState::Waiting, RequestState::Prefilling);
+        assert_ne!(RequestState::Prefilling, RequestState::Decoding);
+        assert_ne!(RequestState::Decoding, RequestState::Finished);
+        assert_ne!(RequestFinishReason::Eos, RequestFinishReason::Length);
         assert_eq!(Qwen36CancelOutcome::NotFound, Qwen36CancelOutcome::NotFound);
     }
 
@@ -893,7 +889,7 @@ mod tests {
         let model = Qwen36TextModel::open(model_dir).expect("load Qwen3.6 model");
         let mut scheduler = Qwen36Scheduler::new(
             &model,
-            Qwen36SchedulerConfig {
+            SchedulerConfig {
                 decode_capacity: 2,
                 prefill_sequence_capacity: 2,
                 prefill_token_capacity: 4,
@@ -910,13 +906,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2]
         );
-        let config = |max_new_tokens| Qwen36RequestConfig {
+        let config = |max_new_tokens| RequestConfig {
             sampling: SamplingConfig {
                 temperature: 0.0,
                 ..SamplingConfig::default()
             },
             max_new_tokens,
-            ..Qwen36RequestConfig::default()
+            ..RequestConfig::default()
         };
         let first = scheduler
             .add_request(vec![9707], config(2))
@@ -972,7 +968,7 @@ mod tests {
             Qwen36CancelOutcome::NotFound
         );
 
-        while scheduler.request_state(second) != Some(Qwen36RequestState::Finished) {
+        while scheduler.request_state(second) != Some(RequestState::Finished) {
             scheduler.tick().expect("finish second");
         }
         assert_eq!(
@@ -988,7 +984,7 @@ mod tests {
         scheduler.tick().expect("start decode cancellation request");
         assert_eq!(
             scheduler.request_state(cancelled_decode),
-            Some(Qwen36RequestState::Decoding)
+            Some(RequestState::Decoding)
         );
         assert!(matches!(
             scheduler.cancel_request(cancelled_decode),

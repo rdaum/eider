@@ -6,8 +6,8 @@ use infer::runtime::chat::{
 };
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::Qwen36RequestConfig;
-use infer::runtime::serving::{Qwen36ChatFinishReason, Qwen36ChatRequest, Qwen36ChatUsage};
+use infer::runtime::scheduler::RequestConfig;
+use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -38,7 +38,15 @@ pub struct ResponseRequest {
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
     pub top_p: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub stop: Option<OneOrMany<String>>,
 }
@@ -102,10 +110,7 @@ impl ApiError {
 
 impl ResponseRequest {
     /// Converts a Responses request into the runtime's complete chat contract.
-    pub fn into_chat_request(
-        self,
-        defaults: &GenerationConfig,
-    ) -> Result<Qwen36ChatRequest, ApiError> {
+    pub fn into_chat_request(self, defaults: &GenerationConfig) -> Result<ChatRequest, ApiError> {
         if self.parallel_tool_calls == Some(true) {
             return Err(ApiError::invalid(
                 "parallel_tool_calls",
@@ -136,10 +141,22 @@ impl ResponseRequest {
         if let Some(temperature) = self.temperature {
             sampling.temperature = temperature;
         }
+        if let Some(top_k) = self.top_k {
+            sampling.top_k = top_k;
+        }
         if let Some(top_p) = self.top_p {
             sampling.top_p = top_p;
         }
-        let generation = Qwen36RequestConfig {
+        if let Some(seed) = self.seed {
+            sampling.seed = Some(seed);
+        }
+        if let Some(penalty) = self.presence_penalty {
+            sampling.presence_penalty = penalty;
+        }
+        if let Some(penalty) = self.frequency_penalty {
+            sampling.frequency_penalty = penalty;
+        }
+        let generation = RequestConfig {
             sampling,
             max_new_tokens: self.max_output_tokens.unwrap_or(1024),
             eos_token_ids: defaults.eos_token_ids.clone(),
@@ -148,7 +165,7 @@ impl ResponseRequest {
             .validate()
             .map_err(|error| ApiError::invalid("sampling", error.to_string()))?;
 
-        Ok(Qwen36ChatRequest {
+        Ok(ChatRequest {
             messages,
             tools,
             template: ChatTemplateOptions::default(),
@@ -370,8 +387,8 @@ pub enum InferenceEvent {
 /// Request terminal metadata after the actor releases runtime state.
 #[derive(Clone, Debug)]
 pub struct InferenceFinished {
-    pub finish_reason: Qwen36ChatFinishReason,
-    pub usage: Qwen36ChatUsage,
+    pub finish_reason: ChatFinishReason,
+    pub usage: ChatUsage,
 }
 
 /// Per-response event builder and non-streaming accumulator.
@@ -561,7 +578,7 @@ impl ResponseStream {
     fn finish(&mut self, finished: InferenceFinished) -> Vec<Value> {
         let mut events = self.close_text();
         self.completed = true;
-        let incomplete = matches!(finished.finish_reason, Qwen36ChatFinishReason::Length)
+        let incomplete = matches!(finished.finish_reason, ChatFinishReason::Length)
             .then(|| json!({"reason": "max_output_tokens"}));
         let status = if incomplete.is_some() {
             "incomplete"
@@ -580,7 +597,7 @@ impl ResponseStream {
         events
     }
 
-    fn response(&self, status: &str, terminal: Option<(&Qwen36ChatUsage, Option<Value>)>) -> Value {
+    fn response(&self, status: &str, terminal: Option<(&ChatUsage, Option<Value>)>) -> Value {
         let (usage, incomplete_details) =
             terminal.map_or((Value::Null, Value::Null), |(usage, incomplete)| {
                 (
@@ -693,14 +710,24 @@ mod tests {
                 {"type":"web_search","external_web_access":false}
             ],
             "parallel_tool_calls": false,
-            "temperature": 0,
+            "temperature": 0.7,
+            "top_k": 12,
+            "top_p": 0.8,
+            "seed": 42,
+            "presence_penalty": 0.2,
+            "frequency_penalty": 0.1,
             "max_output_tokens": 12
         })).unwrap();
         let chat = request.into_chat_request(&defaults()).unwrap();
         assert_eq!(chat.messages.len(), 4);
         assert_eq!(chat.tools.len(), 1);
         assert_eq!(chat.generation.max_new_tokens, 12);
-        assert_eq!(chat.generation.sampling.temperature, 0.0);
+        assert_eq!(chat.generation.sampling.temperature, 0.7);
+        assert_eq!(chat.generation.sampling.top_k, 12);
+        assert_eq!(chat.generation.sampling.top_p, 0.8);
+        assert_eq!(chat.generation.sampling.seed, Some(42));
+        assert_eq!(chat.generation.sampling.presence_penalty, 0.2);
+        assert_eq!(chat.generation.sampling.frequency_penalty, 0.1);
         assert!(
             chat.messages[0]
                 .content
@@ -731,8 +758,8 @@ mod tests {
         assert_eq!(tool[0]["type"], "response.output_text.done");
         assert_eq!(tool[3]["type"], "response.output_item.added");
         let finished = InferenceFinished {
-            finish_reason: Qwen36ChatFinishReason::ToolCalls,
-            usage: Qwen36ChatUsage {
+            finish_reason: ChatFinishReason::ToolCalls,
+            usage: ChatUsage {
                 prompt_tokens: 8,
                 completion_tokens: 4,
             },
