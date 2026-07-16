@@ -1,5 +1,5 @@
 use fast_telemetry::{Counter, ExportMetrics, Histogram};
-use infer::nvfp4::{Error, GpuCounterCollector, GpuCounterMetric, Result};
+use infer::nvfp4::{Error, GpuCounterCollector, GpuCounterMetric, Result, device_memory_info};
 use infer::qwen3::infer::{
     Qwen3Model, QwenArchitecture, QwenDecodeProfile, QwenModelManifest, QwenRuntimeCounters,
     runtime_counters,
@@ -22,6 +22,7 @@ struct BenchArgs {
     metrics_prometheus: bool,
     gpu_counters: bool,
     gpu_counter_stage: Option<Qwen36GpuCounterStage>,
+    expert_cache_capacity: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,7 +145,9 @@ fn main() -> Result<()> {
             detail: "tokenizer produced no token ids".to_string(),
         });
     }
-    let mut model = BenchModel::load(&args.model_dir)?;
+    let (free_before_load, total_memory) = device_memory_info()?;
+    let mut model = BenchModel::load(&args.model_dir, args.expert_cache_capacity)?;
+    let (free_after_load, _) = device_memory_info()?;
     validate_token_ids("prompt token id", &prompt_ids, model.vocab_size())?;
 
     println!("Qwen3 benchmark");
@@ -156,24 +159,35 @@ fn main() -> Result<()> {
     println!("  temperature: {}", args.temperature);
     println!("  profile decode: {}", args.profile_decode);
     println!("  gpu counters: {}", args.gpu_counters);
+    println!("  expert cache capacity: {:?}", args.expert_cache_capacity);
+    println!(
+        "  CUDA memory after load: {:.3} GiB used, {:.3} GiB free, {:.3} GiB total",
+        free_before_load.saturating_sub(free_after_load) as f64 / (1u64 << 30) as f64,
+        free_after_load as f64 / (1u64 << 30) as f64,
+        total_memory as f64 / (1u64 << 30) as f64,
+    );
 
     for repeat in 0..args.warmup_repeats {
+        let paging_before = model.expert_paging_stats();
         let run = model.run_once(&prompt_ids, args.decode_tokens, false)?;
         println!(
             "  warmup {repeat}: prefill_ms={:.3} decode_ms={:.3} total_ms={:.3}",
             run.prefill_ms, run.decode_ms, run.total_ms
         );
+        print_paging_delta("warmup", paging_before, model.expert_paging_stats());
     }
 
     let metrics = BenchMetrics::new();
     let mut runs = Vec::with_capacity(args.repeats);
     for repeat in 0..args.repeats {
+        let paging_before = model.expert_paging_stats();
         let run = model.run_once(&prompt_ids, args.decode_tokens, args.profile_decode)?;
         metrics.record(&run, prompt_ids.len(), args.decode_tokens);
         println!(
             "  repeat {repeat}: prefill_ms={:.3} decode_ms={:.3} total_ms={:.3}",
             run.prefill_ms, run.decode_ms, run.total_ms
         );
+        print_paging_delta("repeat", paging_before, model.expert_paging_stats());
         runs.push(run);
     }
 
@@ -194,6 +208,18 @@ fn main() -> Result<()> {
         args.decode_tokens, decode_ms, decode_tps
     );
     println!("total_ms={:.3}", total_ms);
+    if let Some(stats) = model.expert_paging_stats() {
+        let lookups = stats.hits + stats.misses;
+        let hit_rate = if lookups == 0 {
+            0.0
+        } else {
+            stats.hits as f64 * 100.0 / lookups as f64
+        };
+        println!(
+            "expert_paging hits={} misses={} hit_rate={:.3}% bytes_read={}",
+            stats.hits, stats.misses, hit_rate, stats.bytes_read
+        );
+    }
     let total_counters = sum_counters(runs.iter().map(|run| run.counters));
     println!(
         "runtime_counters fp4_gemm_calls={} quantize_calls={} rms_norm_calls={} rope_calls={} attention_calls={} silu_calls={} add_calls={} bf16_to_f32_calls={} lm_head_argmax_calls={} lm_head_logits_calls={} host_logits_bytes={}",
@@ -234,11 +260,18 @@ fn main() -> Result<()> {
 }
 
 impl BenchModel {
-    fn load(model_dir: &Path) -> Result<Self> {
+    fn load(model_dir: &Path, expert_cache_capacity: Option<usize>) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir)?;
         match manifest.architecture {
             QwenArchitecture::Qwen3 => Qwen3Model::load(model_dir).map(Self::Qwen3),
-            QwenArchitecture::Qwen35Moe => Qwen36TextModel::open(model_dir).map(Self::Qwen36),
+            QwenArchitecture::Qwen35Moe => {
+                let model = if let Some(capacity) = expert_cache_capacity {
+                    Qwen36TextModel::open_with_expert_cache_capacity(model_dir, capacity)?
+                } else {
+                    Qwen36TextModel::open(model_dir)?
+                };
+                Ok(Self::Qwen36(model))
+            }
         }
     }
 
@@ -246,6 +279,13 @@ impl BenchModel {
         match self {
             Self::Qwen3(model) => model.vocab_size(),
             Self::Qwen36(model) => model.manifest().vocab,
+        }
+    }
+
+    fn expert_paging_stats(&self) -> Option<infer::qwen3::qwen36::Qwen36PagingStats> {
+        match self {
+            Self::Qwen3(_) => None,
+            Self::Qwen36(model) => model.expert_paging_stats(),
         }
     }
 
@@ -494,6 +534,7 @@ impl BenchArgs {
         let mut metrics_prometheus = false;
         let mut gpu_counters = false;
         let mut gpu_counter_stage = None;
+        let mut expert_cache_capacity = None;
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -567,6 +608,17 @@ impl BenchArgs {
                     gpu_counter_stage = Some(parse_gpu_counter_stage(&value)?);
                     gpu_counters = true;
                 }
+                "--expert-cache-capacity" => {
+                    let value = args.next().ok_or_else(|| Error::Format {
+                        label: "--expert-cache-capacity",
+                        detail: "expected slots per layer".to_string(),
+                    })?;
+                    expert_cache_capacity =
+                        Some(value.parse::<usize>().map_err(|err| Error::Format {
+                            label: "--expert-cache-capacity",
+                            detail: err.to_string(),
+                        })?);
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -603,13 +655,14 @@ impl BenchArgs {
             metrics_prometheus,
             gpu_counters,
             gpu_counter_stage,
+            expert_cache_capacity,
         })
     }
 }
 
 fn print_usage() {
     println!(
-        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
+        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--expert-cache-capacity N] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
     );
 }
 
@@ -734,6 +787,28 @@ fn tokens_per_second(tokens: usize, ms: f64) -> f64 {
     } else {
         tokens as f64 / (ms / 1_000.0)
     }
+}
+
+fn print_paging_delta(
+    label: &str,
+    before: Option<infer::qwen3::qwen36::Qwen36PagingStats>,
+    after: Option<infer::qwen3::qwen36::Qwen36PagingStats>,
+) {
+    let (Some(before), Some(after)) = (before, after) else {
+        return;
+    };
+    let hits = after.hits - before.hits;
+    let misses = after.misses - before.misses;
+    let bytes_read = after.bytes_read - before.bytes_read;
+    let lookups = hits + misses;
+    let hit_rate = if lookups == 0 {
+        0.0
+    } else {
+        hits as f64 * 100.0 / lookups as f64
+    };
+    println!(
+        "  {label} paging: hits={hits} misses={misses} hit_rate={hit_rate:.3}% bytes_read={bytes_read}"
+    );
 }
 
 fn ms_to_us(ms: f64) -> u64 {

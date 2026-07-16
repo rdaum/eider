@@ -10,10 +10,10 @@ pub use batch::{
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    MarlinNvfp4GateUp, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, Result, SafeTensorInfo,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace,
-    Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptFp8Linear,
+    ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer,
+    Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
@@ -41,8 +41,14 @@ use super::infer::{
     QwenArchitecture, QwenDecodeProfile, QwenFfnConfig, QwenLayerKind, QwenLinearAttentionConfig,
     QwenModelManifest,
 };
-use super::qwen36_cache::{ensure_layer_cache, ensure_model_cache, prepared_layer_dir};
+use super::qwen36_cache::{
+    down_path, ensure_layer_cache, ensure_model_cache, gate_up_path, prepared_layer_dir,
+};
+use crate::runtime::expert_cache::{
+    ExpertRecordSource, ExpertSlotCache, ExpertUploadCoordinator, read_expert_misses,
+};
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -386,6 +392,14 @@ impl Qwen36Model {
 
     fn load_moe_from_prepared_cache(&self, layer: usize) -> Result<Qwen36MoeWeights> {
         Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer, true)
+    }
+
+    fn load_moe_from_prepared_cache_paged(
+        &self,
+        layer: usize,
+        capacity: usize,
+    ) -> Result<Qwen36MoeWeights> {
+        Qwen36MoeWeights::load_paged(&self.checkpoint, &self.manifest, layer, true, capacity)
     }
 
     /// Allocates workspace for a loaded MoE + shared-expert FFN.
@@ -1707,11 +1721,120 @@ pub struct Qwen36MoeWeights {
     experts_per_token: usize,
     expert_intermediate: usize,
     norm_topk_prob: bool,
+    expert_pager: std::cell::RefCell<Option<Qwen36ExpertPager>>,
+}
+
+/// Result of resolving original expert IDs into a bounded resident slot table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen36PageResolution {
+    /// Slot IDs corresponding one-for-one with the requested expert IDs.
+    pub slots: Vec<u32>,
+    /// Requested experts that were already resident.
+    pub hits: usize,
+    /// Requested experts loaded into a slot.
+    pub misses: usize,
+    /// Prepared cache bytes read for misses.
+    pub bytes_read: usize,
+}
+
+/// Cumulative expert-cache activity across paged layers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Qwen36PagingStats {
+    /// Expert route lookups served by an already-resident slot.
+    pub hits: u64,
+    /// Expert route lookups that loaded a prepared record.
+    pub misses: u64,
+    /// Prepared cache bytes read for misses.
+    pub bytes_read: u64,
+}
+
+/// Bounded expert cache for the Qwen3.6 NVFP4 MoE path.
+pub struct Qwen36ExpertPager {
+    cache_dir: PathBuf,
+    gate_up: MarlinNvfp4GateUp,
+    down: Vec<Sm12xFp4DeviceGemmWeight>,
+    down_tiles: DeviceBuffer<*const u8>,
+    down_scales: DeviceBuffer<*const u32>,
+    down_input_scales: DeviceBuffer<f32>,
+    down_alphas: DeviceBuffer<f32>,
+    gate_up_unity_alphas: DeviceBuffer<f32>,
+    slots: ExpertSlotCache,
+    down_input_scales_host: Vec<f32>,
+    down_alphas_host: Vec<f32>,
+    hidden: usize,
+    intermediate: usize,
+    top_k: usize,
+    stats: Qwen36PagingStats,
+    uploads: ExpertUploadCoordinator,
+    staging_pool: Vec<Qwen36ExpertStaging>,
+}
+
+struct Qwen36ExpertStaging {
+    slot: usize,
+    gate_weight: PinnedHostBuffer<u32>,
+    gate_scale: PinnedHostBuffer<u8>,
+    gate_global_scale: PinnedHostBuffer<f32>,
+    down_tiles: PinnedHostBuffer<u8>,
+    down_scales: PinnedHostBuffer<u32>,
+    down_input_scale: PinnedHostBuffer<f32>,
+    down_alpha: PinnedHostBuffer<f32>,
+}
+
+struct Qwen36PreparedExpertRecord {
+    gate: MarlinNvfp4HostWeight,
+    down: Sm12xFp4GemmWeight,
+    bytes: usize,
+}
+
+struct Qwen36ExpertRecordSource<'a> {
+    cache_dir: &'a std::path::Path,
+}
+
+impl ExpertRecordSource for Qwen36ExpertRecordSource<'_> {
+    type Record = Qwen36PreparedExpertRecord;
+
+    fn read_record(&self, expert: usize) -> Result<Self::Record> {
+        let gate_path = gate_up_path(self.cache_dir, expert);
+        let down_path = down_path(self.cache_dir, expert);
+        let gate = MarlinNvfp4HostWeight::read_cache_file(&gate_path)?;
+        let down = Sm12xFp4GemmWeight::read_cache_file(&down_path)?;
+        let bytes = std::fs::metadata(&gate_path)
+            .map_err(|error| Error::Format {
+                label: "Qwen3.6 expert pager",
+                detail: format!("failed to inspect {}: {error}", gate_path.display()),
+            })?
+            .len() as usize
+            + std::fs::metadata(&down_path)
+                .map_err(|error| Error::Format {
+                    label: "Qwen3.6 expert pager",
+                    detail: format!("failed to inspect {}: {error}", down_path.display()),
+                })?
+                .len() as usize;
+        Ok(Qwen36PreparedExpertRecord { gate, down, bytes })
+    }
+}
+
+impl Qwen36ExpertStaging {
+    fn new(gate_up: usize, hidden: usize, intermediate: usize) -> Result<Self> {
+        let down_tiles = (hidden / 16) * (intermediate / 64) * 512;
+        let down_scales = (hidden / 16) * (intermediate / 64);
+        Ok(Self {
+            slot: 0,
+            gate_weight: PinnedHostBuffer::zeroed(gate_up * hidden / 8)?,
+            gate_scale: PinnedHostBuffer::zeroed(gate_up * hidden / 16)?,
+            gate_global_scale: PinnedHostBuffer::zeroed(1)?,
+            down_tiles: PinnedHostBuffer::zeroed(down_tiles)?,
+            down_scales: PinnedHostBuffer::zeroed(down_scales)?,
+            down_input_scale: PinnedHostBuffer::zeroed(1)?,
+            down_alpha: PinnedHostBuffer::zeroed(1)?,
+        })
+    }
 }
 
 enum Qwen36GateUpStorage {
     Marlin(MarlinNvfp4GateUp),
     Grouped { _weights: Vec<Nvfp4DeviceLinear> },
+    Paged,
     Fp8,
 }
 
@@ -1893,6 +2016,276 @@ struct Qwen36ParallelMoe<'a> {
     join: &'a CudaEvent,
 }
 
+impl Qwen36ExpertPager {
+    /// Allocates `capacity` resident slots and retains only per-expert scalar metadata.
+    pub fn load(model: &Qwen36Model, layer: usize, capacity: usize) -> Result<Self> {
+        Self::load_from_checkpoint(&model.checkpoint, &model.manifest, layer, capacity, false)
+    }
+
+    fn load_from_checkpoint(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        layer: usize,
+        capacity: usize,
+        cache_prepared: bool,
+    ) -> Result<Self> {
+        if layer >= manifest.layers {
+            return Err(Error::Shape {
+                label: "Qwen3.6 expert pager layer",
+                expected: format!("layer < {}", manifest.layers),
+                actual: layer.to_string(),
+            });
+        }
+        let (experts, top_k, intermediate) = match manifest.ffn {
+            QwenFfnConfig::Moe {
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                ..
+            } => (experts, experts_per_token, expert_intermediate),
+            QwenFfnConfig::Dense => {
+                return Err(Error::Format {
+                    label: "Qwen3.6 expert pager",
+                    detail: "expected MoE model".to_string(),
+                });
+            }
+        };
+        if capacity < top_k || capacity > experts {
+            return Err(Error::Shape {
+                label: "Qwen3.6 expert pager capacity",
+                expected: format!("{top_k}..={experts} slots"),
+                actual: capacity.to_string(),
+            });
+        }
+
+        let cache_dir = if cache_prepared {
+            prepared_layer_dir(checkpoint, layer)
+        } else {
+            ensure_layer_cache(checkpoint, manifest, layer)?
+        };
+        let prefix = format!("{}.layers.{layer}.mlp.experts", manifest.tensor_prefix);
+        let mut down_input_scales_host = Vec::with_capacity(experts);
+        let mut down_alphas_host = Vec::with_capacity(experts);
+        for expert in 0..experts {
+            let (weight_scale, input_scale) =
+                checkpoint.load_nvfp4_scales(&format!("{prefix}.{expert}.down_proj"))?;
+            down_input_scales_host.push(input_scale);
+            down_alphas_host.push(weight_scale * input_scale);
+        }
+
+        let gate_up =
+            MarlinNvfp4GateUp::new_empty_slots(capacity, intermediate * 2, manifest.hidden)?;
+        let mut down = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            down.push(Sm12xFp4DeviceGemmWeight::zeroed(
+                manifest.hidden,
+                intermediate,
+            )?);
+        }
+        let down_tiles = DeviceBuffer::from_host(
+            &down
+                .iter()
+                .map(Sm12xFp4DeviceGemmWeight::tiles_ptr)
+                .collect::<Vec<_>>(),
+        )?;
+        let down_scales = DeviceBuffer::from_host(
+            &down
+                .iter()
+                .map(Sm12xFp4DeviceGemmWeight::scales_ptr)
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(Self {
+            cache_dir,
+            gate_up,
+            down,
+            down_tiles,
+            down_scales,
+            down_input_scales: DeviceBuffer::zeroed(capacity)?,
+            down_alphas: DeviceBuffer::zeroed(capacity)?,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; capacity])?,
+            slots: ExpertSlotCache::new(experts, capacity, top_k)?,
+            down_input_scales_host,
+            down_alphas_host,
+            hidden: manifest.hidden,
+            intermediate,
+            top_k,
+            stats: Qwen36PagingStats::default(),
+            uploads: ExpertUploadCoordinator::new()?,
+            staging_pool: (0..top_k)
+                .map(|_| Qwen36ExpertStaging::new(intermediate * 2, manifest.hidden, intermediate))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    /// Resolves one token's routed experts and enqueues any miss uploads.
+    pub fn resolve(
+        &mut self,
+        expert_ids: &[u32],
+        device_expert_ids: &DeviceBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<Qwen36PageResolution> {
+        if device_expert_ids.len() != self.top_k {
+            return Err(Error::Shape {
+                label: "Qwen3.6 expert pager route",
+                expected: format!("{} device expert IDs", self.top_k),
+                actual: format!("{} device expert IDs", device_expert_ids.len()),
+            });
+        }
+        self.uploads.wait_for_staging_reuse()?;
+        let plan = self.slots.plan(expert_ids)?;
+        let slots = plan.slots;
+        let hits = plan.hits;
+        let pending = plan.misses;
+        let misses = pending.len();
+
+        let mut bytes_read = 0;
+        if !pending.is_empty() {
+            self.uploads.begin(stream)?;
+
+            let source = Qwen36ExpertRecordSource {
+                cache_dir: &self.cache_dir,
+            };
+            let loaded = read_expert_misses(&source, &pending)?;
+
+            for (staged, loaded) in self.staging_pool.iter_mut().zip(loaded) {
+                let expert = loaded.expert;
+                let Qwen36PreparedExpertRecord { gate, down, bytes } = loaded.record;
+                bytes_read += bytes;
+                let down_tiles = down.tile_bytes();
+                staged.slot = loaded.slot;
+                staged.gate_weight.copy_from_slice(&gate.packed_weight)?;
+                staged.gate_scale.copy_from_slice(&gate.weight_scale)?;
+                staged
+                    .gate_global_scale
+                    .copy_from_slice(&[gate.global_scale])?;
+                staged.down_tiles.copy_from_slice(&down_tiles)?;
+                staged.down_scales.copy_from_slice(down.scale_words())?;
+                staged
+                    .down_input_scale
+                    .copy_from_slice(&[self.down_input_scales_host[expert]])?;
+                staged
+                    .down_alpha
+                    .copy_from_slice(&[self.down_alphas_host[expert]])?;
+            }
+            for staged in self.staging_pool.iter().take(misses) {
+                self.gate_up.load_slot_from_pinned_on_stream(
+                    staged.slot,
+                    &staged.gate_weight,
+                    &staged.gate_scale,
+                    &staged.gate_global_scale,
+                    self.uploads.stream(),
+                )?;
+                self.down[staged.slot].copy_from_pinned_on_stream(
+                    &staged.down_tiles,
+                    &staged.down_scales,
+                    self.uploads.stream(),
+                )?;
+                self.down_input_scales.copy_range_from_pinned_on_stream(
+                    staged.slot,
+                    &staged.down_input_scale,
+                    self.uploads.stream(),
+                )?;
+                self.down_alphas.copy_range_from_pinned_on_stream(
+                    staged.slot,
+                    &staged.down_alpha,
+                    self.uploads.stream(),
+                )?;
+            }
+            self.slots.enqueue_mapping_upload(self.uploads.stream())?;
+            self.uploads.finish(stream)?;
+        }
+
+        self.slots.remap_on_stream(device_expert_ids, stream)?;
+        self.stats.hits += hits as u64;
+        self.stats.misses += misses as u64;
+        self.stats.bytes_read += bytes_read as u64;
+        Ok(Qwen36PageResolution {
+            slots,
+            hits,
+            misses,
+            bytes_read,
+        })
+    }
+
+    /// Runs the routed expert computation using the most recently resolved slots.
+    pub fn run_routed<'a>(
+        &self,
+        workspace: &'a mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        if ffn_norm.len() != self.hidden || workspace.route.weights.len() != self.top_k {
+            return Err(Error::Shape {
+                label: "Qwen3.6 paged routed MoE inputs",
+                expected: format!("hidden={} route_weights={}", self.hidden, self.top_k),
+                actual: format!(
+                    "hidden={} route_weights={}",
+                    ffn_norm.len(),
+                    workspace.route.weights.len()
+                ),
+            });
+        }
+        let slot_indices = self.slots.slot_indices();
+        self.gate_up.run_on_stream(
+            slot_indices,
+            ffn_norm,
+            workspace.marlin_gate_up_output.output(),
+            stream,
+        )?;
+        moe_silu_quantize_slots_on_stream(
+            slot_indices,
+            &workspace.marlin_gate_up_table,
+            &mut workspace.sm12x_down.b_tiles,
+            &mut workspace.sm12x_down.b_scales,
+            &self.down_input_scales,
+            &self.gate_up_unity_alphas,
+            self.intermediate,
+            self.top_k,
+            stream,
+        )?;
+        indexed_grouped_gemv_on_stream(
+            slot_indices,
+            &self.down_tiles,
+            &self.down_scales,
+            self.slots.capacity(),
+            &workspace.sm12x_down.b_tiles,
+            &workspace.sm12x_down.b_scales,
+            &workspace.sm12x_down.d,
+            self.hidden / 16,
+            self.intermediate / 64,
+            self.top_k,
+            stream,
+        )?;
+        fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+        moe_weighted_accumulate_slots_f32_on_stream(
+            slot_indices,
+            &workspace.route.weights,
+            &workspace.sm12x_down.c,
+            &self.down_alphas,
+            workspace.moe_out.inout(),
+            stream,
+        )?;
+        Ok(&workspace.moe_out)
+    }
+
+    /// Returns device bytes retained by the resident expert slots.
+    pub fn expert_device_bytes(&self) -> usize {
+        self.gate_up.expert_device_bytes()
+            + self
+                .down
+                .iter()
+                .map(Sm12xFp4DeviceGemmWeight::device_bytes)
+                .sum::<usize>()
+            + self.down_input_scales.device_bytes()
+            + self.down_alphas.device_bytes()
+    }
+
+    /// Returns cumulative lookup and miss-I/O counters.
+    pub fn stats(&self) -> Qwen36PagingStats {
+        self.stats
+    }
+}
+
 impl Qwen36MoeWeights {
     /// Loads the MoE + shared-expert FFN for layer `layer`.
     pub fn load(
@@ -1966,11 +2359,7 @@ impl Qwen36MoeWeights {
             checkpoint.contains_tensor(&format!("{prefix}.experts.0.gate_proj.weight_packed"));
         let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
-            && (0..experts).all(|expert_idx| {
-                sm12x_cache_dir
-                    .join(format!("expert-{expert_idx:03}.down.s12x"))
-                    .is_file()
-            });
+            && (0..experts).all(|expert_idx| down_path(&sm12x_cache_dir, expert_idx).is_file());
         let storage_plan =
             Qwen36MoeStoragePlan::select(request_sm12x_down, sm12x_down_cache_complete);
 
@@ -2036,7 +2425,7 @@ impl Qwen36MoeWeights {
             }
 
             if storage_plan.down == Qwen36DownStorage::Sm12x {
-                let path = sm12x_cache_dir.join(format!("expert-{expert_idx:03}.down.s12x"));
+                let path = down_path(&sm12x_cache_dir, expert_idx);
                 let weight = Sm12xFp4GemmWeight::read_cache_file(&path)?.to_device()?;
                 sm12x_down_m_tiles = weight.m_tiles();
                 sm12x_down_k_tiles = weight.k_tiles();
@@ -2155,6 +2544,139 @@ impl Qwen36MoeWeights {
             experts_per_token,
             expert_intermediate,
             norm_topk_prob,
+            expert_pager: std::cell::RefCell::new(None),
+        })
+    }
+
+    fn load_paged(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        layer: usize,
+        cache_prepared: bool,
+        capacity: usize,
+    ) -> Result<Self> {
+        let (experts, experts_per_token, expert_intermediate, norm_topk_prob) = match manifest.ffn {
+            QwenFfnConfig::Moe {
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                norm_topk_prob,
+            } => (
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                norm_topk_prob,
+            ),
+            QwenFfnConfig::Dense => {
+                return Err(Error::Format {
+                    label: "Qwen3.6 paged MoE FFN",
+                    detail: "expected MoE config, got Dense".to_string(),
+                });
+            }
+        };
+        let prefix = format!("{}.layers.{layer}.mlp", manifest.tensor_prefix);
+        let first_gate = format!("{prefix}.experts.0.gate_proj");
+        let uses_nvfp4 = checkpoint.contains_tensor(&format!("{first_gate}.weight_scale_2"))
+            || checkpoint.contains_tensor(&format!("{first_gate}.weight_global_scale"));
+        if !uses_nvfp4 {
+            return Err(Error::Format {
+                label: "Qwen3.6 paged MoE FFN",
+                detail: format!("layer {layer} uses FP8 routed experts"),
+            });
+        }
+
+        let router = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.gate.weight"),
+            experts,
+            manifest.hidden,
+        )?;
+        let pager = Qwen36ExpertPager::load_from_checkpoint(
+            checkpoint,
+            manifest,
+            layer,
+            capacity,
+            cache_prepared,
+        )?;
+
+        let shared_gate_up = load_concat_gate_up(
+            checkpoint,
+            &format!("{prefix}.shared_expert.gate_proj"),
+            &format!("{prefix}.shared_expert.up_proj"),
+            "Qwen3.6 shared expert gate/up",
+        )?;
+        let shared_down =
+            checkpoint.load_nvfp4_linear(&format!("{prefix}.shared_expert.down_proj"))?;
+        let shared_intermediate = shared_gate_up.out_features / 2;
+        if shared_gate_up.in_features != manifest.hidden
+            || shared_down.in_features != shared_intermediate
+            || shared_down.out_features != manifest.hidden
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.6 shared expert",
+                expected: format!(
+                    "gate_up in={} out=2*{} down in={} out={}",
+                    manifest.hidden, shared_intermediate, shared_intermediate, manifest.hidden
+                ),
+                actual: format!(
+                    "gate_up in={} out={} down in={} out={}",
+                    shared_gate_up.in_features,
+                    shared_gate_up.out_features,
+                    shared_down.in_features,
+                    shared_down.out_features
+                ),
+            });
+        }
+        let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
+            gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
+            down: Nvfp4DeviceLinear::from_host(&shared_down)?,
+        });
+        let shared_gate = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.shared_expert_gate.weight"),
+            1,
+            manifest.hidden,
+        )?;
+
+        let null_u8 = vec![std::ptr::null(); experts];
+        let expert_ptrs = MoeExpertPointerTables {
+            gate_up_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_scales: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_values: DeviceBuffer::from_host(&null_u8)?,
+            down_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_input_scales: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            down_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            shared_gate_up_input_scale: None,
+            gate_up_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+        };
+
+        Ok(Self {
+            router,
+            experts: Vec::new(),
+            expert_ptrs,
+            gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            storage_plan: Qwen36MoeStoragePlan {
+                down: Qwen36DownStorage::Sm12x,
+            },
+            gate_up_storage: Qwen36GateUpStorage::Paged,
+            fp8_experts: None,
+            shared,
+            shared_gate,
+            _sm12x_down: Vec::new(),
+            sm12x_down_tiles: None,
+            sm12x_down_scales: None,
+            sm12x_down_m_tiles: manifest.hidden / 16,
+            sm12x_down_k_tiles: expert_intermediate / 64,
+            num_experts: experts,
+            experts_per_token,
+            expert_intermediate,
+            norm_topk_prob,
+            expert_pager: std::cell::RefCell::new(Some(pager)),
         })
     }
 
@@ -2248,6 +2770,7 @@ impl Qwen36MoeWeights {
             experts_per_token,
             expert_intermediate,
             norm_topk_prob,
+            expert_pager: std::cell::RefCell::new(None),
         })
     }
 
@@ -2258,6 +2781,17 @@ impl Qwen36MoeWeights {
             self.experts_per_token,
             self.expert_intermediate,
         )
+    }
+
+    /// Installs a bounded expert pager for this layer's routed path.
+    pub fn enable_expert_paging(
+        &mut self,
+        model: &Qwen36Model,
+        layer: usize,
+        capacity: usize,
+    ) -> Result<()> {
+        *self.expert_pager.get_mut() = Some(Qwen36ExpertPager::load(model, layer, capacity)?);
+        Ok(())
     }
 
     fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36MoeWorkspace> {
@@ -2314,6 +2848,10 @@ impl Qwen36MoeWeights {
                 workspace.marlin_gate_up_output.output(),
                 stream,
             ),
+            Qwen36GateUpStorage::Paged => Err(Error::Format {
+                label: "Qwen3.6 paged routed gate/up",
+                detail: "resolve resident expert slots before routed execution".to_string(),
+            }),
             Qwen36GateUpStorage::Fp8 => {
                 let fp8 = self.fp8_experts.as_ref().ok_or_else(|| Error::Format {
                     label: "Qwen3.6 FP8 routed gate/up",
@@ -2478,6 +3016,12 @@ impl Qwen36MoeWeights {
             }
             Qwen36GateUpStorage::Marlin(_) | Qwen36GateUpStorage::Fp8 => {
                 &workspace.marlin_gate_up_table
+            }
+            Qwen36GateUpStorage::Paged => {
+                return Err(Error::Format {
+                    label: "Qwen3.6 paged grouped down",
+                    detail: "use the expert pager routed path".to_string(),
+                });
             }
         };
         let grouped_down = workspace
@@ -3007,7 +3551,28 @@ impl Qwen36MoeWeights {
             && self.sm12x_down_tiles.is_some()
             && self.sm12x_down_scales.is_some();
         let use_device_route = workspace.grouped_down.is_some();
-        let used_grouped = if let Some(fp8) = &self.fp8_experts {
+        let used_pager = self.expert_pager.borrow().is_some();
+        let used_grouped = if used_pager {
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, topk_ms) = timed_cuda(stream, || {
+                    workspace
+                        .route
+                        .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)
+                })?;
+                profile.qwen36_router_topk_ms += topk_ms;
+                profile.qwen36_router_ms += topk_ms;
+            } else {
+                workspace
+                    .route
+                    .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
+            }
+            let indices = workspace.route.indices.copy_to_host(stream)?.into_vec();
+            let mut pager = self.expert_pager.borrow_mut();
+            let pager = pager.as_mut().expect("expert pager checked above");
+            pager.resolve(&indices, &workspace.route.indices, stream)?;
+            pager.run_routed(workspace, ffn_norm, stream)?;
+            true
+        } else if let Some(fp8) = &self.fp8_experts {
             if let Some(profile) = profile.as_deref_mut() {
                 let (_, topk_ms) = timed_cuda(stream, || {
                     workspace
@@ -3550,7 +4115,7 @@ impl Qwen36MoeWeights {
 
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
-                if use_device_route && use_sm12x_down {
+                if use_device_route && use_sm12x_down && !used_pager {
                     qwen36_ffn_finalize_routed_f32_into_on_stream(
                         &workspace.route.indices,
                         &workspace.route.weights,
@@ -3574,7 +4139,7 @@ impl Qwen36MoeWeights {
                 }
             })?;
             profile.qwen36_ffn_combine_ms += ms;
-        } else if use_device_route && use_sm12x_down {
+        } else if use_device_route && use_sm12x_down && !used_pager {
             qwen36_ffn_finalize_routed_f32_into_on_stream(
                 &workspace.route.indices,
                 &workspace.route.weights,
@@ -4077,7 +4642,7 @@ impl Qwen36LayerBlock {
             model.checkpoint(),
             model.manifest(),
         )?);
-        Self::load_inner(model, layer, false, fp8)
+        Self::load_inner(model, layer, false, None, fp8)
     }
 
     fn load_from_prepared_cache(
@@ -4085,13 +4650,23 @@ impl Qwen36LayerBlock {
         layer: usize,
         fp8: Rc<Qwen36LinearFp8Execution>,
     ) -> Result<Self> {
-        Self::load_inner(model, layer, true, fp8)
+        Self::load_inner(model, layer, true, None, fp8)
+    }
+
+    fn load_from_prepared_cache_paged(
+        model: &Qwen36Model,
+        layer: usize,
+        capacity: usize,
+        fp8: Rc<Qwen36LinearFp8Execution>,
+    ) -> Result<Self> {
+        Self::load_inner(model, layer, true, Some(capacity), fp8)
     }
 
     fn load_inner(
         model: &Qwen36Model,
         layer: usize,
         cache_prepared: bool,
+        expert_cache_capacity: Option<usize>,
         fp8: Rc<Qwen36LinearFp8Execution>,
     ) -> Result<Self> {
         let kind = model.layer_kind(layer)?;
@@ -4110,7 +4685,9 @@ impl Qwen36LayerBlock {
                 Qwen36FullAttentionWeights::load(&model.checkpoint, &model.manifest, layer)?,
             ),
         };
-        let moe = if cache_prepared {
+        let moe = if let Some(capacity) = expert_cache_capacity {
+            model.load_moe_from_prepared_cache_paged(layer, capacity)?
+        } else if cache_prepared {
             model.load_moe_from_prepared_cache(layer)?
         } else {
             model.load_moe(layer)?
@@ -4626,6 +5203,7 @@ pub struct Qwen36TextModel {
     embedding: DeviceBuffer<u16>,
     final_norm: DeviceBuffer<f32>,
     lm_head: Qwen36LmHead,
+    expert_paging: bool,
 }
 
 enum Qwen36LmHead {
@@ -4894,8 +5472,32 @@ impl Qwen36TextModel {
         Self::from_qwen36_model(model)
     }
 
+    /// Loads the model with only `capacity_per_layer` routed experts resident.
+    pub fn open_with_expert_cache_capacity(
+        model_dir: impl AsRef<std::path::Path>,
+        capacity_per_layer: usize,
+    ) -> Result<Self> {
+        let model = Qwen36Model::open(model_dir)?;
+        Self::from_qwen36_model_with_expert_cache_capacity(model, capacity_per_layer)
+    }
+
     /// Builds the full text model from an already-opened [`Qwen36Model`].
     pub fn from_qwen36_model(model: Qwen36Model) -> Result<Self> {
+        Self::from_qwen36_model_inner(model, None)
+    }
+
+    /// Builds a text model whose routed experts are backed only by bounded slots.
+    pub fn from_qwen36_model_with_expert_cache_capacity(
+        model: Qwen36Model,
+        capacity_per_layer: usize,
+    ) -> Result<Self> {
+        Self::from_qwen36_model_inner(model, Some(capacity_per_layer))
+    }
+
+    fn from_qwen36_model_inner(
+        model: Qwen36Model,
+        capacity_per_layer: Option<usize>,
+    ) -> Result<Self> {
         let manifest = model.manifest().clone();
         let checkpoint = model.checkpoint().clone();
         ensure_model_cache(&checkpoint, &manifest)?;
@@ -4903,11 +5505,17 @@ impl Qwen36TextModel {
         let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(&checkpoint, &manifest)?);
         let mut layers = Vec::with_capacity(manifest.layers);
         for layer in 0..manifest.layers {
-            layers.push(Qwen36LayerBlock::load_from_prepared_cache(
-                &model,
-                layer,
-                Rc::clone(&linear_fp8),
-            )?);
+            let block = if let Some(capacity) = capacity_per_layer {
+                Qwen36LayerBlock::load_from_prepared_cache_paged(
+                    &model,
+                    layer,
+                    capacity,
+                    Rc::clone(&linear_fp8),
+                )?
+            } else {
+                Qwen36LayerBlock::load_from_prepared_cache(&model, layer, Rc::clone(&linear_fp8))?
+            };
+            layers.push(block);
         }
         let embedding = read_bf16_matrix_device(
             &checkpoint,
@@ -4938,6 +5546,48 @@ impl Qwen36TextModel {
             embedding,
             final_norm,
             lm_head,
+            expert_paging: capacity_per_layer.is_some(),
+        })
+    }
+
+    /// Enables the synchronous bounded expert-cache experiment for every NVFP4 layer.
+    ///
+    /// The resident weights remain allocated so this mode can be compared
+    /// directly with the established path. Decode graphs are disabled because
+    /// route readback and slot replacement are host-controlled.
+    pub fn enable_expert_paging(&mut self, capacity_per_layer: usize) -> Result<()> {
+        let model = Qwen36Model {
+            manifest: self.manifest.clone(),
+            checkpoint: self.checkpoint.clone(),
+        };
+        for block in &mut self.layers {
+            block
+                .moe
+                .enable_expert_paging(&model, block.layer, capacity_per_layer)?;
+        }
+        self.expert_paging = true;
+        Ok(())
+    }
+
+    /// Returns cumulative paging activity across all layers, when enabled.
+    pub fn expert_paging_stats(&self) -> Option<Qwen36PagingStats> {
+        self.expert_paging.then(|| {
+            self.layers
+                .iter()
+                .filter_map(|block| {
+                    block
+                        .moe
+                        .expert_pager
+                        .borrow()
+                        .as_ref()
+                        .map(Qwen36ExpertPager::stats)
+                })
+                .fold(Qwen36PagingStats::default(), |mut total, layer| {
+                    total.hits += layer.hits;
+                    total.misses += layer.misses;
+                    total.bytes_read += layer.bytes_read;
+                    total
+                })
         })
     }
 
@@ -4988,8 +5638,9 @@ impl Qwen36TextModel {
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);
         }
-        let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+        let enable_segmented_graphs = !self.expert_paging
+            && !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
         let enable_parallel_moe = enable_segmented_graphs;
         let parallel_moe_stream = enable_parallel_moe
             .then(CudaStream::new_non_blocking)

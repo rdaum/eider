@@ -1,5 +1,6 @@
 //! Prepared expert storage for the Step-3.5-Flash NVFP4 checkpoint.
 
+use crate::runtime::expert_cache::ExpertRecordSource;
 use nvfp4::{
     DeviceBuffer, Error, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
     Sm12xFp4GemmWeight,
@@ -42,6 +43,92 @@ struct PreparedHeader {
     gate_global_scales: Vec<f32>,
     down_input_scales: Vec<f32>,
     down_alphas: Vec<f32>,
+}
+
+/// One Step-3.5 prepared expert record and its scalar execution metadata.
+pub struct Step35PreparedExpertRecord {
+    bytes: Vec<u8>,
+    pub gate_global_scale: f32,
+    pub down_input_scale: f32,
+    pub down_alpha: f32,
+}
+
+impl Step35PreparedExpertRecord {
+    pub fn gate_weight_bytes(&self) -> &[u8] {
+        &self.bytes[..GATE_WEIGHT_BYTES]
+    }
+
+    pub fn gate_scale_bytes(&self) -> &[u8] {
+        &self.bytes[GATE_WEIGHT_BYTES..GATE_WEIGHT_BYTES + GATE_SCALE_BYTES]
+    }
+
+    pub fn down_tile_bytes(&self) -> &[u8] {
+        let start = GATE_WEIGHT_BYTES + GATE_SCALE_BYTES;
+        &self.bytes[start..start + DOWN_TILE_BYTES]
+    }
+
+    pub fn down_scale_bytes(&self) -> &[u8] {
+        let start = GATE_WEIGHT_BYTES + GATE_SCALE_BYTES + DOWN_TILE_BYTES;
+        &self.bytes[start..]
+    }
+}
+
+/// Random-access source for Step-3.5's fixed-size prepared expert records.
+pub struct Step35ExpertRecordSource {
+    file: File,
+    header: PreparedHeader,
+}
+
+impl Step35ExpertRecordSource {
+    pub fn open(model_dir: impl AsRef<Path>, layer: usize) -> Result<Self> {
+        if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
+            return Err(Error::Shape {
+                label: "Step-3.5 prepared expert layer",
+                expected: format!("{FIRST_MOE_LAYER}..{}", FIRST_MOE_LAYER + LAYERS),
+                actual: layer.to_string(),
+            });
+        }
+        let path = layer_path(model_dir.as_ref(), layer);
+        let file = File::open(&path).map_err(|error| cache_io_error("open", &path, error))?;
+        let header = read_header(&file, &path)?;
+        if header.layer != layer {
+            return Err(Error::Format {
+                label: "Step-3.5 prepared expert layer",
+                detail: format!("{} contains layer {}", path.display(), header.layer),
+            });
+        }
+        Ok(Self { file, header })
+    }
+}
+
+impl ExpertRecordSource for Step35ExpertRecordSource {
+    type Record = Step35PreparedExpertRecord;
+
+    fn read_record(&self, expert: usize) -> Result<Self::Record> {
+        if expert >= EXPERTS {
+            return Err(Error::Shape {
+                label: "Step-3.5 prepared expert",
+                expected: format!("expert < {EXPERTS}"),
+                actual: expert.to_string(),
+            });
+        }
+        let mut bytes = vec![0u8; EXPERT_RECORD_BYTES];
+        self.file
+            .read_exact_at(
+                &mut bytes,
+                (HEADER_BYTES + expert * EXPERT_RECORD_BYTES) as u64,
+            )
+            .map_err(|error| Error::Format {
+                label: "Step-3.5 prepared expert",
+                detail: format!("failed to read expert {expert}: {error}"),
+            })?;
+        Ok(Step35PreparedExpertRecord {
+            bytes,
+            gate_global_scale: self.header.gate_global_scales[expert],
+            down_input_scale: self.header.down_input_scales[expert],
+            down_alpha: self.header.down_alphas[expert],
+        })
+    }
 }
 
 /// Device allocations holding every prepared routed expert plus fixed-weight headroom.

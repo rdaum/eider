@@ -30,7 +30,7 @@ pub use cublaslt::{
 };
 pub use cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
-    HostRead, synchronize_device,
+    HostRead, PinnedHostBuffer, device_memory_info, synchronize_device,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
@@ -79,12 +79,13 @@ pub use kernels::non_gemm::{
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_batch_into_on_stream,
     qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_batch_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, qwen36_gdn_prep_into_on_stream,
-    rms_norm_f32_into_on_stream, rms_norm_rope_neox_f32_indexed_into_on_stream,
-    rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
-    rope_imrope_text_batch_f32_into_on_stream, rope_neox_f32_indexed_into_on_stream,
-    rope_neox_f32_into_on_stream, rope_neox_partial_f32_into_on_stream,
-    rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    round_f32_to_bf16_into_on_stream, scale_channel_f32_device_row_scalar_in_place_on_stream,
+    remap_expert_indices_into_on_stream, rms_norm_f32_into_on_stream,
+    rms_norm_rope_neox_f32_indexed_into_on_stream, rope_imrope_f32_indexed_into_on_stream,
+    rope_imrope_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
+    rope_neox_f32_indexed_into_on_stream, rope_neox_f32_into_on_stream,
+    rope_neox_partial_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_into_on_stream,
+    scale_channel_f32_device_row_scalar_in_place_on_stream,
     scale_channel_f32_device_scalar_in_place_on_stream, scaled_add_f32_into_on_stream,
     sigmoid_mul_f32_into_on_stream, sigmoid_scale_scalar_f32_into_on_stream,
     silu_mul_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,

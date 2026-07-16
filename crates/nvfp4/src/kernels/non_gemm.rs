@@ -701,6 +701,48 @@ pub fn moe_topk_f32_into_on_stream(
     }
 }
 
+/// Remaps logical expert indices through a device-resident slot table.
+///
+/// Missing or out-of-range experts produce `u32::MAX` in the corresponding
+/// output position.
+pub fn remap_expert_indices_into_on_stream(
+    expert_indices: &DeviceBuffer<u32>,
+    expert_to_slot: &DeviceBuffer<u32>,
+    mut slot_indices: DeviceOutput<'_, u32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if expert_indices.is_empty()
+        || expert_to_slot.is_empty()
+        || slot_indices.len() != expert_indices.len()
+        || expert_indices.len() > u32::MAX as usize
+        || expert_to_slot.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "expert slot remap",
+            expected: "non-empty equally-sized input/output and non-empty expert table".to_string(),
+            actual: format!(
+                "indices={} slots={} table={}",
+                expert_indices.len(),
+                slot_indices.len(),
+                expert_to_slot.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_remap_expert_indices_on_stream",
+            ffi::infer_remap_expert_indices_on_stream(
+                expert_indices.ptr,
+                expert_to_slot.ptr,
+                slot_indices.buffer_mut().ptr,
+                expert_indices.len() as u32,
+                expert_to_slot.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues independent softmax top-k routing for a row-major batch.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_topk_f32_batch_into_on_stream(
@@ -6109,6 +6151,20 @@ pub fn gated_rms_norm_f32_into_on_stream(
 mod tests {
     use super::*;
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn expert_indices_remap_through_device_slot_table() {
+        let indices = DeviceBuffer::from_host(&[3u32, 0, 4, 9]).expect("indices");
+        let map = DeviceBuffer::from_host(&[7u32, u32::MAX, 2, 5, 1]).expect("map");
+        let mut slots = DeviceBuffer::zeroed(4).expect("slots");
+        let stream = CudaStream::new_blocking().expect("stream");
+        remap_expert_indices_into_on_stream(&indices, &map, slots.output(), &stream)
+            .expect("remap");
+        assert_eq!(
+            slots.copy_to_host(&stream).expect("readback"),
+            [5, 7, 1, u32::MAX]
+        );
+    }
 
     #[test]
     fn gpu_token_sampler_keeps_logits_on_device_and_applies_penalties() {

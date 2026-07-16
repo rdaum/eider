@@ -1,12 +1,15 @@
 use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
-use nvfp4::{Error, ModelOptCheckpoint, Result, Sm12xFp4GemmWeight};
+use nvfp4::{
+    Error, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
+    Sm12xFp4GemmWeight,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
-const CACHE_DIR: &str = ".eider-cache/sm12x-down-v1";
-const CACHE_MARKER_VERSION: &str = "eider-sm12x-down-v1";
+const CACHE_DIR: &str = ".eider-cache/qwen36-experts-v1";
+const CACHE_MARKER_VERSION: &str = "eider-qwen36-experts-v1";
 
 pub(crate) fn ensure_model_cache(
     checkpoint: &ModelOptCheckpoint,
@@ -106,8 +109,13 @@ fn build_layer_cache(
     let missing = (0..experts)
         .filter(|&expert| {
             rebuild_all
+                || !MarlinNvfp4HostWeight::cache_file_matches(
+                    gate_up_path(&layer_dir, expert),
+                    intermediate * 2,
+                    manifest.hidden,
+                )
                 || !Sm12xFp4GemmWeight::cache_file_matches(
-                    expert_path(&layer_dir, expert),
+                    down_path(&layer_dir, expert),
                     manifest.hidden,
                     intermediate,
                 )
@@ -156,10 +164,38 @@ fn build_expert_cache(
     layer: usize,
     expert: usize,
 ) -> Result<()> {
+    let (_, intermediate) = moe_shape(manifest)?;
+    let gate_prefix = format!(
+        "{}.layers.{layer}.mlp.experts.{expert}.gate_proj",
+        manifest.tensor_prefix
+    );
+    let up_prefix = format!(
+        "{}.layers.{layer}.mlp.experts.{expert}.up_proj",
+        manifest.tensor_prefix
+    );
+    let gate_path = gate_up_path(layer_dir, expert);
+    if !MarlinNvfp4HostWeight::cache_file_matches(&gate_path, intermediate * 2, manifest.hidden) {
+        let gate = checkpoint.load_nvfp4_linear(&gate_prefix)?;
+        let up = checkpoint.load_nvfp4_linear(&up_prefix)?;
+        let gate_up = ModelOptNvfp4Linear::concat_out_features(
+            format!(
+                "{}.layers.{layer}.mlp.experts.{expert}.gate_up_proj",
+                manifest.tensor_prefix
+            ),
+            &gate,
+            &up,
+        )?;
+        MarlinNvfp4HostWeight::from_modelopt(&gate_up)?.write_cache_file(&gate_path)?;
+    }
+
     let prefix = format!(
         "{}.layers.{layer}.mlp.experts.{expert}.down_proj",
         manifest.tensor_prefix
     );
+    let down_path = down_path(layer_dir, expert);
+    if Sm12xFp4GemmWeight::cache_file_matches(&down_path, manifest.hidden, intermediate) {
+        return Ok(());
+    }
     let down = checkpoint.load_nvfp4_linear(&prefix)?;
     let row_major = down.dequantize_to_f32_col_major();
     let quantized = Sm12xFp4GemmWeight::quantize_f32_row_major_m16_k16(
@@ -167,9 +203,7 @@ fn build_expert_cache(
         down.in_features,
         &row_major,
     )?;
-    quantized
-        .weight
-        .write_cache_file(expert_path(layer_dir, expert))
+    quantized.weight.write_cache_file(down_path)
 }
 
 fn layer_cache_complete(
@@ -191,8 +225,12 @@ fn layer_cache_complete(
         return false;
     };
     (0..experts).all(|expert| {
-        Sm12xFp4GemmWeight::cache_file_matches(
-            expert_path(&layer_dir, expert),
+        MarlinNvfp4HostWeight::cache_file_matches(
+            gate_up_path(&layer_dir, expert),
+            intermediate * 2,
+            manifest.hidden,
+        ) && Sm12xFp4GemmWeight::cache_file_matches(
+            down_path(&layer_dir, expert),
             manifest.hidden,
             intermediate,
         )
@@ -280,8 +318,12 @@ fn layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {
     cache_root(checkpoint).join(format!("layer-{layer:03}"))
 }
 
-fn expert_path(layer_dir: &Path, expert: usize) -> PathBuf {
+pub(crate) fn down_path(layer_dir: &Path, expert: usize) -> PathBuf {
     layer_dir.join(format!("expert-{expert:03}.down.s12x"))
+}
+
+pub(crate) fn gate_up_path(layer_dir: &Path, expert: usize) -> PathBuf {
+    layer_dir.join(format!("expert-{expert:03}.gate-up.marlin"))
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
