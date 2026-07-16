@@ -7,7 +7,9 @@ use infer::qwen3::qwen36::Qwen36TextModel;
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, SchedulerConfig};
+use infer::runtime::scheduler::{
+    Qwen36CancelOutcome, Qwen36PrefixCacheConfig, Qwen36RequestId, SchedulerConfig,
+};
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
 use infer::runtime::step37_scheduler::{Step37CancelOutcome, Step37RequestId};
 use infer::runtime::step37_serving::Step37ChatService;
@@ -29,6 +31,7 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub scheduler: SchedulerConfig,
+    pub qwen_prefix_cache: Qwen36PrefixCacheConfig,
     pub step_expert_capacity: usize,
     pub event_capacity: usize,
 }
@@ -38,6 +41,7 @@ impl InferenceActorConfig {
         Self {
             model_dir: model_dir.into(),
             scheduler: SchedulerConfig::default(),
+            qwen_prefix_cache: Qwen36PrefixCacheConfig::default(),
             step_expert_capacity: 240,
             event_capacity: 256,
         }
@@ -87,6 +91,7 @@ struct ActiveRequest {
 struct SessionMetrics {
     submitted_at: Instant,
     prompt_tokens: usize,
+    cached_prompt_tokens: usize,
     sequence_device_bytes: usize,
     prefilled_tokens: usize,
     last_prefill_report_at: Instant,
@@ -122,6 +127,7 @@ impl InferenceActor {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let model_dir = config.model_dir.clone();
         let scheduler = config.scheduler;
+        let qwen_prefix_cache = config.qwen_prefix_cache;
         let step_expert_capacity = config.step_expert_capacity;
         thread::Builder::new()
             .name("eider-inference".to_string())
@@ -129,6 +135,7 @@ impl InferenceActor {
                 actor_main(
                     model_dir,
                     scheduler,
+                    qwen_prefix_cache,
                     step_expert_capacity,
                     commands_rx,
                     ready_tx,
@@ -189,6 +196,7 @@ impl Drop for ActorInner {
 fn actor_main(
     model_dir: PathBuf,
     scheduler: SchedulerConfig,
+    qwen_prefix_cache: Qwen36PrefixCacheConfig,
     step_expert_capacity: usize,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
@@ -225,7 +233,11 @@ fn actor_main(
 
     match architecture {
         CheckpointArchitecture::Qwen36 => {
-            info!(model_dir = %model_dir.display(), "loading Qwen3.6 model");
+            info!(
+                model_dir = %model_dir.display(),
+                prefix_cache_max_device_bytes = qwen_prefix_cache.max_device_bytes,
+                "loading Qwen3.6 model"
+            );
             let model = match Qwen36TextModel::open(&model_dir) {
                 Ok(model) => model,
                 Err(error) => {
@@ -233,7 +245,12 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Qwen36ChatService::new(&model, &template, scheduler) {
+            let service = match Qwen36ChatService::new_with_prefix_cache(
+                &model,
+                &template,
+                scheduler,
+                qwen_prefix_cache,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -305,6 +322,7 @@ struct EngineAdmission {
 struct EngineAdmissionProgress {
     request_id: u64,
     sequence_device_bytes: usize,
+    cached_prompt_tokens: usize,
 }
 
 struct EnginePrefillProgress {
@@ -389,6 +407,7 @@ impl ActorService for QwenActorService<'_, '_> {
                 .map(|progress| EngineAdmissionProgress {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
+                    cached_prompt_tokens: progress.cached_prompt_tokens,
                 })
                 .collect(),
             prefilled: tick
@@ -488,6 +507,7 @@ impl ActorService for StepActorService<'_> {
                 .map(|progress| EngineAdmissionProgress {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
+                    cached_prompt_tokens: 0,
                 })
                 .collect(),
             prefilled: tick
@@ -609,10 +629,15 @@ fn run_actor_loop(
         for admission in &tick.admitted {
             if let Some(request) = active.get_mut(&admission.request_id) {
                 request.metrics.sequence_device_bytes = admission.sequence_device_bytes;
+                request.metrics.cached_prompt_tokens = admission.cached_prompt_tokens;
+                request.metrics.prefilled_tokens = admission.cached_prompt_tokens;
+                request.metrics.last_prefill_report_tokens = admission.cached_prompt_tokens;
+                request.metrics.last_prefill_report_at = now;
                 infer_metrics().requests_admitted.inc();
                 info!(
                     session = request.external_id.0,
                     state_bytes = admission.sequence_device_bytes,
+                    cached_prompt_tokens = admission.cached_prompt_tokens,
                     active_sequences = tick.active_sequences,
                     "request admitted"
                 );
@@ -620,7 +645,8 @@ fn run_actor_loop(
         }
         for progress in &tick.prefilled {
             if let Some(request) = active.get_mut(&progress.request_id) {
-                let starting = request.metrics.prefilled_tokens == 0;
+                let starting =
+                    request.metrics.prefilled_tokens == request.metrics.cached_prompt_tokens;
                 let prefill_delta = progress
                     .prompt_position
                     .saturating_sub(request.metrics.prefilled_tokens);
@@ -632,6 +658,7 @@ fn run_actor_loop(
                     info!(
                         session = request.external_id.0,
                         prompt_tokens = request.metrics.prompt_tokens,
+                        cached_prompt_tokens = request.metrics.cached_prompt_tokens,
                         state_bytes = request.metrics.sequence_device_bytes,
                         "prefill started"
                     );
@@ -660,6 +687,7 @@ fn run_actor_loop(
                         session = request.external_id.0,
                         ttft_ms = ttft.as_secs_f64() * 1000.0,
                         prompt_tokens = request.metrics.prompt_tokens,
+                        cached_prompt_tokens = request.metrics.cached_prompt_tokens,
                         prefill_tok_s = request.metrics.prefill_tokens_per_second(now),
                         "decoding started"
                     );
@@ -866,6 +894,7 @@ impl SessionMetrics {
         Self {
             submitted_at,
             prompt_tokens,
+            cached_prompt_tokens: 0,
             sequence_device_bytes: 0,
             prefilled_tokens: 0,
             last_prefill_report_at: submitted_at,
@@ -935,12 +964,17 @@ impl SessionMetrics {
         active_sequences: usize,
     ) {
         debug_assert_eq!(self.generated_tokens, finished.usage.completion_tokens);
+        debug_assert_eq!(
+            self.cached_prompt_tokens,
+            finished.usage.cached_prompt_tokens
+        );
         let time_to_first_token = self.first_token_at.map_or(Duration::ZERO, |first| {
             first.duration_since(self.submitted_at)
         });
         info!(
             session = id.0,
             prompt_tokens = finished.usage.prompt_tokens,
+            cached_prompt_tokens = finished.usage.cached_prompt_tokens,
             output_tokens = finished.usage.completion_tokens,
             ttft_ms = time_to_first_token.as_secs_f64() * 1000.0,
             decode_tok_s = self.decode_tokens_per_second(),
@@ -999,7 +1033,11 @@ impl SessionMetrics {
     }
 
     fn prefill_tokens_per_second(&self, now: Instant) -> f64 {
-        rate(self.prefilled_tokens, now.duration_since(self.submitted_at))
+        rate(
+            self.prefilled_tokens
+                .saturating_sub(self.cached_prompt_tokens),
+            now.duration_since(self.submitted_at),
+        )
     }
 
     fn decode_tokens_per_second(&self) -> f64 {
@@ -1082,6 +1120,22 @@ mod tests {
         assert_eq!(second.prompt_position, 500);
         assert_eq!(second.interval_tokens_per_second, 20.0);
         assert_eq!(second.total_tokens_per_second, 25.0);
+    }
+
+    #[test]
+    fn session_metrics_exclude_cached_tokens_from_prefill_rates() {
+        let submitted = Instant::now();
+        let mut metrics = SessionMetrics::new(submitted, 1_000);
+        metrics.cached_prompt_tokens = 256;
+        metrics.prefilled_tokens = 256;
+        metrics.last_prefill_report_tokens = 256;
+
+        let snapshot = metrics
+            .record_prefill(submitted + Duration::from_secs(10), 456)
+            .expect("ten-second report interval elapsed");
+        assert_eq!(snapshot.prompt_position, 456);
+        assert_eq!(snapshot.interval_tokens_per_second, 20.0);
+        assert_eq!(snapshot.total_tokens_per_second, 20.0);
     }
 
     #[test]

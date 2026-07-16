@@ -134,6 +134,62 @@ impl Sm12xKvCache {
             + self.value_tail.device_bytes()
     }
 
+    /// Returns the device bytes this cache shape would allocate at another capacity.
+    pub fn device_bytes_for_capacity(&self, max_tokens: usize) -> Result<usize> {
+        if max_tokens == 0 || max_tokens > u32::MAX as usize {
+            return Err(Error::Shape {
+                label: "SM12x KV cache byte estimate",
+                expected: "token capacity in 1..=u32::MAX".to_string(),
+                actual: max_tokens.to_string(),
+            });
+        }
+        let key_tiles = checked_product(
+            "SM12x K tile count",
+            &[
+                self.kv_heads,
+                max_tokens.div_ceil(K_TOKEN_TILE),
+                self.head_dim / MMA_K,
+            ],
+        )?;
+        let value_tiles = checked_product(
+            "SM12x V tile count",
+            &[
+                self.kv_heads,
+                self.head_dim / MMA_N,
+                max_tokens.div_ceil(MMA_K),
+            ],
+        )?;
+        let tail_values = checked_product(
+            "SM12x KV tail",
+            &[V_TOKEN_BLOCK, self.kv_heads, self.head_dim],
+        )?;
+        [
+            checked_product("SM12x K values", &[key_tiles, COMPACT_TILE_BYTES])?,
+            checked_product(
+                "SM12x K scales",
+                &[key_tiles, K_TOKEN_TILE, SCALE_BYTES_PER_TILE],
+            )?,
+            checked_product("SM12x V values", &[value_tiles, COMPACT_TILE_BYTES])?,
+            checked_product(
+                "SM12x V scales",
+                &[value_tiles, MMA_N, SCALE_BYTES_PER_TILE],
+            )?,
+            checked_product("SM12x K tail bytes", &[tail_values, size_of::<f32>()])?,
+            checked_product("SM12x V tail bytes", &[tail_values, size_of::<f32>()])?,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| {
+            total.checked_add(bytes).ok_or_else(|| Error::Shape {
+                label: "SM12x KV cache byte estimate",
+                expected: "allocation byte total without overflow".to_string(),
+                actual: format!(
+                    "max_tokens={max_tokens} kv_heads={} head_dim={}",
+                    self.kv_heads, self.head_dim
+                ),
+            })
+        })
+    }
+
     /// Returns the number of K tokens finalized into compact 8-token tiles.
     pub fn compact_key_tokens(&self) -> usize {
         self.len / K_TOKEN_TILE * K_TOKEN_TILE
@@ -422,6 +478,62 @@ impl Sm12xKvCache {
                 ),
             )
         }
+    }
+
+    /// Copies a complete 128-token-aligned prefix from another compact cache.
+    ///
+    /// The source and destination may have different token capacities. Only
+    /// finalized compact tiles are copied; a 128-token boundary has no live K
+    /// or V tail rows.
+    pub fn copy_aligned_prefix_from_on_stream(
+        &mut self,
+        source: &Self,
+        prefix_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if self.len != 0
+            || source.kv_heads != self.kv_heads
+            || source.head_dim != self.head_dim
+            || prefix_tokens == 0
+            || !prefix_tokens.is_multiple_of(128)
+            || prefix_tokens > source.len
+            || prefix_tokens > self.max_tokens
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV aligned prefix copy",
+                expected: format!(
+                    "empty destination, matching {}/{} shape, and a nonzero 128-token prefix <= source len {} and destination capacity {}",
+                    self.kv_heads, self.head_dim, source.len, self.max_tokens
+                ),
+                actual: format!(
+                    "destination_len={} source_shape={}/{} prefix_tokens={prefix_tokens}",
+                    self.len, source.kv_heads, source.head_dim
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_copy_aligned_prefix_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_copy_aligned_prefix_on_stream(
+                    source.key_values.as_const_ptr().cast(),
+                    source.key_scales.as_const_ptr().cast(),
+                    source.value_values.as_const_ptr().cast(),
+                    source.value_scales.as_const_ptr().cast(),
+                    self.key_values.as_mut_ptr().cast(),
+                    self.key_scales.as_mut_ptr().cast(),
+                    self.value_values.as_mut_ptr().cast(),
+                    self.value_scales.as_mut_ptr().cast(),
+                    prefix_tokens as u32,
+                    source.max_tokens as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.len = prefix_tokens;
+        Ok(())
     }
 
     /// Shortens the logical cache without moving device memory.
@@ -1008,6 +1120,69 @@ mod tests {
             crate::format::ue4m3_code(max_abs / 6.0)
         };
         (code, crate::format::e4m3_value(code))
+    }
+
+    #[test]
+    fn aligned_prefix_copy_preserves_attention_across_capacities() {
+        const TOKENS: usize = 128;
+        const SOURCE_CAPACITY: usize = 192;
+        const DESTINATION_CAPACITY: usize = 320;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = 8;
+        let width = KV_HEADS * HEAD_DIM;
+        let key = (0..TOKENS * width)
+            .map(|index| ((index * 17 + 11) % 251) as f32 / 64.0 - 1.5)
+            .collect::<Vec<_>>();
+        let value = (0..TOKENS * width)
+            .map(|index| ((index * 29 + 7) % 257) as f32 / 80.0 - 1.25)
+            .collect::<Vec<_>>();
+        let query = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 13 + 5) % 127) as f32 / 48.0 - 1.0)
+            .collect::<Vec<_>>();
+        let key = DeviceBuffer::from_host(&key).expect("key");
+        let value = DeviceBuffer::from_host(&value).expect("value");
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut source = Sm12xKvCache::new(SOURCE_CAPACITY, KV_HEADS, HEAD_DIM).expect("source");
+        source
+            .append_rows_at_offset_on_stream(&key, &value, 0, TOKENS, &stream)
+            .expect("append source");
+        let mut destination =
+            Sm12xKvCache::new(DESTINATION_CAPACITY, KV_HEADS, HEAD_DIM).expect("destination");
+        assert_eq!(
+            source
+                .device_bytes_for_capacity(DESTINATION_CAPACITY)
+                .expect("destination byte estimate"),
+            destination.device_bytes()
+        );
+        destination
+            .copy_aligned_prefix_from_on_stream(&source, TOKENS, &stream)
+            .expect("copy prefix");
+
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(DESTINATION_CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("attention workspace");
+        let mut source_output = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("source output");
+        workspace
+            .attention_into_on_stream(&source, &query, source_output.output(), &stream)
+            .expect("source attention");
+        let mut destination_output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("destination output");
+        workspace
+            .attention_into_on_stream(&destination, &query, destination_output.output(), &stream)
+            .expect("destination attention");
+
+        assert_eq!(destination.len(), TOKENS);
+        assert_eq!(
+            source_output
+                .copy_to_host(&stream)
+                .expect("source output read"),
+            destination_output
+                .copy_to_host(&stream)
+                .expect("destination output read")
+        );
     }
 
     #[test]

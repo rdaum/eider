@@ -687,6 +687,7 @@ dependencies = [
  "minijinja-contrib",
  "nvfp4",
  "rand",
+ "rart",
  "rayon",
  "serde",
  "serde_json",
@@ -914,6 +915,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-traits"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "nvfp4"
 version = "0.1.0"
 dependencies = [
@@ -1112,6 +1122,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rart"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19087bab094578a3e932bf449dfd52336c3cad7cc6462db77172e31cc01ba0c9"
+dependencies = [
+ "num-traits",
+ "simdeez",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1287,6 +1307,16 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simdeez"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e08cb8b1603106d47fbd32f34f5e4f332bb07c02c7b2c6ebad893e6f6ba53f9e"
+dependencies = [
+ "cfg-if",
+ "paste",
 ]
 
 [[package]]

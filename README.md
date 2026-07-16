@@ -39,6 +39,12 @@ weights to NVFP4. In a local API comparison using the same 200-token request
 for each runtime, Eider reached 44.9 decode tokens/sec and vLLM reached 37.2
 tokens/sec.
 
+Qwen-family sessions automatically reuse the longest cached prompt prefix,
+including both full-attention KV and recurrent linear-attention state. In a
+local Agents-A1 check, a repeated 3,209-token request restored 3,200 tokens and
+reduced TTFT from 35.9 seconds to 1.1 seconds. Cached checkpoints can seed
+multiple concurrent requests without sharing their mutable sequence state.
+
 The 198B Step-3.7-Flash checkpoint uses the same API with disk-backed expert
 paging. With 240 of 288 experts resident per routed layer, the current warm
 path reaches about 12.6 decode tokens/sec for one session and 11.2 tokens/sec
@@ -90,7 +96,7 @@ The workspace has three crates:
   thread while async handlers submit, stream, and cancel requests over bounded
   channels. It also exposes Prometheus and optional DogStatsD metrics for HTTP
   requests, scheduler activity, token usage, throughput, and SM12x cache
-  preparation.
+preparation.
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust
 crate by its build script. CUTLASS is optional; when it is unavailable, the
@@ -160,7 +166,12 @@ The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 additionally push metrics over UDP. The `eider-serve` binary also takes
 `--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
 `--max-active-sequences`, and `--max-context-tokens` flags that map directly to
-the scheduler admission limits.
+the scheduler admission limits. Qwen-family serving retains up to 2 GiB of
+device-resident prompt checkpoints by default; pass `--qwen-prefix-cache-gib 0`
+to disable it or another whole-GiB value to change the budget. Responses report
+reused input tokens as `usage.input_tokens_details.cached_tokens`, and the
+checkpoint cache exports hit, miss, eviction, retained-byte, and copy-latency
+metrics alongside the other scheduler telemetry.
 
 Run Pi against the matching server with:
 

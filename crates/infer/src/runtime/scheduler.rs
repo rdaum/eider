@@ -1,12 +1,19 @@
 //! Tokenized Qwen3.6 scheduling over chunked prefill and batched decode.
 
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use crate::metrics::PrefixCacheMetricHandle;
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36NextToken, Qwen36PrefillBatchWorkspace,
-    Qwen36PrefillRow, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36PrefillRow, Qwen36SequenceCheckpoint, Qwen36SequenceState, Qwen36TextModel,
 };
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use rart::{AdaptiveRadixTree, VectorKey};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::Instant;
+use tracing::warn;
+
+const PREFIX_CACHE_BLOCK_TOKENS: usize = 128;
+const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Stable scheduler identity for one request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -89,6 +96,21 @@ impl SchedulerConfig {
     }
 }
 
+/// Device-memory bound for reusable Qwen hybrid prompt checkpoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen36PrefixCacheConfig {
+    /// Maximum device bytes retained by cached checkpoints. Zero disables the cache.
+    pub max_device_bytes: usize,
+}
+
+impl Default for Qwen36PrefixCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_device_bytes: DEFAULT_PREFIX_CACHE_BYTES,
+        }
+    }
+}
+
 /// Token-level generation policy for a scheduled request.
 #[derive(Clone, Debug)]
 pub struct RequestConfig {
@@ -157,6 +179,8 @@ pub struct Qwen36AdmissionProgress {
     pub request_id: Qwen36RequestId,
     /// Exact bytes owned by the newly allocated sequence state.
     pub sequence_device_bytes: usize,
+    /// Prompt tokens restored from a reusable hybrid-state checkpoint.
+    pub cached_prompt_tokens: usize,
 }
 
 /// Observable result of one scheduler tick.
@@ -221,6 +245,9 @@ struct Qwen36Request {
     config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
+    prefix_cache_key: Option<VectorKey>,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
     sequence: Option<Box<Qwen36SequenceState>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
@@ -285,6 +312,161 @@ impl Qwen36Request {
     }
 }
 
+struct Qwen36PrefixCacheEntry {
+    key: VectorKey,
+    checkpoint: Qwen36SequenceCheckpoint,
+    last_used: u64,
+    device_bytes: usize,
+}
+
+struct Qwen36PrefixCache {
+    index: AdaptiveRadixTree<VectorKey, u64>,
+    entries: BTreeMap<u64, Qwen36PrefixCacheEntry>,
+    blocks: HashMap<Box<[u32]>, u32>,
+    next_block_id: u32,
+    next_entry_id: u64,
+    clock: u64,
+    max_device_bytes: usize,
+    device_bytes: usize,
+    metric_handle: PrefixCacheMetricHandle,
+}
+
+impl Qwen36PrefixCache {
+    fn new(max_device_bytes: usize) -> Self {
+        Self {
+            index: AdaptiveRadixTree::new(),
+            entries: BTreeMap::new(),
+            blocks: HashMap::new(),
+            next_block_id: 0,
+            next_entry_id: 0,
+            clock: 0,
+            max_device_bytes,
+            device_bytes: 0,
+            metric_handle: PrefixCacheMetricHandle::new(),
+        }
+    }
+
+    fn prompt_key(&mut self, prompt_tokens: &[u32], prefix_tokens: usize) -> Result<VectorKey> {
+        if prefix_tokens == 0
+            || !prefix_tokens.is_multiple_of(PREFIX_CACHE_BLOCK_TOKENS)
+            || prefix_tokens > prompt_tokens.len()
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.6 prefix-cache key",
+                expected: format!(
+                    "nonzero {PREFIX_CACHE_BLOCK_TOKENS}-token-aligned prefix within prompt"
+                ),
+                actual: format!(
+                    "prefix_tokens={prefix_tokens} prompt_tokens={}",
+                    prompt_tokens.len()
+                ),
+            });
+        }
+        let block_count = prefix_tokens / PREFIX_CACHE_BLOCK_TOKENS;
+        let mut encoded = Vec::with_capacity(block_count * size_of::<u32>());
+        for block in prompt_tokens[..prefix_tokens].chunks_exact(PREFIX_CACHE_BLOCK_TOKENS) {
+            let block_id = if let Some(&block_id) = self.blocks.get(block) {
+                block_id
+            } else {
+                let block_id = self.next_block_id;
+                self.next_block_id =
+                    self.next_block_id
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Format {
+                            label: "Qwen3.6 prefix-cache block ID",
+                            detail: "block ID space exhausted".to_string(),
+                        })?;
+                self.blocks.insert(Box::from(block), block_id);
+                block_id
+            };
+            encoded.extend_from_slice(&block_id.to_be_bytes());
+        }
+        Ok(VectorKey::new_from_vec(encoded))
+    }
+
+    fn restore(
+        &mut self,
+        model: &Qwen36TextModel,
+        key: &VectorKey,
+        max_tokens: usize,
+    ) -> Result<Option<Qwen36SequenceState>> {
+        let started = Instant::now();
+        let mut entry_id = None;
+        self.index
+            .with_longest_prefix_match_view_k(key, |_matched, &id| entry_id = Some(id));
+        let Some(entry_id) = entry_id else {
+            self.metric_handle.record_miss();
+            return Ok(None);
+        };
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self
+            .entries
+            .get_mut(&entry_id)
+            .expect("prefix-cache ART entry has retained checkpoint metadata");
+        entry.last_used = self.clock;
+        let cached_tokens = entry.checkpoint.position();
+        let sequence = model.restore_sequence_checkpoint(&entry.checkpoint, max_tokens)?;
+        self.metric_handle
+            .record_hit(cached_tokens, started.elapsed());
+        Ok(Some(sequence))
+    }
+
+    fn contains(&self, key: &VectorKey) -> bool {
+        self.index.get_k(key).is_some()
+    }
+
+    fn prepare_insert(&mut self, device_bytes: usize) -> bool {
+        if self.max_device_bytes == 0 || device_bytes > self.max_device_bytes {
+            return false;
+        }
+        while self.device_bytes.saturating_add(device_bytes) > self.max_device_bytes {
+            let Some((&evicted_id, evicted)) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| (entry.last_used, entry.device_bytes))
+            else {
+                break;
+            };
+            let evicted_key = evicted.key.clone();
+            let evicted_bytes = evicted.device_bytes;
+            self.index.remove_k(&evicted_key);
+            self.entries.remove(&evicted_id);
+            self.device_bytes = self.device_bytes.saturating_sub(evicted_bytes);
+            self.metric_handle.record_eviction(evicted_bytes);
+        }
+        true
+    }
+
+    fn insert(&mut self, key: VectorKey, checkpoint: Qwen36SequenceCheckpoint) -> Result<()> {
+        let device_bytes = checkpoint.device_bytes();
+        if !self.prepare_insert(device_bytes) || self.contains(&key) {
+            return Ok(());
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let entry_id = self.next_entry_id;
+        self.next_entry_id = self
+            .next_entry_id
+            .checked_add(1)
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.6 prefix-cache entry ID",
+                detail: "entry ID space exhausted".to_string(),
+            })?;
+        self.index.insert_k(&key, entry_id);
+        self.device_bytes += device_bytes;
+        self.metric_handle.record_insert(device_bytes);
+        self.entries.insert(
+            entry_id,
+            Qwen36PrefixCacheEntry {
+                key,
+                checkpoint,
+                last_used: self.clock,
+                device_bytes,
+            },
+        );
+        Ok(())
+    }
+}
+
 /// Decode-first continuous scheduler with deferred GPU admission.
 pub struct Qwen36Scheduler<'model> {
     model: &'model Qwen36TextModel,
@@ -295,12 +477,22 @@ pub struct Qwen36Scheduler<'model> {
     waiting: VecDeque<Qwen36RequestId>,
     prefilling: VecDeque<Qwen36RequestId>,
     decoding: VecDeque<Qwen36RequestId>,
+    prefix_cache: Option<Qwen36PrefixCache>,
     next_id: u64,
 }
 
 impl<'model> Qwen36Scheduler<'model> {
     /// Creates a scheduler with explicit execution and admission limits.
     pub fn new(model: &'model Qwen36TextModel, config: SchedulerConfig) -> Result<Self> {
+        Self::new_with_prefix_cache(model, config, Qwen36PrefixCacheConfig::default())
+    }
+
+    /// Creates a scheduler with explicit execution, admission, and prefix-cache limits.
+    pub fn new_with_prefix_cache(
+        model: &'model Qwen36TextModel,
+        config: SchedulerConfig,
+        prefix_cache: Qwen36PrefixCacheConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let decode_workspaces = decode_capacity_classes(config.decode_capacity)
             .into_iter()
@@ -319,6 +511,8 @@ impl<'model> Qwen36Scheduler<'model> {
             waiting: VecDeque::new(),
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
+            prefix_cache: (prefix_cache.max_device_bytes != 0)
+                .then(|| Qwen36PrefixCache::new(prefix_cache.max_device_bytes)),
             next_id: 0,
         })
     }
@@ -374,6 +568,15 @@ impl<'model> Qwen36Scheduler<'model> {
         let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
+        let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt_tokens.len());
+        let prefix_cache_key = if prefix_cache_target == 0 {
+            None
+        } else {
+            self.prefix_cache
+                .as_mut()
+                .map(|cache| cache.prompt_key(&prompt_tokens, prefix_cache_target))
+                .transpose()?
+        };
         self.requests.insert(
             id,
             Box::new(Qwen36Request {
@@ -382,6 +585,9 @@ impl<'model> Qwen36Scheduler<'model> {
                 config,
                 prompt_tokens,
                 prompt_position: 0,
+                prefix_cache_key,
+                prefix_cache_target,
+                prefix_cache_checkpointed: false,
                 sequence: None,
                 device_token_counts: None,
                 sequence_device_bytes: 0,
@@ -417,13 +623,26 @@ impl<'model> Qwen36Scheduler<'model> {
                 .requests
                 .get_mut(&id)
                 .expect("waiting request is retained");
-            let sequence = match self.model.new_sequence_state(request.max_tokens().max(1)) {
+            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
+                (Some(cache), Some(key)) => {
+                    cache.restore(self.model, key, request.max_tokens().max(1))?
+                }
+                _ => None,
+            };
+            let cached_prompt_tokens = restored.as_ref().map_or(0, Qwen36SequenceState::position);
+            let sequence = match restored
+                .map(Ok)
+                .unwrap_or_else(|| self.model.new_sequence_state(request.max_tokens().max(1)))
+            {
                 Ok(sequence) => sequence,
                 Err(error) => {
                     self.waiting.push_front(id);
                     return Err(error);
                 }
             };
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_cache_checkpointed =
+                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             let device_token_counts = if request.config.sampling.supports_gpu_sampling()
                 && request.config.sampling.uses_history_penalties()
             {
@@ -444,6 +663,7 @@ impl<'model> Qwen36Scheduler<'model> {
             tick.admitted.push(Qwen36AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
+                cached_prompt_tokens,
             });
         }
         Ok(())
@@ -605,6 +825,57 @@ impl<'model> Qwen36Scheduler<'model> {
         Ok(samples)
     }
 
+    fn retain_request_checkpoint(&mut self, request: &mut Qwen36Request) {
+        if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
+            return;
+        }
+        let (Some(cache), Some(key), Some(sequence)) = (
+            self.prefix_cache.as_mut(),
+            request.prefix_cache_key.as_ref(),
+            request.sequence.as_deref(),
+        ) else {
+            return;
+        };
+        if sequence.position() != request.prefix_cache_target {
+            return;
+        }
+        if !cache.contains(key) {
+            let estimated_bytes = match sequence.checkpoint_device_bytes() {
+                Ok(device_bytes) => device_bytes,
+                Err(error) => {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to size prompt prefix checkpoint"
+                    );
+                    request.prefix_cache_checkpointed = true;
+                    return;
+                }
+            };
+            if cache.prepare_insert(estimated_bytes) {
+                let started = Instant::now();
+                match self.model.checkpoint_sequence(sequence) {
+                    Ok(checkpoint) => {
+                        cache.metric_handle.record_checkpoint(started.elapsed());
+                        if let Err(error) = cache.insert(key.clone(), checkpoint) {
+                            warn!(
+                                request = request.id.get(),
+                                %error,
+                                "failed to retain prompt prefix checkpoint"
+                            );
+                        }
+                    }
+                    Err(error) => warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to copy prompt prefix checkpoint"
+                    ),
+                }
+            }
+        }
+        request.prefix_cache_checkpointed = true;
+    }
+
     fn run_prefill_phase(&mut self, tick: &mut Qwen36SchedulerTick) -> Result<()> {
         let eligible = self
             .prefilling
@@ -634,7 +905,14 @@ impl<'model> Qwen36Scheduler<'model> {
                 continue;
             }
             let fair_share = token_budget.div_ceil(slots_remaining);
-            let chunk = available.min(fair_share);
+            let mut chunk = available.min(fair_share);
+            let request = &self.requests[&id];
+            if !request.prefix_cache_checkpointed
+                && request.prompt_position < request.prefix_cache_target
+                && request.prompt_position + chunk > request.prefix_cache_target
+            {
+                chunk = request.prefix_cache_target - request.prompt_position;
+            }
             token_budget -= chunk;
             slots_remaining -= 1;
             chunk_lengths.push(chunk);
@@ -676,6 +954,7 @@ impl<'model> Qwen36Scheduler<'model> {
         }
         for (mut request, chunk) in selected.into_iter().zip(chunk_lengths) {
             request.prompt_position += chunk;
+            self.retain_request_checkpoint(&mut request);
             tick.prefilled.push(Qwen36PrefillProgress {
                 request_id: request.id,
                 tokens: chunk,
@@ -800,6 +1079,10 @@ fn decode_capacity_classes(max_capacity: usize) -> Vec<usize> {
     classes
 }
 
+fn cacheable_prompt_prefix_tokens(prompt_tokens: usize) -> usize {
+    prompt_tokens.saturating_sub(1) / PREFIX_CACHE_BLOCK_TOKENS * PREFIX_CACHE_BLOCK_TOKENS
+}
+
 fn sampled_top1(token: Qwen36NextToken) -> SampledToken {
     SampledToken {
         id: token.id,
@@ -833,8 +1116,9 @@ fn argmax_logits(logits: &[f32]) -> Result<SampledToken> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
-        SchedulerConfig, argmax_logits, decode_capacity_classes,
+        PREFIX_CACHE_BLOCK_TOKENS, Qwen36CancelOutcome, Qwen36PrefixCache, Qwen36Scheduler,
+        RequestConfig, RequestFinishReason, RequestState, SchedulerConfig, argmax_logits,
+        cacheable_prompt_prefix_tokens, decode_capacity_classes,
     };
     use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
     use crate::runtime::sampling::SamplingConfig;
@@ -874,6 +1158,50 @@ mod tests {
                 assert!(selected < active_rows.saturating_mul(2));
             }
         }
+    }
+
+    #[test]
+    fn prefix_cache_keys_preserve_shared_token_block_prefixes() {
+        let mut cache = Qwen36PrefixCache::new(1024);
+        let first_block = (0..PREFIX_CACHE_BLOCK_TOKENS as u32).collect::<Vec<_>>();
+        let second_block = (1000..1000 + PREFIX_CACHE_BLOCK_TOKENS as u32).collect::<Vec<_>>();
+        let third_block = (2000..2000 + PREFIX_CACHE_BLOCK_TOKENS as u32).collect::<Vec<_>>();
+        let different_second = (3000..3000 + PREFIX_CACHE_BLOCK_TOKENS as u32).collect::<Vec<_>>();
+        let two_blocks = [&first_block[..], &second_block[..]].concat();
+        let three_blocks = [&two_blocks[..], &third_block[..]].concat();
+        let divergent = [&first_block[..], &different_second[..]].concat();
+
+        let two_key = cache
+            .prompt_key(&two_blocks, two_blocks.len())
+            .expect("two-block key");
+        let repeated_key = cache
+            .prompt_key(&two_blocks, two_blocks.len())
+            .expect("repeated key");
+        let three_key = cache
+            .prompt_key(&three_blocks, three_blocks.len())
+            .expect("three-block key");
+        let divergent_key = cache
+            .prompt_key(&divergent, divergent.len())
+            .expect("divergent key");
+
+        assert!(two_key == repeated_key);
+        assert_eq!(
+            two_key.as_ref(),
+            &three_key.as_ref()[..two_key.as_ref().len()]
+        );
+        assert_ne!(
+            two_key.as_ref(),
+            &divergent_key.as_ref()[..two_key.as_ref().len()]
+        );
+    }
+
+    #[test]
+    fn cacheable_prefix_leaves_the_final_prompt_token_for_decode() {
+        assert_eq!(cacheable_prompt_prefix_tokens(1), 0);
+        assert_eq!(cacheable_prompt_prefix_tokens(128), 0);
+        assert_eq!(cacheable_prompt_prefix_tokens(129), 128);
+        assert_eq!(cacheable_prompt_prefix_tokens(256), 128);
+        assert_eq!(cacheable_prompt_prefix_tokens(257), 256);
     }
 
     #[test]
@@ -991,5 +1319,86 @@ mod tests {
             Qwen36CancelOutcome::Cancelled(_)
         ));
         assert_eq!(scheduler.request_state(cancelled_decode), None);
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.6 checkpoint"]
+    fn real_model_prefix_checkpoint_restores_into_concurrent_requests() {
+        let model_dir = std::env::var_os("QWEN36_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/qwen3.6-35b-a3-nvfp4")
+            });
+        let model = Qwen36TextModel::open(model_dir).expect("load Qwen3.6 model");
+        let mut scheduler = Qwen36Scheduler::new(
+            &model,
+            SchedulerConfig {
+                decode_capacity: 2,
+                prefill_sequence_capacity: 2,
+                prefill_token_capacity: 128,
+                max_active_sequences: 2,
+                max_context_tokens: 257,
+            },
+        )
+        .expect("scheduler");
+        let config = RequestConfig {
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..SamplingConfig::default()
+            },
+            max_new_tokens: 1,
+            ..RequestConfig::default()
+        };
+        let prompt = vec![9707; 256];
+
+        let first = scheduler
+            .add_request(prompt.clone(), config.clone())
+            .expect("first request");
+        while scheduler.request_state(first) != Some(RequestState::Finished) {
+            scheduler.tick().expect("run first request");
+        }
+        let first_token = scheduler
+            .remove_finished(first)
+            .expect("first result")
+            .generated_tokens[0]
+            .id;
+
+        let second = scheduler
+            .add_request(prompt.clone(), config.clone())
+            .expect("second request");
+        let third = scheduler
+            .add_request(prompt, config)
+            .expect("third request");
+        let tick = scheduler.tick().expect("restore concurrent requests");
+        assert_eq!(tick.admitted.len(), 2);
+        assert!(
+            tick.admitted
+                .iter()
+                .all(|admission| admission.cached_prompt_tokens == 128)
+        );
+        while scheduler.request_state(second) != Some(RequestState::Finished)
+            || scheduler.request_state(third) != Some(RequestState::Finished)
+        {
+            scheduler.tick().expect("finish concurrent requests");
+        }
+        assert_eq!(
+            scheduler.request_state(second),
+            Some(RequestState::Finished)
+        );
+        assert_eq!(scheduler.request_state(third), Some(RequestState::Finished));
+        let second_token = scheduler
+            .remove_finished(second)
+            .expect("second result")
+            .generated_tokens[0]
+            .id;
+        let third_token = scheduler
+            .remove_finished(third)
+            .expect("third result")
+            .generated_tokens[0]
+            .id;
+        assert_eq!(second_token, first_token);
+        assert_eq!(third_token, first_token);
     }
 }

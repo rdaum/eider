@@ -635,7 +635,7 @@ impl ResponseStream {
                 (
                     json!({
                         "input_tokens": usage.prompt_tokens,
-                        "input_tokens_details": {"cached_tokens": 0},
+                        "input_tokens_details": {"cached_tokens": usage.cached_prompt_tokens},
                         "output_tokens": usage.completion_tokens,
                         "output_tokens_details": {"reasoning_tokens": 0},
                         "total_tokens": usage.total_tokens()
@@ -809,11 +809,16 @@ mod tests {
             finish_reason: ChatFinishReason::ToolCalls,
             usage: ChatUsage {
                 prompt_tokens: 8,
+                cached_prompt_tokens: 4,
                 completion_tokens: 4,
             },
         };
         let done = stream.push(InferenceEvent::Finished(finished));
         assert_eq!(done.last().unwrap()["type"], "response.completed");
+        assert_eq!(
+            done.last().unwrap()["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            4
+        );
         assert_eq!(
             done.last().unwrap()["response"]["output"]
                 .as_array()

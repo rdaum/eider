@@ -24,6 +24,7 @@ pub(crate) type cudaStreamCaptureMode = i32;
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: cudaMemcpyKind = 2;
+pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: cudaMemcpyKind = 3;
 pub(crate) const CUDA_HOST_ALLOC_DEFAULT: u32 = 0;
 pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
@@ -312,6 +313,22 @@ unsafe extern "C" {
         value_tail: *mut f32,
         position: *const u32,
         max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_cache_copy_aligned_prefix_on_stream(
+        source_key_values: *const u8,
+        source_key_scales: *const u8,
+        source_value_values: *const u8,
+        source_value_scales: *const u8,
+        destination_key_values: *mut u8,
+        destination_key_scales: *mut u8,
+        destination_value_values: *mut u8,
+        destination_value_scales: *mut u8,
+        prefix_tokens: u32,
+        source_max_tokens: u32,
+        destination_max_tokens: u32,
         kv_heads: u32,
         head_dim: u32,
         stream: cudaStream_t,

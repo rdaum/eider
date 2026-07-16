@@ -3,8 +3,9 @@
 use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
-    Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState, SchedulerConfig,
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36PrefixCacheConfig,
+    Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
+    SchedulerConfig,
 };
 use super::stop::StopBuffer;
 use crate::qwen3::qwen36::Qwen36TextModel;
@@ -77,6 +78,8 @@ pub enum ChatFinishReason {
 pub struct ChatUsage {
     /// Tokens in the rendered and tokenized prompt.
     pub prompt_tokens: usize,
+    /// Prompt tokens restored from reusable model state.
+    pub cached_prompt_tokens: usize,
     /// Model-selected completion tokens, including a selected EOS token.
     pub completion_tokens: usize,
 }
@@ -140,9 +143,24 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
+        Self::new_with_prefix_cache(
+            model,
+            template,
+            scheduler,
+            Qwen36PrefixCacheConfig::default(),
+        )
+    }
+
+    /// Creates a serving bridge with explicit scheduler and prefix-cache limits.
+    pub fn new_with_prefix_cache(
+        model: &'model Qwen36TextModel,
+        template: &'template CheckpointChatTemplate,
+        scheduler: SchedulerConfig,
+        prefix_cache: Qwen36PrefixCacheConfig,
+    ) -> Result<Self> {
         Ok(Self {
             template,
-            scheduler: Qwen36Scheduler::new(model, scheduler)?,
+            scheduler: Qwen36Scheduler::new_with_prefix_cache(model, scheduler, prefix_cache)?,
             requests: BTreeMap::new(),
         })
     }
@@ -175,6 +193,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 filter,
                 usage: ChatUsage {
                     prompt_tokens,
+                    cached_prompt_tokens: 0,
                     completion_tokens: 0,
                 },
             },
@@ -190,6 +209,13 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     /// Runs one scheduler iteration and translates token output into chat deltas.
     pub fn tick(&mut self) -> Result<Qwen36ChatTick> {
         let scheduled = self.scheduler.tick()?;
+        for admission in &scheduled.admitted {
+            self.requests
+                .get_mut(&admission.request_id)
+                .expect("admitted chat request is retained")
+                .usage
+                .cached_prompt_tokens = admission.cached_prompt_tokens;
+        }
         let mut tick = Qwen36ChatTick {
             admitted: scheduled.admitted,
             scheduled: scheduled.scheduled,

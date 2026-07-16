@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 fast-telemetry.workspace = true
 rand = "0.9"
+rart.workspace = true
 serde_json.workspace = true
 nvfp4.workspace = true
 tokenizers = "0.22"

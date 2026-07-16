@@ -714,6 +714,47 @@ impl<T: Copy> DeviceBuffer<T> {
         }
     }
 
+    /// Enqueues a device-to-device copy of the first `len` elements.
+    pub fn copy_prefix_from_device_on_stream(
+        &mut self,
+        source: &Self,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if len > self.len || len > source.len {
+            return Err(Error::Shape {
+                label: "device prefix copy",
+                expected: format!(
+                    "at most destination={} and source={} values",
+                    self.len, source.len
+                ),
+                actual: format!("{len} values"),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device prefix copy bytes",
+                expected: "len * element size without overflow".to_string(),
+                actual: format!("len={len} element_size={}", size_of::<T>()),
+            })?;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D prefix)",
+                ffi::cudaMemcpyAsync(
+                    self.ptr.cast(),
+                    source.ptr.cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Copies host values into a contiguous element range of this allocation.
     pub fn copy_range_from_host(&mut self, element_offset: usize, values: &[T]) -> Result<()> {
         let end = element_offset

@@ -97,6 +97,7 @@ impl<'template> Step37ChatService<'template> {
                 filter,
                 usage: ChatUsage {
                     prompt_tokens,
+                    cached_prompt_tokens: 0,
                     completion_tokens: 0,
                 },
             },

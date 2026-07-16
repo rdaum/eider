@@ -975,6 +975,111 @@ __global__ void infer_sm12x_kv_finalize_value_kernel(
     }
 }
 
+__global__ void infer_sm12x_kv_copy_key_tiles_kernel(
+    const std::uint8_t* __restrict__ source_values,
+    const std::uint8_t* __restrict__ source_scales,
+    std::uint8_t* __restrict__ destination_values,
+    std::uint8_t* __restrict__ destination_scales,
+    std::uint32_t source_token_tiles,
+    std::uint32_t destination_token_tiles,
+    std::uint32_t copied_token_tiles,
+    std::uint32_t k_tiles)
+{
+    const std::uint32_t logical_tile = blockIdx.x;
+    const std::uint32_t k_tile = logical_tile % k_tiles;
+    const std::uint32_t token_head = logical_tile / k_tiles;
+    const std::uint32_t token_tile = token_head % copied_token_tiles;
+    const std::uint32_t head = token_head / copied_token_tiles;
+    const std::uint32_t source_tile =
+        (head * source_token_tiles + token_tile) * k_tiles + k_tile;
+    const std::uint32_t destination_tile =
+        (head * destination_token_tiles + token_tile) * k_tiles + k_tile;
+    if (threadIdx.x < 256) {
+        destination_values[destination_tile * 256 + threadIdx.x] =
+            source_values[source_tile * 256 + threadIdx.x];
+    }
+    if (threadIdx.x < 32) {
+        destination_scales[destination_tile * 32 + threadIdx.x] =
+            source_scales[source_tile * 32 + threadIdx.x];
+    }
+}
+
+__global__ void infer_sm12x_kv_copy_value_tiles_kernel(
+    const std::uint8_t* __restrict__ source_values,
+    const std::uint8_t* __restrict__ source_scales,
+    std::uint8_t* __restrict__ destination_values,
+    std::uint8_t* __restrict__ destination_scales,
+    std::uint32_t source_context_tiles,
+    std::uint32_t destination_context_tiles,
+    std::uint32_t copied_context_tiles)
+{
+    const std::uint32_t logical_tile = blockIdx.x;
+    const std::uint32_t context_tile = logical_tile % copied_context_tiles;
+    const std::uint32_t head_dimension_tile = logical_tile / copied_context_tiles;
+    const std::uint32_t source_tile =
+        head_dimension_tile * source_context_tiles + context_tile;
+    const std::uint32_t destination_tile =
+        head_dimension_tile * destination_context_tiles + context_tile;
+    if (threadIdx.x < 256) {
+        destination_values[destination_tile * 256 + threadIdx.x] =
+            source_values[source_tile * 256 + threadIdx.x];
+    }
+    if (threadIdx.x < 32) {
+        destination_scales[destination_tile * 32 + threadIdx.x] =
+            source_scales[source_tile * 32 + threadIdx.x];
+    }
+}
+
+extern "C" cudaError_t infer_sm12x_kv_cache_copy_aligned_prefix_on_stream(
+    const std::uint8_t* source_key_values,
+    const std::uint8_t* source_key_scales,
+    const std::uint8_t* source_value_values,
+    const std::uint8_t* source_value_scales,
+    std::uint8_t* destination_key_values,
+    std::uint8_t* destination_key_scales,
+    std::uint8_t* destination_value_values,
+    std::uint8_t* destination_value_scales,
+    std::uint32_t prefix_tokens,
+    std::uint32_t source_max_tokens,
+    std::uint32_t destination_max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream)
+{
+    if (source_key_values == nullptr || source_key_scales == nullptr ||
+        source_value_values == nullptr || source_value_scales == nullptr ||
+        destination_key_values == nullptr || destination_key_scales == nullptr ||
+        destination_value_values == nullptr || destination_value_scales == nullptr ||
+        prefix_tokens == 0 || (prefix_tokens % 128) != 0 ||
+        prefix_tokens > source_max_tokens || prefix_tokens > destination_max_tokens ||
+        kv_heads == 0 || head_dim == 0 || (head_dim % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    const std::uint32_t source_token_tiles = (source_max_tokens + 7) / 8;
+    const std::uint32_t destination_token_tiles = (destination_max_tokens + 7) / 8;
+    const std::uint32_t copied_token_tiles = prefix_tokens / 8;
+    const std::uint32_t k_tiles = head_dim / 64;
+    const std::uint32_t key_tiles = kv_heads * copied_token_tiles * k_tiles;
+    infer_sm12x_kv_copy_key_tiles_kernel<<<key_tiles, 256, 0, stream>>>(
+        source_key_values, source_key_scales, destination_key_values,
+        destination_key_scales, source_token_tiles, destination_token_tiles,
+        copied_token_tiles, k_tiles);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+
+    const std::uint32_t source_context_tiles = (source_max_tokens + 63) / 64;
+    const std::uint32_t destination_context_tiles = (destination_max_tokens + 63) / 64;
+    const std::uint32_t copied_context_tiles = prefix_tokens / 64;
+    const std::uint32_t value_tiles =
+        kv_heads * (head_dim / 8) * copied_context_tiles;
+    infer_sm12x_kv_copy_value_tiles_kernel<<<value_tiles, 256, 0, stream>>>(
+        source_value_values, source_value_scales, destination_value_values,
+        destination_value_scales, source_context_tiles, destination_context_tiles,
+        copied_context_tiles);
+    return cudaGetLastError();
+}
+
 __global__ void infer_sm12x_kv_copy_tail_indexed_kernel(
     const float* __restrict__ key,
     const float* __restrict__ value,

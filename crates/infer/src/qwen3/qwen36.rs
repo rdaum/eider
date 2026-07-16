@@ -5656,6 +5656,15 @@ pub struct Qwen36SequenceState {
     max_tokens: usize,
 }
 
+/// Immutable, 128-token-aligned hybrid sequence checkpoint.
+///
+/// Linear-attention state is copied in full. Full-attention state retains only
+/// compact K/V storage through the checkpoint position, independent of the
+/// source request's allocated context capacity.
+pub struct Qwen36SequenceCheckpoint {
+    sequence: Qwen36SequenceState,
+}
+
 impl Qwen36SequenceState {
     /// Returns the next position that will be written by decode.
     pub fn position(&self) -> usize {
@@ -5676,6 +5685,113 @@ impl Qwen36SequenceState {
                 Qwen36AttentionState::FullAttention(state) => state.device_bytes(),
             })
             .sum()
+    }
+
+    /// Returns the device bytes needed to retain the current aligned prefix.
+    pub fn checkpoint_device_bytes(&self) -> Result<usize> {
+        if self.position == 0 || !self.position.is_multiple_of(128) {
+            return Err(Error::Shape {
+                label: "Qwen3.6 sequence checkpoint byte estimate",
+                expected: "nonzero 128-token-aligned sequence position".to_string(),
+                actual: self.position.to_string(),
+            });
+        }
+        self.layer_states.iter().try_fold(0usize, |total, layer| {
+            let layer_bytes = match &layer.attention {
+                Qwen36AttentionState::LinearAttention(state) => state.device_bytes(),
+                Qwen36AttentionState::FullAttention(state) => state
+                    .compact_cache
+                    .device_bytes_for_capacity(self.position)?,
+            };
+            total.checked_add(layer_bytes).ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 sequence checkpoint byte estimate",
+                expected: "device-byte total without overflow".to_string(),
+                actual: format!("position={}", self.position),
+            })
+        })
+    }
+
+    fn copy_aligned_prefix_from_on_stream(
+        &mut self,
+        source: &Self,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let prefix_tokens = source.position;
+        if self.model_id != source.model_id
+            || self.position != 0
+            || prefix_tokens == 0
+            || !prefix_tokens.is_multiple_of(128)
+            || prefix_tokens > self.max_tokens
+            || self.layer_states.len() != source.layer_states.len()
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.6 sequence prefix copy",
+                expected: format!(
+                    "empty matching-model destination with capacity >= a nonzero 128-token source position {}",
+                    source.position
+                ),
+                actual: format!(
+                    "source_model={} destination_model={} destination_position={} destination_capacity={} source_layers={} destination_layers={}",
+                    source.model_id,
+                    self.model_id,
+                    self.position,
+                    self.max_tokens,
+                    source.layer_states.len(),
+                    self.layer_states.len()
+                ),
+            });
+        }
+        for (destination, source) in self.layer_states.iter_mut().zip(&source.layer_states) {
+            match (&mut destination.attention, &source.attention) {
+                (
+                    Qwen36AttentionState::LinearAttention(destination),
+                    Qwen36AttentionState::LinearAttention(source),
+                ) => {
+                    destination.conv_state.copy_prefix_from_device_on_stream(
+                        &source.conv_state,
+                        source.conv_state.len(),
+                        stream,
+                    )?;
+                    destination
+                        .recurrent_state
+                        .copy_prefix_from_device_on_stream(
+                            &source.recurrent_state,
+                            source.recurrent_state.len(),
+                            stream,
+                        )?;
+                }
+                (
+                    Qwen36AttentionState::FullAttention(destination),
+                    Qwen36AttentionState::FullAttention(source),
+                ) => destination
+                    .compact_cache
+                    .copy_aligned_prefix_from_on_stream(
+                        &source.compact_cache,
+                        prefix_tokens,
+                        stream,
+                    )?,
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.6 sequence prefix copy",
+                        detail: "source and destination layer kinds differ".to_string(),
+                    });
+                }
+            }
+        }
+        self.position = prefix_tokens;
+        Ok(())
+    }
+}
+
+impl Qwen36SequenceCheckpoint {
+    /// Returns the number of prompt tokens represented by this checkpoint.
+    pub fn position(&self) -> usize {
+        self.sequence.position()
+    }
+
+    /// Returns the exact device bytes retained by this checkpoint.
+    pub fn device_bytes(&self) -> usize {
+        self.sequence.device_bytes()
     }
 }
 
@@ -5924,6 +6040,51 @@ impl Qwen36TextModel {
             position: 0,
             max_tokens,
         })
+    }
+
+    /// Copies a sequence's current aligned prefix into an immutable checkpoint.
+    pub fn checkpoint_sequence(
+        &self,
+        source: &Qwen36SequenceState,
+    ) -> Result<Qwen36SequenceCheckpoint> {
+        if source.model_id != self.model_id {
+            return Err(Error::Format {
+                label: "Qwen3.6 sequence checkpoint",
+                detail: "sequence was created by a different model instance".to_string(),
+            });
+        }
+        source.checkpoint_device_bytes()?;
+        let mut sequence = self.new_sequence_state(source.position)?;
+        let stream = CudaStream::new_non_blocking()?;
+        sequence.copy_aligned_prefix_from_on_stream(source, &stream)?;
+        stream.synchronize()?;
+        Ok(Qwen36SequenceCheckpoint { sequence })
+    }
+
+    /// Creates active sequence state from a cached aligned checkpoint.
+    pub fn restore_sequence_checkpoint(
+        &self,
+        checkpoint: &Qwen36SequenceCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Qwen36SequenceState> {
+        if checkpoint.sequence.model_id != self.model_id {
+            return Err(Error::Format {
+                label: "Qwen3.6 sequence checkpoint restore",
+                detail: "checkpoint was created by a different model instance".to_string(),
+            });
+        }
+        if max_tokens < checkpoint.position() {
+            return Err(Error::Shape {
+                label: "Qwen3.6 sequence checkpoint restore",
+                expected: format!("max_tokens >= {}", checkpoint.position()),
+                actual: max_tokens.to_string(),
+            });
+        }
+        let mut sequence = self.new_sequence_state(max_tokens)?;
+        let stream = CudaStream::new_non_blocking()?;
+        sequence.copy_aligned_prefix_from_on_stream(&checkpoint.sequence, &stream)?;
+        stream.synchronize()?;
+        Ok(sequence)
     }
 
     /// Allocates the legacy single-row decode state.
