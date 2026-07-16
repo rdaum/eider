@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use crate::cuda::check_cuda;
-use crate::{CudaStream, DeviceBuffer, DeviceOutput, Result};
+use crate::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, Result};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -423,6 +423,16 @@ pub struct Sm12xFp4DeviceGemmVector {
 }
 
 impl Sm12xFp4GemmWeight {
+    /// Returns the native tile payload as contiguous bytes.
+    pub fn tile_bytes(&self) -> Vec<u8> {
+        self.tiles.to_bytes()
+    }
+
+    /// Returns the packed scale words for the native tiles.
+    pub fn scale_words(&self) -> &[u32] {
+        &self.scales
+    }
+
     /// Serializes the native tile and scale payload without a cache-file header.
     pub fn payload_bytes(&self) -> Vec<u8> {
         let tile_bytes = self.tiles.to_bytes();
@@ -638,18 +648,85 @@ impl Sm12xFp4GemmWeight {
 }
 
 impl Sm12xFp4DeviceGemmWeight {
+    /// Allocates an empty fixed-shape weight suitable for an expert cache slot.
+    pub fn zeroed(m: usize, k: usize) -> Result<Self> {
+        if m == 0 || k == 0 || !m.is_multiple_of(16) || !k.is_multiple_of(64) {
+            return Err(crate::Error::Shape {
+                label: "SM12x FP4 empty GEMV weight",
+                expected: "non-zero M divisible by 16 and K divisible by 64".to_string(),
+                actual: format!("M={m} K={k}"),
+            });
+        }
+        let m_tiles = m / 16;
+        let k_tiles = k / 64;
+        Ok(Self {
+            tiles: DeviceBuffer::zeroed(m_tiles * k_tiles * TILE_BYTES)?,
+            scales: DeviceBuffer::zeroed(m_tiles * k_tiles)?,
+            m_tiles,
+            k_tiles,
+        })
+    }
+
+    /// Replaces this slot's weight while preserving its device pointers.
+    pub fn copy_from_host(&mut self, weight: &Sm12xFp4GemmWeight) -> Result<()> {
+        if self.m_tiles != weight.m_tiles || self.k_tiles != weight.k_tiles {
+            return Err(crate::Error::Shape {
+                label: "SM12x FP4 GEMV slot weight",
+                expected: format!("m_tiles={} k_tiles={}", self.m_tiles, self.k_tiles),
+                actual: format!("m_tiles={} k_tiles={}", weight.m_tiles, weight.k_tiles),
+            });
+        }
+        self.tiles.copy_from_host(&weight.tiles.to_bytes())?;
+        self.scales.copy_from_host(&weight.scales)
+    }
+
+    /// Enqueues replacement of this slot from pinned staging buffers.
+    pub fn copy_from_pinned_on_stream(
+        &mut self,
+        tiles: &PinnedHostBuffer<u8>,
+        scales: &PinnedHostBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if tiles.as_slice().len() != self.tiles.len()
+            || scales.as_slice().len() != self.scales.len()
+        {
+            return Err(crate::Error::Shape {
+                label: "SM12x FP4 asynchronous slot weight",
+                expected: format!("tiles={} scales={}", self.tiles.len(), self.scales.len()),
+                actual: format!(
+                    "tiles={} scales={}",
+                    tiles.as_slice().len(),
+                    scales.as_slice().len()
+                ),
+            });
+        }
+        self.tiles
+            .copy_range_from_pinned_on_stream(0, tiles, stream)?;
+        self.scales
+            .copy_range_from_pinned_on_stream(0, scales, stream)
+    }
+
+    /// Returns the bytes occupied by this resident weight.
+    pub fn device_bytes(&self) -> usize {
+        self.tiles.device_bytes() + self.scales.device_bytes()
+    }
+
+    /// Returns the native-tile device pointer.
     pub fn tiles_ptr(&self) -> *const u8 {
         self.tiles.as_const_ptr().cast()
     }
 
+    /// Returns the scale device pointer.
     pub fn scales_ptr(&self) -> *const u32 {
         self.scales.as_const_ptr().cast()
     }
 
+    /// Returns the output tile count.
     pub fn m_tiles(&self) -> usize {
         self.m_tiles
     }
 
+    /// Returns the input tile count.
     pub fn k_tiles(&self) -> usize {
         self.k_tiles
     }

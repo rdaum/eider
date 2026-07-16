@@ -555,7 +555,9 @@ impl BatchMoeWorkspace {
     fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, capacity: usize) -> Result<Self> {
         let marlin = match &weights.gate_up_storage {
             Qwen36GateUpStorage::Marlin(marlin) => marlin.new_batch_workspace(capacity)?,
-            Qwen36GateUpStorage::Grouped { .. } | Qwen36GateUpStorage::Fp8 => {
+            Qwen36GateUpStorage::Grouped { .. }
+            | Qwen36GateUpStorage::Paged
+            | Qwen36GateUpStorage::Fp8 => {
                 return Err(crate::nvfp4::Error::Format {
                     label: "Qwen3.6 batched routed gate/up",
                     detail: "the current model does not use the Marlin NVFP4 route".to_string(),

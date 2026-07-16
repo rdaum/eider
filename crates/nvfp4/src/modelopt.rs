@@ -574,6 +574,45 @@ impl ModelOptCheckpoint {
         })
     }
 
+    /// Reads only the global weight and input scales for an NVFP4 linear.
+    ///
+    /// This avoids faulting the packed weight and block-scale payloads when a
+    /// caller needs scalar metadata before loading weights on demand.
+    pub fn load_nvfp4_scales(&self, prefix: &str) -> Result<(f32, f32)> {
+        if self.contains_tensor(&format!("{prefix}.weight_packed")) {
+            let weight_name = format!("{prefix}.weight_global_scale");
+            let input_name = format!("{prefix}.input_global_scale");
+            let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+            let input_shard = self.open_shard_for_tensor(&input_name)?;
+            let weight_divisor = read_single_f32(
+                &weight_shard,
+                &weight_name,
+                "compressed-tensors NVFP4 weight_global_scale",
+            )?;
+            let input_divisor = read_single_f32(
+                &input_shard,
+                &input_name,
+                "compressed-tensors NVFP4 input_global_scale",
+            )?;
+            return Ok((
+                reciprocal_scale(
+                    weight_divisor,
+                    "compressed-tensors NVFP4 weight_global_scale",
+                )?,
+                reciprocal_scale(input_divisor, "compressed-tensors NVFP4 input_global_scale")?,
+            ));
+        }
+
+        let weight_name = format!("{prefix}.weight_scale_2");
+        let input_name = format!("{prefix}.input_scale");
+        let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+        let input_shard = self.open_shard_for_tensor(&input_name)?;
+        Ok((
+            weight_shard.read_scalar_f32(&weight_name)?,
+            input_shard.read_scalar_f32(&input_name)?,
+        ))
+    }
+
     /// Imports a ModelOpt FP8 linear by tensor prefix.
     pub fn load_fp8_linear(&self, prefix: &str) -> Result<ModelOptFp8Linear> {
         let weight_name = format!("{prefix}.weight");

@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Deref;
 use std::ptr::null_mut;
+use std::slice;
 use std::sync::OnceLock;
 
 /// Host-side view of a device-buffer readback.
@@ -17,6 +18,100 @@ use std::sync::OnceLock;
 pub struct HostRead<'a, T> {
     values: Vec<T>,
     _device: PhantomData<&'a DeviceBuffer<T>>,
+}
+
+/// Page-locked host allocation suitable for asynchronous CUDA transfers.
+pub struct PinnedHostBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+}
+
+impl<T: Copy> PinnedHostBuffer<T> {
+    /// Allocates `len` zero-initialized values in pinned host memory.
+    pub fn zeroed(len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::Shape {
+                label: "pinned host allocation",
+                expected: "at least one value".to_string(),
+                actual: "0 values".to_string(),
+            });
+        }
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "pinned host allocation",
+                expected: "len * element size without overflow".to_string(),
+                actual: format!("len={len} element_size={}", size_of::<T>()),
+            })?;
+        let mut raw = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaHostAlloc",
+                ffi::cudaHostAlloc(&mut raw, bytes, ffi::CUDA_HOST_ALLOC_DEFAULT),
+            )?;
+            raw.cast::<u8>().write_bytes(0, bytes);
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len,
+        })
+    }
+
+    /// Allocates pinned host memory and copies `values` into it.
+    pub fn from_slice(values: &[T]) -> Result<Self> {
+        if values.is_empty() {
+            return Err(Error::Shape {
+                label: "pinned host allocation",
+                expected: "at least one value".to_string(),
+                actual: "0 values".to_string(),
+            });
+        }
+        let bytes = std::mem::size_of_val(values);
+        let mut raw = null_mut();
+        unsafe {
+            check_cuda(
+                "cudaHostAlloc",
+                ffi::cudaHostAlloc(&mut raw, bytes, ffi::CUDA_HOST_ALLOC_DEFAULT),
+            )?;
+            raw.cast::<T>()
+                .copy_from_nonoverlapping(values.as_ptr(), values.len());
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len: values.len(),
+        })
+    }
+
+    /// Returns the pinned values.
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Replaces the allocation contents without changing its address.
+    pub fn copy_from_slice(&mut self, values: &[T]) -> Result<()> {
+        if values.len() != self.len {
+            return Err(Error::Shape {
+                label: "pinned host copy",
+                expected: format!("{} values", self.len),
+                actual: format!("{} values", values.len()),
+            });
+        }
+        unsafe {
+            self.ptr
+                .copy_from_nonoverlapping(values.as_ptr(), values.len());
+        }
+        Ok(())
+    }
+}
+
+impl<T> Drop for PinnedHostBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = ffi::cudaFreeHost(self.ptr.cast());
+            }
+        }
+    }
 }
 
 /// Borrowed device input role.
@@ -244,6 +339,16 @@ pub(crate) fn max_shared_memory_per_block() -> Result<usize> {
 /// harness. CUDA event timing should be used for GPU-side elapsed time.
 pub fn synchronize_device() -> Result<()> {
     unsafe { check_cuda("cudaDeviceSynchronize", ffi::cudaDeviceSynchronize()) }
+}
+
+/// Returns CUDA-visible free and total memory bytes for the current device.
+pub fn device_memory_info() -> Result<(usize, usize)> {
+    let mut free = 0;
+    let mut total = 0;
+    unsafe {
+        check_cuda("cudaMemGetInfo", ffi::cudaMemGetInfo(&mut free, &mut total))?;
+    }
+    Ok((free, total))
 }
 
 /// Non-blocking CUDA stream suitable for graph capture and replay.
@@ -594,6 +699,71 @@ impl<T: Copy> DeviceBuffer<T> {
                     values.as_ptr().cast(),
                     bytes,
                     ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )
+        }
+    }
+
+    /// Copies host values into a contiguous element range of this allocation.
+    pub fn copy_range_from_host(&mut self, element_offset: usize, values: &[T]) -> Result<()> {
+        let end = element_offset
+            .checked_add(values.len())
+            .ok_or_else(|| Error::Shape {
+                label: "device range copy from host",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={element_offset} length={}", values.len()),
+            })?;
+        if end > self.len {
+            return Err(Error::Shape {
+                label: "device range copy from host",
+                expected: format!("end <= {}", self.len),
+                actual: format!("offset={element_offset} length={} end={end}", values.len()),
+            });
+        }
+        let bytes = std::mem::size_of_val(values);
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(H2D element range)",
+                ffi::cudaMemcpy(
+                    self.ptr.add(element_offset).cast(),
+                    values.as_ptr().cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )
+        }
+    }
+
+    /// Enqueues a pinned-host copy into a contiguous element range on `stream`.
+    pub fn copy_range_from_pinned_on_stream(
+        &mut self,
+        element_offset: usize,
+        values: &PinnedHostBuffer<T>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let end = element_offset
+            .checked_add(values.len)
+            .ok_or_else(|| Error::Shape {
+                label: "device asynchronous range copy",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={element_offset} length={}", values.len),
+            })?;
+        if end > self.len {
+            return Err(Error::Shape {
+                label: "device asynchronous range copy",
+                expected: format!("end <= {}", self.len),
+                actual: format!("offset={element_offset} length={} end={end}", values.len),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(H2D element range)",
+                ffi::cudaMemcpyAsync(
+                    self.ptr.add(element_offset).cast(),
+                    values.ptr.cast(),
+                    values.len * size_of::<T>(),
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                    stream.as_raw(),
                 ),
             )
         }

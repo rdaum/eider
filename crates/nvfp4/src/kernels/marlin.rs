@@ -1,10 +1,17 @@
 //! Host preprocessing for the focused NVFP4 Marlin MoE path.
 
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, check_cuda};
+use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format::e4m3_value;
 use crate::modelopt::ModelOptNvfp4Linear;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+
+const CACHE_MAGIC: &[u8; 8] = b"EIDMRL01";
+const CACHE_VERSION: u32 = 1;
+const CACHE_HEADER_BYTES: u64 = 48;
 
 /// Marlin-repacked NVFP4 weight and scale data for one expert linear.
 pub struct MarlinNvfp4HostWeight {
@@ -85,39 +92,31 @@ impl MarlinNvfp4GateUp {
             });
         }
 
-        let hidden = weights[0].in_features;
-        let gate_up = weights[0].out_features;
-        if hidden == 0
-            || gate_up == 0
-            || !hidden.is_multiple_of(16)
-            || !gate_up.is_multiple_of(128)
-            || !gate_up.is_multiple_of(2)
-            || hidden > u32::MAX as usize
-            || gate_up > u32::MAX as usize
-        {
-            return Err(Error::Shape {
-                label: "Marlin routed gate/up shape",
-                expected: "non-zero hidden divisible by 16 and even gate/up divisible by 128"
-                    .to_string(),
-                actual: format!("out={gate_up} in={hidden}"),
-            });
+        let mut prepared = Vec::with_capacity(weights.len());
+        for weight in weights {
+            prepared.push(MarlinNvfp4HostWeight::from_modelopt(weight)?);
         }
+        Self::from_prepared(&prepared)
+    }
 
+    /// Creates a plan from already-repacked expert weights.
+    pub fn from_prepared(weights: &[MarlinNvfp4HostWeight]) -> Result<Self> {
+        ensure_gate_up_device_support()?;
+        let Some(first) = weights.first() else {
+            return Err(Error::Shape {
+                label: "Marlin gate/up prepared experts",
+                expected: "at least one expert".to_string(),
+                actual: "0 experts".to_string(),
+            });
+        };
+        validate_gate_up_shape(first.out_features, first.in_features)?;
+        let hidden = first.in_features;
+        let gate_up = first.out_features;
         let mut repacked_weight = Vec::with_capacity(weights.len() * gate_up * hidden / 8);
         let mut weight_scale = Vec::with_capacity(weights.len() * gate_up * hidden / 16);
         let mut global_scale = Vec::with_capacity(weights.len());
         for weight in weights {
-            if weight.out_features != gate_up || weight.in_features != hidden {
-                return Err(Error::Shape {
-                    label: "Marlin routed gate/up expert",
-                    expected: format!("out={gate_up} in={hidden}"),
-                    actual: format!(
-                        "{} out={} in={}",
-                        weight.prefix, weight.out_features, weight.in_features
-                    ),
-                });
-            }
-            let weight = MarlinNvfp4HostWeight::from_modelopt(weight)?;
+            validate_prepared_weight(weight, gate_up, hidden)?;
             repacked_weight.extend_from_slice(&weight.packed_weight);
             weight_scale.extend_from_slice(&weight.weight_scale);
             global_scale.push(weight.global_scale);
@@ -138,6 +137,108 @@ impl MarlinNvfp4GateUp {
             expert_ids: DeviceBuffer::zeroed(ROUTED_TOP_K)?,
             num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
         })
+    }
+
+    /// Allocates a fixed number of empty expert slots for paging.
+    pub fn new_empty_slots(experts: usize, gate_up: usize, hidden: usize) -> Result<Self> {
+        ensure_gate_up_device_support()?;
+        if experts == 0 {
+            return Err(Error::Shape {
+                label: "Marlin gate/up expert slots",
+                expected: "at least one slot".to_string(),
+                actual: "0 slots".to_string(),
+            });
+        }
+        validate_gate_up_shape(gate_up, hidden)?;
+        Ok(Self {
+            experts,
+            hidden,
+            gate_up,
+            repacked_weight: DeviceBuffer::zeroed(experts * gate_up * hidden / 8)?,
+            weight_scale: DeviceBuffer::zeroed(experts * gate_up * hidden / 16)?,
+            global_scale: DeviceBuffer::zeroed(experts)?,
+            input_bf16: DeviceBuffer::zeroed(hidden)?,
+            output_bf16: DeviceBuffer::zeroed(ROUTED_TOP_K * gate_up)?,
+            reduce_tmp: DeviceBuffer::zeroed(gate_up * ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
+            locks: DeviceBuffer::zeroed(ROUTED_TOP_K * (gate_up / 128))?,
+            sorted_token_ids: DeviceBuffer::zeroed(ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
+            expert_ids: DeviceBuffer::zeroed(ROUTED_TOP_K)?,
+            num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
+        })
+    }
+
+    /// Replaces one resident slot with an already-repacked expert weight.
+    pub fn load_slot(&mut self, slot: usize, weight: &MarlinNvfp4HostWeight) -> Result<()> {
+        if slot >= self.experts {
+            return Err(Error::Shape {
+                label: "Marlin gate/up slot",
+                expected: format!("slot < {}", self.experts),
+                actual: slot.to_string(),
+            });
+        }
+        validate_prepared_weight(weight, self.gate_up, self.hidden)?;
+        let weight_words = self.gate_up * self.hidden / 8;
+        let scale_bytes = self.gate_up * self.hidden / 16;
+        self.repacked_weight
+            .copy_range_from_host(slot * weight_words, &weight.packed_weight)?;
+        self.weight_scale
+            .copy_range_from_host(slot * scale_bytes, &weight.weight_scale)?;
+        self.global_scale
+            .copy_range_from_host(slot, &[weight.global_scale])
+    }
+
+    /// Enqueues replacement of one resident slot from pinned staging buffers.
+    pub fn load_slot_from_pinned_on_stream(
+        &mut self,
+        slot: usize,
+        packed_weight: &PinnedHostBuffer<u32>,
+        weight_scale: &PinnedHostBuffer<u8>,
+        global_scale: &PinnedHostBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if slot >= self.experts {
+            return Err(Error::Shape {
+                label: "Marlin gate/up asynchronous slot",
+                expected: format!("slot < {}", self.experts),
+                actual: slot.to_string(),
+            });
+        }
+        let weight_words = self.gate_up * self.hidden / 8;
+        let scale_bytes = self.gate_up * self.hidden / 16;
+        if packed_weight.as_slice().len() != weight_words
+            || weight_scale.as_slice().len() != scale_bytes
+            || global_scale.as_slice().len() != 1
+        {
+            return Err(Error::Shape {
+                label: "Marlin gate/up asynchronous slot buffers",
+                expected: format!("weight={weight_words} scales={scale_bytes} global_scale=1"),
+                actual: format!(
+                    "weight={} scales={} global_scale={}",
+                    packed_weight.as_slice().len(),
+                    weight_scale.as_slice().len(),
+                    global_scale.as_slice().len()
+                ),
+            });
+        }
+        self.repacked_weight.copy_range_from_pinned_on_stream(
+            slot * weight_words,
+            packed_weight,
+            stream,
+        )?;
+        self.weight_scale.copy_range_from_pinned_on_stream(
+            slot * scale_bytes,
+            weight_scale,
+            stream,
+        )?;
+        self.global_scale
+            .copy_range_from_pinned_on_stream(slot, global_scale, stream)
+    }
+
+    /// Returns the bytes occupied by resident expert weights and scales.
+    pub fn expert_device_bytes(&self) -> usize {
+        self.repacked_weight.device_bytes()
+            + self.weight_scale.device_bytes()
+            + self.global_scale.device_bytes()
     }
 
     /// Returns the number of experts stored by the plan.
@@ -527,6 +628,211 @@ impl MarlinNvfp4HostWeight {
             in_features: k,
         })
     }
+
+    /// Writes the prepared weight to a fixed-layout cache file.
+    pub fn write_cache_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        validate_prepared_weight(self, self.out_features, self.in_features)?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = File::create(&temporary)
+            .map_err(|error| marlin_cache_error("create", &temporary, error))?;
+        file.write_all(CACHE_MAGIC)
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&CACHE_VERSION.to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&(self.out_features as u64).to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&(self.in_features as u64).to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&(self.packed_weight.len() as u64).to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&(self.weight_scale.len() as u64).to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&self.global_scale.to_le_bytes())
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        let mut packed_bytes = Vec::with_capacity(self.packed_weight.len() * 4);
+        for value in &self.packed_weight {
+            packed_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        file.write_all(&packed_bytes)
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.write_all(&self.weight_scale)
+            .map_err(|error| marlin_cache_error("write", path, error))?;
+        file.flush()
+            .map_err(|error| marlin_cache_error("flush", &temporary, error))?;
+        drop(file);
+        std::fs::rename(&temporary, path).map_err(|error| marlin_cache_error("rename", path, error))
+    }
+
+    /// Returns whether a cache file contains the complete expected payload.
+    pub fn cache_file_matches(
+        path: impl AsRef<Path>,
+        out_features: usize,
+        in_features: usize,
+    ) -> bool {
+        let path = path.as_ref();
+        if validate_gate_up_shape(out_features, in_features).is_err() {
+            return false;
+        }
+        let packed_words = out_features * in_features / 8;
+        let scale_bytes = out_features * in_features / 16;
+        let expected_len = CACHE_HEADER_BYTES + (packed_words * 4 + scale_bytes) as u64;
+        let Ok(mut file) = File::open(path) else {
+            return false;
+        };
+        if !matches!(file.metadata(), Ok(metadata) if metadata.len() == expected_len) {
+            return false;
+        }
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic).is_ok()
+            && read_cache_u32(&mut file).is_ok_and(|value| value == CACHE_VERSION)
+            && read_cache_u64(&mut file).is_ok_and(|value| value as usize == out_features)
+            && read_cache_u64(&mut file).is_ok_and(|value| value as usize == in_features)
+            && read_cache_u64(&mut file).is_ok_and(|value| value as usize == packed_words)
+            && read_cache_u64(&mut file).is_ok_and(|value| value as usize == scale_bytes)
+            && &magic == CACHE_MAGIC
+    }
+
+    /// Reads an already-repacked expert weight from its cache file.
+    pub fn read_cache_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|error| marlin_cache_error("open", path, error))?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)
+            .map_err(|error| marlin_cache_error("read", path, error))?;
+        let version = read_cache_u32(&mut file)?;
+        let out_features = read_cache_u64(&mut file)? as usize;
+        let in_features = read_cache_u64(&mut file)? as usize;
+        let packed_words = read_cache_u64(&mut file)? as usize;
+        let scale_bytes = read_cache_u64(&mut file)? as usize;
+        let global_scale = read_cache_f32(&mut file)?;
+        if &magic != CACHE_MAGIC || version != CACHE_VERSION {
+            return Err(Error::Format {
+                label: "Marlin expert cache",
+                detail: format!("invalid header in {}", path.display()),
+            });
+        }
+        let mut packed_bytes = vec![0u8; packed_words * 4];
+        file.read_exact(&mut packed_bytes)
+            .map_err(|error| marlin_cache_error("read", path, error))?;
+        let packed_weight = packed_bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four packed bytes")))
+            .collect::<Vec<_>>();
+        let mut weight_scale = vec![0u8; scale_bytes];
+        file.read_exact(&mut weight_scale)
+            .map_err(|error| marlin_cache_error("read", path, error))?;
+        let weight = Self {
+            packed_weight,
+            weight_scale,
+            global_scale,
+            out_features,
+            in_features,
+        };
+        validate_prepared_weight(&weight, out_features, in_features)?;
+        Ok(weight)
+    }
+}
+
+fn validate_gate_up_shape(gate_up: usize, hidden: usize) -> Result<()> {
+    if hidden == 0
+        || gate_up == 0
+        || !hidden.is_multiple_of(16)
+        || !gate_up.is_multiple_of(128)
+        || !gate_up.is_multiple_of(2)
+        || hidden > u32::MAX as usize
+        || gate_up > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "Marlin routed gate/up shape",
+            expected: "non-zero hidden divisible by 16 and even gate/up divisible by 128"
+                .to_string(),
+            actual: format!("out={gate_up} in={hidden}"),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_gate_up_device_support() -> Result<()> {
+    if unsafe { ffi::infer_marlin_nvfp4_gate_up_supported() } == 0 {
+        return Err(Error::Format {
+            label: "Marlin NVFP4 gate/up device support",
+            detail: "requires a device accepted by the compiled Marlin kernel".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_prepared_weight(
+    weight: &MarlinNvfp4HostWeight,
+    gate_up: usize,
+    hidden: usize,
+) -> Result<()> {
+    validate_gate_up_shape(gate_up, hidden)?;
+    let expected_weight = gate_up * hidden / 8;
+    let expected_scales = gate_up * hidden / 16;
+    if weight.out_features != gate_up
+        || weight.in_features != hidden
+        || weight.packed_weight.len() != expected_weight
+        || weight.weight_scale.len() != expected_scales
+        || !weight.global_scale.is_finite()
+    {
+        return Err(Error::Shape {
+            label: "Marlin prepared expert",
+            expected: format!(
+                "out={gate_up} in={hidden} packed_words={expected_weight} scales={expected_scales}"
+            ),
+            actual: format!(
+                "out={} in={} packed_words={} scales={} global_scale={}",
+                weight.out_features,
+                weight.in_features,
+                weight.packed_weight.len(),
+                weight.weight_scale.len(),
+                weight.global_scale
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn marlin_cache_error(action: &'static str, path: &Path, error: std::io::Error) -> Error {
+    Error::Format {
+        label: "Marlin expert cache",
+        detail: format!("failed to {action} {}: {error}", path.display()),
+    }
+}
+
+fn read_cache_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| Error::Format {
+            label: "Marlin expert cache",
+            detail: format!("failed to read u32: {error}"),
+        })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_cache_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| Error::Format {
+            label: "Marlin expert cache",
+            detail: format!("failed to read u64: {error}"),
+        })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_cache_f32(reader: &mut impl Read) -> Result<f32> {
+    let mut bytes = [0u8; 4];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| Error::Format {
+            label: "Marlin expert cache",
+            detail: format!("failed to read f32: {error}"),
+        })?;
+    Ok(f32::from_le_bytes(bytes))
 }
 
 fn repack_weight(source: &[u8], n: usize, k: usize) -> Vec<u32> {
@@ -677,6 +983,34 @@ mod tests {
         assert_eq!(repacked.packed_weight.len() * 4, weight.packed_weight.len());
         assert_eq!(repacked.weight_scale.len(), weight.weight_scale.len());
         assert!(repacked.global_scale.is_finite());
+    }
+
+    #[test]
+    fn marlin_prepared_cache_round_trips() {
+        let weight = ModelOptNvfp4Linear {
+            prefix: "cache-test".to_string(),
+            out_features: 128,
+            in_features: 128,
+            packed_weight: (0..128 * 128 / 2).map(|idx| idx as u8).collect(),
+            weight_scale: vec![0x38; 128 * 128 / 16],
+            weight_scale_2: 0.25,
+            input_scale: 0.5,
+        };
+        let expected = MarlinNvfp4HostWeight::from_modelopt(&weight).expect("repack");
+        let path = std::env::temp_dir().join(format!(
+            "eider-marlin-cache-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        expected.write_cache_file(&path).expect("write cache");
+        assert!(MarlinNvfp4HostWeight::cache_file_matches(&path, 128, 128));
+        let actual = MarlinNvfp4HostWeight::read_cache_file(&path).expect("read cache");
+        std::fs::remove_file(&path).expect("remove cache");
+        assert_eq!(actual.packed_weight, expected.packed_weight);
+        assert_eq!(actual.weight_scale, expected.weight_scale);
+        assert_eq!(actual.global_scale, expected.global_scale);
+        assert_eq!(actual.out_features, expected.out_features);
+        assert_eq!(actual.in_features, expected.in_features);
     }
 
     #[test]

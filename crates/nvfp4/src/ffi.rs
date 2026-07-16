@@ -24,6 +24,7 @@ pub(crate) type cudaStreamCaptureMode = i32;
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: cudaMemcpyKind = 2;
+pub(crate) const CUDA_HOST_ALLOC_DEFAULT: u32 = 0;
 pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
@@ -86,6 +87,7 @@ pub(crate) struct cublasLtMatmulHeuristicResult_t {
 
 unsafe extern "C" {
     pub(crate) fn cudaGetDevice(device: *mut i32) -> cudaError_t;
+    pub(crate) fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> cudaError_t;
     pub(crate) fn infer_cuda_e2m1_rn(value: f32) -> u8;
     pub(crate) fn infer_cuda_e4m3_satfinite(value: f32) -> u8;
@@ -567,6 +569,14 @@ unsafe extern "C" {
         experts: u32,
         k: u32,
         norm_topk_prob: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_remap_expert_indices_on_stream(
+        expert_indices: *const u32,
+        expert_to_slot: *const u32,
+        slot_indices: *mut u32,
+        count: u32,
+        experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_gather_nvfp4_grouped_gemv_ptrs_on_stream(
@@ -1448,6 +1458,16 @@ unsafe extern "C" {
         count: usize,
         kind: cudaMemcpyKind,
     ) -> cudaError_t;
+    pub(crate) fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: cudaMemcpyKind,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn cudaHostAlloc(host_ptr: *mut *mut c_void, size: usize, flags: u32)
+    -> cudaError_t;
+    pub(crate) fn cudaFreeHost(host_ptr: *mut c_void) -> cudaError_t;
     pub(crate) fn cudaMemset(dev_ptr: *mut c_void, value: i32, count: usize) -> cudaError_t;
     pub(crate) fn cudaDeviceSynchronize() -> cudaError_t;
     pub(crate) fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: u32) -> cudaError_t;

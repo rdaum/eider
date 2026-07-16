@@ -1140,6 +1140,35 @@ extern "C" cudaError_t infer_moe_topk_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_remap_expert_indices_kernel(
+    const std::uint32_t* expert_indices,
+    const std::uint32_t* expert_to_slot,
+    std::uint32_t* slot_indices,
+    std::uint32_t count,
+    std::uint32_t experts) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const std::uint32_t expert = expert_indices[index];
+    slot_indices[index] = expert < experts ? expert_to_slot[expert] : UINT32_MAX;
+}
+
+extern "C" cudaError_t infer_remap_expert_indices_on_stream(
+    const std::uint32_t* expert_indices,
+    const std::uint32_t* expert_to_slot,
+    std::uint32_t* slot_indices,
+    std::uint32_t count,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (expert_indices == nullptr || expert_to_slot == nullptr || slot_indices == nullptr ||
+        count == 0 || experts == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 128;
+    infer_remap_expert_indices_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        expert_indices, expert_to_slot, slot_indices, count, experts);
+    return cudaGetLastError();
+}
+
 __global__ void infer_gather_nvfp4_grouped_gemv_ptrs_kernel(
     const std::uint32_t* indices,
     const std::uint8_t* const* a_values_table,
