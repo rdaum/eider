@@ -1,9 +1,9 @@
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36AttentionState, Qwen36DownStorage,
-    Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36LinearAttentionState,
-    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken,
-    Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage, Qwen36TextModel,
-    Sm12xGateUpWorkspace, maybe_round_device_f32_to_bf16,
+    Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36Linear,
+    Qwen36LinearAttentionState, Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights,
+    Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage,
+    Qwen36TextModel, Sm12xGateUpWorkspace, maybe_round_device_f32_to_bf16,
 };
 use crate::nvfp4::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
@@ -154,6 +154,17 @@ impl BatchLinearPlan {
     }
 }
 
+fn new_batch_linear_plan(
+    model: &Qwen36TextModel,
+    linear: &Qwen36Linear,
+    capacity: usize,
+) -> Result<Option<BatchLinearPlan>> {
+    match linear {
+        Qwen36Linear::Fp8(linear) => Ok(Some(BatchLinearPlan::new(model, linear, capacity)?)),
+        Qwen36Linear::Bf16(_) => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_fp8_batch(
     model: &Qwen36TextModel,
@@ -207,6 +218,44 @@ fn run_fp8_batch(
     maybe_round_device_f32_to_bf16(output, stream)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_linear_batch(
+    model: &Qwen36TextModel,
+    linear: &Qwen36Linear,
+    plan: &mut Option<BatchLinearPlan>,
+    raw_input: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    rows: usize,
+    w8a16_threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    match linear {
+        Qwen36Linear::Fp8(linear) => run_fp8_batch(
+            model,
+            linear,
+            plan.as_mut().expect("FP8 projection has a batch plan"),
+            raw_input,
+            input,
+            input_scale,
+            output,
+            rows,
+            w8a16_threads,
+            stream,
+        ),
+        Qwen36Linear::Bf16(linear) => bf16_linear_logits_f32_batch_into_on_stream(
+            raw_input,
+            &linear.weight,
+            output.output(),
+            rows,
+            linear.rows,
+            linear.cols,
+            stream,
+        ),
+    }
+}
+
 struct BatchLinearAttentionWorkspace {
     hidden_quantized: DeviceBuffer<u8>,
     hidden_scale: DeviceBuffer<f32>,
@@ -229,9 +278,9 @@ struct BatchLinearAttentionWorkspace {
     gdn_output: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
-    qkv_plan: BatchLinearPlan,
-    z_plan: BatchLinearPlan,
-    out_plan: BatchLinearPlan,
+    qkv_plan: Option<BatchLinearPlan>,
+    z_plan: Option<BatchLinearPlan>,
+    out_plan: Option<BatchLinearPlan>,
 }
 
 impl BatchLinearAttentionWorkspace {
@@ -257,8 +306,8 @@ impl BatchLinearAttentionWorkspace {
             hidden_scale: DeviceBuffer::zeroed(row_capacity)?,
             value_quantized: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             value_scale: DeviceBuffer::zeroed(row_capacity)?,
-            qkv_output: DeviceBuffer::zeroed(row_capacity * weights.qkv.rows)?,
-            z_output: DeviceBuffer::zeroed(row_capacity * weights.z.rows)?,
+            qkv_output: DeviceBuffer::zeroed(row_capacity * weights.qkv.rows())?,
+            z_output: DeviceBuffer::zeroed(row_capacity * weights.z.rows())?,
             alpha: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
             beta_input: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
             gate: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
@@ -274,9 +323,9 @@ impl BatchLinearAttentionWorkspace {
             gdn_output: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             normed: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             output: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
-            qkv_plan: BatchLinearPlan::new(model, &weights.qkv, row_capacity)?,
-            z_plan: BatchLinearPlan::new(model, &weights.z, row_capacity)?,
-            out_plan: BatchLinearPlan::new(model, &weights.out, row_capacity)?,
+            qkv_plan: new_batch_linear_plan(model, &weights.qkv, row_capacity)?,
+            z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
+            out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
         })
     }
 
@@ -376,9 +425,18 @@ impl BatchLinearAttentionWorkspace {
             + self.gdn_output.device_bytes()
             + self.normed.device_bytes()
             + self.output.device_bytes()
-            + self.qkv_plan.device_bytes()
-            + self.z_plan.device_bytes()
-            + self.out_plan.device_bytes()
+            + self
+                .qkv_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .z_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .out_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
     }
 }
 
@@ -399,10 +457,10 @@ struct BatchFullAttentionWorkspace {
     gated_attention: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
     compact_attention: Sm12xKvAttentionWorkspace,
-    q_plan: BatchLinearPlan,
-    k_plan: BatchLinearPlan,
-    v_plan: BatchLinearPlan,
-    o_plan: BatchLinearPlan,
+    q_plan: Option<BatchLinearPlan>,
+    k_plan: Option<BatchLinearPlan>,
+    v_plan: Option<BatchLinearPlan>,
+    o_plan: Option<BatchLinearPlan>,
 }
 
 impl BatchFullAttentionWorkspace {
@@ -424,7 +482,7 @@ impl BatchFullAttentionWorkspace {
             hidden_scale: DeviceBuffer::zeroed(capacity)?,
             value_quantized: DeviceBuffer::zeroed(capacity * q_width)?,
             value_scale: DeviceBuffer::zeroed(capacity)?,
-            q_proj: DeviceBuffer::zeroed(capacity * weights.q.rows)?,
+            q_proj: DeviceBuffer::zeroed(capacity * weights.q.rows())?,
             k_raw: DeviceBuffer::zeroed(capacity * kv_width)?,
             v: DeviceBuffer::zeroed(capacity * kv_width)?,
             q: DeviceBuffer::zeroed(capacity * q_width)?,
@@ -436,10 +494,10 @@ impl BatchFullAttentionWorkspace {
             gated_attention: DeviceBuffer::zeroed(capacity * q_width)?,
             output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
             compact_attention,
-            q_plan: BatchLinearPlan::new(model, &weights.q, capacity)?,
-            k_plan: BatchLinearPlan::new(model, &weights.k, capacity)?,
-            v_plan: BatchLinearPlan::new(model, &weights.v, capacity)?,
-            o_plan: BatchLinearPlan::new(model, &weights.o, capacity)?,
+            q_plan: new_batch_linear_plan(model, &weights.q, capacity)?,
+            k_plan: new_batch_linear_plan(model, &weights.k, capacity)?,
+            v_plan: new_batch_linear_plan(model, &weights.v, capacity)?,
+            o_plan: new_batch_linear_plan(model, &weights.o, capacity)?,
         })
     }
 
@@ -460,10 +518,22 @@ impl BatchFullAttentionWorkspace {
             + self.gated_attention.device_bytes()
             + self.output.device_bytes()
             + self.compact_attention.device_bytes()
-            + self.q_plan.device_bytes()
-            + self.k_plan.device_bytes()
-            + self.v_plan.device_bytes()
-            + self.o_plan.device_bytes()
+            + self
+                .q_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .k_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .v_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .o_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
     }
 }
 
@@ -1044,7 +1114,7 @@ impl Qwen36TextModel {
             .expect("Qwen3.6 has full-attention layers");
         let first_moe = &self.layers.first().expect("Qwen3.6 has layers").moe;
         let lm_head_plan = match &self.lm_head {
-            Qwen36LmHead::Nvfp4(_) => None,
+            Qwen36LmHead::Nvfp4(_) | Qwen36LmHead::Bf16(_) => None,
             Qwen36LmHead::Fp8 { linear, .. } => Some(BatchLinearPlan::new(self, linear, capacity)?),
         };
         let mut moe_stream_sync = Vec::with_capacity(self.layers.len());
@@ -1413,6 +1483,15 @@ impl Qwen36TextModel {
                 workspace.capacity,
                 stream,
             )?,
+            Qwen36LmHead::Bf16(linear) => bf16_linear_logits_f32_batch_into_on_stream(
+                &workspace.final_hidden,
+                &linear.weight,
+                workspace.logits.output(),
+                workspace.capacity,
+                linear.rows,
+                linear.cols,
+                stream,
+            )?,
             Qwen36LmHead::Fp8 { linear, .. } => {
                 quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
                     &workspace.final_hidden,
@@ -1473,7 +1552,7 @@ impl Qwen36LinearAttentionWeights {
             model.manifest.hidden,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.qkv,
             &mut workspace.qkv_plan,
@@ -1485,7 +1564,7 @@ impl Qwen36LinearAttentionWeights {
             128,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.z,
             &mut workspace.z_plan,
@@ -1571,7 +1650,7 @@ impl Qwen36LinearAttentionWeights {
             value_dim,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.out,
             &mut workspace.out_plan,
@@ -1613,7 +1692,7 @@ impl Qwen36LinearAttentionWeights {
             model.manifest.hidden,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.qkv,
             &mut workspace.qkv_plan,
@@ -1625,7 +1704,7 @@ impl Qwen36LinearAttentionWeights {
             128,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.z,
             &mut workspace.z_plan,
@@ -1750,7 +1829,7 @@ impl Qwen36LinearAttentionWeights {
             value_dim,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.out,
             &mut workspace.out_plan,
@@ -1784,7 +1863,7 @@ impl Qwen36FullAttentionWeights {
             model.manifest.hidden,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.q,
             &mut workspace.q_plan,
@@ -1796,7 +1875,7 @@ impl Qwen36FullAttentionWeights {
             128,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.k,
             &mut workspace.k_plan,
@@ -1808,7 +1887,7 @@ impl Qwen36FullAttentionWeights {
             128,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.v,
             &mut workspace.v_plan,
@@ -1998,7 +2077,7 @@ impl Qwen36FullAttentionWeights {
             q_width,
             stream,
         )?;
-        run_fp8_batch(
+        run_linear_batch(
             model,
             &self.o,
             &mut workspace.o_plan,

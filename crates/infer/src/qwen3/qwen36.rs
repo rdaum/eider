@@ -72,10 +72,10 @@ pub enum Qwen36LayerWeights {
 
 /// Device-ready Qwen3.6 full-attention weights.
 pub struct Qwen36FullAttentionWeights {
-    q: Fp8Linear,
-    k: Fp8Linear,
-    v: Fp8Linear,
-    o: Fp8Linear,
+    q: Qwen36Linear,
+    k: Qwen36Linear,
+    v: Qwen36Linear,
+    o: Qwen36Linear,
     q_norm_weight: DeviceBuffer<f32>,
     k_norm_weight: DeviceBuffer<f32>,
 }
@@ -121,15 +121,15 @@ pub struct Qwen36FullAttentionStep<'a> {
 /// Device-ready Qwen3.6 Gated Delta Net layer weights.
 pub struct Qwen36LinearAttentionWeights {
     fp8: Rc<Qwen36LinearFp8Execution>,
-    qkv: Fp8Linear,
-    z: Fp8Linear,
+    qkv: Qwen36Linear,
+    z: Qwen36Linear,
     alpha: Bf16Linear,
     beta: Bf16Linear,
     conv_weight: DeviceBuffer<u16>,
     a_log: DeviceBuffer<u16>,
     dt_bias: DeviceBuffer<u16>,
     norm_weight: DeviceBuffer<f32>,
-    out: Fp8Linear,
+    out: Qwen36Linear,
 }
 
 /// Mutable one-token decode workspace for a Qwen3.6 Gated Delta Net layer.
@@ -180,6 +180,11 @@ struct Fp8Linear {
     weight_scale: f32,
     channel_weight_scale: Option<DeviceBuffer<f32>>,
     input_scale: Option<f32>,
+}
+
+enum Qwen36Linear {
+    Fp8(Fp8Linear),
+    Bf16(Bf16Linear),
 }
 
 struct Qwen36LinearFp8Plans {
@@ -436,11 +441,6 @@ impl Qwen36FullAttentionWeights {
         layer: usize,
     ) -> Result<Self> {
         let prefix = format!("{}.layers.{layer}.self_attn", manifest.tensor_prefix);
-        let q = Fp8Linear::from_host(&checkpoint.load_fp8_linear(&format!("{prefix}.q_proj"))?)?;
-        let k = Fp8Linear::from_host(&checkpoint.load_fp8_linear(&format!("{prefix}.k_proj"))?)?;
-        let v = Fp8Linear::from_host(&checkpoint.load_fp8_linear(&format!("{prefix}.v_proj"))?)?;
-        let o = Fp8Linear::from_host(&checkpoint.load_fp8_linear(&format!("{prefix}.o_proj"))?)?;
-
         let expected_q_rows = manifest
             .q_heads
             .checked_mul(manifest.head_dim)
@@ -464,6 +464,30 @@ impl Qwen36FullAttentionWeights {
                     manifest.kv_heads, manifest.head_dim
                 ),
             })?;
+        let q = Qwen36Linear::load(
+            checkpoint,
+            &format!("{prefix}.q_proj"),
+            expected_q_rows,
+            manifest.hidden,
+        )?;
+        let k = Qwen36Linear::load(
+            checkpoint,
+            &format!("{prefix}.k_proj"),
+            expected_kv_rows,
+            manifest.hidden,
+        )?;
+        let v = Qwen36Linear::load(
+            checkpoint,
+            &format!("{prefix}.v_proj"),
+            expected_kv_rows,
+            manifest.hidden,
+        )?;
+        let o = Qwen36Linear::load(
+            checkpoint,
+            &format!("{prefix}.o_proj"),
+            manifest.hidden,
+            manifest.q_heads * manifest.head_dim,
+        )?;
         q.require_shape(expected_q_rows, manifest.hidden, "Qwen3.6 q_proj")?;
         k.require_shape(expected_kv_rows, manifest.hidden, "Qwen3.6 k_proj")?;
         v.require_shape(expected_kv_rows, manifest.hidden, "Qwen3.6 v_proj")?;
@@ -493,7 +517,7 @@ impl Qwen36FullAttentionWeights {
 
     /// Returns `(q_rows, k_rows, v_rows, o_rows)` for inspection/probes.
     pub fn projection_rows(&self) -> (usize, usize, usize, usize) {
-        (self.q.rows, self.k.rows, self.v.rows, self.o.rows)
+        (self.q.rows(), self.k.rows(), self.v.rows(), self.o.rows())
     }
 
     /// Returns `(q_norm_len, k_norm_len)`.
@@ -503,7 +527,7 @@ impl Qwen36FullAttentionWeights {
 
     /// Returns output width.
     pub fn output_width(&self) -> usize {
-        self.o.rows
+        self.o.rows()
     }
 
     fn run_qkv_projections(
@@ -512,25 +536,28 @@ impl Qwen36FullAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let static_scales = self.q.channel_weight_scale.is_none()
-            && self.k.channel_weight_scale.is_none()
-            && self.v.channel_weight_scale.is_none();
-        if static_scales && std::env::var_os("QWEN36_FP8_W8A8").is_none() {
+        if let (Qwen36Linear::Fp8(q), Qwen36Linear::Fp8(k), Qwen36Linear::Fp8(v)) =
+            (&self.q, &self.k, &self.v)
+            && q.channel_weight_scale.is_none()
+            && k.channel_weight_scale.is_none()
+            && v.channel_weight_scale.is_none()
+            && std::env::var_os("QWEN36_FP8_W8A8").is_none()
+        {
             fp8_linear_triple_configured_f32_into_on_stream(
                 hidden,
-                &self.q.weight,
-                &self.k.weight,
-                &self.v.weight,
+                &q.weight,
+                &k.weight,
+                &v.weight,
                 workspace.q_proj_output.output(),
                 workspace.k.output(),
                 workspace.v.output(),
-                self.q.rows,
-                self.k.rows,
-                self.v.rows,
-                self.q.cols,
-                self.q.weight_scale,
-                self.k.weight_scale,
-                self.v.weight_scale,
+                q.rows,
+                k.rows,
+                v.rows,
+                q.cols,
+                q.weight_scale,
+                k.weight_scale,
+                v.weight_scale,
                 128,
                 stream,
             )?;
@@ -770,14 +797,34 @@ impl Qwen36LinearAttentionWeights {
         let key_heads = linear.key_heads;
         let value_heads = linear.value_heads;
         let head_v_dim = linear.value_head_dim;
-        let qkv_host = checkpoint.load_fp8_linear(&format!("{prefix}.in_proj_qkv"))?;
-        let z_host = checkpoint.load_fp8_linear(&format!("{prefix}.in_proj_z"))?;
-        let out_host = checkpoint.load_fp8_linear(&format!("{prefix}.out_proj"))?;
+        let key_dim = key_heads * linear.key_head_dim;
+        let value_dim = value_heads * head_v_dim;
+        let qkv_rows = key_dim * 2 + value_dim;
+        let qkv = Qwen36Linear::load(
+            checkpoint,
+            &format!("{prefix}.in_proj_qkv"),
+            qkv_rows,
+            manifest.hidden,
+        )?;
+        let z = Qwen36Linear::load_reordered_v_rows(
+            checkpoint,
+            &format!("{prefix}.in_proj_z"),
+            value_heads,
+            head_v_dim,
+            manifest.hidden,
+            key_heads,
+        )?;
+        let out = Qwen36Linear::load_reordered_v_cols(
+            checkpoint,
+            &format!("{prefix}.out_proj"),
+            manifest.hidden,
+            value_heads,
+            head_v_dim,
+            key_heads,
+        )?;
 
         // Reorder V heads from grouped-by-K to tiled order for tensors consumed after GDN prep.
         // qkv/conv stay in checkpoint order; qwen36_gdn_prep reorders V after depthwise conv.
-        let z_host = reorder_fp8_v_rows(z_host, key_heads, value_heads, head_v_dim);
-        let out_host = reorder_fp8_v_cols(out_host, key_heads, value_heads, head_v_dim);
 
         // Alpha/beta: BF16 [value_heads, hidden] — reorder rows
         let alpha_host = reorder_bf16_rows(
@@ -805,7 +852,7 @@ impl Qwen36LinearAttentionWeights {
         let conv_host = read_bf16_flat_host(
             checkpoint,
             &format!("{prefix}.conv1d.weight"),
-            qkv_host.out_features * linear.conv_kernel,
+            qkv_rows * linear.conv_kernel,
         )?;
 
         // A_log / dt_bias: BF16 [value_heads] — reorder elements
@@ -817,8 +864,8 @@ impl Qwen36LinearAttentionWeights {
 
         Ok(Self {
             fp8,
-            qkv: Fp8Linear::from_host(&qkv_host)?,
-            z: Fp8Linear::from_host(&z_host)?,
+            qkv,
+            z,
             alpha: Bf16Linear::from_host(&alpha_host, value_heads, manifest.hidden)?,
             beta: Bf16Linear::from_host(&beta_host, value_heads, manifest.hidden)?,
             conv_weight: DeviceBuffer::from_host(&conv_host)?,
@@ -829,7 +876,7 @@ impl Qwen36LinearAttentionWeights {
                 &format!("{prefix}.norm.weight"),
                 linear.value_head_dim,
             )?,
-            out: Fp8Linear::from_host(&out_host)?,
+            out,
         })
     }
 
@@ -839,8 +886,17 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let Some(plans) = self.fp8.plans.as_ref() else {
+        let Qwen36Linear::Fp8(qkv) = &self.qkv else {
             return self.qkv.run_into(
+                hidden,
+                &mut workspace.qkv_output,
+                &mut workspace.fp8_dynamic_input,
+                &mut workspace.fp8_dynamic_input_scale,
+                stream,
+            );
+        };
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return qkv.run_into(
                 hidden,
                 &mut workspace.qkv_output,
                 &mut workspace.fp8_dynamic_input,
@@ -854,7 +910,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.fp8_dynamic_input_scale,
             stream,
         )?;
-        self.qkv.run_prequantized_channel_scaled_with_plan_into(
+        qkv.run_prequantized_channel_scaled_with_plan_into(
             &self.fp8,
             &plans.qkv,
             &workspace.fp8_dynamic_input,
@@ -870,7 +926,7 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let Some(plans) = self.fp8.plans.as_ref() else {
+        let Qwen36Linear::Fp8(z) = &self.z else {
             return self.z.run_into(
                 hidden,
                 &mut workspace.z_output,
@@ -879,7 +935,16 @@ impl Qwen36LinearAttentionWeights {
                 stream,
             );
         };
-        self.z.run_prequantized_channel_scaled_with_plan_into(
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return z.run_into(
+                hidden,
+                &mut workspace.z_output,
+                &mut workspace.fp8_dynamic_input,
+                &mut workspace.fp8_dynamic_input_scale,
+                stream,
+            );
+        };
+        z.run_prequantized_channel_scaled_with_plan_into(
             &self.fp8,
             &plans.z,
             &workspace.fp8_dynamic_input,
@@ -895,21 +960,36 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let static_scales = self.fp8.plans.is_none()
-            && self.qkv.channel_weight_scale.is_none()
-            && self.z.channel_weight_scale.is_none();
-        if static_scales && std::env::var_os("QWEN36_FP8_W8A8").is_none() {
-            fp8_linear_pair_configured_f32_into_on_stream(
+        if let (Qwen36Linear::Bf16(qkv), Qwen36Linear::Bf16(z)) = (&self.qkv, &self.z) {
+            return bf16_linear_pair_logits_f32_into_on_stream(
                 hidden,
-                &self.qkv.weight,
-                &self.z.weight,
+                &qkv.weight,
+                &z.weight,
                 workspace.qkv_output.output(),
                 workspace.z_output.output(),
-                self.qkv.rows,
-                self.z.rows,
-                self.qkv.cols,
-                self.qkv.weight_scale,
-                self.z.weight_scale,
+                qkv.rows,
+                z.rows,
+                qkv.cols,
+                stream,
+            );
+        }
+        if let (Qwen36Linear::Fp8(qkv), Qwen36Linear::Fp8(z)) = (&self.qkv, &self.z)
+            && self.fp8.plans.is_none()
+            && qkv.channel_weight_scale.is_none()
+            && z.channel_weight_scale.is_none()
+            && std::env::var_os("QWEN36_FP8_W8A8").is_none()
+        {
+            fp8_linear_pair_configured_f32_into_on_stream(
+                hidden,
+                &qkv.weight,
+                &z.weight,
+                workspace.qkv_output.output(),
+                workspace.z_output.output(),
+                qkv.rows,
+                z.rows,
+                qkv.cols,
+                qkv.weight_scale,
+                z.weight_scale,
                 128,
                 stream,
             )?;
@@ -945,8 +1025,17 @@ impl Qwen36LinearAttentionWeights {
         workspace: &mut Qwen36LinearAttentionWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        let Some(plans) = self.fp8.plans.as_ref() else {
+        let Qwen36Linear::Fp8(out) = &self.out else {
             return self.out.run_into(
+                &workspace.normed,
+                &mut workspace.output,
+                &mut workspace.fp8_value_input,
+                &mut workspace.fp8_value_input_scale,
+                stream,
+            );
+        };
+        let Some(plans) = self.fp8.plans.as_ref() else {
+            return out.run_into(
                 &workspace.normed,
                 &mut workspace.output,
                 &mut workspace.fp8_dynamic_input,
@@ -960,7 +1049,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.fp8_value_input_scale,
             stream,
         )?;
-        self.out.run_prequantized_channel_scaled_with_plan_into(
+        out.run_prequantized_channel_scaled_with_plan_into(
             &self.fp8,
             &plans.out,
             &workspace.fp8_value_input,
@@ -1131,7 +1220,7 @@ impl Qwen36LinearAttentionWeights {
 
     /// Returns output width.
     pub fn output_width(&self) -> usize {
-        self.out.rows
+        self.out.rows()
     }
 }
 
@@ -1149,8 +1238,8 @@ impl Qwen36LinearAttentionWorkspace {
             fp8_dynamic_input_scale: DeviceBuffer::zeroed(1)?,
             fp8_value_input: DeviceBuffer::zeroed(value_dim)?,
             fp8_value_input_scale: DeviceBuffer::zeroed(1)?,
-            qkv_output: DeviceBuffer::zeroed(weights.qkv.rows)?,
-            z_output: DeviceBuffer::zeroed(weights.z.rows)?,
+            qkv_output: DeviceBuffer::zeroed(weights.qkv.rows())?,
+            z_output: DeviceBuffer::zeroed(weights.z.rows())?,
             alpha: DeviceBuffer::zeroed(linear.value_heads)?,
             beta_input: DeviceBuffer::zeroed(linear.value_heads)?,
             gate: DeviceBuffer::zeroed(linear.value_heads)?,
@@ -1172,7 +1261,7 @@ impl Qwen36LinearAttentionState {
         weights: &Qwen36LinearAttentionWeights,
     ) -> Result<Self> {
         Ok(Self {
-            conv_state: DeviceBuffer::zeroed(weights.qkv.rows * (linear.conv_kernel - 1))?,
+            conv_state: DeviceBuffer::zeroed(weights.qkv.rows() * (linear.conv_kernel - 1))?,
             recurrent_state: DeviceBuffer::zeroed(
                 linear.value_heads * linear.value_head_dim * linear.value_head_dim,
             )?,
@@ -1203,7 +1292,7 @@ impl Qwen36FullAttentionWorkspace {
         Ok(Self {
             fp8_dynamic_input: DeviceBuffer::zeroed(manifest.hidden.max(q_width))?,
             fp8_dynamic_input_scale: DeviceBuffer::zeroed(1)?,
-            q_proj_output: DeviceBuffer::zeroed(weights.q.rows)?,
+            q_proj_output: DeviceBuffer::zeroed(weights.q.rows())?,
             q_normed: DeviceBuffer::zeroed(q_width)?,
             gate: DeviceBuffer::zeroed(q_width)?,
             k: DeviceBuffer::zeroed(kv_width)?,
@@ -1373,13 +1462,112 @@ impl Fp8Linear {
         )?;
         maybe_round_device_f32_to_bf16(output, stream)
     }
+}
+
+impl Qwen36Linear {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let weight_name = format!("{prefix}.weight");
+        let info = checkpoint.tensor_info(&weight_name)?;
+        let linear = if info.dtype == "BF16" {
+            Self::Bf16(Bf16Linear::load(checkpoint, &weight_name, rows, cols)?)
+        } else {
+            Self::Fp8(Fp8Linear::from_host(&checkpoint.load_fp8_linear(prefix)?)?)
+        };
+        linear.require_shape(rows, cols, "Qwen3.5 projection")?;
+        Ok(linear)
+    }
+
+    fn load_reordered_v_rows(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        value_heads: usize,
+        head_dim: usize,
+        cols: usize,
+        key_heads: usize,
+    ) -> Result<Self> {
+        let rows = value_heads * head_dim;
+        let weight_name = format!("{prefix}.weight");
+        let info = checkpoint.tensor_info(&weight_name)?;
+        if info.dtype == "BF16" {
+            let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
+            let host = reorder_bf16_v_rows(host, key_heads, value_heads, head_dim);
+            return Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?));
+        }
+        let host = checkpoint.load_fp8_linear(prefix)?;
+        Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_rows(
+            host,
+            key_heads,
+            value_heads,
+            head_dim,
+        ))?))
+    }
+
+    fn load_reordered_v_cols(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        value_heads: usize,
+        head_dim: usize,
+        key_heads: usize,
+    ) -> Result<Self> {
+        let cols = value_heads * head_dim;
+        let weight_name = format!("{prefix}.weight");
+        let info = checkpoint.tensor_info(&weight_name)?;
+        if info.dtype == "BF16" {
+            let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
+            let host = reorder_bf16_v_cols(host, rows, key_heads, value_heads, head_dim);
+            return Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?));
+        }
+        let host = checkpoint.load_fp8_linear(prefix)?;
+        Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_cols(
+            host,
+            key_heads,
+            value_heads,
+            head_dim,
+        ))?))
+    }
+
+    fn rows(&self) -> usize {
+        match self {
+            Self::Fp8(linear) => linear.rows,
+            Self::Bf16(linear) => linear.rows,
+        }
+    }
+
+    fn cols(&self) -> usize {
+        match self {
+            Self::Fp8(linear) => linear.cols,
+            Self::Bf16(linear) => linear.cols,
+        }
+    }
+
+    fn run_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        dynamic_input: &mut DeviceBuffer<u8>,
+        dynamic_input_scale: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Fp8(linear) => {
+                linear.run_into(input, output, dynamic_input, dynamic_input_scale, stream)
+            }
+            Self::Bf16(linear) => linear.run_into(input, output, stream),
+        }
+    }
 
     fn require_shape(&self, rows: usize, cols: usize, label: &'static str) -> Result<()> {
-        if self.rows != rows || self.cols != cols {
+        if self.rows() != rows || self.cols() != cols {
             return Err(Error::Shape {
                 label,
                 expected: format!("rows={rows} cols={cols}"),
-                actual: format!("rows={} cols={}", self.rows, self.cols),
+                actual: format!("rows={} cols={}", self.rows(), self.cols()),
             });
         }
         Ok(())
@@ -1530,6 +1718,58 @@ fn reorder_bf16_rows(data: Vec<u16>, key_heads: usize, value_heads: usize) -> Ve
         let v_sub = v_k_head % v_per_k;
         let dst = (v_sub * key_heads + k_head) * cols;
         out[dst..dst + cols].copy_from_slice(row);
+    }
+    out
+}
+
+/// Reorders grouped V-head blocks in a BF16 matrix `[value_heads * head_dim, cols]`.
+fn reorder_bf16_v_rows(
+    data: Vec<u16>,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+) -> Vec<u16> {
+    if key_heads == value_heads {
+        return data;
+    }
+    let cols = data.len() / (value_heads * head_dim);
+    let rows_per_head = head_dim * cols;
+    let v_per_k = value_heads / key_heads;
+    let mut out = vec![0u16; data.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let src = v_k_head * rows_per_head;
+        let dst = (v_sub * key_heads + k_head) * rows_per_head;
+        out[dst..dst + rows_per_head].copy_from_slice(&data[src..src + rows_per_head]);
+    }
+    out
+}
+
+/// Reorders grouped V-head blocks in a BF16 matrix `[rows, value_heads * head_dim]`.
+fn reorder_bf16_v_cols(
+    data: Vec<u16>,
+    rows: usize,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+) -> Vec<u16> {
+    if key_heads == value_heads {
+        return data;
+    }
+    let cols = value_heads * head_dim;
+    let v_per_k = value_heads / key_heads;
+    let mut out = vec![0u16; data.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let src_col = v_k_head * head_dim;
+        let dst_col = (v_sub * key_heads + k_head) * head_dim;
+        for row in 0..rows {
+            let src = row * cols + src_col;
+            let dst = row * cols + dst_col;
+            out[dst..dst + head_dim].copy_from_slice(&data[src..src + head_dim]);
+        }
     }
     out
 }
@@ -5241,6 +5481,7 @@ pub struct Qwen36TextModel {
 
 enum Qwen36LmHead {
     Nvfp4(Nvfp4DeviceLinear),
+    Bf16(Bf16Linear),
     Fp8 {
         linear: Fp8Linear,
         plan: Box<Fp8TnMatmulPlan>,
@@ -5251,6 +5492,21 @@ impl Qwen36LmHead {
     fn load(checkpoint: &ModelOptCheckpoint, lt: &CublasLt) -> Result<Self> {
         if checkpoint.contains_tensor("lm_head.weight_scale_2") {
             Ok(Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, "lm_head")?))
+        } else if checkpoint.tensor_info("lm_head.weight")?.dtype == "BF16" {
+            let info = checkpoint.tensor_info("lm_head.weight")?;
+            let [rows, cols] = info.shape.as_slice() else {
+                return Err(Error::Shape {
+                    label: "Qwen3.5 BF16 lm_head",
+                    expected: "two-dimensional weight".to_string(),
+                    actual: format!("shape={:?}", info.shape),
+                });
+            };
+            Ok(Self::Bf16(Bf16Linear::load(
+                checkpoint,
+                "lm_head.weight",
+                *rows,
+                *cols,
+            )?))
         } else {
             let linear = Fp8Linear::from_host(&checkpoint.load_fp8_linear("lm_head")?)?;
             let plan =
@@ -5265,6 +5521,7 @@ impl Qwen36LmHead {
     fn shape(&self) -> (usize, usize) {
         match self {
             Self::Nvfp4(linear) => (linear.out_features, linear.in_features),
+            Self::Bf16(linear) => (linear.rows, linear.cols),
             Self::Fp8 { linear, .. } => (linear.rows, linear.cols),
         }
     }
@@ -5278,6 +5535,7 @@ impl Qwen36LmHead {
     ) -> Result<()> {
         match self {
             Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
+            Self::Bf16(linear) => linear.run_into(input, &mut workspace.logits, stream),
             Self::Fp8 { linear, plan } => {
                 Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)
             }
@@ -5305,6 +5563,15 @@ impl Qwen36LmHead {
                 linear.weight_scale_2,
                 stream,
             ),
+            Self::Bf16(linear) => {
+                linear.run_into(input, &mut workspace.logits, stream)?;
+                argmax_f32_into_on_stream(
+                    &workspace.logits,
+                    workspace.next_index.output(),
+                    workspace.next_value.output(),
+                    stream,
+                )
+            }
             Self::Fp8 { linear, plan } => {
                 Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)?;
                 argmax_f32_into_on_stream(
@@ -5991,7 +6258,7 @@ impl Qwen36TextModel {
 
 #[cfg(test)]
 mod tests {
-    use super::reorder_fp8_v_rows;
+    use super::{reorder_bf16_v_cols, reorder_bf16_v_rows, reorder_fp8_v_rows};
     use crate::nvfp4::ModelOptFp8Linear;
 
     #[test]
@@ -6011,6 +6278,30 @@ mod tests {
         assert_eq!(
             reordered.channel_weight_scale,
             Some(vec![100.0, 101.0, 104.0, 105.0, 102.0, 103.0, 106.0, 107.0])
+        );
+    }
+
+    #[test]
+    fn reorder_bf16_v_rows_moves_complete_head_blocks() {
+        let reordered = reorder_bf16_v_rows((0..16).collect(), 2, 4, 2);
+        assert_eq!(
+            reordered,
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15]
+        );
+    }
+
+    #[test]
+    fn reorder_bf16_v_cols_moves_complete_head_blocks_per_row() {
+        let reordered = reorder_bf16_v_cols(
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17],
+            2,
+            2,
+            4,
+            2,
+        );
+        assert_eq!(
+            reordered,
+            vec![0, 1, 4, 5, 2, 3, 6, 7, 10, 11, 14, 15, 12, 13, 16, 17]
         );
     }
 }
