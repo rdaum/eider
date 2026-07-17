@@ -10,10 +10,10 @@ use super::scheduler::{RequestConfig, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::nemotron3::{
-    Nemotron3DecodeState, Nemotron3Model, Nemotron3MtpWorkspace, Nemotron3SequenceCheckpoint,
-    Nemotron3SpeculativeCycleWorkspace,
+    Nemotron3BlockWorkspace, Nemotron3DecodeState, Nemotron3Model, Nemotron3MtpWorkspace,
+    Nemotron3SequenceCheckpoint, Nemotron3SpeculativeCycleWorkspace,
 };
-use nvfp4::{Error, Result};
+use nvfp4::{DeviceBuffer, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 use tracing::warn;
@@ -99,6 +99,36 @@ struct ActiveRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
+struct Nemotron3PrefillWorkspace {
+    target: Nemotron3BlockWorkspace,
+    previous_hidden: DeviceBuffer<f32>,
+    mtp: Option<Nemotron3MtpWorkspace>,
+    mtp_hidden: Option<DeviceBuffer<f32>>,
+}
+
+impl Nemotron3PrefillWorkspace {
+    fn new(
+        model: &Nemotron3Model,
+        sequence_count: usize,
+        rows: usize,
+        mtp_sequence_count: usize,
+        mtp_rows: usize,
+    ) -> Result<Self> {
+        let hidden = model.manifest().hidden_size;
+        let mtp = (mtp_rows != 0)
+            .then(|| model.mtp_workspace(mtp_sequence_count, mtp_rows))
+            .transpose()?;
+        Ok(Self {
+            target: model.block_workspace(sequence_count, rows)?,
+            previous_hidden: DeviceBuffer::zeroed(sequence_count * hidden)?,
+            mtp,
+            mtp_hidden: (mtp_rows != 0)
+                .then(|| DeviceBuffer::zeroed(mtp_rows * hidden))
+                .transpose()?,
+        })
+    }
+}
+
 /// Checkpoint prompt rendering and round-robin multi-session Nemotron execution.
 pub struct Nemotron3ChatService<'model, 'template> {
     model: &'model Nemotron3Model,
@@ -109,7 +139,8 @@ pub struct Nemotron3ChatService<'model, 'template> {
     requests: BTreeMap<Nemotron3RequestId, ActiveRequest<'template>>,
     active_sequences: usize,
     prefix_cache: Option<PrefixCache<Nemotron3SequenceCheckpoint>>,
-    mtp_prefill_workspace: Option<Nemotron3MtpWorkspace>,
+    mtp_token_workspace: Option<Nemotron3MtpWorkspace>,
+    prefill_workspaces: BTreeMap<(usize, usize, usize, usize), Nemotron3PrefillWorkspace>,
     speculative_workspaces: BTreeMap<usize, Nemotron3SpeculativeCycleWorkspace>,
 }
 
@@ -141,10 +172,11 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             active_sequences: 0,
             prefix_cache: (prefix_cache.max_device_bytes != 0)
                 .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
-            mtp_prefill_workspace: model
+            mtp_token_workspace: model
                 .has_mtp()
                 .then(|| model.mtp_workspace(1, 1))
                 .transpose()?,
+            prefill_workspaces: BTreeMap::new(),
             speculative_workspaces: BTreeMap::new(),
         })
     }
@@ -283,48 +315,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .map(|(&id, _)| id)
             .take(self.config.prefill_sequence_capacity)
             .collect::<Vec<_>>();
-        let mut token_budget = self.config.prefill_token_capacity;
-        let mut prefill_progress = BTreeMap::new();
-        while token_budget != 0 {
-            let mut progressed = false;
-            for &id in &prefill_ids {
-                if token_budget == 0 {
-                    break;
-                }
-                let checkpoint = {
-                    let request = self.requests.get_mut(&id).expect("prefill request exists");
-                    if request.prompt_position + 1 >= request.prompt.len() {
-                        continue;
-                    }
-                    let token = request.prompt[request.prompt_position];
-                    let state = request.state.as_mut().expect("admitted request has state");
-                    if let Some(workspace) = self.mtp_prefill_workspace.as_mut() {
-                        self.model
-                            .append_mtp_prompt_token(state, token, workspace)?;
-                    }
-                    self.model.forward_one(state, token)?;
-                    request.prompt_position += 1;
-                    prefill_progress.insert(id, request.prompt_position);
-                    request.prompt_position == request.prefix_cache_target
-                };
-                if checkpoint {
-                    let mut request = self.requests.remove(&id).expect("prefill request exists");
-                    self.retain_request_checkpoint(&mut request);
-                    self.requests.insert(id, request);
-                }
-                token_budget -= 1;
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-        }
-        for (id, position) in prefill_progress {
-            tick.prefilled.push(Nemotron3PrefillProgress {
-                request_id: id,
-                prompt_position: position,
-            });
-        }
+        self.prefill_blocks(&prefill_ids, &mut tick)?;
 
         for (&id, request) in &self.requests {
             if request.state.is_some() && request.generation.max_new_tokens == 0 {
@@ -391,6 +382,138 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         Ok(())
     }
 
+    fn prefill_blocks(
+        &mut self,
+        ids: &[Nemotron3RequestId],
+        tick: &mut Nemotron3Tick,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut remaining_budget = self.config.prefill_token_capacity;
+        let mut selected = Vec::new();
+        for (index, &id) in ids.iter().enumerate() {
+            let request = self.requests.get(&id).expect("prefill request exists");
+            let remaining_sequences = ids.len() - index;
+            let available = request
+                .prompt
+                .len()
+                .saturating_sub(request.prompt_position + 1);
+            let before_checkpoint = if request.prefix_cache_checkpointed {
+                available
+            } else {
+                request
+                    .prefix_cache_target
+                    .saturating_sub(request.prompt_position)
+            };
+            let rows = available
+                .min(before_checkpoint)
+                .min(remaining_budget.div_ceil(remaining_sequences));
+            if rows == 0 {
+                continue;
+            }
+            selected.push((
+                id,
+                request.prompt_position,
+                request.prompt[request.prompt_position..request.prompt_position + rows].to_vec(),
+            ));
+            remaining_budget -= rows;
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+
+        let sequence_count = selected.len();
+        let rows = selected
+            .iter()
+            .map(|(_, _, chunk)| chunk.len())
+            .sum::<usize>();
+        let mtp_rows = selected
+            .iter()
+            .map(|(_, start, chunk)| chunk.len().saturating_sub(usize::from(*start == 0)))
+            .sum::<usize>();
+        let mtp_sequence_count = selected
+            .iter()
+            .filter(|(_, start, chunk)| chunk.len() > usize::from(*start == 0))
+            .count();
+        let key = (sequence_count, rows, mtp_sequence_count, mtp_rows);
+        if !self.prefill_workspaces.contains_key(&key) {
+            self.prefill_workspaces.insert(
+                key,
+                Nemotron3PrefillWorkspace::new(
+                    self.model,
+                    sequence_count,
+                    rows,
+                    mtp_sequence_count,
+                    mtp_rows,
+                )?,
+            );
+        }
+        let workspace = self
+            .prefill_workspaces
+            .get_mut(&key)
+            .expect("prefill workspace was inserted");
+        let mut requests = selected
+            .iter()
+            .map(|(id, _, _)| {
+                (
+                    *id,
+                    self.requests.remove(id).expect("prefill request exists"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chunks = selected
+            .iter()
+            .map(|(_, _, chunk)| chunk.as_slice())
+            .collect::<Vec<_>>();
+        let starts = selected
+            .iter()
+            .map(|(_, start, _)| *start)
+            .collect::<Vec<_>>();
+        let mut states = requests
+            .iter_mut()
+            .map(|(_, request)| request.state.as_mut().expect("prefill request has state"))
+            .collect::<Vec<_>>();
+        self.model
+            .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
+        self.model
+            .forward_block(&mut states, &chunks, &mut workspace.target)?;
+        if let (Some(mtp), Some(mtp_hidden)) = (&mut workspace.mtp, &mut workspace.mtp_hidden) {
+            let offsets = selected
+                .iter()
+                .scan(0usize, |offset, (_, _, chunk)| {
+                    let current = *offset;
+                    *offset += chunk.len();
+                    Some(u32::try_from(current).expect("prefill row offsets fit u32"))
+                })
+                .collect::<Vec<_>>();
+            self.model.append_mtp_prompt_block(
+                &mut states,
+                &chunks,
+                &starts,
+                &offsets,
+                &workspace.previous_hidden,
+                workspace.target.final_hidden(),
+                mtp_hidden,
+                mtp,
+            )?;
+        }
+        drop(states);
+        for ((id, mut request), (_, _, chunk)) in requests.into_iter().zip(&selected) {
+            request.prompt_position += chunk.len();
+            let checkpoint = request.prompt_position == request.prefix_cache_target;
+            if checkpoint {
+                self.retain_request_checkpoint(&mut request);
+            }
+            tick.prefilled.push(Nemotron3PrefillProgress {
+                request_id: id,
+                prompt_position: request.prompt_position,
+            });
+            self.requests.insert(id, request);
+        }
+        Ok(())
+    }
+
     fn retain_request_checkpoint(&mut self, request: &mut ActiveRequest<'template>) {
         if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
             return;
@@ -434,7 +557,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .last_token
             .unwrap_or(request.prompt[request.prompt.len() - 1]);
         let state = request.state.as_mut().expect("admitted request has state");
-        if let Some(workspace) = self.mtp_prefill_workspace.as_mut() {
+        if let Some(workspace) = self.mtp_token_workspace.as_mut() {
             self.model
                 .append_mtp_prompt_token(state, input, workspace)?;
         }
