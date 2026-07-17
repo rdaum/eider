@@ -1,0 +1,280 @@
+use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
+use super::{Nemotron3LayerKind, Nemotron3Manifest};
+use nvfp4::{
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    nemotron3_mamba_conv_update_f32_into_on_stream,
+    nemotron3_mamba_state_update_f32_into_on_stream, rms_norm_f32_into_on_stream,
+};
+
+/// Device-resident weights for one Nemotron 3 Mamba-2 layer.
+pub struct Nemotron3MambaLayer {
+    layer: usize,
+    manifest: Nemotron3Manifest,
+    block_norm: DeviceBuffer<f32>,
+    in_proj: Nemotron3Linear,
+    conv_weight: DeviceBuffer<u16>,
+    conv_bias: DeviceBuffer<u16>,
+    a_log: DeviceBuffer<u16>,
+    d: DeviceBuffer<u16>,
+    dt_bias: DeviceBuffer<u16>,
+    mixer_norm: DeviceBuffer<u16>,
+    out_proj: Nemotron3Linear,
+}
+
+impl Nemotron3MambaLayer {
+    /// Loads one Mamba layer from a Nemotron 3 checkpoint.
+    pub fn load(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+    ) -> Result<Self> {
+        let kind = manifest
+            .layers
+            .get(layer)
+            .copied()
+            .ok_or_else(|| Error::Shape {
+                label: "Nemotron 3 Mamba layer index",
+                expected: format!("layer < {}", manifest.layers.len()),
+                actual: layer.to_string(),
+            })?;
+        if kind != Nemotron3LayerKind::Mamba {
+            return Err(Error::Format {
+                label: "Nemotron 3 Mamba layer",
+                detail: format!("layer {layer} is {}, not mamba", kind.as_str()),
+            });
+        }
+        let prefix = format!("backbone.layers.{layer}");
+        let mixer = format!("{prefix}.mixer");
+        let hidden = manifest.hidden_size;
+        let intermediate = manifest.mamba_intermediate_size();
+        let conv_channels = manifest.mamba_conv_channels();
+        let projection = manifest.mamba_projection_size();
+        Ok(Self {
+            layer,
+            manifest: manifest.clone(),
+            block_norm: load_bf16_as_f32(checkpoint, &format!("{prefix}.norm.weight"), &[hidden])?,
+            in_proj: Nemotron3Linear::load(
+                checkpoint,
+                &format!("{mixer}.in_proj"),
+                projection,
+                hidden,
+            )?,
+            conv_weight: load_bf16(
+                checkpoint,
+                &format!("{mixer}.conv1d.weight"),
+                &[conv_channels, 1, manifest.mamba_conv_kernel],
+            )?,
+            conv_bias: load_bf16(
+                checkpoint,
+                &format!("{mixer}.conv1d.bias"),
+                &[conv_channels],
+            )?,
+            a_log: load_bf16(
+                checkpoint,
+                &format!("{mixer}.A_log"),
+                &[manifest.mamba_heads],
+            )?,
+            d: load_bf16(checkpoint, &format!("{mixer}.D"), &[manifest.mamba_heads])?,
+            dt_bias: load_bf16(
+                checkpoint,
+                &format!("{mixer}.dt_bias"),
+                &[manifest.mamba_heads],
+            )?,
+            mixer_norm: load_bf16(checkpoint, &format!("{mixer}.norm.weight"), &[intermediate])?,
+            out_proj: Nemotron3Linear::load(
+                checkpoint,
+                &format!("{mixer}.out_proj"),
+                hidden,
+                intermediate,
+            )?,
+        })
+    }
+
+    /// Allocates the scratch buffers used for one-token execution.
+    pub fn workspace(&self) -> Result<Nemotron3MambaWorkspace> {
+        Nemotron3MambaWorkspace::new(&self.manifest)
+    }
+
+    /// Allocates an empty recurrent state for a new sequence.
+    pub fn sequence_state(&self) -> Result<Nemotron3MambaState> {
+        Nemotron3MambaState::new(&self.manifest)
+    }
+
+    /// Runs one token through pre-norm, Mamba-2, output projection, and residual add.
+    pub fn run_one_token(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MambaWorkspace,
+        state: &mut Nemotron3MambaState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if hidden.len() != self.manifest.hidden_size {
+            return Err(Error::Shape {
+                label: "Nemotron 3 Mamba hidden state",
+                expected: format!("{} values", self.manifest.hidden_size),
+                actual: format!("{} values", hidden.len()),
+            });
+        }
+        workspace.require_manifest(&self.manifest)?;
+        state.require_manifest(&self.manifest)?;
+        rms_norm_f32_into_on_stream(
+            1,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.in_proj
+            .run(&workspace.normed, &mut workspace.projected, stream)?;
+        nemotron3_mamba_conv_update_f32_into_on_stream(
+            &workspace.projected,
+            &self.conv_weight,
+            &self.conv_bias,
+            state.conv.inout(),
+            workspace.conv_output.output(),
+            self.manifest.mamba_intermediate_size(),
+            self.manifest.mamba_conv_channels(),
+            self.manifest.mamba_conv_kernel,
+            stream,
+        )?;
+        nemotron3_mamba_state_update_f32_into_on_stream(
+            &workspace.projected,
+            &workspace.conv_output,
+            &self.a_log,
+            &self.d,
+            &self.dt_bias,
+            &self.mixer_norm,
+            state.ssm.inout(),
+            workspace.mixer_output.output(),
+            self.manifest.mamba_heads,
+            self.manifest.mamba_head_dim,
+            self.manifest.mamba_groups,
+            self.manifest.mamba_state_size,
+            1.0e-4,
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.out_proj.run(
+            &workspace.mixer_output,
+            &mut workspace.projected_output,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            hidden,
+            &workspace.projected_output,
+            workspace.output.output(),
+            stream,
+        )
+    }
+
+    /// Returns the output buffer after [`Self::run_one_token`].
+    pub fn output<'a>(&self, workspace: &'a Nemotron3MambaWorkspace) -> &'a DeviceBuffer<f32> {
+        &workspace.output
+    }
+
+    /// Returns this layer's backbone index.
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// Returns bytes owned by the layer's device-resident weights.
+    pub fn device_bytes(&self) -> usize {
+        self.block_norm.device_bytes()
+            + self.in_proj.device_bytes()
+            + self.conv_weight.device_bytes()
+            + self.conv_bias.device_bytes()
+            + self.a_log.device_bytes()
+            + self.d.device_bytes()
+            + self.dt_bias.device_bytes()
+            + self.mixer_norm.device_bytes()
+            + self.out_proj.device_bytes()
+    }
+}
+
+/// One sequence's recurrent state for a Nemotron 3 Mamba layer.
+pub struct Nemotron3MambaState {
+    conv: DeviceBuffer<f32>,
+    ssm: DeviceBuffer<f32>,
+}
+
+impl Nemotron3MambaState {
+    fn new(manifest: &Nemotron3Manifest) -> Result<Self> {
+        Ok(Self {
+            conv: DeviceBuffer::zeroed(
+                manifest.mamba_conv_channels() * manifest.mamba_conv_kernel,
+            )?,
+            ssm: DeviceBuffer::zeroed(
+                manifest.mamba_intermediate_size() * manifest.mamba_state_size,
+            )?,
+        })
+    }
+
+    fn require_manifest(&self, manifest: &Nemotron3Manifest) -> Result<()> {
+        let conv = manifest.mamba_conv_channels() * manifest.mamba_conv_kernel;
+        let ssm = manifest.mamba_intermediate_size() * manifest.mamba_state_size;
+        if self.conv.len() == conv && self.ssm.len() == ssm {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 Mamba sequence state",
+            expected: format!("conv={conv} ssm={ssm}"),
+            actual: format!("conv={} ssm={}", self.conv.len(), self.ssm.len()),
+        })
+    }
+
+    /// Returns device bytes owned by this layer state.
+    pub fn device_bytes(&self) -> usize {
+        self.conv.device_bytes() + self.ssm.device_bytes()
+    }
+}
+
+/// Reusable one-token scratch storage for a Nemotron 3 Mamba layer.
+pub struct Nemotron3MambaWorkspace {
+    normed: DeviceBuffer<f32>,
+    projected: DeviceBuffer<f32>,
+    conv_output: DeviceBuffer<f32>,
+    mixer_output: DeviceBuffer<f32>,
+    projected_output: DeviceBuffer<f32>,
+    pub(super) output: DeviceBuffer<f32>,
+}
+
+impl Nemotron3MambaWorkspace {
+    fn new(manifest: &Nemotron3Manifest) -> Result<Self> {
+        Ok(Self {
+            normed: DeviceBuffer::zeroed(manifest.hidden_size)?,
+            projected: DeviceBuffer::zeroed(manifest.mamba_projection_size())?,
+            conv_output: DeviceBuffer::zeroed(manifest.mamba_conv_channels())?,
+            mixer_output: DeviceBuffer::zeroed(manifest.mamba_intermediate_size())?,
+            projected_output: DeviceBuffer::zeroed(manifest.hidden_size)?,
+            output: DeviceBuffer::zeroed(manifest.hidden_size)?,
+        })
+    }
+
+    fn require_manifest(&self, manifest: &Nemotron3Manifest) -> Result<()> {
+        if self.normed.len() == manifest.hidden_size
+            && self.projected.len() == manifest.mamba_projection_size()
+            && self.conv_output.len() == manifest.mamba_conv_channels()
+            && self.mixer_output.len() == manifest.mamba_intermediate_size()
+            && self.projected_output.len() == manifest.hidden_size
+            && self.output.len() == manifest.hidden_size
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 Mamba workspace",
+            expected: "buffers matching model manifest".to_string(),
+            actual: "workspace belongs to another manifest".to_string(),
+        })
+    }
+
+    pub(super) fn device_bytes(&self) -> usize {
+        self.normed.device_bytes()
+            + self.projected.device_bytes()
+            + self.conv_output.device_bytes()
+            + self.mixer_output.device_bytes()
+            + self.projected_output.device_bytes()
+            + self.output.device_bytes()
+    }
+}

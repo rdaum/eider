@@ -723,6 +723,19 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_sigmoid_topk_f32_on_stream(
+        logits: *const f32,
+        bias: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        experts: u32,
+        k: u32,
+        groups: u32,
+        topk_groups: u32,
+        normalize: i32,
+        scaling_factor: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_step37_sigmoid_top8_f32_batch_on_stream(
         logits: *const f32,
         bias: *const f32,
@@ -1666,6 +1679,40 @@ unsafe extern "C" {
         output: *mut f32,
         rows: u32,
         cols: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_relu_squared_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_conv_update_f32_on_stream(
+        projected: *const f32,
+        conv_weight_bf16: *const u16,
+        conv_bias_bf16: *const u16,
+        conv_state: *mut f32,
+        conv_output: *mut f32,
+        intermediate_size: u32,
+        conv_channels: u32,
+        conv_kernel: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_state_update_f32_on_stream(
+        projected: *const f32,
+        conv_output: *const f32,
+        a_log_bf16: *const u16,
+        d_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        norm_weight_bf16: *const u16,
+        ssm_state: *mut f32,
+        output: *mut f32,
+        heads: u32,
+        head_dim: u32,
+        groups: u32,
+        state_size: u32,
+        dt_floor: f32,
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;

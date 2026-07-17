@@ -3,13 +3,16 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::metrics::metrics as infer_metrics;
+use infer::nemotron3::Nemotron3Model;
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::{
-    Qwen36CancelOutcome, Qwen36PrefixCacheConfig, Qwen36RequestId, SchedulerConfig,
+use infer::runtime::nemotron3_serving::{
+    Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
 };
+use infer::runtime::prefix_cache::PrefixCacheConfig;
+use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, SchedulerConfig};
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
 use infer::runtime::step37_scheduler::{Step37CancelOutcome, Step37RequestId};
 use infer::runtime::step37_serving::Step37ChatService;
@@ -31,7 +34,7 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub scheduler: SchedulerConfig,
-    pub qwen_prefix_cache: Qwen36PrefixCacheConfig,
+    pub prefix_cache: PrefixCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
     pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
@@ -44,7 +47,7 @@ impl InferenceActorConfig {
         Self {
             model_dir: model_dir.into(),
             scheduler: SchedulerConfig::default(),
-            qwen_prefix_cache: Qwen36PrefixCacheConfig::default(),
+            prefix_cache: PrefixCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
             qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
@@ -195,7 +198,7 @@ fn actor_main(
     let InferenceActorConfig {
         model_dir,
         scheduler,
-        qwen_prefix_cache,
+        prefix_cache,
         qwen_bf16_storage,
         qwen_fp8_attention_storage,
         step_expert_capacity,
@@ -236,7 +239,7 @@ fn actor_main(
         CheckpointArchitecture::Qwen36 => {
             info!(
                 model_dir = %model_dir.display(),
-                prefix_cache_max_device_bytes = qwen_prefix_cache.max_device_bytes,
+                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
                 bf16_storage = ?qwen_bf16_storage,
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
                 "loading Qwen3.6 model"
@@ -256,7 +259,7 @@ fn actor_main(
                 &model,
                 &template,
                 scheduler,
-                qwen_prefix_cache,
+                prefix_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -271,6 +274,7 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 expert_capacity = step_expert_capacity,
+                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
                 bf16_storage = ?step_bf16_storage,
                 "loading Step-3.7 model"
             );
@@ -285,7 +289,12 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Step37ChatService::new(model, &template, scheduler) {
+            let service = match Step37ChatService::new_with_prefix_cache(
+                model,
+                &template,
+                scheduler,
+                prefix_cache,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -295,6 +304,28 @@ fn actor_main(
             let mut service = StepActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
+        CheckpointArchitecture::Nemotron3 => {
+            info!(
+                model_dir = %model_dir.display(),
+                "loading Nemotron 3 model"
+            );
+            let model = match Nemotron3Model::load(&model_dir) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let service = match Nemotron3ChatService::new(&model, &template, scheduler) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut service = NemotronActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
+        }
     }
 }
 
@@ -302,6 +333,7 @@ fn actor_main(
 enum CheckpointArchitecture {
     Qwen36,
     Step37,
+    Nemotron3,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +350,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
     match config.model_type.as_str() {
         "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
         "step3p7" => Ok(CheckpointArchitecture::Step37),
+        "nemotron_h" => Ok(CheckpointArchitecture::Nemotron3),
         other => Err(format!(
             "unsupported model_type {other:?} in {}",
             path.display()
@@ -519,7 +552,7 @@ impl ActorService for StepActorService<'_> {
                 .map(|progress| EngineAdmissionProgress {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
-                    cached_prompt_tokens: 0,
+                    cached_prompt_tokens: progress.cached_prompt_tokens,
                 })
                 .collect(),
             prefilled: tick
@@ -571,6 +604,107 @@ impl ActorService for StepActorService<'_> {
             },
             Step37CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
             Step37CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+struct NemotronActorService<'model, 'template> {
+    inner: Nemotron3ChatService<'model, 'template>,
+    ids: BTreeMap<u64, Nemotron3RequestId>,
+}
+
+impl<'model, 'template> NemotronActorService<'model, 'template> {
+    fn new(inner: Nemotron3ChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for NemotronActorService<'_, '_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
+        let tick = self.inner.tick()?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            admitted: tick
+                .admitted
+                .into_iter()
+                .map(|progress| EngineAdmissionProgress {
+                    request_id: progress.request_id.get(),
+                    sequence_device_bytes: progress.sequence_device_bytes,
+                    cached_prompt_tokens: progress.cached_prompt_tokens,
+                })
+                .collect(),
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Nemotron3RequestId::get)
+                .collect(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Nemotron3CancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            Nemotron3CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
@@ -1178,6 +1312,15 @@ mod tests {
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Qwen36
+        );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"nemotron_h"}"#,
+        )
+        .expect("write Nemotron config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Nemotron3
         );
         fs::remove_dir_all(directory).expect("remove checkpoint directory");
     }

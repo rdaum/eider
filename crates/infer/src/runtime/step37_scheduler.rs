@@ -1,12 +1,18 @@
 //! Multi-session scheduling for the paged Step-3.7 runtime.
 
+use super::prefix_cache::{
+    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
+};
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestFinishReason, RequestState, SchedulerConfig};
 use crate::step37::{
-    Step37DecodeState, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
+    Step37DecodeState, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37SequenceCheckpoint,
+    Step37TextModel,
 };
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
+use tracing::warn;
 
 /// Stable scheduler identity for one Step request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -46,6 +52,7 @@ pub struct Step37PrefillProgress {
 pub struct Step37AdmissionProgress {
     pub request_id: Step37RequestId,
     pub sequence_device_bytes: usize,
+    pub cached_prompt_tokens: usize,
 }
 
 /// Observable result of one multi-session Step scheduler iteration.
@@ -92,6 +99,9 @@ struct Step37Request {
     config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
+    prefix_cache_key: Option<PrefixCacheKey>,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
     sequence: Option<Box<Step37DecodeState>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
@@ -166,10 +176,19 @@ pub struct Step37Scheduler {
     prefilling: VecDeque<Step37RequestId>,
     decoding: VecDeque<Step37RequestId>,
     next_id: u64,
+    prefix_cache: Option<PrefixCache<Step37SequenceCheckpoint>>,
 }
 
 impl Step37Scheduler {
     pub fn new(model: Step37TextModel, config: SchedulerConfig) -> Result<Self> {
+        Self::new_with_prefix_cache(model, config, PrefixCacheConfig::default())
+    }
+
+    pub fn new_with_prefix_cache(
+        model: Step37TextModel,
+        config: SchedulerConfig,
+        prefix_cache: PrefixCacheConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let prefill_workspace = model.new_prefill_batch_workspace(
             config.prefill_sequence_capacity,
@@ -185,6 +204,8 @@ impl Step37Scheduler {
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
             next_id: 0,
+            prefix_cache: (prefix_cache.max_device_bytes != 0)
+                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
         })
     }
 
@@ -238,6 +259,15 @@ impl Step37Scheduler {
         let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
+        let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt_tokens.len());
+        let prefix_cache_key = if prefix_cache_target == 0 {
+            None
+        } else {
+            self.prefix_cache
+                .as_mut()
+                .map(|cache| cache.prompt_key(&prompt_tokens, prefix_cache_target))
+                .transpose()?
+        };
         self.requests.insert(
             id,
             Box::new(Step37Request {
@@ -246,6 +276,9 @@ impl Step37Scheduler {
                 config,
                 prompt_tokens,
                 prompt_position: 0,
+                prefix_cache_key,
+                prefix_cache_target,
+                prefix_cache_checkpointed: false,
                 sequence: None,
                 device_token_counts: None,
                 sequence_device_bytes: 0,
@@ -280,13 +313,29 @@ impl Step37Scheduler {
                 .requests
                 .get_mut(&id)
                 .expect("waiting request retained");
-            let sequence = match self.model.new_decode_state(request.max_tokens().max(1)) {
+            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
+                (Some(cache), Some(key)) => {
+                    cache.restore(key, Step37SequenceCheckpoint::position, |checkpoint| {
+                        self.model
+                            .restore_sequence_checkpoint(checkpoint, request.max_tokens().max(1))
+                    })?
+                }
+                _ => None,
+            };
+            let cached_prompt_tokens = restored.as_ref().map_or(0, Step37DecodeState::len);
+            let sequence = match restored
+                .map(Ok)
+                .unwrap_or_else(|| self.model.new_decode_state(request.max_tokens().max(1)))
+            {
                 Ok(sequence) => sequence,
                 Err(error) => {
                     self.waiting.push_front(id);
                     return Err(error);
                 }
             };
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_cache_checkpointed =
+                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             let device_token_counts = if request.config.sampling.supports_gpu_sampling()
                 && request.config.sampling.uses_history_penalties()
             {
@@ -307,6 +356,7 @@ impl Step37Scheduler {
             tick.admitted.push(Step37AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
+                cached_prompt_tokens,
             });
         }
         Ok(())
@@ -415,6 +465,58 @@ impl Step37Scheduler {
         request.sampler.sample(&logits, &request.history)
     }
 
+    fn retain_request_checkpoint(&mut self, request: &mut Step37Request) {
+        if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
+            return;
+        }
+        let (Some(cache), Some(key), Some(sequence)) = (
+            self.prefix_cache.as_mut(),
+            request.prefix_cache_key.as_ref(),
+            request.sequence.as_deref(),
+        ) else {
+            return;
+        };
+        if sequence.len() != request.prefix_cache_target {
+            return;
+        }
+        if !cache.contains(key) {
+            let estimated_bytes = match sequence.checkpoint_device_bytes() {
+                Ok(device_bytes) => device_bytes,
+                Err(error) => {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to size Step prompt prefix checkpoint"
+                    );
+                    request.prefix_cache_checkpointed = true;
+                    return;
+                }
+            };
+            if cache.prepare_insert(estimated_bytes) {
+                let started = Instant::now();
+                match self.model.checkpoint_sequence(sequence) {
+                    Ok(checkpoint) => {
+                        cache.record_checkpoint(started);
+                        let device_bytes = checkpoint.device_bytes();
+                        if let Err(error) = cache.insert(key.clone(), checkpoint, device_bytes) {
+                            warn!(
+                                request = request.id.get(),
+                                %error,
+                                "failed to retain Step prompt prefix checkpoint"
+                            );
+                        }
+                    }
+                    Err(error) => warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to copy Step prompt prefix checkpoint"
+                    ),
+                }
+            }
+        }
+        request.prefix_cache_checkpointed = true;
+    }
+
     fn run_prefill_phase(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
         let eligible = self
             .prefilling
@@ -442,7 +544,14 @@ impl Step37Scheduler {
                 self.prefilling.push_back(id);
                 continue;
             }
-            let chunk = available.min(token_budget.div_ceil(slots_remaining));
+            let mut chunk = available.min(token_budget.div_ceil(slots_remaining));
+            let request = &self.requests[&id];
+            if !request.prefix_cache_checkpointed
+                && request.prompt_position < request.prefix_cache_target
+                && request.prompt_position + chunk > request.prefix_cache_target
+            {
+                chunk = request.prefix_cache_target - request.prompt_position;
+            }
             token_budget -= chunk;
             slots_remaining -= 1;
             selected.push((id, chunk));
@@ -487,6 +596,7 @@ impl Step37Scheduler {
         }
         for (mut request, (_, chunk)) in requests.into_iter().zip(selected) {
             request.prompt_position += chunk;
+            self.retain_request_checkpoint(&mut request);
             tick.prefilled.push(Step37PrefillProgress {
                 request_id: request.id,
                 tokens: chunk,
@@ -542,5 +652,73 @@ impl Step37Scheduler {
                 .expect("finished request has a reason"),
             released_sequence_device_bytes: request.sequence_device_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::sampling::SamplingConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "loads the full local Step-3.7 checkpoint"]
+    fn real_model_prefix_checkpoint_restores_repeated_prompt() {
+        let model_dir = std::env::var_os("STEP37_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/step-3.7-flash-nvfp4")
+            });
+        let model = Step37TextModel::open(model_dir, 240).expect("load Step-3.7 model");
+        let mut scheduler = Step37Scheduler::new(
+            model,
+            SchedulerConfig {
+                decode_capacity: 1,
+                prefill_sequence_capacity: 1,
+                prefill_token_capacity: 128,
+                max_active_sequences: 1,
+                max_context_tokens: 257,
+            },
+        )
+        .expect("scheduler");
+        let config = RequestConfig {
+            sampling: SamplingConfig {
+                temperature: 0.0,
+                ..SamplingConfig::default()
+            },
+            max_new_tokens: 1,
+            ..RequestConfig::default()
+        };
+        let prompt = vec![9707; 256];
+
+        let first = scheduler
+            .add_request(prompt.clone(), config.clone())
+            .expect("first request");
+        while scheduler.request_state(first) != Some(RequestState::Finished) {
+            scheduler.tick().expect("run first request");
+        }
+        let first_token = scheduler
+            .remove_finished(first)
+            .expect("first result")
+            .generated_tokens[0]
+            .id;
+
+        let second = scheduler
+            .add_request(prompt, config)
+            .expect("second request");
+        let tick = scheduler.tick().expect("restore repeated prompt");
+        assert_eq!(tick.admitted.len(), 1);
+        assert_eq!(tick.admitted[0].cached_prompt_tokens, 128);
+        while scheduler.request_state(second) != Some(RequestState::Finished) {
+            scheduler.tick().expect("finish second request");
+        }
+        let second_token = scheduler
+            .remove_finished(second)
+            .expect("second result")
+            .generated_tokens[0]
+            .id;
+        assert_eq!(second_token, first_token);
     }
 }

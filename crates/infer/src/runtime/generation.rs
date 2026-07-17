@@ -2,6 +2,7 @@
 
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::stop::StopBuffer;
+use crate::nemotron3::{Nemotron3DecodeState, Nemotron3Model};
 use crate::qwen3::qwen36::{Qwen36DecodeState, Qwen36TextModel};
 use nvfp4::{Error, Result};
 use serde_json::Value;
@@ -396,6 +397,159 @@ impl<'a> Qwen36GenerationSession<'a> {
             .model
             .decode_one_token_logits(&mut self.state, input)?
             .logits;
+        self.sampler.sample(&logits, &self.history)
+    }
+}
+
+/// One Nemotron 3 generation request with isolated recurrent, KV, and sampling state.
+pub struct Nemotron3GenerationSession<'a> {
+    model: &'a Nemotron3Model,
+    state: Nemotron3DecodeState,
+    sampler: Sampler,
+    decode_stream: TokenizerDecodeStream<'a>,
+    config: GenerationConfig,
+    prompt_tokens: Vec<u32>,
+    history: TokenHistory,
+    stop_buffer: StopBuffer,
+    prefilled: bool,
+    last_token: Option<u32>,
+    generated_tokens: usize,
+    finish_reason: Option<GenerationFinishReason>,
+}
+
+impl<'a> Nemotron3GenerationSession<'a> {
+    /// Creates a request session for an already-tokenized non-empty prompt.
+    pub fn new(
+        model: &'a Nemotron3Model,
+        tokenizer: &'a Tokenizer,
+        prompt_tokens: &[u32],
+        config: GenerationConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        if prompt_tokens.is_empty() {
+            return Err(Error::Format {
+                label: "generation prompt",
+                detail: "prompt tokenized to zero tokens".to_string(),
+            });
+        }
+        if let Some(&token) = prompt_tokens
+            .iter()
+            .find(|&&token| token as usize >= model.manifest().vocab_size)
+        {
+            return Err(Error::Shape {
+                label: "generation prompt token",
+                expected: format!("token < {}", model.manifest().vocab_size),
+                actual: token.to_string(),
+            });
+        }
+        let max_tokens = prompt_tokens
+            .len()
+            .checked_add(config.max_new_tokens)
+            .ok_or_else(|| Error::Shape {
+                label: "generation capacity",
+                expected: "prompt + completion length without overflow".to_string(),
+                actual: format!("{} + {}", prompt_tokens.len(), config.max_new_tokens),
+            })?
+            .max(1);
+        let state = model.sequence_state(max_tokens)?;
+        let sampler = Sampler::new(config.sampling)?;
+        let finish_reason = (config.max_new_tokens == 0).then_some(GenerationFinishReason::Length);
+        Ok(Self {
+            model,
+            state,
+            sampler,
+            decode_stream: tokenizer.decode_stream(true),
+            prompt_tokens: prompt_tokens.to_vec(),
+            history: TokenHistory::from_tokens(prompt_tokens.iter().copied()),
+            stop_buffer: StopBuffer::new(config.stop_sequences.clone()),
+            config,
+            prefilled: false,
+            last_token: None,
+            generated_tokens: 0,
+            finish_reason,
+        })
+    }
+
+    /// Generates the next token, or returns `None` after the session finishes.
+    pub fn next_token(&mut self) -> Result<Option<GeneratedToken>> {
+        if self.finish_reason.is_some() {
+            return Ok(None);
+        }
+        let input = self.next_input_token()?;
+        let sampled = self.decode_and_select(input)?;
+        self.generated_tokens += 1;
+        self.last_token = Some(sampled.id);
+        self.history.push(sampled.id);
+
+        let mut finish_reason = None;
+        let mut text = String::new();
+        if self.config.eos_token_ids.contains(&sampled.id) {
+            text.push_str(&self.stop_buffer.finish());
+            finish_reason = Some(GenerationFinishReason::Eos);
+        } else if let Some(chunk) =
+            self.decode_stream
+                .step(sampled.id)
+                .map_err(|error| Error::Format {
+                    label: "tokenizer decode stream",
+                    detail: error.to_string(),
+                })?
+        {
+            let output = self.stop_buffer.push(&chunk);
+            text.push_str(&output.text);
+            finish_reason = output.matched.map(GenerationFinishReason::StopSequence);
+        }
+
+        if finish_reason.is_none() && self.generated_tokens == self.config.max_new_tokens {
+            text.push_str(&self.stop_buffer.finish());
+            finish_reason = Some(GenerationFinishReason::Length);
+        }
+        if let Some(reason) = &finish_reason {
+            self.finish_reason = Some(reason.clone());
+        }
+        Ok(Some(GeneratedToken {
+            id: sampled.id,
+            logit: sampled.logit,
+            text,
+            finish_reason,
+        }))
+    }
+
+    /// Returns the final reason after the session has stopped.
+    pub fn finish_reason(&self) -> Option<&GenerationFinishReason> {
+        self.finish_reason.as_ref()
+    }
+
+    /// Returns the number of completion tokens selected so far.
+    pub fn generated_token_count(&self) -> usize {
+        self.generated_tokens
+    }
+
+    fn next_input_token(&mut self) -> Result<u32> {
+        if self.prefilled {
+            return self.last_token.ok_or_else(|| Error::Format {
+                label: "generation session",
+                detail: "prefilled session has no generated token".to_string(),
+            });
+        }
+        for index in 0..self.prompt_tokens.len() - 1 {
+            self.model
+                .forward_one(&mut self.state, self.prompt_tokens[index])?;
+        }
+        self.prefilled = true;
+        Ok(*self.prompt_tokens.last().expect("non-empty prompt"))
+    }
+
+    fn decode_and_select(&mut self, input: u32) -> Result<SampledToken> {
+        self.model.forward_one(&mut self.state, input)?;
+        if self.sampler.config().uses_fast_argmax() {
+            let (id, logit) = self.model.argmax_with_logit(&mut self.state)?;
+            return Ok(SampledToken {
+                id,
+                logit,
+                adjusted_logit: logit,
+            });
+        }
+        let logits = self.model.logits_to_host(&self.state)?;
         self.sampler.sample(&logits, &self.history)
     }
 }

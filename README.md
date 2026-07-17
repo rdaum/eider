@@ -4,10 +4,10 @@
 > insulation (ahem)
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, and StepFun's
-separate Step-3.7-Flash architecture. It includes an OpenAI API-compatible
-server with continuous
-multi-session scheduling and a compact FP4 KV cache, on top of some
+Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
+Step-3.7-Flash, and NVIDIA's Nemotron 3 hybrid architecture. It includes an
+OpenAI API-compatible server with continuous multi-session scheduling and,
+for the Qwen-family and Step paths, a compact FP4 KV cache, on top of some
 (hopefully) finely tuned CUDA kernels.
 
 This started as a personal research project and is crawling towards more of a
@@ -83,9 +83,9 @@ The workspace has three crates:
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
 - `crates/infer` owns model loading, model execution, KV-cache state,
-  request-scoped sampling and generation, Qwen3.6 and Step-3.7 scheduling,
-  prefill/decode orchestration, CLI binaries, and runtime benchmarks. Its
-  reusable execution state lives under `runtime/`.
+  request-scoped sampling and generation, Qwen3.6, Step-3.7, and Nemotron 3
+  scheduling, prefill/decode orchestration, CLI binaries, and runtime
+  benchmarks. Its reusable execution state lives under `runtime/`.
 - `crates/eider-api` owns the dedicated inference actor and OpenAI-compatible
   HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
   thread while async handlers submit, stream, and cancel requests over bounded
@@ -107,6 +107,7 @@ Checkpoints kept under `models/`:
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
 - `models/agents-a1-nvfp4`
 - `models/step-3.7-flash-nvfp4`
+- `models/nemotron-3-super-120b-a12b-nvfp4`
 
 Models are expected to use the repository's supported ModelOpt or
 compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
@@ -120,6 +121,11 @@ Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
 retain those types or convert the BF16 weights to FP8 or NVFP4. The checkpoint
 also contains a vision tower, but Eider currently serves its text path only.
+
+[NVIDIA Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
+uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
+backbone. Eider follows the checkpoint's mixed BF16, FP8, and NVFP4 storage and
+retains 69.3 GiB of model weights on one Spark.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -151,6 +157,12 @@ Start Step-3.7 with:
 scripts/run-eider-stepfun-server.sh
 ```
 
+Start Nemotron 3 Super with:
+
+```sh
+scripts/run-eider-nemotron3-super-server.sh
+```
+
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
 `EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. Its BF16 attention,
@@ -172,12 +184,13 @@ The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 additionally push metrics over UDP. The `eider-serve` binary also takes
 `--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
 `--max-active-sequences`, and `--max-context-tokens` flags that map directly to
-the scheduler admission limits. Qwen-family serving retains up to 2 GiB of
-device-resident prompt checkpoints by default; pass `--qwen-prefix-cache-gib 0`
-to disable it or another whole-GiB value to change the budget. Responses report
-reused input tokens as `usage.input_tokens_details.cached_tokens`, and the
-checkpoint cache exports hit, miss, eviction, retained-byte, and copy-latency
-metrics alongside the other scheduler telemetry.
+the scheduler admission limits. Qwen-family and StepFun serving retain up to 2
+GiB of device-resident prompt checkpoints by default; pass
+`--prefix-cache-gib 0` to disable it or another whole-GiB value to change the
+budget. Responses report reused input tokens as
+`usage.input_tokens_details.cached_tokens`, and the checkpoint cache exports
+hit, miss, eviction, retained-byte, and copy-latency metrics alongside the other
+scheduler telemetry.
 
 Run Pi against the matching server with:
 
@@ -185,6 +198,7 @@ Run Pi against the matching server with:
 scripts/run-pi-eider-qwen.sh
 scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
+scripts/run-pi-eider-nemotron3-super.sh
 ```
 
 Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
@@ -239,6 +253,13 @@ Qwen3.6 smoke test:
 ```sh
 cargo run --release -p infer --bin qwen36-generate -- \
     models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
+```
+
+Nemotron 3 Super smoke test:
+
+```sh
+cargo run --release -p infer --bin nemotron3-generate -- \
+    models/nemotron-3-super-120b-a12b-nvfp4 "What is 2+2?" 30
 ```
 
 The generator applies the checkpoint's text chat prefix and reads its sampling

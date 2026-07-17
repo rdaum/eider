@@ -873,6 +873,71 @@ pub fn step37_sigmoid_top8_f32_into_on_stream(
     }
 }
 
+/// Enqueues Nemotron 3 grouped sigmoid routing with correction bias.
+///
+/// Selection uses `sigmoid(logit) + bias`; returned weights use the original
+/// sigmoid probabilities, optionally normalized over the selected experts,
+/// and multiplied by `scaling_factor`.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_sigmoid_topk_f32_into_on_stream(
+    logits: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    mut out_indices: DeviceOutput<'_, u32>,
+    mut out_weights: DeviceOutput<'_, f32>,
+    k: usize,
+    groups: usize,
+    topk_groups: usize,
+    normalize: bool,
+    scaling_factor: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    if logits.is_empty()
+        || logits.len() > 512
+        || logits.len() != bias.len()
+        || k == 0
+        || k > logits.len()
+        || groups == 0
+        || groups > 64
+        || !logits.len().is_multiple_of(groups)
+        || topk_groups == 0
+        || topk_groups > groups
+        || out_indices.len() != k
+        || out_weights.len() != k
+        || !scaling_factor.is_finite()
+    {
+        return Err(Error::Shape {
+            label: "Nemotron 3 sigmoid top-k buffers",
+            expected: "matching <=512 logits/bias; valid grouped top-k; k-sized outputs"
+                .to_string(),
+            actual: format!(
+                "logits={} bias={} k={k} groups={groups} topk_groups={topk_groups} indices={} weights={} scale={scaling_factor}",
+                logits.len(),
+                bias.len(),
+                out_indices.len(),
+                out_weights.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_sigmoid_topk_f32_on_stream",
+            ffi::infer_nemotron3_sigmoid_topk_f32_on_stream(
+                logits.ptr,
+                bias.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                logits.len() as u32,
+                k as u32,
+                groups as u32,
+                topk_groups as u32,
+                i32::from(normalize),
+                scaling_factor,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues independent Step sigmoid routing with biased top-8 selection.
 pub fn step37_sigmoid_top8_f32_batch_into_on_stream(
     logits: &DeviceBuffer<f32>,
@@ -1402,6 +1467,32 @@ pub fn moe_weighted_accumulate_slots_f32_on_stream(
                 output.buffer_mut().ptr,
                 output.len() as u32,
                 groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies ReLU squared elementwise on `stream`.
+pub fn relu_squared_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty() || output.len() != input.len() || input.len() > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "ReLU squared f32 buffers",
+            expected: "matching non-empty input and output".to_string(),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_relu_squared_f32_on_stream",
+            ffi::infer_relu_squared_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                input.len() as u32,
                 stream.as_raw(),
             ),
         )
@@ -6676,10 +6767,462 @@ pub fn gated_rms_norm_f32_into_on_stream(
     }
 }
 
+/// Advances the one-token causal depthwise convolution in a Nemotron 3 Mamba layer.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_conv_update_f32_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    conv_bias_bf16: &DeviceBuffer<u16>,
+    mut conv_state: DeviceInOut<'_, f32>,
+    mut conv_output: DeviceOutput<'_, f32>,
+    intermediate_size: usize,
+    conv_channels: usize,
+    conv_kernel: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let projection_size = intermediate_size
+        .checked_add(conv_channels)
+        .ok_or_else(|| Error::Shape {
+            label: "Nemotron 3 Mamba convolution",
+            expected: "intermediate_size + conv_channels without overflow".to_string(),
+            actual: format!("intermediate_size={intermediate_size} conv_channels={conv_channels}"),
+        })?;
+    let state_len = conv_channels
+        .checked_mul(conv_kernel)
+        .ok_or_else(|| Error::Shape {
+            label: "Nemotron 3 Mamba convolution",
+            expected: "conv_channels * conv_kernel without overflow".to_string(),
+            actual: format!("conv_channels={conv_channels} conv_kernel={conv_kernel}"),
+        })?;
+    if intermediate_size == 0
+        || conv_channels == 0
+        || conv_kernel == 0
+        || intermediate_size > u32::MAX as usize
+        || conv_channels > u32::MAX as usize
+        || conv_kernel > u32::MAX as usize
+        || projected.len() < projection_size
+        || conv_weight_bf16.len() != state_len
+        || conv_bias_bf16.len() != conv_channels
+        || conv_state.len() != state_len
+        || conv_output.len() != conv_channels
+    {
+        return Err(Error::Shape {
+            label: "Nemotron 3 Mamba convolution buffers",
+            expected: format!(
+                "projected>={projection_size} weight/state={state_len} bias/output={conv_channels}"
+            ),
+            actual: format!(
+                "projected={} weight={} bias={} state={} output={}",
+                projected.len(),
+                conv_weight_bf16.len(),
+                conv_bias_bf16.len(),
+                conv_state.len(),
+                conv_output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_conv_update_f32_on_stream",
+            ffi::infer_nemotron3_mamba_conv_update_f32_on_stream(
+                projected.ptr,
+                conv_weight_bf16.ptr,
+                conv_bias_bf16.ptr,
+                conv_state.buffer_mut().ptr,
+                conv_output.buffer_mut().ptr,
+                intermediate_size as u32,
+                conv_channels as u32,
+                conv_kernel as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Advances one token of Nemotron 3 Mamba selective state and applies its
+/// gate-before-group-RMSNorm operation.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_state_update_f32_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_output: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    d_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    norm_weight_bf16: &DeviceBuffer<u16>,
+    mut ssm_state: DeviceInOut<'_, f32>,
+    mut output: DeviceOutput<'_, f32>,
+    heads: usize,
+    head_dim: usize,
+    groups: usize,
+    state_size: usize,
+    dt_floor: f32,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let intermediate_size = heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "Nemotron 3 Mamba state",
+        expected: "heads * head_dim without overflow".to_string(),
+        actual: format!("heads={heads} head_dim={head_dim}"),
+    })?;
+    let bc_width = groups.checked_mul(state_size).ok_or_else(|| Error::Shape {
+        label: "Nemotron 3 Mamba state",
+        expected: "groups * state_size without overflow".to_string(),
+        actual: format!("groups={groups} state_size={state_size}"),
+    })?;
+    let conv_channels = intermediate_size + 2 * bc_width;
+    let projection_size = intermediate_size + conv_channels + heads;
+    let state_len = intermediate_size
+        .checked_mul(state_size)
+        .ok_or_else(|| Error::Shape {
+            label: "Nemotron 3 Mamba state",
+            expected: "intermediate_size * state_size without overflow".to_string(),
+            actual: format!("intermediate_size={intermediate_size} state_size={state_size}"),
+        })?;
+    if heads == 0
+        || head_dim == 0
+        || groups == 0
+        || state_size == 0
+        || !heads.is_multiple_of(groups)
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || groups > u32::MAX as usize
+        || state_size > u32::MAX as usize
+        || !dt_floor.is_finite()
+        || dt_floor <= 0.0
+        || !eps.is_finite()
+        || eps <= 0.0
+        || projected.len() != projection_size
+        || conv_output.len() != conv_channels
+        || a_log_bf16.len() != heads
+        || d_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+        || norm_weight_bf16.len() != intermediate_size
+        || ssm_state.len() != state_len
+        || output.len() != intermediate_size
+    {
+        return Err(Error::Shape {
+            label: "Nemotron 3 Mamba state buffers",
+            expected: format!(
+                "projected={projection_size} conv={conv_channels} head params={heads} norm/output={intermediate_size} state={state_len}"
+            ),
+            actual: format!(
+                "projected={} conv={} a_log={} D={} dt_bias={} norm={} state={} output={}",
+                projected.len(),
+                conv_output.len(),
+                a_log_bf16.len(),
+                d_bf16.len(),
+                dt_bias_bf16.len(),
+                norm_weight_bf16.len(),
+                ssm_state.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_state_update_f32_on_stream",
+            ffi::infer_nemotron3_mamba_state_update_f32_on_stream(
+                projected.ptr,
+                conv_output.ptr,
+                a_log_bf16.ptr,
+                d_bf16.ptr,
+                dt_bias_bf16.ptr,
+                norm_weight_bf16.ptr,
+                ssm_state.buffer_mut().ptr,
+                output.buffer_mut().ptr,
+                heads as u32,
+                head_dim as u32,
+                groups as u32,
+                state_size as u32,
+                dt_floor,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn nemotron3_mamba_decode_matches_cpu_reference() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 4;
+        const GROUPS: usize = 2;
+        const STATE_SIZE: usize = 3;
+        const CONV_KERNEL: usize = 4;
+        const DT_FLOOR: f32 = 1.0e-4;
+        const EPS: f32 = 1.0e-5;
+        const INTERMEDIATE: usize = HEADS * HEAD_DIM;
+        const BC_WIDTH: usize = GROUPS * STATE_SIZE;
+        const CONV_CHANNELS: usize = INTERMEDIATE + 2 * BC_WIDTH;
+        const PROJECTION: usize = INTERMEDIATE + CONV_CHANNELS + HEADS;
+
+        let mut projected = (0..PROJECTION)
+            .map(|index| (index as f32 - 17.0) * 0.017)
+            .collect::<Vec<_>>();
+        for head in 0..HEADS {
+            projected[INTERMEDIATE + CONV_CHANNELS + head] = -0.3 + head as f32 * 0.08;
+        }
+        let conv_weight = (0..CONV_CHANNELS * CONV_KERNEL)
+            .map(|index| f32_to_bf16(((index % 9) as f32 - 4.0) * 0.035))
+            .collect::<Vec<_>>();
+        let conv_bias = (0..CONV_CHANNELS)
+            .map(|index| f32_to_bf16((index as f32 - 8.0) * 0.003))
+            .collect::<Vec<_>>();
+        let initial_conv_state = (0..CONV_CHANNELS * CONV_KERNEL)
+            .map(|index| ((index % 13) as f32 - 6.0) * 0.011)
+            .collect::<Vec<_>>();
+
+        let mut expected_conv_state = initial_conv_state.clone();
+        let mut expected_conv = vec![0.0; CONV_CHANNELS];
+        for channel in 0..CONV_CHANNELS {
+            let state =
+                &mut expected_conv_state[channel * CONV_KERNEL..(channel + 1) * CONV_KERNEL];
+            state.rotate_left(1);
+            state[CONV_KERNEL - 1] = projected[INTERMEDIATE + channel];
+            let mut value = bf16_to_f32(conv_bias[channel]);
+            for index in 0..CONV_KERNEL {
+                value += state[index] * bf16_to_f32(conv_weight[channel * CONV_KERNEL + index]);
+            }
+            expected_conv[channel] = value / (1.0 + (-value).exp());
+        }
+
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let projected_device = DeviceBuffer::from_host(&projected).expect("projected");
+        let conv_weight_device = DeviceBuffer::from_host(&conv_weight).expect("conv weight");
+        let conv_bias_device = DeviceBuffer::from_host(&conv_bias).expect("conv bias");
+        let mut conv_state_device =
+            DeviceBuffer::from_host(&initial_conv_state).expect("conv state");
+        let mut conv_output_device = DeviceBuffer::zeroed(CONV_CHANNELS).expect("conv output");
+        nemotron3_mamba_conv_update_f32_into_on_stream(
+            &projected_device,
+            &conv_weight_device,
+            &conv_bias_device,
+            conv_state_device.inout(),
+            conv_output_device.output(),
+            INTERMEDIATE,
+            CONV_CHANNELS,
+            CONV_KERNEL,
+            &stream,
+        )
+        .expect("Mamba convolution");
+        let actual_conv = conv_output_device
+            .copy_to_host(&stream)
+            .expect("conv output download");
+        assert_close(&actual_conv, &expected_conv, 2.0e-6, "Mamba convolution");
+        assert_close(
+            &conv_state_device
+                .copy_to_host(&stream)
+                .expect("conv state download"),
+            &expected_conv_state,
+            0.0,
+            "Mamba convolution state",
+        );
+
+        let a_log = (0..HEADS)
+            .map(|head| f32_to_bf16(-0.2 + head as f32 * 0.07))
+            .collect::<Vec<_>>();
+        let d = (0..HEADS)
+            .map(|head| f32_to_bf16(0.8 + head as f32 * 0.05))
+            .collect::<Vec<_>>();
+        let dt_bias = (0..HEADS)
+            .map(|head| f32_to_bf16(-0.1 + head as f32 * 0.03))
+            .collect::<Vec<_>>();
+        let norm_weight = (0..INTERMEDIATE)
+            .map(|index| f32_to_bf16(0.9 + index as f32 * 0.01))
+            .collect::<Vec<_>>();
+        let initial_ssm = (0..INTERMEDIATE * STATE_SIZE)
+            .map(|index| ((index % 11) as f32 - 5.0) * 0.009)
+            .collect::<Vec<_>>();
+        let mut expected_ssm = initial_ssm.clone();
+        let mut expected_output = vec![0.0; INTERMEDIATE];
+        let heads_per_group = HEADS / GROUPS;
+        let group_width = heads_per_group * HEAD_DIM;
+        for group in 0..GROUPS {
+            for group_index in 0..group_width {
+                let flat = group * group_width + group_index;
+                let head = flat / HEAD_DIM;
+                let raw_dt =
+                    projected[INTERMEDIATE + CONV_CHANNELS + head] + bf16_to_f32(dt_bias[head]);
+                let dt = (1.0 + raw_dt.exp()).ln().max(DT_FLOOR);
+                let decay = (-dt * bf16_to_f32(a_log[head]).exp()).exp();
+                let x = actual_conv[flat];
+                let b = &actual_conv
+                    [INTERMEDIATE + group * STATE_SIZE..INTERMEDIATE + (group + 1) * STATE_SIZE];
+                let c_offset = INTERMEDIATE + BC_WIDTH + group * STATE_SIZE;
+                let c = &actual_conv[c_offset..c_offset + STATE_SIZE];
+                let state = &mut expected_ssm[flat * STATE_SIZE..(flat + 1) * STATE_SIZE];
+                let mut y = bf16_to_f32(d[head]) * x;
+                for state_index in 0..STATE_SIZE {
+                    state[state_index] = state[state_index] * decay + dt * b[state_index] * x;
+                    y += state[state_index] * c[state_index];
+                }
+                let gate = projected[flat];
+                expected_output[flat] = y * gate / (1.0 + (-gate).exp());
+            }
+            let values = &expected_output[group * group_width..(group + 1) * group_width];
+            let mean_square =
+                values.iter().map(|value| value * value).sum::<f32>() / group_width as f32;
+            let inv_rms = (mean_square + EPS).sqrt().recip();
+            for group_index in 0..group_width {
+                let flat = group * group_width + group_index;
+                expected_output[flat] *= inv_rms * bf16_to_f32(norm_weight[flat]);
+            }
+        }
+
+        let a_log_device = DeviceBuffer::from_host(&a_log).expect("A log");
+        let d_device = DeviceBuffer::from_host(&d).expect("D");
+        let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+        let norm_weight_device = DeviceBuffer::from_host(&norm_weight).expect("norm weight");
+        let mut ssm_state_device = DeviceBuffer::from_host(&initial_ssm).expect("SSM state");
+        let mut output_device = DeviceBuffer::zeroed(INTERMEDIATE).expect("Mamba output");
+        nemotron3_mamba_state_update_f32_into_on_stream(
+            &projected_device,
+            &conv_output_device,
+            &a_log_device,
+            &d_device,
+            &dt_bias_device,
+            &norm_weight_device,
+            ssm_state_device.inout(),
+            output_device.output(),
+            HEADS,
+            HEAD_DIM,
+            GROUPS,
+            STATE_SIZE,
+            DT_FLOOR,
+            EPS,
+            &stream,
+        )
+        .expect("Mamba state update");
+        assert_close(
+            &output_device
+                .copy_to_host(&stream)
+                .expect("Mamba output download"),
+            &expected_output,
+            3.0e-5,
+            "Mamba output",
+        );
+        assert_close(
+            &ssm_state_device
+                .copy_to_host(&stream)
+                .expect("SSM state download"),
+            &expected_ssm,
+            3.0e-6,
+            "Mamba state",
+        );
+    }
+
+    #[test]
+    fn nemotron3_sigmoid_topk_matches_grouped_cpu_reference() {
+        const EXPERTS: usize = 512;
+        const K: usize = 22;
+        const GROUPS: usize = 8;
+        const TOPK_GROUPS: usize = 3;
+        const SCALE: f32 = 5.0;
+        let logits = (0..EXPERTS)
+            .map(|expert| ((expert * 37 % 101) as f32 - 50.0) * 0.031)
+            .collect::<Vec<_>>();
+        let bias = (0..EXPERTS)
+            .map(|expert| ((expert * 17 % 29) as f32 - 14.0) * 0.004)
+            .collect::<Vec<_>>();
+        let probabilities = logits
+            .iter()
+            .map(|value| 1.0 / (1.0 + (-value).exp()))
+            .collect::<Vec<_>>();
+        let scores = probabilities
+            .iter()
+            .zip(&bias)
+            .map(|(probability, bias)| probability + bias)
+            .collect::<Vec<_>>();
+        let experts_per_group = EXPERTS / GROUPS;
+        let mut group_scores = (0..GROUPS)
+            .map(|group| {
+                let mut values =
+                    scores[group * experts_per_group..(group + 1) * experts_per_group].to_vec();
+                values.sort_by(|left, right| right.total_cmp(left));
+                (group, values[0] + values[1])
+            })
+            .collect::<Vec<_>>();
+        group_scores.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut selected_groups = [false; GROUPS];
+        for &(group, _) in &group_scores[..TOPK_GROUPS] {
+            selected_groups[group] = true;
+        }
+        let mut candidates = (0..EXPERTS)
+            .filter(|expert| selected_groups[expert / experts_per_group])
+            .collect::<Vec<_>>();
+        candidates.sort_by(|&left, &right| {
+            scores[right]
+                .total_cmp(&scores[left])
+                .then_with(|| left.cmp(&right))
+        });
+        let expected_indices = candidates[..K]
+            .iter()
+            .map(|&expert| expert as u32)
+            .collect::<Vec<_>>();
+        let denominator = expected_indices
+            .iter()
+            .map(|&expert| probabilities[expert as usize])
+            .sum::<f32>()
+            + 1.0e-20;
+        let expected_weights = expected_indices
+            .iter()
+            .map(|&expert| probabilities[expert as usize] / denominator * SCALE)
+            .collect::<Vec<_>>();
+
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let logits = DeviceBuffer::from_host(&logits).expect("logits");
+        let bias = DeviceBuffer::from_host(&bias).expect("bias");
+        let mut indices = DeviceBuffer::zeroed(K).expect("indices");
+        let mut weights = DeviceBuffer::zeroed(K).expect("weights");
+        nemotron3_sigmoid_topk_f32_into_on_stream(
+            &logits,
+            &bias,
+            indices.output(),
+            weights.output(),
+            K,
+            GROUPS,
+            TOPK_GROUPS,
+            true,
+            SCALE,
+            &stream,
+        )
+        .expect("Nemotron router");
+        assert_eq!(
+            indices.copy_to_host(&stream).expect("indices download"),
+            expected_indices
+        );
+        assert_close(
+            &weights.copy_to_host(&stream).expect("weights download"),
+            &expected_weights,
+            2.0e-6,
+            "Nemotron router weights",
+        );
+    }
+
+    #[test]
+    fn relu_squared_matches_cpu_reference() {
+        let values = [-3.0, -0.0, 0.25, 2.0, 7.5];
+        let expected = [0.0, 0.0, 0.0625, 4.0, 56.25];
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let input = DeviceBuffer::from_host(&values).expect("input");
+        let mut output = DeviceBuffer::zeroed(values.len()).expect("output");
+        relu_squared_f32_into_on_stream(&input, output.output(), &stream).expect("ReLU squared");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output download"),
+            expected
+        );
+    }
 
     #[test]
     fn clamped_silu_halves_matches_step_reference_for_single_and_batch_rows() {

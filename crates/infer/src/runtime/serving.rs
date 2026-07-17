@@ -2,10 +2,10 @@
 
 use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::prefix_cache::PrefixCacheConfig;
 use super::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36PrefixCacheConfig,
-    Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
-    SchedulerConfig,
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
+    Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState, SchedulerConfig,
 };
 use super::stop::StopBuffer;
 use crate::qwen3::qwen36::Qwen36TextModel;
@@ -145,12 +145,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_prefix_cache(
-            model,
-            template,
-            scheduler,
-            Qwen36PrefixCacheConfig::default(),
-        )
+        Self::new_with_prefix_cache(model, template, scheduler, PrefixCacheConfig::default())
     }
 
     /// Creates a serving bridge with explicit scheduler and prefix-cache limits.
@@ -158,7 +153,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         model: &'model Qwen36TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
-        prefix_cache: Qwen36PrefixCacheConfig,
+        prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         Ok(Self {
             template,

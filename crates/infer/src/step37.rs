@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::info;
@@ -33,6 +33,8 @@ pub use batch::{Step37PrefillBatchWorkspace, Step37PrefillRow};
 
 pub const LAYERS: usize = 42;
 pub const FIRST_MOE_LAYER: usize = 3;
+
+static NEXT_STEP37_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 pub const EXPERTS: usize = 288;
 pub const HIDDEN: usize = 4096;
 pub const INTERMEDIATE: usize = 1280;
@@ -1880,6 +1882,7 @@ impl Step37LmHead {
 
 /// Fully loaded Step-3.7 model with nonresident routed experts.
 pub struct Step37TextModel {
+    model_id: u64,
     layers: Vec<Step37Layer>,
     embedding: DeviceBuffer<u16>,
     final_norm: Step37RmsNorm,
@@ -1890,6 +1893,7 @@ pub struct Step37TextModel {
 
 /// Mutable scratch and persistent KV state for one Step decode session.
 pub struct Step37DecodeState {
+    model_id: u64,
     token: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Step37LayerWorkspace>,
@@ -1901,6 +1905,13 @@ pub struct Step37DecodeState {
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
     sampler: GpuTokenSampler,
+}
+
+/// Immutable, 128-token-aligned Step KV checkpoint.
+pub struct Step37SequenceCheckpoint {
+    model_id: u64,
+    position: usize,
+    kv_cache: Vec<Sm12xKvCache>,
 }
 
 /// One Step next-token argmax result.
@@ -1954,6 +1965,7 @@ impl Step37TextModel {
             );
         }
         Ok(Self {
+            model_id: NEXT_STEP37_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             layers,
             embedding,
             final_norm,
@@ -1965,6 +1977,7 @@ impl Step37TextModel {
 
     pub fn new_decode_state(&self, max_tokens: usize) -> Result<Step37DecodeState> {
         Ok(Step37DecodeState {
+            model_id: self.model_id,
             token: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(HIDDEN)?,
             layers: self
@@ -1997,6 +2010,70 @@ impl Step37TextModel {
             next_value: DeviceBuffer::zeroed(1)?,
             sampler: GpuTokenSampler::new(1, self.vocab)?,
         })
+    }
+
+    /// Copies a sequence's current aligned KV prefix into an immutable checkpoint.
+    pub fn checkpoint_sequence(
+        &self,
+        source: &Step37DecodeState,
+    ) -> Result<Step37SequenceCheckpoint> {
+        if source.model_id != self.model_id {
+            return Err(Error::Format {
+                label: "Step-3.7 sequence checkpoint",
+                detail: "sequence was created by a different model instance".to_string(),
+            });
+        }
+        source.checkpoint_device_bytes()?;
+        self.stream.synchronize()?;
+        let position = source.len();
+        let mut kv_cache = (0..source.kv_cache.len())
+            .map(|_| Sm12xKvCache::new(position, KV_HEADS, HEAD_DIM))
+            .collect::<Result<Vec<_>>>()?;
+        let stream = CudaStream::new_non_blocking()?;
+        for (destination, source) in kv_cache.iter_mut().zip(&source.kv_cache) {
+            destination.copy_aligned_prefix_from_on_stream(source, position, &stream)?;
+        }
+        stream.synchronize()?;
+        Ok(Step37SequenceCheckpoint {
+            model_id: self.model_id,
+            position,
+            kv_cache,
+        })
+    }
+
+    /// Creates active sequence state from a cached aligned KV checkpoint.
+    pub fn restore_sequence_checkpoint(
+        &self,
+        checkpoint: &Step37SequenceCheckpoint,
+        max_tokens: usize,
+    ) -> Result<Step37DecodeState> {
+        if checkpoint.model_id != self.model_id {
+            return Err(Error::Format {
+                label: "Step-3.7 sequence checkpoint restore",
+                detail: "checkpoint was created by a different model instance".to_string(),
+            });
+        }
+        if max_tokens < checkpoint.position || checkpoint.kv_cache.len() != self.layers.len() {
+            return Err(Error::Shape {
+                label: "Step-3.7 sequence checkpoint restore",
+                expected: format!(
+                    "max_tokens >= {} and {} layer caches",
+                    checkpoint.position,
+                    self.layers.len()
+                ),
+                actual: format!(
+                    "max_tokens={max_tokens} layer_caches={}",
+                    checkpoint.kv_cache.len()
+                ),
+            });
+        }
+        let mut state = self.new_decode_state(max_tokens)?;
+        let stream = CudaStream::new_non_blocking()?;
+        for (destination, source) in state.kv_cache.iter_mut().zip(&checkpoint.kv_cache) {
+            destination.copy_aligned_prefix_from_on_stream(source, checkpoint.position, &stream)?;
+        }
+        stream.synchronize()?;
+        Ok(state)
     }
 
     /// Returns the checkpoint vocabulary size.
@@ -2194,6 +2271,41 @@ impl Step37DecodeState {
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()
             + self.sampler.device_bytes()
+    }
+
+    /// Returns the device bytes needed to retain the current aligned KV prefix.
+    pub fn checkpoint_device_bytes(&self) -> Result<usize> {
+        let position = self.len();
+        if position == 0
+            || !position.is_multiple_of(128)
+            || self.kv_cache.iter().any(|cache| cache.len() != position)
+        {
+            return Err(Error::Shape {
+                label: "Step-3.7 sequence checkpoint byte estimate",
+                expected: "matching nonzero 128-token-aligned KV positions".to_string(),
+                actual: format!("position={position}"),
+            });
+        }
+        self.kv_cache.iter().try_fold(0usize, |total, cache| {
+            let bytes = cache.device_bytes_for_capacity(position)?;
+            total.checked_add(bytes).ok_or_else(|| Error::Shape {
+                label: "Step-3.7 sequence checkpoint byte estimate",
+                expected: "device-byte total without overflow".to_string(),
+                actual: format!("position={position}"),
+            })
+        })
+    }
+}
+
+impl Step37SequenceCheckpoint {
+    /// Returns the number of prompt tokens represented by this checkpoint.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the exact device bytes retained by this checkpoint.
+    pub fn device_bytes(&self) -> usize {
+        self.kv_cache.iter().map(Sm12xKvCache::device_bytes).sum()
     }
 }
 
