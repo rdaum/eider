@@ -16,15 +16,15 @@ GB10 specific kernels that others may potentially reuse in their projects.
 
 ### Why... ?
 
-Mainly, I wanted to learn more about how an inference runtime is structured, and
-I wanted to understand more about the Spark's architecture, and I got annoyed by
-how heavy weight vLLM is, and I got frustrated by the state (or lack of it) of
-NVFP4 in `llama.cpp`.
-
 The Spark is not a datacentre GPU (despite the marketing.) The SM12x Blackwell
 in it is not the same as the heavy duty "grown up" version. So I have a personal
 suspicion that it will likely be better served in the medium term by a bespoke
 runtime than by work being done on the vLLM mainline.
+
+But mainly, I wanted to learn more about how an inference runtime is structured, and
+I wanted to understand more about the Spark's architecture, and I got annoyed by
+how heavy weight vLLM is, and I got frustrated by the state (or lack of it) of
+NVFP4 in `llama.cpp`.
 
 ### Performance
 
@@ -33,28 +33,21 @@ Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
 comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
 with the same model using BF16 KV and greedy sampling.
 
-Agents-A1 is a 35B Qwen3.5-MoE agentic fine-tune whose ModelOpt checkpoint
+*Agents-A1* is a 35B Qwen3.5-MoE agentic fine-tune whose ModelOpt checkpoint
 keeps attention projections and the LM head in BF16 while quantizing its MoE
 weights to NVFP4. In a local API comparison using the same 200-token request
-for each runtime, Eider reached 44.9 decode tokens/sec and vLLM reached 37.2
+for each runtime, Eider reached 44.9 decode tokens/sec vs vLLM which did 37.2
 tokens/sec.
 
-Qwen-family sessions automatically reuse the longest cached prompt prefix,
-including both full-attention KV and recurrent linear-attention state. In a
-local Agents-A1 check, a repeated 3,209-token request restored 3,200 tokens and
-reduced TTFT from 35.9 seconds to 1.1 seconds. Cached checkpoints can seed
-multiple concurrent requests without sharing their mutable sequence state.
+The 198B *Step-3.7-Flash* checkpoint just squeezes in because I added 
+expert paging to/from nVME. Normally this model would be a bit too big at nVFP4, but
+paging lets it be more viable. That said, it's a bit slow: with 240 of 
+288 experts resident per routed layer, the current warm path reaches about 12.6 
+decode tokens/sec for one session and 11.2 tokens/sec
+in aggregate for two concurrent sessions.
 
-The 198B Step-3.7-Flash checkpoint uses the same API with disk-backed expert
-paging. With 240 of 288 experts resident per routed layer, the current warm
-path reaches about 12.6 decode tokens/sec for one session and 11.2 tokens/sec
-in aggregate for two concurrent sessions. Request KV state remains independent
-while the expert cache is shared across sessions. A 2,048-token agent prompt
-prefills at about 48.9 tokens/sec with a warm expert cache and 35.7 tokens/sec
-on the first request while the cache is populated.
-
-Compared with the current vLLM setup, the more consequential differences are
-operational. Eider starts substantially faster and has a smaller idle footprint
+Compared with a vLLM setup in docker, the more biggest differences is
+operational: Eider starts up substantially faster and has a smaller idle footprint
 because sequence state is allocated on demand rather than as a large up-front
 KV pool. It also supports a compact NVFP4 KV cache directly on SM121; current
 vLLM builds cannot use their NVFP4 KV path for this model on GB10 and fall back
