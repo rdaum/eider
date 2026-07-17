@@ -3,7 +3,7 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::metrics::metrics as infer_metrics;
-use infer::qwen3::qwen36::{Qwen36Bf16Fp8Mode, Qwen36TextModel};
+use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36TextModel};
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
@@ -32,7 +32,7 @@ pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub scheduler: SchedulerConfig,
     pub qwen_prefix_cache: Qwen36PrefixCacheConfig,
-    pub qwen_bf16_fp8: Qwen36Bf16Fp8Mode,
+    pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
     pub step_expert_capacity: usize,
     pub event_capacity: usize,
 }
@@ -43,7 +43,7 @@ impl InferenceActorConfig {
             model_dir: model_dir.into(),
             scheduler: SchedulerConfig::default(),
             qwen_prefix_cache: Qwen36PrefixCacheConfig::default(),
-            qwen_bf16_fp8: Qwen36Bf16Fp8Mode::Disabled,
+            qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
             step_expert_capacity: 240,
             event_capacity: 256,
         }
@@ -130,7 +130,7 @@ impl InferenceActor {
         let model_dir = config.model_dir.clone();
         let scheduler = config.scheduler;
         let qwen_prefix_cache = config.qwen_prefix_cache;
-        let qwen_bf16_fp8 = config.qwen_bf16_fp8;
+        let qwen_bf16_storage = config.qwen_bf16_storage;
         let step_expert_capacity = config.step_expert_capacity;
         thread::Builder::new()
             .name("eider-inference".to_string())
@@ -139,7 +139,7 @@ impl InferenceActor {
                     model_dir,
                     scheduler,
                     qwen_prefix_cache,
-                    qwen_bf16_fp8,
+                    qwen_bf16_storage,
                     step_expert_capacity,
                     commands_rx,
                     ready_tx,
@@ -201,7 +201,7 @@ fn actor_main(
     model_dir: PathBuf,
     scheduler: SchedulerConfig,
     qwen_prefix_cache: Qwen36PrefixCacheConfig,
-    qwen_bf16_fp8: Qwen36Bf16Fp8Mode,
+    qwen_bf16_storage: Qwen36Bf16StorageConfig,
     step_expert_capacity: usize,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
@@ -241,10 +241,11 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 prefix_cache_max_device_bytes = qwen_prefix_cache.max_device_bytes,
-                bf16_fp8 = ?qwen_bf16_fp8,
+                bf16_storage = ?qwen_bf16_storage,
                 "loading Qwen3.6 model"
             );
-            let model = match Qwen36TextModel::open_with_bf16_fp8(&model_dir, qwen_bf16_fp8) {
+            let model = match Qwen36TextModel::open_with_bf16_storage(&model_dir, qwen_bf16_storage)
+            {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

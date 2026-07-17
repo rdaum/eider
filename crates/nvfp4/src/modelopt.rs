@@ -262,6 +262,104 @@ impl ModelOptCublasLtWeight {
 }
 
 impl ModelOptNvfp4Linear {
+    /// Quantizes a row-major BF16 weight to ModelOpt-compatible NVFP4 storage.
+    ///
+    /// This is a weight-only conversion: each consecutive K16 block receives
+    /// an independent UE4M3 scale, while the tensor-wide scale remains one.
+    pub fn quantize_bf16(
+        prefix: impl Into<String>,
+        out_features: usize,
+        in_features: usize,
+        values: &[u16],
+    ) -> Result<Self> {
+        let expected = out_features
+            .checked_mul(in_features)
+            .ok_or_else(|| Error::Shape {
+                label: "BF16-to-NVFP4 weight",
+                expected: "out_features * in_features without overflow".to_string(),
+                actual: format!("out_features={out_features} in_features={in_features}"),
+            })?;
+        if out_features == 0 || in_features == 0 || !in_features.is_multiple_of(16) {
+            return Err(Error::Shape {
+                label: "BF16-to-NVFP4 weight",
+                expected: "non-zero dimensions and in_features divisible by 16".to_string(),
+                actual: format!("out_features={out_features} in_features={in_features}"),
+            });
+        }
+        if values.len() != expected {
+            return Err(Error::Shape {
+                label: "BF16-to-NVFP4 weight",
+                expected: format!("{expected} values"),
+                actual: format!("{} values", values.len()),
+            });
+        }
+
+        let blocks_per_row = in_features / 16;
+        let mut packed_weight = vec![0u8; expected.div_ceil(2)];
+        let mut weight_scale = vec![0u8; out_features * blocks_per_row];
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(out_features);
+        let rows_per_chunk = out_features.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * in_features;
+        let packed_per_chunk = rows_per_chunk * in_features / 2;
+        let scales_per_chunk = rows_per_chunk * blocks_per_row;
+        std::thread::scope(|scope| {
+            for ((values, packed_weight), weight_scale) in values
+                .chunks(values_per_chunk)
+                .zip(packed_weight.chunks_mut(packed_per_chunk))
+                .zip(weight_scale.chunks_mut(scales_per_chunk))
+            {
+                scope.spawn(move || {
+                    for row in 0..values.len() / in_features {
+                        for block in 0..blocks_per_row {
+                            let start = row * in_features + block * 16;
+                            let block_values = &values[start..start + 16];
+                            let max_abs = block_values
+                                .iter()
+                                .map(|&value| format::bf16_to_f32(value))
+                                .filter(|value| value.is_finite())
+                                .map(f32::abs)
+                                .fold(0.0f32, f32::max);
+                            let scale_code = if max_abs == 0.0 {
+                                0
+                            } else {
+                                format::ue4m3_code(max_abs / 6.0)
+                            };
+                            let scale = format::e4m3_value(scale_code);
+                            weight_scale[row * blocks_per_row + block] = scale_code;
+
+                            for (offset, &value) in block_values.iter().enumerate() {
+                                let flat = start + offset;
+                                let value = format::bf16_to_f32(value);
+                                let code = format::e2m1_code(if scale == 0.0 {
+                                    0.0
+                                } else {
+                                    value / scale
+                                });
+                                if flat & 1 == 0 {
+                                    packed_weight[flat / 2] = code;
+                                } else {
+                                    packed_weight[flat / 2] |= code << 4;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(Self {
+            prefix: prefix.into(),
+            out_features,
+            in_features,
+            packed_weight,
+            weight_scale,
+            weight_scale_2: 1.0,
+            input_scale: 1.0,
+        })
+    }
+
     /// Imports a ModelOpt NVFP4 linear from one safetensors shard.
     pub fn from_shard(shard: &SafeTensorShard, prefix: impl Into<String>) -> Result<Self> {
         let prefix = prefix.into();
@@ -938,6 +1036,41 @@ fn validate_modelopt_expert_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_weight_quantization_emits_modelopt_k16_blocks() {
+        let row = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let values = row
+            .into_iter()
+            .chain(row)
+            .map(format::f32_to_bf16)
+            .collect::<Vec<_>>();
+        let quantized =
+            ModelOptNvfp4Linear::quantize_bf16("test", 2, 16, &values).expect("quantize");
+
+        assert_eq!(quantized.packed_weight.len(), 16);
+        assert_eq!(quantized.weight_scale, vec![format::ue4m3_code(1.0); 2]);
+        assert_eq!(quantized.weight_scale_2, 1.0);
+        assert_eq!(quantized.input_scale, 1.0);
+        for (index, expected) in row.into_iter().chain(row).enumerate() {
+            let packed = quantized.packed_weight[index / 2];
+            let code = if index & 1 == 0 {
+                packed & 0x0f
+            } else {
+                packed >> 4
+            };
+            assert_eq!(format::e2m1_value(code), expected);
+        }
+    }
+
+    #[test]
+    fn bf16_weight_quantization_requires_k16_rows() {
+        let error = ModelOptNvfp4Linear::quantize_bf16("test", 1, 15, &[0; 15])
+            .expect_err("reject non-K16 shape");
+        assert!(matches!(error, Error::Shape { .. }));
+    }
 
     #[test]
     fn modelopt_scale_repack_matches_cublaslt_offsets() {

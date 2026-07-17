@@ -161,7 +161,7 @@ fn new_batch_linear_plan(
 ) -> Result<Option<BatchLinearPlan>> {
     match linear {
         Qwen36Linear::Fp8(linear) => Ok(Some(BatchLinearPlan::new(model, linear, capacity)?)),
-        Qwen36Linear::Bf16(_) => Ok(None),
+        Qwen36Linear::Nvfp4(_) | Qwen36Linear::Bf16(_) => Ok(None),
     }
 }
 
@@ -232,6 +232,7 @@ fn run_linear_batch(
     stream: &CudaStream,
 ) -> Result<()> {
     match linear {
+        Qwen36Linear::Nvfp4(linear) => linear.run_f32_batch_into(raw_input, output, rows, stream),
         Qwen36Linear::Fp8(linear) => run_fp8_batch(
             model,
             linear,

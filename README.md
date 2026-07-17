@@ -153,12 +153,12 @@ The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
 `EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. The Agents-A1 server
 accepts the checkpoint's full 262,144-token context; override it with
-`EIDER_MAX_CONTEXT_TOKENS`. The launcher defaults to FP8-converting both its
-BF16 attention projections and LM head; set `EIDER_QWEN_BF16_FP8=attention` to
-retain the BF16 head or `EIDER_QWEN_BF16_FP8=disabled` to use the checkpoint
-types unchanged. Its Pi entry advertises a 131,072-token working window so
-compaction starts well before that hard limit. The launchers build the release
-server, listen on `127.0.0.1:8080`, and default the API key to `local-eider`.
+`EIDER_MAX_CONTEXT_TOKENS`. Its BF16 attention projections and LM head default
+to FP8; `EIDER_QWEN_BF16_ATTENTION` and `EIDER_QWEN_BF16_LM_HEAD` independently
+accept `bf16`, `fp8`, or `nvfp4`. Its Pi entry advertises a 131,072-token working
+window so compaction starts well before that hard limit. The launchers build
+the release server, listen on `127.0.0.1:8080`, and default the API key to
+`local-eider`.
 Override their model, listen address, served name, or key with `EIDER_MODEL_DIR`,
 `EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set

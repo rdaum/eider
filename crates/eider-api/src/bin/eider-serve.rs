@@ -3,7 +3,7 @@ use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
-use infer::qwen3::qwen36::Qwen36Bf16Fp8Mode;
+use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig};
 use infer::runtime::scheduler::SchedulerConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,19 +15,19 @@ use tracing::info;
 const TOKEN_RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum QwenBf16Fp8Arg {
+enum QwenBf16StorageArg {
     #[default]
-    Disabled,
-    Attention,
-    All,
+    Bf16,
+    Fp8,
+    Nvfp4,
 }
 
-impl From<QwenBf16Fp8Arg> for Qwen36Bf16Fp8Mode {
-    fn from(value: QwenBf16Fp8Arg) -> Self {
+impl From<QwenBf16StorageArg> for Qwen36Bf16Storage {
+    fn from(value: QwenBf16StorageArg) -> Self {
         match value {
-            QwenBf16Fp8Arg::Disabled => Self::Disabled,
-            QwenBf16Fp8Arg::Attention => Self::Attention,
-            QwenBf16Fp8Arg::All => Self::AttentionAndLmHead,
+            QwenBf16StorageArg::Bf16 => Self::Bf16,
+            QwenBf16StorageArg::Fp8 => Self::Fp8,
+            QwenBf16StorageArg::Nvfp4 => Self::Nvfp4,
         }
     }
 }
@@ -70,9 +70,13 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     qwen_prefix_cache_gib: usize,
 
-    /// Lossily convert BF16 Qwen weights to per-channel FP8 at load time.
-    #[arg(long, value_enum, default_value_t = QwenBf16Fp8Arg::Disabled)]
-    qwen_bf16_fp8: QwenBf16Fp8Arg,
+    /// Runtime storage for BF16 Qwen attention projections.
+    #[arg(long, value_enum, default_value_t = QwenBf16StorageArg::Bf16)]
+    qwen_bf16_attention: QwenBf16StorageArg,
+
+    /// Runtime storage for the BF16 Qwen LM head.
+    #[arg(long, value_enum, default_value_t = QwenBf16StorageArg::Bf16)]
+    qwen_bf16_lm_head: QwenBf16StorageArg,
 
     /// Resident expert slots per routed Step layer.
     #[arg(long, default_value_t = 240)]
@@ -117,7 +121,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .qwen_prefix_cache_gib
         .checked_mul(1024 * 1024 * 1024)
         .ok_or("Qwen prefix-cache size exceeds usize")?;
-    actor_config.qwen_bf16_fp8 = args.qwen_bf16_fp8.into();
+    actor_config.qwen_bf16_storage = Qwen36Bf16StorageConfig::new(
+        args.qwen_bf16_attention.into(),
+        args.qwen_bf16_lm_head.into(),
+    );
     actor_config.step_expert_capacity = args.step_expert_capacity;
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
