@@ -310,6 +310,7 @@ fn actor_main(
         CheckpointArchitecture::Nemotron3 => {
             info!(
                 model_dir = %model_dir.display(),
+                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
                 storage = ?nemotron_storage,
                 "loading Nemotron 3 model"
             );
@@ -320,7 +321,12 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Nemotron3ChatService::new(&model, &template, scheduler) {
+            let service = match Nemotron3ChatService::new_with_prefix_cache(
+                &model,
+                &template,
+                scheduler,
+                prefix_cache,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

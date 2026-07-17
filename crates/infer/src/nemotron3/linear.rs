@@ -1,8 +1,10 @@
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    Result, bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_into_on_stream,
-    fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    Result, bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    fp8_linear_channel_scaled_f32_batch_into_on_stream,
+    fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
+    fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
 
 /// Device format used when the checkpoint stores a dense linear in BF16.
@@ -91,6 +93,61 @@ impl Nemotron3Linear {
             Self::Bf16(linear) => linear.run(input, output, stream),
             Self::Fp8(linear) => linear.run(input, output, stream),
             Self::Nvfp4(linear) => linear.run(input, output, stream),
+        }
+    }
+
+    pub(super) fn run_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Bf16(linear) => bf16_linear_logits_f32_batch_into_on_stream(
+                input,
+                &linear.weight,
+                output.output(),
+                batch_rows,
+                linear.rows,
+                linear.cols,
+                stream,
+            ),
+            Self::Fp8(linear) => match &linear.channel_weight_scale {
+                Some(scales) => fp8_linear_channel_scaled_f32_batch_into_on_stream(
+                    input,
+                    &linear.weight,
+                    scales,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    256,
+                    stream,
+                ),
+                None => fp8_linear_f32_batch_into_on_stream(
+                    input,
+                    &linear.weight,
+                    output.output(),
+                    batch_rows,
+                    linear.rows,
+                    linear.cols,
+                    linear.weight_scale,
+                    256,
+                    stream,
+                ),
+            },
+            Self::Nvfp4(linear) => nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+                input,
+                &linear.packed_weight,
+                &linear.weight_scale,
+                output.output(),
+                batch_rows,
+                linear.rows,
+                linear.cols,
+                linear.weight_scale_2,
+                stream,
+            ),
         }
     }
 

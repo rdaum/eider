@@ -8,7 +8,9 @@ Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
 Step-3.7-Flash, and NVIDIA's Nemotron 3 hybrid architecture. It includes an
 OpenAI API-compatible server with continuous multi-session scheduling and,
 for the Qwen-family and Step paths, a compact FP4 KV cache, on top of some
-(hopefully) finely tuned CUDA kernels.
+(hopefully) finely tuned CUDA kernels. Nemotron uses its own hybrid
+Mamba/attention state and prompt-prefix checkpoints; compact FP4 KV storage is
+not implemented for that path yet.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -47,6 +49,11 @@ remaining BF16 attention, dense and shared FFNs, and LM head to NVFP4 at load
 time. With 240 of 288 experts resident per routed layer, this reduces device
 weights from 95.5 to 87.3 GiB and sustains about 20.4 API decode tokens/sec once
 the required experts are resident.
+
+[Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
+is a 120B hybrid model that fits on one Spark in 65.6 GiB. Its greedy
+speculative decode reaches about 32 tokens/sec on GB10, compared with 26 for
+vLLM.
 
 Compared with a vLLM setup in docker, the more biggest differences is
 operational: Eider starts up substantially faster and has a smaller idle footprint
@@ -125,8 +132,7 @@ also contains a vision tower, but Eider currently serves its text path only.
 [NVIDIA Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
 uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
 backbone. Eider converts its remaining dense BF16 and FP8 weights to NVFP4,
-retaining 64.1 GiB and serving about 20 decode tokens/sec on one Spark, up from
-about 12 tokens/sec with the checkpoint's mixed storage.
+retaining 65.6 GiB including its MTP block.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -166,7 +172,8 @@ scripts/run-eider-nemotron3-super-server.sh
 
 The Nemotron launcher converts its dense BF16 and FP8 weights to NVFP4 by
 default. `EIDER_NEMOTRON_BF16_STORAGE` accepts `bf16`, `fp8`, or `nvfp4`, while
-`EIDER_NEMOTRON_FP8_STORAGE` accepts `fp8` or `nvfp4`.
+`EIDER_NEMOTRON_FP8_STORAGE` accepts `fp8` or `nvfp4`. It also uses the shared
+prompt-prefix cache by default; set `--prefix-cache-gib 0` to disable it.
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set

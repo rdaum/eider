@@ -2,13 +2,21 @@
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::prefix_cache::{
+    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
+};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::nemotron3::{Nemotron3DecodeState, Nemotron3Model};
+use crate::nemotron3::{
+    Nemotron3DecodeState, Nemotron3Model, Nemotron3MtpWorkspace, Nemotron3SequenceCheckpoint,
+    Nemotron3SpeculativeCycleWorkspace,
+};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
+use tracing::warn;
 
 /// Stable request identity assigned by a Nemotron 3 chat service.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -77,6 +85,9 @@ pub enum Nemotron3CancelOutcome {
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
+    prefix_cache_key: Option<PrefixCacheKey>,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
@@ -97,6 +108,9 @@ pub struct Nemotron3ChatService<'model, 'template> {
     waiting: VecDeque<Nemotron3RequestId>,
     requests: BTreeMap<Nemotron3RequestId, ActiveRequest<'template>>,
     active_sequences: usize,
+    prefix_cache: Option<PrefixCache<Nemotron3SequenceCheckpoint>>,
+    mtp_prefill_workspace: Option<Nemotron3MtpWorkspace>,
+    speculative_workspaces: BTreeMap<usize, Nemotron3SpeculativeCycleWorkspace>,
 }
 
 impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
@@ -105,6 +119,16 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         model: &'model Nemotron3Model,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
+    ) -> Result<Self> {
+        Self::new_with_prefix_cache(model, template, config, PrefixCacheConfig::default())
+    }
+
+    /// Creates a multi-session service with ART-backed reusable prompt prefixes.
+    pub fn new_with_prefix_cache(
+        model: &'model Nemotron3Model,
+        template: &'template CheckpointChatTemplate,
+        config: SchedulerConfig,
+        prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
@@ -115,6 +139,13 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
+            prefix_cache: (prefix_cache.max_device_bytes != 0)
+                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
+            mtp_prefill_workspace: model
+                .has_mtp()
+                .then(|| model.mtp_workspace(1, 1))
+                .transpose()?,
+            speculative_workspaces: BTreeMap::new(),
         })
     }
 
@@ -162,9 +193,21 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         self.next_id += 1;
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
+        let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_cache_key = if prefix_cache_target == 0 {
+            None
+        } else {
+            self.prefix_cache
+                .as_mut()
+                .map(|cache| cache.prompt_key(&prompt.token_ids, prefix_cache_target))
+                .transpose()?
+        };
         let active = ActiveRequest {
             prompt: prompt.token_ids.clone(),
             prompt_position: 0,
+            prefix_cache_key,
+            prefix_cache_target,
+            prefix_cache_checkpointed: false,
             generation: request.generation.clone(),
             generated_tokens: 0,
             last_token: None,
@@ -208,11 +251,26 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .map(|(&id, _)| id)
             .take(self.config.decode_capacity)
             .collect::<Vec<_>>();
+        let mut speculative_ids = Vec::new();
         for id in decode_ids {
+            let request = self.requests.get(&id).expect("decode request exists");
+            let remaining = request
+                .generation
+                .max_new_tokens
+                .saturating_sub(request.generated_tokens);
+            if self.model.has_mtp()
+                && request.sampler.config().uses_fast_argmax()
+                && request.last_token.is_some()
+                && remaining >= 4
+            {
+                speculative_ids.push(id);
+                continue;
+            }
             if let Some(reason) = self.generate_one(id, &mut tick)? {
                 terminal.insert(id, reason);
             }
         }
+        self.generate_speculative(&speculative_ids, &mut tick, &mut terminal)?;
 
         let prefill_ids = self
             .requests
@@ -233,19 +291,29 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 if token_budget == 0 {
                     break;
                 }
-                let request = self.requests.get_mut(&id).expect("prefill request exists");
-                if request.prompt_position + 1 >= request.prompt.len() {
-                    continue;
+                let checkpoint = {
+                    let request = self.requests.get_mut(&id).expect("prefill request exists");
+                    if request.prompt_position + 1 >= request.prompt.len() {
+                        continue;
+                    }
+                    let token = request.prompt[request.prompt_position];
+                    let state = request.state.as_mut().expect("admitted request has state");
+                    if let Some(workspace) = self.mtp_prefill_workspace.as_mut() {
+                        self.model
+                            .append_mtp_prompt_token(state, token, workspace)?;
+                    }
+                    self.model.forward_one(state, token)?;
+                    request.prompt_position += 1;
+                    prefill_progress.insert(id, request.prompt_position);
+                    request.prompt_position == request.prefix_cache_target
+                };
+                if checkpoint {
+                    let mut request = self.requests.remove(&id).expect("prefill request exists");
+                    self.retain_request_checkpoint(&mut request);
+                    self.requests.insert(id, request);
                 }
-                let token = request.prompt[request.prompt_position];
-                self.model.forward_one(
-                    request.state.as_mut().expect("admitted request has state"),
-                    token,
-                )?;
-                request.prompt_position += 1;
                 token_budget -= 1;
                 progressed = true;
-                prefill_progress.insert(id, request.prompt_position);
             }
             if !progressed {
                 break;
@@ -297,17 +365,63 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let state = self.model.sequence_state(capacity.max(1))?;
+            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
+                (Some(cache), Some(key)) => {
+                    cache.restore(key, Nemotron3SequenceCheckpoint::position, |checkpoint| {
+                        self.model
+                            .restore_sequence_checkpoint(checkpoint, capacity.max(1))
+                    })?
+                }
+                _ => None,
+            };
+            let cached_prompt_tokens = restored.as_ref().map_or(0, Nemotron3DecodeState::len);
+            let state = restored.unwrap_or(self.model.sequence_state(capacity.max(1))?);
             let bytes = state.device_bytes();
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_cache_checkpointed =
+                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             request.state = Some(state);
             self.active_sequences += 1;
             tick.admitted.push(Nemotron3AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
-                cached_prompt_tokens: 0,
+                cached_prompt_tokens,
             });
         }
         Ok(())
+    }
+
+    fn retain_request_checkpoint(&mut self, request: &mut ActiveRequest<'template>) {
+        if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
+            return;
+        }
+        let (Some(cache), Some(key), Some(state)) = (
+            self.prefix_cache.as_mut(),
+            request.prefix_cache_key.as_ref(),
+            request.state.as_ref(),
+        ) else {
+            return;
+        };
+        if state.len() != request.prefix_cache_target {
+            return;
+        }
+        if !cache.contains(key) {
+            let estimated_bytes = self.model.checkpoint_sequence_device_bytes(state);
+            if cache.prepare_insert(estimated_bytes) {
+                let started = Instant::now();
+                match self.model.checkpoint_sequence(state) {
+                    Ok(checkpoint) => {
+                        cache.record_checkpoint(started);
+                        let device_bytes = checkpoint.device_bytes();
+                        if let Err(error) = cache.insert(key.clone(), checkpoint, device_bytes) {
+                            warn!(%error, "failed to retain Nemotron prompt prefix checkpoint");
+                        }
+                    }
+                    Err(error) => warn!(%error, "failed to checkpoint Nemotron prompt prefix"),
+                }
+            }
+        }
+        request.prefix_cache_checkpointed = true;
     }
 
     fn generate_one(
@@ -320,6 +434,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .last_token
             .unwrap_or(request.prompt[request.prompt.len() - 1]);
         let state = request.state.as_mut().expect("admitted request has state");
+        if let Some(workspace) = self.mtp_prefill_workspace.as_mut() {
+            self.model
+                .append_mtp_prompt_token(state, input, workspace)?;
+        }
         self.model.forward_one(state, input)?;
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(state)?;
@@ -351,6 +469,90 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             return Ok(Some(ChatFinishReason::Length));
         }
         Ok(None)
+    }
+
+    fn generate_speculative(
+        &mut self,
+        ids: &[Nemotron3RequestId],
+        tick: &mut Nemotron3Tick,
+        terminal: &mut BTreeMap<Nemotron3RequestId, ChatFinishReason>,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut selected = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    self.requests
+                        .remove(id)
+                        .expect("selected speculative request exists"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let inputs = selected
+            .iter()
+            .map(|(_, request)| {
+                request
+                    .last_token
+                    .expect("speculative request has input token")
+            })
+            .collect::<Vec<_>>();
+        let result = {
+            if !self.speculative_workspaces.contains_key(&selected.len()) {
+                let workspace = self.model.speculative_cycle_workspace(selected.len())?;
+                self.speculative_workspaces
+                    .insert(selected.len(), workspace);
+            }
+            let workspace = self
+                .speculative_workspaces
+                .get_mut(&selected.len())
+                .expect("speculative workspace was inserted");
+            let mut states = selected
+                .iter_mut()
+                .map(|(_, request)| request.state.as_mut().expect("selected request has state"))
+                .collect::<Vec<_>>();
+            self.model
+                .speculative_cycle_argmax(&mut states, &inputs, workspace)
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                for (id, request) in selected {
+                    self.requests.insert(id, request);
+                }
+                return Err(error);
+            }
+        };
+        for (sequence, (id, mut request)) in selected.into_iter().enumerate() {
+            let emitted = result.emitted_tokens(sequence)?;
+            request.last_token = emitted.last().copied();
+            for token in emitted {
+                request.generated_tokens += 1;
+                request.history.push(token);
+                request.usage.completion_tokens += 1;
+                if request.output.is_reasoning() {
+                    request.usage.reasoning_tokens += 1;
+                }
+                tick.generated.push(id);
+                let events = request.output.push_token(token)?;
+                if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
+                    terminal.insert(id, reason);
+                    break;
+                }
+                if request.generation.eos_token_ids.contains(&token) {
+                    terminal.insert(id, ChatFinishReason::Eos);
+                    break;
+                }
+                if request.generated_tokens == request.generation.max_new_tokens {
+                    terminal.insert(id, ChatFinishReason::Length);
+                    break;
+                }
+            }
+            self.requests.insert(id, request);
+        }
+        Ok(())
     }
 
     fn finish_request(

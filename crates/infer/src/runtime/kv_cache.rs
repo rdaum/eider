@@ -90,6 +90,21 @@ pub struct LayerKvCache {
     head_dim: usize,
 }
 
+/// A compact, device-resident snapshot of the valid prefix of one layer cache.
+pub(crate) struct LayerKvCacheCheckpoint {
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+impl LayerKvCacheCheckpoint {
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.key.device_bytes() + self.value.device_bytes()
+    }
+}
+
 impl LayerKvCache {
     /// Allocates a zero-initialized cache for one layer.
     pub fn new(max_tokens: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
@@ -143,6 +158,72 @@ impl LayerKvCache {
     /// Returns bytes owned by this layer's device-resident key/value storage.
     pub fn device_bytes(&self) -> usize {
         self.key.device_bytes() + self.value.device_bytes()
+    }
+
+    pub(crate) fn checkpoint_device_bytes(&self) -> usize {
+        self.len
+            .saturating_mul(self.kv_width())
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<f32>())
+    }
+
+    /// Copies only the valid prefix into a compact device checkpoint.
+    pub(crate) fn checkpoint_on_stream(
+        &self,
+        stream: &CudaStream,
+    ) -> Result<LayerKvCacheCheckpoint> {
+        let values = self.len.saturating_mul(self.kv_width());
+        let mut key = DeviceBuffer::zeroed(values)?;
+        let mut value = DeviceBuffer::zeroed(values)?;
+        key.copy_prefix_from_device_on_stream(&self.key, values, stream)?;
+        value.copy_prefix_from_device_on_stream(&self.value, values, stream)?;
+        Ok(LayerKvCacheCheckpoint {
+            key,
+            value,
+            len: self.len,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+        })
+    }
+
+    /// Restores a compact prefix checkpoint into this cache's existing capacity.
+    pub(crate) fn restore_checkpoint_on_stream(
+        &mut self,
+        checkpoint: &LayerKvCacheCheckpoint,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if self.kv_heads != checkpoint.kv_heads || self.head_dim != checkpoint.head_dim {
+            return Err(Error::Shape {
+                label: "layer KV checkpoint layout",
+                expected: format!("kv_heads={} head_dim={}", self.kv_heads, self.head_dim),
+                actual: format!(
+                    "kv_heads={} head_dim={}",
+                    checkpoint.kv_heads, checkpoint.head_dim
+                ),
+            });
+        }
+        if checkpoint.len > self.max_tokens {
+            return Err(Error::Shape {
+                label: "layer KV checkpoint capacity",
+                expected: format!("at most {} rows", self.max_tokens),
+                actual: format!("{} rows", checkpoint.len),
+            });
+        }
+        let values = checkpoint.len.saturating_mul(self.kv_width());
+        self.key
+            .copy_prefix_from_device_on_stream(&checkpoint.key, values, stream)?;
+        self.value
+            .copy_prefix_from_device_on_stream(&checkpoint.value, values, stream)?;
+        self.len = checkpoint.len;
+        Ok(())
+    }
+
+    pub(crate) fn key_ptr(&mut self) -> *mut f32 {
+        self.key.inout().as_mut_ptr().cast()
+    }
+
+    pub(crate) fn value_ptr(&mut self) -> *mut f32 {
+        self.value.inout().as_mut_ptr().cast()
     }
 
     /// Appends one or more contiguous K/V rows and advances the valid length.
@@ -262,6 +343,19 @@ impl LayerKvCache {
             });
         }
         self.len += rows;
+        Ok(())
+    }
+
+    /// Truncates the logical cache length without modifying stored K/V rows.
+    pub fn truncate_len(&mut self, len: usize) -> Result<()> {
+        if len > self.len {
+            return Err(Error::Shape {
+                label: "layer KV truncate",
+                expected: format!("at most {} rows", self.len),
+                actual: format!("{len} rows"),
+            });
+        }
+        self.len = len;
         Ok(())
     }
 

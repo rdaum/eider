@@ -736,6 +736,20 @@ unsafe extern "C" {
         scaling_factor: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_sigmoid_topk_f32_batch_on_stream(
+        logits: *const f32,
+        bias: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        batch_size: u32,
+        experts: u32,
+        k: u32,
+        groups: u32,
+        topk_groups: u32,
+        normalize: i32,
+        scaling_factor: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_step37_sigmoid_top8_f32_batch_on_stream(
         logits: *const f32,
         bias: *const f32,
@@ -837,6 +851,17 @@ unsafe extern "C" {
         inputs: *const *const f32,
         alpha_table: *const f32,
         output: *mut f32,
+        len: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
+        indices: *const u32,
+        route_weights: *const f32,
+        inputs: *const *const f32,
+        alpha_table: *const f32,
+        output: *mut f32,
+        rows: u32,
         len: u32,
         groups: u32,
         stream: cudaStream_t,
@@ -981,6 +1006,36 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_concat_f32_rows_on_stream(
+        left: *const f32,
+        right: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_increment_u32_on_stream(
+        values: *mut u32,
+        len: u32,
+        increment: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_store_u32_column_on_stream(
+        input: *const u32,
+        output: *mut u32,
+        rows: u32,
+        columns: u32,
+        column: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_prepend_u32_rows_on_stream(
+        first: *const u32,
+        remaining: *const u32,
+        output: *mut u32,
+        rows: u32,
+        remaining_columns: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     #[cfg(test)]
     pub(crate) fn infer_row_major_to_col_major_f32(
         input: *const f32,
@@ -1009,9 +1064,25 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gather_group_row_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        groups: u32,
+        rows_per_group: u32,
+        row: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_copy_bf16_row_to_f32_indexed_on_stream(
         input: *const u16,
         row: *const u32,
+        output: *mut f32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_copy_bf16_row_to_f32_on_stream(
+        input: *const u16,
+        row: u32,
         output: *mut f32,
         cols: u32,
         stream: cudaStream_t,
@@ -1154,6 +1225,34 @@ unsafe extern "C" {
         kv_heads: u32,
         head_dim: u32,
     ) -> cudaError_t;
+    pub(crate) fn infer_append_ragged_kv_f32_on_stream(
+        key: *const f32,
+        value: *const f32,
+        key_cache_table: *const *mut f32,
+        value_cache_table: *const *mut f32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        start_positions: *const u32,
+        sequence_count: u32,
+        total_tokens: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ragged_gqa_attention_f32_on_stream(
+        query: *const f32,
+        key_cache_table: *const *mut f32,
+        value_cache_table: *const *mut f32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        start_positions: *const u32,
+        output: *mut f32,
+        sequence_count: u32,
+        total_tokens: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_bf16_linear_argmax_f32_on_stream(
         input: *const f32,
         weight: *const u16,
@@ -1177,6 +1276,17 @@ unsafe extern "C" {
         out_value: *mut f32,
         rows: u32,
         cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_speculative_accept_argmax_f32_on_stream(
+        previous_logits: *const *const f32,
+        verification_logits: *const f32,
+        drafted_tokens: *const u32,
+        accepted_counts: *mut u32,
+        next_tokens: *mut u32,
+        sequence_count: u32,
+        draft_count: u32,
+        vocab_size: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_sample_topk_topp_f32_batch_on_stream(
@@ -1356,6 +1466,17 @@ unsafe extern "C" {
         weight: *const u8,
         channel_weight_scale: *const f32,
         output: *mut f32,
+        rows: u32,
+        cols: u32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_fp8_linear_channel_scaled_f32_batch_configured_on_stream(
+        input: *const f32,
+        weight: *const u8,
+        channel_weight_scale: *const f32,
+        output: *mut f32,
+        batch_size: u32,
         rows: u32,
         cols: u32,
         threads: u32,
@@ -1692,8 +1813,40 @@ unsafe extern "C" {
         projected: *const f32,
         conv_weight_bf16: *const u16,
         conv_bias_bf16: *const u16,
-        conv_state: *mut f32,
+        conv_state: *mut u16,
         conv_output: *mut f32,
+        intermediate_size: u32,
+        conv_channels: u32,
+        conv_kernel: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_conv_update_f32_chunks_on_stream(
+        projected: *const f32,
+        conv_weight_bf16: *const u16,
+        conv_bias_bf16: *const u16,
+        conv_state_table: *const *mut u16,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        conv_output: *mut f32,
+        sequence_count: u32,
+        projection_size: u32,
+        intermediate_size: u32,
+        conv_channels: u32,
+        conv_kernel: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_conv_update_f32_chunks_snapshot_on_stream(
+        projected: *const f32,
+        conv_weight_bf16: *const u16,
+        conv_bias_bf16: *const u16,
+        conv_state_table: *const *mut u16,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        conv_output: *mut f32,
+        state_snapshots_bf16: *mut u16,
+        sequence_count: u32,
+        snapshot_slots: u32,
+        projection_size: u32,
         intermediate_size: u32,
         conv_channels: u32,
         conv_kernel: u32,
@@ -1706,7 +1859,7 @@ unsafe extern "C" {
         d_bf16: *const u16,
         dt_bias_bf16: *const u16,
         norm_weight_bf16: *const u16,
-        ssm_state: *mut f32,
+        ssm_state: *mut u16,
         output: *mut f32,
         heads: u32,
         head_dim: u32,
@@ -1714,6 +1867,61 @@ unsafe extern "C" {
         state_size: u32,
         dt_floor: f32,
         eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
+        projected: *const f32,
+        conv_output: *const f32,
+        a_log_bf16: *const u16,
+        d_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        norm_weight_bf16: *const u16,
+        ssm_state_table: *const *mut u16,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        output: *mut f32,
+        sequence_count: u32,
+        total_tokens: u32,
+        projection_size: u32,
+        heads: u32,
+        head_dim: u32,
+        groups: u32,
+        state_size: u32,
+        dt_floor: f32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
+        projected: *const f32,
+        conv_output: *const f32,
+        a_log_bf16: *const u16,
+        d_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        norm_weight_bf16: *const u16,
+        ssm_state_table: *const *mut u16,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        output: *mut f32,
+        state_snapshots_bf16: *mut u16,
+        sequence_count: u32,
+        total_tokens: u32,
+        snapshot_slots: u32,
+        projection_size: u32,
+        heads: u32,
+        head_dim: u32,
+        groups: u32,
+        state_size: u32,
+        dt_floor: f32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_select_bf16_state_snapshot_on_stream(
+        state_table: *const *mut u16,
+        snapshots_bf16: *const u16,
+        selected_slots: *const u32,
+        sequence_count: u32,
+        snapshot_slots: u32,
+        state_size: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 
