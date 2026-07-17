@@ -270,35 +270,44 @@ implement the measured kernels underneath it.
 
 ```mermaid
 flowchart TD
-    A[Prompt tokens] --> B[Prefill]
-    B --> C[Runnable sequence states]
-    C --> D[Batched decode tick]
-    D --> E{Layer attention type}
-    E -->|Linear attention| F[QKV + GDN state + output projection]
-    E -->|Full attention| G[QKV + KV-cache append + cached attention + output projection]
-    F --> H[MoE FFN]
-    G --> H
-    H --> I[Router + top-k]
-    I --> J{Expert weight format}
-    J -->|NVFP4| K[Marlin W4A16 gate/up + SM12x down]
-    J -->|FP8| L[Grouped W8A8 gate/up + down]
-    K --> M[Shared expert + weighted combine]
-    L --> M
-    M --> N[Final RMSNorm + lm-head logits]
-    N --> P{Sampling policy}
-    P -->|Greedy| Q[GPU top-1]
-    P -->|Bounded top-k/top-p| R[Hierarchical GPU top-k + sampling]
-    Q --> O[Selected token]
-    R --> O
-    O --> C
+    A[Prompt chunks] --> B[Ragged batched prefill]
+    B --> C[Per-sequence NVFP4 KV and GDN state]
+    C --> D[Select changing decode batch]
+    D --> E[Embedding lookup]
+    E --> F{Layer attention type}
+    F -->|Linear: captured through layer tail| G[QKV/Z + GDN update + gated norm + output projection]
+    F -->|Full: captured pre-attention| H[Q/K/V + Q/K norm + iMROPE]
+    H -->|Eager for active rows| I[NVFP4 KV append + cached attention]
+    I -->|Captured post-attention through layer tail| J[Sigmoid gate + output projection]
+    G --> K[Attention residual + post-attention RMSNorm]
+    J --> K
+    K -->|Main stream| L[BF16 router + top-k]
+    K -->|Shared stream| M[NVFP4 shared expert + BF16 gate]
+    L --> N[Marlin W4A16 routed gate/up]
+    N --> O[SiLU + indexed SM12x routed down]
+    O --> P[Fused routed/shared combine + residual]
+    M --> P
+    P --> Q{Last layer?}
+    Q -->|No| F
+    Q -->|Yes| R[Final RMSNorm + LM-head logits]
+    R --> S{Sampling policy}
+    S -->|Greedy| T[GPU top-1]
+    S -->|Bounded top-k/top-p| U[GPU penalties + hierarchical sampling]
+    S -->|Unbounded/large top-k| V[Logit readback + CPU sampling]
+    T --> W[Selected tokens]
+    U --> W
+    V --> W
+    W --> D
 
     subgraph Host[Host orchestration]
-        B
-        C
+        A
         D
-        O
+        V
+        W
     end
     subgraph Device[Device-resident work]
+        B
+        C
         E
         F
         G
@@ -309,12 +318,22 @@ flowchart TD
         L
         M
         N
+        O
+        P
+        Q
+        R
+        S
+        T
+        U
     end
 ```
 
-Sequence-owned KV and recurrent state remains device-resident as requests move
-between decode batches. The canonical changing-membership batch path is eager;
-the legacy single-row reference still uses graph replay for stable segments.
+Sequence-owned KV and recurrent states remain device-resident as requests move
+between decode batches. Linear-attention layers replay one captured layer
+graph. Full-attention layers replay captured pre- and post-attention graphs
+around the active-row KV-cache operation. The shared expert overlaps the routed
+experts on a second CUDA stream. `EIDER_DISABLE_DECODE_GRAPHS=1` retains the
+same execution path but submits its layer work eagerly.
 
 ## CUTLASS setup
 
