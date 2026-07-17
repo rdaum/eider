@@ -13,6 +13,7 @@ mod moe;
 mod router;
 
 pub use attention::{Nemotron3AttentionLayer, Nemotron3AttentionWorkspace};
+pub use linear::{Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3StorageConfig};
 pub use mamba::{Nemotron3MambaLayer, Nemotron3MambaState, Nemotron3MambaWorkspace};
 pub use model::{Nemotron3DecodeState, Nemotron3Model};
 pub use moe::{Nemotron3MoeLayer, Nemotron3MoeWorkspace};

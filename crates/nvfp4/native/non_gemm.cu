@@ -6226,49 +6226,77 @@ __global__ void infer_nemotron3_mamba_state_update_f32_kernel(
     std::uint32_t head_dim,
     std::uint32_t groups,
     std::uint32_t state_size,
-    float dt_floor,
-    float eps) {
-    const std::uint32_t group = blockIdx.x;
+    float dt_floor) {
+    constexpr std::uint32_t kWarpsPerBlock = 8;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t flat = blockIdx.x * kWarpsPerBlock + warp;
+    const std::uint32_t intermediate_size = heads * head_dim;
+    if (flat >= intermediate_size) {
+        return;
+    }
+
     const std::uint32_t heads_per_group = heads / groups;
     const std::uint32_t group_width = heads_per_group * head_dim;
-    const std::uint32_t intermediate_size = heads * head_dim;
+    const std::uint32_t group = flat / group_width;
     const std::uint32_t bc_width = groups * state_size;
     const std::uint32_t conv_channels = intermediate_size + 2 * bc_width;
-    const std::uint32_t group_begin = group * group_width;
-    float sum_squares = 0.0f;
-
-    for (std::uint32_t group_index = threadIdx.x; group_index < group_width;
-         group_index += blockDim.x) {
-        const std::uint32_t flat = group_begin + group_index;
+    float x = 0.0f;
+    float gate = 0.0f;
+    float dt = 0.0f;
+    float decay = 0.0f;
+    float d = 0.0f;
+    if (lane == 0) {
         const std::uint32_t head = flat / head_dim;
-        const float x = conv_output[flat];
-        const float gate = projected[flat];
+        x = conv_output[flat];
+        gate = projected[flat];
         const float raw_dt = projected[intermediate_size + conv_channels + head];
         const float dt_bias = __bfloat162float(
             *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
-        const float dt = fmaxf(log1pf(expf(-fabsf(raw_dt + dt_bias))) +
-                                   fmaxf(raw_dt + dt_bias, 0.0f),
-                               dt_floor);
+        dt = fmaxf(log1pf(expf(-fabsf(raw_dt + dt_bias))) +
+                       fmaxf(raw_dt + dt_bias, 0.0f),
+                   dt_floor);
         const float a_log = __bfloat162float(
             *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
-        const float decay = expf(-dt * expf(a_log));
-        const float d = __bfloat162float(
+        decay = expf(-dt * expf(a_log));
+        d = __bfloat162float(
             *reinterpret_cast<const __nv_bfloat16*>(d_bf16 + head));
-        float* state = ssm_state + flat * state_size;
-        const float* b = conv_output + intermediate_size + group * state_size;
-        const float* c = conv_output + intermediate_size + bc_width + group * state_size;
-        float y = d * x;
-        for (std::uint32_t state_index = 0; state_index < state_size; ++state_index) {
-            const float updated = state[state_index] * decay + dt * b[state_index] * x;
-            state[state_index] = updated;
-            y = __fmaf_rn(updated, c[state_index], y);
-        }
-        const float silu_gate = gate / (1.0f + expf(-gate));
-        const float gated = y * silu_gate;
-        output[flat] = gated;
-        sum_squares = __fmaf_rn(gated, gated, sum_squares);
     }
+    x = __shfl_sync(0xffffffff, x, 0);
+    gate = __shfl_sync(0xffffffff, gate, 0);
+    dt = __shfl_sync(0xffffffff, dt, 0);
+    decay = __shfl_sync(0xffffffff, decay, 0);
+    d = __shfl_sync(0xffffffff, d, 0);
 
+    float* state = ssm_state + static_cast<std::size_t>(flat) * state_size;
+    const float* b = conv_output + intermediate_size + group * state_size;
+    const float* c = conv_output + intermediate_size + bc_width + group * state_size;
+    float y = 0.0f;
+    for (std::uint32_t state_index = lane; state_index < state_size; state_index += 32) {
+        const float updated = state[state_index] * decay + dt * b[state_index] * x;
+        state[state_index] = updated;
+        y = __fmaf_rn(updated, c[state_index], y);
+    }
+    y = infer_warp_reduce_sum(y);
+    if (lane == 0) {
+        y += d * x;
+        const float silu_gate = gate / (1.0f + expf(-gate));
+        output[flat] = y * silu_gate;
+    }
+}
+
+__global__ void infer_nemotron3_group_rms_norm_f32_kernel(
+    float* output,
+    const std::uint16_t* norm_weight_bf16,
+    std::uint32_t group_width,
+    float eps) {
+    const std::uint32_t group_begin = blockIdx.x * group_width;
+    float sum_squares = 0.0f;
+    for (std::uint32_t group_index = threadIdx.x; group_index < group_width;
+         group_index += blockDim.x) {
+        const float value = output[group_begin + group_index];
+        sum_squares = __fmaf_rn(value, value, sum_squares);
+    }
     const float group_sum = infer_block_reduce_sum(sum_squares);
     __shared__ float inv_rms;
     if (threadIdx.x == 0) {
@@ -6307,8 +6335,12 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
         !(dt_floor > 0.0f) || !(eps > 0.0f)) {
         return cudaErrorInvalidValue;
     }
-    constexpr int kThreads = 256;
-    infer_nemotron3_mamba_state_update_f32_kernel<<<groups, kThreads, 0, stream>>>(
+    constexpr std::uint32_t kThreads = 256;
+    constexpr std::uint32_t kWarpsPerBlock = kThreads / 32;
+    const std::uint32_t intermediate_size = heads * head_dim;
+    const std::uint32_t state_blocks =
+        (intermediate_size + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    infer_nemotron3_mamba_state_update_f32_kernel<<<state_blocks, kThreads, 0, stream>>>(
         projected,
         conv_output,
         a_log_bf16,
@@ -6321,8 +6353,14 @@ extern "C" cudaError_t infer_nemotron3_mamba_state_update_f32_on_stream(
         head_dim,
         groups,
         state_size,
-        dt_floor,
-        eps);
+        dt_floor);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const std::uint32_t group_width = intermediate_size / groups;
+    infer_nemotron3_group_rms_norm_f32_kernel<<<groups, kThreads, 0, stream>>>(
+        output, norm_weight_bf16, group_width, eps);
     return cudaGetLastError();
 }
 

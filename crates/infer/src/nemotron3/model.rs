@@ -2,7 +2,7 @@ use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{
     Nemotron3AttentionLayer, Nemotron3AttentionWorkspace, Nemotron3LayerKind, Nemotron3MambaLayer,
     Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest, Nemotron3MoeLayer,
-    Nemotron3MoeWorkspace,
+    Nemotron3MoeWorkspace, Nemotron3StorageConfig,
 };
 use crate::runtime::kv_cache::LayerKvCache;
 use nvfp4::{
@@ -25,10 +25,19 @@ pub struct Nemotron3Model {
 impl Nemotron3Model {
     /// Loads a Nemotron 3 checkpoint into device memory.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_storage(model_dir, Nemotron3StorageConfig::default())
+    }
+
+    /// Loads a Nemotron 3 checkpoint with an explicit dense-linear storage policy.
+    pub fn load_with_storage(
+        model_dir: impl AsRef<Path>,
+        storage: Nemotron3StorageConfig,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let manifest = Nemotron3Manifest::from_model_dir(model_dir)?;
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         manifest.validate_checkpoint_index(&checkpoint)?;
+        info!(?storage, "selected Nemotron 3 dense-linear storage");
         let embedding = load_bf16(
             &checkpoint,
             "backbone.embeddings.weight",
@@ -37,18 +46,22 @@ impl Nemotron3Model {
         let mut layers = Vec::with_capacity(manifest.layers.len());
         let mut device_bytes = embedding.device_bytes();
         for (layer, kind) in manifest.layers.iter().copied().enumerate() {
-            let loaded =
-                match kind {
-                    Nemotron3LayerKind::Mamba => Nemotron3Layer::Mamba(Box::new(
-                        Nemotron3MambaLayer::load(&checkpoint, &manifest, layer)?,
-                    )),
-                    Nemotron3LayerKind::Moe => Nemotron3Layer::Moe(Box::new(
-                        Nemotron3MoeLayer::load(&checkpoint, &manifest, layer)?,
-                    )),
-                    Nemotron3LayerKind::Attention => Nemotron3Layer::Attention(Box::new(
-                        Nemotron3AttentionLayer::load(&checkpoint, &manifest, layer)?,
-                    )),
-                };
+            let loaded = match kind {
+                Nemotron3LayerKind::Mamba => Nemotron3Layer::Mamba(Box::new(
+                    Nemotron3MambaLayer::load_with_storage(&checkpoint, &manifest, layer, storage)?,
+                )),
+                Nemotron3LayerKind::Moe => Nemotron3Layer::Moe(Box::new(
+                    Nemotron3MoeLayer::load_with_storage(&checkpoint, &manifest, layer, storage)?,
+                )),
+                Nemotron3LayerKind::Attention => {
+                    Nemotron3Layer::Attention(Box::new(Nemotron3AttentionLayer::load_with_storage(
+                        &checkpoint,
+                        &manifest,
+                        layer,
+                        storage,
+                    )?))
+                }
+            };
             device_bytes += loaded.device_bytes();
             info!(
                 layer,
@@ -68,6 +81,7 @@ impl Nemotron3Model {
             "lm_head",
             manifest.vocab_size,
             manifest.hidden_size,
+            storage,
         )?;
         Ok(Self {
             manifest,

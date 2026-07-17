@@ -124,8 +124,9 @@ also contains a vision tower, but Eider currently serves its text path only.
 
 [NVIDIA Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
 uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
-backbone. Eider follows the checkpoint's mixed BF16, FP8, and NVFP4 storage and
-retains 69.3 GiB of model weights on one Spark.
+backbone. Eider converts its remaining dense BF16 and FP8 weights to NVFP4,
+retaining 64.1 GiB and serving about 20 decode tokens/sec on one Spark, up from
+about 12 tokens/sec with the checkpoint's mixed storage.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -162,6 +163,10 @@ Start Nemotron 3 Super with:
 ```sh
 scripts/run-eider-nemotron3-super-server.sh
 ```
+
+The Nemotron launcher converts its dense BF16 and FP8 weights to NVFP4 by
+default. `EIDER_NEMOTRON_BF16_STORAGE` accepts `bf16`, `fp8`, or `nvfp4`, while
+`EIDER_NEMOTRON_FP8_STORAGE` accepts `fp8` or `nvfp4`.
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
@@ -259,7 +264,7 @@ Nemotron 3 Super smoke test:
 
 ```sh
 cargo run --release -p infer --bin nemotron3-generate -- \
-    models/nemotron-3-super-120b-a12b-nvfp4 "What is 2+2?" 30
+    models/nemotron-3-super-120b-a12b-nvfp4 "What is 2+2?" 30 nvfp4 nvfp4
 ```
 
 The generator applies the checkpoint's text chat prefix and reads its sampling

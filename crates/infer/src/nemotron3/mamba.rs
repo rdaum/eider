@@ -1,5 +1,5 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
-use super::{Nemotron3LayerKind, Nemotron3Manifest};
+use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
@@ -27,6 +27,21 @@ impl Nemotron3MambaLayer {
         checkpoint: &ModelOptCheckpoint,
         manifest: &Nemotron3Manifest,
         layer: usize,
+    ) -> Result<Self> {
+        Self::load_with_storage(
+            checkpoint,
+            manifest,
+            layer,
+            Nemotron3StorageConfig::default(),
+        )
+    }
+
+    /// Loads one Mamba layer with an explicit dense-linear storage policy.
+    pub fn load_with_storage(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        storage: Nemotron3StorageConfig,
     ) -> Result<Self> {
         let kind = manifest
             .layers
@@ -58,6 +73,7 @@ impl Nemotron3MambaLayer {
                 &format!("{mixer}.in_proj"),
                 projection,
                 hidden,
+                storage,
             )?,
             conv_weight: load_bf16(
                 checkpoint,
@@ -86,6 +102,7 @@ impl Nemotron3MambaLayer {
                 &format!("{mixer}.out_proj"),
                 hidden,
                 intermediate,
+                storage,
             )?,
         })
     }
