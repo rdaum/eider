@@ -62,17 +62,18 @@ pub struct Qwen36Model {
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
     bf16_storage: Qwen36Bf16StorageConfig,
+    fp8_attention_storage: Qwen36Fp8AttentionStorage,
 }
 
 /// Runtime storage for checkpoint BF16 projection weights.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Qwen36Bf16Storage {
     /// Retain the checkpoint's BF16 weights.
-    #[default]
     Bf16,
     /// Convert weights to per-output-channel E4M3.
     Fp8,
     /// Convert weights to E2M1 with K16 UE4M3 scales.
+    #[default]
     Nvfp4,
 }
 
@@ -90,6 +91,22 @@ impl Qwen36Bf16StorageConfig {
     pub const fn new(attention: Qwen36Bf16Storage, lm_head: Qwen36Bf16Storage) -> Self {
         Self { attention, lm_head }
     }
+}
+
+/// Runtime storage for checkpoint FP8 attention projections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen36Fp8AttentionStorage {
+    /// Retain the checkpoint's E4M3 weights and scales.
+    #[default]
+    Fp8,
+    /// Requantize the dequantized weights to E2M1 with K16 UE4M3 scales.
+    Nvfp4,
+}
+
+#[derive(Clone, Copy)]
+struct Qwen36AttentionStorage {
+    bf16: Qwen36Bf16Storage,
+    fp8: Qwen36Fp8AttentionStorage,
 }
 
 /// Device-ready weights for one Qwen3.6 text layer.
@@ -235,6 +252,7 @@ impl Qwen36LinearFp8Execution {
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear FP8 execution",
@@ -253,10 +271,13 @@ impl Qwen36LinearFp8Execution {
             manifest.tensor_prefix
         );
         let lt = CublasLt::new()?;
-        let converts_bf16 = checkpoint.tensor_info(&format!("{prefix}.weight"))?.dtype == "BF16"
-            && bf16_storage.attention != Qwen36Bf16Storage::Bf16;
-        let plans = if converts_bf16 || checkpoint.contains_tensor(&format!("{prefix}.input_scale"))
-        {
+        let checkpoint_dtype = &checkpoint.tensor_info(&format!("{prefix}.weight"))?.dtype;
+        let uses_fp8 = if checkpoint_dtype == "BF16" {
+            bf16_storage.attention == Qwen36Bf16Storage::Fp8
+        } else {
+            fp8_attention_storage == Qwen36Fp8AttentionStorage::Fp8
+        };
+        let plans = if !uses_fp8 || checkpoint.contains_tensor(&format!("{prefix}.input_scale")) {
             None
         } else {
             let key_dim = linear.key_heads * linear.key_head_dim;
@@ -294,13 +315,30 @@ struct Bf16Linear {
 impl Qwen36Model {
     /// Opens a Qwen3.6/Qwen3.5-MoE checkpoint and validates its hybrid schedule.
     pub fn open(model_dir: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::open_with_bf16_storage(model_dir, Qwen36Bf16StorageConfig::default())
+        Self::open_with_storage(
+            model_dir,
+            Qwen36Bf16StorageConfig::default(),
+            Qwen36Fp8AttentionStorage::default(),
+        )
     }
 
     /// Opens a checkpoint with explicit runtime storage for BF16 weights.
     pub fn open_with_bf16_storage(
         model_dir: impl AsRef<std::path::Path>,
         bf16_storage: Qwen36Bf16StorageConfig,
+    ) -> Result<Self> {
+        Self::open_with_storage(
+            model_dir,
+            bf16_storage,
+            Qwen36Fp8AttentionStorage::default(),
+        )
+    }
+
+    /// Opens a checkpoint with explicit runtime storage for BF16 and FP8 weights.
+    pub fn open_with_storage(
+        model_dir: impl AsRef<std::path::Path>,
+        bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir.as_ref())?;
         if manifest.architecture != QwenArchitecture::Qwen35Moe {
@@ -334,6 +372,7 @@ impl Qwen36Model {
             manifest,
             checkpoint,
             bf16_storage,
+            fp8_attention_storage,
         })
     }
 
@@ -369,6 +408,7 @@ impl Qwen36Model {
                     &self.manifest,
                     layer,
                     self.bf16_storage.attention,
+                    self.fp8_attention_storage,
                 )?,
             )),
             QwenLayerKind::FullAttention => Ok(Qwen36LayerWeights::FullAttention(
@@ -377,6 +417,7 @@ impl Qwen36Model {
                     &self.manifest,
                     layer,
                     self.bf16_storage.attention,
+                    self.fp8_attention_storage,
                 )?,
             )),
         }
@@ -498,6 +539,7 @@ impl Qwen36FullAttentionWeights {
         manifest: &QwenModelManifest,
         layer: usize,
         bf16_storage: Qwen36Bf16Storage,
+        fp8_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let prefix = format!("{}.layers.{layer}.self_attn", manifest.tensor_prefix);
         let expected_q_rows = manifest
@@ -529,6 +571,7 @@ impl Qwen36FullAttentionWeights {
             expected_q_rows,
             manifest.hidden,
             bf16_storage,
+            fp8_storage,
         )?;
         let k = Qwen36Linear::load(
             checkpoint,
@@ -536,6 +579,7 @@ impl Qwen36FullAttentionWeights {
             expected_kv_rows,
             manifest.hidden,
             bf16_storage,
+            fp8_storage,
         )?;
         let v = Qwen36Linear::load(
             checkpoint,
@@ -543,6 +587,7 @@ impl Qwen36FullAttentionWeights {
             expected_kv_rows,
             manifest.hidden,
             bf16_storage,
+            fp8_storage,
         )?;
         let o = Qwen36Linear::load(
             checkpoint,
@@ -550,6 +595,7 @@ impl Qwen36FullAttentionWeights {
             manifest.hidden,
             manifest.q_heads * manifest.head_dim,
             bf16_storage,
+            fp8_storage,
         )?;
         q.require_shape(expected_q_rows, manifest.hidden, "Qwen3.6 q_proj")?;
         k.require_shape(expected_kv_rows, manifest.hidden, "Qwen3.6 k_proj")?;
@@ -842,13 +888,15 @@ impl Qwen36LinearAttentionWeights {
         manifest: &QwenModelManifest,
         layer: usize,
         bf16_storage: Qwen36Bf16Storage,
+        fp8_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             checkpoint,
             manifest,
             Qwen36Bf16StorageConfig::new(bf16_storage, Qwen36Bf16Storage::Bf16),
+            fp8_storage,
         )?);
-        Self::load_with_fp8(checkpoint, manifest, layer, fp8, bf16_storage)
+        Self::load_with_fp8(checkpoint, manifest, layer, fp8, bf16_storage, fp8_storage)
     }
 
     fn load_with_fp8(
@@ -857,6 +905,7 @@ impl Qwen36LinearAttentionWeights {
         layer: usize,
         fp8: Rc<Qwen36LinearFp8Execution>,
         bf16_storage: Qwen36Bf16Storage,
+        fp8_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear attention",
@@ -869,12 +918,17 @@ impl Qwen36LinearAttentionWeights {
         let key_dim = key_heads * linear.key_head_dim;
         let value_dim = value_heads * head_v_dim;
         let qkv_rows = key_dim * 2 + value_dim;
+        let storage = Qwen36AttentionStorage {
+            bf16: bf16_storage,
+            fp8: fp8_storage,
+        };
         let qkv = Qwen36Linear::load(
             checkpoint,
             &format!("{prefix}.in_proj_qkv"),
             qkv_rows,
             manifest.hidden,
             bf16_storage,
+            fp8_storage,
         )?;
         let z = Qwen36Linear::load_reordered_v_rows(
             checkpoint,
@@ -883,7 +937,7 @@ impl Qwen36LinearAttentionWeights {
             head_v_dim,
             manifest.hidden,
             key_heads,
-            bf16_storage,
+            storage,
         )?;
         let out = Qwen36Linear::load_reordered_v_cols(
             checkpoint,
@@ -892,7 +946,7 @@ impl Qwen36LinearAttentionWeights {
             value_heads,
             head_v_dim,
             key_heads,
-            bf16_storage,
+            storage,
         )?;
 
         // Reorder V heads from grouped-by-K to tiled order for tensors consumed after GDN prep.
@@ -1605,6 +1659,7 @@ impl Qwen36Linear {
         rows: usize,
         cols: usize,
         bf16_storage: Qwen36Bf16Storage,
+        fp8_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
@@ -1625,7 +1680,13 @@ impl Qwen36Linear {
                 }
             }
         } else {
-            Self::Fp8(Fp8Linear::from_host(&checkpoint.load_fp8_linear(prefix)?)?)
+            let host = checkpoint.load_fp8_linear(prefix)?;
+            match fp8_storage {
+                Qwen36Fp8AttentionStorage::Fp8 => Self::Fp8(Fp8Linear::from_host(&host)?),
+                Qwen36Fp8AttentionStorage::Nvfp4 => {
+                    Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?)
+                }
+            }
         };
         linear.require_shape(rows, cols, "Qwen3.5 projection")?;
         Ok(linear)
@@ -1638,7 +1699,7 @@ impl Qwen36Linear {
         head_dim: usize,
         cols: usize,
         key_heads: usize,
-        bf16_storage: Qwen36Bf16Storage,
+        storage: Qwen36AttentionStorage,
     ) -> Result<Self> {
         let rows = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1646,7 +1707,7 @@ impl Qwen36Linear {
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_rows(host, key_heads, value_heads, head_dim);
-            return match bf16_storage {
+            return match storage.bf16 {
                 Qwen36Bf16Storage::Bf16 => {
                     Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?))
                 }
@@ -1658,13 +1719,18 @@ impl Qwen36Linear {
                 )?)),
             };
         }
-        let host = checkpoint.load_fp8_linear(prefix)?;
-        Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_rows(
-            host,
+        let host = reorder_fp8_v_rows(
+            checkpoint.load_fp8_linear(prefix)?,
             key_heads,
             value_heads,
             head_dim,
-        ))?))
+        );
+        match storage.fp8 {
+            Qwen36Fp8AttentionStorage::Fp8 => Ok(Self::Fp8(Fp8Linear::from_host(&host)?)),
+            Qwen36Fp8AttentionStorage::Nvfp4 => {
+                Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?))
+            }
+        }
     }
 
     fn load_reordered_v_cols(
@@ -1674,7 +1740,7 @@ impl Qwen36Linear {
         value_heads: usize,
         head_dim: usize,
         key_heads: usize,
-        bf16_storage: Qwen36Bf16Storage,
+        storage: Qwen36AttentionStorage,
     ) -> Result<Self> {
         let cols = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1682,7 +1748,7 @@ impl Qwen36Linear {
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_cols(host, rows, key_heads, value_heads, head_dim);
-            return match bf16_storage {
+            return match storage.bf16 {
                 Qwen36Bf16Storage::Bf16 => {
                     Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?))
                 }
@@ -1694,13 +1760,18 @@ impl Qwen36Linear {
                 )?)),
             };
         }
-        let host = checkpoint.load_fp8_linear(prefix)?;
-        Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_cols(
-            host,
+        let host = reorder_fp8_v_cols(
+            checkpoint.load_fp8_linear(prefix)?,
             key_heads,
             value_heads,
             head_dim,
-        ))?))
+        );
+        match storage.fp8 {
+            Qwen36Fp8AttentionStorage::Fp8 => Ok(Self::Fp8(Fp8Linear::from_host(&host)?)),
+            Qwen36Fp8AttentionStorage::Nvfp4 => {
+                Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?))
+            }
+        }
     }
 
     fn rows(&self) -> usize {
@@ -4710,6 +4781,11 @@ impl Nvfp4DeviceLinear {
         Self::from_host(&host)
     }
 
+    fn from_fp8_host(weight: &ModelOptFp8Linear) -> Result<Self> {
+        let host = ModelOptNvfp4Linear::quantize_fp8(weight)?;
+        Self::from_host(&host)
+    }
+
     /// W4A16 matvec: f32 input × dequantized NVFP4 weight → f32 output.
     fn run_f32_into(
         &self,
@@ -5094,6 +5170,7 @@ impl Qwen36LayerBlock {
             model.checkpoint(),
             model.manifest(),
             model.bf16_storage,
+            model.fp8_attention_storage,
         )?);
         Self::load_inner(model, layer, false, None, fp8)
     }
@@ -5133,6 +5210,7 @@ impl Qwen36LayerBlock {
                     layer,
                     fp8,
                     model.bf16_storage.attention,
+                    model.fp8_attention_storage,
                 )?)
             }
             QwenLayerKind::FullAttention => {
@@ -5141,6 +5219,7 @@ impl Qwen36LayerBlock {
                     &model.manifest,
                     layer,
                     model.bf16_storage.attention,
+                    model.fp8_attention_storage,
                 )?)
             }
         };
@@ -5664,6 +5743,7 @@ pub struct Qwen36TextModel {
     lm_head: Qwen36LmHead,
     expert_paging: bool,
     bf16_storage: Qwen36Bf16StorageConfig,
+    fp8_attention_storage: Qwen36Fp8AttentionStorage,
 }
 
 enum Qwen36LmHead {
@@ -6114,6 +6194,16 @@ impl Qwen36TextModel {
         Self::from_qwen36_model(model)
     }
 
+    /// Loads the model with explicit runtime storage for BF16 and FP8 weights.
+    pub fn open_with_storage(
+        model_dir: impl AsRef<std::path::Path>,
+        bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
+    ) -> Result<Self> {
+        let model = Qwen36Model::open_with_storage(model_dir, bf16_storage, fp8_attention_storage)?;
+        Self::from_qwen36_model(model)
+    }
+
     /// Loads the model with only `capacity_per_layer` routed experts resident.
     pub fn open_with_expert_cache_capacity(
         model_dir: impl AsRef<std::path::Path>,
@@ -6143,12 +6233,14 @@ impl Qwen36TextModel {
         let manifest = model.manifest().clone();
         let checkpoint = model.checkpoint().clone();
         let bf16_storage = model.bf16_storage;
+        let fp8_attention_storage = model.fp8_attention_storage;
         ensure_model_cache(&checkpoint, &manifest)?;
         let lt = CublasLt::new()?;
         let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             &checkpoint,
             &manifest,
             bf16_storage,
+            fp8_attention_storage,
         )?);
         let mut layers = Vec::with_capacity(manifest.layers);
         for layer in 0..manifest.layers {
@@ -6195,6 +6287,7 @@ impl Qwen36TextModel {
             lm_head,
             expert_paging: capacity_per_layer.is_some(),
             bf16_storage,
+            fp8_attention_storage,
         })
     }
 
@@ -6208,6 +6301,7 @@ impl Qwen36TextModel {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
             bf16_storage: self.bf16_storage,
+            fp8_attention_storage: self.fp8_attention_storage,
         };
         for block in &mut self.layers {
             block
@@ -6263,6 +6357,7 @@ impl Qwen36TextModel {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
             bf16_storage: self.bf16_storage,
+            fp8_attention_storage: self.fp8_attention_storage,
         };
         let mut layer_states = Vec::with_capacity(self.layers.len());
         for block in &self.layers {
@@ -6330,6 +6425,7 @@ impl Qwen36TextModel {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
             bf16_storage: self.bf16_storage,
+            fp8_attention_storage: self.fp8_attention_storage,
         };
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);

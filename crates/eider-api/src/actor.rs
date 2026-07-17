@@ -3,7 +3,7 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::metrics::metrics as infer_metrics;
-use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36TextModel};
+use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
@@ -33,6 +33,7 @@ pub struct InferenceActorConfig {
     pub scheduler: SchedulerConfig,
     pub qwen_prefix_cache: Qwen36PrefixCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
+    pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
     pub step_bf16_storage: Step37Bf16StorageConfig,
     pub event_capacity: usize,
@@ -45,6 +46,7 @@ impl InferenceActorConfig {
             scheduler: SchedulerConfig::default(),
             qwen_prefix_cache: Qwen36PrefixCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
+            qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
             event_capacity: 256,
@@ -195,6 +197,7 @@ fn actor_main(
         scheduler,
         qwen_prefix_cache,
         qwen_bf16_storage,
+        qwen_fp8_attention_storage,
         step_expert_capacity,
         step_bf16_storage,
         ..
@@ -235,10 +238,14 @@ fn actor_main(
                 model_dir = %model_dir.display(),
                 prefix_cache_max_device_bytes = qwen_prefix_cache.max_device_bytes,
                 bf16_storage = ?qwen_bf16_storage,
+                native_fp8_attention_storage = ?qwen_fp8_attention_storage,
                 "loading Qwen3.6 model"
             );
-            let model = match Qwen36TextModel::open_with_bf16_storage(&model_dir, qwen_bf16_storage)
-            {
+            let model = match Qwen36TextModel::open_with_storage(
+                &model_dir,
+                qwen_bf16_storage,
+                qwen_fp8_attention_storage,
+            ) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

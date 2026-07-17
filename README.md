@@ -4,8 +4,9 @@
 > insulation (ahem)
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6, Qwen3.5-MoE fine-tunes such as Agents-A1, and
-Step-3.7-Flash. It includes an OpenAI API-compatible server with continuous
+Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, and StepFun's
+separate Step-3.7-Flash architecture. It includes an OpenAI API-compatible
+server with continuous
 multi-session scheduling and a compact FP4 KV cache, on top of some
 (hopefully) finely tuned CUDA kernels.
 
@@ -35,8 +36,8 @@ OpenAI-compatible API reaches about 77 decode tokens/sec with the same model
 using BF16 KV and greedy sampling.
 
 [Agents-A1](https://internscience.github.io/Agents-A1/) reaches 63.6 decode
-tokens/sec with Eider's default FP8 conversion, compared with 44.9 using its
-checkpoint-native weights and 37.2 for vLLM in the same API comparison. A Pi
+tokens/sec with FP8 conversion, compared with 44.9 using its checkpoint-native
+weights and 37.2 for vLLM in the same API comparison. A Pi
 coding session sustained 58-60 tokens/sec through 4,200-token turns and 44.5 at
 17,748 tokens.
 
@@ -135,6 +136,9 @@ Start the Qwen3.6 server with:
 scripts/run-eider-qwen-server.sh
 ```
 
+Its native FP8 attention projections remain FP8 by default. Set
+`EIDER_QWEN_FP8_ATTENTION=nvfp4` to enable the experimental runtime conversion.
+
 Start Agents-A1 with:
 
 ```sh
@@ -156,7 +160,7 @@ independently with `EIDER_STEP_BF16_ATTENTION`, `EIDER_STEP_BF16_DENSE_MLP`,
 `bf16` or `nvfp4`. The Agents-A1 server
 accepts the checkpoint's full 262,144-token context; override it with
 `EIDER_MAX_CONTEXT_TOKENS`. Its BF16 attention projections and LM head default
-to FP8; `EIDER_QWEN_BF16_ATTENTION` and `EIDER_QWEN_BF16_LM_HEAD` independently
+to NVFP4; `EIDER_QWEN_BF16_ATTENTION` and `EIDER_QWEN_BF16_LM_HEAD` independently
 accept `bf16`, `fp8`, or `nvfp4`. Its Pi entry advertises a 131,072-token working
 window so compaction starts well before that hard limit. The launchers build
 the release server, listen on `127.0.0.1:8080`, and default the API key to

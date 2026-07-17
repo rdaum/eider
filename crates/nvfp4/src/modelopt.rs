@@ -294,30 +294,106 @@ impl ModelOptNvfp4Linear {
             });
         }
 
+        Self::quantize_values(prefix, out_features, in_features, |index| {
+            format::bf16_to_f32(values[index])
+        })
+    }
+
+    /// Requantizes a row-major ModelOpt FP8 weight to NVFP4 storage.
+    ///
+    /// FP8 scalar or per-output-channel scales are applied before each K16
+    /// block is quantized. Activation calibration metadata is not retained
+    /// because the resulting weight is consumed by the weight-only path.
+    pub fn quantize_fp8(weight: &ModelOptFp8Linear) -> Result<Self> {
+        let expected = weight
+            .out_features
+            .checked_mul(weight.in_features)
+            .ok_or_else(|| Error::Shape {
+                label: "FP8-to-NVFP4 weight",
+                expected: "out_features * in_features without overflow".to_string(),
+                actual: format!(
+                    "out_features={} in_features={}",
+                    weight.out_features, weight.in_features
+                ),
+            })?;
+        if weight.weight.len() != expected {
+            return Err(Error::Shape {
+                label: "FP8-to-NVFP4 weight",
+                expected: format!("{expected} values"),
+                actual: format!("{} values", weight.weight.len()),
+            });
+        }
+        if !weight.weight_scale.is_finite() {
+            return Err(Error::Format {
+                label: "FP8-to-NVFP4 weight scale",
+                detail: format!("expected finite scalar scale, got {}", weight.weight_scale),
+            });
+        }
+        if let Some(scales) = &weight.channel_weight_scale
+            && (scales.len() != weight.out_features
+                || scales.iter().any(|scale| !scale.is_finite()))
+        {
+            return Err(Error::Shape {
+                label: "FP8-to-NVFP4 channel scales",
+                expected: format!("{} finite scales", weight.out_features),
+                actual: format!("{} scales", scales.len()),
+            });
+        }
+
+        Self::quantize_values(
+            weight.prefix.clone(),
+            weight.out_features,
+            weight.in_features,
+            |index| {
+                let row = index / weight.in_features;
+                let scale = weight
+                    .channel_weight_scale
+                    .as_ref()
+                    .map_or(weight.weight_scale, |scales| scales[row]);
+                format::e4m3_value(weight.weight[index]) * scale
+            },
+        )
+    }
+
+    fn quantize_values(
+        prefix: impl Into<String>,
+        out_features: usize,
+        in_features: usize,
+        value_at: impl Fn(usize) -> f32 + Sync,
+    ) -> Result<Self> {
+        if out_features == 0 || in_features == 0 || !in_features.is_multiple_of(16) {
+            return Err(Error::Shape {
+                label: "NVFP4 weight quantization",
+                expected: "non-zero dimensions and in_features divisible by 16".to_string(),
+                actual: format!("out_features={out_features} in_features={in_features}"),
+            });
+        }
+
         let blocks_per_row = in_features / 16;
-        let mut packed_weight = vec![0u8; expected.div_ceil(2)];
+        let mut packed_weight = vec![0u8; out_features * in_features / 2];
         let mut weight_scale = vec![0u8; out_features * blocks_per_row];
         let workers = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .min(out_features);
         let rows_per_chunk = out_features.div_ceil(workers);
-        let values_per_chunk = rows_per_chunk * in_features;
         let packed_per_chunk = rows_per_chunk * in_features / 2;
         let scales_per_chunk = rows_per_chunk * blocks_per_row;
         std::thread::scope(|scope| {
-            for ((values, packed_weight), weight_scale) in values
-                .chunks(values_per_chunk)
-                .zip(packed_weight.chunks_mut(packed_per_chunk))
+            for (chunk, (packed_weight, weight_scale)) in packed_weight
+                .chunks_mut(packed_per_chunk)
                 .zip(weight_scale.chunks_mut(scales_per_chunk))
+                .enumerate()
             {
+                let value_at = &value_at;
                 scope.spawn(move || {
-                    for row in 0..values.len() / in_features {
+                    let rows = weight_scale.len() / blocks_per_row;
+                    for row in 0..rows {
+                        let global_row = chunk * rows_per_chunk + row;
                         for block in 0..blocks_per_row {
-                            let start = row * in_features + block * 16;
-                            let block_values = &values[start..start + 16];
-                            let max_abs = block_values
-                                .iter()
-                                .map(|&value| format::bf16_to_f32(value))
+                            let global_start = global_row * in_features + block * 16;
+                            let local_start = row * in_features + block * 16;
+                            let max_abs = (global_start..global_start + 16)
+                                .map(value_at)
                                 .filter(|value| value.is_finite())
                                 .map(f32::abs)
                                 .fold(0.0f32, f32::max);
@@ -329,9 +405,9 @@ impl ModelOptNvfp4Linear {
                             let scale = format::e4m3_value(scale_code);
                             weight_scale[row * blocks_per_row + block] = scale_code;
 
-                            for (offset, &value) in block_values.iter().enumerate() {
-                                let flat = start + offset;
-                                let value = format::bf16_to_f32(value);
+                            for offset in 0..16 {
+                                let flat = local_start + offset;
+                                let value = value_at(global_start + offset);
                                 let code = format::e2m1_code(if scale == 0.0 {
                                     0.0
                                 } else {
@@ -1070,6 +1146,26 @@ mod tests {
         let error = ModelOptNvfp4Linear::quantize_bf16("test", 1, 15, &[0; 15])
             .expect_err("reject non-K16 shape");
         assert!(matches!(error, Error::Shape { .. }));
+    }
+
+    #[test]
+    fn fp8_weight_quantization_applies_channel_scales() {
+        let weight = ModelOptFp8Linear {
+            prefix: "test".to_string(),
+            out_features: 2,
+            in_features: 16,
+            weight: vec![format::ue4m3_code(3.0); 32],
+            weight_scale: 1.0,
+            channel_weight_scale: Some(vec![2.0, 0.5]),
+            input_scale: None,
+        };
+        let quantized = ModelOptNvfp4Linear::quantize_fp8(&weight).expect("quantize");
+
+        assert_eq!(quantized.weight_scale.len(), 2);
+        assert_eq!(format::e4m3_value(quantized.weight_scale[0]), 1.0);
+        assert_eq!(format::e4m3_value(quantized.weight_scale[1]), 0.25);
+        let expected = [vec![6.0; 16], vec![1.5; 16]].concat();
+        assert_eq!(quantized.dequantize_to_f32_col_major(), expected);
     }
 
     #[test]

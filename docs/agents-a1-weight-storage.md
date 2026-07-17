@@ -19,9 +19,9 @@ slower of the two measured repetitions.
 
 Both conversions independently reduce decode time, and their gains compose.
 The all-NVFP4 configuration also produced a coherent two-paragraph response
-and a correctly structured calculator tool call through the API. This is a
-smoke check rather than an accuracy evaluation, so the Agents-A1 launcher
-continues to default both components to FP8.
+and a correctly structured calculator tool call through the API. The runtime
+and Agents-A1 launcher therefore default both components to NVFP4; BF16 and
+FP8 remain available as diagnostic overrides.
 
 Reproduce a configuration with:
 

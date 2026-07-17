@@ -6,8 +6,8 @@ use infer::qwen3::infer::{
 };
 use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
 use infer::qwen3::qwen36::{
-    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36GpuCounterProbe, Qwen36GpuCounterStage,
-    Qwen36Model, Qwen36TextModel,
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36GpuCounterProbe,
+    Qwen36GpuCounterStage, Qwen36Model, Qwen36TextModel,
 };
 use std::env;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ struct BenchArgs {
     gpu_counter_stage: Option<Qwen36GpuCounterStage>,
     expert_cache_capacity: Option<usize>,
     bf16_storage: Qwen36Bf16StorageConfig,
+    fp8_attention_storage: Qwen36Fp8AttentionStorage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +155,7 @@ fn main() -> Result<()> {
         &args.model_dir,
         args.expert_cache_capacity,
         args.bf16_storage,
+        args.fp8_attention_storage,
     )?;
     let (free_after_load, _) = device_memory_info()?;
     validate_token_ids("prompt token id", &prompt_ids, model.vocab_size())?;
@@ -169,6 +171,7 @@ fn main() -> Result<()> {
     println!("  gpu counters: {}", args.gpu_counters);
     println!("  expert cache capacity: {:?}", args.expert_cache_capacity);
     println!("  BF16 storage: {:?}", args.bf16_storage);
+    println!("  FP8 attention storage: {:?}", args.fp8_attention_storage);
     println!(
         "  CUDA memory after load: {:.3} GiB used, {:.3} GiB free, {:.3} GiB total",
         free_before_load.saturating_sub(free_after_load) as f64 / (1u64 << 30) as f64,
@@ -273,12 +276,14 @@ impl BenchModel {
         model_dir: &Path,
         expert_cache_capacity: Option<usize>,
         bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir)?;
         match manifest.architecture {
             QwenArchitecture::Qwen3 => Qwen3Model::load(model_dir).map(Self::Qwen3),
             QwenArchitecture::Qwen35Moe => {
-                let checkpoint = Qwen36Model::open_with_bf16_storage(model_dir, bf16_storage)?;
+                let checkpoint =
+                    Qwen36Model::open_with_storage(model_dir, bf16_storage, fp8_attention_storage)?;
                 let model = if let Some(capacity) = expert_cache_capacity {
                     Qwen36TextModel::from_qwen36_model_with_expert_cache_capacity(
                         checkpoint, capacity,
@@ -552,6 +557,7 @@ impl BenchArgs {
         let mut gpu_counter_stage = None;
         let mut expert_cache_capacity = None;
         let mut bf16_storage = Qwen36Bf16StorageConfig::default();
+        let mut fp8_attention_storage = Qwen36Fp8AttentionStorage::default();
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -650,6 +656,13 @@ impl BenchArgs {
                     })?;
                     bf16_storage.lm_head = parse_bf16_storage("--qwen-bf16-lm-head", &value)?;
                 }
+                "--qwen-fp8-attention" => {
+                    let value = args.next().ok_or_else(|| Error::Format {
+                        label: "--qwen-fp8-attention",
+                        detail: "expected fp8 or nvfp4".to_string(),
+                    })?;
+                    fp8_attention_storage = parse_fp8_storage(&value)?;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -688,13 +701,14 @@ impl BenchArgs {
             gpu_counter_stage,
             expert_cache_capacity,
             bf16_storage,
+            fp8_attention_storage,
         })
     }
 }
 
 fn print_usage() {
     println!(
-        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--expert-cache-capacity N] [--qwen-bf16-attention bf16|fp8|nvfp4] [--qwen-bf16-lm-head bf16|fp8|nvfp4] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
+        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--expert-cache-capacity N] [--qwen-bf16-attention bf16|fp8|nvfp4] [--qwen-bf16-lm-head bf16|fp8|nvfp4] [--qwen-fp8-attention fp8|nvfp4] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
     );
 }
 
@@ -705,6 +719,17 @@ fn parse_bf16_storage(label: &'static str, value: &str) -> Result<Qwen36Bf16Stor
         "nvfp4" => Ok(Qwen36Bf16Storage::Nvfp4),
         _ => Err(Error::Format {
             label,
+            detail: format!("unknown mode {value:?}"),
+        }),
+    }
+}
+
+fn parse_fp8_storage(value: &str) -> Result<Qwen36Fp8AttentionStorage> {
+    match value {
+        "fp8" => Ok(Qwen36Fp8AttentionStorage::Fp8),
+        "nvfp4" => Ok(Qwen36Fp8AttentionStorage::Nvfp4),
+        _ => Err(Error::Format {
+            label: "--qwen-fp8-attention",
             detail: format!("unknown mode {value:?}"),
         }),
     }
