@@ -29,19 +29,19 @@ NVFP4 in `llama.cpp`.
 ### Performance
 
 Eider's OpenAI-compatible API sustains about 72.7 decode tokens/sec with
-Qwen3.6-35B-A3B NVFP4 and the checkpoint's default sampling policy. For a rough
-comparison, vLLM's OpenAI-compatible API reaches about 77 decode tokens/sec
-with the same model using BF16 KV and greedy sampling.
+[Qwen3.6-35B-A3B NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
+and the checkpoint's default sampling policy. For a rough comparison, vLLM's
+OpenAI-compatible API reaches about 77 decode tokens/sec with the same model
+using BF16 KV and greedy sampling.
 
-*Agents-A1* is a 35B Qwen3.5-MoE agentic fine-tune whose ModelOpt checkpoint
-keeps attention projections and the LM head in BF16 while quantizing its MoE
-weights to NVFP4. With those checkpoint-native types, Eider reached 44.9 decode
-tokens/sec vs vLLM's 37.2 in a local API comparison. Eider can instead convert
-the BF16 projections to per-output-channel, weight-only FP8 at load time; that
-raised its API result to 63.6 decode tokens/sec and a 2,212-token prefill from
-89.8 to 256.7 tokens/sec. This conversion is lossy and remains configurable.
+[Agents-A1](https://internscience.github.io/Agents-A1/) reaches 63.6 decode
+tokens/sec with Eider's default FP8 conversion, compared with 44.9 using its
+checkpoint-native weights and 37.2 for vLLM in the same API comparison. A Pi
+coding session sustained 58-60 tokens/sec through 4,200-token turns and 44.5 at
+17,748 tokens.
 
-The 198B *Step-3.7-Flash* checkpoint just squeezes in because I added 
+[Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) is a
+198B checkpoint that just squeezes in because I added
 expert paging to/from nVME. Normally this model would be a bit too big at nVFP4, but
 paging lets it be more viable. That said, it's a bit slow: with 240 of 
 288 experts resident per routed layer, the current warm path reaches about 12.6 
