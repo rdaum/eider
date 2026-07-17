@@ -239,6 +239,7 @@ fn main() {
             Nemotron3StorageConfig {
                 bf16: Nemotron3Bf16Storage::Nvfp4,
                 fp8: Nemotron3Fp8Storage::Nvfp4,
+                ..Nemotron3StorageConfig::default()
             },
         )
         .expect("load Nemotron 3 model"),

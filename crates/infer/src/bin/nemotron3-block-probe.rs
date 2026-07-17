@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         Nemotron3StorageConfig {
             bf16: Nemotron3Bf16Storage::Nvfp4,
             fp8: Nemotron3Fp8Storage::Nvfp4,
+            ..Nemotron3StorageConfig::default()
         },
     )?;
     println!("model_device_bytes={}", model.device_bytes());

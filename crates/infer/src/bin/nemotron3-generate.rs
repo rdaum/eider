@@ -47,6 +47,7 @@ fn main() -> Result<()> {
     let storage = Nemotron3StorageConfig {
         bf16: parse_bf16_storage(args.next())?,
         fp8: parse_fp8_storage(args.next())?,
+        ..Nemotron3StorageConfig::default()
     };
 
     let mut generation = GenerationConfig::from_model_dir(&model_dir)?;

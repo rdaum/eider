@@ -6,11 +6,9 @@
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
 Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
 Step-3.7-Flash, and NVIDIA's Nemotron 3 hybrid architecture. It includes an
-OpenAI API-compatible server with continuous multi-session scheduling and,
-for the Qwen-family and Step paths, a compact FP4 KV cache, on top of some
-(hopefully) finely tuned CUDA kernels. Nemotron uses its own hybrid
-Mamba/attention state and prompt-prefix checkpoints; compact FP4 KV storage is
-not implemented for that path yet.
+OpenAI API-compatible server with continuous multi-session scheduling and a
+compact FP4 KV cache for attention layers. Nemotron combines it for backbone
+attention with Mamba recurrent state.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -170,10 +168,10 @@ Start Nemotron 3 Super with:
 scripts/run-eider-nemotron3-super-server.sh
 ```
 
-The Nemotron launcher converts its dense BF16 and FP8 weights to NVFP4 by
-default. `EIDER_NEMOTRON_BF16_STORAGE` accepts `bf16`, `fp8`, or `nvfp4`, while
-`EIDER_NEMOTRON_FP8_STORAGE` accepts `fp8` or `nvfp4`. It also uses the shared
-prompt-prefix cache by default; set `--prefix-cache-gib 0` to disable it.
+The Nemotron launcher stores dense weights and backbone-attention KV in NVFP4 by
+default. Set `EIDER_NEMOTRON_KV_CACHE=f32` for the uncompressed cache. It also
+uses the shared prompt-prefix cache by default; set `--prefix-cache-gib 0` to
+disable it.
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set

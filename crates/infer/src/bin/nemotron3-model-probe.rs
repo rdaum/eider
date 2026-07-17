@@ -33,6 +33,7 @@ fn main() -> infer::nvfp4::Result<()> {
     let storage = Nemotron3StorageConfig {
         bf16: parse_bf16_storage(5)?,
         fp8: parse_fp8_storage(6)?,
+        ..Nemotron3StorageConfig::default()
     };
     if decode_tokens == 0 {
         return Err(infer::nvfp4::Error::Shape {

@@ -1698,12 +1698,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_mma_attention_tracks_f32_gqa_at_qwen_shape() {
+    fn compact_mma_attention_tracks_f32_gqa_at_nemotron_shape() {
         const MAX_TOKENS: usize = 128;
         const TOKENS: usize = 65;
         const KV_HEADS: usize = 2;
-        const HEAD_DIM: usize = 256;
-        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        const HEAD_DIM: usize = 128;
+        const Q_HEADS: usize = 32;
         let width = KV_HEADS * HEAD_DIM;
         let key_host = (0..TOKENS * width)
             .map(|index| ((index * 31 % 509) as f32 - 254.0) / 768.0)
@@ -1743,7 +1743,8 @@ mod tests {
         .expect("f32 attention");
         let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
         let mut workspace =
-            Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("workspace");
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("workspace");
         workspace
             .attention_into_on_stream(&cache, &query, actual.output(), &stream)
             .expect("compact attention");
@@ -1756,7 +1757,7 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(
             max_abs <= 0.25,
-            "Qwen-shape compact FP4 attention error too large: max_abs={max_abs}"
+            "Nemotron-shape compact FP4 attention error too large: max_abs={max_abs}"
         );
     }
 

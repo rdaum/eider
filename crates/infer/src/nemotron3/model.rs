@@ -1,19 +1,20 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{
-    Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
-    Nemotron3LayerKind, Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace, Nemotron3MambaState,
-    Nemotron3MambaWorkspace, Nemotron3Manifest, Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace,
-    Nemotron3MoeWorkspace, Nemotron3MtpWorkspace, Nemotron3StorageConfig,
+    Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
+    Nemotron3AttentionWorkspace, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer,
+    Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest,
+    Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
+    Nemotron3StorageConfig,
 };
-use crate::runtime::kv_cache::{LayerKvCache, LayerKvCacheCheckpoint};
+use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
 use nvfp4::{
     CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
-    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
-    speculative_accept_argmax_f32_into_on_stream,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
+    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
+    select_bf16_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
 };
 use std::path::Path;
 use tracing::info;
@@ -29,6 +30,7 @@ pub struct Nemotron3Model {
     final_norm: DeviceBuffer<f32>,
     lm_head: Nemotron3Linear,
     mtp: Option<Nemotron3Mtp>,
+    compact_kv_cache: bool,
     stream: CudaStream,
 }
 
@@ -109,6 +111,7 @@ impl Nemotron3Model {
             final_norm,
             lm_head,
             mtp,
+            compact_kv_cache: storage.kv_cache == Nemotron3KvCacheStorage::Nvfp4,
             stream: CudaStream::new_non_blocking()?,
         })
     }
@@ -127,7 +130,7 @@ impl Nemotron3Model {
     pub fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3DecodeState> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            layers.push(layer.sequence_state(max_tokens)?);
+            layers.push(layer.sequence_state(max_tokens, self.compact_kv_cache)?);
         }
         Ok(Nemotron3DecodeState {
             hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
@@ -140,6 +143,17 @@ impl Nemotron3Model {
                 .mtp
                 .as_ref()
                 .map(|mtp| mtp.sequence_state(max_tokens))
+                .transpose()?,
+            compact_attention: self
+                .compact_kv_cache
+                .then(|| {
+                    Sm12xKvAttentionWorkspace::new_gqa(
+                        max_tokens,
+                        self.manifest.attention_heads,
+                        self.manifest.kv_heads,
+                        self.manifest.attention_head_dim,
+                    )
+                })
                 .transpose()?,
             tokens: 0,
         })
@@ -172,9 +186,32 @@ impl Nemotron3Model {
                     Nemotron3CheckpointLayer::Mamba(state.checkpoint_on_stream(&self.stream)?)
                 }
                 Nemotron3LayerState::Moe(_) => Nemotron3CheckpointLayer::Moe,
-                Nemotron3LayerState::Attention { cache, .. } => {
-                    Nemotron3CheckpointLayer::Attention(cache.checkpoint_on_stream(&self.stream)?)
-                }
+                Nemotron3LayerState::Attention { cache, .. } => match cache {
+                    Nemotron3AttentionCache::F32(cache) => Nemotron3CheckpointLayer::AttentionF32(
+                        cache.checkpoint_on_stream(&self.stream)?,
+                    ),
+                    Nemotron3AttentionCache::Nvfp4(cache) => {
+                        let tokens = state.tokens;
+                        if tokens == 0 || !tokens.is_multiple_of(128) {
+                            return Err(Error::Shape {
+                                label: "Nemotron 3 compact prefix checkpoint",
+                                expected: "a non-zero 128-token-aligned sequence".to_string(),
+                                actual: format!("{tokens} tokens"),
+                            });
+                        }
+                        let mut checkpoint = Sm12xKvCache::new(
+                            tokens,
+                            self.manifest.kv_heads,
+                            self.manifest.attention_head_dim,
+                        )?;
+                        checkpoint.copy_aligned_prefix_from_on_stream(
+                            cache,
+                            tokens,
+                            &self.stream,
+                        )?;
+                        Nemotron3CheckpointLayer::AttentionNvfp4(checkpoint)
+                    }
+                },
             });
         }
         let mut final_hidden = DeviceBuffer::zeroed(state.final_hidden.len())?;
@@ -233,9 +270,23 @@ impl Nemotron3Model {
                 ) => state.restore_checkpoint_on_stream(checkpoint, &self.stream)?,
                 (Nemotron3LayerState::Moe(_), Nemotron3CheckpointLayer::Moe) => {}
                 (
-                    Nemotron3LayerState::Attention { cache, .. },
-                    Nemotron3CheckpointLayer::Attention(checkpoint),
+                    Nemotron3LayerState::Attention {
+                        cache: Nemotron3AttentionCache::F32(cache),
+                        ..
+                    },
+                    Nemotron3CheckpointLayer::AttentionF32(checkpoint),
                 ) => cache.restore_checkpoint_on_stream(checkpoint, &self.stream)?,
+                (
+                    Nemotron3LayerState::Attention {
+                        cache: Nemotron3AttentionCache::Nvfp4(cache),
+                        ..
+                    },
+                    Nemotron3CheckpointLayer::AttentionNvfp4(checkpoint),
+                ) => cache.copy_aligned_prefix_from_on_stream(
+                    checkpoint,
+                    checkpoint.len(),
+                    &self.stream,
+                )?,
                 _ => {
                     return Err(Error::Format {
                         label: "Nemotron 3 prefix checkpoint",
@@ -587,8 +638,10 @@ impl Nemotron3Model {
                                 detail: format!("state variant mismatch at layer {layer}"),
                             });
                         };
-                        key_ptrs.push(cache.key_ptr());
-                        value_ptrs.push(cache.value_ptr());
+                        if let Nemotron3AttentionCache::F32(cache) = cache {
+                            key_ptrs.push(cache.key_ptr());
+                            value_ptrs.push(cache.value_ptr());
+                        }
                     }
                 }
                 Nemotron3Layer::Moe(_) => {}
@@ -596,8 +649,10 @@ impl Nemotron3Model {
         }
         workspace.conv_state_table.copy_from_host(&conv_ptrs)?;
         workspace.ssm_state_table.copy_from_host(&ssm_ptrs)?;
-        workspace.key_cache_table.copy_from_host(&key_ptrs)?;
-        workspace.value_cache_table.copy_from_host(&value_ptrs)?;
+        if !self.compact_kv_cache {
+            workspace.key_cache_table.copy_from_host(&key_ptrs)?;
+            workspace.value_cache_table.copy_from_host(&value_ptrs)?;
+        }
 
         copy_bf16_rows_to_f32_indexed_into_on_stream(
             self.manifest.vocab_size,
@@ -612,7 +667,15 @@ impl Nemotron3Model {
                 graph.launch(&self.stream)?;
             }
         } else {
-            self.enqueue_block_layers(workspace, sequence_count, rows, &self.stream)?;
+            self.enqueue_block_layers(
+                states,
+                offsets,
+                lengths,
+                workspace,
+                sequence_count,
+                rows,
+                &self.stream,
+            )?;
         }
         let last = workspace
             .layers
@@ -1002,7 +1065,7 @@ impl Nemotron3Model {
             }
             for layer in &mut state.layers {
                 if let Nemotron3LayerState::Attention { cache, .. } = layer {
-                    cache.advance_len(accepted)?;
+                    cache.commit_speculative(state.tokens, accepted)?;
                 }
             }
             state.tokens += accepted;
@@ -1013,8 +1076,12 @@ impl Nemotron3Model {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_block_layers(
         &self,
+        states: &mut [&mut Nemotron3DecodeState],
+        offsets: &[u32],
+        lengths: &[u32],
         workspace: &mut Nemotron3BlockWorkspace,
         sequence_count: usize,
         rows: usize,
@@ -1024,6 +1091,9 @@ impl Nemotron3Model {
         let mut attention_layer = 0;
         for layer in 0..self.layers.len() {
             self.enqueue_block_layer(
+                states,
+                offsets,
+                lengths,
                 workspace,
                 layer,
                 sequence_count,
@@ -1044,6 +1114,9 @@ impl Nemotron3Model {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_block_layer(
         &self,
+        states: &mut [&mut Nemotron3DecodeState],
+        offsets: &[u32],
+        lengths: &[u32],
         workspace: &mut Nemotron3BlockWorkspace,
         layer: usize,
         sequence_count: usize,
@@ -1098,19 +1171,59 @@ impl Nemotron3Model {
             (
                 Nemotron3Layer::Attention(weights),
                 Nemotron3LayerRowsWorkspace::Attention(scratch),
-            ) => weights.run_rows(
-                input,
-                scratch,
-                &workspace.key_cache_table,
-                &workspace.value_cache_table,
-                attention_layer * sequence_count,
-                &workspace.sequence_offsets,
-                &workspace.sequence_lengths,
-                &workspace.start_positions,
-                sequence_count,
-                rows,
-                stream,
-            ),
+            ) => {
+                if self.compact_kv_cache {
+                    let compact_attention =
+                        workspace
+                            .compact_attention
+                            .as_mut()
+                            .ok_or_else(|| Error::Format {
+                                label: "Nemotron 3 compact attention workspace",
+                                detail: "missing shared compact-attention scratch".to_string(),
+                            })?;
+                    let mut caches = Vec::with_capacity(sequence_count);
+                    for state in states.iter_mut() {
+                        let Nemotron3LayerState::Attention { cache, .. } = &mut state.layers[layer]
+                        else {
+                            return Err(Error::Format {
+                                label: "Nemotron 3 compact attention state",
+                                detail: format!("state variant mismatch at layer {layer}"),
+                            });
+                        };
+                        let Nemotron3AttentionCache::Nvfp4(cache) = cache else {
+                            return Err(Error::Format {
+                                label: "Nemotron 3 compact attention cache",
+                                detail: "loaded compact execution with an FP32 cache".to_string(),
+                            });
+                        };
+                        caches.push(cache);
+                    }
+                    weights.run_rows_compact(
+                        input,
+                        scratch,
+                        &mut caches,
+                        offsets,
+                        lengths,
+                        rows,
+                        compact_attention,
+                        stream,
+                    )
+                } else {
+                    weights.run_rows(
+                        input,
+                        scratch,
+                        &workspace.key_cache_table,
+                        &workspace.value_cache_table,
+                        attention_layer * sequence_count,
+                        &workspace.sequence_offsets,
+                        &workspace.sequence_lengths,
+                        &workspace.start_positions,
+                        sequence_count,
+                        rows,
+                        stream,
+                    )
+                }
+            }
             _ => Err(Error::Format {
                 label: "Nemotron 3 block layer workspace",
                 detail: format!("workspace variant mismatch at layer {layer}"),
@@ -1128,6 +1241,9 @@ impl Nemotron3Model {
         for layer in 0..self.layers.len() {
             graphs.push(self.stream.capture(|stream| {
                 self.enqueue_block_layer(
+                    &mut [],
+                    &[],
+                    &[],
                     workspace,
                     layer,
                     workspace.sequence_count,
@@ -1202,7 +1318,12 @@ impl Nemotron3Model {
             } else {
                 previous[layer - 1].output()
             };
-            self.layers[layer].run_one(&mut current[0], input, &self.stream)?;
+            self.layers[layer].run_one(
+                &mut current[0],
+                input,
+                state.compact_attention.as_mut(),
+                &self.stream,
+            )?;
         }
         let last = state
             .layers
@@ -1452,6 +1573,7 @@ pub struct Nemotron3BlockWorkspace {
     ssm_state_table: DeviceBuffer<*mut u16>,
     key_cache_table: DeviceBuffer<*mut f32>,
     value_cache_table: DeviceBuffer<*mut f32>,
+    compact_attention: Option<Sm12xKvAttentionWorkspace>,
     previous_logits_table: DeviceBuffer<*const f32>,
     accepted_counts: DeviceBuffer<u32>,
     next_tokens: DeviceBuffer<u32>,
@@ -1560,6 +1682,17 @@ impl Nemotron3BlockWorkspace {
             ssm_state_table: DeviceBuffer::zeroed(mamba_layers * sequence_count)?,
             key_cache_table: DeviceBuffer::zeroed(attention_layers * sequence_count)?,
             value_cache_table: DeviceBuffer::zeroed(attention_layers * sequence_count)?,
+            compact_attention: model
+                .compact_kv_cache
+                .then(|| {
+                    Sm12xKvAttentionWorkspace::new_gqa(
+                        model.manifest.max_position_embeddings,
+                        model.manifest.attention_heads,
+                        model.manifest.kv_heads,
+                        model.manifest.attention_head_dim,
+                    )
+                })
+                .transpose()?,
             previous_logits_table: DeviceBuffer::zeroed(sequence_count)?,
             accepted_counts: DeviceBuffer::zeroed(sequence_count)?,
             next_tokens: DeviceBuffer::zeroed(sequence_count)?,
@@ -1576,7 +1709,7 @@ impl Nemotron3BlockWorkspace {
         };
         let enable_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-        if enable_graphs {
+        if enable_graphs && !model.compact_kv_cache {
             let (layers, tail) = model.capture_block_graphs(&mut workspace)?;
             workspace.layer_graphs = Some(layers);
             workspace.tail_graph = Some(tail);
@@ -1640,6 +1773,10 @@ impl Nemotron3BlockWorkspace {
             + self.ssm_state_table.device_bytes()
             + self.key_cache_table.device_bytes()
             + self.value_cache_table.device_bytes()
+            + self
+                .compact_attention
+                .as_ref()
+                .map_or(0, Sm12xKvAttentionWorkspace::device_bytes)
             + self.previous_logits_table.device_bytes()
             + self.accepted_counts.device_bytes()
             + self.next_tokens.device_bytes()
@@ -1659,7 +1796,11 @@ enum Nemotron3Layer {
 }
 
 impl Nemotron3Layer {
-    fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3LayerState> {
+    fn sequence_state(
+        &self,
+        max_tokens: usize,
+        compact_kv_cache: bool,
+    ) -> Result<Nemotron3LayerState> {
         match self {
             Self::Mamba(layer) => Ok(Nemotron3LayerState::Mamba {
                 workspace: layer.workspace()?,
@@ -1668,7 +1809,7 @@ impl Nemotron3Layer {
             Self::Moe(layer) => Ok(Nemotron3LayerState::Moe(layer.workspace()?)),
             Self::Attention(layer) => Ok(Nemotron3LayerState::Attention {
                 workspace: layer.workspace()?,
-                cache: layer.sequence_state(max_tokens)?,
+                cache: layer.sequence_state_with_storage(max_tokens, compact_kv_cache)?,
             }),
         }
     }
@@ -1677,6 +1818,7 @@ impl Nemotron3Layer {
         &self,
         state: &mut Nemotron3LayerState,
         input: &DeviceBuffer<f32>,
+        compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
         stream: &CudaStream,
     ) -> Result<()> {
         match (self, state) {
@@ -1687,7 +1829,7 @@ impl Nemotron3Layer {
                 layer.run_one_token(input, workspace, stream)
             }
             (Self::Attention(layer), Nemotron3LayerState::Attention { workspace, cache }) => {
-                layer.run_one_token(input, workspace, cache, stream)
+                layer.run_one_token(input, workspace, cache, compact_attention, stream)
             }
             _ => Err(Error::Format {
                 label: "Nemotron 3 layer state",
@@ -1713,14 +1855,15 @@ enum Nemotron3LayerState {
     Moe(Nemotron3MoeWorkspace),
     Attention {
         workspace: Nemotron3AttentionWorkspace,
-        cache: LayerKvCache,
+        cache: Nemotron3AttentionCache,
     },
 }
 
 enum Nemotron3CheckpointLayer {
     Mamba(Nemotron3MambaState),
     Moe,
-    Attention(LayerKvCacheCheckpoint),
+    AttentionF32(LayerKvCacheCheckpoint),
+    AttentionNvfp4(Sm12xKvCache),
 }
 
 impl Nemotron3LayerState {
@@ -1774,7 +1917,8 @@ impl Nemotron3SequenceCheckpoint {
                 .map(|layer| match layer {
                     Nemotron3CheckpointLayer::Mamba(state) => state.device_bytes(),
                     Nemotron3CheckpointLayer::Moe => 0,
-                    Nemotron3CheckpointLayer::Attention(cache) => cache.device_bytes(),
+                    Nemotron3CheckpointLayer::AttentionF32(cache) => cache.device_bytes(),
+                    Nemotron3CheckpointLayer::AttentionNvfp4(cache) => cache.device_bytes(),
                 })
                 .sum::<usize>()
             + self
@@ -1793,6 +1937,7 @@ pub struct Nemotron3DecodeState {
     next_token: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
     mtp: Option<Nemotron3MtpState>,
+    compact_attention: Option<Sm12xKvAttentionWorkspace>,
     tokens: usize,
 }
 
@@ -1830,6 +1975,10 @@ impl Nemotron3DecodeState {
             + self.next_token.device_bytes()
             + self.next_value.device_bytes()
             + self.mtp.as_ref().map_or(0, Nemotron3MtpState::device_bytes)
+            + self
+                .compact_attention
+                .as_ref()
+                .map_or(0, Sm12xKvAttentionWorkspace::device_bytes)
     }
 
     fn max_tokens(&self) -> Result<usize> {
