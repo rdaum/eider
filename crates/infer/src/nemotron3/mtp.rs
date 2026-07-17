@@ -1,8 +1,8 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{
-    Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3Bf16Storage,
-    Nemotron3Fp8Storage, Nemotron3Manifest, Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace,
-    Nemotron3StorageConfig,
+    Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
+    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3Manifest,
+    Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3StorageConfig,
 };
 use crate::runtime::kv_cache::LayerKvCache;
 use nvfp4::{
@@ -45,6 +45,7 @@ impl Nemotron3Mtp {
         let storage = Nemotron3StorageConfig {
             bf16: Nemotron3Bf16Storage::Nvfp4,
             fp8: Nemotron3Fp8Storage::Nvfp4,
+            kv_cache: Nemotron3KvCacheStorage::F32,
         };
         Ok(Some(Self {
             manifest: manifest.clone(),
@@ -76,9 +77,13 @@ impl Nemotron3Mtp {
     }
 
     pub(super) fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3MtpState> {
-        Ok(Nemotron3MtpState {
-            cache: self.attention.sequence_state(max_tokens)?,
-        })
+        let Nemotron3AttentionCache::F32(cache) = self
+            .attention
+            .sequence_state_with_storage(max_tokens, false)?
+        else {
+            unreachable!("explicit FP32 MTP cache allocation returned compact storage")
+        };
+        Ok(Nemotron3MtpState { cache })
     }
 
     pub(super) fn workspace(

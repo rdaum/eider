@@ -9,6 +9,7 @@ served_model="${EIDER_SERVED_MODEL:-eider-nemotron3-super}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-262144}"
 bf16_storage="${EIDER_NEMOTRON_BF16_STORAGE:-nvfp4}"
 fp8_storage="${EIDER_NEMOTRON_FP8_STORAGE:-nvfp4}"
+kv_cache="${EIDER_NEMOTRON_KV_CACHE:-nvfp4}"
 export EIDER_API_KEY="${EIDER_API_KEY:-local-eider}"
 
 dogstatsd_args=()
@@ -36,5 +37,6 @@ exec "$repo_dir/target/release/eider-serve" \
   --max-context-tokens "$max_context_tokens" \
   --nemotron-bf16-storage "$bf16_storage" \
   --nemotron-fp8-storage "$fp8_storage" \
+  --nemotron-kv-cache "$kv_cache" \
   "${dogstatsd_args[@]}" \
   "$@"

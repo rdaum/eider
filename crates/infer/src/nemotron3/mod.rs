@@ -14,9 +14,12 @@ mod mtp;
 mod router;
 
 pub use attention::{
-    Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
+    Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
+    Nemotron3AttentionWorkspace,
 };
-pub use linear::{Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3StorageConfig};
+pub use linear::{
+    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
+};
 pub use mamba::{
     Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace,
 };

@@ -3,7 +3,9 @@ use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
-use infer::nemotron3::{Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3StorageConfig};
+use infer::nemotron3::{
+    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
+};
 use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage};
 use infer::runtime::scheduler::SchedulerConfig;
 use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
@@ -89,6 +91,22 @@ enum NemotronFp8StorageArg {
     Fp8,
     #[default]
     Nvfp4,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum NemotronKvCacheStorageArg {
+    F32,
+    #[default]
+    Nvfp4,
+}
+
+impl From<NemotronKvCacheStorageArg> for Nemotron3KvCacheStorage {
+    fn from(value: NemotronKvCacheStorageArg) -> Self {
+        match value {
+            NemotronKvCacheStorageArg::F32 => Self::F32,
+            NemotronKvCacheStorageArg::Nvfp4 => Self::Nvfp4,
+        }
+    }
 }
 
 impl From<NemotronFp8StorageArg> for Nemotron3Fp8Storage {
@@ -178,6 +196,10 @@ struct Args {
     #[arg(long, value_enum, default_value_t = NemotronFp8StorageArg::Nvfp4)]
     nemotron_fp8_storage: NemotronFp8StorageArg,
 
+    /// Runtime storage for Nemotron attention key/value cache pages.
+    #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::Nvfp4)]
+    nemotron_kv_cache: NemotronKvCacheStorageArg,
+
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
     api_key_env: String,
@@ -232,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     actor_config.nemotron_storage = Nemotron3StorageConfig {
         bf16: args.nemotron_bf16_storage.into(),
         fp8: args.nemotron_fp8_storage.into(),
+        kv_cache: args.nemotron_kv_cache.into(),
     };
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;

@@ -31,7 +31,7 @@ fn main() -> infer::nvfp4::Result<()> {
             .map(|index| ((index % 31) as f32 - 15.0 + token as f32) * 0.001)
             .collect::<Vec<_>>();
         let hidden = DeviceBuffer::from_host(&hidden)?;
-        weights.run_one_token(&hidden, &mut workspace, &mut state, &stream)?;
+        weights.run_one_token(&hidden, &mut workspace, &mut state, None, &stream)?;
         let output = weights.output(&workspace).copy_to_host(&stream)?;
         if output.iter().any(|value| !value.is_finite()) {
             return Err(infer::nvfp4::Error::Format {

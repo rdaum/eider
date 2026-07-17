@@ -29,11 +29,22 @@ pub enum Nemotron3Fp8Storage {
     Nvfp4,
 }
 
+/// Storage used for Nemotron 3 attention keys and values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Nemotron3KvCacheStorage {
+    /// Preserve full-precision key/value rows.
+    F32,
+    /// Quantize finalized key/value tiles to the SM12x FP4 cache format.
+    #[default]
+    Nvfp4,
+}
+
 /// Dense-linear storage policy for a Nemotron 3 checkpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Nemotron3StorageConfig {
     pub bf16: Nemotron3Bf16Storage,
     pub fp8: Nemotron3Fp8Storage,
+    pub kv_cache: Nemotron3KvCacheStorage,
 }
 
 pub(super) enum Nemotron3Linear {
