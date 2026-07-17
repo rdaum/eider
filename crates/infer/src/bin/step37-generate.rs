@@ -1,7 +1,9 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
 use infer::nvfp4::{Error, Result};
-use infer::step37::{Step37PagingStats, Step37TextModel};
+use infer::step37::{
+    Step37Bf16Storage, Step37Bf16StorageConfig, Step37PagingStats, Step37TextModel,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -55,8 +57,16 @@ fn main() -> Result<()> {
         });
     }
 
+    let bf16_storage = Step37Bf16StorageConfig {
+        attention: storage_from_env("STEP37_BF16_ATTENTION")?,
+        dense_mlp: storage_from_env("STEP37_BF16_DENSE_MLP")?,
+        shared_expert: storage_from_env("STEP37_BF16_SHARED_EXPERT")?,
+        lm_head: storage_from_env("STEP37_BF16_LM_HEAD")?,
+    };
+    println!("Step-3.7 BF16 storage: {bf16_storage:?}");
     let load_started = Instant::now();
-    let mut model = Step37TextModel::open(model_dir, capacity as usize)?;
+    let mut model =
+        Step37TextModel::open_with_bf16_storage(model_dir, capacity as usize, bf16_storage)?;
     let load_elapsed = load_started.elapsed();
     for pass in 0..passes {
         let mut state = model.new_decode_state(tokens as usize)?;
@@ -137,6 +147,22 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn storage_from_env(name: &'static str) -> Result<Step37Bf16Storage> {
+    match std::env::var(name) {
+        Ok(value) if value == "bf16" => Ok(Step37Bf16Storage::Bf16),
+        Ok(value) if value == "nvfp4" => Ok(Step37Bf16Storage::Nvfp4),
+        Ok(value) => Err(Error::Format {
+            label: name,
+            detail: format!("expected bf16 or nvfp4, got {value:?}"),
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(Step37Bf16Storage::Nvfp4),
+        Err(error) => Err(Error::Format {
+            label: name,
+            detail: error.to_string(),
+        }),
+    }
 }
 
 fn subtract_stats(total: Step37PagingStats, start: Step37PagingStats) -> Step37PagingStats {

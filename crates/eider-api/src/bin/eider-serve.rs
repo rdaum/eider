@@ -5,6 +5,7 @@ use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
 use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig};
 use infer::runtime::scheduler::SchedulerConfig;
+use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,6 +29,22 @@ impl From<QwenBf16StorageArg> for Qwen36Bf16Storage {
             QwenBf16StorageArg::Bf16 => Self::Bf16,
             QwenBf16StorageArg::Fp8 => Self::Fp8,
             QwenBf16StorageArg::Nvfp4 => Self::Nvfp4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum StepBf16StorageArg {
+    Bf16,
+    #[default]
+    Nvfp4,
+}
+
+impl From<StepBf16StorageArg> for Step37Bf16Storage {
+    fn from(value: StepBf16StorageArg) -> Self {
+        match value {
+            StepBf16StorageArg::Bf16 => Self::Bf16,
+            StepBf16StorageArg::Nvfp4 => Self::Nvfp4,
         }
     }
 }
@@ -82,6 +99,22 @@ struct Args {
     #[arg(long, default_value_t = 240)]
     step_expert_capacity: usize,
 
+    /// Runtime storage for BF16 Step attention projections.
+    #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Bf16)]
+    step_bf16_attention: StepBf16StorageArg,
+
+    /// Runtime storage for the BF16 Step dense MLPs.
+    #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Bf16)]
+    step_bf16_dense_mlp: StepBf16StorageArg,
+
+    /// Runtime storage for BF16 Step shared experts.
+    #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Bf16)]
+    step_bf16_shared_expert: StepBf16StorageArg,
+
+    /// Runtime storage for the BF16 Step LM head.
+    #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Bf16)]
+    step_bf16_lm_head: StepBf16StorageArg,
+
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
     api_key_env: String,
@@ -126,6 +159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.qwen_bf16_lm_head.into(),
     );
     actor_config.step_expert_capacity = args.step_expert_capacity;
+    actor_config.step_bf16_storage = Step37Bf16StorageConfig {
+        attention: args.step_bf16_attention.into(),
+        dense_mlp: args.step_bf16_dense_mlp.into(),
+        shared_expert: args.step_bf16_shared_expert.into(),
+        lm_head: args.step_bf16_lm_head.into(),
+    };
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
     let config = ApiConfig {

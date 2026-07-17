@@ -7,6 +7,10 @@ model_dir="${EIDER_MODEL_DIR:-$repo_dir/models/step-3.7-flash-nvfp4}"
 listen="${EIDER_LISTEN:-127.0.0.1:8080}"
 served_model="${EIDER_SERVED_MODEL:-eider-step3.7}"
 expert_capacity="${EIDER_STEP_EXPERT_CAPACITY:-240}"
+bf16_attention="${EIDER_STEP_BF16_ATTENTION:-nvfp4}"
+bf16_dense_mlp="${EIDER_STEP_BF16_DENSE_MLP:-nvfp4}"
+bf16_shared_expert="${EIDER_STEP_BF16_SHARED_EXPERT:-nvfp4}"
+bf16_lm_head="${EIDER_STEP_BF16_LM_HEAD:-nvfp4}"
 export EIDER_API_KEY="${EIDER_API_KEY:-local-eider}"
 
 dogstatsd_args=()
@@ -41,5 +45,9 @@ exec "$repo_dir/target/release/eider-serve" \
   --listen "$listen" \
   --served-model-name "$served_model" \
   --step-expert-capacity "$expert_capacity" \
+  --step-bf16-attention "$bf16_attention" \
+  --step-bf16-dense-mlp "$bf16_dense_mlp" \
+  --step-bf16-shared-expert "$bf16_shared_expert" \
+  --step-bf16-lm-head "$bf16_lm_head" \
   "${dogstatsd_args[@]}" \
   "$@"

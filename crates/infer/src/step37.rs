@@ -47,6 +47,29 @@ const SHARED_SWIGLU_LIMIT: f32 = 16.0;
 const RESIDENT_INPUT_MULTIPLIER: f32 = 128.0;
 const TEXT_PREFIX: &str = "model.language_model";
 
+/// Runtime storage for BF16 Step-3.7 linear weights.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Step37Bf16Storage {
+    /// Retain the checkpoint's BF16 weights.
+    Bf16,
+    /// Convert the weights to E2M1 with K16 UE4M3 scales.
+    #[default]
+    Nvfp4,
+}
+
+/// Independent storage choices for Step-3.7's resident BF16 linears.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Step37Bf16StorageConfig {
+    /// Storage used for attention projection weights.
+    pub attention: Step37Bf16Storage,
+    /// Storage used for the dense MLPs before the first routed-MoE layer.
+    pub dense_mlp: Step37Bf16Storage,
+    /// Storage used for the shared expert in routed-MoE layers.
+    pub shared_expert: Step37Bf16Storage,
+    /// Storage used for the language-model head.
+    pub lm_head: Step37Bf16Storage,
+}
+
 const CACHE_DIR: &str = ".eider-cache/step37-experts-v1";
 const MAGIC: &[u8; 8] = b"EIDST371";
 const VERSION: u32 = 1;
@@ -358,16 +381,25 @@ impl Step37QuantizedRows {
 }
 
 impl Step37Linear {
-    pub fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        bf16_storage: Step37Bf16Storage,
+    ) -> Result<Self> {
         let tensor = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&tensor)?;
         if info.dtype == "BF16" {
             let (weight, out_features, in_features) = read_bf16_linear(checkpoint, prefix)?;
-            return Ok(Self {
-                weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&weight)?),
-                out_features,
-                in_features,
-            });
+            return match bf16_storage {
+                Step37Bf16Storage::Bf16 => Ok(Self {
+                    weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&weight)?),
+                    out_features,
+                    in_features,
+                }),
+                Step37Bf16Storage::Nvfp4 => Self::from_modelopt(
+                    ModelOptNvfp4Linear::quantize_bf16(prefix, out_features, in_features, &weight)?,
+                ),
+            };
         }
         let weight = checkpoint.load_nvfp4_linear(prefix)?;
         Self::from_modelopt(weight)
@@ -378,6 +410,7 @@ impl Step37Linear {
         first_prefix: &str,
         second_prefix: &str,
         combined_prefix: &str,
+        bf16_storage: Step37Bf16Storage,
     ) -> Result<Self> {
         let first_tensor = format!("{first_prefix}.weight");
         if checkpoint.tensor_info(&first_tensor)?.dtype == "BF16" {
@@ -391,11 +424,21 @@ impl Step37Linear {
                 });
             }
             first.extend_from_slice(&second);
-            return Ok(Self {
-                weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&first)?),
-                out_features: first_out + second_out,
-                in_features: input,
-            });
+            return match bf16_storage {
+                Step37Bf16Storage::Bf16 => Ok(Self {
+                    weight: Step37LinearWeight::Bf16(DeviceBuffer::from_host(&first)?),
+                    out_features: first_out + second_out,
+                    in_features: input,
+                }),
+                Step37Bf16Storage::Nvfp4 => {
+                    Self::from_modelopt(ModelOptNvfp4Linear::quantize_bf16(
+                        combined_prefix,
+                        first_out + second_out,
+                        input,
+                        &first,
+                    )?)
+                }
+            };
         }
         let first = checkpoint.load_nvfp4_linear(first_prefix)?;
         let second = checkpoint.load_nvfp4_linear(second_prefix)?;
@@ -607,14 +650,16 @@ impl Step37Mlp {
         checkpoint: &ModelOptCheckpoint,
         prefix: &str,
         swiglu_limit: Option<f32>,
+        bf16_storage: Step37Bf16Storage,
     ) -> Result<Self> {
         let gate_up = Step37Linear::load_concat(
             checkpoint,
             &format!("{prefix}.gate_proj"),
             &format!("{prefix}.up_proj"),
             &format!("{prefix}.gate_up"),
+            bf16_storage,
         )?;
-        let down = Step37Linear::load(checkpoint, &format!("{prefix}.down_proj"))?;
+        let down = Step37Linear::load(checkpoint, &format!("{prefix}.down_proj"), bf16_storage)?;
         let (gate_up_features, hidden) = gate_up.shape();
         let intermediate = gate_up_features / 2;
         if !gate_up_features.is_multiple_of(2) || down.shape() != (hidden, intermediate) {
@@ -752,19 +797,23 @@ impl Step37AttentionWorkspace {
 }
 
 impl Step37Attention {
-    pub fn load(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<Self> {
+    pub fn load(
+        checkpoint: &ModelOptCheckpoint,
+        layer: usize,
+        bf16_storage: Step37Bf16Storage,
+    ) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}.self_attn");
         let q_heads = if layer.is_multiple_of(4) { 64 } else { 96 };
         let rotary_dim = if layer.is_multiple_of(4) { 64 } else { 128 };
         let inv_freq = step37_inverse_frequencies(layer);
         Ok(Self {
-            q: Step37Linear::load(checkpoint, &format!("{prefix}.q_proj"))?,
-            k: Step37Linear::load(checkpoint, &format!("{prefix}.k_proj"))?,
-            v: Step37Linear::load(checkpoint, &format!("{prefix}.v_proj"))?,
+            q: Step37Linear::load(checkpoint, &format!("{prefix}.q_proj"), bf16_storage)?,
+            k: Step37Linear::load(checkpoint, &format!("{prefix}.k_proj"), bf16_storage)?,
+            v: Step37Linear::load(checkpoint, &format!("{prefix}.v_proj"), bf16_storage)?,
             q_norm: Step37RmsNorm::load(checkpoint, &format!("{prefix}.q_norm.weight"), HEAD_DIM)?,
             k_norm: Step37RmsNorm::load(checkpoint, &format!("{prefix}.k_norm.weight"), HEAD_DIM)?,
-            gate: Step37Linear::load(checkpoint, &format!("{prefix}.g_proj"))?,
-            output: Step37Linear::load(checkpoint, &format!("{prefix}.o_proj"))?,
+            gate: Step37Linear::load(checkpoint, &format!("{prefix}.g_proj"), bf16_storage)?,
+            output: Step37Linear::load(checkpoint, &format!("{prefix}.o_proj"), bf16_storage)?,
             inv_freq: DeviceBuffer::from_host(&inv_freq)?,
             q_heads,
             rotary_dim,
@@ -1631,6 +1680,7 @@ impl Step37Layer {
         checkpoint: &ModelOptCheckpoint,
         layer: usize,
         expert_capacity: usize,
+        bf16_storage: Step37Bf16StorageConfig,
     ) -> Result<Self> {
         let prefix = format!("{TEXT_PREFIX}.layers.{layer}");
         let ffn = if layer < FIRST_MOE_LAYER {
@@ -1638,6 +1688,7 @@ impl Step37Layer {
                 checkpoint,
                 &format!("{prefix}.mlp"),
                 step37_shared_swiglu_limit(layer),
+                bf16_storage.dense_mlp,
             )?)
         } else {
             Step37LayerFfn::Moe {
@@ -1645,6 +1696,7 @@ impl Step37Layer {
                     checkpoint,
                     &format!("{prefix}.share_expert"),
                     step37_shared_swiglu_limit(layer),
+                    bf16_storage.shared_expert,
                 )?,
                 router: Step37Router::load(checkpoint, layer)?,
                 paged: Box::new(Step37PagedExperts::load(
@@ -1661,7 +1713,7 @@ impl Step37Layer {
                 &format!("{prefix}.input_layernorm.weight"),
                 HIDDEN,
             )?,
-            attention: Step37Attention::load(checkpoint, layer)?,
+            attention: Step37Attention::load(checkpoint, layer, bf16_storage.attention)?,
             post_attention_norm: Step37RmsNorm::load(
                 checkpoint,
                 &format!("{prefix}.post_attention_layernorm.weight"),
@@ -1786,12 +1838,52 @@ impl Step37Layer {
     }
 }
 
+enum Step37LmHead {
+    Bf16(DeviceBuffer<u16>),
+    Nvfp4(Step37Linear),
+}
+
+impl Step37LmHead {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        vocab: usize,
+        bf16_storage: Step37Bf16Storage,
+    ) -> Result<Self> {
+        match bf16_storage {
+            Step37Bf16Storage::Bf16 => Ok(Self::Bf16(read_bf16_matrix(
+                checkpoint,
+                "lm_head.weight",
+                vocab,
+                HIDDEN,
+            )?)),
+            Step37Bf16Storage::Nvfp4 => {
+                let linear = Step37Linear::load(checkpoint, "lm_head", Step37Bf16Storage::Nvfp4)?;
+                if linear.shape() != (vocab, HIDDEN) {
+                    return Err(Error::Shape {
+                        label: "Step-3.7 lm_head",
+                        expected: format!("[{vocab}, {HIDDEN}]"),
+                        actual: format!("{:?}", linear.shape()),
+                    });
+                }
+                Ok(Self::Nvfp4(linear))
+            }
+        }
+    }
+
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Bf16(weight) => weight.device_bytes(),
+            Self::Nvfp4(linear) => linear.device_bytes(),
+        }
+    }
+}
+
 /// Fully loaded Step-3.7 model with nonresident routed experts.
 pub struct Step37TextModel {
     layers: Vec<Step37Layer>,
     embedding: DeviceBuffer<u16>,
     final_norm: Step37RmsNorm,
-    lm_head: DeviceBuffer<u16>,
+    lm_head: Step37LmHead,
     vocab: usize,
     stream: CudaStream,
 }
@@ -1804,6 +1896,7 @@ pub struct Step37DecodeState {
     kv_cache: Vec<Sm12xKvCache>,
     kv_attention: Vec<Sm12xKvAttentionWorkspace>,
     final_hidden: DeviceBuffer<f32>,
+    lm_head_quantized: Option<Step37QuantizedRows>,
     logits: DeviceBuffer<f32>,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
@@ -1818,6 +1911,19 @@ pub struct Step37NextToken {
 
 impl Step37TextModel {
     pub fn open(model_dir: impl AsRef<Path>, expert_capacity: usize) -> Result<Self> {
+        Self::open_with_bf16_storage(
+            model_dir,
+            expert_capacity,
+            Step37Bf16StorageConfig::default(),
+        )
+    }
+
+    /// Opens Step-3.7 with explicit runtime storage for resident BF16 linears.
+    pub fn open_with_bf16_storage(
+        model_dir: impl AsRef<Path>,
+        expert_capacity: usize,
+        bf16_storage: Step37Bf16StorageConfig,
+    ) -> Result<Self> {
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let vocab = 128_896;
         let embedding = read_bf16_matrix(
@@ -1828,10 +1934,15 @@ impl Step37TextModel {
         )?;
         let final_norm =
             Step37RmsNorm::load(&checkpoint, &format!("{TEXT_PREFIX}.norm.weight"), HIDDEN)?;
-        let lm_head = read_bf16_matrix(&checkpoint, "lm_head.weight", vocab, HIDDEN)?;
+        let lm_head = Step37LmHead::load(&checkpoint, vocab, bf16_storage.lm_head)?;
         let mut layers = Vec::with_capacity(45);
         for layer in 0..45 {
-            layers.push(Step37Layer::load(&checkpoint, layer, expert_capacity)?);
+            layers.push(Step37Layer::load(
+                &checkpoint,
+                layer,
+                expert_capacity,
+                bf16_storage,
+            )?);
             let bytes = embedding.device_bytes()
                 + final_norm.device_bytes()
                 + lm_head.device_bytes()
@@ -1877,6 +1988,10 @@ impl Step37TextModel {
                 })
                 .collect::<Result<Vec<_>>>()?,
             final_hidden: DeviceBuffer::zeroed(HIDDEN)?,
+            lm_head_quantized: match self.lm_head {
+                Step37LmHead::Bf16(_) => None,
+                Step37LmHead::Nvfp4(_) => Some(Step37QuantizedRows::new(1, HIDDEN)?),
+            },
             logits: DeviceBuffer::zeroed(self.vocab)?,
             next_index: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
@@ -1998,14 +2113,32 @@ impl Step37TextModel {
             .output();
         self.final_norm
             .run_into(last, &mut state.final_hidden, 1, HIDDEN, &self.stream)?;
-        bf16_linear_logits_f32_into_on_stream(
-            &state.final_hidden,
-            &self.lm_head,
-            state.logits.output(),
-            self.vocab,
-            HIDDEN,
-            &self.stream,
-        )
+        match &self.lm_head {
+            Step37LmHead::Bf16(weight) => bf16_linear_logits_f32_into_on_stream(
+                &state.final_hidden,
+                weight,
+                state.logits.output(),
+                self.vocab,
+                HIDDEN,
+                &self.stream,
+            ),
+            Step37LmHead::Nvfp4(linear) => {
+                let quantized = state
+                    .lm_head_quantized
+                    .as_mut()
+                    .ok_or_else(|| Error::Format {
+                        label: "Step-3.7 lm_head workspace",
+                        detail: "NVFP4 lm_head has no quantized-input workspace".to_string(),
+                    })?;
+                quantized.quantize(&state.final_hidden, &self.stream)?;
+                linear.run_with_quantized_into(
+                    &state.final_hidden,
+                    quantized,
+                    &mut state.logits,
+                    &self.stream,
+                )
+            }
+        }
     }
 
     /// Returns cumulative paging activity across all routed-expert layers.
@@ -2053,6 +2186,10 @@ impl Step37DecodeState {
                 .map(Sm12xKvAttentionWorkspace::device_bytes)
                 .sum::<usize>()
             + self.final_hidden.device_bytes()
+            + self
+                .lm_head_quantized
+                .as_ref()
+                .map_or(0, Step37QuantizedRows::device_bytes)
             + self.logits.device_bytes()
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()

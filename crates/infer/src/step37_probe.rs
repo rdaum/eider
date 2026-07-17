@@ -7,8 +7,9 @@ use nvfp4::{
 use std::path::Path;
 
 use crate::step37::{
-    Step37Attention, Step37Linear, Step37Mlp, Step37PagedExpertWorkspace, Step37PagedExperts,
-    Step37RmsNorm, Step37Router, step37_inverse_frequencies, step37_shared_swiglu_limit,
+    Step37Attention, Step37Bf16Storage, Step37Linear, Step37Mlp, Step37PagedExpertWorkspace,
+    Step37PagedExperts, Step37RmsNorm, Step37Router, step37_inverse_frequencies,
+    step37_shared_swiglu_limit,
 };
 
 const LAYERS: [usize; 6] = [0, 1, 3, 4, 43, 44];
@@ -121,7 +122,7 @@ fn run_attention(
     normed: &DeviceBuffer<f32>,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let attention = Step37Attention::load(checkpoint, layer)?;
+    let attention = Step37Attention::load(checkpoint, layer, Step37Bf16Storage::Bf16)?;
     let inverse_frequencies = step37_inverse_frequencies(layer);
     let expected_inv_freq =
         reference_values(reference, layer, "inv_freq", inverse_frequencies.len())?;
@@ -153,7 +154,7 @@ fn run_mlp(
     swiglu_limit: Option<f32>,
     stream: &CudaStream,
 ) -> Result<DeviceBuffer<f32>> {
-    let mlp = Step37Mlp::load(checkpoint, prefix, swiglu_limit)?;
+    let mlp = Step37Mlp::load(checkpoint, prefix, swiglu_limit, Step37Bf16Storage::Bf16)?;
     let mut workspace = mlp.new_workspace()?;
     mlp.run(&mut workspace, input, stream)?;
     Ok(workspace.into_output())

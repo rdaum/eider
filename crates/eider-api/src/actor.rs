@@ -13,7 +13,7 @@ use infer::runtime::scheduler::{
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
 use infer::runtime::step37_scheduler::{Step37CancelOutcome, Step37RequestId};
 use infer::runtime::step37_serving::Step37ChatService;
-use infer::step37::Step37TextModel;
+use infer::step37::{Step37Bf16StorageConfig, Step37TextModel};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +34,7 @@ pub struct InferenceActorConfig {
     pub qwen_prefix_cache: Qwen36PrefixCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
     pub step_expert_capacity: usize,
+    pub step_bf16_storage: Step37Bf16StorageConfig,
     pub event_capacity: usize,
 }
 
@@ -45,6 +46,7 @@ impl InferenceActorConfig {
             qwen_prefix_cache: Qwen36PrefixCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
             step_expert_capacity: 240,
+            step_bf16_storage: Step37Bf16StorageConfig::default(),
             event_capacity: 256,
         }
     }
@@ -127,24 +129,10 @@ impl InferenceActor {
         }
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let model_dir = config.model_dir.clone();
-        let scheduler = config.scheduler;
-        let qwen_prefix_cache = config.qwen_prefix_cache;
-        let qwen_bf16_storage = config.qwen_bf16_storage;
-        let step_expert_capacity = config.step_expert_capacity;
+        let event_capacity = config.event_capacity;
         thread::Builder::new()
             .name("eider-inference".to_string())
-            .spawn(move || {
-                actor_main(
-                    model_dir,
-                    scheduler,
-                    qwen_prefix_cache,
-                    qwen_bf16_storage,
-                    step_expert_capacity,
-                    commands_rx,
-                    ready_tx,
-                )
-            })
+            .spawn(move || actor_main(config, commands_rx, ready_tx))
             .map_err(|error| {
                 ApiError::server(format!("failed to start inference actor: {error}"))
             })?;
@@ -156,7 +144,7 @@ impl InferenceActor {
             inner: Arc::new(ActorInner {
                 commands: commands_tx,
                 next_request_id: AtomicU64::new(1),
-                event_capacity: config.event_capacity,
+                event_capacity,
             }),
             defaults,
         })
@@ -198,14 +186,19 @@ impl Drop for ActorInner {
 }
 
 fn actor_main(
-    model_dir: PathBuf,
-    scheduler: SchedulerConfig,
-    qwen_prefix_cache: Qwen36PrefixCacheConfig,
-    qwen_bf16_storage: Qwen36Bf16StorageConfig,
-    step_expert_capacity: usize,
+    config: InferenceActorConfig,
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
 ) {
+    let InferenceActorConfig {
+        model_dir,
+        scheduler,
+        qwen_prefix_cache,
+        qwen_bf16_storage,
+        step_expert_capacity,
+        step_bf16_storage,
+        ..
+    } = config;
     let architecture = match checkpoint_architecture(&model_dir) {
         Ok(architecture) => architecture,
         Err(error) => {
@@ -271,9 +264,14 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 expert_capacity = step_expert_capacity,
+                bf16_storage = ?step_bf16_storage,
                 "loading Step-3.7 model"
             );
-            let model = match Step37TextModel::open(&model_dir, step_expert_capacity) {
+            let model = match Step37TextModel::open_with_bf16_storage(
+                &model_dir,
+                step_expert_capacity,
+                step_bf16_storage,
+            ) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

@@ -41,12 +41,11 @@ coding session sustained 58-60 tokens/sec through 4,200-token turns and 44.5 at
 17,748 tokens.
 
 [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) is a
-198B checkpoint that just squeezes in because I added
-expert paging to/from nVME. Normally this model would be a bit too big at nVFP4, but
-paging lets it be more viable. That said, it's a bit slow: with 240 of 
-288 experts resident per routed layer, the current warm path reaches about 12.6 
-decode tokens/sec for one session and 11.2 tokens/sec
-in aggregate for two concurrent sessions.
+198B checkpoint served with disk-backed expert paging. Eider also converts its
+remaining BF16 attention, dense and shared FFNs, and LM head to NVFP4 at load
+time. With 240 of 288 experts resident per routed layer, this reduces device
+weights from 95.5 to 87.3 GiB and sustains about 20.4 API decode tokens/sec once
+the required experts are resident.
 
 Compared with a vLLM setup in docker, the more biggest differences is
 operational: Eider starts up substantially faster and has a smaller idle footprint
@@ -118,9 +117,8 @@ path but are not kept on this machine.
 
 Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
-retain those types or convert the BF16 weights to per-output-channel FP8 while
-keeping activations in f32. The checkpoint also contains a vision tower, but
-Eider currently serves its text path only.
+retain those types or convert the BF16 weights to FP8 or NVFP4. The checkpoint
+also contains a vision tower, but Eider currently serves its text path only.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -151,7 +149,11 @@ scripts/run-eider-stepfun-server.sh
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
-`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. The Agents-A1 server
+`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. Its BF16 attention,
+dense MLP, shared-expert, and LM-head weights default to NVFP4; override them
+independently with `EIDER_STEP_BF16_ATTENTION`, `EIDER_STEP_BF16_DENSE_MLP`,
+`EIDER_STEP_BF16_SHARED_EXPERT`, and `EIDER_STEP_BF16_LM_HEAD`, each accepting
+`bf16` or `nvfp4`. The Agents-A1 server
 accepts the checkpoint's full 262,144-token context; override it with
 `EIDER_MAX_CONTEXT_TOKENS`. Its BF16 attention projections and LM head default
 to FP8; `EIDER_QWEN_BF16_ATTENTION` and `EIDER_QWEN_BF16_LM_HEAD` independently
