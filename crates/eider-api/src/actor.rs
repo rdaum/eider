@@ -308,6 +308,12 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Nemotron3 => {
+            let mut defaults = defaults;
+            // The MTP path is exact only for greedy decoding. Checkpoint
+            // sampling defaults describe an offline generation policy, while
+            // interactive API serving should use the fast greedy path unless
+            // the request explicitly overrides temperature or top-k.
+            defaults.sampling.temperature = 0.0;
             info!(
                 model_dir = %model_dir.display(),
                 prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,

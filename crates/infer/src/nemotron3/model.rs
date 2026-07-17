@@ -428,6 +428,131 @@ impl Nemotron3Model {
         )
     }
 
+    /// Copies the current final hidden state of each sequence into rows of a
+    /// caller-owned buffer before a target-model prompt block overwrites it.
+    pub fn capture_final_hidden_rows(
+        &self,
+        states: &[&mut Nemotron3DecodeState],
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let expected = states.len().saturating_mul(self.manifest.hidden_size);
+        if output.len() != expected {
+            return Err(Error::Shape {
+                label: "Nemotron 3 prefill previous hidden states",
+                expected: format!("{expected} values"),
+                actual: format!("{} values", output.len()),
+            });
+        }
+        for (sequence, state) in states.iter().enumerate() {
+            output.copy_range_from_device_on_stream(
+                sequence * self.manifest.hidden_size,
+                &state.final_hidden,
+                0,
+                self.manifest.hidden_size,
+                &self.stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Appends the shifted MTP prompt state after a ragged target-model block.
+    ///
+    /// Each MTP row pairs a prompt token with the preceding target hidden
+    /// state. A sequence beginning at position zero therefore omits its first
+    /// token, while later sequences use their captured pre-block final state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_mtp_prompt_block(
+        &self,
+        states: &mut [&mut Nemotron3DecodeState],
+        token_chunks: &[&[u32]],
+        start_positions: &[usize],
+        row_offsets: &[u32],
+        previous_hidden: &DeviceBuffer<f32>,
+        block_final_hidden: &DeviceBuffer<f32>,
+        mtp_hidden: &mut DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MtpWorkspace,
+    ) -> Result<()> {
+        if states.len() != token_chunks.len()
+            || states.len() != start_positions.len()
+            || states.len() != row_offsets.len()
+            || previous_hidden.len() != states.len().saturating_mul(self.manifest.hidden_size)
+        {
+            return Err(Error::Shape {
+                label: "Nemotron 3 MTP prompt block",
+                expected: "matching sequence metadata and previous hidden rows".to_string(),
+                actual: format!(
+                    "states={} chunks={} starts={} offsets={} previous_hidden={}",
+                    states.len(),
+                    token_chunks.len(),
+                    start_positions.len(),
+                    row_offsets.len(),
+                    previous_hidden.len()
+                ),
+            });
+        }
+        let expected_rows = token_chunks
+            .iter()
+            .zip(start_positions)
+            .map(|(chunk, &start)| chunk.len().saturating_sub(usize::from(start == 0)))
+            .sum::<usize>();
+        if expected_rows == 0 {
+            return Ok(());
+        }
+        let expected_hidden = expected_rows.saturating_mul(self.manifest.hidden_size);
+        if mtp_hidden.len() != expected_hidden {
+            return Err(Error::Shape {
+                label: "Nemotron 3 MTP prompt hidden rows",
+                expected: format!("{expected_hidden} values"),
+                actual: format!("{} values", mtp_hidden.len()),
+            });
+        }
+
+        let mut selected_states = Vec::new();
+        let mut selected_chunks = Vec::new();
+        let mut destination_row = 0;
+        for (sequence, ((state, chunk), (&start, &row_offset))) in states
+            .iter_mut()
+            .zip(token_chunks)
+            .zip(start_positions.iter().zip(row_offsets))
+            .enumerate()
+        {
+            let skip = usize::from(start == 0);
+            if chunk.len() <= skip {
+                continue;
+            }
+            if start != 0 {
+                mtp_hidden.copy_range_from_device_on_stream(
+                    destination_row * self.manifest.hidden_size,
+                    previous_hidden,
+                    sequence * self.manifest.hidden_size,
+                    self.manifest.hidden_size,
+                    &self.stream,
+                )?;
+                destination_row += 1;
+            }
+            if chunk.len() > 1 {
+                let rows = chunk.len() - 1;
+                mtp_hidden.copy_range_from_device_on_stream(
+                    destination_row * self.manifest.hidden_size,
+                    block_final_hidden,
+                    row_offset as usize * self.manifest.hidden_size,
+                    rows * self.manifest.hidden_size,
+                    &self.stream,
+                )?;
+                destination_row += rows;
+            }
+            selected_states.push(&mut **state);
+            selected_chunks.push(&chunk[skip..]);
+        }
+        debug_assert_eq!(destination_row, expected_rows);
+        self.append_mtp_cache_block(
+            &mut selected_states,
+            &selected_chunks,
+            mtp_hidden,
+            workspace,
+        )
+    }
+
     /// Drafts three greedy tokens with the repeated MTP block. Draft tokens
     /// remain device resident in `workspace` in sequence-major order.
     pub fn draft_three_mtp_argmax(

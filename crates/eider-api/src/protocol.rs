@@ -6,6 +6,7 @@ use infer::runtime::chat::{
 };
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::generation::GenerationConfig;
+use infer::runtime::sampling::SamplingConfig;
 use infer::runtime::scheduler::RequestConfig;
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use serde::{Deserialize, Serialize};
@@ -147,7 +148,17 @@ impl ResponseRequest {
         } else {
             Vec::new()
         };
-        let mut sampling = defaults.sampling;
+        let has_sampling_override = self.temperature.is_some()
+            || self.top_k.is_some()
+            || self.top_p.is_some()
+            || self.seed.is_some()
+            || self.presence_penalty.is_some()
+            || self.frequency_penalty.is_some();
+        let mut sampling = if defaults.sampling.uses_fast_argmax() && has_sampling_override {
+            SamplingConfig::default()
+        } else {
+            defaults.sampling
+        };
         if let Some(temperature) = self.temperature {
             sampling.temperature = temperature;
         }
@@ -850,6 +861,21 @@ mod tests {
         let chat = request.into_chat_request(&defaults()).unwrap();
         assert_eq!(chat.generation.max_new_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(!chat.template.enable_thinking);
+    }
+
+    #[test]
+    fn explicit_sampling_overrides_greedy_server_defaults() {
+        let mut defaults = defaults();
+        defaults.sampling.temperature = 0.0;
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "hello",
+            "top_p": 0.8
+        }))
+        .unwrap();
+        let chat = request.into_chat_request(&defaults).unwrap();
+        assert_eq!(chat.generation.sampling.temperature, 1.0);
+        assert_eq!(chat.generation.sampling.top_p, 0.8);
     }
 
     #[test]
