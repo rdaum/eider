@@ -1,5 +1,5 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
-use super::{Nemotron3LayerKind, Nemotron3Manifest};
+use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::runtime::kv_cache::LayerKvCache;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
@@ -23,6 +23,21 @@ impl Nemotron3AttentionLayer {
         checkpoint: &ModelOptCheckpoint,
         manifest: &Nemotron3Manifest,
         layer: usize,
+    ) -> Result<Self> {
+        Self::load_with_storage(
+            checkpoint,
+            manifest,
+            layer,
+            Nemotron3StorageConfig::default(),
+        )
+    }
+
+    /// Loads one attention layer with an explicit dense-linear storage policy.
+    pub fn load_with_storage(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        storage: Nemotron3StorageConfig,
     ) -> Result<Self> {
         let kind = manifest
             .layers
@@ -56,24 +71,28 @@ impl Nemotron3AttentionLayer {
                 &format!("{mixer}.q_proj"),
                 query_width,
                 manifest.hidden_size,
+                storage,
             )?,
             key: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.k_proj"),
                 kv_width,
                 manifest.hidden_size,
+                storage,
             )?,
             value: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.v_proj"),
                 kv_width,
                 manifest.hidden_size,
+                storage,
             )?,
             output: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.o_proj"),
                 manifest.hidden_size,
                 query_width,
+                storage,
             )?,
         })
     }

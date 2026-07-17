@@ -1,5 +1,8 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
-use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3Router, Nemotron3RouterWorkspace};
+use super::{
+    Nemotron3LayerKind, Nemotron3Manifest, Nemotron3Router, Nemotron3RouterWorkspace,
+    Nemotron3StorageConfig,
+};
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
     add_f32_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
@@ -27,6 +30,21 @@ impl Nemotron3MoeLayer {
         checkpoint: &ModelOptCheckpoint,
         manifest: &Nemotron3Manifest,
         layer: usize,
+    ) -> Result<Self> {
+        Self::load_with_storage(
+            checkpoint,
+            manifest,
+            layer,
+            Nemotron3StorageConfig::default(),
+        )
+    }
+
+    /// Loads one MoE layer with an explicit dense-linear storage policy.
+    pub fn load_with_storage(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        storage: Nemotron3StorageConfig,
     ) -> Result<Self> {
         let kind = manifest
             .layers
@@ -63,12 +81,14 @@ impl Nemotron3MoeLayer {
                 &format!("{mixer}.fc1_latent_proj"),
                 latent,
                 manifest.hidden_size,
+                storage,
             )?,
             latent_out: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.fc2_latent_proj"),
                 manifest.hidden_size,
                 latent,
+                storage,
             )?,
             experts: Nemotron3ExpertSlab::load(checkpoint, manifest, &mixer, latent)?,
             shared_up: Nemotron3Linear::load(
@@ -76,12 +96,14 @@ impl Nemotron3MoeLayer {
                 &format!("{mixer}.shared_experts.up_proj"),
                 manifest.shared_expert_intermediate_size,
                 manifest.hidden_size,
+                storage,
             )?,
             shared_down: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.shared_experts.down_proj"),
                 manifest.hidden_size,
                 manifest.shared_expert_intermediate_size,
+                storage,
             )?,
         })
     }

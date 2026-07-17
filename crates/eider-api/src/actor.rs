@@ -3,7 +3,7 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::metrics::metrics as infer_metrics;
-use infer::nemotron3::Nemotron3Model;
+use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
@@ -39,6 +39,7 @@ pub struct InferenceActorConfig {
     pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
     pub step_bf16_storage: Step37Bf16StorageConfig,
+    pub nemotron_storage: Nemotron3StorageConfig,
     pub event_capacity: usize,
 }
 
@@ -52,6 +53,7 @@ impl InferenceActorConfig {
             qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
+            nemotron_storage: Nemotron3StorageConfig::default(),
             event_capacity: 256,
         }
     }
@@ -203,6 +205,7 @@ fn actor_main(
         qwen_fp8_attention_storage,
         step_expert_capacity,
         step_bf16_storage,
+        nemotron_storage,
         ..
     } = config;
     let architecture = match checkpoint_architecture(&model_dir) {
@@ -307,9 +310,10 @@ fn actor_main(
         CheckpointArchitecture::Nemotron3 => {
             info!(
                 model_dir = %model_dir.display(),
+                storage = ?nemotron_storage,
                 "loading Nemotron 3 model"
             );
-            let model = match Nemotron3Model::load(&model_dir) {
+            let model = match Nemotron3Model::load_with_storage(&model_dir, nemotron_storage) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

@@ -1,8 +1,38 @@
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    Result, bf16_linear_logits_f32_into_on_stream, fp8_linear_f32_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream,
+    Result, bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_into_on_stream,
+    fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
+
+/// Device format used when the checkpoint stores a dense linear in BF16.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Nemotron3Bf16Storage {
+    /// Preserve checkpoint BF16 weights.
+    #[default]
+    Bf16,
+    /// Convert each output channel to E4M3 with an independent scale.
+    Fp8,
+    /// Requantize each K16 block to NVFP4.
+    Nvfp4,
+}
+
+/// Device format used when the checkpoint stores a dense linear in FP8.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Nemotron3Fp8Storage {
+    /// Preserve checkpoint FP8 weights and scalar scale.
+    #[default]
+    Fp8,
+    /// Requantize each K16 block to NVFP4.
+    Nvfp4,
+}
+
+/// Dense-linear storage policy for a Nemotron 3 checkpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nemotron3StorageConfig {
+    pub bf16: Nemotron3Bf16Storage,
+    pub fp8: Nemotron3Fp8Storage,
+}
 
 pub(super) enum Nemotron3Linear {
     Bf16(Nemotron3Bf16Linear),
@@ -16,17 +46,31 @@ impl Nemotron3Linear {
         prefix: &str,
         rows: usize,
         cols: usize,
+        storage: Nemotron3StorageConfig,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let shard = checkpoint.open_shard_for_tensor(&weight_name)?;
         let dtype = shard.require_tensor(&weight_name)?.dtype.as_str();
         match dtype {
-            "BF16" => Ok(Self::Bf16(Nemotron3Bf16Linear::load(
-                checkpoint, prefix, rows, cols,
-            )?)),
-            "F8_E4M3" => Ok(Self::Fp8(Nemotron3Fp8Linear::load(
-                checkpoint, prefix, rows, cols,
-            )?)),
+            "BF16" => match storage.bf16 {
+                Nemotron3Bf16Storage::Bf16 => Ok(Self::Bf16(Nemotron3Bf16Linear::load(
+                    checkpoint, prefix, rows, cols,
+                )?)),
+                Nemotron3Bf16Storage::Fp8 => Ok(Self::Fp8(Nemotron3Fp8Linear::load_from_bf16(
+                    checkpoint, prefix, rows, cols,
+                )?)),
+                Nemotron3Bf16Storage::Nvfp4 => Ok(Self::Nvfp4(
+                    Nemotron3Nvfp4Linear::load_from_bf16(checkpoint, prefix, rows, cols)?,
+                )),
+            },
+            "F8_E4M3" => match storage.fp8 {
+                Nemotron3Fp8Storage::Fp8 => Ok(Self::Fp8(Nemotron3Fp8Linear::load(
+                    checkpoint, prefix, rows, cols,
+                )?)),
+                Nemotron3Fp8Storage::Nvfp4 => Ok(Self::Nvfp4(Nemotron3Nvfp4Linear::load_from_fp8(
+                    checkpoint, prefix, rows, cols,
+                )?)),
+            },
             "U8" => Ok(Self::Nvfp4(Nemotron3Nvfp4Linear::load(
                 checkpoint, prefix, rows, cols,
             )?)),
@@ -61,6 +105,7 @@ impl Nemotron3Linear {
 
 pub(super) struct Nemotron3Fp8Linear {
     weight: DeviceBuffer<u8>,
+    channel_weight_scale: Option<DeviceBuffer<f32>>,
     rows: usize,
     cols: usize,
     weight_scale: f32,
@@ -136,6 +181,38 @@ impl Nemotron3Nvfp4Linear {
         Self::from_host(host)
     }
 
+    fn load_from_bf16(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let values = load_bf16_host(checkpoint, &format!("{prefix}.weight"), &[rows, cols])?;
+        Self::from_host(ModelOptNvfp4Linear::quantize_bf16(
+            prefix, rows, cols, &values,
+        )?)
+    }
+
+    fn load_from_fp8(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let host = checkpoint.load_fp8_linear(prefix)?;
+        if host.out_features != rows || host.in_features != cols {
+            return Err(linear_shape_error(
+                "FP8-to-NVFP4",
+                prefix,
+                rows,
+                cols,
+                host.out_features,
+                host.in_features,
+            ));
+        }
+        Self::from_host(ModelOptNvfp4Linear::quantize_fp8(&host)?)
+    }
+
     fn from_host(host: ModelOptNvfp4Linear) -> Result<Self> {
         Ok(Self {
             packed_weight: DeviceBuffer::from_host(&host.packed_weight)?,
@@ -208,9 +285,54 @@ impl Nemotron3Fp8Linear {
     fn from_host(host: ModelOptFp8Linear) -> Result<Self> {
         Ok(Self {
             weight: DeviceBuffer::from_host(&host.weight)?,
+            channel_weight_scale: host
+                .channel_weight_scale
+                .as_deref()
+                .map(DeviceBuffer::from_host)
+                .transpose()?,
             rows: host.out_features,
             cols: host.in_features,
             weight_scale: host.weight_scale,
+        })
+    }
+
+    fn load_from_bf16(
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let values = load_bf16_host(checkpoint, &format!("{prefix}.weight"), &[rows, cols])?;
+        let scales = values
+            .chunks_exact(cols)
+            .map(|row| {
+                let max_abs = row
+                    .iter()
+                    .map(|&value| nvfp4::format::bf16_to_f32(value).abs())
+                    .filter(|value| value.is_finite())
+                    .fold(0.0f32, f32::max);
+                if max_abs == 0.0 { 1.0 } else { max_abs / 448.0 }
+            })
+            .collect::<Vec<_>>();
+        let source = DeviceBuffer::from_host(&values)?;
+        let scales = DeviceBuffer::from_host(&scales)?;
+        let mut weight = DeviceBuffer::zeroed(values.len())?;
+        let stream = CudaStream::new_blocking()?;
+        quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream(
+            &source,
+            &scales,
+            weight.output(),
+            rows,
+            cols,
+            &stream,
+        )?;
+        stream.synchronize()?;
+        Ok(Self {
+            weight,
+            channel_weight_scale: Some(scales),
+            rows,
+            cols,
+            weight_scale: 1.0,
         })
     }
 
@@ -220,6 +342,18 @@ impl Nemotron3Fp8Linear {
         output: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
+        if let Some(scales) = &self.channel_weight_scale {
+            return fp8_linear_channel_scaled_f32_into_on_stream(
+                input,
+                &self.weight,
+                scales,
+                output.output(),
+                self.rows,
+                self.cols,
+                256,
+                stream,
+            );
+        }
         fp8_linear_f32_into_on_stream(
             input,
             &self.weight,
@@ -233,6 +367,10 @@ impl Nemotron3Fp8Linear {
 
     pub(super) fn device_bytes(&self) -> usize {
         self.weight.device_bytes()
+            + self
+                .channel_weight_scale
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
     }
 }
 

@@ -3,6 +3,7 @@ use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
+use infer::nemotron3::{Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage};
 use infer::runtime::scheduler::SchedulerConfig;
 use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
@@ -61,6 +62,40 @@ impl From<StepBf16StorageArg> for Step37Bf16Storage {
         match value {
             StepBf16StorageArg::Bf16 => Self::Bf16,
             StepBf16StorageArg::Nvfp4 => Self::Nvfp4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum NemotronBf16StorageArg {
+    Bf16,
+    Fp8,
+    #[default]
+    Nvfp4,
+}
+
+impl From<NemotronBf16StorageArg> for Nemotron3Bf16Storage {
+    fn from(value: NemotronBf16StorageArg) -> Self {
+        match value {
+            NemotronBf16StorageArg::Bf16 => Self::Bf16,
+            NemotronBf16StorageArg::Fp8 => Self::Fp8,
+            NemotronBf16StorageArg::Nvfp4 => Self::Nvfp4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum NemotronFp8StorageArg {
+    Fp8,
+    #[default]
+    Nvfp4,
+}
+
+impl From<NemotronFp8StorageArg> for Nemotron3Fp8Storage {
+    fn from(value: NemotronFp8StorageArg) -> Self {
+        match value {
+            NemotronFp8StorageArg::Fp8 => Self::Fp8,
+            NemotronFp8StorageArg::Nvfp4 => Self::Nvfp4,
         }
     }
 }
@@ -135,6 +170,14 @@ struct Args {
     #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Nvfp4)]
     step_bf16_lm_head: StepBf16StorageArg,
 
+    /// Runtime storage for BF16 Nemotron dense linears.
+    #[arg(long, value_enum, default_value_t = NemotronBf16StorageArg::Nvfp4)]
+    nemotron_bf16_storage: NemotronBf16StorageArg,
+
+    /// Runtime storage for native FP8 Nemotron dense linears.
+    #[arg(long, value_enum, default_value_t = NemotronFp8StorageArg::Nvfp4)]
+    nemotron_fp8_storage: NemotronFp8StorageArg,
+
     /// Environment variable containing an optional server bearer token.
     #[arg(long, default_value = "EIDER_API_KEY")]
     api_key_env: String,
@@ -185,6 +228,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dense_mlp: args.step_bf16_dense_mlp.into(),
         shared_expert: args.step_bf16_shared_expert.into(),
         lm_head: args.step_bf16_lm_head.into(),
+    };
+    actor_config.nemotron_storage = Nemotron3StorageConfig {
+        bf16: args.nemotron_bf16_storage.into(),
+        fp8: args.nemotron_fp8_storage.into(),
     };
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;

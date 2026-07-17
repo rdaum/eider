@@ -1,4 +1,6 @@
-use infer::nemotron3::Nemotron3Model;
+use infer::nemotron3::{
+    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3StorageConfig,
+};
 use infer::nvfp4::{Error, Result};
 use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::runtime::generation::{GenerationConfig, Nemotron3GenerationSession};
@@ -24,7 +26,9 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| Error::Format {
             label: "usage",
-            detail: format!("{program} <model-dir> [prompt] [max-new-tokens]"),
+            detail: format!(
+                "{program} <model-dir> [prompt] [max-new-tokens] [bf16|fp8|nvfp4] [fp8|nvfp4]"
+            ),
         })?;
     let prompt = args
         .next()
@@ -40,6 +44,10 @@ fn main() -> Result<()> {
             detail: error.to_string(),
         })?
         .unwrap_or(64);
+    let storage = Nemotron3StorageConfig {
+        bf16: parse_bf16_storage(args.next())?,
+        fp8: parse_fp8_storage(args.next())?,
+    };
 
     let mut generation = GenerationConfig::from_model_dir(&model_dir)?;
     generation.max_new_tokens = max_new_tokens;
@@ -49,7 +57,7 @@ fn main() -> Result<()> {
         &[],
         ChatTemplateOptions::default(),
     )?;
-    let model = Nemotron3Model::load(&model_dir)?;
+    let model = Nemotron3Model::load_with_storage(&model_dir, storage)?;
     let mut session = Nemotron3GenerationSession::new(
         &model,
         template.tokenizer(),
@@ -66,4 +74,35 @@ fn main() -> Result<()> {
         "generation complete"
     );
     Ok(())
+}
+
+fn parse_bf16_storage(value: Option<std::ffi::OsString>) -> Result<Nemotron3Bf16Storage> {
+    match value
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("bf16")
+    {
+        "bf16" => Ok(Nemotron3Bf16Storage::Bf16),
+        "fp8" => Ok(Nemotron3Bf16Storage::Fp8),
+        "nvfp4" => Ok(Nemotron3Bf16Storage::Nvfp4),
+        value => Err(Error::Format {
+            label: "BF16 storage",
+            detail: format!("expected bf16, fp8, or nvfp4, got {value:?}"),
+        }),
+    }
+}
+
+fn parse_fp8_storage(value: Option<std::ffi::OsString>) -> Result<Nemotron3Fp8Storage> {
+    match value
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("fp8")
+    {
+        "fp8" => Ok(Nemotron3Fp8Storage::Fp8),
+        "nvfp4" => Ok(Nemotron3Fp8Storage::Nvfp4),
+        value => Err(Error::Format {
+            label: "FP8 storage",
+            detail: format!("expected fp8 or nvfp4, got {value:?}"),
+        }),
+    }
 }

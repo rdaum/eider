@@ -69,6 +69,10 @@ harness = false
 name = "nvfp4_kv_attention"
 harness = false
 
+[[bench]]
+name = "nemotron3_dense_linear"
+harness = false
+
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"
