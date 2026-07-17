@@ -3,6 +3,7 @@ use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::runtime::kv_cache::LayerKvCache;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    append_ragged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
 
@@ -55,6 +56,37 @@ impl Nemotron3AttentionLayer {
             });
         }
         let prefix = format!("backbone.layers.{layer}");
+        Self::load_at_prefix(checkpoint, manifest, layer, &prefix, storage)
+    }
+
+    pub(super) fn load_mtp(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        storage: Nemotron3StorageConfig,
+    ) -> Result<Self> {
+        if manifest.mtp_layers.get(layer) != Some(&Nemotron3LayerKind::Attention) {
+            return Err(Error::Format {
+                label: "Nemotron 3 MTP attention layer",
+                detail: format!("MTP layer {layer} is not attention"),
+            });
+        }
+        Self::load_at_prefix(
+            checkpoint,
+            manifest,
+            layer,
+            &format!("mtp.layers.{layer}"),
+            storage,
+        )
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        prefix: &str,
+        storage: Nemotron3StorageConfig,
+    ) -> Result<Self> {
         let mixer = format!("{prefix}.mixer");
         let query_width = manifest.attention_heads * manifest.attention_head_dim;
         let kv_width = manifest.kv_heads * manifest.attention_head_dim;
@@ -111,6 +143,11 @@ impl Nemotron3AttentionLayer {
         Nemotron3AttentionWorkspace::new(&self.manifest)
     }
 
+    /// Allocates scratch buffers for a fixed flattened row count.
+    pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3AttentionRowsWorkspace> {
+        Nemotron3AttentionRowsWorkspace::new(&self.manifest, rows)
+    }
+
     /// Appends one token to `cache` and runs causal grouped-query attention.
     pub fn run_one_token(
         &self,
@@ -159,6 +196,142 @@ impl Nemotron3AttentionLayer {
         )
     }
 
+    /// Appends and attends flattened, ragged rows for multiple sequences.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3AttentionRowsWorkspace,
+        key_cache_table: &DeviceBuffer<*mut f32>,
+        value_cache_table: &DeviceBuffer<*mut f32>,
+        cache_table_offset: usize,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        start_positions: &DeviceBuffer<u32>,
+        sequence_count: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
+            return Err(Error::Shape {
+                label: "Nemotron 3 attention row hidden state",
+                expected: format!("{} values", rows.saturating_mul(self.manifest.hidden_size)),
+                actual: format!("{} values", hidden.len()),
+            });
+        }
+        workspace.require_manifest(&self.manifest, rows)?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.query
+            .run_rows(&workspace.normed, &mut workspace.query, rows, stream)?;
+        self.key
+            .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
+        self.value
+            .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
+        append_ragged_kv_f32_into_on_stream(
+            &workspace.key,
+            &workspace.value,
+            key_cache_table,
+            value_cache_table,
+            cache_table_offset,
+            sequence_offsets,
+            sequence_lengths,
+            start_positions,
+            sequence_count,
+            rows,
+            self.manifest.kv_heads * self.manifest.attention_head_dim,
+            stream,
+        )?;
+        ragged_gqa_attention_f32_into_on_stream(
+            &workspace.query,
+            key_cache_table,
+            value_cache_table,
+            cache_table_offset,
+            sequence_offsets,
+            sequence_lengths,
+            start_positions,
+            workspace.attended.output(),
+            sequence_count,
+            rows,
+            self.manifest.attention_heads,
+            self.manifest.kv_heads,
+            self.manifest.attention_head_dim,
+            stream,
+        )?;
+        self.output.run_rows(
+            &workspace.attended,
+            &mut workspace.projected_output,
+            rows,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            hidden,
+            &workspace.projected_output,
+            workspace.output.output(),
+            stream,
+        )
+    }
+
+    /// Appends flattened ragged K/V rows without computing attention output.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn append_kv_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3AttentionRowsWorkspace,
+        key_cache_table: &DeviceBuffer<*mut f32>,
+        value_cache_table: &DeviceBuffer<*mut f32>,
+        cache_table_offset: usize,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        start_positions: &DeviceBuffer<u32>,
+        sequence_count: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
+            return Err(Error::Shape {
+                label: "Nemotron 3 attention K/V row hidden state",
+                expected: format!("{} values", rows.saturating_mul(self.manifest.hidden_size)),
+                actual: format!("{} values", hidden.len()),
+            });
+        }
+        workspace.require_manifest(&self.manifest, rows)?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.key
+            .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
+        self.value
+            .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
+        append_ragged_kv_f32_into_on_stream(
+            &workspace.key,
+            &workspace.value,
+            key_cache_table,
+            value_cache_table,
+            cache_table_offset,
+            sequence_offsets,
+            sequence_lengths,
+            start_positions,
+            sequence_count,
+            rows,
+            self.manifest.kv_heads * self.manifest.attention_head_dim,
+            stream,
+        )
+    }
+
     /// Returns the output buffer after [`Self::run_one_token`].
     pub fn output<'a>(&self, workspace: &'a Nemotron3AttentionWorkspace) -> &'a DeviceBuffer<f32> {
         &workspace.output
@@ -188,6 +361,74 @@ pub struct Nemotron3AttentionWorkspace {
     attended: DeviceBuffer<f32>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
+}
+
+/// Reusable scratch storage for flattened, ragged attention rows.
+pub struct Nemotron3AttentionRowsWorkspace {
+    normed: DeviceBuffer<f32>,
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    attended: DeviceBuffer<f32>,
+    projected_output: DeviceBuffer<f32>,
+    pub(super) output: DeviceBuffer<f32>,
+}
+
+impl Nemotron3AttentionRowsWorkspace {
+    fn new(manifest: &Nemotron3Manifest, rows: usize) -> Result<Self> {
+        if rows == 0 {
+            return Err(Error::Shape {
+                label: "Nemotron 3 attention row workspace",
+                expected: "at least one row".to_string(),
+                actual: "0 rows".to_string(),
+            });
+        }
+        let query_width = manifest.attention_heads * manifest.attention_head_dim;
+        let kv_width = manifest.kv_heads * manifest.attention_head_dim;
+        Ok(Self {
+            normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            query: DeviceBuffer::zeroed(rows * query_width)?,
+            key: DeviceBuffer::zeroed(rows * kv_width)?,
+            value: DeviceBuffer::zeroed(rows * kv_width)?,
+            attended: DeviceBuffer::zeroed(rows * query_width)?,
+            projected_output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+        })
+    }
+
+    fn require_manifest(&self, manifest: &Nemotron3Manifest, rows: usize) -> Result<()> {
+        let query_width = manifest.attention_heads * manifest.attention_head_dim;
+        let kv_width = manifest.kv_heads * manifest.attention_head_dim;
+        if self.normed.len() == rows * manifest.hidden_size
+            && self.query.len() == rows * query_width
+            && self.key.len() == rows * kv_width
+            && self.value.len() == rows * kv_width
+            && self.attended.len() == rows * query_width
+            && self.projected_output.len() == rows * manifest.hidden_size
+            && self.output.len() == rows * manifest.hidden_size
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 attention row workspace",
+            expected: format!("{rows} rows matching model manifest"),
+            actual: "workspace belongs to another manifest or row count".to_string(),
+        })
+    }
+
+    pub(super) fn output(&self) -> &DeviceBuffer<f32> {
+        &self.output
+    }
+
+    pub(super) fn device_bytes(&self) -> usize {
+        self.normed.device_bytes()
+            + self.query.device_bytes()
+            + self.key.device_bytes()
+            + self.value.device_bytes()
+            + self.attended.device_bytes()
+            + self.projected_output.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 impl Nemotron3AttentionWorkspace {

@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "step37_prefill"
 harness = false
+
+[[bench]]
+name = "nemotron3_speculative_decode"
+harness = false

@@ -5,7 +5,8 @@ use micromeasure::{
 use nvfp4::{
     CudaEvent, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
     bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
     quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use std::time::Duration;
 const PREFIX: &str = "backbone.layers.22.mixer.in_proj";
 const ROWS: usize = 18_560;
 const COLS: usize = 4_096;
+const VERIFY_ROWS: usize = 4;
 
 struct Nvfp4Weight {
     packed: DeviceBuffer<u8>,
@@ -26,11 +28,13 @@ struct Nemotron3DenseLinearBench {
     start: CudaEvent,
     stop: CudaEvent,
     input: DeviceBuffer<f32>,
+    verify_input: DeviceBuffer<f32>,
     bf16: DeviceBuffer<u16>,
     fp8: DeviceBuffer<u8>,
     fp8_scales: DeviceBuffer<f32>,
     nvfp4: Nvfp4Weight,
     output: DeviceBuffer<f32>,
+    verify_output: DeviceBuffer<f32>,
 }
 
 impl BenchContext for Nemotron3DenseLinearBench {
@@ -86,11 +90,19 @@ impl Nemotron3DenseLinearBench {
             &stream,
         )?;
         stream.synchronize()?;
+        let input_host = host_input();
+        let verify_input_host = input_host
+            .iter()
+            .copied()
+            .cycle()
+            .take(VERIFY_ROWS * COLS)
+            .collect::<Vec<_>>();
         let mut bench = Self {
             stream,
             start: CudaEvent::new()?,
             stop: CudaEvent::new()?,
-            input: DeviceBuffer::from_host(&host_input())?,
+            input: DeviceBuffer::from_host(&input_host)?,
+            verify_input: DeviceBuffer::from_host(&verify_input_host)?,
             bf16,
             fp8,
             fp8_scales,
@@ -100,6 +112,7 @@ impl Nemotron3DenseLinearBench {
                 alpha: nvfp4_host.weight_scale_2,
             },
             output: DeviceBuffer::zeroed(ROWS)?,
+            verify_output: DeviceBuffer::zeroed(VERIFY_ROWS * ROWS)?,
         };
         bench.validate()?;
         Ok(bench)
@@ -156,6 +169,20 @@ impl Nemotron3DenseLinearBench {
         )
     }
 
+    fn run_nvfp4_verify_rows(&mut self) -> Result<()> {
+        nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+            &self.verify_input,
+            &self.nvfp4.packed,
+            &self.nvfp4.scales,
+            self.verify_output.output(),
+            VERIFY_ROWS,
+            ROWS,
+            COLS,
+            self.nvfp4.alpha,
+            &self.stream,
+        )
+    }
+
     fn validate(&mut self) -> Result<()> {
         self.run_bf16()?;
         let reference = self.output.copy_to_host(&self.stream)?.into_vec();
@@ -164,7 +191,18 @@ impl Nemotron3DenseLinearBench {
         validate_approximation("Nemotron 3 BF16-to-FP8", &fp8, &reference, 0.999, 0.05)?;
         self.run_nvfp4()?;
         let nvfp4 = self.output.copy_to_host(&self.stream)?.into_vec();
-        validate_approximation("Nemotron 3 BF16-to-NVFP4", &nvfp4, &reference, 0.98, 0.20)
+        validate_approximation("Nemotron 3 BF16-to-NVFP4", &nvfp4, &reference, 0.98, 0.20)?;
+        self.run_nvfp4_verify_rows()?;
+        let verify = self.verify_output.copy_to_host(&self.stream)?;
+        for row in verify.chunks_exact(ROWS) {
+            if row != nvfp4 {
+                return Err(Error::Format {
+                    label: "Nemotron 3 four-row NVFP4 projection",
+                    detail: "batched output differs from independent projection".to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -289,6 +327,24 @@ fn nvfp4_warps_sample<const WARPS: usize>(
     finish_sample(context, chunk_size)
 }
 
+fn nvfp4_verify_rows_sample(
+    context: &mut Nemotron3DenseLinearBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    context
+        .start
+        .record_on_stream(&context.stream)
+        .expect("record start");
+    for _ in 0..chunk_size {
+        context
+            .run_nvfp4_verify_rows()
+            .expect("four-row NVFP4 projection");
+    }
+    black_box(context.verify_output.as_const_ptr());
+    finish_sample(context, chunk_size)
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nemotron3-dense-linear".to_string()),
@@ -307,6 +363,7 @@ fn main() {
             group.bench_sample("checkpoint_bf16", bf16_sample);
             group.bench_sample("converted_fp8", fp8_sample);
             group.bench_sample("converted_nvfp4", nvfp4_sample);
+            group.bench_sample("converted_nvfp4_verify_rows_4", nvfp4_verify_rows_sample);
             group.bench_sample("converted_nvfp4_warps_4", nvfp4_warps_sample::<4>);
             group.bench_sample("converted_nvfp4_warps_16", nvfp4_warps_sample::<16>);
             group.bench_sample("converted_nvfp4_warps_32", nvfp4_warps_sample::<32>);

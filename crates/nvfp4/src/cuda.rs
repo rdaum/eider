@@ -755,6 +755,63 @@ impl<T: Copy> DeviceBuffer<T> {
         }
     }
 
+    /// Enqueues a device-to-device copy between contiguous element ranges.
+    pub fn copy_range_from_device_on_stream(
+        &mut self,
+        destination_offset: usize,
+        source: &Self,
+        source_offset: usize,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let destination_end = destination_offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Shape {
+                label: "device range copy destination",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={destination_offset} length={len}"),
+            })?;
+        let source_end = source_offset.checked_add(len).ok_or_else(|| Error::Shape {
+            label: "device range copy source",
+            expected: "offset + length without overflow".to_string(),
+            actual: format!("offset={source_offset} length={len}"),
+        })?;
+        if destination_end > self.len || source_end > source.len {
+            return Err(Error::Shape {
+                label: "device range copy",
+                expected: format!(
+                    "destination end <= {} and source end <= {}",
+                    self.len, source.len
+                ),
+                actual: format!(
+                    "destination_end={destination_end} source_end={source_end} length={len}"
+                ),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device range copy bytes",
+                expected: "length * element size without overflow".to_string(),
+                actual: format!("length={len} element_size={}", size_of::<T>()),
+            })?;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D range)",
+                ffi::cudaMemcpyAsync(
+                    self.ptr.add(destination_offset).cast(),
+                    source.ptr.add(source_offset).cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Copies host values into a contiguous element range of this allocation.
     pub fn copy_range_from_host(&mut self, element_offset: usize, values: &[T]) -> Result<()> {
         let end = element_offset

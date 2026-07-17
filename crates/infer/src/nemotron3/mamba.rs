@@ -2,7 +2,11 @@ use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
+    nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
+    nemotron3_mamba_state_update_f32_chunks_into_on_stream,
+    nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_state_update_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
 
@@ -112,6 +116,11 @@ impl Nemotron3MambaLayer {
         Nemotron3MambaWorkspace::new(&self.manifest)
     }
 
+    /// Allocates scratch storage for a flattened set of sequence rows.
+    pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MambaRowsWorkspace> {
+        Nemotron3MambaRowsWorkspace::new(&self.manifest, rows)
+    }
+
     /// Allocates an empty recurrent state for a new sequence.
     pub fn sequence_state(&self) -> Result<Nemotron3MambaState> {
         Nemotron3MambaState::new(&self.manifest)
@@ -186,6 +195,201 @@ impl Nemotron3MambaLayer {
         )
     }
 
+    /// Runs flattened, ragged sequence rows through one Mamba layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MambaRowsWorkspace,
+        conv_state_table: &DeviceBuffer<*mut u16>,
+        ssm_state_table: &DeviceBuffer<*mut u16>,
+        state_table_offset: usize,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        sequence_count: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_rows_impl(
+            hidden,
+            workspace,
+            conv_state_table,
+            ssm_state_table,
+            state_table_offset,
+            sequence_offsets,
+            sequence_lengths,
+            sequence_count,
+            rows,
+            None,
+            stream,
+        )
+    }
+
+    /// Runs flattened speculative rows and records BF16 recurrent-state slots
+    /// for device-side commit or rollback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rows_transactional(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MambaRowsWorkspace,
+        conv_state_table: &DeviceBuffer<*mut u16>,
+        ssm_state_table: &DeviceBuffer<*mut u16>,
+        state_table_offset: usize,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        sequence_count: usize,
+        rows: usize,
+        conv_snapshots: &mut DeviceBuffer<u16>,
+        ssm_snapshots: &mut DeviceBuffer<u16>,
+        snapshot_slots: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_rows_impl(
+            hidden,
+            workspace,
+            conv_state_table,
+            ssm_state_table,
+            state_table_offset,
+            sequence_offsets,
+            sequence_lengths,
+            sequence_count,
+            rows,
+            Some((conv_snapshots, ssm_snapshots, snapshot_slots)),
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rows_impl(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MambaRowsWorkspace,
+        conv_state_table: &DeviceBuffer<*mut u16>,
+        ssm_state_table: &DeviceBuffer<*mut u16>,
+        state_table_offset: usize,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        sequence_count: usize,
+        rows: usize,
+        mut snapshots: Option<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>, usize)>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
+            return Err(Error::Shape {
+                label: "Nemotron 3 Mamba row hidden state",
+                expected: format!("{} values", rows.saturating_mul(self.manifest.hidden_size)),
+                actual: format!("{} values", hidden.len()),
+            });
+        }
+        workspace.require_manifest(&self.manifest, rows)?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.in_proj
+            .run_rows(&workspace.normed, &mut workspace.projected, rows, stream)?;
+        if let Some((conv_snapshots, ssm_snapshots, snapshot_slots)) = snapshots.as_mut() {
+            nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
+                &workspace.projected,
+                &self.conv_weight,
+                &self.conv_bias,
+                conv_state_table,
+                state_table_offset,
+                sequence_offsets,
+                sequence_lengths,
+                workspace.conv_output.output(),
+                conv_snapshots.output(),
+                sequence_count,
+                rows,
+                *snapshot_slots,
+                self.manifest.mamba_intermediate_size(),
+                self.manifest.mamba_conv_channels(),
+                self.manifest.mamba_conv_kernel,
+                stream,
+            )?;
+            nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
+                &workspace.projected,
+                &workspace.conv_output,
+                &self.a_log,
+                &self.d,
+                &self.dt_bias,
+                &self.mixer_norm,
+                ssm_state_table,
+                state_table_offset,
+                sequence_offsets,
+                sequence_lengths,
+                workspace.mixer_output.output(),
+                ssm_snapshots.output(),
+                sequence_count,
+                rows,
+                *snapshot_slots,
+                self.manifest.mamba_heads,
+                self.manifest.mamba_head_dim,
+                self.manifest.mamba_groups,
+                self.manifest.mamba_state_size,
+                1.0e-4,
+                self.manifest.norm_epsilon,
+                stream,
+            )?;
+        } else {
+            nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
+                &workspace.projected,
+                &self.conv_weight,
+                &self.conv_bias,
+                conv_state_table,
+                state_table_offset,
+                sequence_offsets,
+                sequence_lengths,
+                workspace.conv_output.output(),
+                sequence_count,
+                rows,
+                self.manifest.mamba_intermediate_size(),
+                self.manifest.mamba_conv_channels(),
+                self.manifest.mamba_conv_kernel,
+                stream,
+            )?;
+            nemotron3_mamba_state_update_f32_chunks_into_on_stream(
+                &workspace.projected,
+                &workspace.conv_output,
+                &self.a_log,
+                &self.d,
+                &self.dt_bias,
+                &self.mixer_norm,
+                ssm_state_table,
+                state_table_offset,
+                sequence_offsets,
+                sequence_lengths,
+                workspace.mixer_output.output(),
+                sequence_count,
+                rows,
+                self.manifest.mamba_heads,
+                self.manifest.mamba_head_dim,
+                self.manifest.mamba_groups,
+                self.manifest.mamba_state_size,
+                1.0e-4,
+                self.manifest.norm_epsilon,
+                stream,
+            )?;
+        }
+        self.out_proj.run_rows(
+            &workspace.mixer_output,
+            &mut workspace.projected_output,
+            rows,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            hidden,
+            &workspace.projected_output,
+            workspace.output.output(),
+            stream,
+        )
+    }
+
     /// Returns the output buffer after [`Self::run_one_token`].
     pub fn output<'a>(&self, workspace: &'a Nemotron3MambaWorkspace) -> &'a DeviceBuffer<f32> {
         &workspace.output
@@ -212,8 +416,8 @@ impl Nemotron3MambaLayer {
 
 /// One sequence's recurrent state for a Nemotron 3 Mamba layer.
 pub struct Nemotron3MambaState {
-    conv: DeviceBuffer<f32>,
-    ssm: DeviceBuffer<f32>,
+    conv: DeviceBuffer<u16>,
+    ssm: DeviceBuffer<u16>,
 }
 
 impl Nemotron3MambaState {
@@ -245,6 +449,36 @@ impl Nemotron3MambaState {
     pub fn device_bytes(&self) -> usize {
         self.conv.device_bytes() + self.ssm.device_bytes()
     }
+
+    pub(super) fn checkpoint_on_stream(&self, stream: &CudaStream) -> Result<Self> {
+        let mut conv = DeviceBuffer::zeroed(self.conv.len())?;
+        let mut ssm = DeviceBuffer::zeroed(self.ssm.len())?;
+        conv.copy_prefix_from_device_on_stream(&self.conv, self.conv.len(), stream)?;
+        ssm.copy_prefix_from_device_on_stream(&self.ssm, self.ssm.len(), stream)?;
+        Ok(Self { conv, ssm })
+    }
+
+    pub(super) fn restore_checkpoint_on_stream(
+        &mut self,
+        checkpoint: &Self,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.conv.copy_prefix_from_device_on_stream(
+            &checkpoint.conv,
+            checkpoint.conv.len(),
+            stream,
+        )?;
+        self.ssm
+            .copy_prefix_from_device_on_stream(&checkpoint.ssm, checkpoint.ssm.len(), stream)
+    }
+
+    pub(super) fn conv_ptr(&mut self) -> *mut u16 {
+        self.conv.inout().as_mut_ptr().cast()
+    }
+
+    pub(super) fn ssm_ptr(&mut self) -> *mut u16 {
+        self.ssm.inout().as_mut_ptr().cast()
+    }
 }
 
 /// Reusable one-token scratch storage for a Nemotron 3 Mamba layer.
@@ -255,6 +489,66 @@ pub struct Nemotron3MambaWorkspace {
     mixer_output: DeviceBuffer<f32>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
+}
+
+/// Reusable scratch storage for flattened, ragged Mamba rows.
+pub struct Nemotron3MambaRowsWorkspace {
+    normed: DeviceBuffer<f32>,
+    projected: DeviceBuffer<f32>,
+    conv_output: DeviceBuffer<f32>,
+    mixer_output: DeviceBuffer<f32>,
+    projected_output: DeviceBuffer<f32>,
+    pub(super) output: DeviceBuffer<f32>,
+}
+
+impl Nemotron3MambaRowsWorkspace {
+    fn new(manifest: &Nemotron3Manifest, rows: usize) -> Result<Self> {
+        if rows == 0 {
+            return Err(Error::Shape {
+                label: "Nemotron 3 Mamba row workspace",
+                expected: "at least one row".to_string(),
+                actual: "0 rows".to_string(),
+            });
+        }
+        Ok(Self {
+            normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            projected: DeviceBuffer::zeroed(rows * manifest.mamba_projection_size())?,
+            conv_output: DeviceBuffer::zeroed(rows * manifest.mamba_conv_channels())?,
+            mixer_output: DeviceBuffer::zeroed(rows * manifest.mamba_intermediate_size())?,
+            projected_output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+        })
+    }
+
+    fn require_manifest(&self, manifest: &Nemotron3Manifest, rows: usize) -> Result<()> {
+        if self.normed.len() == rows * manifest.hidden_size
+            && self.projected.len() == rows * manifest.mamba_projection_size()
+            && self.conv_output.len() == rows * manifest.mamba_conv_channels()
+            && self.mixer_output.len() == rows * manifest.mamba_intermediate_size()
+            && self.projected_output.len() == rows * manifest.hidden_size
+            && self.output.len() == rows * manifest.hidden_size
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 Mamba row workspace",
+            expected: format!("{rows} rows matching model manifest"),
+            actual: "workspace belongs to another manifest or row count".to_string(),
+        })
+    }
+
+    pub(super) fn output(&self) -> &DeviceBuffer<f32> {
+        &self.output
+    }
+
+    pub(super) fn device_bytes(&self) -> usize {
+        self.normed.device_bytes()
+            + self.projected.device_bytes()
+            + self.conv_output.device_bytes()
+            + self.mixer_output.device_bytes()
+            + self.projected_output.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 impl Nemotron3MambaWorkspace {

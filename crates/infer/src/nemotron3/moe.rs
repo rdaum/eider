@@ -1,11 +1,12 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{
-    Nemotron3LayerKind, Nemotron3Manifest, Nemotron3Router, Nemotron3RouterWorkspace,
-    Nemotron3StorageConfig,
+    Nemotron3LayerKind, Nemotron3Manifest, Nemotron3Router, Nemotron3RouterRowsWorkspace,
+    Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    add_f32_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    add_f32_into_on_stream, moe_weighted_accumulate_slots_f32_batch_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream, relu_squared_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
@@ -61,11 +62,50 @@ impl Nemotron3MoeLayer {
                 detail: format!("layer {layer} is {}, not moe", kind.as_str()),
             });
         }
+        Self::load_at_prefix(
+            checkpoint,
+            manifest,
+            layer,
+            &format!("backbone.layers.{layer}"),
+            storage,
+            false,
+        )
+    }
+
+    pub(super) fn load_mtp(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        storage: Nemotron3StorageConfig,
+    ) -> Result<Self> {
+        if manifest.mtp_layers.get(layer) != Some(&Nemotron3LayerKind::Moe) {
+            return Err(Error::Format {
+                label: "Nemotron 3 MTP MoE layer",
+                detail: format!("MTP layer {layer} is not moe"),
+            });
+        }
+        Self::load_at_prefix(
+            checkpoint,
+            manifest,
+            layer,
+            &format!("mtp.layers.{layer}"),
+            storage,
+            true,
+        )
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &Nemotron3Manifest,
+        layer: usize,
+        prefix: &str,
+        storage: Nemotron3StorageConfig,
+        mtp: bool,
+    ) -> Result<Self> {
         let latent = manifest.moe_latent_size.ok_or_else(|| Error::Format {
             label: "Nemotron 3 MoE layer",
             detail: "the current MoE execution path requires moe_latent_size".to_string(),
         })?;
-        let prefix = format!("backbone.layers.{layer}");
         let mixer = format!("{prefix}.mixer");
         Ok(Self {
             layer,
@@ -75,7 +115,11 @@ impl Nemotron3MoeLayer {
                 &format!("{prefix}.norm.weight"),
                 &[manifest.hidden_size],
             )?,
-            router: Nemotron3Router::load(checkpoint, manifest, layer)?,
+            router: if mtp {
+                Nemotron3Router::load_mtp(checkpoint, manifest, layer)?
+            } else {
+                Nemotron3Router::load(checkpoint, manifest, layer)?
+            },
             latent_in: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.fc1_latent_proj"),
@@ -111,6 +155,11 @@ impl Nemotron3MoeLayer {
     /// Allocates the scratch buffers and route pointer tables used for one token.
     pub fn workspace(&self) -> Result<Nemotron3MoeWorkspace> {
         Nemotron3MoeWorkspace::new(&self.manifest)
+    }
+
+    /// Allocates scratch and route tables for a fixed flattened row count.
+    pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MoeRowsWorkspace> {
+        Nemotron3MoeRowsWorkspace::new(&self.manifest, rows)
     }
 
     /// Runs one token through pre-norm, routed and shared experts, and the residual add.
@@ -158,6 +207,74 @@ impl Nemotron3MoeLayer {
         self.shared_down.run(
             &workspace.shared_activated,
             &mut workspace.shared_hidden,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            &workspace.routed_hidden,
+            &workspace.shared_hidden,
+            workspace.combined.output(),
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            hidden,
+            &workspace.combined,
+            workspace.output.output(),
+            stream,
+        )
+    }
+
+    /// Runs flattened rows through pre-norm, routed and shared experts, and residual add.
+    pub fn run_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3MoeRowsWorkspace,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
+            return Err(Error::Shape {
+                label: "Nemotron 3 MoE row hidden state",
+                expected: format!("{} values", rows.saturating_mul(self.manifest.hidden_size)),
+                actual: format!("{} values", hidden.len()),
+            });
+        }
+        workspace.require_manifest(&self.manifest, rows)?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.router
+            .run_rows(&workspace.normed, &mut workspace.router, rows, stream)?;
+        self.latent_in
+            .run_rows(&workspace.normed, &mut workspace.latent, rows, stream)?;
+        self.experts.run_rows(workspace, rows, stream)?;
+        self.latent_out.run_rows(
+            &workspace.routed_latent,
+            &mut workspace.routed_hidden,
+            rows,
+            stream,
+        )?;
+
+        self.shared_up.run_rows(
+            &workspace.normed,
+            &mut workspace.shared_projected,
+            rows,
+            stream,
+        )?;
+        relu_squared_f32_into_on_stream(
+            &workspace.shared_projected,
+            workspace.shared_activated.output(),
+            stream,
+        )?;
+        self.shared_down.run_rows(
+            &workspace.shared_activated,
+            &mut workspace.shared_hidden,
+            rows,
             stream,
         )?;
         add_f32_into_on_stream(
@@ -233,7 +350,12 @@ impl Nemotron3ExpertSlab {
         for expert in 0..experts {
             let prefix = format!("{mixer}.experts.{expert}");
             append_linear(
-                checkpoint.load_nvfp4_linear(&format!("{prefix}.up_proj"))?,
+                load_expert_linear(
+                    checkpoint,
+                    &format!("{prefix}.up_proj"),
+                    intermediate,
+                    latent,
+                )?,
                 intermediate,
                 latent,
                 &mut up_packed,
@@ -241,7 +363,12 @@ impl Nemotron3ExpertSlab {
                 &mut up_scale_2,
             )?;
             append_linear(
-                checkpoint.load_nvfp4_linear(&format!("{prefix}.down_proj"))?,
+                load_expert_linear(
+                    checkpoint,
+                    &format!("{prefix}.down_proj"),
+                    latent,
+                    intermediate,
+                )?,
                 latent,
                 intermediate,
                 &mut down_packed,
@@ -314,6 +441,52 @@ impl Nemotron3ExpertSlab {
         )
     }
 
+    fn run_rows(
+        &self,
+        workspace: &mut Nemotron3MoeRowsWorkspace,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let indices = workspace.router.indices();
+        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+            indices,
+            &workspace.up_input_table,
+            &self.up_packed_table,
+            &self.up_scale_table,
+            &self.up_scale_2,
+            &workspace.up_output_table,
+            self.intermediate,
+            self.latent,
+            stream,
+        )?;
+        relu_squared_f32_into_on_stream(
+            &workspace.routed_up,
+            workspace.routed_activated.output(),
+            stream,
+        )?;
+        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+            indices,
+            &workspace.down_input_table,
+            &self.down_packed_table,
+            &self.down_scale_table,
+            &self.down_scale_2,
+            &workspace.down_output_table,
+            self.latent,
+            self.intermediate,
+            stream,
+        )?;
+        moe_weighted_accumulate_slots_f32_batch_on_stream(
+            indices,
+            workspace.router.weights(),
+            &workspace.down_result_table,
+            &self.expert_alpha,
+            workspace.routed_latent.inout(),
+            rows,
+            workspace.routes_per_row,
+            stream,
+        )
+    }
+
     fn device_bytes(&self) -> usize {
         self.up_packed.device_bytes()
             + self.up_scales.device_bytes()
@@ -326,6 +499,27 @@ impl Nemotron3ExpertSlab {
             + self.down_scale_table.device_bytes()
             + self.down_scale_2.device_bytes()
             + self.expert_alpha.device_bytes()
+    }
+}
+
+fn load_expert_linear(
+    checkpoint: &ModelOptCheckpoint,
+    prefix: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<ModelOptNvfp4Linear> {
+    let name = format!("{prefix}.weight");
+    let shard = checkpoint.open_shard_for_tensor(&name)?;
+    match shard.require_tensor(&name)?.dtype.as_str() {
+        "U8" => checkpoint.load_nvfp4_linear(prefix),
+        "BF16" => {
+            let values = super::linear::load_bf16_host(checkpoint, &name, &[rows, cols])?;
+            ModelOptNvfp4Linear::quantize_bf16(prefix, rows, cols, &values)
+        }
+        dtype => Err(Error::Format {
+            label: "Nemotron 3 routed expert",
+            detail: format!("unsupported {dtype} weight at {name}"),
+        }),
     }
 }
 
@@ -385,6 +579,140 @@ pub struct Nemotron3MoeWorkspace {
     down_input_table: DeviceBuffer<*const f32>,
     down_output_table: DeviceBuffer<*mut f32>,
     down_result_table: DeviceBuffer<*const f32>,
+}
+
+/// Reusable scratch and pointer-table storage for flattened MoE rows.
+pub struct Nemotron3MoeRowsWorkspace {
+    router: Nemotron3RouterRowsWorkspace,
+    normed: DeviceBuffer<f32>,
+    latent: DeviceBuffer<f32>,
+    routed_up: DeviceBuffer<f32>,
+    routed_activated: DeviceBuffer<f32>,
+    routed_down: DeviceBuffer<f32>,
+    routed_latent: DeviceBuffer<f32>,
+    routed_hidden: DeviceBuffer<f32>,
+    shared_projected: DeviceBuffer<f32>,
+    shared_activated: DeviceBuffer<f32>,
+    shared_hidden: DeviceBuffer<f32>,
+    combined: DeviceBuffer<f32>,
+    pub(super) output: DeviceBuffer<f32>,
+    up_input_table: DeviceBuffer<*const f32>,
+    up_output_table: DeviceBuffer<*mut f32>,
+    down_input_table: DeviceBuffer<*const f32>,
+    down_output_table: DeviceBuffer<*mut f32>,
+    down_result_table: DeviceBuffer<*const f32>,
+    routes_per_row: usize,
+}
+
+impl Nemotron3MoeRowsWorkspace {
+    fn new(manifest: &Nemotron3Manifest, rows: usize) -> Result<Self> {
+        if rows == 0 {
+            return Err(Error::Shape {
+                label: "Nemotron 3 MoE row workspace",
+                expected: "at least one row".to_string(),
+                actual: "0 rows".to_string(),
+            });
+        }
+        let latent = manifest.moe_latent_size.ok_or_else(|| Error::Format {
+            label: "Nemotron 3 MoE row workspace",
+            detail: "the current MoE execution path requires moe_latent_size".to_string(),
+        })?;
+        let routes_per_row = manifest.experts_per_token;
+        let routes = rows * routes_per_row;
+        let intermediate = manifest.moe_intermediate_size;
+        let latent_buffer = DeviceBuffer::zeroed(rows * latent)?;
+        let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
+        let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
+        let routed_down = DeviceBuffer::zeroed(routes * latent)?;
+        let up_input_table =
+            repeated_const_pointer_table(&latent_buffer, rows, routes_per_row, latent)?;
+        let up_output_table = mutable_pointer_table(&routed_up, routes, intermediate)?;
+        let down_input_table = const_pointer_table(&routed_activated, routes, intermediate)?;
+        let down_output_table = mutable_pointer_table(&routed_down, routes, latent)?;
+        let down_result_table = const_pointer_table(&routed_down, routes, latent)?;
+        Ok(Self {
+            router: Nemotron3RouterRowsWorkspace::new(manifest, rows)?,
+            normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            latent: latent_buffer,
+            routed_up,
+            routed_activated,
+            routed_down,
+            routed_latent: DeviceBuffer::zeroed(rows * latent)?,
+            routed_hidden: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            shared_projected: DeviceBuffer::zeroed(
+                rows * manifest.shared_expert_intermediate_size,
+            )?,
+            shared_activated: DeviceBuffer::zeroed(
+                rows * manifest.shared_expert_intermediate_size,
+            )?,
+            shared_hidden: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            combined: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            output: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
+            up_input_table,
+            up_output_table,
+            down_input_table,
+            down_output_table,
+            down_result_table,
+            routes_per_row,
+        })
+    }
+
+    fn require_manifest(&self, manifest: &Nemotron3Manifest, rows: usize) -> Result<()> {
+        let latent = manifest.moe_latent_size.unwrap_or_default();
+        let routes = rows * manifest.experts_per_token;
+        let intermediate = manifest.moe_intermediate_size;
+        if self.normed.len() == rows * manifest.hidden_size
+            && self.latent.len() == rows * latent
+            && self.routed_up.len() == routes * intermediate
+            && self.routed_activated.len() == routes * intermediate
+            && self.routed_down.len() == routes * latent
+            && self.routed_latent.len() == rows * latent
+            && self.routed_hidden.len() == rows * manifest.hidden_size
+            && self.shared_projected.len() == rows * manifest.shared_expert_intermediate_size
+            && self.shared_activated.len() == rows * manifest.shared_expert_intermediate_size
+            && self.shared_hidden.len() == rows * manifest.hidden_size
+            && self.combined.len() == rows * manifest.hidden_size
+            && self.output.len() == rows * manifest.hidden_size
+            && self.up_input_table.len() == routes
+            && self.up_output_table.len() == routes
+            && self.down_input_table.len() == routes
+            && self.down_output_table.len() == routes
+            && self.down_result_table.len() == routes
+            && self.routes_per_row == manifest.experts_per_token
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "Nemotron 3 MoE row workspace",
+            expected: format!("{rows} rows matching model manifest"),
+            actual: "workspace belongs to another manifest or row count".to_string(),
+        })
+    }
+
+    pub(super) fn output(&self) -> &DeviceBuffer<f32> {
+        &self.output
+    }
+
+    pub(super) fn device_bytes(&self) -> usize {
+        self.router.device_bytes()
+            + self.normed.device_bytes()
+            + self.latent.device_bytes()
+            + self.routed_up.device_bytes()
+            + self.routed_activated.device_bytes()
+            + self.routed_down.device_bytes()
+            + self.routed_latent.device_bytes()
+            + self.routed_hidden.device_bytes()
+            + self.shared_projected.device_bytes()
+            + self.shared_activated.device_bytes()
+            + self.shared_hidden.device_bytes()
+            + self.combined.device_bytes()
+            + self.output.device_bytes()
+            + self.up_input_table.device_bytes()
+            + self.up_output_table.device_bytes()
+            + self.down_input_table.device_bytes()
+            + self.down_output_table.device_bytes()
+            + self.down_result_table.device_bytes()
+    }
 }
 
 impl Nemotron3MoeWorkspace {
@@ -491,6 +819,23 @@ fn mutable_pointer_table(
     DeviceBuffer::from_host(
         &(0..entries)
             .map(|entry| unsafe { base.add(entry * stride) })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn repeated_const_pointer_table(
+    buffer: &DeviceBuffer<f32>,
+    rows: usize,
+    repeats: usize,
+    row_stride: usize,
+) -> Result<DeviceBuffer<*const f32>> {
+    let base = buffer.as_const_ptr().cast::<f32>();
+    DeviceBuffer::from_host(
+        &(0..rows)
+            .flat_map(|row| {
+                let row_ptr = unsafe { base.add(row * row_stride) };
+                std::iter::repeat_n(row_ptr, repeats)
+            })
             .collect::<Vec<_>>(),
     )
 }

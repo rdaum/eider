@@ -938,6 +938,75 @@ pub fn nemotron3_sigmoid_topk_f32_into_on_stream(
     }
 }
 
+/// Enqueues independent Nemotron 3 grouped sigmoid routing for dense rows.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_sigmoid_topk_f32_batch_into_on_stream(
+    logits: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    mut out_indices: DeviceOutput<'_, u32>,
+    mut out_weights: DeviceOutput<'_, f32>,
+    rows: usize,
+    k: usize,
+    groups: usize,
+    topk_groups: usize,
+    normalize: bool,
+    scaling_factor: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let experts = bias.len();
+    let logits_len = rows.saturating_mul(experts);
+    let routes = rows.saturating_mul(k);
+    if rows == 0
+        || experts == 0
+        || experts > 512
+        || logits.len() != logits_len
+        || k == 0
+        || k > experts
+        || groups == 0
+        || groups > 64
+        || !experts.is_multiple_of(groups)
+        || topk_groups == 0
+        || topk_groups > groups
+        || out_indices.len() != routes
+        || out_weights.len() != routes
+        || rows > u32::MAX as usize
+        || !scaling_factor.is_finite()
+    {
+        return Err(Error::Shape {
+            label: "batched Nemotron 3 sigmoid top-k buffers",
+            expected: format!(
+                "logits={logits_len} bias={experts}; valid grouped top-k; outputs={routes}"
+            ),
+            actual: format!(
+                "rows={rows} logits={} bias={} k={k} groups={groups} topk_groups={topk_groups} indices={} weights={} scale={scaling_factor}",
+                logits.len(),
+                bias.len(),
+                out_indices.len(),
+                out_weights.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_sigmoid_topk_f32_batch_on_stream",
+            ffi::infer_nemotron3_sigmoid_topk_f32_batch_on_stream(
+                logits.ptr,
+                bias.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                rows as u32,
+                experts as u32,
+                k as u32,
+                groups as u32,
+                topk_groups as u32,
+                i32::from(normalize),
+                scaling_factor,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues independent Step sigmoid routing with biased top-8 selection.
 pub fn step37_sigmoid_top8_f32_batch_into_on_stream(
     logits: &DeviceBuffer<f32>,
@@ -1466,6 +1535,66 @@ pub fn moe_weighted_accumulate_slots_f32_on_stream(
                 alpha_table.ptr,
                 output.buffer_mut().ptr,
                 output.len() as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Writes one weighted sum of per-slot expert outputs for every dense row.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<*const f32>,
+    alpha_table: &DeviceBuffer<f32>,
+    mut output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = rows.saturating_mul(groups);
+    let len = output.len().checked_div(rows).unwrap_or(0);
+    if rows == 0
+        || groups == 0
+        || len == 0
+        || output.len() != rows.saturating_mul(len)
+        || indices.len() != routes
+        || route_weights.len() != routes
+        || inputs.len() != routes
+        || alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || len > u32::MAX as usize
+        || groups > u32::MAX as usize
+        || output.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "batched MoE weighted slot accumulate",
+            expected: format!(
+                "output={rows}xnonzero routes={routes} matching indices/weights/inputs"
+            ),
+            actual: format!(
+                "output={} rows={rows} groups={groups} indices={} weights={} inputs={} alphas={}",
+                output.len(),
+                indices.len(),
+                route_weights.len(),
+                inputs.len(),
+                alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_weighted_accumulate_slots_f32_batch_on_stream",
+            ffi::infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
+                indices.ptr,
+                route_weights.ptr,
+                inputs.ptr,
+                alpha_table.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                len as u32,
                 groups as u32,
                 stream.as_raw(),
             ),
@@ -2244,6 +2373,184 @@ fn validate_add_f32(left: &DeviceBuffer<f32>, right: &DeviceBuffer<f32>) -> Resu
     Ok(())
 }
 
+/// Concatenates row-major `[rows, cols]` f32 inputs into row-major
+/// `[rows, 2 * cols]` output on `stream`.
+pub fn concat_f32_rows_into_on_stream(
+    rows: usize,
+    cols: usize,
+    left: &DeviceBuffer<f32>,
+    right: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "concatenate f32 rows",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let output_len = input_len.checked_mul(2).ok_or_else(|| Error::Shape {
+        label: "concatenate f32 row output",
+        expected: "2 * rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0 || cols == 0 || rows > u32::MAX as usize || cols > u32::MAX as usize / 2 {
+        return Err(Error::Shape {
+            label: "concatenate f32 row dimensions",
+            expected: "non-zero u32-sized rows and doubled columns".to_string(),
+            actual: format!("rows={rows} cols={cols}"),
+        });
+    }
+    for (label, actual) in [
+        ("concatenate f32 left input", left.len()),
+        ("concatenate f32 right input", right.len()),
+    ] {
+        if actual != input_len {
+            return Err(Error::Shape {
+                label,
+                expected: format!("{input_len} values"),
+                actual: format!("{actual} values"),
+            });
+        }
+    }
+    if output.len() != output_len {
+        return Err(Error::Shape {
+            label: "concatenate f32 row output",
+            expected: format!("{output_len} values"),
+            actual: format!("{} values", output.len()),
+        });
+    }
+
+    unsafe {
+        check_cuda(
+            "infer_concat_f32_rows_on_stream",
+            ffi::infer_concat_f32_rows_on_stream(
+                left.ptr,
+                right.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Adds `increment` to every u32 value on `stream`.
+pub fn increment_u32_in_place_on_stream(
+    mut values: DeviceInOut<'_, u32>,
+    increment: u32,
+    stream: &CudaStream,
+) -> Result<()> {
+    if values.is_empty() || values.len() > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "increment u32",
+            expected: "1..=u32::MAX values".to_string(),
+            actual: format!("{} values", values.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_increment_u32_on_stream",
+            ffi::infer_increment_u32_on_stream(
+                values.as_mut_ptr().cast(),
+                values.len() as u32,
+                increment,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Stores one dense u32 input vector into a column of a row-major matrix.
+pub fn store_u32_column_into_on_stream(
+    input: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, u32>,
+    rows: usize,
+    columns: usize,
+    column: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if rows == 0
+        || columns == 0
+        || column >= columns
+        || rows > u32::MAX as usize
+        || columns > u32::MAX as usize
+        || input.len() != rows
+        || output.len() != rows.saturating_mul(columns)
+    {
+        return Err(Error::Shape {
+            label: "u32 matrix-column store",
+            expected: format!(
+                "input={rows} output={} column < {columns}",
+                rows.saturating_mul(columns)
+            ),
+            actual: format!(
+                "input={} output={} rows={rows} columns={columns} column={column}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_store_u32_column_on_stream",
+            ffi::infer_store_u32_column_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                columns as u32,
+                column as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Prepends one dense u32 value to each row of a row-major matrix.
+pub fn prepend_u32_rows_into_on_stream(
+    first: &DeviceBuffer<u32>,
+    remaining: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, u32>,
+    rows: usize,
+    remaining_columns: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let remaining_len = rows.saturating_mul(remaining_columns);
+    let output_len = rows.saturating_mul(remaining_columns.saturating_add(1));
+    if rows == 0
+        || remaining_columns == 0
+        || rows > u32::MAX as usize
+        || remaining_columns >= u32::MAX as usize
+        || first.len() != rows
+        || remaining.len() != remaining_len
+        || output.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "prepend u32 rows",
+            expected: format!("first={rows} remaining={remaining_len} output={output_len}"),
+            actual: format!(
+                "first={} remaining={} output={} rows={rows} remaining_columns={remaining_columns}",
+                first.len(),
+                remaining.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_prepend_u32_rows_on_stream",
+            ffi::infer_prepend_u32_rows_on_stream(
+                first.ptr,
+                remaining.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                remaining_columns as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Transposes row-major `[rows, cols]` f32 into column-major `[rows, cols]`.
 #[cfg(test)]
 pub fn row_major_to_col_major_f32(
@@ -2376,6 +2683,55 @@ pub fn copy_row_f32_into_on_stream(
     }
 }
 
+/// Gathers the same row from each group of a row-major f32 tensor.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_group_row_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    groups: usize,
+    rows_per_group: usize,
+    row: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = groups.saturating_mul(rows_per_group).saturating_mul(cols);
+    let output_len = groups.saturating_mul(cols);
+    if groups == 0
+        || rows_per_group == 0
+        || row >= rows_per_group
+        || cols == 0
+        || groups > u32::MAX as usize
+        || rows_per_group > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != input_len
+        || output.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "gather grouped f32 row",
+            expected: format!("input={input_len} output={output_len} row < {rows_per_group}"),
+            actual: format!(
+                "input={} output={} groups={groups} rows_per_group={rows_per_group} row={row} cols={cols}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gather_group_row_f32_on_stream",
+            ffi::infer_gather_group_row_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                groups as u32,
+                rows_per_group as u32,
+                row as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues BF16 row-to-f32 copy selected by a device-resident row index.
 pub fn copy_bf16_row_to_f32_indexed_into_on_stream(
     rows: usize,
@@ -2417,6 +2773,52 @@ pub fn copy_bf16_row_to_f32_indexed_into_on_stream(
             ffi::infer_copy_bf16_row_to_f32_indexed_on_stream(
                 input.ptr,
                 row.ptr,
+                output.buffer_mut().ptr,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Copies one host-selected BF16 row to f32 on `stream`.
+pub fn copy_bf16_row_to_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    row: usize,
+    input: &DeviceBuffer<u16>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "copy BF16 row to f32 input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || row >= rows
+        || row > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != input_len
+        || output.len() != cols
+    {
+        return Err(Error::Shape {
+            label: "copy BF16 row to f32 buffers",
+            expected: format!("input={input_len} row < {rows} output={cols}"),
+            actual: format!(
+                "input={} row={row} output={} rows={rows} cols={cols}",
+                input.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_copy_bf16_row_to_f32_on_stream",
+            ffi::infer_copy_bf16_row_to_f32_on_stream(
+                input.ptr,
+                row as u32,
                 output.buffer_mut().ptr,
                 cols as u32,
                 stream.as_raw(),
@@ -3477,6 +3879,150 @@ pub fn prefill_gqa_attention_f32_into(
     }
 }
 
+/// Appends flattened ragged K/V rows into per-sequence cache pointer tables.
+#[allow(clippy::too_many_arguments)]
+pub fn append_ragged_kv_f32_into_on_stream(
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    key_cache_table: &DeviceBuffer<*mut f32>,
+    value_cache_table: &DeviceBuffer<*mut f32>,
+    cache_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    start_positions: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = total_tokens.saturating_mul(width);
+    if sequence_count == 0
+        || total_tokens == 0
+        || width == 0
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || width > u32::MAX as usize
+        || key.len() != values
+        || value.len() != values
+        || cache_table_offset.saturating_add(sequence_count) > key_cache_table.len()
+        || cache_table_offset.saturating_add(sequence_count) > value_cache_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+        || start_positions.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "ragged KV append buffers",
+            expected: format!("key/value={values}; cache and metadata tables >= {sequence_count}"),
+            actual: format!(
+                "key={} value={} key_cache={} value_cache={} offsets={} lengths={} starts={} sequences={sequence_count} tokens={total_tokens} width={width}",
+                key.len(),
+                value.len(),
+                key_cache_table.len().saturating_sub(cache_table_offset),
+                value_cache_table.len().saturating_sub(cache_table_offset),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+                start_positions.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_append_ragged_kv_f32_on_stream",
+            ffi::infer_append_ragged_kv_f32_on_stream(
+                key.ptr,
+                value.ptr,
+                key_cache_table.ptr.add(cache_table_offset),
+                value_cache_table.ptr.add(cache_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                start_positions.ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs causal GQA for flattened ragged rows over per-sequence cache tables.
+#[allow(clippy::too_many_arguments)]
+pub fn ragged_gqa_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_cache_table: &DeviceBuffer<*mut f32>,
+    value_cache_table: &DeviceBuffer<*mut f32>,
+    cache_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    start_positions: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_width = q_heads.saturating_mul(head_dim);
+    let values = total_tokens.saturating_mul(query_width);
+    if sequence_count == 0
+        || total_tokens == 0
+        || q_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || !q_heads.is_multiple_of(kv_heads)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || q_heads > u32::MAX as usize
+        || kv_heads > u32::MAX as usize
+        || head_dim > 256
+        || query.len() != values
+        || output.len() != values
+        || cache_table_offset.saturating_add(sequence_count) > key_cache_table.len()
+        || cache_table_offset.saturating_add(sequence_count) > value_cache_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+        || start_positions.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "ragged GQA buffers",
+            expected: format!(
+                "query/output={values}; cache and metadata tables >= {sequence_count}; valid GQA heads"
+            ),
+            actual: format!(
+                "query={} output={} key_cache={} value_cache={} offsets={} lengths={} starts={} sequences={sequence_count} tokens={total_tokens} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}",
+                query.len(),
+                output.len(),
+                key_cache_table.len().saturating_sub(cache_table_offset),
+                value_cache_table.len().saturating_sub(cache_table_offset),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+                start_positions.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ragged_gqa_attention_f32_on_stream",
+            ffi::infer_ragged_gqa_attention_f32_on_stream(
+                query.ptr,
+                key_cache_table.ptr.add(cache_table_offset),
+                value_cache_table.ptr.add(cache_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                start_positions.ptr,
+                output.buffer_mut().ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn prefill_gqa_attention_len(
     query: &DeviceBuffer<f32>,
     key_cache: &DeviceBuffer<f32>,
@@ -3734,6 +4280,73 @@ pub fn argmax_f32_batch_into_on_stream(
                 out_value.buffer_mut().ptr,
                 rows as u32,
                 cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Greedily accepts a contiguous speculative prefix for each sequence.
+///
+/// Draft tokens and verification-logit rows are sequence-major. The first
+/// draft is checked against each sequence's previous logits; subsequent
+/// drafts are checked against the preceding verification row. `next_tokens`
+/// receives the target token at the first rejection, or the bonus token when
+/// every draft is accepted.
+#[allow(clippy::too_many_arguments)]
+pub fn speculative_accept_argmax_f32_into_on_stream(
+    previous_logits: &DeviceBuffer<*const f32>,
+    verification_logits: &DeviceBuffer<f32>,
+    drafted_tokens: &DeviceBuffer<u32>,
+    mut accepted_counts: DeviceOutput<'_, u32>,
+    mut next_tokens: DeviceOutput<'_, u32>,
+    sequence_count: usize,
+    draft_count: usize,
+    vocab_size: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let rows = sequence_count.saturating_mul(draft_count);
+    let logits_len = rows.saturating_mul(vocab_size);
+    if sequence_count == 0
+        || draft_count == 0
+        || draft_count > 4
+        || vocab_size == 0
+        || sequence_count > u32::MAX as usize
+        || draft_count > u32::MAX as usize
+        || vocab_size > u32::MAX as usize
+        || previous_logits.len() != sequence_count
+        || verification_logits.len() != logits_len
+        || drafted_tokens.len() != rows
+        || accepted_counts.len() != sequence_count
+        || next_tokens.len() != sequence_count
+    {
+        return Err(Error::Shape {
+            label: "speculative argmax acceptance buffers",
+            expected: format!(
+                "previous/accepted/next={sequence_count} drafts={rows} verification_logits={logits_len} with 1..=4 drafts"
+            ),
+            actual: format!(
+                "previous={} drafts={} verification_logits={} accepted={} next={} sequences={sequence_count} draft_count={draft_count} vocab={vocab_size}",
+                previous_logits.len(),
+                drafted_tokens.len(),
+                verification_logits.len(),
+                accepted_counts.len(),
+                next_tokens.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_speculative_accept_argmax_f32_on_stream",
+            ffi::infer_speculative_accept_argmax_f32_on_stream(
+                previous_logits.ptr,
+                verification_logits.ptr,
+                drafted_tokens.ptr,
+                accepted_counts.buffer_mut().ptr,
+                next_tokens.buffer_mut().ptr,
+                sequence_count as u32,
+                draft_count as u32,
+                vocab_size as u32,
                 stream.as_raw(),
             ),
         )
@@ -5066,6 +5679,67 @@ pub fn fp8_linear_channel_scaled_f32_into_on_stream(
                 weight.ptr,
                 channel_weight_scale.ptr,
                 output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                threads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues channel-scaled W8A16 FP8 projections for a dense f32 batch.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_linear_channel_scaled_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    channel_weight_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+    threads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_size.saturating_mul(cols);
+    let weight_len = rows.saturating_mul(cols);
+    let output_len = batch_size.saturating_mul(rows);
+    if batch_size == 0
+        || rows == 0
+        || cols == 0
+        || input.len() != input_len
+        || weight.len() != weight_len
+        || channel_weight_scale.len() != rows
+        || output.len() != output_len
+        || batch_size > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !(64..=512).contains(&threads)
+        || !threads.is_multiple_of(32)
+    {
+        return Err(Error::Shape {
+            label: "batched channel-scaled FP8 W8A16 linear buffers",
+            expected: format!(
+                "input={input_len} weight={weight_len} scales={rows} output={output_len}"
+            ),
+            actual: format!(
+                "input={} weight={} scales={} output={} batch={batch_size} rows={rows} cols={cols} threads={threads}",
+                input.len(),
+                weight.len(),
+                channel_weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_fp8_linear_channel_scaled_f32_batch_configured_on_stream",
+            ffi::infer_fp8_linear_channel_scaled_f32_batch_configured_on_stream(
+                input.ptr,
+                weight.ptr,
+                channel_weight_scale.ptr,
+                output.buffer_mut().ptr,
+                batch_size as u32,
                 rows as u32,
                 cols as u32,
                 threads as u32,
@@ -6773,7 +7447,7 @@ pub fn nemotron3_mamba_conv_update_f32_into_on_stream(
     projected: &DeviceBuffer<f32>,
     conv_weight_bf16: &DeviceBuffer<u16>,
     conv_bias_bf16: &DeviceBuffer<u16>,
-    mut conv_state: DeviceInOut<'_, f32>,
+    mut conv_state: DeviceInOut<'_, u16>,
     mut conv_output: DeviceOutput<'_, f32>,
     intermediate_size: usize,
     conv_channels: usize,
@@ -6839,6 +7513,211 @@ pub fn nemotron3_mamba_conv_update_f32_into_on_stream(
     }
 }
 
+/// Advances ragged, token-ordered convolution chunks for multiple Nemotron 3
+/// sequences. Dense rows are flattened by sequence, and each state-table entry
+/// identifies the persistent convolution state for one sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    conv_bias_bf16: &DeviceBuffer<u16>,
+    conv_state_table: &DeviceBuffer<*mut u16>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut conv_output: DeviceOutput<'_, f32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    intermediate_size: usize,
+    conv_channels: usize,
+    conv_kernel: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let minimum_projection_size =
+        intermediate_size
+            .checked_add(conv_channels)
+            .ok_or_else(|| Error::Shape {
+                label: "chunked Nemotron 3 Mamba convolution",
+                expected: "intermediate_size + conv_channels without overflow".to_string(),
+                actual: format!(
+                    "intermediate_size={intermediate_size} conv_channels={conv_channels}"
+                ),
+            })?;
+    let projection_size = projected.len().checked_div(total_tokens).unwrap_or(0);
+    let state_len = conv_channels
+        .checked_mul(conv_kernel)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Nemotron 3 Mamba convolution",
+            expected: "conv_channels * conv_kernel without overflow".to_string(),
+            actual: format!("conv_channels={conv_channels} conv_kernel={conv_kernel}"),
+        })?;
+    let output_len = total_tokens
+        .checked_mul(conv_channels)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Nemotron 3 Mamba convolution",
+            expected: "total_tokens * conv_channels without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} conv_channels={conv_channels}"),
+        })?;
+    let state_table_end = state_table_offset
+        .checked_add(sequence_count)
+        .ok_or_else(|| Error::Shape {
+            label: "chunked Nemotron 3 Mamba convolution state table",
+            expected: "state_table_offset + sequence_count without overflow".to_string(),
+            actual: format!(
+                "state_table_offset={state_table_offset} sequence_count={sequence_count}"
+            ),
+        })?;
+    if sequence_count == 0
+        || total_tokens == 0
+        || intermediate_size == 0
+        || conv_channels == 0
+        || conv_kernel == 0
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || projection_size > u32::MAX as usize
+        || intermediate_size > u32::MAX as usize
+        || conv_channels > u32::MAX as usize
+        || conv_kernel > u32::MAX as usize
+        || projected.len() != total_tokens.saturating_mul(projection_size)
+        || projection_size < minimum_projection_size
+        || conv_weight_bf16.len() != state_len
+        || conv_bias_bf16.len() != conv_channels
+        || conv_output.len() != output_len
+        || state_table_end > conv_state_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "chunked Nemotron 3 Mamba convolution buffers",
+            expected: format!(
+                "projected={total_tokens}x>={minimum_projection_size} weight={state_len} bias={conv_channels} output={output_len} metadata/state>={sequence_count}"
+            ),
+            actual: format!(
+                "projected={} projection_size={projection_size} weight={} bias={} output={} state={} offsets={} lengths={}",
+                projected.len(),
+                conv_weight_bf16.len(),
+                conv_bias_bf16.len(),
+                conv_output.len(),
+                conv_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_conv_update_f32_chunks_on_stream",
+            ffi::infer_nemotron3_mamba_conv_update_f32_chunks_on_stream(
+                projected.ptr,
+                conv_weight_bf16.ptr,
+                conv_bias_bf16.ptr,
+                conv_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                conv_output.buffer_mut().ptr,
+                sequence_count as u32,
+                projection_size as u32,
+                intermediate_size as u32,
+                conv_channels as u32,
+                conv_kernel as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Advances ragged Nemotron 3 convolution chunks while recording the initial
+/// and per-row recurrent states as BF16 transaction snapshots.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    conv_bias_bf16: &DeviceBuffer<u16>,
+    conv_state_table: &DeviceBuffer<*mut u16>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut conv_output: DeviceOutput<'_, f32>,
+    mut state_snapshots_bf16: DeviceOutput<'_, u16>,
+    sequence_count: usize,
+    total_tokens: usize,
+    snapshot_slots: usize,
+    intermediate_size: usize,
+    conv_channels: usize,
+    conv_kernel: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let projection_size = projected.len().checked_div(total_tokens).unwrap_or(0);
+    let state_len = conv_channels.saturating_mul(conv_kernel);
+    let output_len = total_tokens.saturating_mul(conv_channels);
+    let snapshot_len = sequence_count
+        .saturating_mul(snapshot_slots)
+        .saturating_mul(state_len);
+    let state_table_end = state_table_offset.saturating_add(sequence_count);
+    if sequence_count == 0
+        || total_tokens == 0
+        || snapshot_slots == 0
+        || intermediate_size == 0
+        || conv_channels == 0
+        || conv_kernel == 0
+        || sequence_count > u32::MAX as usize
+        || snapshot_slots > u32::MAX as usize
+        || projection_size > u32::MAX as usize
+        || intermediate_size > u32::MAX as usize
+        || conv_channels > u32::MAX as usize
+        || conv_kernel > u32::MAX as usize
+        || projected.len() != total_tokens.saturating_mul(projection_size)
+        || projection_size < intermediate_size.saturating_add(conv_channels)
+        || conv_weight_bf16.len() != state_len
+        || conv_bias_bf16.len() != conv_channels
+        || conv_output.len() != output_len
+        || state_snapshots_bf16.len() != snapshot_len
+        || state_table_end > conv_state_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "transactional Nemotron 3 Mamba convolution buffers",
+            expected: format!(
+                "output={output_len} snapshots={snapshot_len} states/metadata>={sequence_count} slots={snapshot_slots}"
+            ),
+            actual: format!(
+                "projected={} weight={} bias={} output={} snapshots={} states={} offsets={} lengths={}",
+                projected.len(),
+                conv_weight_bf16.len(),
+                conv_bias_bf16.len(),
+                conv_output.len(),
+                state_snapshots_bf16.len(),
+                conv_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_conv_update_f32_chunks_snapshot_on_stream",
+            ffi::infer_nemotron3_mamba_conv_update_f32_chunks_snapshot_on_stream(
+                projected.ptr,
+                conv_weight_bf16.ptr,
+                conv_bias_bf16.ptr,
+                conv_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                conv_output.buffer_mut().ptr,
+                state_snapshots_bf16.buffer_mut().ptr,
+                sequence_count as u32,
+                snapshot_slots as u32,
+                projection_size as u32,
+                intermediate_size as u32,
+                conv_channels as u32,
+                conv_kernel as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Advances one token of Nemotron 3 Mamba selective state and applies its
 /// gate-before-group-RMSNorm operation.
 #[allow(clippy::too_many_arguments)]
@@ -6849,7 +7728,7 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    mut ssm_state: DeviceInOut<'_, f32>,
+    mut ssm_state: DeviceInOut<'_, u16>,
     mut output: DeviceOutput<'_, f32>,
     heads: usize,
     head_dim: usize,
@@ -6942,11 +7821,409 @@ pub fn nemotron3_mamba_state_update_f32_into_on_stream(
     }
 }
 
+/// Advances ragged, token-ordered selective-state chunks for multiple
+/// Nemotron 3 sequences and applies group RMS normalization to every row.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_output: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    d_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    norm_weight_bf16: &DeviceBuffer<u16>,
+    ssm_state_table: &DeviceBuffer<*mut u16>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    groups: usize,
+    state_size: usize,
+    dt_floor: f32,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let intermediate_size = heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "chunked Nemotron 3 Mamba state",
+        expected: "heads * head_dim without overflow".to_string(),
+        actual: format!("heads={heads} head_dim={head_dim}"),
+    })?;
+    let bc_width = groups.checked_mul(state_size).ok_or_else(|| Error::Shape {
+        label: "chunked Nemotron 3 Mamba state",
+        expected: "groups * state_size without overflow".to_string(),
+        actual: format!("groups={groups} state_size={state_size}"),
+    })?;
+    let conv_channels = intermediate_size + 2 * bc_width;
+    let projection_size = intermediate_size + conv_channels + heads;
+    let projected_len = total_tokens.saturating_mul(projection_size);
+    let conv_len = total_tokens.saturating_mul(conv_channels);
+    let output_len = total_tokens.saturating_mul(intermediate_size);
+    let state_table_end = state_table_offset.saturating_add(sequence_count);
+    if sequence_count == 0
+        || total_tokens == 0
+        || heads == 0
+        || head_dim == 0
+        || groups == 0
+        || state_size == 0
+        || !heads.is_multiple_of(groups)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || projection_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || groups > u32::MAX as usize
+        || state_size > u32::MAX as usize
+        || !dt_floor.is_finite()
+        || dt_floor <= 0.0
+        || !eps.is_finite()
+        || eps <= 0.0
+        || projected.len() != projected_len
+        || conv_output.len() != conv_len
+        || a_log_bf16.len() != heads
+        || d_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+        || norm_weight_bf16.len() != intermediate_size
+        || output.len() != output_len
+        || state_table_end > ssm_state_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "chunked Nemotron 3 Mamba state buffers",
+            expected: format!(
+                "projected={projected_len} conv={conv_len} head params={heads} norm={intermediate_size} output={output_len} metadata/state>={sequence_count}"
+            ),
+            actual: format!(
+                "projected={} conv={} a_log={} D={} dt_bias={} norm={} output={} state={} offsets={} lengths={}",
+                projected.len(),
+                conv_output.len(),
+                a_log_bf16.len(),
+                d_bf16.len(),
+                dt_bias_bf16.len(),
+                norm_weight_bf16.len(),
+                output.len(),
+                ssm_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_state_update_f32_chunks_on_stream",
+            ffi::infer_nemotron3_mamba_state_update_f32_chunks_on_stream(
+                projected.ptr,
+                conv_output.ptr,
+                a_log_bf16.ptr,
+                d_bf16.ptr,
+                dt_bias_bf16.ptr,
+                norm_weight_bf16.ptr,
+                ssm_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                output.buffer_mut().ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                projection_size as u32,
+                heads as u32,
+                head_dim as u32,
+                groups as u32,
+                state_size as u32,
+                dt_floor,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Advances ragged Nemotron 3 selective-state chunks while recording the
+/// initial and per-row recurrent states as BF16 transaction snapshots.
+#[allow(clippy::too_many_arguments)]
+pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
+    projected: &DeviceBuffer<f32>,
+    conv_output: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    d_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    norm_weight_bf16: &DeviceBuffer<u16>,
+    ssm_state_table: &DeviceBuffer<*mut u16>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    mut state_snapshots_bf16: DeviceOutput<'_, u16>,
+    sequence_count: usize,
+    total_tokens: usize,
+    snapshot_slots: usize,
+    heads: usize,
+    head_dim: usize,
+    groups: usize,
+    state_size: usize,
+    dt_floor: f32,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let intermediate_size = heads.saturating_mul(head_dim);
+    let bc_width = groups.saturating_mul(state_size);
+    let conv_channels = intermediate_size.saturating_add(2 * bc_width);
+    let projection_size = intermediate_size
+        .saturating_add(conv_channels)
+        .saturating_add(heads);
+    let state_len = intermediate_size.saturating_mul(state_size);
+    let snapshot_len = sequence_count
+        .saturating_mul(snapshot_slots)
+        .saturating_mul(state_len);
+    let state_table_end = state_table_offset.saturating_add(sequence_count);
+    if sequence_count == 0
+        || total_tokens == 0
+        || snapshot_slots == 0
+        || heads == 0
+        || head_dim == 0
+        || groups == 0
+        || state_size == 0
+        || !heads.is_multiple_of(groups)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || snapshot_slots > u32::MAX as usize
+        || projection_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || groups > u32::MAX as usize
+        || state_size > u32::MAX as usize
+        || !dt_floor.is_finite()
+        || dt_floor <= 0.0
+        || !eps.is_finite()
+        || eps <= 0.0
+        || projected.len() != total_tokens.saturating_mul(projection_size)
+        || conv_output.len() != total_tokens.saturating_mul(conv_channels)
+        || a_log_bf16.len() != heads
+        || d_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+        || norm_weight_bf16.len() != intermediate_size
+        || output.len() != total_tokens.saturating_mul(intermediate_size)
+        || state_snapshots_bf16.len() != snapshot_len
+        || state_table_end > ssm_state_table.len()
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "transactional Nemotron 3 Mamba state buffers",
+            expected: format!(
+                "projected={} conv={} output={} snapshots={snapshot_len} states/metadata>={sequence_count}",
+                total_tokens.saturating_mul(projection_size),
+                total_tokens.saturating_mul(conv_channels),
+                total_tokens.saturating_mul(intermediate_size),
+            ),
+            actual: format!(
+                "projected={} conv={} output={} snapshots={} states={} offsets={} lengths={}",
+                projected.len(),
+                conv_output.len(),
+                output.len(),
+                state_snapshots_bf16.len(),
+                ssm_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream",
+            ffi::infer_nemotron3_mamba_state_update_f32_chunks_snapshot_on_stream(
+                projected.ptr,
+                conv_output.ptr,
+                a_log_bf16.ptr,
+                d_bf16.ptr,
+                dt_bias_bf16.ptr,
+                norm_weight_bf16.ptr,
+                ssm_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                output.buffer_mut().ptr,
+                state_snapshots_bf16.buffer_mut().ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                snapshot_slots as u32,
+                projection_size as u32,
+                heads as u32,
+                head_dim as u32,
+                groups as u32,
+                state_size as u32,
+                dt_floor,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Selects one BF16 transaction snapshot per sequence into persistent BF16
+/// recurrent-state buffers without staging the states through host memory.
+pub fn select_bf16_state_snapshot_into_on_stream(
+    state_table: &DeviceBuffer<*mut u16>,
+    state_table_offset: usize,
+    snapshots_bf16: &DeviceBuffer<u16>,
+    selected_slots: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    snapshot_slots: usize,
+    state_size: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let state_table_end = state_table_offset.saturating_add(sequence_count);
+    let snapshot_len = sequence_count
+        .saturating_mul(snapshot_slots)
+        .saturating_mul(state_size);
+    if sequence_count == 0
+        || snapshot_slots == 0
+        || state_size == 0
+        || sequence_count > u32::MAX as usize
+        || snapshot_slots > u32::MAX as usize
+        || state_size > u32::MAX as usize
+        || state_table_end > state_table.len()
+        || snapshots_bf16.len() != snapshot_len
+        || selected_slots.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "BF16 recurrent-state snapshot selection buffers",
+            expected: format!(
+                "states/slots>={sequence_count} snapshots={snapshot_len} slots={snapshot_slots} state_size={state_size}"
+            ),
+            actual: format!(
+                "states={} selected={} snapshots={}",
+                state_table.len(),
+                selected_slots.len(),
+                snapshots_bf16.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_select_bf16_state_snapshot_on_stream",
+            ffi::infer_select_bf16_state_snapshot_on_stream(
+                state_table.ptr.add(state_table_offset),
+                snapshots_bf16.ptr,
+                selected_slots.ptr,
+                sequence_count as u32,
+                snapshot_slots as u32,
+                state_size as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn speculative_acceptance_stops_at_first_mismatch_and_returns_bonus() {
+        const SEQUENCES: usize = 3;
+        const DRAFTS: usize = 3;
+        const VOCAB: usize = 12;
+        let logits = |token: usize| {
+            let mut row = vec![-10.0f32; VOCAB];
+            row[token] = 10.0;
+            row
+        };
+        let mut previous = Vec::new();
+        let mut previous_ptrs = Vec::new();
+        for token in [1, 8, 7] {
+            let mut row = DeviceBuffer::from_host(&logits(token)).expect("previous logits");
+            previous_ptrs.push(row.as_mut_ptr().cast::<f32>().cast_const());
+            previous.push(row);
+        }
+        let mut verification = Vec::new();
+        for token in [2, 9, 0, 5, 6, 7, 8, 9, 10] {
+            verification.extend(logits(token));
+        }
+        let drafts = [1u32, 2, 3, 4, 5, 6, 7, 8, 9];
+        let previous_ptrs = DeviceBuffer::from_host(&previous_ptrs).expect("logit pointers");
+        let verification = DeviceBuffer::from_host(&verification).expect("verification logits");
+        let drafts = DeviceBuffer::from_host(&drafts).expect("drafts");
+        let mut accepted = DeviceBuffer::zeroed(SEQUENCES).expect("accepted counts");
+        let mut next = DeviceBuffer::zeroed(SEQUENCES).expect("next tokens");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        speculative_accept_argmax_f32_into_on_stream(
+            &previous_ptrs,
+            &verification,
+            &drafts,
+            accepted.output(),
+            next.output(),
+            SEQUENCES,
+            DRAFTS,
+            VOCAB,
+            &stream,
+        )
+        .expect("speculative acceptance");
+        assert_eq!(
+            accepted.copy_to_host(&stream).expect("accepted download"),
+            [2, 0, 3]
+        );
+        assert_eq!(
+            next.copy_to_host(&stream).expect("next download"),
+            [9, 8, 10]
+        );
+        drop(previous);
+    }
+
+    #[test]
+    fn bf16_state_snapshot_selection_stays_on_device() {
+        const SEQUENCES: usize = 3;
+        const SLOTS: usize = 4;
+        const STATE: usize = 5;
+        let mut states = (0..SEQUENCES)
+            .map(|_| DeviceBuffer::from_host(&[f32_to_bf16(-1.0); STATE]).expect("state"))
+            .collect::<Vec<_>>();
+        let pointers = states
+            .iter_mut()
+            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .collect::<Vec<_>>();
+        let pointers = DeviceBuffer::from_host(&pointers).expect("state pointers");
+        let snapshots = (0..SEQUENCES * SLOTS * STATE)
+            .map(|index| f32_to_bf16(index as f32 * 0.25))
+            .collect::<Vec<_>>();
+        let snapshots_device = DeviceBuffer::from_host(&snapshots).expect("snapshots");
+        let selected = DeviceBuffer::from_host(&[0u32, 3, 4]).expect("selected slots");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        select_bf16_state_snapshot_into_on_stream(
+            &pointers,
+            0,
+            &snapshots_device,
+            &selected,
+            SEQUENCES,
+            SLOTS,
+            STATE,
+            &stream,
+        )
+        .expect("state selection");
+        for sequence in 0..SEQUENCES {
+            if sequence == 2 {
+                assert_eq!(
+                    states[sequence]
+                        .copy_to_host(&stream)
+                        .expect("state download"),
+                    [f32_to_bf16(-1.0); STATE]
+                );
+                continue;
+            }
+            let slot = if sequence == 0 { 0 } else { 3 };
+            let begin = (sequence * SLOTS + slot) * STATE;
+            let expected = snapshots[begin..begin + STATE].to_vec();
+            assert_eq!(
+                states[sequence]
+                    .copy_to_host(&stream)
+                    .expect("state download"),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn nemotron3_mamba_decode_matches_cpu_reference() {
@@ -6975,16 +8252,20 @@ mod tests {
             .map(|index| f32_to_bf16((index as f32 - 8.0) * 0.003))
             .collect::<Vec<_>>();
         let initial_conv_state = (0..CONV_CHANNELS * CONV_KERNEL)
-            .map(|index| ((index % 13) as f32 - 6.0) * 0.011)
+            .map(|index| f32_to_bf16(((index % 13) as f32 - 6.0) * 0.011))
             .collect::<Vec<_>>();
 
-        let mut expected_conv_state = initial_conv_state.clone();
+        let mut expected_conv_state = initial_conv_state
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect::<Vec<_>>();
         let mut expected_conv = vec![0.0; CONV_CHANNELS];
         for channel in 0..CONV_CHANNELS {
             let state =
                 &mut expected_conv_state[channel * CONV_KERNEL..(channel + 1) * CONV_KERNEL];
             state.rotate_left(1);
-            state[CONV_KERNEL - 1] = projected[INTERMEDIATE + channel];
+            state[CONV_KERNEL - 1] = bf16_to_f32(f32_to_bf16(projected[INTERMEDIATE + channel]));
             let mut value = bf16_to_f32(conv_bias[channel]);
             for index in 0..CONV_KERNEL {
                 value += state[index] * bf16_to_f32(conv_weight[channel * CONV_KERNEL + index]);
@@ -7015,13 +8296,15 @@ mod tests {
             .copy_to_host(&stream)
             .expect("conv output download");
         assert_close(&actual_conv, &expected_conv, 2.0e-6, "Mamba convolution");
-        assert_close(
-            &conv_state_device
+        assert_eq!(
+            conv_state_device
                 .copy_to_host(&stream)
                 .expect("conv state download"),
-            &expected_conv_state,
-            0.0,
-            "Mamba convolution state",
+            expected_conv_state
+                .iter()
+                .copied()
+                .map(f32_to_bf16)
+                .collect::<Vec<_>>()
         );
 
         let a_log = (0..HEADS)
@@ -7037,9 +8320,13 @@ mod tests {
             .map(|index| f32_to_bf16(0.9 + index as f32 * 0.01))
             .collect::<Vec<_>>();
         let initial_ssm = (0..INTERMEDIATE * STATE_SIZE)
-            .map(|index| ((index % 11) as f32 - 5.0) * 0.009)
+            .map(|index| f32_to_bf16(((index % 11) as f32 - 5.0) * 0.009))
             .collect::<Vec<_>>();
-        let mut expected_ssm = initial_ssm.clone();
+        let mut expected_ssm = initial_ssm
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect::<Vec<_>>();
         let mut expected_output = vec![0.0; INTERMEDIATE];
         let heads_per_group = HEADS / GROUPS;
         let group_width = heads_per_group * HEAD_DIM;
@@ -7059,8 +8346,9 @@ mod tests {
                 let state = &mut expected_ssm[flat * STATE_SIZE..(flat + 1) * STATE_SIZE];
                 let mut y = bf16_to_f32(d[head]) * x;
                 for state_index in 0..STATE_SIZE {
-                    state[state_index] = state[state_index] * decay + dt * b[state_index] * x;
-                    y += state[state_index] * c[state_index];
+                    let updated = state[state_index] * decay + dt * b[state_index] * x;
+                    state[state_index] = bf16_to_f32(f32_to_bf16(updated));
+                    y += updated * c[state_index];
                 }
                 let gate = projected[flat];
                 expected_output[flat] = y * gate / (1.0 + (-gate).exp());
@@ -7107,14 +8395,264 @@ mod tests {
             3.0e-5,
             "Mamba output",
         );
-        assert_close(
-            &ssm_state_device
+        assert_eq!(
+            ssm_state_device
                 .copy_to_host(&stream)
                 .expect("SSM state download"),
-            &expected_ssm,
-            3.0e-6,
-            "Mamba state",
+            expected_ssm
+                .iter()
+                .copied()
+                .map(f32_to_bf16)
+                .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn nemotron3_mamba_chunks_match_repeated_one_token_updates() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 16;
+        const GROUPS: usize = 2;
+        const STATE_SIZE: usize = 40;
+        const CONV_KERNEL: usize = 4;
+        const INTERMEDIATE: usize = HEADS * HEAD_DIM;
+        const BC_WIDTH: usize = GROUPS * STATE_SIZE;
+        const CONV_CHANNELS: usize = INTERMEDIATE + 2 * BC_WIDTH;
+        const PROJECTION: usize = INTERMEDIATE + CONV_CHANNELS + HEADS;
+        const TOTAL_TOKENS: usize = 5;
+
+        let projected = (0..TOTAL_TOKENS * PROJECTION)
+            .map(|index| ((index * 17 % 113) as f32 - 56.0) * 0.007)
+            .collect::<Vec<_>>();
+        let conv_weight = (0..CONV_CHANNELS * CONV_KERNEL)
+            .map(|index| f32_to_bf16(((index * 7 % 29) as f32 - 14.0) * 0.019))
+            .collect::<Vec<_>>();
+        let conv_bias = (0..CONV_CHANNELS)
+            .map(|index| f32_to_bf16((index as f32 - 11.0) * 0.002))
+            .collect::<Vec<_>>();
+        let initial_conv_states = (0..2)
+            .map(|sequence| {
+                (0..CONV_CHANNELS * CONV_KERNEL)
+                    .map(|index| {
+                        f32_to_bf16(
+                            ((index * 5 % 31) as f32 - 15.0) * 0.004 + sequence as f32 * 0.013,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let offsets = [0u32, 2];
+        let lengths = [2u32, 3];
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let conv_weight_device = DeviceBuffer::from_host(&conv_weight).expect("conv weight");
+        let conv_bias_device = DeviceBuffer::from_host(&conv_bias).expect("conv bias");
+
+        let mut expected_conv_states = initial_conv_states
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("expected conv state"))
+            .collect::<Vec<_>>();
+        let mut expected_conv = vec![0.0f32; TOTAL_TOKENS * CONV_CHANNELS];
+        for sequence in 0..2 {
+            let begin = offsets[sequence] as usize;
+            let end = begin + lengths[sequence] as usize;
+            for row in begin..end {
+                let row_projected =
+                    DeviceBuffer::from_host(&projected[row * PROJECTION..(row + 1) * PROJECTION])
+                        .expect("row projection");
+                let mut row_output = DeviceBuffer::zeroed(CONV_CHANNELS).expect("row conv output");
+                nemotron3_mamba_conv_update_f32_into_on_stream(
+                    &row_projected,
+                    &conv_weight_device,
+                    &conv_bias_device,
+                    expected_conv_states[sequence].inout(),
+                    row_output.output(),
+                    INTERMEDIATE,
+                    CONV_CHANNELS,
+                    CONV_KERNEL,
+                    &stream,
+                )
+                .expect("sequential convolution");
+                expected_conv[row * CONV_CHANNELS..(row + 1) * CONV_CHANNELS].copy_from_slice(
+                    &row_output
+                        .copy_to_host(&stream)
+                        .expect("row conv output copy"),
+                );
+            }
+        }
+
+        let projected_device = DeviceBuffer::from_host(&projected).expect("projected");
+        let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
+        let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
+        let mut actual_conv_states = initial_conv_states
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("actual conv state"))
+            .collect::<Vec<_>>();
+        let conv_state_ptrs = actual_conv_states
+            .iter_mut()
+            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .collect::<Vec<_>>();
+        let conv_state_table = DeviceBuffer::from_host(&conv_state_ptrs).expect("conv state table");
+        let mut actual_conv =
+            DeviceBuffer::zeroed(TOTAL_TOKENS * CONV_CHANNELS).expect("chunk conv output");
+        nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
+            &projected_device,
+            &conv_weight_device,
+            &conv_bias_device,
+            &conv_state_table,
+            0,
+            &offsets_device,
+            &lengths_device,
+            actual_conv.output(),
+            2,
+            TOTAL_TOKENS,
+            INTERMEDIATE,
+            CONV_CHANNELS,
+            CONV_KERNEL,
+            &stream,
+        )
+        .expect("chunked convolution");
+        assert_close(
+            &actual_conv
+                .copy_to_host(&stream)
+                .expect("chunk conv output copy"),
+            &expected_conv,
+            0.0,
+            "chunked convolution output",
+        );
+        for sequence in 0..2 {
+            assert_eq!(
+                actual_conv_states[sequence]
+                    .copy_to_host(&stream)
+                    .expect("actual conv state copy"),
+                expected_conv_states[sequence]
+                    .copy_to_host(&stream)
+                    .expect("expected conv state copy"),
+                "chunked convolution state {sequence}",
+            );
+        }
+
+        let a_log = (0..HEADS)
+            .map(|head| f32_to_bf16(-0.3 + head as f32 * 0.04))
+            .collect::<Vec<_>>();
+        let d = (0..HEADS)
+            .map(|head| f32_to_bf16(0.7 + head as f32 * 0.03))
+            .collect::<Vec<_>>();
+        let dt_bias = (0..HEADS)
+            .map(|head| f32_to_bf16(-0.2 + head as f32 * 0.02))
+            .collect::<Vec<_>>();
+        let norm_weight = (0..INTERMEDIATE)
+            .map(|index| f32_to_bf16(0.8 + index as f32 * 0.008))
+            .collect::<Vec<_>>();
+        let initial_ssm_states = (0..2)
+            .map(|sequence| {
+                (0..INTERMEDIATE * STATE_SIZE)
+                    .map(|index| {
+                        f32_to_bf16(
+                            ((index * 11 % 37) as f32 - 18.0) * 0.003 + sequence as f32 * 0.009,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let a_log_device = DeviceBuffer::from_host(&a_log).expect("A log");
+        let d_device = DeviceBuffer::from_host(&d).expect("D");
+        let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+        let norm_weight_device = DeviceBuffer::from_host(&norm_weight).expect("norm weight");
+        let mut expected_ssm_states = initial_ssm_states
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("expected SSM state"))
+            .collect::<Vec<_>>();
+        let mut expected_output = vec![0.0f32; TOTAL_TOKENS * INTERMEDIATE];
+        for sequence in 0..2 {
+            let begin = offsets[sequence] as usize;
+            let end = begin + lengths[sequence] as usize;
+            for row in begin..end {
+                let row_projected =
+                    DeviceBuffer::from_host(&projected[row * PROJECTION..(row + 1) * PROJECTION])
+                        .expect("row projection");
+                let row_conv = DeviceBuffer::from_host(
+                    &expected_conv[row * CONV_CHANNELS..(row + 1) * CONV_CHANNELS],
+                )
+                .expect("row convolution");
+                let mut row_output = DeviceBuffer::zeroed(INTERMEDIATE).expect("row Mamba output");
+                nemotron3_mamba_state_update_f32_into_on_stream(
+                    &row_projected,
+                    &row_conv,
+                    &a_log_device,
+                    &d_device,
+                    &dt_bias_device,
+                    &norm_weight_device,
+                    expected_ssm_states[sequence].inout(),
+                    row_output.output(),
+                    HEADS,
+                    HEAD_DIM,
+                    GROUPS,
+                    STATE_SIZE,
+                    1.0e-4,
+                    1.0e-5,
+                    &stream,
+                )
+                .expect("sequential state update");
+                expected_output[row * INTERMEDIATE..(row + 1) * INTERMEDIATE].copy_from_slice(
+                    &row_output
+                        .copy_to_host(&stream)
+                        .expect("row Mamba output copy"),
+                );
+            }
+        }
+
+        let mut actual_ssm_states = initial_ssm_states
+            .iter()
+            .map(|state| DeviceBuffer::from_host(state).expect("actual SSM state"))
+            .collect::<Vec<_>>();
+        let ssm_state_ptrs = actual_ssm_states
+            .iter_mut()
+            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .collect::<Vec<_>>();
+        let ssm_state_table = DeviceBuffer::from_host(&ssm_state_ptrs).expect("SSM state table");
+        let mut actual_output =
+            DeviceBuffer::zeroed(TOTAL_TOKENS * INTERMEDIATE).expect("chunk Mamba output");
+        nemotron3_mamba_state_update_f32_chunks_into_on_stream(
+            &projected_device,
+            &actual_conv,
+            &a_log_device,
+            &d_device,
+            &dt_bias_device,
+            &norm_weight_device,
+            &ssm_state_table,
+            0,
+            &offsets_device,
+            &lengths_device,
+            actual_output.output(),
+            2,
+            TOTAL_TOKENS,
+            HEADS,
+            HEAD_DIM,
+            GROUPS,
+            STATE_SIZE,
+            1.0e-4,
+            1.0e-5,
+            &stream,
+        )
+        .expect("chunked state update");
+        assert_close(
+            &actual_output
+                .copy_to_host(&stream)
+                .expect("chunk Mamba output copy"),
+            &expected_output,
+            0.0,
+            "chunked Mamba output",
+        );
+        for sequence in 0..2 {
+            assert_eq!(
+                actual_ssm_states[sequence]
+                    .copy_to_host(&stream)
+                    .expect("actual SSM state copy"),
+                expected_ssm_states[sequence]
+                    .copy_to_host(&stream)
+                    .expect("expected SSM state copy"),
+                "chunked SSM state {sequence}",
+            );
+        }
     }
 
     #[test]
@@ -7208,6 +8746,85 @@ mod tests {
             2.0e-6,
             "Nemotron router weights",
         );
+    }
+
+    #[test]
+    fn nemotron3_sigmoid_topk_batch_matches_independent_rows() {
+        const ROWS: usize = 3;
+        const EXPERTS: usize = 512;
+        const K: usize = 22;
+        const GROUPS: usize = 8;
+        const TOPK_GROUPS: usize = 3;
+        const SCALE: f32 = 5.0;
+        let logits = (0..ROWS * EXPERTS)
+            .map(|index| {
+                let row = index / EXPERTS;
+                let expert = index % EXPERTS;
+                (((expert * 37 + row * 19) % 101) as f32 - 50.0) * 0.031
+            })
+            .collect::<Vec<_>>();
+        let bias = (0..EXPERTS)
+            .map(|expert| ((expert * 17 % 29) as f32 - 14.0) * 0.004)
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let logits_device = DeviceBuffer::from_host(&logits).expect("logits");
+        let bias_device = DeviceBuffer::from_host(&bias).expect("bias");
+        let mut actual_indices = DeviceBuffer::zeroed(ROWS * K).expect("batch indices");
+        let mut actual_weights = DeviceBuffer::zeroed(ROWS * K).expect("batch weights");
+        nemotron3_sigmoid_topk_f32_batch_into_on_stream(
+            &logits_device,
+            &bias_device,
+            actual_indices.output(),
+            actual_weights.output(),
+            ROWS,
+            K,
+            GROUPS,
+            TOPK_GROUPS,
+            true,
+            SCALE,
+            &stream,
+        )
+        .expect("batched Nemotron router");
+        let actual_indices = actual_indices
+            .copy_to_host(&stream)
+            .expect("batch indices download");
+        let actual_weights = actual_weights
+            .copy_to_host(&stream)
+            .expect("batch weights download");
+
+        for row in 0..ROWS {
+            let row_logits = DeviceBuffer::from_host(&logits[row * EXPERTS..(row + 1) * EXPERTS])
+                .expect("row logits");
+            let mut expected_indices = DeviceBuffer::zeroed(K).expect("row indices");
+            let mut expected_weights = DeviceBuffer::zeroed(K).expect("row weights");
+            nemotron3_sigmoid_topk_f32_into_on_stream(
+                &row_logits,
+                &bias_device,
+                expected_indices.output(),
+                expected_weights.output(),
+                K,
+                GROUPS,
+                TOPK_GROUPS,
+                true,
+                SCALE,
+                &stream,
+            )
+            .expect("independent Nemotron router");
+            assert_eq!(
+                &actual_indices[row * K..(row + 1) * K],
+                &*expected_indices
+                    .copy_to_host(&stream)
+                    .expect("row indices download")
+            );
+            assert_close(
+                &actual_weights[row * K..(row + 1) * K],
+                &expected_weights
+                    .copy_to_host(&stream)
+                    .expect("row weights download"),
+                0.0,
+                &format!("batched Nemotron router row {row}"),
+            );
+        }
     }
 
     #[test]
@@ -8306,6 +9923,159 @@ mod tests {
     }
 
     #[test]
+    fn concat_f32_rows_matches_cpu_reference() {
+        const ROWS: usize = 3;
+        const COLS: usize = 5;
+        let left = (0..ROWS * COLS)
+            .map(|value| value as f32)
+            .collect::<Vec<_>>();
+        let right = (0..ROWS * COLS)
+            .map(|value| 100.0 + value as f32)
+            .collect::<Vec<_>>();
+        let left_device = DeviceBuffer::from_host(&left).expect("left upload");
+        let right_device = DeviceBuffer::from_host(&right).expect("right upload");
+        let mut output = DeviceBuffer::zeroed(ROWS * COLS * 2).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        concat_f32_rows_into_on_stream(
+            ROWS,
+            COLS,
+            &left_device,
+            &right_device,
+            output.output(),
+            &stream,
+        )
+        .expect("concatenate rows");
+        let actual = output.copy_to_host(&stream).expect("output download");
+
+        let expected = (0..ROWS)
+            .flat_map(|row| {
+                left[row * COLS..(row + 1) * COLS]
+                    .iter()
+                    .chain(&right[row * COLS..(row + 1) * COLS])
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn increment_u32_matches_cpu_reference() {
+        let mut values = DeviceBuffer::from_host(&[0u32, 7, u32::MAX - 1]).expect("upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        increment_u32_in_place_on_stream(values.inout(), 2, &stream).expect("increment");
+        let actual = values.copy_to_host(&stream).expect("download");
+        assert_eq!(actual.as_ref(), &[2, 9, 0]);
+    }
+
+    #[test]
+    fn store_u32_column_writes_sequence_major_drafts() {
+        let input = DeviceBuffer::from_host(&[11u32, 21, 31]).expect("input upload");
+        let mut output =
+            DeviceBuffer::from_host(&[1u32, 2, 3, 4, 5, 6, 7, 8, 9]).expect("output upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        store_u32_column_into_on_stream(&input, output.output(), 3, 3, 1, &stream)
+            .expect("column store");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output download"),
+            [1, 11, 3, 4, 21, 6, 7, 31, 9]
+        );
+    }
+
+    #[test]
+    fn prepend_u32_rows_interleaves_sequence_inputs() {
+        let first = DeviceBuffer::from_host(&[10u32, 20, 30]).expect("first upload");
+        let remaining = DeviceBuffer::from_host(&[11u32, 12, 13, 21, 22, 23, 31, 32, 33])
+            .expect("remaining upload");
+        let mut output = DeviceBuffer::zeroed(12).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        prepend_u32_rows_into_on_stream(&first, &remaining, output.output(), 3, 3, &stream)
+            .expect("prepend rows");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output download"),
+            [10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33]
+        );
+    }
+
+    #[test]
+    fn moe_weighted_accumulate_batch_matches_independent_rows() {
+        const ROWS: usize = 3;
+        const GROUPS: usize = 4;
+        const LEN: usize = 19;
+        let indices = [2u32, 0, 3, 1, 1, 3, 0, 2, 3, 2, 1, 0];
+        let weights = [
+            0.4f32, 0.3, 0.2, 0.1, 0.35, 0.3, 0.2, 0.15, 0.5, 0.25, 0.15, 0.1,
+        ];
+        let alphas = [0.75f32, 1.0, 1.25, 0.875];
+        let routed = (0..ROWS * GROUPS)
+            .map(|route| {
+                DeviceBuffer::from_host(
+                    &(0..LEN)
+                        .map(|column| {
+                            (((column * 7 + route * 11) % 101) as f32 - 50.0) * 0.00390625
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("routed output")
+            })
+            .collect::<Vec<_>>();
+        let routed_ptrs = DeviceBuffer::from_host(
+            &routed
+                .iter()
+                .map(|values| values.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("routed pointers");
+        let indices_device = DeviceBuffer::from_host(&indices).expect("indices");
+        let weights_device = DeviceBuffer::from_host(&weights).expect("weights");
+        let alphas_device = DeviceBuffer::from_host(&alphas).expect("alphas");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut actual = DeviceBuffer::zeroed(ROWS * LEN).expect("batch output");
+        moe_weighted_accumulate_slots_f32_batch_on_stream(
+            &indices_device,
+            &weights_device,
+            &routed_ptrs,
+            &alphas_device,
+            actual.inout(),
+            ROWS,
+            GROUPS,
+            &stream,
+        )
+        .expect("batched route accumulation");
+        let actual = actual.copy_to_host(&stream).expect("batch output download");
+
+        for row in 0..ROWS {
+            let begin = row * GROUPS;
+            let end = begin + GROUPS;
+            let row_indices = DeviceBuffer::from_host(&indices[begin..end]).expect("row indices");
+            let row_weights = DeviceBuffer::from_host(&weights[begin..end]).expect("row weights");
+            let row_ptrs = DeviceBuffer::from_host(
+                &routed[begin..end]
+                    .iter()
+                    .map(|values| values.as_const_ptr().cast::<f32>())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("row pointers");
+            let mut expected = DeviceBuffer::zeroed(LEN).expect("row output");
+            moe_weighted_accumulate_slots_f32_on_stream(
+                &row_indices,
+                &row_weights,
+                &row_ptrs,
+                &alphas_device,
+                expected.inout(),
+                &stream,
+            )
+            .expect("independent route accumulation");
+            assert_close(
+                &actual[row * LEN..(row + 1) * LEN],
+                &expected.copy_to_host(&stream).expect("row output download"),
+                0.0,
+                &format!("batched route accumulation row {row}"),
+            );
+        }
+    }
+
+    #[test]
     fn qwen36_routed_ffn_finalize_matches_unfused_sequence() {
         let len = 2048;
         let groups = 8;
@@ -8559,6 +10329,39 @@ mod tests {
     }
 
     #[test]
+    fn gather_group_row_matches_cpu_reference() {
+        const GROUPS: usize = 3;
+        const ROWS: usize = 4;
+        const COLS: usize = 5;
+        let input = (0..GROUPS * ROWS * COLS)
+            .map(|index| index as f32 * 0.25)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let mut output = DeviceBuffer::zeroed(GROUPS * COLS).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        gather_group_row_f32_into_on_stream(
+            &input,
+            output.output(),
+            GROUPS,
+            ROWS,
+            2,
+            COLS,
+            &stream,
+        )
+        .expect("grouped row gather");
+        let expected = (0..GROUPS)
+            .flat_map(|group| {
+                let begin = (group * ROWS + 2) * COLS;
+                (begin..begin + COLS).map(|index| index as f32 * 0.25)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output download"),
+            expected
+        );
+    }
+
+    #[test]
     fn copy_bf16_row_to_f32_indexed_matches_cpu_reference() {
         let rows = 4;
         let cols = 5;
@@ -8606,6 +10409,27 @@ mod tests {
             .map(|value| format::bf16_to_f32(*value))
             .collect::<Vec<_>>();
         assert_eq!(stream_values, expected_stream);
+
+        let mut host_index_output = DeviceBuffer::<f32>::zeroed(cols).expect("host index output");
+        copy_bf16_row_to_f32_into_on_stream(
+            rows,
+            cols,
+            3,
+            &input_device,
+            host_index_output.output(),
+            &stream,
+        )
+        .expect("host-indexed BF16 row copy");
+        let expected_host_index = values[3 * cols..4 * cols]
+            .iter()
+            .map(|value| format::bf16_to_f32(*value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            host_index_output
+                .copy_to_host(&stream)
+                .expect("host-indexed row download"),
+            expected_host_index,
+        );
     }
 
     #[test]
@@ -9054,6 +10878,165 @@ mod tests {
                 "prefill GQA mismatch at {idx}: actual={actual} expected={expected} error={error}"
             );
         }
+    }
+
+    #[test]
+    fn ragged_gqa_attention_matches_independent_sequence_reference() {
+        const SEQUENCES: usize = 2;
+        const TOKENS: usize = 5;
+        const Q_HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 8;
+        const MAX_TOKENS: usize = 5;
+        const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
+        const QUERY_WIDTH: usize = Q_HEADS * HEAD_DIM;
+        let offsets = [0u32, 2];
+        let lengths = [2u32, 3];
+        let starts = [2u32, 1];
+        let query = (0..TOKENS * QUERY_WIDTH)
+            .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.0234375)
+            .collect::<Vec<_>>();
+        let key = (0..TOKENS * KV_WIDTH)
+            .map(|index| ((index * 17 % 53) as f32 - 26.0) * 0.01953125)
+            .collect::<Vec<_>>();
+        let value = (0..TOKENS * KV_WIDTH)
+            .map(|index| ((index * 19 % 59) as f32 - 29.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let mut expected_keys = (0..SEQUENCES)
+            .map(|sequence| {
+                (0..MAX_TOKENS * KV_WIDTH)
+                    .map(|index| {
+                        if index < starts[sequence] as usize * KV_WIDTH {
+                            (((index + sequence * 7) * 11 % 43) as f32 - 21.0) * 0.02734375
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut expected_values = (0..SEQUENCES)
+            .map(|sequence| {
+                (0..MAX_TOKENS * KV_WIDTH)
+                    .map(|index| {
+                        if index < starts[sequence] as usize * KV_WIDTH {
+                            (((index + sequence * 5) * 7 % 41) as f32 - 20.0) * 0.03125
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let initial_keys = expected_keys.clone();
+        let initial_values = expected_values.clone();
+        for sequence in 0..SEQUENCES {
+            let begin = offsets[sequence] as usize;
+            for local in 0..lengths[sequence] as usize {
+                let source = (begin + local) * KV_WIDTH;
+                let destination = (starts[sequence] as usize + local) * KV_WIDTH;
+                expected_keys[sequence][destination..destination + KV_WIDTH]
+                    .copy_from_slice(&key[source..source + KV_WIDTH]);
+                expected_values[sequence][destination..destination + KV_WIDTH]
+                    .copy_from_slice(&value[source..source + KV_WIDTH]);
+            }
+        }
+
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let query_device = DeviceBuffer::from_host(&query).expect("query");
+        let key_device = DeviceBuffer::from_host(&key).expect("key");
+        let value_device = DeviceBuffer::from_host(&value).expect("value");
+        let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
+        let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
+        let starts_device = DeviceBuffer::from_host(&starts).expect("starts");
+        let mut key_caches = initial_keys
+            .iter()
+            .map(|cache| DeviceBuffer::from_host(cache).expect("key cache"))
+            .collect::<Vec<_>>();
+        let mut value_caches = initial_values
+            .iter()
+            .map(|cache| DeviceBuffer::from_host(cache).expect("value cache"))
+            .collect::<Vec<_>>();
+        let key_table = DeviceBuffer::from_host(
+            &key_caches
+                .iter_mut()
+                .map(|cache| cache.as_mut_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("key table");
+        let value_table = DeviceBuffer::from_host(
+            &value_caches
+                .iter_mut()
+                .map(|cache| cache.as_mut_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("value table");
+        append_ragged_kv_f32_into_on_stream(
+            &key_device,
+            &value_device,
+            &key_table,
+            &value_table,
+            0,
+            &offsets_device,
+            &lengths_device,
+            &starts_device,
+            SEQUENCES,
+            TOKENS,
+            KV_WIDTH,
+            &stream,
+        )
+        .expect("ragged KV append");
+        let mut actual = DeviceBuffer::zeroed(TOKENS * QUERY_WIDTH).expect("output");
+        ragged_gqa_attention_f32_into_on_stream(
+            &query_device,
+            &key_table,
+            &value_table,
+            0,
+            &offsets_device,
+            &lengths_device,
+            &starts_device,
+            actual.output(),
+            SEQUENCES,
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("ragged GQA");
+
+        for sequence in 0..SEQUENCES {
+            assert_eq!(
+                key_caches[sequence]
+                    .copy_to_host(&stream)
+                    .expect("key cache download"),
+                expected_keys[sequence],
+            );
+            assert_eq!(
+                value_caches[sequence]
+                    .copy_to_host(&stream)
+                    .expect("value cache download"),
+                expected_values[sequence],
+            );
+        }
+        let actual = actual.copy_to_host(&stream).expect("output download");
+        let mut expected = Vec::with_capacity(actual.len());
+        for sequence in 0..SEQUENCES {
+            let begin = offsets[sequence] as usize;
+            for local in 0..lengths[sequence] as usize {
+                let row = begin + local;
+                expected.extend(cpu_cached_gqa_attention(
+                    &query[row * QUERY_WIDTH..(row + 1) * QUERY_WIDTH],
+                    &expected_keys[sequence],
+                    &expected_values[sequence],
+                    starts[sequence] as usize + local + 1,
+                    Q_HEADS,
+                    KV_HEADS,
+                    HEAD_DIM,
+                ));
+            }
+        }
+        assert_close(&actual, &expected, 2.0e-6, "ragged GQA");
     }
 
     #[test]
@@ -10095,6 +12078,60 @@ mod tests {
     }
 
     #[test]
+    fn fp8_channel_scaled_linear_batch_matches_independent_rows() {
+        let batch = 3usize;
+        let rows = 5usize;
+        let cols = 7usize;
+        let input = (0..batch * cols)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.125)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::cuda_e4m3_code(((idx % 13) as f32 - 6.0) * 0.125))
+            .collect::<Vec<_>>();
+        let scales = (0..rows)
+            .map(|row| 0.5 + row as f32 * 0.125)
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let scales_device = DeviceBuffer::from_host(&scales).expect("scale upload");
+        let mut actual = DeviceBuffer::<f32>::zeroed(batch * rows).expect("batch output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        fp8_linear_channel_scaled_f32_batch_into_on_stream(
+            &input_device,
+            &weight_device,
+            &scales_device,
+            actual.output(),
+            batch,
+            rows,
+            cols,
+            128,
+            &stream,
+        )
+        .expect("batch channel-scaled FP8 linear");
+        let actual = actual.copy_to_host(&stream).expect("batch output copy");
+        for row in 0..batch {
+            let row_input =
+                DeviceBuffer::from_host(&input[row * cols..(row + 1) * cols]).expect("row input");
+            let mut expected = DeviceBuffer::<f32>::zeroed(rows).expect("row output");
+            fp8_linear_channel_scaled_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                &scales_device,
+                expected.output(),
+                rows,
+                cols,
+                128,
+                &stream,
+            )
+            .expect("row channel-scaled FP8 linear");
+            assert_eq!(
+                &actual[row * rows..(row + 1) * rows],
+                &*expected.copy_to_host(&stream).expect("row output copy")
+            );
+        }
+    }
+
+    #[test]
     fn segmented_fp8_linears_match_cpu_reference() {
         let cols = 7usize;
         let rows = [5usize, 3, 2];
@@ -10676,6 +12713,134 @@ mod tests {
                 &actual[row * out_features..(row + 1) * out_features],
                 &*expected.copy_to_host(&stream).expect("row output copy")
             );
+        }
+    }
+
+    #[test]
+    fn nvfp4_grouped_inputs_match_independent_shared_inputs() {
+        const BATCH: usize = 3;
+        const ROUTES: usize = 2;
+        const EXPERTS: usize = 4;
+        const OUT: usize = 37;
+        const INPUT: usize = 128;
+        let inputs = (0..BATCH * INPUT)
+            .map(|index| (((index * 11) % 29) as f32 - 14.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let indices = [0u32, 3, 2, 1, 3, 0];
+        let packed = (0..EXPERTS)
+            .map(|expert| {
+                let mut values = vec![0u8; OUT * INPUT / 2];
+                for index in 0..OUT * INPUT {
+                    let code = ((index * 7 + expert * 3 + 5) % 16) as u8;
+                    if index & 1 == 0 {
+                        values[index / 2] = code;
+                    } else {
+                        values[index / 2] |= code << 4;
+                    }
+                }
+                DeviceBuffer::from_host(&values).expect("packed expert")
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..EXPERTS)
+            .map(|expert| {
+                DeviceBuffer::from_host(
+                    &(0..OUT * (INPUT / 16))
+                        .map(|index| [0x28u8, 0x30, 0x38, 0x40][(index + expert) % 4])
+                        .collect::<Vec<_>>(),
+                )
+                .expect("expert scales")
+            })
+            .collect::<Vec<_>>();
+        let packed_table = DeviceBuffer::from_host(
+            &packed
+                .iter()
+                .map(|weight| weight.as_const_ptr().cast::<u8>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("packed table");
+        let scale_table = DeviceBuffer::from_host(
+            &scales
+                .iter()
+                .map(|scale| scale.as_const_ptr().cast::<u8>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("scale table");
+        let scale_2 = DeviceBuffer::from_host(&[0.75f32, 1.0, 1.25, 0.875]).expect("scale 2 table");
+        let input_rows = (0..BATCH)
+            .map(|row| {
+                DeviceBuffer::from_host(&inputs[row * INPUT..(row + 1) * INPUT]).expect("input row")
+            })
+            .collect::<Vec<_>>();
+        let input_table = DeviceBuffer::from_host(
+            &(0..BATCH)
+                .flat_map(|row| {
+                    std::iter::repeat_n(input_rows[row].as_const_ptr().cast::<f32>(), ROUTES)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("input table");
+        let mut actual_outputs = (0..BATCH * ROUTES)
+            .map(|_| DeviceBuffer::<f32>::zeroed(OUT).expect("actual output"))
+            .collect::<Vec<_>>();
+        let actual_table = DeviceBuffer::from_host(
+            &actual_outputs
+                .iter_mut()
+                .map(|output| output.as_mut_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("actual table");
+        let indices_device = DeviceBuffer::from_host(&indices).expect("indices");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+            &indices_device,
+            &input_table,
+            &packed_table,
+            &scale_table,
+            &scale_2,
+            &actual_table,
+            OUT,
+            INPUT,
+            &stream,
+        )
+        .expect("grouped inputs");
+
+        for row in 0..BATCH {
+            let begin = row * ROUTES;
+            let row_indices =
+                DeviceBuffer::from_host(&indices[begin..begin + ROUTES]).expect("row indices");
+            let mut expected_outputs = (0..ROUTES)
+                .map(|_| DeviceBuffer::<f32>::zeroed(OUT).expect("expected output"))
+                .collect::<Vec<_>>();
+            let expected_table = DeviceBuffer::from_host(
+                &expected_outputs
+                    .iter_mut()
+                    .map(|output| output.as_mut_ptr().cast::<f32>())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("expected table");
+            nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+                &row_indices,
+                &input_rows[row],
+                &packed_table,
+                &scale_table,
+                &scale_2,
+                &expected_table,
+                OUT,
+                INPUT,
+                &stream,
+            )
+            .expect("shared input routes");
+            for route in 0..ROUTES {
+                assert_eq!(
+                    actual_outputs[begin + route]
+                        .copy_to_host(&stream)
+                        .expect("actual download"),
+                    expected_outputs[route]
+                        .copy_to_host(&stream)
+                        .expect("expected download"),
+                    "row {row} route {route}",
+                );
+            }
         }
     }
 

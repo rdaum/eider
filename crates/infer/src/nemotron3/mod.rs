@@ -10,14 +10,24 @@ mod linear;
 mod mamba;
 mod model;
 mod moe;
+mod mtp;
 mod router;
 
-pub use attention::{Nemotron3AttentionLayer, Nemotron3AttentionWorkspace};
+pub use attention::{
+    Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
+};
 pub use linear::{Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3StorageConfig};
-pub use mamba::{Nemotron3MambaLayer, Nemotron3MambaState, Nemotron3MambaWorkspace};
-pub use model::{Nemotron3DecodeState, Nemotron3Model};
-pub use moe::{Nemotron3MoeLayer, Nemotron3MoeWorkspace};
-pub use router::{Nemotron3Router, Nemotron3RouterWorkspace};
+pub use mamba::{
+    Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace,
+};
+pub use model::{
+    Nemotron3BlockWorkspace, Nemotron3DecodeState, Nemotron3Model, Nemotron3SequenceCheckpoint,
+    Nemotron3SpeculativeCycleResult, Nemotron3SpeculativeCycleWorkspace,
+    Nemotron3SpeculativeResult,
+};
+pub use moe::{Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace};
+pub use mtp::Nemotron3MtpWorkspace;
+pub use router::{Nemotron3Router, Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace};
 
 /// Mixer used by one Nemotron 3 backbone layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
