@@ -5640,6 +5640,55 @@ pub fn quantize_fp8_e4m3_f32_into_on_stream(
     }
 }
 
+/// Quantizes a row-major BF16 matrix to E4M3 with one scale per row.
+pub fn quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream(
+    input: &DeviceBuffer<u16>,
+    channel_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u8>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "channel-scaled BF16-to-FP8 quantization",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || len > u32::MAX as usize
+        || input.len() != len
+        || output.len() != len
+        || channel_scale.len() != rows
+    {
+        return Err(Error::Shape {
+            label: "channel-scaled BF16-to-FP8 quantization buffers",
+            expected: format!("input={len} scales={rows} output={len}; u32-sized dimensions"),
+            actual: format!(
+                "input={} scales={} output={} rows={rows} cols={cols}",
+                input.len(),
+                channel_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_quantize_fp8_e4m3_bf16_channel_scaled_on_stream",
+            ffi::infer_quantize_fp8_e4m3_bf16_channel_scaled_on_stream(
+                input.ptr,
+                channel_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn validate_nvfp4_w4a16_matvec(
     input: &DeviceBuffer<f32>,
     packed_weight: &DeviceBuffer<u8>,
@@ -9365,6 +9414,44 @@ mod tests {
                 .expect("repeated recurrent download"),
             1.0e-5,
             "chunked recurrent state",
+        );
+    }
+
+    #[test]
+    fn channel_scaled_bf16_to_fp8_quantization_uses_row_scales() {
+        let rows = 2usize;
+        let cols = 4usize;
+        let values = [-4.0f32, -2.0, 0.0, 4.0, -32.0, -8.0, 8.0, 32.0];
+        let scales = [0.25f32, 2.0];
+        let bf16 = values
+            .iter()
+            .map(|&value| crate::format::f32_to_bf16(value))
+            .collect::<Vec<_>>();
+        let expected = bf16
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                crate::format::cuda_e4m3_code(
+                    crate::format::bf16_to_f32(value) / scales[index / cols],
+                )
+            })
+            .collect::<Vec<_>>();
+        let bf16 = DeviceBuffer::from_host(&bf16).expect("BF16 upload");
+        let scales = DeviceBuffer::from_host(&scales).expect("scale upload");
+        let mut quantized = DeviceBuffer::zeroed(values.len()).expect("FP8 output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream(
+            &bf16,
+            &scales,
+            quantized.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("channel-scaled quantization");
+        assert_eq!(
+            quantized.copy_to_host(&stream).expect("FP8 readback"),
+            expected
         );
     }
 

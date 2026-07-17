@@ -35,9 +35,11 @@ with the same model using BF16 KV and greedy sampling.
 
 *Agents-A1* is a 35B Qwen3.5-MoE agentic fine-tune whose ModelOpt checkpoint
 keeps attention projections and the LM head in BF16 while quantizing its MoE
-weights to NVFP4. In a local API comparison using the same 200-token request
-for each runtime, Eider reached 44.9 decode tokens/sec vs vLLM which did 37.2
-tokens/sec.
+weights to NVFP4. With those checkpoint-native types, Eider reached 44.9 decode
+tokens/sec vs vLLM's 37.2 in a local API comparison. Eider can instead convert
+the BF16 projections to per-output-channel, weight-only FP8 at load time; that
+raised its API result to 63.6 decode tokens/sec and a 2,212-token prefill from
+89.8 to 256.7 tokens/sec. This conversion is lossy and remains configurable.
 
 The 198B *Step-3.7-Flash* checkpoint just squeezes in because I added 
 expert paging to/from nVME. Normally this model would be a bit too big at nVFP4, but
@@ -114,9 +116,11 @@ shared experts in layers 32-39. The dense Qwen3 checkpoints (`qwen3-8b`,
 `qwen3-32b`) are still supported by the loader and the dense GEMV/CUTLASS
 path but are not kept on this machine.
 
-Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6, with BF16 attention
-projections and a BF16 LM head alongside its NVFP4 experts. The checkpoint
-also contains a vision tower, but Eider currently serves its text path only.
+Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
+attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
+retain those types or convert the BF16 weights to per-output-channel FP8 while
+keeping activations in f32. The checkpoint also contains a vision tower, but
+Eider currently serves its text path only.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -149,11 +153,14 @@ The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
 `EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. The Agents-A1 server
 accepts the checkpoint's full 262,144-token context; override it with
-`EIDER_MAX_CONTEXT_TOKENS`. Its Pi entry advertises a 131,072-token working
-window so compaction starts well before that hard limit. The launchers build
-the release server, listen on `127.0.0.1:8080`, and default the API key to
-`local-eider`. Override their model, listen address, served name, or key with
-`EIDER_MODEL_DIR`, `EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
+`EIDER_MAX_CONTEXT_TOKENS`. The launcher defaults to FP8-converting both its
+BF16 attention projections and LM head; set `EIDER_QWEN_BF16_FP8=attention` to
+retain the BF16 head or `EIDER_QWEN_BF16_FP8=disabled` to use the checkpoint
+types unchanged. Its Pi entry advertises a 131,072-token working window so
+compaction starts well before that hard limit. The launchers build the release
+server, listen on `127.0.0.1:8080`, and default the API key to `local-eider`.
+Override their model, listen address, served name, or key with `EIDER_MODEL_DIR`,
+`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 `EIDER_DOGSTATSD_ENDPOINT` (with optional `EIDER_DOGSTATSD_INTERVAL_SECS`) to
 additionally push metrics over UDP. The `eider-serve` binary also takes

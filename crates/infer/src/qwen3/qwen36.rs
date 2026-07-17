@@ -18,15 +18,16 @@ use crate::nvfp4::{
     bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
-    fp8_linear_configured_f32_into_on_stream, fp8_linear_f32_into_on_stream,
-    fp8_linear_pair_configured_f32_into_on_stream, fp8_linear_triple_configured_f32_into_on_stream,
-    fp8_linear_w8a8_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
-    fp8_moe_grouped_gate_up_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
-    gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
+    fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
+    fp8_linear_f32_into_on_stream, fp8_linear_pair_configured_f32_into_on_stream,
+    fp8_linear_triple_configured_f32_into_on_stream, fp8_linear_w8a8_f32_into_on_stream,
+    fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
+    gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
+    gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_fp8_slots_f32_into_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
@@ -60,6 +61,29 @@ static NEXT_QWEN36_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Qwen36Model {
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
+    bf16_fp8: Qwen36Bf16Fp8Mode,
+}
+
+/// Optional weight-only FP8 conversion for BF16 Qwen projections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen36Bf16Fp8Mode {
+    /// Retain the checkpoint's BF16 attention projections and lm_head.
+    #[default]
+    Disabled,
+    /// Convert BF16 attention projections to per-output-channel E4M3.
+    Attention,
+    /// Convert BF16 attention projections and the BF16 lm_head to E4M3.
+    AttentionAndLmHead,
+}
+
+impl Qwen36Bf16Fp8Mode {
+    fn attention(self) -> bool {
+        self != Self::Disabled
+    }
+
+    fn lm_head(self) -> bool {
+        self == Self::AttentionAndLmHead
+    }
 }
 
 /// Device-ready weights for one Qwen3.6 text layer.
@@ -180,6 +204,7 @@ struct Fp8Linear {
     weight_scale: f32,
     channel_weight_scale: Option<DeviceBuffer<f32>>,
     input_scale: Option<f32>,
+    weight_only: bool,
 }
 
 enum Qwen36Linear {
@@ -199,7 +224,11 @@ struct Qwen36LinearFp8Execution {
 }
 
 impl Qwen36LinearFp8Execution {
-    fn new(checkpoint: &ModelOptCheckpoint, manifest: &QwenModelManifest) -> Result<Self> {
+    fn new(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
+    ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear FP8 execution",
             detail: "manifest has no linear-attention config".to_string(),
@@ -217,7 +246,9 @@ impl Qwen36LinearFp8Execution {
             manifest.tensor_prefix
         );
         let lt = CublasLt::new()?;
-        let plans = if checkpoint.contains_tensor(&format!("{prefix}.input_scale")) {
+        let plans = if bf16_fp8.attention()
+            || checkpoint.contains_tensor(&format!("{prefix}.input_scale"))
+        {
             None
         } else {
             let key_dim = linear.key_heads * linear.key_head_dim;
@@ -255,6 +286,14 @@ struct Bf16Linear {
 impl Qwen36Model {
     /// Opens a Qwen3.6/Qwen3.5-MoE checkpoint and validates its hybrid schedule.
     pub fn open(model_dir: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_with_bf16_fp8(model_dir, Qwen36Bf16Fp8Mode::Disabled)
+    }
+
+    /// Opens a checkpoint with an explicit BF16 weight-conversion mode.
+    pub fn open_with_bf16_fp8(
+        model_dir: impl AsRef<std::path::Path>,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
+    ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir.as_ref())?;
         if manifest.architecture != QwenArchitecture::Qwen35Moe {
             return Err(Error::Format {
@@ -286,6 +325,7 @@ impl Qwen36Model {
         Ok(Self {
             manifest,
             checkpoint,
+            bf16_fp8,
         })
     }
 
@@ -316,10 +356,20 @@ impl Qwen36Model {
     pub fn load_layer(&self, layer: usize) -> Result<Qwen36LayerWeights> {
         match self.layer_kind(layer)? {
             QwenLayerKind::LinearAttention => Ok(Qwen36LayerWeights::LinearAttention(
-                Qwen36LinearAttentionWeights::load(&self.checkpoint, &self.manifest, layer)?,
+                Qwen36LinearAttentionWeights::load(
+                    &self.checkpoint,
+                    &self.manifest,
+                    layer,
+                    self.bf16_fp8,
+                )?,
             )),
             QwenLayerKind::FullAttention => Ok(Qwen36LayerWeights::FullAttention(
-                Qwen36FullAttentionWeights::load(&self.checkpoint, &self.manifest, layer)?,
+                Qwen36FullAttentionWeights::load(
+                    &self.checkpoint,
+                    &self.manifest,
+                    layer,
+                    self.bf16_fp8,
+                )?,
             )),
         }
     }
@@ -439,6 +489,7 @@ impl Qwen36FullAttentionWeights {
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         layer: usize,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
         let prefix = format!("{}.layers.{layer}.self_attn", manifest.tensor_prefix);
         let expected_q_rows = manifest
@@ -469,24 +520,28 @@ impl Qwen36FullAttentionWeights {
             &format!("{prefix}.q_proj"),
             expected_q_rows,
             manifest.hidden,
+            bf16_fp8,
         )?;
         let k = Qwen36Linear::load(
             checkpoint,
             &format!("{prefix}.k_proj"),
             expected_kv_rows,
             manifest.hidden,
+            bf16_fp8,
         )?;
         let v = Qwen36Linear::load(
             checkpoint,
             &format!("{prefix}.v_proj"),
             expected_kv_rows,
             manifest.hidden,
+            bf16_fp8,
         )?;
         let o = Qwen36Linear::load(
             checkpoint,
             &format!("{prefix}.o_proj"),
             manifest.hidden,
             manifest.q_heads * manifest.head_dim,
+            bf16_fp8,
         )?;
         q.require_shape(expected_q_rows, manifest.hidden, "Qwen3.6 q_proj")?;
         k.require_shape(expected_kv_rows, manifest.hidden, "Qwen3.6 k_proj")?;
@@ -778,9 +833,12 @@ impl Qwen36LinearAttentionWeights {
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         layer: usize,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
-        let fp8 = Rc::new(Qwen36LinearFp8Execution::new(checkpoint, manifest)?);
-        Self::load_with_fp8(checkpoint, manifest, layer, fp8)
+        let fp8 = Rc::new(Qwen36LinearFp8Execution::new(
+            checkpoint, manifest, bf16_fp8,
+        )?);
+        Self::load_with_fp8(checkpoint, manifest, layer, fp8, bf16_fp8)
     }
 
     fn load_with_fp8(
@@ -788,6 +846,7 @@ impl Qwen36LinearAttentionWeights {
         manifest: &QwenModelManifest,
         layer: usize,
         fp8: Rc<Qwen36LinearFp8Execution>,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear attention",
@@ -805,6 +864,7 @@ impl Qwen36LinearAttentionWeights {
             &format!("{prefix}.in_proj_qkv"),
             qkv_rows,
             manifest.hidden,
+            bf16_fp8,
         )?;
         let z = Qwen36Linear::load_reordered_v_rows(
             checkpoint,
@@ -813,6 +873,7 @@ impl Qwen36LinearAttentionWeights {
             head_v_dim,
             manifest.hidden,
             key_heads,
+            bf16_fp8,
         )?;
         let out = Qwen36Linear::load_reordered_v_cols(
             checkpoint,
@@ -821,6 +882,7 @@ impl Qwen36LinearAttentionWeights {
             value_heads,
             head_v_dim,
             key_heads,
+            bf16_fp8,
         )?;
 
         // Reorder V heads from grouped-by-K to tiled order for tensors consumed after GDN prep.
@@ -1357,6 +1419,55 @@ impl Fp8Linear {
                 .map(DeviceBuffer::from_host)
                 .transpose()?,
             input_scale: host.input_scale,
+            weight_only: false,
+        })
+    }
+
+    fn from_bf16_host(weight: &[u16], rows: usize, cols: usize) -> Result<Self> {
+        let expected = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+            label: "Qwen3.5 BF16-to-FP8 projection",
+            expected: "rows * cols without overflow".to_string(),
+            actual: format!("rows={rows} cols={cols}"),
+        })?;
+        if weight.len() != expected {
+            return Err(Error::Shape {
+                label: "Qwen3.5 BF16-to-FP8 projection",
+                expected: format!("{expected} weights"),
+                actual: format!("{} weights", weight.len()),
+            });
+        }
+        let source = DeviceBuffer::from_host(weight)?;
+        let mut quantized = DeviceBuffer::zeroed(weight.len())?;
+        let stream = CudaStream::new_blocking()?;
+        let scales = weight
+            .chunks_exact(cols)
+            .map(|row| {
+                let max_abs = row
+                    .iter()
+                    .map(|&value| crate::nvfp4::format::bf16_to_f32(value).abs())
+                    .filter(|value| value.is_finite())
+                    .fold(0.0f32, f32::max);
+                if max_abs == 0.0 { 1.0 } else { max_abs / 448.0 }
+            })
+            .collect::<Vec<_>>();
+        let scales = DeviceBuffer::from_host(&scales)?;
+        quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream(
+            &source,
+            &scales,
+            quantized.output(),
+            rows,
+            cols,
+            &stream,
+        )?;
+        stream.synchronize()?;
+        Ok(Self {
+            weight: quantized,
+            rows,
+            cols,
+            weight_scale: 1.0,
+            channel_weight_scale: Some(scales),
+            input_scale: None,
+            weight_only: true,
         })
     }
 
@@ -1368,7 +1479,20 @@ impl Fp8Linear {
         dynamic_input_scale: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let result = if let Some(channel_weight_scale) = &self.channel_weight_scale {
+        let result = if let Some(channel_weight_scale) = &self.channel_weight_scale
+            && self.weight_only
+        {
+            fp8_linear_channel_scaled_f32_into_on_stream(
+                input,
+                &self.weight,
+                channel_weight_scale,
+                output.output(),
+                self.rows,
+                self.cols,
+                128,
+                stream,
+            )
+        } else if let Some(channel_weight_scale) = &self.channel_weight_scale {
             if std::env::var_os("QWEN36_FP8_W8A8").is_some() {
                 return Err(Error::Format {
                     label: "Qwen3.6 compressed-tensors FP8",
@@ -1470,11 +1594,17 @@ impl Qwen36Linear {
         prefix: &str,
         rows: usize,
         cols: usize,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
         let linear = if info.dtype == "BF16" {
-            Self::Bf16(Bf16Linear::load(checkpoint, &weight_name, rows, cols)?)
+            if bf16_fp8.attention() {
+                let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
+                Self::Fp8(Fp8Linear::from_bf16_host(&host, rows, cols)?)
+            } else {
+                Self::Bf16(Bf16Linear::load(checkpoint, &weight_name, rows, cols)?)
+            }
         } else {
             Self::Fp8(Fp8Linear::from_host(&checkpoint.load_fp8_linear(prefix)?)?)
         };
@@ -1489,6 +1619,7 @@ impl Qwen36Linear {
         head_dim: usize,
         cols: usize,
         key_heads: usize,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
         let rows = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1496,7 +1627,11 @@ impl Qwen36Linear {
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_rows(host, key_heads, value_heads, head_dim);
-            return Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?));
+            return if bf16_fp8.attention() {
+                Ok(Self::Fp8(Fp8Linear::from_bf16_host(&host, rows, cols)?))
+            } else {
+                Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?))
+            };
         }
         let host = checkpoint.load_fp8_linear(prefix)?;
         Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_rows(
@@ -1514,6 +1649,7 @@ impl Qwen36Linear {
         value_heads: usize,
         head_dim: usize,
         key_heads: usize,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
     ) -> Result<Self> {
         let cols = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1521,7 +1657,11 @@ impl Qwen36Linear {
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_cols(host, rows, key_heads, value_heads, head_dim);
-            return Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?));
+            return if bf16_fp8.attention() {
+                Ok(Self::Fp8(Fp8Linear::from_bf16_host(&host, rows, cols)?))
+            } else {
+                Ok(Self::Bf16(Bf16Linear::from_host(&host, rows, cols)?))
+            };
         }
         let host = checkpoint.load_fp8_linear(prefix)?;
         Ok(Self::Fp8(Fp8Linear::from_host(&reorder_fp8_v_cols(
@@ -4914,6 +5054,7 @@ impl Qwen36LayerBlock {
         let fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             model.checkpoint(),
             model.manifest(),
+            model.bf16_fp8,
         )?);
         Self::load_inner(model, layer, false, None, fp8)
     }
@@ -4952,11 +5093,17 @@ impl Qwen36LayerBlock {
                     &model.manifest,
                     layer,
                     fp8,
+                    model.bf16_fp8,
                 )?)
             }
-            QwenLayerKind::FullAttention => Qwen36Attention::FullAttention(
-                Qwen36FullAttentionWeights::load(&model.checkpoint, &model.manifest, layer)?,
-            ),
+            QwenLayerKind::FullAttention => {
+                Qwen36Attention::FullAttention(Qwen36FullAttentionWeights::load(
+                    &model.checkpoint,
+                    &model.manifest,
+                    layer,
+                    model.bf16_fp8,
+                )?)
+            }
         };
         let moe = if let Some(capacity) = expert_cache_capacity {
             model.load_moe_from_prepared_cache_paged(layer, capacity)?
@@ -5477,6 +5624,7 @@ pub struct Qwen36TextModel {
     final_norm: DeviceBuffer<f32>,
     lm_head: Qwen36LmHead,
     expert_paging: bool,
+    bf16_fp8: Qwen36Bf16Fp8Mode,
 }
 
 enum Qwen36LmHead {
@@ -5484,12 +5632,16 @@ enum Qwen36LmHead {
     Bf16(Bf16Linear),
     Fp8 {
         linear: Fp8Linear,
-        plan: Box<Fp8TnMatmulPlan>,
+        plan: Option<Box<Fp8TnMatmulPlan>>,
     },
 }
 
 impl Qwen36LmHead {
-    fn load(checkpoint: &ModelOptCheckpoint, lt: &CublasLt) -> Result<Self> {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        lt: &CublasLt,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
+    ) -> Result<Self> {
         if checkpoint.contains_tensor("lm_head.weight_scale_2") {
             Ok(Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, "lm_head")?))
         } else if checkpoint.tensor_info("lm_head.weight")?.dtype == "BF16" {
@@ -5501,19 +5653,25 @@ impl Qwen36LmHead {
                     actual: format!("shape={:?}", info.shape),
                 });
             };
-            Ok(Self::Bf16(Bf16Linear::load(
-                checkpoint,
-                "lm_head.weight",
-                *rows,
-                *cols,
-            )?))
+            if bf16_fp8.lm_head() {
+                let host = read_bf16_matrix_host(checkpoint, "lm_head.weight", *rows, *cols)?;
+                let linear = Fp8Linear::from_bf16_host(&host, *rows, *cols)?;
+                Ok(Self::Fp8 { linear, plan: None })
+            } else {
+                Ok(Self::Bf16(Bf16Linear::load(
+                    checkpoint,
+                    "lm_head.weight",
+                    *rows,
+                    *cols,
+                )?))
+            }
         } else {
             let linear = Fp8Linear::from_host(&checkpoint.load_fp8_linear("lm_head")?)?;
             let plan =
                 Fp8TnMatmulPlan::new(lt, GemmShape::new(linear.rows, 1, linear.cols), 8 << 20)?;
             Ok(Self::Fp8 {
                 linear,
-                plan: Box::new(plan),
+                plan: Some(Box::new(plan)),
             })
         }
     }
@@ -5537,7 +5695,7 @@ impl Qwen36LmHead {
             Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
             Self::Bf16(linear) => linear.run_into(input, &mut workspace.logits, stream),
             Self::Fp8 { linear, plan } => {
-                Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)
+                Self::run_fp8_logits(lt, linear, plan.as_deref(), input, workspace, stream)
             }
         }
     }
@@ -5573,7 +5731,7 @@ impl Qwen36LmHead {
                 )
             }
             Self::Fp8 { linear, plan } => {
-                Self::run_fp8_logits(lt, linear, plan, input, workspace, stream)?;
+                Self::run_fp8_logits(lt, linear, plan.as_deref(), input, workspace, stream)?;
                 argmax_f32_into_on_stream(
                     &workspace.logits,
                     workspace.next_index.output(),
@@ -5587,11 +5745,20 @@ impl Qwen36LmHead {
     fn run_fp8_logits(
         lt: &CublasLt,
         linear: &Fp8Linear,
-        plan: &Fp8TnMatmulPlan,
+        plan: Option<&Fp8TnMatmulPlan>,
         input: &DeviceBuffer<f32>,
         workspace: &mut Qwen36LmHeadWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
+        if linear.weight_only {
+            return linear.run_into(
+                input,
+                &mut workspace.logits,
+                &mut workspace.dynamic_input,
+                &mut workspace.dynamic_input_scale,
+                stream,
+            );
+        }
         let Some(channel_scale) = linear.channel_weight_scale.as_ref() else {
             return linear.run_into(
                 input,
@@ -5601,6 +5768,10 @@ impl Qwen36LmHead {
                 stream,
             );
         };
+        let plan = plan.ok_or_else(|| Error::Format {
+            label: "Qwen3.6 FP8 lm_head",
+            detail: "channel-scaled checkpoint weight has no cuBLASLt plan".to_string(),
+        })?;
         quantize_fp8_e4m3_dynamic_f32_into_on_stream(
             input,
             &mut workspace.dynamic_input,
@@ -5888,6 +6059,15 @@ impl Qwen36TextModel {
         Self::from_qwen36_model(model)
     }
 
+    /// Loads the model with an explicit BF16 weight-conversion mode.
+    pub fn open_with_bf16_fp8(
+        model_dir: impl AsRef<std::path::Path>,
+        bf16_fp8: Qwen36Bf16Fp8Mode,
+    ) -> Result<Self> {
+        let model = Qwen36Model::open_with_bf16_fp8(model_dir, bf16_fp8)?;
+        Self::from_qwen36_model(model)
+    }
+
     /// Loads the model with only `capacity_per_layer` routed experts resident.
     pub fn open_with_expert_cache_capacity(
         model_dir: impl AsRef<std::path::Path>,
@@ -5916,9 +6096,14 @@ impl Qwen36TextModel {
     ) -> Result<Self> {
         let manifest = model.manifest().clone();
         let checkpoint = model.checkpoint().clone();
+        let bf16_fp8 = model.bf16_fp8;
         ensure_model_cache(&checkpoint, &manifest)?;
         let lt = CublasLt::new()?;
-        let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(&checkpoint, &manifest)?);
+        let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(
+            &checkpoint,
+            &manifest,
+            bf16_fp8,
+        )?);
         let mut layers = Vec::with_capacity(manifest.layers);
         for layer in 0..manifest.layers {
             let block = if let Some(capacity) = capacity_per_layer {
@@ -5944,7 +6129,7 @@ impl Qwen36TextModel {
             &format!("{}.norm.weight", manifest.tensor_prefix),
             manifest.hidden,
         )?;
-        let lm_head = Qwen36LmHead::load(&checkpoint, &lt)?;
+        let lm_head = Qwen36LmHead::load(&checkpoint, &lt, bf16_fp8)?;
         let lm_head_shape = lm_head.shape();
         if lm_head_shape != (manifest.vocab, manifest.hidden) {
             return Err(Error::Shape {
@@ -5963,6 +6148,7 @@ impl Qwen36TextModel {
             final_norm,
             lm_head,
             expert_paging: capacity_per_layer.is_some(),
+            bf16_fp8,
         })
     }
 
@@ -5975,6 +6161,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            bf16_fp8: self.bf16_fp8,
         };
         for block in &mut self.layers {
             block
@@ -6029,6 +6216,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            bf16_fp8: self.bf16_fp8,
         };
         let mut layer_states = Vec::with_capacity(self.layers.len());
         for block in &self.layers {
@@ -6095,6 +6283,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            bf16_fp8: self.bf16_fp8,
         };
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);

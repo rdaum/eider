@@ -1428,6 +1428,14 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_quantize_fp8_e4m3_bf16_channel_scaled_on_stream(
+        input: *const u16,
+        channel_scale: *const f32,
+        output: *mut u8,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_scale_channel_f32_device_scalar_on_stream(
         values: *mut f32,
         channel_scale: *const f32,

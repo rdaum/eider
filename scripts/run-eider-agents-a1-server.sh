@@ -7,6 +7,7 @@ model_dir="${EIDER_MODEL_DIR:-$repo_dir/models/agents-a1-nvfp4}"
 listen="${EIDER_LISTEN:-127.0.0.1:8080}"
 served_model="${EIDER_SERVED_MODEL:-eider-agents-a1}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-262144}"
+bf16_fp8="${EIDER_QWEN_BF16_FP8:-all}"
 export EIDER_API_KEY="${EIDER_API_KEY:-local-eider}"
 
 dogstatsd_args=()
@@ -32,5 +33,6 @@ exec "$repo_dir/target/release/eider-serve" \
   --listen "$listen" \
   --served-model-name "$served_model" \
   --max-context-tokens "$max_context_tokens" \
+  --qwen-bf16-fp8 "$bf16_fp8" \
   "${dogstatsd_args[@]}" \
   "$@"

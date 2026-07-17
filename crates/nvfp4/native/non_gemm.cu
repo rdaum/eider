@@ -5472,6 +5472,23 @@ __global__ void infer_quantize_fp8_e4m3_f32_kernel(const float* input,
     }
 }
 
+__global__ void infer_quantize_fp8_e4m3_bf16_channel_scaled_kernel(
+    const std::uint16_t* input,
+    const float* channel_scale,
+    std::uint8_t* output,
+    std::uint32_t len,
+    std::uint32_t cols) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const auto value = *reinterpret_cast<const __nv_bfloat16*>(input + idx);
+        const float scale = channel_scale[idx / cols];
+        output[idx] = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(__bfloat162float(value) / scale,
+                                  __NV_SATFINITE,
+                                  __NV_E4M3));
+    }
+}
+
 extern "C" cudaError_t infer_quantize_fp8_e4m3_f32_on_stream(
     const float* input,
     std::uint8_t* output,
@@ -5487,6 +5504,29 @@ extern "C" cudaError_t infer_quantize_fp8_e4m3_f32_on_stream(
     const std::uint32_t blocks = (len + kThreads - 1) / kThreads;
     infer_quantize_fp8_e4m3_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, len, 1.0f / input_scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_quantize_fp8_e4m3_bf16_channel_scaled_on_stream(
+    const std::uint16_t* input,
+    const float* channel_scale,
+    std::uint8_t* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || channel_scale == nullptr || output == nullptr || rows == 0 ||
+        cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint64_t len = static_cast<std::uint64_t>(rows) * cols;
+    if (len > UINT32_MAX) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr int kThreads = 256;
+    const std::uint32_t blocks = (static_cast<std::uint32_t>(len) + kThreads - 1) / kThreads;
+    infer_quantize_fp8_e4m3_bf16_channel_scaled_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, channel_scale, output, static_cast<std::uint32_t>(len), cols);
     return cudaGetLastError();
 }
 
