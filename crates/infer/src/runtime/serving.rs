@@ -82,6 +82,8 @@ pub struct ChatUsage {
     pub cached_prompt_tokens: usize,
     /// Model-selected completion tokens, including a selected EOS token.
     pub completion_tokens: usize,
+    /// Completion tokens generated while the output parser was in reasoning mode.
+    pub reasoning_tokens: usize,
 }
 
 impl ChatUsage {
@@ -195,6 +197,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                     prompt_tokens,
                     cached_prompt_tokens: 0,
                     completion_tokens: 0,
+                    reasoning_tokens: 0,
                 },
             },
         );
@@ -237,6 +240,9 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                         ),
                     })?;
             request.usage.completion_tokens += 1;
+            if request.output.is_reasoning() {
+                request.usage.reasoning_tokens += 1;
+            }
             let events = request.output.push_token(token.id)?;
             if let Some(reason) = request
                 .filter
@@ -400,6 +406,7 @@ impl ResponseFilter {
                     self.flush(request_id, output);
                     output.push(Qwen36ChatDelta { request_id, event });
                     self.saw_tool_calls = true;
+                    return Some(ChatFinishReason::ToolCalls);
                 }
             }
         }
@@ -582,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_completion_flushes_safe_text_and_maps_tool_reason() {
+    fn first_complete_tool_call_flushes_text_and_terminates_generation() {
         let id = request_id();
         let mut filter = ResponseFilter::new(vec!["END".to_string()]);
         let mut output = Vec::new();
@@ -596,10 +603,14 @@ mod tests {
         assert_eq!(
             filter.apply(
                 id,
-                vec![ChatOutputEvent::Text("safe E".to_string()), call.clone()],
+                vec![
+                    ChatOutputEvent::Text("safe E".to_string()),
+                    call.clone(),
+                    ChatOutputEvent::Text("ignored".to_string()),
+                ],
                 &mut output,
             ),
-            None
+            Some(ChatFinishReason::ToolCalls)
         );
         assert!(filter.saw_tool_calls());
         assert_eq!(

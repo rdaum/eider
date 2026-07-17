@@ -30,7 +30,7 @@
           "name": "Agents-A1 35B-A3B NVFP4",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
+            "off": "none",
             "minimal": "low",
             "xhigh": "high"
           },
@@ -49,7 +49,7 @@
           "name": "Step-3.7-Flash NVFP4",
           "reasoning": true,
           "thinkingLevelMap": {
-            "off": null,
+            "off": "none",
             "minimal": "low",
             "xhigh": "high"
           },

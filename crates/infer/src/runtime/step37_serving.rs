@@ -99,6 +99,7 @@ impl<'template> Step37ChatService<'template> {
                     prompt_tokens,
                     cached_prompt_tokens: 0,
                     completion_tokens: 0,
+                    reasoning_tokens: 0,
                 },
             },
         );
@@ -133,6 +134,9 @@ impl<'template> Step37ChatService<'template> {
                         ),
                     })?;
             request.usage.completion_tokens += 1;
+            if request.output.is_reasoning() {
+                request.usage.reasoning_tokens += 1;
+            }
             let events = request.output.push_token(token.id)?;
             if let Some(reason) = request
                 .filter
@@ -271,6 +275,7 @@ impl ResponseFilter {
                     self.flush(request_id, output);
                     output.push(Step37ChatDelta { request_id, event });
                     self.saw_tool_calls = true;
+                    return Some(ChatFinishReason::ToolCalls);
                 }
             }
         }
@@ -306,5 +311,43 @@ fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
     match reason {
         RequestFinishReason::Eos => ChatFinishReason::Eos,
         RequestFinishReason::Length => ChatFinishReason::Length,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::chat::{ChatFunctionCall, ChatToolCall};
+    use serde_json::json;
+
+    #[test]
+    fn first_complete_tool_call_terminates_generation() {
+        let request_id = Step37RequestId::for_test(7);
+        let call = ChatOutputEvent::ToolCall(ChatToolCall {
+            id: "call_1".to_string(),
+            function: ChatFunctionCall {
+                name: "read".to_string(),
+                arguments: BTreeMap::from([("path".to_string(), json!("README.md"))]),
+            },
+        });
+        let mut filter = ResponseFilter::new(Vec::new());
+        let mut output = Vec::new();
+
+        assert_eq!(
+            filter.apply(
+                request_id,
+                vec![call.clone(), ChatOutputEvent::Text("ignored".to_string())],
+                &mut output,
+            ),
+            Some(ChatFinishReason::ToolCalls)
+        );
+        assert!(filter.saw_tool_calls());
+        assert_eq!(
+            output,
+            [Step37ChatDelta {
+                request_id,
+                event: call,
+            }]
+        );
     }
 }

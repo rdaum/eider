@@ -976,6 +976,7 @@ impl SessionMetrics {
             prompt_tokens = finished.usage.prompt_tokens,
             cached_prompt_tokens = finished.usage.cached_prompt_tokens,
             output_tokens = finished.usage.completion_tokens,
+            reasoning_tokens = finished.usage.reasoning_tokens,
             ttft_ms = time_to_first_token.as_secs_f64() * 1000.0,
             decode_tok_s = self.decode_tokens_per_second(),
             total_tok_s = rate(

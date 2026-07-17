@@ -50,7 +50,8 @@ impl Default for GenerationConfig {
 impl GenerationConfig {
     /// Loads checkpoint sampling defaults and EOS IDs.
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self> {
-        let path = model_dir.as_ref().join("generation_config.json");
+        let model_dir = model_dir.as_ref();
+        let path = model_dir.join("generation_config.json");
         let contents = std::fs::read_to_string(&path).map_err(|error| Error::Format {
             label: "generation_config.json",
             detail: format!("{}: {error}", path.display()),
@@ -62,7 +63,7 @@ impl GenerationConfig {
         let defaults = SamplingConfig::default();
         let eos_token_ids = parse_eos_token_ids(&value)?;
         let eos_token_ids = if eos_token_ids.is_empty() {
-            let config_path = model_dir.as_ref().join("config.json");
+            let config_path = model_dir.join("config.json");
             let contents =
                 std::fs::read_to_string(&config_path).map_err(|error| Error::Format {
                     label: "config.json",
@@ -76,6 +77,8 @@ impl GenerationConfig {
         } else {
             eos_token_ids
         };
+        let mut eos_token_ids = eos_token_ids;
+        add_tokenizer_eos_ids(model_dir, &mut eos_token_ids)?;
         let do_sample = value["do_sample"].as_bool().unwrap_or(false);
         let config = Self {
             sampling: SamplingConfig {
@@ -117,6 +120,68 @@ impl GenerationConfig {
             });
         }
         Ok(())
+    }
+}
+
+fn add_tokenizer_eos_ids(model_dir: &Path, ids: &mut BTreeSet<u32>) -> Result<()> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::Format {
+                label: "tokenizer_config.json",
+                detail: format!("{}: {error}", config_path.display()),
+            });
+        }
+    };
+    let config: Value = serde_json::from_str(&contents).map_err(|error| Error::Format {
+        label: "tokenizer_config.json",
+        detail: error.to_string(),
+    })?;
+    let eos_tokens = tokenizer_eos_tokens(&config["eos_token"])?;
+    if eos_tokens.is_empty() {
+        return Ok(());
+    }
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| Error::Format {
+        label: "tokenizer.json",
+        detail: format!("{}: {error}", tokenizer_path.display()),
+    })?;
+    for token in eos_tokens {
+        let id = tokenizer.token_to_id(&token).ok_or_else(|| Error::Format {
+            label: "tokenizer_config.json",
+            detail: format!("EOS token {token:?} is absent from tokenizer.json"),
+        })?;
+        ids.insert(id);
+    }
+    Ok(())
+}
+
+fn tokenizer_eos_tokens(value: &Value) -> Result<Vec<String>> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(token) => Ok(vec![token.clone()]),
+        Value::Object(object) => object
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|token| vec![token.to_string()])
+            .ok_or_else(|| Error::Format {
+                label: "tokenizer_config.json",
+                detail: format!("expected eos_token object with string content, got {value}"),
+            }),
+        Value::Array(values) => {
+            let mut tokens = Vec::with_capacity(values.len());
+            for value in values {
+                tokens.extend(tokenizer_eos_tokens(value)?);
+            }
+            Ok(tokens)
+        }
+        other => Err(Error::Format {
+            label: "tokenizer_config.json",
+            detail: format!("expected string, object, or array eos_token, got {other}"),
+        }),
     }
 }
 
@@ -339,6 +404,8 @@ impl<'a> Qwen36GenerationSession<'a> {
 mod tests {
     use super::GenerationConfig;
     use std::fs;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::{AddedToken, Tokenizer};
 
     #[test]
     fn model_generation_config_loads_sampling_and_eos_defaults() {
@@ -388,6 +455,45 @@ mod tests {
             config.eos_token_ids.into_iter().collect::<Vec<_>>(),
             [1, 2, 128007]
         );
+
+        fs::remove_dir_all(directory).expect("remove config directory");
+    }
+
+    #[test]
+    fn tokenizer_declared_eos_is_added_to_stale_generation_ids() {
+        let directory = std::env::temp_dir().join(format!(
+            "eider-tokenizer-eos-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).expect("create config directory");
+        fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id":1}"#,
+        )
+        .expect("write generation config");
+        fs::write(
+            directory.join("tokenizer_config.json"),
+            r#"{"eos_token":"<|im_end|>"}"#,
+        )
+        .expect("write tokenizer config");
+        let model = WordLevel::builder()
+            .vocab(
+                [("[UNK]".to_string(), 0), ("ordinary".to_string(), 1)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("word-level model");
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.add_special_tokens(&[AddedToken::from("<|im_end|>", true)]);
+        tokenizer
+            .save(directory.join("tokenizer.json"), false)
+            .expect("write tokenizer");
+
+        let config = GenerationConfig::from_model_dir(&directory).expect("generation config");
+        assert_eq!(config.eos_token_ids.into_iter().collect::<Vec<_>>(), [1, 2]);
 
         fs::remove_dir_all(directory).expect("remove config directory");
     }

@@ -90,6 +90,11 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         self.parser.push_text(&text)
     }
 
+    /// Returns whether the next generated token belongs to the thinking section.
+    pub fn is_reasoning(&self) -> bool {
+        self.parser.mode == OutputMode::Reasoning
+    }
+
     /// Finishes protocol parsing and flushes safe pending text.
     pub fn finish(&mut self) -> Result<Vec<ChatOutputEvent>> {
         self.finish_with_truncation(false)
@@ -574,6 +579,14 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn closing_think_tag_switches_output_mode_to_text() {
+        let mut parser = ChatOutputParser::new(&[], true).unwrap();
+        assert_eq!(parser.mode, OutputMode::Reasoning);
+        parser.push_text("checking</think>\n\nanswer").unwrap();
+        assert_eq!(parser.mode, OutputMode::Text);
     }
 
     #[test]

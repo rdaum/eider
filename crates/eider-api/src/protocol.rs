@@ -175,10 +175,14 @@ impl ResponseRequest {
             .validate()
             .map_err(|error| ApiError::invalid("sampling", error.to_string()))?;
 
-        let reasoning_effort = self
+        let requested_reasoning_effort = self
             .reasoning
             .as_ref()
-            .and_then(|reasoning| reasoning.effort.as_deref())
+            .and_then(|reasoning| reasoning.effort.as_deref());
+        let enable_thinking =
+            self.reasoning.is_some() && requested_reasoning_effort != Some("none");
+        let reasoning_effort = requested_reasoning_effort
+            .filter(|effort| *effort != "none")
             .map(parse_reasoning_effort)
             .transpose()?;
 
@@ -186,6 +190,7 @@ impl ResponseRequest {
             messages,
             tools,
             template: ChatTemplateOptions {
+                enable_thinking,
                 reasoning_effort,
                 ..ChatTemplateOptions::default()
             },
@@ -429,8 +434,15 @@ pub struct ResponseStream {
     model: String,
     created_at: u64,
     output: Vec<Value>,
+    reasoning: Option<ReasoningItem>,
     text: Option<TextItem>,
     completed: bool,
+}
+
+struct ReasoningItem {
+    id: String,
+    output_index: usize,
+    text: String,
 }
 
 struct TextItem {
@@ -449,6 +461,7 @@ impl ResponseStream {
                 .unwrap_or_default()
                 .as_secs(),
             output: Vec::new(),
+            reasoning: None,
             text: None,
             completed: false,
         }
@@ -467,8 +480,12 @@ impl ResponseStream {
 
     pub fn push(&mut self, inference: InferenceEvent) -> Vec<Value> {
         match inference {
-            InferenceEvent::Output(ChatOutputEvent::Reasoning(_)) => Vec::new(),
-            InferenceEvent::Output(ChatOutputEvent::Text(delta)) => self.push_text(delta),
+            InferenceEvent::Output(ChatOutputEvent::Reasoning(delta)) => self.push_reasoning(delta),
+            InferenceEvent::Output(ChatOutputEvent::Text(delta)) => {
+                let mut events = self.close_reasoning();
+                events.extend(self.push_text(delta));
+                events
+            }
             InferenceEvent::Output(ChatOutputEvent::ToolCall(call)) => self.push_tool(call),
             InferenceEvent::Finished(finished) => self.finish(finished),
             InferenceEvent::Error(message) => {
@@ -490,6 +507,82 @@ impl ResponseStream {
 
     pub fn is_completed(&self) -> bool {
         self.completed
+    }
+
+    fn push_reasoning(&mut self, delta: String) -> Vec<Value> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if self.reasoning.is_none() {
+            let id = next_id("rs", &NEXT_ITEM_ID);
+            let output_index = self.output.len();
+            events.push(event(
+                "response.output_item.added",
+                json!({
+                    "output_index": output_index,
+                    "item": reasoning_item(&id, "in_progress", "")
+                }),
+            ));
+            events.push(event(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "item_id": id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                    "part": reasoning_summary("")
+                }),
+            ));
+            self.reasoning = Some(ReasoningItem {
+                id,
+                output_index,
+                text: String::new(),
+            });
+        }
+        let reasoning = self.reasoning.as_mut().expect("reasoning item exists");
+        reasoning.text.push_str(&delta);
+        events.push(event(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": reasoning.id,
+                "output_index": reasoning.output_index,
+                "summary_index": 0,
+                "delta": delta
+            }),
+        ));
+        events
+    }
+
+    fn close_reasoning(&mut self) -> Vec<Value> {
+        let Some(reasoning) = self.reasoning.take() else {
+            return Vec::new();
+        };
+        let item = reasoning_item(&reasoning.id, "completed", &reasoning.text);
+        self.output.push(item.clone());
+        vec![
+            event(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": reasoning.id,
+                    "output_index": reasoning.output_index,
+                    "summary_index": 0,
+                    "text": reasoning.text
+                }),
+            ),
+            event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": reasoning.id,
+                    "output_index": reasoning.output_index,
+                    "summary_index": 0,
+                    "part": reasoning_summary(&reasoning.text)
+                }),
+            ),
+            event(
+                "response.output_item.done",
+                json!({"output_index": reasoning.output_index, "item": item}),
+            ),
+        ]
     }
 
     fn push_text(&mut self, delta: String) -> Vec<Value> {
@@ -569,7 +662,8 @@ impl ResponseStream {
     }
 
     fn push_tool(&mut self, call: ChatToolCall) -> Vec<Value> {
-        let mut events = self.close_text();
+        let mut events = self.close_reasoning();
+        events.extend(self.close_text());
         let id = next_id("fc", &NEXT_ITEM_ID);
         let output_index = self.output.len();
         let arguments = serde_json::to_string(&call.function.arguments)
@@ -608,7 +702,8 @@ impl ResponseStream {
     }
 
     fn finish(&mut self, finished: InferenceFinished) -> Vec<Value> {
-        let mut events = self.close_text();
+        let mut events = self.close_reasoning();
+        events.extend(self.close_text());
         self.completed = true;
         let incomplete = matches!(finished.finish_reason, ChatFinishReason::Length)
             .then(|| json!({"reason": "max_output_tokens"}));
@@ -637,7 +732,7 @@ impl ResponseStream {
                         "input_tokens": usage.prompt_tokens,
                         "input_tokens_details": {"cached_tokens": usage.cached_prompt_tokens},
                         "output_tokens": usage.completion_tokens,
-                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
                         "total_tokens": usage.total_tokens()
                     }),
                     incomplete.unwrap_or(Value::Null),
@@ -699,6 +794,26 @@ fn output_text(text: &str) -> Value {
     json!({"type": "output_text", "text": text, "annotations": [], "logprobs": []})
 }
 
+fn reasoning_item(id: &str, status: &str, text: &str) -> Value {
+    let summary = if status == "in_progress" {
+        Vec::new()
+    } else {
+        vec![reasoning_summary(text)]
+    };
+    json!({
+        "id": id,
+        "type": "reasoning",
+        "status": status,
+        "summary": summary,
+        "content": [],
+        "encrypted_content": null
+    })
+}
+
+fn reasoning_summary(text: &str) -> Value {
+    json!({"type": "summary_text", "text": text})
+}
+
 fn function_item(id: &str, call_id: &str, name: &str, arguments: &str, status: &str) -> Value {
     json!({
         "id": id,
@@ -734,6 +849,7 @@ mod tests {
         .unwrap();
         let chat = request.into_chat_request(&defaults()).unwrap();
         assert_eq!(chat.generation.max_new_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(!chat.template.enable_thinking);
     }
 
     #[test]
@@ -776,6 +892,7 @@ mod tests {
             chat.template.reasoning_effort,
             Some(ChatReasoningEffort::Low)
         );
+        assert!(chat.template.enable_thinking);
         assert!(
             chat.messages[0]
                 .content
@@ -785,6 +902,20 @@ mod tests {
         );
         assert_eq!(chat.messages[2].tool_calls[0].id, "call_1");
         assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn reasoning_effort_none_disables_checkpoint_thinking() {
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "answer directly",
+            "reasoning": {"effort": "none"}
+        }))
+        .unwrap();
+
+        let chat = request.into_chat_request(&defaults()).unwrap();
+        assert!(!chat.template.enable_thinking);
+        assert_eq!(chat.template.reasoning_effort, None);
     }
 
     #[test]
@@ -811,6 +942,7 @@ mod tests {
                 prompt_tokens: 8,
                 cached_prompt_tokens: 4,
                 completion_tokens: 4,
+                reasoning_tokens: 0,
             },
         };
         let done = stream.push(InferenceEvent::Finished(finished));
@@ -825,6 +957,43 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn response_events_stream_reasoning_before_visible_text() {
+        let mut stream = ResponseStream::new("eider");
+        let started = stream.push(InferenceEvent::Output(ChatOutputEvent::Reasoning(
+            "checking".into(),
+        )));
+        assert_eq!(started.len(), 3);
+        assert_eq!(started[0]["type"], "response.output_item.added");
+        assert_eq!(started[0]["item"]["type"], "reasoning");
+        assert_eq!(started[1]["type"], "response.reasoning_summary_part.added");
+        assert_eq!(started[2]["type"], "response.reasoning_summary_text.delta");
+
+        let text = stream.push(InferenceEvent::Output(ChatOutputEvent::Text("done".into())));
+        assert_eq!(text[0]["type"], "response.reasoning_summary_text.done");
+        assert_eq!(text[1]["type"], "response.reasoning_summary_part.done");
+        assert_eq!(text[2]["type"], "response.output_item.done");
+        assert_eq!(text[3]["type"], "response.output_item.added");
+        assert_eq!(text.last().unwrap()["type"], "response.output_text.delta");
+
+        let done = stream.push(InferenceEvent::Finished(InferenceFinished {
+            finish_reason: ChatFinishReason::Length,
+            usage: ChatUsage {
+                prompt_tokens: 2,
+                cached_prompt_tokens: 0,
+                completion_tokens: 5,
+                reasoning_tokens: 3,
+            },
+        }));
+        let response = &done.last().unwrap()["response"];
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(response["output"][0]["summary"][0]["text"], "checking");
+        assert_eq!(
+            response["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
         );
     }
 }
