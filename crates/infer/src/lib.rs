@@ -14,6 +14,9 @@ pub use runtime::kv_cache;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Nemotron 3 hybrid Mamba/attention/MoE model support.
+pub mod nemotron3;
+
 /// Step-3.7 expert preparation and residency experiments.
 pub mod step37;
 

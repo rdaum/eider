@@ -2,6 +2,7 @@
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::prefix_cache::PrefixCacheConfig;
 use super::scheduler::{RequestFinishReason, RequestState, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::step37_scheduler::{
@@ -63,9 +64,18 @@ impl<'template> Step37ChatService<'template> {
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
+        Self::new_with_prefix_cache(model, template, scheduler, PrefixCacheConfig::default())
+    }
+
+    pub fn new_with_prefix_cache(
+        model: Step37TextModel,
+        template: &'template CheckpointChatTemplate,
+        scheduler: SchedulerConfig,
+        prefix_cache: PrefixCacheConfig,
+    ) -> Result<Self> {
         Ok(Self {
             template,
-            scheduler: Step37Scheduler::new(model, scheduler)?,
+            scheduler: Step37Scheduler::new_with_prefix_cache(model, scheduler, prefix_cache)?,
             requests: BTreeMap::new(),
         })
     }
@@ -113,6 +123,13 @@ impl<'template> Step37ChatService<'template> {
 
     pub fn tick(&mut self) -> Result<Step37ChatTick> {
         let scheduled = self.scheduler.tick()?;
+        for admission in &scheduled.admitted {
+            self.requests
+                .get_mut(&admission.request_id)
+                .expect("admitted chat request is retained")
+                .usage
+                .cached_prompt_tokens = admission.cached_prompt_tokens;
+        }
         let mut tick = Step37ChatTick {
             admitted: scheduled.admitted,
             scheduled: scheduled.scheduled,

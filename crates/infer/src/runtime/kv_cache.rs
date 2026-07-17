@@ -140,6 +140,11 @@ impl LayerKvCache {
         self.kv_heads * self.head_dim
     }
 
+    /// Returns bytes owned by this layer's device-resident key/value storage.
+    pub fn device_bytes(&self) -> usize {
+        self.key.device_bytes() + self.value.device_bytes()
+    }
+
     /// Appends one or more contiguous K/V rows and advances the valid length.
     pub fn append(&mut self, key: &DeviceBuffer<f32>, value: &DeviceBuffer<f32>) -> Result<()> {
         let width = self.kv_width();
