@@ -33,9 +33,9 @@ pub enum Nemotron3Fp8Storage {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Nemotron3KvCacheStorage {
     /// Preserve full-precision key/value rows.
+    #[default]
     F32,
     /// Quantize finalized key/value tiles to the SM12x FP4 cache format.
-    #[default]
     Nvfp4,
 }
 

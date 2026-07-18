@@ -366,7 +366,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
     match config.model_type.as_str() {
         "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
         "step3p7" => Ok(CheckpointArchitecture::Step37),
-        "nemotron_h" => Ok(CheckpointArchitecture::Nemotron3),
+        "nemotron_h" | "nemotron_h_puzzle" => Ok(CheckpointArchitecture::Nemotron3),
         other => Err(format!(
             "unsupported model_type {other:?} in {}",
             path.display()
@@ -1334,6 +1334,15 @@ mod tests {
             r#"{"model_type":"nemotron_h"}"#,
         )
         .expect("write Nemotron config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Nemotron3
+        );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"nemotron_h_puzzle"}"#,
+        )
+        .expect("write Puzzle config");
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Nemotron3
