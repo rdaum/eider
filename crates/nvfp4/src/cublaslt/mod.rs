@@ -7,8 +7,8 @@ mod fp8_tn;
 mod handle;
 
 pub use fp4_tn::{
-    CutlassFp4GroupedGemvF32Plan, Fp4TnMatmul, Fp4TnMatmulPlan, Fp4TnPlanMetadata, GemmShape,
-    InferenceGemm, Nvfp4TnInputs,
+    CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan, Fp4TnMatmul, Fp4TnMatmulPlan,
+    Fp4TnPlanMetadata, GemmShape, InferenceGemm, Nvfp4TnInputs,
 };
 pub use fp8_tn::Fp8TnMatmulPlan;
 pub use handle::CublasLt;

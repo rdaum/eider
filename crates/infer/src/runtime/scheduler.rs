@@ -62,7 +62,7 @@ impl Default for SchedulerConfig {
         Self {
             decode_capacity: 8,
             prefill_sequence_capacity: 8,
-            prefill_token_capacity: 128,
+            prefill_token_capacity: 2_048,
             max_active_sequences: 8,
             max_context_tokens: 32_768,
         }

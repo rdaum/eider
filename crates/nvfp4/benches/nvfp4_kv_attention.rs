@@ -4,10 +4,11 @@ use micromeasure::{
 };
 use nvfp4::{
     CudaEvent, CudaStream, DeviceBuffer, Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight,
-    Sm12xFp4GemmVector, Sm12xFp4GemmWeight, cached_gqa_attention_f32_into_on_stream,
-    cached_gqa_attention_nvfp4_into_on_stream, device_weight_gemv_native_vector_on_stream,
-    device_weight_gemv_on_stream, quantize_dynamic_vector_on_stream,
-    quantize_nvfp4_simple_scales_f32_into_on_stream, softmax_f32_in_place_on_stream,
+    Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    cached_gqa_attention_f32_into_on_stream, cached_gqa_attention_nvfp4_into_on_stream,
+    device_weight_gemv_native_vector_on_stream, device_weight_gemv_on_stream,
+    quantize_dynamic_vector_on_stream, quantize_nvfp4_simple_scales_f32_into_on_stream,
+    softmax_f32_in_place_on_stream,
 };
 use std::time::Duration;
 
@@ -454,6 +455,164 @@ fn tile_attention_sample<const CACHE_LEN: usize>(
     ))
 }
 
+const PREFILL_PREFIX: usize = 2_048;
+const PREFILL_ROWS: usize = 128;
+
+struct CausalPrefillBench {
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    query: DeviceBuffer<f32>,
+    serial_cache: Sm12xKvCache,
+    serial_workspace: Sm12xKvAttentionWorkspace,
+    serial_output: DeviceBuffer<f32>,
+    batched_cache: Sm12xKvCache,
+    batched_workspace: Sm12xKvAttentionWorkspace,
+    batched_output: DeviceBuffer<f32>,
+}
+
+impl BenchContext for CausalPrefillBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        let max_tokens = PREFILL_PREFIX + PREFILL_ROWS;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let key = DeviceBuffer::from_host(
+            &(0..max_tokens * kv_width)
+                .map(|index| ((index * 29 % 509) as f32 - 254.0) / 384.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefill key");
+        let value = DeviceBuffer::from_host(
+            &(0..max_tokens * kv_width)
+                .map(|index| ((index * 43 % 509) as f32 - 254.0) / 448.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefill value");
+        let query = DeviceBuffer::from_host(
+            &(0..max_tokens * q_width)
+                .map(|index| ((index * 17 % 251) as f32 - 125.0) / 512.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefill query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut serial_cache =
+            Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM).expect("serial cache");
+        serial_cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, PREFILL_PREFIX, &stream)
+            .expect("serial prefix");
+        let mut batched_cache =
+            Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM).expect("batched cache");
+        batched_cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, PREFILL_PREFIX, &stream)
+            .expect("batched prefix");
+        stream.synchronize().expect("prefix sync");
+        Self {
+            stream,
+            start: CudaEvent::new().expect("start"),
+            stop: CudaEvent::new().expect("stop"),
+            key,
+            value,
+            query,
+            serial_cache,
+            serial_workspace: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_tokens, Q_HEADS, KV_HEADS, HEAD_DIM, 1,
+            )
+            .expect("serial workspace"),
+            serial_output: DeviceBuffer::zeroed(max_tokens * q_width).expect("serial output"),
+            batched_cache,
+            batched_workspace: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_tokens, Q_HEADS, KV_HEADS, HEAD_DIM, 8,
+            )
+            .expect("batched workspace"),
+            batched_output: DeviceBuffer::zeroed(max_tokens * q_width).expect("batched output"),
+        }
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
+impl CausalPrefillBench {
+    fn run_serial(&mut self) {
+        self.serial_cache
+            .truncate(PREFILL_PREFIX)
+            .expect("truncate serial cache");
+        self.serial_workspace
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut self.serial_cache,
+                &self.query,
+                &self.key,
+                &self.value,
+                PREFILL_PREFIX,
+                PREFILL_ROWS,
+                None,
+                self.serial_output.output(),
+                &self.stream,
+            )
+            .expect("serial causal prefill");
+    }
+
+    fn run_batched(&mut self) {
+        self.batched_cache
+            .truncate(PREFILL_PREFIX)
+            .expect("truncate batched cache");
+        self.batched_workspace
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut self.batched_cache,
+                &self.query,
+                &self.key,
+                &self.value,
+                PREFILL_PREFIX,
+                PREFILL_ROWS,
+                None,
+                self.batched_output.output(),
+                &self.stream,
+            )
+            .expect("batched causal prefill");
+    }
+}
+
+fn causal_prefill_serial_sample(
+    ctx: &mut CausalPrefillBench,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_serial();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.serial_output.as_const_ptr());
+    BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms/chunk",
+    ))
+}
+
+fn causal_prefill_batched_sample(
+    ctx: &mut CausalPrefillBench,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_batched();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.batched_output.as_const_ptr());
+    BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms/chunk",
+    ))
+}
+
 fn main() {
     run_benchmark_main(
         BenchmarkMainOptions {
@@ -469,6 +628,10 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<CausalPrefillBench>("SM12x compact causal prefill 2K+128", |group| {
+                group.bench_sample("one_row_per_launch", causal_prefill_serial_sample);
+                group.bench_sample("eight_rows_per_launch", causal_prefill_batched_sample);
+            });
             runner.group::<KvAttentionBench<4_096>>("Qwen3.6 GQA 4K", |group| {
                 group.bench_sample("f32_cache", f32_sample::<4_096>);
                 group.bench_sample("nvfp4_cache_fused_decode", nvfp4_sample::<4_096>);

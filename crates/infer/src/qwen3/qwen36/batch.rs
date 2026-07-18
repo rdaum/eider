@@ -473,10 +473,12 @@ impl BatchFullAttentionWorkspace {
     ) -> Result<Self> {
         let q_width = model.manifest.q_heads * model.manifest.head_dim;
         let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
-        let compact_attention = Sm12xKvAttentionWorkspace::new(
+        let compact_attention = Sm12xKvAttentionWorkspace::new_gqa_batched(
             max_context_tokens,
+            model.manifest.q_heads,
             model.manifest.kv_heads,
             model.manifest.head_dim,
+            8,
         )?;
         Ok(Self {
             hidden_quantized: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,

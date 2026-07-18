@@ -1261,6 +1261,311 @@ pub fn moe_topk_f32_batch_into_on_stream(
     }
 }
 
+/// Reusable device storage for expert-major MoE route ordering.
+pub struct MoeSortedRoutes {
+    routes: usize,
+    experts: usize,
+    expert_counts: DeviceBuffer<u32>,
+    expert_offsets: DeviceBuffer<u32>,
+    expert_cursors: DeviceBuffer<u32>,
+    sorted_routes: DeviceBuffer<u32>,
+    sorted_experts: DeviceBuffer<u32>,
+    route_to_sorted: DeviceBuffer<u32>,
+}
+
+impl MoeSortedRoutes {
+    /// Allocates route sorting storage for one fixed-capacity prompt batch.
+    pub fn new(routes: usize, experts: usize) -> Result<Self> {
+        if routes == 0
+            || experts == 0
+            || experts > 1024
+            || routes > u32::MAX as usize
+            || experts > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "MoE sorted routes",
+                expected: "nonzero u32-sized routes and 1..=1024 experts".to_string(),
+                actual: format!("routes={routes} experts={experts}"),
+            });
+        }
+        Ok(Self {
+            routes,
+            experts,
+            expert_counts: DeviceBuffer::zeroed(experts)?,
+            expert_offsets: DeviceBuffer::zeroed(experts + 1)?,
+            expert_cursors: DeviceBuffer::zeroed(experts)?,
+            sorted_routes: DeviceBuffer::zeroed(routes)?,
+            sorted_experts: DeviceBuffer::zeroed(routes)?,
+            route_to_sorted: DeviceBuffer::zeroed(routes)?,
+        })
+    }
+
+    /// Sorts `indices` into expert-major route order without host readback.
+    pub fn sort_on_stream(
+        &mut self,
+        indices: &DeviceBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if indices.len() != self.routes {
+            return Err(Error::Shape {
+                label: "MoE route indices",
+                expected: format!("{} indices", self.routes),
+                actual: format!("{} indices", indices.len()),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_sort_routes_on_stream",
+                ffi::infer_moe_sort_routes_on_stream(
+                    indices.ptr,
+                    self.expert_counts.ptr,
+                    self.expert_offsets.ptr,
+                    self.expert_cursors.ptr,
+                    self.sorted_routes.ptr,
+                    self.sorted_experts.ptr,
+                    self.route_to_sorted.ptr,
+                    self.routes as u32,
+                    self.experts as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Returns one route count per expert.
+    pub fn expert_counts(&self) -> &DeviceBuffer<u32> {
+        &self.expert_counts
+    }
+
+    /// Returns the `experts + 1` exclusive expert offsets.
+    pub fn expert_offsets(&self) -> &DeviceBuffer<u32> {
+        &self.expert_offsets
+    }
+
+    /// Returns original route identifiers in expert-major order.
+    pub fn sorted_routes(&self) -> &DeviceBuffer<u32> {
+        &self.sorted_routes
+    }
+
+    /// Returns the expert identifier for every sorted route.
+    pub fn sorted_experts(&self) -> &DeviceBuffer<u32> {
+        &self.sorted_experts
+    }
+
+    /// Returns the inverse mapping from original route to sorted position.
+    pub fn route_to_sorted(&self) -> &DeviceBuffer<u32> {
+        &self.route_to_sorted
+    }
+
+    /// Returns device bytes retained by the route ordering workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.expert_counts.device_bytes()
+            + self.expert_offsets.device_bytes()
+            + self.expert_cursors.device_bytes()
+            + self.sorted_routes.device_bytes()
+            + self.sorted_experts.device_bytes()
+            + self.route_to_sorted.device_bytes()
+    }
+}
+
+/// Expert-major NVFP4 activation storage for grouped MoE GEMMs.
+pub struct MoeSortedNvfp4Rows {
+    routes: usize,
+    experts: usize,
+    routes_per_row: usize,
+    in_features: usize,
+    scale_stride: usize,
+    packed: DeviceBuffer<u8>,
+    scales: DeviceBuffer<u8>,
+    packed_table: DeviceBuffer<*const u8>,
+    scale_table: DeviceBuffer<*const u8>,
+}
+
+impl MoeSortedNvfp4Rows {
+    /// Allocates expert-major activation storage for a fixed prompt capacity.
+    pub fn new(
+        rows: usize,
+        routes_per_row: usize,
+        experts: usize,
+        in_features: usize,
+    ) -> Result<Self> {
+        let routes = rows.saturating_mul(routes_per_row);
+        if rows == 0
+            || routes_per_row == 0
+            || experts == 0
+            || routes == 0
+            || in_features == 0
+            || !in_features.is_multiple_of(16)
+            || routes > u32::MAX as usize
+            || routes_per_row > u32::MAX as usize
+            || experts > u32::MAX as usize
+            || in_features > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE NVFP4 rows",
+                expected: "positive u32-sized dimensions and K divisible by 16".to_string(),
+                actual: format!(
+                    "rows={rows} routes_per_row={routes_per_row} experts={experts} in={in_features}"
+                ),
+            });
+        }
+        let scale_stride = format::ue4m3_scale_layout_len(routes, in_features);
+        Ok(Self {
+            routes,
+            experts,
+            routes_per_row,
+            in_features,
+            scale_stride,
+            packed: DeviceBuffer::zeroed(routes * in_features / 2)?,
+            scales: DeviceBuffer::zeroed(experts * scale_stride)?,
+            packed_table: DeviceBuffer::zeroed(experts)?,
+            scale_table: DeviceBuffer::zeroed(experts)?,
+        })
+    }
+
+    /// Gathers token rows in sorted route order and quantizes them to NVFP4.
+    pub fn gather_quantize_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        routes: &MoeSortedRoutes,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let rows = self.routes / self.routes_per_row;
+        self.quantize_on_stream(input, routes, rows, true, stream)
+    }
+
+    /// Quantizes already-sorted route rows to NVFP4 without gathering.
+    pub fn quantize_sorted_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        routes: &MoeSortedRoutes,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.quantize_on_stream(input, routes, self.routes, false, stream)
+    }
+
+    fn quantize_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        routes: &MoeSortedRoutes,
+        source_rows: usize,
+        gather_rows: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || input.len() != source_rows * self.in_features
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE NVFP4 quantization",
+                expected: format!(
+                    "routes={} experts={} input={}",
+                    self.routes,
+                    self.experts,
+                    source_rows * self.in_features
+                ),
+                actual: format!(
+                    "routes={} experts={} input={}",
+                    routes.routes,
+                    routes.experts,
+                    input.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_quantize_sorted_routes_nvfp4_on_stream",
+                ffi::infer_moe_quantize_sorted_routes_nvfp4_on_stream(
+                    input.ptr,
+                    routes.sorted_routes.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    self.routes as u32,
+                    self.routes_per_row as u32,
+                    self.in_features as u32,
+                    self.scale_stride as u32,
+                    i32::from(gather_rows),
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Builds device pointer tables for grouped GEMM input and output operands.
+    pub fn build_pointer_tables_on_stream(
+        &mut self,
+        routes: &MoeSortedRoutes,
+        output: &mut DeviceBuffer<f32>,
+        output_table: &mut DeviceBuffer<*mut f32>,
+        out_features: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || output.len() != self.routes * out_features
+            || output_table.len() != self.experts
+            || out_features == 0
+            || out_features > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE grouped pointer tables",
+                expected: format!(
+                    "routes={} experts={} output={}",
+                    self.routes,
+                    self.experts,
+                    self.routes * out_features
+                ),
+                actual: format!(
+                    "routes={} experts={} output={} output_table={} out={out_features}",
+                    routes.routes,
+                    routes.experts,
+                    output.len(),
+                    output_table.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_grouped_pointer_tables_on_stream",
+                ffi::infer_moe_grouped_pointer_tables_on_stream(
+                    routes.expert_offsets.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    output.ptr,
+                    self.packed_table.ptr,
+                    self.scale_table.ptr,
+                    output_table.ptr,
+                    self.experts as u32,
+                    self.in_features as u32,
+                    out_features as u32,
+                    self.scale_stride as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Returns the expert-indexed packed activation pointer table.
+    pub fn packed_table(&self) -> &DeviceBuffer<*const u8> {
+        &self.packed_table
+    }
+
+    /// Returns the expert-indexed tiled scale pointer table.
+    pub fn scale_table(&self) -> &DeviceBuffer<*const u8> {
+        &self.scale_table
+    }
+
+    /// Returns exact device bytes retained by the grouped activation storage.
+    pub fn device_bytes(&self) -> usize {
+        self.packed.device_bytes()
+            + self.scales.device_bytes()
+            + self.packed_table.device_bytes()
+            + self.scale_table.device_bytes()
+    }
+}
+
 #[allow(missing_docs)]
 pub struct GroupedGemvPointerBuffers<'a> {
     pub indices: &'a DeviceBuffer<u32>,
@@ -1686,6 +1991,64 @@ pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
                 rows as u32,
                 len as u32,
                 groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Writes weighted per-row sums from expert-major route output.
+pub fn moe_weighted_accumulate_sorted_f32_batch_on_stream(
+    routes: &MoeSortedRoutes,
+    route_weights: &DeviceBuffer<f32>,
+    sorted_inputs: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    routes_per_row: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let route_count = rows.saturating_mul(routes_per_row);
+    let len = output.len().checked_div(rows).unwrap_or(0);
+    if rows == 0
+        || routes_per_row == 0
+        || route_count != routes.routes
+        || route_weights.len() != route_count
+        || len == 0
+        || sorted_inputs.len() != route_count.saturating_mul(len)
+        || rows > u32::MAX as usize
+        || len > u32::MAX as usize
+        || routes_per_row > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "sorted MoE weighted accumulate",
+            expected: format!(
+                "routes={} weights={} sorted={} output={}x{}",
+                route_count,
+                route_count,
+                route_count.saturating_mul(len),
+                rows,
+                len
+            ),
+            actual: format!(
+                "routes={} weights={} sorted={} output={} rows={rows} routes_per_row={routes_per_row}",
+                routes.routes,
+                route_weights.len(),
+                sorted_inputs.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_weighted_accumulate_sorted_f32_batch_on_stream",
+            ffi::infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+                routes.route_to_sorted.ptr,
+                route_weights.ptr,
+                sorted_inputs.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                len as u32,
+                routes_per_row as u32,
                 stream.as_raw(),
             ),
         )
@@ -6894,6 +7257,44 @@ pub fn nvfp4_w4a16_matvec_f32_batch_into_on_stream(
     }
 }
 
+/// Enqueues one W4A16 matvec per activation row using the packed payload of a
+/// cuBLASLt-layout NVFP4 weight matrix.
+///
+/// The matrix must be the `K x M` representation of a row-major `[M, K]`
+/// ModelOpt weight. Its tiled scale metadata is ignored here; `weight_scale`
+/// supplies the simple row-major scales required by the decode kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    packed_weight: &Nvfp4Matrix,
+    weight_scale: &DeviceBuffer<u8>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+    weight_scale_2: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    if (packed_weight.rows, packed_weight.cols) != (in_features, out_features) {
+        return Err(Error::Shape {
+            label: "batched NVFP4 W4A16 matrix weight",
+            expected: format!("{}x{} KxM matrix", in_features, out_features),
+            actual: format!("{}x{}", packed_weight.rows, packed_weight.cols),
+        });
+    }
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+        input,
+        &packed_weight.values,
+        weight_scale,
+        output,
+        rows,
+        out_features,
+        in_features,
+        weight_scale_2,
+        stream,
+    )
+}
+
 /// Enqueues the W4A16 matvec using one warp per output row.
 ///
 /// This configured entry point exists to measure launch schedules on real model
@@ -8373,6 +8774,46 @@ mod tests {
     use crate::{F32Matrix, synchronize_device};
 
     #[test]
+    fn moe_routes_are_grouped_by_expert_on_device() {
+        let indices = DeviceBuffer::from_host(&[3u32, 1, 3, 0, 1, 2, 3, 2]).expect("route indices");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut sorted = MoeSortedRoutes::new(8, 4).expect("sorted routes");
+        sorted
+            .sort_on_stream(&indices, &stream)
+            .expect("sort routes");
+
+        let counts = sorted
+            .expert_counts()
+            .copy_to_host(&stream)
+            .expect("expert counts");
+        let offsets = sorted
+            .expert_offsets()
+            .copy_to_host(&stream)
+            .expect("expert offsets");
+        let routes = sorted
+            .sorted_routes()
+            .copy_to_host(&stream)
+            .expect("sorted routes");
+        let experts = sorted
+            .sorted_experts()
+            .copy_to_host(&stream)
+            .expect("sorted experts");
+        let inverse = sorted
+            .route_to_sorted()
+            .copy_to_host(&stream)
+            .expect("inverse routes");
+
+        assert_eq!(counts, [1, 2, 2, 3]);
+        assert_eq!(offsets, [0, 1, 3, 5, 8]);
+        assert_eq!(experts, [0, 1, 1, 2, 2, 3, 3, 3]);
+        let indices = indices.copy_to_host(&stream).expect("indices");
+        for (sorted_index, &route) in routes.iter().enumerate() {
+            assert_eq!(inverse[route as usize], sorted_index as u32);
+            assert_eq!(indices[route as usize], experts[sorted_index]);
+        }
+    }
+
+    #[test]
     fn speculative_acceptance_stops_at_first_mismatch_and_returns_bonus() {
         const SEQUENCES: usize = 3;
         const DRAFTS: usize = 3;
@@ -8453,12 +8894,10 @@ mod tests {
             &stream,
         )
         .expect("state selection");
-        for sequence in 0..SEQUENCES {
+        for (sequence, state) in states.iter().enumerate() {
             if sequence == 2 {
                 assert_eq!(
-                    states[sequence]
-                        .copy_to_host(&stream)
-                        .expect("state download"),
+                    state.copy_to_host(&stream).expect("state download"),
                     [f32_to_bf16(-1.0); STATE]
                 );
                 continue;
@@ -8467,9 +8906,7 @@ mod tests {
             let begin = (sequence * SLOTS + slot) * STATE;
             let expected = snapshots[begin..begin + STATE].to_vec();
             assert_eq!(
-                states[sequence]
-                    .copy_to_host(&stream)
-                    .expect("state download"),
+                state.copy_to_host(&stream).expect("state download"),
                 expected
             );
         }
@@ -13258,7 +13695,7 @@ mod tests {
         )
         .expect("grouped inputs");
 
-        for row in 0..BATCH {
+        for (row, input_row) in input_rows.iter().enumerate() {
             let begin = row * ROUTES;
             let row_indices =
                 DeviceBuffer::from_host(&indices[begin..begin + ROUTES]).expect("row indices");
@@ -13274,7 +13711,7 @@ mod tests {
             .expect("expected table");
             nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
                 &row_indices,
-                &input_rows[row],
+                input_row,
                 &packed_table,
                 &scale_table,
                 &scale_2,

@@ -69,6 +69,7 @@ fn main() {
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
     let marlin_moe_object = format!("{out_dir}/marlin_moe.o");
     let cutlass_gemv_object = format!("{out_dir}/cutlass_gemv.o");
+    let cutlass_grouped_gemm_object = format!("{out_dir}/cutlass_grouped_gemm.o");
     let archive = format!("{out_dir}/libfp4_oracle.a");
 
     let compile_status = std::process::Command::new("g++")
@@ -185,7 +186,7 @@ fn main() {
             "-DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1",
             "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
             "-Xcompiler=-fno-strict-aliasing",
-            "--generate-code=arch=compute_121,code=sm_121",
+            "--generate-code=arch=compute_121a,code=sm_121a",
             "-I",
             &cuda_include,
             "-I",
@@ -216,6 +217,51 @@ fn main() {
             cutlass_status.success(),
             "nvcc failed to build CUTLASS GEMV"
         );
+
+        let mut grouped_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+        grouped_nvcc.args([
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-DCUTLASS_VERSIONS_GENERATED",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "--expt-relaxed-constexpr",
+            "-ftemplate-backtrace-limit=0",
+            "-DCUTLASS_TEST_LEVEL=0",
+            "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+            "-Xcompiler=-fno-strict-aliasing",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-I",
+            cutlass_include
+                .to_str()
+                .expect("CUTLASS include path is UTF-8"),
+            "-I",
+            cutlass_util_include
+                .to_str()
+                .expect("CUTLASS util include path is UTF-8"),
+            "-I",
+            cutlass_common_include
+                .to_str()
+                .expect("CUTLASS common include path is UTF-8"),
+            "-I",
+            cutlass_generated_include
+                .to_str()
+                .expect("CUTLASS generated include path is UTF-8"),
+            "-c",
+            "native/cutlass_grouped_gemm.cu",
+            "-o",
+            &cutlass_grouped_gemm_object,
+        ]);
+        let grouped_status = grouped_nvcc
+            .status()
+            .expect("failed to run nvcc for CUTLASS grouped GEMM");
+        assert!(
+            grouped_status.success(),
+            "nvcc failed to build CUTLASS grouped GEMM"
+        );
     } else {
         let stub_status = std::process::Command::new("g++")
             .args([
@@ -234,6 +280,24 @@ fn main() {
             stub_status.success(),
             "g++ failed to build CUTLASS GEMV stub"
         );
+
+        let grouped_stub_status = std::process::Command::new("g++")
+            .args([
+                "-std=c++17",
+                "-O2",
+                "-I",
+                &cuda_include,
+                "-c",
+                "native/cutlass_grouped_gemm_stub.cpp",
+                "-o",
+                &cutlass_grouped_gemm_object,
+            ])
+            .status()
+            .expect("failed to run g++ for CUTLASS grouped GEMM stub");
+        assert!(
+            grouped_stub_status.success(),
+            "g++ failed to build CUTLASS grouped GEMM stub"
+        );
     }
 
     let archive_status = std::process::Command::new("ar")
@@ -246,6 +310,7 @@ fn main() {
             &sm12x_mma_object,
             &marlin_moe_object,
             &cutlass_gemv_object,
+            &cutlass_grouped_gemm_object,
         ])
         .status()
         .expect("failed to run ar for fp4 oracle");
@@ -268,6 +333,8 @@ fn main() {
     println!("cargo:rerun-if-changed=native/marlin");
     println!("cargo:rerun-if-changed=native/cutlass_gemv.cu");
     println!("cargo:rerun-if-changed=native/cutlass_gemv_stub.cpp");
+    println!("cargo:rerun-if-changed=native/cutlass_grouped_gemm.cu");
+    println!("cargo:rerun-if-changed=native/cutlass_grouped_gemm_stub.cpp");
     println!("cargo:rerun-if-changed=native/README.md");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");

@@ -1,10 +1,15 @@
 use super::*;
 use nvfp4::{
-    copy_bf16_rows_to_f32_indexed_into_on_stream, moe_topk_f32_batch_into_on_stream,
-    moe_weighted_accumulate_slots_f32_batch_on_stream,
+    CublasLt, CutlassFp4GroupedGemmPlan, F32Matrix, Fp4TnMatmulPlan, GemmShape, MoeSortedNvfp4Rows,
+    MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_sorted_f32_batch_on_stream,
     rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream,
 };
+use std::collections::HashMap;
+
+const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
+const CAUSAL_ATTENTION_ROW_BATCH: usize = 8;
 
 /// One scheduler-selected Gemma prompt chunk and its persistent sequence state.
 pub struct Gemma4PrefillRow<'tokens, 'state> {
@@ -14,11 +19,22 @@ pub struct Gemma4PrefillRow<'tokens, 'state> {
 
 struct Gemma4BatchLinearWorkspace {
     rows: usize,
+    lt: CublasLt,
+    plans: HashMap<(usize, usize), Gemma4BatchLinearPlan>,
+}
+
+struct Gemma4BatchLinearPlan {
+    input: Nvfp4Matrix,
+    plan: Fp4TnMatmulPlan,
 }
 
 impl Gemma4BatchLinearWorkspace {
-    fn new(rows: usize) -> Self {
-        Self { rows }
+    fn new(rows: usize) -> Result<Self> {
+        Ok(Self {
+            rows,
+            lt: CublasLt::new()?,
+            plans: HashMap::new(),
+        })
     }
 
     fn run(
@@ -28,15 +44,55 @@ impl Gemma4BatchLinearWorkspace {
         output: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        linear.run_rows_into(input, output, self.rows, stream)
+        let (out_features, in_features) = linear.shape();
+        let key = (out_features, in_features);
+        if !self.plans.contains_key(&key) {
+            let activation = Nvfp4Matrix::zeroed_col_major(in_features, self.rows)?;
+            let output_layout = F32Matrix::zeroed(out_features, self.rows)?;
+            let plan = Fp4TnMatmulPlan::new_f32_output(
+                &self.lt,
+                GemmShape::new(out_features, self.rows, in_features),
+                Nvfp4TnInputs::new(linear.cublaslt_weight().matrix(), &activation),
+                &output_layout,
+                PREFILL_GEMM_WORKSPACE_LIMIT,
+            )?;
+            self.plans.insert(
+                key,
+                Gemma4BatchLinearPlan {
+                    input: activation,
+                    plan,
+                },
+            );
+        }
+        let plan = self.plans.get_mut(&key).expect("prefill GEMM plan exists");
+        let weight = linear.cublaslt_weight();
+        weight.quantize_activation_device_col_major_f32_into_on_stream(
+            in_features,
+            self.rows,
+            input,
+            &mut plan.input,
+            stream,
+        )?;
+        plan.plan.run_with_alpha_beta_f32_inout_buffer_on_stream(
+            &self.lt,
+            Nvfp4TnInputs::new(weight.matrix(), &plan.input),
+            output.inout(),
+            weight.matmul_alpha(),
+            0.0,
+            stream,
+        )
     }
 
     fn device_bytes(&self) -> usize {
-        0
+        self.plans
+            .values()
+            .map(|plan| plan.input.device_bytes() + plan.plan.workspace_bytes())
+            .sum()
     }
 }
 
 struct Gemma4BatchAttentionWorkspace {
+    compact: Sm12xKvAttentionWorkspace,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -50,10 +106,17 @@ struct Gemma4BatchAttentionWorkspace {
 }
 
 impl Gemma4BatchAttentionWorkspace {
-    fn new(attention: &Gemma4Attention, rows: usize) -> Result<Self> {
+    fn new(attention: &Gemma4Attention, rows: usize, max_context_tokens: usize) -> Result<Self> {
         let q_width = attention.q_heads * attention.head_dim;
         let kv_width = attention.kv_heads * attention.head_dim;
         Ok(Self {
+            compact: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_context_tokens,
+                attention.q_heads,
+                attention.kv_heads,
+                attention.head_dim,
+                CAUSAL_ATTENTION_ROW_BATCH,
+            )?,
             q: DeviceBuffer::zeroed(rows * q_width)?,
             k: DeviceBuffer::zeroed(rows * kv_width)?,
             v: DeviceBuffer::zeroed(rows * kv_width)?,
@@ -68,7 +131,8 @@ impl Gemma4BatchAttentionWorkspace {
     }
 
     fn device_bytes(&self) -> usize {
-        self.q.device_bytes()
+        self.compact.device_bytes()
+            + self.q.device_bytes()
             + self.k.device_bytes()
             + self.v.device_bytes()
             + self.q_normed.device_bytes()
@@ -119,40 +183,55 @@ impl Gemma4BatchRouterWorkspace {
 
 struct Gemma4BatchMoeWorkspace {
     router: Gemma4BatchRouterWorkspace,
+    sorted_routes: MoeSortedRoutes,
+    gate_up_input: MoeSortedNvfp4Rows,
+    down_input: MoeSortedNvfp4Rows,
+    gate_up_plan: CutlassFp4GroupedGemmPlan,
+    down_plan: CutlassFp4GroupedGemmPlan,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
     activated: DeviceBuffer<f32>,
     down: DeviceBuffer<f32>,
-    expert_input_table: DeviceBuffer<*const f32>,
     gate_output_table: DeviceBuffer<*mut f32>,
     up_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
     down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
     output: DeviceBuffer<f32>,
 }
 
 impl Gemma4BatchMoeWorkspace {
-    fn new(moe: &Gemma4Moe, expert_input: &DeviceBuffer<f32>, rows: usize) -> Result<Self> {
+    fn new(moe: &Gemma4Moe, rows: usize) -> Result<Self> {
         let routes_per_row = moe.router.top_k;
         let routes = rows * routes_per_row;
+        let experts = moe.gate_packed_table.len();
         let gate = DeviceBuffer::zeroed(routes * moe.intermediate_size)?;
         let up = DeviceBuffer::zeroed(routes * moe.intermediate_size)?;
         let activated = DeviceBuffer::zeroed(routes * moe.intermediate_size)?;
         let down = DeviceBuffer::zeroed(routes * moe.hidden_size)?;
         Ok(Self {
             router: Gemma4BatchRouterWorkspace::new(&moe.router, rows)?,
-            expert_input_table: repeated_row_pointer_table(
-                expert_input.as_const_ptr().cast::<f32>(),
+            sorted_routes: MoeSortedRoutes::new(routes, experts)?,
+            gate_up_input: MoeSortedNvfp4Rows::new(rows, routes_per_row, experts, moe.hidden_size)?,
+            down_input: MoeSortedNvfp4Rows::new(
                 rows,
                 routes_per_row,
-                moe.hidden_size,
+                experts,
+                moe.intermediate_size,
             )?,
-            gate_output_table: mutable_row_pointer_table(&gate, routes, moe.intermediate_size)?,
-            up_output_table: mutable_row_pointer_table(&up, routes, moe.intermediate_size)?,
-            down_input_table: const_row_pointer_table(&activated, routes, moe.intermediate_size)?,
-            down_output_table: mutable_row_pointer_table(&down, routes, moe.hidden_size)?,
-            down_result_table: const_row_pointer_table(&down, routes, moe.hidden_size)?,
+            gate_up_plan: CutlassFp4GroupedGemmPlan::new(
+                moe.intermediate_size,
+                routes,
+                moe.hidden_size,
+                experts,
+            )?,
+            down_plan: CutlassFp4GroupedGemmPlan::new(
+                moe.hidden_size,
+                routes,
+                moe.intermediate_size,
+                experts,
+            )?,
+            gate_output_table: DeviceBuffer::zeroed(experts)?,
+            up_output_table: DeviceBuffer::zeroed(experts)?,
+            down_output_table: DeviceBuffer::zeroed(experts)?,
             gate,
             up,
             activated,
@@ -163,16 +242,16 @@ impl Gemma4BatchMoeWorkspace {
 
     fn device_bytes(&self) -> usize {
         self.router.device_bytes()
+            + self.sorted_routes.device_bytes()
+            + self.gate_up_input.device_bytes()
+            + self.down_input.device_bytes()
             + self.gate.device_bytes()
             + self.up.device_bytes()
             + self.activated.device_bytes()
             + self.down.device_bytes()
-            + self.expert_input_table.device_bytes()
             + self.gate_output_table.device_bytes()
             + self.up_output_table.device_bytes()
-            + self.down_input_table.device_bytes()
             + self.down_output_table.device_bytes()
-            + self.down_result_table.device_bytes()
             + self.output.device_bytes()
     }
 }
@@ -259,9 +338,9 @@ impl Gemma4Model {
             .iter()
             .find(|layer| layer.attention.window.is_none())
             .expect("Gemma 4 has global-attention layers");
-        let linear = Gemma4BatchLinearWorkspace::new(token_capacity);
+        let linear = Gemma4BatchLinearWorkspace::new(token_capacity)?;
         let moe_input = DeviceBuffer::zeroed(token_capacity * self.config.hidden_size)?;
-        let moe = Gemma4BatchMoeWorkspace::new(&local.moe, &moe_input, token_capacity)?;
+        let moe = Gemma4BatchMoeWorkspace::new(&local.moe, token_capacity)?;
         Ok(Gemma4PrefillBatchWorkspace {
             sequence_capacity,
             token_capacity,
@@ -277,10 +356,15 @@ impl Gemma4Model {
             moe_input,
             moe_output: DeviceBuffer::zeroed(token_capacity * self.config.hidden_size)?,
             combined: DeviceBuffer::zeroed(token_capacity * self.config.hidden_size)?,
-            local_attention: Gemma4BatchAttentionWorkspace::new(&local.attention, token_capacity)?,
+            local_attention: Gemma4BatchAttentionWorkspace::new(
+                &local.attention,
+                token_capacity,
+                max_context_tokens,
+            )?,
             global_attention: Gemma4BatchAttentionWorkspace::new(
                 &global.attention,
                 token_capacity,
+                max_context_tokens,
             )?,
             dense: local.dense.new_workspace(token_capacity)?,
             moe,
@@ -489,6 +573,7 @@ fn run_layer_prefill(
         &mut workspace.moe,
         &mut workspace.linear,
         &workspace.residual,
+        &workspace.moe_input,
         capacity,
         stream,
     )?;
@@ -596,17 +681,19 @@ fn run_attention_prefill(
             attention.rope_theta,
             stream,
         )?;
-        row.state.compact_attention[layer_index].append_causal_rows_at_offset_into_on_stream(
-            &mut row.state.kv_caches[layer_index],
-            &workspace.q_rope,
-            &workspace.k_rope,
-            &workspace.v_normed,
-            offset,
-            row.token_ids.len(),
-            attention.window,
-            workspace.attended.output(),
-            stream,
-        )?;
+        workspace
+            .compact
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut row.state.kv_caches[layer_index],
+                &workspace.q_rope,
+                &workspace.k_rope,
+                &workspace.v_normed,
+                offset,
+                row.token_ids.len(),
+                attention.window,
+                workspace.attended.output(),
+                stream,
+            )?;
         offset += row.token_ids.len();
     }
     linear.run(
@@ -646,6 +733,7 @@ fn run_moe_prefill(
     workspace: &mut Gemma4BatchMoeWorkspace,
     linear: &mut Gemma4BatchLinearWorkspace,
     router_input: &DeviceBuffer<f32>,
+    expert_input: &DeviceBuffer<f32>,
     rows: usize,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -691,26 +779,46 @@ fn run_moe_prefill(
         workspace.router.route_weights.output(),
         stream,
     )?;
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
-        &workspace.router.indices,
-        &workspace.expert_input_table,
-        &moe.gate_packed_table,
-        &moe.gate_scale_table,
-        &moe.gate_scale_2,
-        &workspace.gate_output_table,
-        moe.intermediate_size,
-        moe.hidden_size,
+    workspace
+        .sorted_routes
+        .sort_on_stream(&workspace.router.indices, stream)?;
+    workspace.gate_up_input.gather_quantize_on_stream(
+        expert_input,
+        &workspace.sorted_routes,
         stream,
     )?;
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
-        &workspace.router.indices,
-        &workspace.expert_input_table,
-        &moe.up_packed_table,
-        &moe.up_scale_table,
-        &moe.up_scale_2,
-        &workspace.up_output_table,
+    workspace.gate_up_input.build_pointer_tables_on_stream(
+        &workspace.sorted_routes,
+        &mut workspace.gate,
+        &mut workspace.gate_output_table,
         moe.intermediate_size,
-        moe.hidden_size,
+        stream,
+    )?;
+    workspace.gate_up_plan.run_on_stream(
+        &moe.gate_packed_table,
+        &moe.gate_tiled_scale_table,
+        workspace.gate_up_input.packed_table(),
+        workspace.gate_up_input.scale_table(),
+        &workspace.gate_output_table,
+        &moe.gate_alpha_table,
+        workspace.sorted_routes.expert_counts(),
+        stream,
+    )?;
+    workspace.gate_up_input.build_pointer_tables_on_stream(
+        &workspace.sorted_routes,
+        &mut workspace.up,
+        &mut workspace.up_output_table,
+        moe.intermediate_size,
+        stream,
+    )?;
+    workspace.gate_up_plan.run_on_stream(
+        &moe.up_packed_table,
+        &moe.up_tiled_scale_table,
+        workspace.gate_up_input.packed_table(),
+        workspace.gate_up_input.scale_table(),
+        &workspace.up_output_table,
+        &moe.up_alpha_table,
+        workspace.sorted_routes.expert_counts(),
         stream,
     )?;
     gelu_tanh_mul_f32_into_on_stream(
@@ -719,79 +827,36 @@ fn run_moe_prefill(
         workspace.activated.output(),
         stream,
     )?;
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
-        &workspace.router.indices,
-        &workspace.down_input_table,
-        &moe.down_packed_table,
-        &moe.down_scale_table,
-        &moe.down_scale_2,
-        &workspace.down_output_table,
-        moe.hidden_size,
-        moe.intermediate_size,
+    workspace.down_input.quantize_sorted_on_stream(
+        &workspace.activated,
+        &workspace.sorted_routes,
         stream,
     )?;
-    moe_weighted_accumulate_slots_f32_batch_on_stream(
-        &workspace.router.indices,
+    workspace.down_input.build_pointer_tables_on_stream(
+        &workspace.sorted_routes,
+        &mut workspace.down,
+        &mut workspace.down_output_table,
+        moe.hidden_size,
+        stream,
+    )?;
+    workspace.down_plan.run_on_stream(
+        &moe.down_packed_table,
+        &moe.down_tiled_scale_table,
+        workspace.down_input.packed_table(),
+        workspace.down_input.scale_table(),
+        &workspace.down_output_table,
+        &moe.down_alpha_table,
+        workspace.sorted_routes.expert_counts(),
+        stream,
+    )?;
+    moe_weighted_accumulate_sorted_f32_batch_on_stream(
+        &workspace.sorted_routes,
         &workspace.router.route_weights,
-        &workspace.down_result_table,
-        &moe.expert_alpha,
-        workspace.output.inout(),
+        &workspace.down,
+        workspace.output.output(),
         rows,
         routes_per_row,
         stream,
-    )
-}
-
-fn const_row_pointer_table(
-    buffer: &DeviceBuffer<f32>,
-    rows: usize,
-    width: usize,
-) -> Result<DeviceBuffer<*const f32>> {
-    let base = buffer.as_const_ptr().cast::<f32>();
-    DeviceBuffer::from_host(
-        &(0..rows)
-            .map(|row| unsafe { base.add(row * width) })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn mutable_row_pointer_table(
-    buffer: &DeviceBuffer<f32>,
-    rows: usize,
-    width: usize,
-) -> Result<DeviceBuffer<*mut f32>> {
-    DeviceBuffer::from_host(
-        &const_row_pointer_table_host(buffer, rows, width)
-            .into_iter()
-            .map(|pointer| pointer.cast_mut())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn const_row_pointer_table_host(
-    buffer: &DeviceBuffer<f32>,
-    rows: usize,
-    width: usize,
-) -> Vec<*const f32> {
-    let base = buffer.as_const_ptr().cast::<f32>();
-    (0..rows)
-        .map(|row| unsafe { base.add(row * width) })
-        .collect()
-}
-
-fn repeated_row_pointer_table(
-    base: *const f32,
-    rows: usize,
-    repeats: usize,
-    width: usize,
-) -> Result<DeviceBuffer<*const f32>> {
-    DeviceBuffer::from_host(
-        &(0..rows)
-            .flat_map(|row| {
-                let pointer = unsafe { base.add(row * width) };
-                std::iter::repeat_n(pointer, repeats)
-            })
-            .collect::<Vec<_>>(),
     )
 }
 
@@ -801,7 +866,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
-    fn local_bf16_batched_projection_matches_reference() {
+    fn local_w4a4_projection_matches_w4a16_reference() {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("models/gemma-4-26b-a4b-nvfp4");
@@ -823,7 +888,7 @@ mod tests {
         linear
             .run_rows_into(&input, &mut reference, rows, &stream)
             .expect("reference projection");
-        let mut workspace = Gemma4BatchLinearWorkspace::new(rows);
+        let mut workspace = Gemma4BatchLinearWorkspace::new(rows).expect("linear workspace");
         workspace
             .run(&linear, &input, &mut actual, &stream)
             .expect("batched projection");
@@ -834,7 +899,20 @@ mod tests {
             .zip(reference.iter())
             .map(|(actual, reference)| (actual - reference).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_error <= 0.25, "max projection error={max_error}");
+        let error_rms = (actual
+            .iter()
+            .zip(reference.iter())
+            .map(|(actual, reference)| (actual - reference).powi(2))
+            .sum::<f32>()
+            / actual.len() as f32)
+            .sqrt();
+        let reference_rms = (reference.iter().map(|value| value.powi(2)).sum::<f32>()
+            / reference.len() as f32)
+            .sqrt();
+        assert!(
+            error_rms <= reference_rms * 0.125,
+            "max_error={max_error} error_rms={error_rms} reference_rms={reference_rms}"
+        );
     }
 
     #[test]
@@ -855,14 +933,14 @@ mod tests {
         let router_input = DeviceBuffer::from_host(&router_host).expect("router input");
         let expert_input = DeviceBuffer::from_host(&expert_host).expect("expert input");
         let stream = CudaStream::new_blocking().expect("stream");
-        let mut workspace =
-            Gemma4BatchMoeWorkspace::new(&moe, &expert_input, rows).expect("batch MoE workspace");
-        let mut linear = Gemma4BatchLinearWorkspace::new(rows);
+        let mut workspace = Gemma4BatchMoeWorkspace::new(&moe, rows).expect("batch MoE workspace");
+        let mut linear = Gemma4BatchLinearWorkspace::new(rows).expect("linear workspace");
         run_moe_prefill(
             &moe,
             &mut workspace,
             &mut linear,
             &router_input,
+            &expert_input,
             rows,
             &stream,
         )

@@ -141,7 +141,7 @@ struct Args {
     prefill_sequence_capacity: usize,
 
     /// Maximum total prompt tokens in one prefill iteration.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 2_048)]
     prefill_token_capacity: usize,
 
     /// Maximum requests retaining device sequence state.

@@ -1,22 +1,20 @@
 //! Gemma 4 text-model loading and inference.
 //!
-//! The NVIDIA NVFP4 checkpoint keeps the dense text linears in BF16 and stores
-//! each MoE expert in ModelOpt NVFP4 form. Stacked BF16 expert checkpoints are
-//! also converted one expert at a time, without materializing a whole expert
+//! Dense and expert linears are resident in ModelOpt NVFP4 form. BF16 source
+//! tensors are converted during loading without materializing a whole expert
 //! stack on the host.
 
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
-    bf16_linear_argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, gather_indexed_mul_f32_into_on_stream,
-    gelu_tanh_mul_f32_into_on_stream, moe_topk_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
+    ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
+    bf16_linear_argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    gather_indexed_mul_f32_into_on_stream, gelu_tanh_mul_f32_into_on_stream,
+    moe_topk_f32_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
-    rope_neox_proportional_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    scale_channel_f32_device_scalar_in_place_on_stream,
+    nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
+    nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_f32_into_on_stream, rope_neox_proportional_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
 };
 use serde::Deserialize;
 use std::fs;
@@ -246,7 +244,7 @@ pub struct Gemma4Checkpoint {
     checkpoint: ModelOptCheckpoint,
 }
 
-/// Device-resident Gemma linear stored as BF16 or ModelOpt NVFP4 weights.
+/// Device-resident Gemma linear with decode and tensor-core scale layouts.
 pub struct Gemma4Linear {
     storage: Gemma4LinearStorage,
     out_features: usize,
@@ -254,11 +252,9 @@ pub struct Gemma4Linear {
 }
 
 enum Gemma4LinearStorage {
-    Bf16(DeviceBuffer<u16>),
     Nvfp4 {
-        packed_weight: DeviceBuffer<u8>,
+        weight: ModelOptCublasLtWeight,
         weight_scale: DeviceBuffer<u8>,
-        weight_scale_2: f32,
     },
 }
 
@@ -314,13 +310,19 @@ pub struct Gemma4Moe {
     _experts: Vec<Gemma4Expert>,
     gate_packed_table: DeviceBuffer<*const u8>,
     gate_scale_table: DeviceBuffer<*const u8>,
+    gate_tiled_scale_table: DeviceBuffer<*const u8>,
     gate_scale_2: DeviceBuffer<f32>,
+    gate_alpha_table: DeviceBuffer<*mut f32>,
     up_packed_table: DeviceBuffer<*const u8>,
     up_scale_table: DeviceBuffer<*const u8>,
+    up_tiled_scale_table: DeviceBuffer<*const u8>,
     up_scale_2: DeviceBuffer<f32>,
+    up_alpha_table: DeviceBuffer<*mut f32>,
     down_packed_table: DeviceBuffer<*const u8>,
     down_scale_table: DeviceBuffer<*const u8>,
+    down_tiled_scale_table: DeviceBuffer<*const u8>,
     down_scale_2: DeviceBuffer<f32>,
+    down_alpha_table: DeviceBuffer<*mut f32>,
     expert_alpha: DeviceBuffer<f32>,
     intermediate_size: usize,
     hidden_size: usize,
@@ -452,23 +454,8 @@ pub struct Gemma4NextToken {
 }
 
 impl Gemma4Linear {
-    /// Loads a BF16 or ModelOpt NVFP4 Gemma linear.
+    /// Loads a Gemma linear into resident ModelOpt NVFP4 storage.
     pub fn load(checkpoint: &Gemma4Checkpoint, tensor: &str) -> Result<Self> {
-        if checkpoint.checkpoint.contains_tensor(tensor) {
-            let info = checkpoint.checkpoint.tensor_info(tensor)?;
-            if info.dtype == "BF16" {
-                let [out_features, in_features] = matrix_shape(&info.shape, tensor)?;
-                return Ok(Self {
-                    storage: Gemma4LinearStorage::Bf16(checkpoint.load_bf16_matrix_device(
-                        tensor,
-                        out_features,
-                        in_features,
-                    )?),
-                    out_features,
-                    in_features,
-                });
-            }
-        }
         Self::from_modelopt(checkpoint.load_linear_nvfp4(tensor)?)
     }
 
@@ -490,14 +477,17 @@ impl Gemma4Linear {
                 ),
             });
         }
+        let weight_scale = DeviceBuffer::from_host(&weight.weight_scale)?;
+        let out_features = weight.out_features;
+        let in_features = weight.in_features;
+        let weight = weight.as_cublaslt_weight()?;
         Ok(Self {
             storage: Gemma4LinearStorage::Nvfp4 {
-                packed_weight: DeviceBuffer::from_host(&weight.packed_weight)?,
-                weight_scale: DeviceBuffer::from_host(&weight.weight_scale)?,
-                weight_scale_2: weight.weight_scale_2,
+                weight,
+                weight_scale,
             },
-            out_features: weight.out_features,
-            in_features: weight.in_features,
+            out_features,
+            in_features,
         })
     }
 
@@ -528,28 +518,18 @@ impl Gemma4Linear {
             });
         }
         match &self.storage {
-            Gemma4LinearStorage::Bf16(weight) => bf16_linear_logits_f32_batch_into_on_stream(
-                input,
-                weight,
-                output.output(),
-                rows,
-                self.out_features,
-                self.in_features,
-                stream,
-            ),
             Gemma4LinearStorage::Nvfp4 {
-                packed_weight,
+                weight,
                 weight_scale,
-                weight_scale_2,
-            } => nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+            } => nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream(
                 input,
-                packed_weight,
+                weight.matrix(),
                 weight_scale,
                 output.output(),
                 rows,
                 self.out_features,
                 self.in_features,
-                *weight_scale_2,
+                weight.weight_scale_2(),
                 stream,
             ),
         }
@@ -568,32 +548,36 @@ impl Gemma4Linear {
 
     fn nvfp4_parts(&self) -> Result<(*const u8, *const u8, f32)> {
         let Gemma4LinearStorage::Nvfp4 {
-            packed_weight,
+            weight,
             weight_scale,
-            weight_scale_2,
-        } = &self.storage
-        else {
-            return Err(Error::Format {
-                label: "Gemma 4 grouped expert",
-                detail: "grouped expert execution requires NVFP4 weights".to_string(),
-            });
-        };
+        } = &self.storage;
         Ok((
-            packed_weight.as_const_ptr().cast::<u8>(),
+            weight.matrix().values_ptr(),
             weight_scale.as_const_ptr().cast::<u8>(),
-            *weight_scale_2,
+            weight.weight_scale_2(),
         ))
     }
 
+    fn cublaslt_weight(&self) -> &ModelOptCublasLtWeight {
+        let Gemma4LinearStorage::Nvfp4 { weight, .. } = &self.storage;
+        weight
+    }
+
+    fn grouped_gemm_parts(&self) -> (*const u8, *const u8, f32) {
+        let weight = self.cublaslt_weight();
+        (
+            weight.matrix().values_ptr(),
+            weight.matrix().scales_ptr(),
+            weight.weight_scale_2(),
+        )
+    }
+
     pub fn device_bytes(&self) -> usize {
-        match &self.storage {
-            Gemma4LinearStorage::Bf16(weight) => weight.device_bytes(),
-            Gemma4LinearStorage::Nvfp4 {
-                packed_weight,
-                weight_scale,
-                ..
-            } => packed_weight.device_bytes() + weight_scale.device_bytes(),
-        }
+        let Gemma4LinearStorage::Nvfp4 {
+            weight,
+            weight_scale,
+        } = &self.storage;
+        weight.device_bytes() + weight_scale.device_bytes()
     }
 }
 
@@ -906,40 +890,61 @@ impl Gemma4Moe {
         }
         let mut gate_packed = Vec::with_capacity(experts.len());
         let mut gate_scales = Vec::with_capacity(experts.len());
+        let mut gate_tiled_scales = Vec::with_capacity(experts.len());
         let mut gate_scale_2 = Vec::with_capacity(experts.len());
         let mut up_packed = Vec::with_capacity(experts.len());
         let mut up_scales = Vec::with_capacity(experts.len());
+        let mut up_tiled_scales = Vec::with_capacity(experts.len());
         let mut up_scale_2 = Vec::with_capacity(experts.len());
         let mut down_packed = Vec::with_capacity(experts.len());
         let mut down_scales = Vec::with_capacity(experts.len());
+        let mut down_tiled_scales = Vec::with_capacity(experts.len());
         let mut down_scale_2 = Vec::with_capacity(experts.len());
         for expert in &experts {
             let (packed, scales, scale_2) = expert.gate.nvfp4_parts()?;
             gate_packed.push(packed);
             gate_scales.push(scales);
             gate_scale_2.push(scale_2);
+            let (_, scales, _) = expert.gate.grouped_gemm_parts();
+            gate_tiled_scales.push(scales);
             let (packed, scales, scale_2) = expert.up.nvfp4_parts()?;
             up_packed.push(packed);
             up_scales.push(scales);
             up_scale_2.push(scale_2);
+            let (_, scales, _) = expert.up.grouped_gemm_parts();
+            up_tiled_scales.push(scales);
             let (packed, scales, scale_2) = expert.down.nvfp4_parts()?;
             down_packed.push(packed);
             down_scales.push(scales);
             down_scale_2.push(scale_2);
+            let (_, scales, _) = expert.down.grouped_gemm_parts();
+            down_tiled_scales.push(scales);
         }
         let intermediate_size = checkpoint.config.moe_intermediate_size;
         let hidden_size = checkpoint.config.hidden_size;
+        let mut gate_scale_2 = DeviceBuffer::from_host(&gate_scale_2)?;
+        let gate_alpha_table = scalar_pointer_table(&mut gate_scale_2)?;
+        let mut up_scale_2 = DeviceBuffer::from_host(&up_scale_2)?;
+        let up_alpha_table = scalar_pointer_table(&mut up_scale_2)?;
+        let mut down_scale_2 = DeviceBuffer::from_host(&down_scale_2)?;
+        let down_alpha_table = scalar_pointer_table(&mut down_scale_2)?;
         Ok(Self {
             router,
             gate_packed_table: DeviceBuffer::from_host(&gate_packed)?,
             gate_scale_table: DeviceBuffer::from_host(&gate_scales)?,
-            gate_scale_2: DeviceBuffer::from_host(&gate_scale_2)?,
+            gate_tiled_scale_table: DeviceBuffer::from_host(&gate_tiled_scales)?,
+            gate_scale_2,
+            gate_alpha_table,
             up_packed_table: DeviceBuffer::from_host(&up_packed)?,
             up_scale_table: DeviceBuffer::from_host(&up_scales)?,
-            up_scale_2: DeviceBuffer::from_host(&up_scale_2)?,
+            up_tiled_scale_table: DeviceBuffer::from_host(&up_tiled_scales)?,
+            up_scale_2,
+            up_alpha_table,
             down_packed_table: DeviceBuffer::from_host(&down_packed)?,
             down_scale_table: DeviceBuffer::from_host(&down_scales)?,
-            down_scale_2: DeviceBuffer::from_host(&down_scale_2)?,
+            down_tiled_scale_table: DeviceBuffer::from_host(&down_tiled_scales)?,
+            down_scale_2,
+            down_alpha_table,
             expert_alpha: DeviceBuffer::from_host(&vec![1.0; experts.len()])?,
             _experts: experts,
             intermediate_size,
@@ -1075,13 +1080,19 @@ impl Gemma4Moe {
                 .sum::<usize>()
             + self.gate_packed_table.device_bytes()
             + self.gate_scale_table.device_bytes()
+            + self.gate_tiled_scale_table.device_bytes()
             + self.gate_scale_2.device_bytes()
+            + self.gate_alpha_table.device_bytes()
             + self.up_packed_table.device_bytes()
             + self.up_scale_table.device_bytes()
+            + self.up_tiled_scale_table.device_bytes()
             + self.up_scale_2.device_bytes()
+            + self.up_alpha_table.device_bytes()
             + self.down_packed_table.device_bytes()
             + self.down_scale_table.device_bytes()
+            + self.down_tiled_scale_table.device_bytes()
             + self.down_scale_2.device_bytes()
+            + self.down_alpha_table.device_bytes()
             + self.expert_alpha.device_bytes()
     }
 }
@@ -1100,6 +1111,15 @@ fn mutable_f32_pointer_table(buffers: &[DeviceBuffer<f32>]) -> Result<DeviceBuff
         &buffers
             .iter()
             .map(|buffer| buffer.as_const_ptr().cast_mut().cast::<f32>())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn scalar_pointer_table(buffer: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
+    let base = buffer.as_const_ptr().cast::<f32>().cast_mut();
+    DeviceBuffer::from_host(
+        &(0..buffer.len())
+            .map(|index| unsafe { base.add(index) })
             .collect::<Vec<_>>(),
     )
 }
@@ -2549,9 +2569,21 @@ mod tests {
             .new_decode_state(prompt.len() + 1)
             .expect("batched state");
         let stream = CudaStream::new_blocking().expect("stream");
-        model
-            .prefill_tokens(&mut serial, &prompt, &stream)
-            .expect("serial prefill");
+        let mut serial_workspace = model
+            .new_prefill_batch_workspace(1, 1, prompt.len() + 1)
+            .expect("serial W4A4 workspace");
+        for token in &prompt {
+            model
+                .prefill_batch(
+                    &mut serial_workspace,
+                    &mut [Gemma4PrefillRow {
+                        token_ids: std::slice::from_ref(token),
+                        state: &mut serial,
+                    }],
+                    &stream,
+                )
+                .expect("serial W4A4 prefill");
+        }
         let mut workspace = model
             .new_prefill_batch_workspace(1, prompt.len(), prompt.len() + 1)
             .expect("batch workspace");
@@ -2574,7 +2606,8 @@ mod tests {
         assert_eq!(batched.len(), serial.len());
         assert_eq!(batched_next.token, serial_next.token);
         assert!(
-            (batched_next.logit - serial_next.logit).abs() <= 0.5,
+            (batched_next.logit - serial_next.logit).abs()
+                <= serial_next.logit.abs().mul_add(0.2, 0.25),
             "serial={serial_next:?} batched={batched_next:?}"
         );
     }

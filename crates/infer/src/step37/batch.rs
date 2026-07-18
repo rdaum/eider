@@ -93,6 +93,7 @@ impl Step37BatchLinearWorkspace {
 
 struct Step37BatchAttentionWorkspace {
     q_heads: usize,
+    compact: Sm12xKvAttentionWorkspace,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -107,11 +108,18 @@ struct Step37BatchAttentionWorkspace {
 }
 
 impl Step37BatchAttentionWorkspace {
-    fn new(token_capacity: usize, q_heads: usize) -> Result<Self> {
+    fn new(token_capacity: usize, max_context_tokens: usize, q_heads: usize) -> Result<Self> {
         let q_values = token_capacity * q_heads * HEAD_DIM;
         let kv_values = token_capacity * KV_HEADS * HEAD_DIM;
         Ok(Self {
             q_heads,
+            compact: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_context_tokens,
+                q_heads,
+                KV_HEADS,
+                HEAD_DIM,
+                8,
+            )?,
             q: DeviceBuffer::zeroed(q_values)?,
             k: DeviceBuffer::zeroed(kv_values)?,
             v: DeviceBuffer::zeroed(kv_values)?,
@@ -215,8 +223,16 @@ impl Step37TextModel {
             hidden: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             layer_output: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             normed: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
-            full_attention: Step37BatchAttentionWorkspace::new(token_capacity, 64)?,
-            sliding_attention: Step37BatchAttentionWorkspace::new(token_capacity, 96)?,
+            full_attention: Step37BatchAttentionWorkspace::new(
+                token_capacity,
+                max_context_tokens,
+                64,
+            )?,
+            sliding_attention: Step37BatchAttentionWorkspace::new(
+                token_capacity,
+                max_context_tokens,
+                96,
+            )?,
             post_attention: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             ffn_input: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             mlp,
@@ -532,17 +548,19 @@ fn run_attention_prefill(
             position,
             stream,
         )?;
-        row.state.kv_attention[layer_index].append_causal_rows_at_offset_into_on_stream(
-            &mut row.state.kv_cache[layer_index],
-            &workspace.q_rope,
-            &workspace.k_rope,
-            &workspace.v,
-            row_offset,
-            row.token_ids.len(),
-            attention.window,
-            workspace.attended.output(),
-            stream,
-        )?;
+        workspace
+            .compact
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut row.state.kv_cache[layer_index],
+                &workspace.q_rope,
+                &workspace.k_rope,
+                &workspace.v,
+                row_offset,
+                row.token_ids.len(),
+                attention.window,
+                workspace.attended.output(),
+                stream,
+            )?;
         row_offset += row.token_ids.len();
     }
     linear.run(

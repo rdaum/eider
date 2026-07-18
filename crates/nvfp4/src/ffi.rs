@@ -178,6 +178,30 @@ unsafe extern "C" {
         alpha: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_cutlass_fp4_grouped_gemm_supported(
+        m: u32,
+        max_n: u32,
+        k: u32,
+        groups: u32,
+    ) -> i32;
+    pub(crate) fn infer_cutlass_fp4_grouped_gemm_create(
+        m: u32,
+        max_n: u32,
+        k: u32,
+        groups: u32,
+    ) -> *mut c_void;
+    pub(crate) fn infer_cutlass_fp4_grouped_gemm_destroy(plan: *mut c_void);
+    pub(crate) fn infer_cutlass_fp4_grouped_gemm_on_stream(
+        plan: *mut c_void,
+        a_values: *const *const u8,
+        a_scales: *const *const u8,
+        b_values: *const *const u8,
+        b_scales: *const *const u8,
+        output: *const *mut f32,
+        alpha: *const *mut f32,
+        tokens_per_expert: *const u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     #[allow(dead_code)]
     pub(crate) fn infer_sm12x_mma_zero_probe_on_stream(
         out: *mut f32,
@@ -400,6 +424,7 @@ unsafe extern "C" {
         kv_heads: u32,
         head_dim: u32,
         window_tokens: u32,
+        workspace_rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_attention_indexed_on_stream(
@@ -788,6 +813,46 @@ unsafe extern "C" {
         norm_topk_prob: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_moe_sort_routes_on_stream(
+        indices: *const u32,
+        expert_counts: *mut u32,
+        expert_offsets: *mut u32,
+        expert_cursors: *mut u32,
+        sorted_routes: *mut u32,
+        sorted_experts: *mut u32,
+        route_to_sorted: *mut u32,
+        routes: u32,
+        experts: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_quantize_sorted_routes_nvfp4_on_stream(
+        input: *const f32,
+        sorted_routes: *const u32,
+        sorted_experts: *const u32,
+        expert_offsets: *const u32,
+        packed: *mut u8,
+        scales: *mut u8,
+        routes: u32,
+        routes_per_row: u32,
+        in_features: u32,
+        scale_stride: u32,
+        gather_rows: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_grouped_pointer_tables_on_stream(
+        expert_offsets: *const u32,
+        packed: *const u8,
+        scales: *const u8,
+        output: *mut f32,
+        packed_table: *mut *const u8,
+        scale_table: *mut *const u8,
+        output_table: *mut *mut f32,
+        experts: u32,
+        in_features: u32,
+        out_features: u32,
+        scale_stride: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_remap_expert_indices_on_stream(
         expert_indices: *const u32,
         expert_to_slot: *const u32,
@@ -892,6 +957,16 @@ unsafe extern "C" {
         rows: u32,
         len: u32,
         groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+        route_to_sorted: *const u32,
+        route_weights: *const f32,
+        sorted_inputs: *const f32,
+        output: *mut f32,
+        rows: u32,
+        len: u32,
+        routes_per_row: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_qwen36_ffn_finalize_f32_on_stream(

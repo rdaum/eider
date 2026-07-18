@@ -102,29 +102,33 @@ __global__ void infer_quantize_nvfp4_col_major_f32_kernel(const float* input,
     const std::uint32_t row_blocks = (rows + 15) / 16;
     const std::uint32_t col = group / row_blocks;
     const std::uint32_t row_block = group % row_blocks;
-    if (col >= cols || threadIdx.x != 0) {
+    if (col >= cols) {
         return;
     }
 
     const std::uint32_t row_start = row_block * 16;
     const std::uint32_t row_end = min(row_start + 16, rows);
+    const std::uint32_t lane = threadIdx.x;
     float max_abs = 0.0f;
-    for (std::uint32_t row = row_start; row < row_end; ++row) {
-        const float value = input[row + col * rows] / input_scale;
-        if (isfinite(value)) {
-            max_abs = fmaxf(max_abs, fabsf(value));
-        }
+    if (row_start + lane < row_end) {
+        const float value = input[row_start + lane + col * rows] / input_scale;
+        max_abs = isfinite(value) ? fabsf(value) : 0.0f;
     }
+    max_abs = infer_warp_reduce_max(max_abs);
 
-    const std::uint8_t scale_code =
-        max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-                                  __nv_cvt_float_to_fp8(max_abs / 6.0f,
-                                                        __NV_SATFINITE,
-                                                        __NV_E4M3));
+    std::uint32_t scale_word = 0;
+    if (lane == 0) {
+        scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        scales[infer_ue4m3_tiled_scale_offset(col, row_block, rows)] =
+            static_cast<std::uint8_t>(scale_word);
+    }
+    scale_word = __shfl_sync(0xffffffffu, scale_word, 0);
+    const std::uint8_t scale_code = static_cast<std::uint8_t>(scale_word);
     const float scale = infer_e4m3_value(scale_code);
-    scales[infer_ue4m3_tiled_scale_offset(col, row_block, rows)] = scale_code;
 
-    for (std::uint32_t row = row_start; row < row_end; row += 2) {
+    if (lane < 8 && row_start + lane * 2 < row_end) {
+        const std::uint32_t row = row_start + lane * 2;
         const float lo_value = scale == 0.0f ? 0.0f : (input[row + col * rows] / input_scale) / scale;
         const std::uint8_t lo =
             static_cast<std::uint8_t>(__nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
@@ -151,7 +155,7 @@ extern "C" cudaError_t infer_quantize_nvfp4_col_major_f32(const float* input,
     }
 
     const std::uint32_t row_blocks = (rows + 15) / 16;
-    infer_quantize_nvfp4_col_major_f32_kernel<<<cols * row_blocks, 1>>>(
+    infer_quantize_nvfp4_col_major_f32_kernel<<<cols * row_blocks, 32>>>(
         input, packed, scales, rows, cols, input_scale);
     return cudaGetLastError();
 }
@@ -170,7 +174,7 @@ extern "C" cudaError_t infer_quantize_nvfp4_col_major_f32_on_stream(
     }
 
     const std::uint32_t row_blocks = (rows + 15) / 16;
-    infer_quantize_nvfp4_col_major_f32_kernel<<<cols * row_blocks, 1, 0, stream>>>(
+    infer_quantize_nvfp4_col_major_f32_kernel<<<cols * row_blocks, 32, 0, stream>>>(
         input, packed, scales, rows, cols, input_scale);
     return cudaGetLastError();
 }
@@ -1602,6 +1606,214 @@ extern "C" cudaError_t infer_moe_topk_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_moe_count_routes_kernel(
+    const std::uint32_t* __restrict__ indices,
+    std::uint32_t* __restrict__ expert_counts,
+    std::uint32_t routes,
+    std::uint32_t experts) {
+    const std::uint32_t route = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= routes) return;
+    const std::uint32_t expert = indices[route];
+    if (expert < experts) atomicAdd(expert_counts + expert, 1u);
+}
+
+__global__ void infer_moe_prefix_route_counts_kernel(
+    const std::uint32_t* __restrict__ expert_counts,
+    std::uint32_t* __restrict__ expert_offsets,
+    std::uint32_t* __restrict__ expert_cursors,
+    std::uint32_t experts) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    std::uint32_t offset = 0;
+    for (std::uint32_t expert = 0; expert < experts; ++expert) {
+        expert_offsets[expert] = offset;
+        expert_cursors[expert] = offset;
+        offset += expert_counts[expert];
+    }
+    expert_offsets[experts] = offset;
+}
+
+__global__ void infer_moe_scatter_sorted_routes_kernel(
+    const std::uint32_t* __restrict__ indices,
+    std::uint32_t* __restrict__ expert_cursors,
+    std::uint32_t* __restrict__ sorted_routes,
+    std::uint32_t* __restrict__ sorted_experts,
+    std::uint32_t* __restrict__ route_to_sorted,
+    std::uint32_t routes,
+    std::uint32_t experts) {
+    const std::uint32_t route = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= routes) return;
+    const std::uint32_t expert = indices[route];
+    if (expert >= experts) return;
+    const std::uint32_t sorted = atomicAdd(expert_cursors + expert, 1u);
+    sorted_routes[sorted] = route;
+    sorted_experts[sorted] = expert;
+    route_to_sorted[route] = sorted;
+}
+
+extern "C" cudaError_t infer_moe_sort_routes_on_stream(
+    const std::uint32_t* indices,
+    std::uint32_t* expert_counts,
+    std::uint32_t* expert_offsets,
+    std::uint32_t* expert_cursors,
+    std::uint32_t* sorted_routes,
+    std::uint32_t* sorted_experts,
+    std::uint32_t* route_to_sorted,
+    std::uint32_t routes,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (indices == nullptr || expert_counts == nullptr || expert_offsets == nullptr ||
+        expert_cursors == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
+        route_to_sorted == nullptr || routes == 0 || experts == 0 || experts > 1024) {
+        return cudaErrorInvalidValue;
+    }
+    cudaError_t status = cudaMemsetAsync(
+        expert_counts, 0, static_cast<std::size_t>(experts) * sizeof(std::uint32_t), stream);
+    if (status != cudaSuccess) return status;
+    constexpr std::uint32_t kThreads = 256;
+    infer_moe_count_routes_kernel<<<(routes + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        indices, expert_counts, routes, experts);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_moe_prefix_route_counts_kernel<<<1, 1, 0, stream>>>(
+        expert_counts, expert_offsets, expert_cursors, experts);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_moe_scatter_sorted_routes_kernel<<<
+        (routes + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        indices, expert_cursors, sorted_routes, sorted_experts, route_to_sorted,
+        routes, experts);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_quantize_sorted_routes_nvfp4_kernel(
+    const float* __restrict__ input,
+    const std::uint32_t* __restrict__ sorted_routes,
+    const std::uint32_t* __restrict__ sorted_experts,
+    const std::uint32_t* __restrict__ expert_offsets,
+    std::uint8_t* __restrict__ packed,
+    std::uint8_t* __restrict__ scales,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    bool gather_rows) {
+    const std::uint32_t k_blocks = (in_features + 15) / 16;
+    const std::uint32_t task = blockIdx.x;
+    const std::uint32_t sorted = task / k_blocks;
+    const std::uint32_t k_block = task % k_blocks;
+    if (sorted >= routes) return;
+    const std::uint32_t route = sorted_routes[sorted];
+    const std::uint32_t source_row = gather_rows ? route / routes_per_row : sorted;
+    const std::uint32_t expert = sorted_experts[sorted];
+    const std::uint32_t expert_col = sorted - expert_offsets[expert];
+    const std::uint32_t row_start = k_block * 16;
+    const std::uint32_t lane = threadIdx.x;
+    const float* source = input + static_cast<std::size_t>(source_row) * in_features;
+
+    float max_abs = 0.0f;
+    if (row_start + lane < in_features) {
+        const float value = source[row_start + lane];
+        max_abs = isfinite(value) ? fabsf(value) : 0.0f;
+    }
+    max_abs = infer_warp_reduce_max(max_abs);
+    std::uint32_t scale_word = 0;
+    if (lane == 0) {
+        scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        scales[static_cast<std::size_t>(expert) * scale_stride +
+               infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
+            static_cast<std::uint8_t>(scale_word);
+    }
+    scale_word = __shfl_sync(0xffffffffu, scale_word, 0);
+    const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+    if (lane < 8 && row_start + lane * 2 < in_features) {
+        const std::uint32_t row = row_start + lane * 2;
+        const float lo_value = scale == 0.0f ? 0.0f : source[row] / scale;
+        const std::uint8_t lo = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+        std::uint8_t hi = 0;
+        if (row + 1 < in_features) {
+            const float hi_value = scale == 0.0f ? 0.0f : source[row + 1] / scale;
+            hi = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(hi_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+        }
+        packed[(static_cast<std::size_t>(sorted) * in_features + row) / 2] = lo | (hi << 4);
+    }
+}
+
+extern "C" cudaError_t infer_moe_quantize_sorted_routes_nvfp4_on_stream(
+    const float* input,
+    const std::uint32_t* sorted_routes,
+    const std::uint32_t* sorted_experts,
+    const std::uint32_t* expert_offsets,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    int gather_rows,
+    cudaStream_t stream) {
+    if (input == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
+        expert_offsets == nullptr || packed == nullptr || scales == nullptr || routes == 0 ||
+        routes_per_row == 0 || in_features == 0 || (in_features % 16) != 0 ||
+        scale_stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t k_blocks = in_features / 16;
+    infer_moe_quantize_sorted_routes_nvfp4_kernel<<<
+        routes * k_blocks, 32, 0, stream>>>(
+        input, sorted_routes, sorted_experts, expert_offsets, packed, scales,
+        routes, routes_per_row, in_features, scale_stride, gather_rows != 0);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_grouped_pointer_tables_kernel(
+    const std::uint32_t* __restrict__ expert_offsets,
+    const std::uint8_t* __restrict__ packed,
+    const std::uint8_t* __restrict__ scales,
+    float* __restrict__ output,
+    const std::uint8_t** __restrict__ packed_table,
+    const std::uint8_t** __restrict__ scale_table,
+    float** __restrict__ output_table,
+    std::uint32_t experts,
+    std::uint32_t in_features,
+    std::uint32_t out_features,
+    std::uint32_t scale_stride) {
+    const std::uint32_t expert = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert >= experts) return;
+    const std::size_t route_offset = expert_offsets[expert];
+    packed_table[expert] = packed + route_offset * (in_features / 2);
+    scale_table[expert] = scales + static_cast<std::size_t>(expert) * scale_stride;
+    output_table[expert] = output + route_offset * out_features;
+}
+
+extern "C" cudaError_t infer_moe_grouped_pointer_tables_on_stream(
+    const std::uint32_t* expert_offsets,
+    const std::uint8_t* packed,
+    const std::uint8_t* scales,
+    float* output,
+    const std::uint8_t** packed_table,
+    const std::uint8_t** scale_table,
+    float** output_table,
+    std::uint32_t experts,
+    std::uint32_t in_features,
+    std::uint32_t out_features,
+    std::uint32_t scale_stride,
+    cudaStream_t stream) {
+    if (expert_offsets == nullptr || packed == nullptr || scales == nullptr || output == nullptr ||
+        packed_table == nullptr || scale_table == nullptr || output_table == nullptr ||
+        experts == 0 || in_features == 0 || out_features == 0 || scale_stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 128;
+    infer_moe_grouped_pointer_tables_kernel<<<
+        (experts + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        expert_offsets, packed, scales, output, packed_table, scale_table,
+        output_table, experts, in_features, out_features, scale_stride);
+    return cudaGetLastError();
+}
+
 __global__ void infer_remap_expert_indices_kernel(
     const std::uint32_t* expert_indices,
     const std::uint32_t* expert_to_slot,
@@ -2101,6 +2313,52 @@ extern "C" cudaError_t infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
     const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
     infer_moe_weighted_accumulate_slots_f32_batch_kernel<<<blocks, kThreads, 0, stream>>>(
         indices, route_weights, inputs, alpha_table, output, rows, len, groups);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_weighted_accumulate_sorted_f32_batch_kernel(
+    const std::uint32_t* route_to_sorted,
+    const float* route_weights,
+    const float* sorted_inputs,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t len,
+    std::uint32_t routes_per_row) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = rows * len;
+    if (idx >= total) return;
+    const std::uint32_t row = idx / len;
+    const std::uint32_t col = idx % len;
+    const std::uint32_t route_begin = row * routes_per_row;
+    float sum = 0.0f;
+    for (std::uint32_t slot = 0; slot < routes_per_row; ++slot) {
+        const std::uint32_t route = route_begin + slot;
+        const std::uint32_t sorted = route_to_sorted[route];
+        sum += sorted_inputs[static_cast<std::size_t>(sorted) * len + col] *
+               route_weights[route];
+    }
+    output[idx] = sum;
+}
+
+extern "C" cudaError_t infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+    const std::uint32_t* route_to_sorted,
+    const float* route_weights,
+    const float* sorted_inputs,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t len,
+    std::uint32_t routes_per_row,
+    cudaStream_t stream) {
+    if (route_to_sorted == nullptr || route_weights == nullptr || sorted_inputs == nullptr ||
+        output == nullptr || rows == 0 || len == 0 || routes_per_row == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t total = rows * len;
+    infer_moe_weighted_accumulate_sorted_f32_batch_kernel<<<
+        (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        route_to_sorted, route_weights, sorted_inputs, output, rows, len,
+        routes_per_row);
     return cudaGetLastError();
 }
 

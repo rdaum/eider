@@ -41,6 +41,7 @@ pub struct Sm12xKvAttentionWorkspace {
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    causal_row_capacity: usize,
 }
 
 impl Sm12xKvCache {
@@ -567,28 +568,45 @@ impl Sm12xKvAttentionWorkspace {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
+        Self::new_gqa_batched(max_tokens, q_heads, kv_heads, head_dim, 1)
+    }
+
+    /// Allocates scratch for causal prompt attention over several rows per launch.
+    pub fn new_gqa_batched(
+        max_tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        causal_row_capacity: usize,
+    ) -> Result<Self> {
         if max_tokens == 0
             || q_heads == 0
             || kv_heads == 0
             || !q_heads.is_multiple_of(kv_heads)
             || head_dim == 0
             || !head_dim.is_multiple_of(MMA_K)
+            || causal_row_capacity == 0
+            || causal_row_capacity > V_TOKEN_BLOCK
         {
             return Err(Error::Shape {
                 label: "SM12x KV attention workspace",
                 expected: "non-zero sizes and head_dim multiple of 64".to_string(),
                 actual: format!(
-                    "max_tokens={max_tokens} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}"
+                    "max_tokens={max_tokens} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim} causal_rows={causal_row_capacity}"
                 ),
             });
         }
         let head_k_tiles = head_dim / MMA_K;
         let context_tiles = max_tokens.div_ceil(MMA_K);
         let query_groups = kv_heads * (q_heads / kv_heads).div_ceil(MMA_N);
-        let query_tile_count =
-            checked_product("SM12x KV query tiles", &[query_groups, head_k_tiles])?;
-        let probability_tile_count =
-            checked_product("SM12x KV probability tiles", &[query_groups, context_tiles])?;
+        let query_tile_count = checked_product(
+            "SM12x KV query tiles",
+            &[causal_row_capacity, query_groups, head_k_tiles],
+        )?;
+        let probability_tile_count = checked_product(
+            "SM12x KV probability tiles",
+            &[causal_row_capacity, query_groups, context_tiles],
+        )?;
         Ok(Self {
             query_tiles: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV query tile bytes",
@@ -600,7 +618,7 @@ impl Sm12xKvAttentionWorkspace {
             )?)?,
             scores: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV scores",
-                &[q_heads, max_tokens],
+                &[causal_row_capacity, q_heads, max_tokens],
             )?)?,
             probability_tiles: DeviceBuffer::zeroed(checked_product(
                 "SM12x KV probability tile bytes",
@@ -614,6 +632,7 @@ impl Sm12xKvAttentionWorkspace {
             q_heads,
             kv_heads,
             head_dim,
+            causal_row_capacity,
         })
     }
 
@@ -764,8 +783,8 @@ impl Sm12xKvAttentionWorkspace {
         }
     }
 
-    /// Appends a prompt chunk and computes each row's causal compact-cache
-    /// attention before advancing to the next row.
+    /// Appends a prompt chunk and computes causal compact-cache attention in
+    /// bounded row batches that do not cross the V-tail wrap boundary.
     ///
     /// Query, key, value, and output buffers are row-major. `input_row_offset`
     /// selects a contiguous chunk in larger flattened prompt buffers.
@@ -874,6 +893,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     window_tokens.unwrap_or(0) as u32,
+                    self.causal_row_capacity as u32,
                     stream.as_raw(),
                 ),
             )?;
@@ -1372,7 +1392,7 @@ mod tests {
     #[test]
     fn compact_causal_rows_match_repeated_append_and_attention() {
         const MAX_TOKENS: usize = 32;
-        const TOKENS: usize = 6;
+        const TOKENS: usize = 23;
         const KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 64;
         const Q_HEADS: usize = KV_HEADS * MMA_N;
@@ -1400,8 +1420,9 @@ mod tests {
 
         let mut chunk_cache =
             Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("chunk cache");
-        let mut chunk_workspace = Sm12xKvAttentionWorkspace::new(MAX_TOKENS, KV_HEADS, HEAD_DIM)
-            .expect("chunk workspace");
+        let mut chunk_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa_batched(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM, 8)
+                .expect("chunk workspace");
         let mut chunk_output = DeviceBuffer::<f32>::zeroed(TOKENS * q_width).expect("chunk output");
         chunk_workspace
             .append_causal_rows_at_offset_into_on_stream(
@@ -1506,7 +1527,7 @@ mod tests {
         let mut chunk_cache =
             Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("chunk cache");
         let mut chunk_workspace =
-            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+            Sm12xKvAttentionWorkspace::new_gqa_batched(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM, 8)
                 .expect("chunk workspace");
         let mut chunk_output = DeviceBuffer::<f32>::zeroed(TOKENS * q_width).expect("chunk output");
         chunk_workspace

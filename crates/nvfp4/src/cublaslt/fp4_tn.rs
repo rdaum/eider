@@ -1007,6 +1007,131 @@ impl Drop for CutlassFp4GroupedGemvF32Plan {
     }
 }
 
+/// Persistent CUTLASS grouped NVFP4 GEMM plan for expert-major MoE batches.
+///
+/// Each expert has its own weight, activation, scale, output, and scalar pointer.
+/// The token count for every expert remains device-resident, so running the plan
+/// does not require a route-count readback.
+pub struct CutlassFp4GroupedGemmPlan {
+    raw: *mut c_void,
+    m: usize,
+    max_n: usize,
+    k: usize,
+    groups: usize,
+}
+
+impl CutlassFp4GroupedGemmPlan {
+    /// Returns whether the native grouped GEMM wrapper supports this shape.
+    pub fn supported(m: usize, max_n: usize, k: usize, groups: usize) -> bool {
+        if [m, max_n, k, groups]
+            .into_iter()
+            .any(|dimension| dimension > u32::MAX as usize)
+        {
+            return false;
+        }
+        unsafe {
+            ffi::infer_cutlass_fp4_grouped_gemm_supported(
+                m as u32,
+                max_n as u32,
+                k as u32,
+                groups as u32,
+            ) != 0
+        }
+    }
+
+    /// Creates a persistent grouped GEMM plan.
+    pub fn new(m: usize, max_n: usize, k: usize, groups: usize) -> Result<Self> {
+        if !Self::supported(m, max_n, k, groups) {
+            return Err(Error::Shape {
+                label: "CUTLASS grouped FP4 GEMM shape",
+                expected: "supported M,max-N,K,groups".to_string(),
+                actual: format!("M={m}, max-N={max_n}, K={k}, groups={groups}"),
+            });
+        }
+        let raw = unsafe {
+            ffi::infer_cutlass_fp4_grouped_gemm_create(
+                m as u32,
+                max_n as u32,
+                k as u32,
+                groups as u32,
+            )
+        };
+        if raw.is_null() {
+            return Err(Error::Cuda("infer_cutlass_fp4_grouped_gemm_create", -1));
+        }
+        Ok(Self {
+            raw,
+            m,
+            max_n,
+            k,
+            groups,
+        })
+    }
+
+    /// Launches grouped GEMM using device-resident pointer tables and route counts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_on_stream(
+        &self,
+        a_values: &DeviceBuffer<*const u8>,
+        a_scales: &DeviceBuffer<*const u8>,
+        b_values: &DeviceBuffer<*const u8>,
+        b_scales: &DeviceBuffer<*const u8>,
+        output: &DeviceBuffer<*mut f32>,
+        alpha: &DeviceBuffer<*mut f32>,
+        tokens_per_expert: &DeviceBuffer<u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for (label, len) in [
+            ("A values", a_values.len()),
+            ("A scales", a_scales.len()),
+            ("B values", b_values.len()),
+            ("B scales", b_scales.len()),
+            ("output", output.len()),
+            ("alpha", alpha.len()),
+            ("tokens per expert", tokens_per_expert.len()),
+        ] {
+            if len != self.groups {
+                return Err(Error::Shape {
+                    label: "CUTLASS grouped FP4 GEMM arrays",
+                    expected: format!("{} entries", self.groups),
+                    actual: format!("{label} has {len}"),
+                });
+            }
+        }
+        unsafe {
+            check_cuda(
+                "infer_cutlass_fp4_grouped_gemm_on_stream",
+                ffi::infer_cutlass_fp4_grouped_gemm_on_stream(
+                    self.raw,
+                    a_values.as_const_ptr().cast(),
+                    a_scales.as_const_ptr().cast(),
+                    b_values.as_const_ptr().cast(),
+                    b_scales.as_const_ptr().cast(),
+                    output.as_const_ptr().cast(),
+                    alpha.as_const_ptr().cast(),
+                    tokens_per_expert.as_const_ptr().cast(),
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Returns `(M, max-N, K, groups)` for this plan.
+    pub fn shape(&self) -> (usize, usize, usize, usize) {
+        (self.m, self.max_n, self.k, self.groups)
+    }
+}
+
+impl Drop for CutlassFp4GroupedGemmPlan {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                ffi::infer_cutlass_fp4_grouped_gemm_destroy(self.raw);
+            }
+        }
+    }
+}
+
 /// Owned FP4 TN matmul operation.
 ///
 /// This owns the cuBLASLt handle, NVFP4 inputs, BF16 C/D buffers, and plan
@@ -1544,6 +1669,128 @@ mod tests {
                 assert!(
                     error <= allowed,
                     "group {group} grouped GEMV mismatch: actual={actual}, expected={expected}, error={error}, allowed={allowed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_cutlass_fp4_grouped_gemm_f32_output() {
+        let m = 128;
+        let k = 256;
+        let columns = [3usize, 5usize];
+        let groups = columns.len();
+        let max_n = *columns.iter().max().expect("columns");
+        if !CutlassFp4GroupedGemmPlan::supported(m, max_n, k, groups) {
+            return;
+        }
+
+        let mut a_matrices = Vec::new();
+        let mut b_matrices = Vec::new();
+        let mut a_quantized = Vec::new();
+        let mut b_quantized = Vec::new();
+        for (group, &n) in columns.iter().enumerate() {
+            let a_host = random_col_major(k, m, 0x3141_5926_5358_9793 ^ group as u64);
+            let b_host = random_col_major(k, n, 0x2718_2818_2845_9045 ^ group as u64);
+            let aq = format::quantize_nvfp4_col_major(k, m, &a_host);
+            let bq = format::quantize_nvfp4_col_major(k, n, &b_host);
+            a_matrices.push(
+                Nvfp4Matrix::from_packed_col_major_parts(k, m, &aq.packed_values, &aq.scales)
+                    .expect("A upload"),
+            );
+            b_matrices.push(
+                Nvfp4Matrix::from_packed_col_major_parts(k, n, &bq.packed_values, &bq.scales)
+                    .expect("B upload"),
+            );
+            a_quantized.push(aq);
+            b_quantized.push(bq);
+        }
+
+        let a_values = DeviceBuffer::from_host(
+            &a_matrices
+                .iter()
+                .map(|matrix| matrix.input().values_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("A values table");
+        let a_scales = DeviceBuffer::from_host(
+            &a_matrices
+                .iter()
+                .map(|matrix| matrix.input().scales_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("A scales table");
+        let b_values = DeviceBuffer::from_host(
+            &b_matrices
+                .iter()
+                .map(|matrix| matrix.input().values_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("B values table");
+        let b_scales = DeviceBuffer::from_host(
+            &b_matrices
+                .iter()
+                .map(|matrix| matrix.input().scales_ptr())
+                .collect::<Vec<_>>(),
+        )
+        .expect("B scales table");
+
+        let mut outputs = columns
+            .iter()
+            .map(|&n| F32Matrix::zeroed(m, n).expect("D alloc"))
+            .collect::<Vec<_>>();
+        let output_ptrs = outputs
+            .iter_mut()
+            .map(|output| output.output().data_mut_ptr())
+            .collect::<Vec<_>>();
+        let output = DeviceBuffer::from_host(&output_ptrs).expect("D table");
+        let mut alpha_storage = (0..groups)
+            .map(|_| DeviceBuffer::from_host(&[1.0f32]).expect("alpha"))
+            .collect::<Vec<_>>();
+        let alpha = DeviceBuffer::from_host(
+            &alpha_storage
+                .iter_mut()
+                .map(|scalar| scalar.as_mut_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("alpha table");
+        let tokens_per_expert =
+            DeviceBuffer::from_host(&columns.iter().map(|&n| n as u32).collect::<Vec<_>>())
+                .expect("token counts");
+
+        let plan = CutlassFp4GroupedGemmPlan::new(m, max_n, k, groups).expect("grouped GEMM plan");
+        let stream = crate::CudaStream::new_non_blocking().expect("stream");
+        plan.run_on_stream(
+            &a_values,
+            &a_scales,
+            &b_values,
+            &b_scales,
+            &output,
+            &alpha,
+            &tokens_per_expert,
+            &stream,
+        )
+        .expect("grouped GEMM launch");
+
+        for group in 0..groups {
+            let actual = outputs[group]
+                .data()
+                .copy_to_host(&stream)
+                .expect("copy output");
+            let a_t = transpose_col_major(&a_quantized[group].dequantized_values, k, m);
+            let expected = format::cpu_matmul_col_major(
+                &a_t,
+                &b_quantized[group].dequantized_values,
+                m,
+                columns[group],
+                k,
+            );
+            for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let error = (actual - expected).abs();
+                let allowed = 0.25f32.max(expected.abs() * 0.02);
+                assert!(
+                    error <= allowed,
+                    "group {group} value {index}: actual={actual}, expected={expected}, error={error}, allowed={allowed}"
                 );
             }
         }

@@ -1810,11 +1810,12 @@ impl Nemotron3BlockWorkspace {
             compact_attention: model
                 .compact_kv_cache
                 .then(|| {
-                    Sm12xKvAttentionWorkspace::new_gqa(
+                    Sm12xKvAttentionWorkspace::new_gqa_batched(
                         model.manifest.max_position_embeddings,
                         model.manifest.attention_heads,
                         model.manifest.kv_heads,
                         model.manifest.attention_head_dim,
+                        8,
                     )
                 })
                 .transpose()?,
