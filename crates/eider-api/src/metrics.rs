@@ -92,11 +92,17 @@ pub struct ServerMetrics {
     #[help = "HTTP request handling duration in microseconds"]
     pub request_duration_us: Histogram,
 
+    #[help = "Inference request submission-to-admission duration in microseconds"]
+    pub request_admission_duration_us: Histogram,
+
     #[help = "Decode tokens per second"]
     pub decode_tokens_per_second: Histogram,
 
-    #[help = "Prefill tokens per second"]
+    #[help = "Effective prefill tokens per second including admission latency"]
     pub prefill_tokens_per_second: Histogram,
+
+    #[help = "Uncached prefill tokens per second after request admission"]
+    pub prefill_compute_tokens_per_second: Histogram,
 }
 
 impl ServerMetrics {
@@ -116,8 +122,10 @@ impl ServerMetrics {
             dogstatsd_configured: Gauge::new(),
             dogstatsd_export_ticks: Counter::new(shard_count),
             request_duration_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            request_admission_duration_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             decode_tokens_per_second: Histogram::new(RATE_BUCKETS, shard_count),
             prefill_tokens_per_second: Histogram::new(RATE_BUCKETS, shard_count),
+            prefill_compute_tokens_per_second: Histogram::new(RATE_BUCKETS, shard_count),
         }
     }
 }

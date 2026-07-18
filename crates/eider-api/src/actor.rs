@@ -103,6 +103,7 @@ struct ActiveRequest {
 
 struct SessionMetrics {
     submitted_at: Instant,
+    admitted_at: Option<Instant>,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
     sequence_device_bytes: usize,
@@ -119,7 +120,8 @@ struct SessionMetrics {
 struct PrefillMetricsSnapshot {
     prompt_position: usize,
     interval_tokens_per_second: f64,
-    total_tokens_per_second: f64,
+    compute_tokens_per_second: f64,
+    effective_tokens_per_second: f64,
 }
 
 struct SessionMetricsSnapshot {
@@ -927,16 +929,17 @@ fn run_actor_loop(
         }
         for admission in &tick.admitted {
             if let Some(request) = active.get_mut(&admission.request_id) {
-                request.metrics.sequence_device_bytes = admission.sequence_device_bytes;
-                request.metrics.cached_prompt_tokens = admission.cached_prompt_tokens;
-                request.metrics.prefilled_tokens = admission.cached_prompt_tokens;
-                request.metrics.last_prefill_report_tokens = admission.cached_prompt_tokens;
-                request.metrics.last_prefill_report_at = now;
+                request.metrics.record_admission(
+                    now,
+                    admission.cached_prompt_tokens,
+                    admission.sequence_device_bytes,
+                );
                 infer_metrics().requests_admitted.inc();
                 info!(
                     session = request.external_id.0,
                     state_bytes = admission.sequence_device_bytes,
                     cached_prompt_tokens = admission.cached_prompt_tokens,
+                    admission_ms = request.metrics.admission_duration().as_secs_f64() * 1000.0,
                     active_sequences = tick.active_sequences,
                     "request admitted"
                 );
@@ -968,7 +971,8 @@ fn run_actor_loop(
                         prompt_position = snapshot.prompt_position,
                         prompt_tokens = request.metrics.prompt_tokens,
                         interval_tok_s = snapshot.interval_tokens_per_second,
-                        prefill_tok_s = snapshot.total_tokens_per_second,
+                        prefill_compute_tok_s = snapshot.compute_tokens_per_second,
+                        effective_prefill_tok_s = snapshot.effective_tokens_per_second,
                         "prefill progress"
                     );
                 }
@@ -981,13 +985,31 @@ fn run_actor_loop(
                 infer_metrics().generated_tokens.inc();
                 if starting {
                     let ttft = now.duration_since(request.metrics.submitted_at);
+                    let admission = request.metrics.admission_duration();
+                    let prefill_compute = request.metrics.prefill_compute_duration(now);
+                    let effective_prefill_tok_s =
+                        request.metrics.effective_prefill_tokens_per_second(now);
+                    let prefill_compute_tok_s =
+                        request.metrics.prefill_compute_tokens_per_second(now);
                     infer_metrics().ttft_us.record(duration_us(ttft));
+                    server_metrics()
+                        .request_admission_duration_us
+                        .record(duration_us(admission));
+                    server_metrics()
+                        .prefill_tokens_per_second
+                        .record(effective_prefill_tok_s as u64);
+                    server_metrics()
+                        .prefill_compute_tokens_per_second
+                        .record(prefill_compute_tok_s as u64);
                     info!(
                         session = request.external_id.0,
                         ttft_ms = ttft.as_secs_f64() * 1000.0,
+                        admission_ms = admission.as_secs_f64() * 1000.0,
+                        prefill_compute_ms = prefill_compute.as_secs_f64() * 1000.0,
                         prompt_tokens = request.metrics.prompt_tokens,
                         cached_prompt_tokens = request.metrics.cached_prompt_tokens,
-                        prefill_tok_s = request.metrics.prefill_tokens_per_second(now),
+                        prefill_compute_tok_s,
+                        effective_prefill_tok_s,
                         "decoding started"
                     );
                 }
@@ -1026,9 +1048,6 @@ fn run_actor_loop(
                 server_metrics()
                     .decode_tokens_per_second
                     .record(request.metrics.decode_tokens_per_second() as u64);
-                server_metrics()
-                    .prefill_tokens_per_second
-                    .record(request.metrics.prefill_tokens_per_second(now) as u64);
                 request.metrics.log_finished(
                     request.external_id,
                     now,
@@ -1192,6 +1211,7 @@ impl SessionMetrics {
     fn new(submitted_at: Instant, prompt_tokens: usize) -> Self {
         Self {
             submitted_at,
+            admitted_at: None,
             prompt_tokens,
             cached_prompt_tokens: 0,
             sequence_device_bytes: 0,
@@ -1204,6 +1224,20 @@ impl SessionMetrics {
             last_report_tokens: 0,
             generated_tokens: 0,
         }
+    }
+
+    fn record_admission(
+        &mut self,
+        now: Instant,
+        cached_prompt_tokens: usize,
+        sequence_device_bytes: usize,
+    ) {
+        self.admitted_at = Some(now);
+        self.sequence_device_bytes = sequence_device_bytes;
+        self.cached_prompt_tokens = cached_prompt_tokens;
+        self.prefilled_tokens = cached_prompt_tokens;
+        self.last_prefill_report_tokens = cached_prompt_tokens;
+        self.last_prefill_report_at = now;
     }
 
     fn record_prefill(
@@ -1220,7 +1254,8 @@ impl SessionMetrics {
         let snapshot = PrefillMetricsSnapshot {
             prompt_position,
             interval_tokens_per_second: rate(interval_tokens, interval),
-            total_tokens_per_second: self.prefill_tokens_per_second(now),
+            compute_tokens_per_second: self.prefill_compute_tokens_per_second(now),
+            effective_tokens_per_second: self.effective_prefill_tokens_per_second(now),
         };
         self.last_prefill_report_at = now;
         self.last_prefill_report_tokens = prompt_position;
@@ -1270,6 +1305,8 @@ impl SessionMetrics {
         let time_to_first_token = self.first_token_at.map_or(Duration::ZERO, |first| {
             first.duration_since(self.submitted_at)
         });
+        let admission = self.admission_duration();
+        let prefill_compute = self.prefill_compute_duration(now);
         info!(
             session = id.0,
             prompt_tokens = finished.usage.prompt_tokens,
@@ -1277,6 +1314,10 @@ impl SessionMetrics {
             output_tokens = finished.usage.completion_tokens,
             reasoning_tokens = finished.usage.reasoning_tokens,
             ttft_ms = time_to_first_token.as_secs_f64() * 1000.0,
+            admission_ms = admission.as_secs_f64() * 1000.0,
+            prefill_compute_ms = prefill_compute.as_secs_f64() * 1000.0,
+            prefill_compute_tok_s = self.prefill_compute_tokens_per_second(now),
+            effective_prefill_tok_s = self.effective_prefill_tokens_per_second(now),
             decode_tok_s = self.decode_tokens_per_second(),
             total_tok_s = rate(
                 finished.usage.completion_tokens,
@@ -1332,12 +1373,37 @@ impl SessionMetrics {
         );
     }
 
-    fn prefill_tokens_per_second(&self, now: Instant) -> f64 {
+    fn admission_duration(&self) -> Duration {
+        self.admitted_at.map_or(Duration::ZERO, |admitted| {
+            admitted.duration_since(self.submitted_at)
+        })
+    }
+
+    fn prefill_compute_duration(&self, now: Instant) -> Duration {
+        let Some(admitted) = self.admitted_at else {
+            return Duration::ZERO;
+        };
+        self.first_token_at.unwrap_or(now).duration_since(admitted)
+    }
+
+    fn effective_prefill_tokens_per_second(&self, now: Instant) -> f64 {
+        let finished = self.first_token_at.unwrap_or(now);
         rate(
-            self.prefilled_tokens
-                .saturating_sub(self.cached_prompt_tokens),
-            now.duration_since(self.submitted_at),
+            self.uncached_prefilled_tokens(),
+            finished.duration_since(self.submitted_at),
         )
+    }
+
+    fn prefill_compute_tokens_per_second(&self, now: Instant) -> f64 {
+        rate(
+            self.uncached_prefilled_tokens(),
+            self.prefill_compute_duration(now),
+        )
+    }
+
+    fn uncached_prefilled_tokens(&self) -> usize {
+        self.prefilled_tokens
+            .saturating_sub(self.cached_prompt_tokens)
     }
 
     fn decode_tokens_per_second(&self) -> f64 {
@@ -1401,6 +1467,7 @@ mod tests {
     fn session_metrics_report_prefill_progress_and_rates() {
         let submitted = Instant::now();
         let mut metrics = SessionMetrics::new(submitted, 1_000);
+        metrics.record_admission(submitted, 0, 0);
         assert!(
             metrics
                 .record_prefill(submitted + Duration::from_secs(5), 100)
@@ -1412,30 +1479,56 @@ mod tests {
             .expect("ten-second report interval elapsed");
         assert_eq!(first.prompt_position, 300);
         assert_eq!(first.interval_tokens_per_second, 30.0);
-        assert_eq!(first.total_tokens_per_second, 30.0);
+        assert_eq!(first.compute_tokens_per_second, 30.0);
+        assert_eq!(first.effective_tokens_per_second, 30.0);
 
         let second = metrics
             .record_prefill(submitted + Duration::from_secs(20), 500)
             .expect("second report interval elapsed");
         assert_eq!(second.prompt_position, 500);
         assert_eq!(second.interval_tokens_per_second, 20.0);
-        assert_eq!(second.total_tokens_per_second, 25.0);
+        assert_eq!(second.compute_tokens_per_second, 25.0);
+        assert_eq!(second.effective_tokens_per_second, 25.0);
     }
 
     #[test]
     fn session_metrics_exclude_cached_tokens_from_prefill_rates() {
         let submitted = Instant::now();
         let mut metrics = SessionMetrics::new(submitted, 1_000);
-        metrics.cached_prompt_tokens = 256;
-        metrics.prefilled_tokens = 256;
-        metrics.last_prefill_report_tokens = 256;
+        metrics.record_admission(submitted, 256, 0);
 
         let snapshot = metrics
             .record_prefill(submitted + Duration::from_secs(10), 456)
             .expect("ten-second report interval elapsed");
         assert_eq!(snapshot.prompt_position, 456);
         assert_eq!(snapshot.interval_tokens_per_second, 20.0);
-        assert_eq!(snapshot.total_tokens_per_second, 20.0);
+        assert_eq!(snapshot.compute_tokens_per_second, 20.0);
+        assert_eq!(snapshot.effective_tokens_per_second, 20.0);
+    }
+
+    #[test]
+    fn session_metrics_separate_admission_compute_and_effective_prefill() {
+        let submitted = Instant::now();
+        let admitted = submitted + Duration::from_secs(2);
+        let first_token = submitted + Duration::from_secs(5);
+        let mut metrics = SessionMetrics::new(submitted, 1_000);
+        metrics.record_admission(admitted, 256, 123_456);
+        metrics.prefilled_tokens = 456;
+        metrics.record_token(first_token);
+
+        assert_eq!(metrics.admission_duration(), Duration::from_secs(2));
+        assert_eq!(
+            metrics.prefill_compute_duration(first_token),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            metrics.prefill_compute_tokens_per_second(first_token),
+            200.0 / 3.0
+        );
+        assert_eq!(
+            metrics.effective_prefill_tokens_per_second(first_token),
+            40.0
+        );
     }
 
     #[test]
