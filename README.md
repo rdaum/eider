@@ -5,10 +5,10 @@
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
 Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
-Step-3.7-Flash, and NVIDIA's Nemotron 3 hybrid architecture. It includes an
+Step-3.7-Flash, and NVIDIA's Nemotron 3 Puzzle hybrid model. It includes an
 OpenAI API-compatible server with continuous multi-session scheduling and a
-compact FP4 KV cache for attention layers. Nemotron combines it for backbone
-attention with Mamba recurrent state.
+compact FP4 KV cache for the Qwen and Step attention paths. Nemotron combines
+backbone attention with Mamba recurrent state.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -48,10 +48,9 @@ time. With 240 of 288 experts resident per routed layer, this reduces device
 weights from 95.5 to 87.3 GiB and sustains about 20.4 API decode tokens/sec once
 the required experts are resident.
 
-[Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
-is a 120B hybrid model that fits on one Spark in 65.6 GiB. Its greedy
-speculative decode reaches about 32 tokens/sec on GB10, compared with 26 for
-vLLM.
+[Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4)
+is a compressed hybrid agent model derived from Nemotron 3 Super. Its NVFP4
+checkpoint occupies 41.9 GiB of Eider device weights on Spark.
 
 Compared with a vLLM setup in docker, the more biggest differences is
 operational: Eider starts up substantially faster and has a smaller idle footprint
@@ -127,10 +126,10 @@ attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
 retain those types or convert the BF16 weights to FP8 or NVFP4. The checkpoint
 also contains a vision tower, but Eider currently serves its text path only.
 
-[NVIDIA Nemotron 3 Super 120B-A12B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4)
+[NVIDIA Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4)
 uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
-backbone. Eider converts its remaining dense BF16 and FP8 weights to NVFP4,
-retaining 65.6 GiB including its MTP block.
+backbone with layer-specific expert widths and top-k routing. Eider loads those
+checkpoint settings directly and retains 41.9 GiB including its MTP block.
 
 The first Qwen3.6 startup builds the SM12x down-weight cache under
 `.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
@@ -162,16 +161,16 @@ Start Step-3.7 with:
 scripts/run-eider-stepfun-server.sh
 ```
 
-Start Nemotron 3 Super with:
+Start Nemotron Labs 3 Puzzle with:
 
 ```sh
-scripts/run-eider-nemotron3-super-server.sh
+scripts/run-eider-nemotron3-puzzle-server.sh
 ```
 
-The Nemotron launcher stores dense weights and backbone-attention KV in NVFP4 by
-default. Set `EIDER_NEMOTRON_KV_CACHE=f32` for the uncompressed cache. It also
-uses the shared prompt-prefix cache by default; set `--prefix-cache-gib 0` to
-disable it.
+The Nemotron launcher stores dense weights in NVFP4 and uses an FP32
+backbone-attention cache by default. Set `EIDER_NEMOTRON_KV_CACHE=nvfp4` when
+long-context headroom matters more than serving speed. It also uses the shared
+prompt-prefix cache by default; set `--prefix-cache-gib 0` to disable it.
 
 The StepFun launcher prepares or validates the disk-backed expert cache before
 starting the server and defaults to 240 resident experts per routed layer. Set
@@ -265,11 +264,11 @@ cargo run --release -p infer --bin qwen36-generate -- \
     models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
 ```
 
-Nemotron 3 Super smoke test:
+Nemotron Labs 3 Puzzle smoke test:
 
 ```sh
 cargo run --release -p infer --bin nemotron3-generate -- \
-    models/nemotron-3-super-120b-a12b-nvfp4 "What is 2+2?" 30 nvfp4 nvfp4
+    models/nemotron-labs-3-puzzle-75b-a9b-nvfp4 "What is 2+2?" 30 nvfp4 nvfp4
 ```
 
 The generator applies the checkpoint's text chat prefix and reads its sampling

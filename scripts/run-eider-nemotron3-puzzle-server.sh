@@ -3,9 +3,9 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-model_dir="${EIDER_MODEL_DIR:-$repo_dir/models/nemotron-3-super-120b-a12b-nvfp4}"
+model_dir="${EIDER_MODEL_DIR:-$repo_dir/models/nemotron-labs-3-puzzle-75b-a9b-nvfp4}"
 listen="${EIDER_LISTEN:-127.0.0.1:8080}"
-served_model="${EIDER_SERVED_MODEL:-eider-nemotron3-super}"
+served_model="${EIDER_SERVED_MODEL:-eider-nemotron3-puzzle}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-262144}"
 bf16_storage="${EIDER_NEMOTRON_BF16_STORAGE:-nvfp4}"
 fp8_storage="${EIDER_NEMOTRON_FP8_STORAGE:-nvfp4}"

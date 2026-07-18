@@ -95,8 +95,8 @@ enum NemotronFp8StorageArg {
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum NemotronKvCacheStorageArg {
-    F32,
     #[default]
+    F32,
     Nvfp4,
 }
 
@@ -197,7 +197,7 @@ struct Args {
     nemotron_fp8_storage: NemotronFp8StorageArg,
 
     /// Runtime storage for Nemotron attention key/value cache pages.
-    #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::Nvfp4)]
+    #[arg(long, value_enum, default_value_t = NemotronKvCacheStorageArg::F32)]
     nemotron_kv_cache: NemotronKvCacheStorageArg,
 
     /// Environment variable containing an optional server bearer token.

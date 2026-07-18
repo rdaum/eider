@@ -43,6 +43,7 @@ enum OutputMode {
     Reasoning,
     Text,
     ToolCall,
+    DirectToolCall,
 }
 
 /// Request-scoped tokenizer and Qwen tool-protocol decoder.
@@ -125,16 +126,33 @@ struct ChatOutputParser {
     trim_after_thinking: bool,
     trim_after_tool_call: bool,
     string_arguments: BTreeMap<String, BTreeSet<String>>,
+    tool_parameters: BTreeMap<String, ToolParameters>,
+    direct_tools: Vec<DirectTool>,
+    active_direct_tool: Option<usize>,
     finished: bool,
+}
+
+struct ToolParameters {
+    names: BTreeSet<String>,
+    required: BTreeSet<String>,
+}
+
+struct DirectTool {
+    name: String,
+    parameter: String,
+    open: String,
+    close: String,
 }
 
 impl ChatOutputParser {
     fn new(tools: &[ChatTool], starts_in_reasoning: bool) -> Result<Self> {
         let mut string_arguments = BTreeMap::new();
+        let mut tool_parameters = BTreeMap::new();
+        let mut direct_tools = Vec::new();
         for tool in tools {
             let name = tool.function.name.clone();
-            let string_parameters = tool.function.parameters["properties"]
-                .as_object()
+            let properties = tool.function.parameters["properties"].as_object();
+            let string_parameters: BTreeSet<String> = properties
                 .map(|properties| {
                     properties
                         .iter()
@@ -143,15 +161,38 @@ impl ChatOutputParser {
                         .collect()
                 })
                 .unwrap_or_default();
-            if string_arguments
-                .insert(name.clone(), string_parameters)
-                .is_some()
-            {
+            if string_arguments.contains_key(&name) {
                 return Err(Error::Format {
                     label: "chat output tools",
                     detail: format!("duplicate function definition {name:?}"),
                 });
             }
+            let names = properties
+                .map(|properties| properties.keys().cloned().collect())
+                .unwrap_or_default();
+            let required: BTreeSet<String> = tool.function.parameters["required"]
+                .as_array()
+                .map(|required| {
+                    required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if required.len() == 1 {
+                let parameter = required.iter().next().expect("one required parameter");
+                if string_parameters.contains(parameter) {
+                    direct_tools.push(DirectTool {
+                        open: format!("<{name}>"),
+                        close: format!("</{name}>"),
+                        name: name.clone(),
+                        parameter: parameter.clone(),
+                    });
+                }
+            }
+            string_arguments.insert(name.clone(), string_parameters);
+            tool_parameters.insert(name, ToolParameters { names, required });
         }
         Ok(Self {
             mode: if starts_in_reasoning {
@@ -164,6 +205,9 @@ impl ChatOutputParser {
             trim_after_thinking: false,
             trim_after_tool_call: false,
             string_arguments,
+            tool_parameters,
+            direct_tools,
+            active_direct_tool: None,
             finished: false,
         })
     }
@@ -182,6 +226,7 @@ impl ChatOutputParser {
                 OutputMode::Reasoning => self.parse_reasoning(&mut events),
                 OutputMode::Text => self.parse_text(&mut events),
                 OutputMode::ToolCall => self.parse_tool_call(&mut events)?,
+                OutputMode::DirectToolCall => self.parse_direct_tool_call(&mut events)?,
             };
             if !progressed {
                 break;
@@ -210,6 +255,11 @@ impl ChatOutputParser {
             OutputMode::ToolCall => Err(Error::Format {
                 label: "chat tool call",
                 detail: "generation ended inside an unterminated <tool_call>".to_string(),
+            }),
+            OutputMode::DirectToolCall if truncated => Ok(Vec::new()),
+            OutputMode::DirectToolCall => Err(Error::Format {
+                label: "chat tool call",
+                detail: "generation ended inside an unterminated direct tool call".to_string(),
             }),
         }
     }
@@ -246,7 +296,20 @@ impl ChatOutputParser {
             self.trim_after_thinking = false;
             self.trim_after_tool_call = false;
         }
-        if let Some(index) = self.pending.find(TOOL_CALL_OPEN) {
+        let direct_open = self
+            .direct_tools
+            .iter()
+            .enumerate()
+            .filter_map(|(tool, definition)| {
+                self.pending
+                    .find(&definition.open)
+                    .map(|index| (index, tool))
+            })
+            .min_by_key(|(index, _)| *index);
+        let xml_open = self.pending.find(TOOL_CALL_OPEN);
+        if let Some(index) = xml_open
+            .filter(|index| direct_open.is_none_or(|(direct_index, _)| *index <= direct_index))
+        {
             push_nonempty(
                 events,
                 ChatOutputEvent::Text(self.pending[..index].to_string()),
@@ -255,9 +318,21 @@ impl ChatOutputParser {
             self.mode = OutputMode::ToolCall;
             return true;
         }
-        flush_safe_prefix(
+        if let Some((index, tool)) = direct_open {
+            push_nonempty(
+                events,
+                ChatOutputEvent::Text(self.pending[..index].to_string()),
+            );
+            let open_len = self.direct_tools[tool].open.len();
+            self.pending.drain(..index + open_len);
+            self.active_direct_tool = Some(tool);
+            self.mode = OutputMode::DirectToolCall;
+            return true;
+        }
+        flush_safe_prefix_with_markers(
             &mut self.pending,
-            TOOL_CALL_OPEN,
+            std::iter::once(TOOL_CALL_OPEN)
+                .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
             events,
             ChatOutputEvent::Text,
         )
@@ -273,7 +348,33 @@ impl ChatOutputParser {
         let remainder = self.tool_call[index + TOOL_CALL_CLOSE.len()..].to_string();
         self.tool_call.clear();
         self.pending = remainder;
-        let function = parse_function_call(&body, &self.string_arguments)?;
+        let function = parse_function_call(&body, &self.string_arguments, &self.tool_parameters)?;
+        let id = next_tool_call_id()?;
+        events.push(ChatOutputEvent::ToolCall(ChatToolCall { id, function }));
+        self.mode = OutputMode::Text;
+        self.trim_after_tool_call = true;
+        Ok(true)
+    }
+
+    fn parse_direct_tool_call(&mut self, events: &mut Vec<ChatOutputEvent>) -> Result<bool> {
+        self.tool_call.push_str(&self.pending);
+        self.pending.clear();
+        let tool = self
+            .active_direct_tool
+            .expect("direct tool call has an active tool");
+        let definition = &self.direct_tools[tool];
+        let Some(index) = self.tool_call.find(&definition.close) else {
+            return Ok(false);
+        };
+        let argument = strip_protocol_newlines(&self.tool_call[..index]).to_string();
+        let remainder = self.tool_call[index + definition.close.len()..].to_string();
+        let function = ChatFunctionCall {
+            name: definition.name.clone(),
+            arguments: BTreeMap::from([(definition.parameter.clone(), Value::String(argument))]),
+        };
+        self.tool_call.clear();
+        self.pending = remainder;
+        self.active_direct_tool = None;
         let id = next_tool_call_id()?;
         events.push(ChatOutputEvent::ToolCall(ChatToolCall { id, function }));
         self.mode = OutputMode::Text;
@@ -289,6 +390,26 @@ fn flush_safe_prefix(
     make_event: fn(String) -> ChatOutputEvent,
 ) -> bool {
     let held = longest_marker_prefix_suffix(pending, marker);
+    let emit_bytes = pending.len() - held;
+    if emit_bytes == 0 {
+        return false;
+    }
+    let emitted = pending[..emit_bytes].to_string();
+    pending.drain(..emit_bytes);
+    push_nonempty(events, make_event(emitted));
+    true
+}
+
+fn flush_safe_prefix_with_markers<'a>(
+    pending: &mut String,
+    markers: impl Iterator<Item = &'a str>,
+    events: &mut Vec<ChatOutputEvent>,
+    make_event: fn(String) -> ChatOutputEvent,
+) -> bool {
+    let held = markers
+        .map(|marker| longest_marker_prefix_suffix(pending, marker))
+        .max()
+        .unwrap_or(0);
     let emit_bytes = pending.len() - held;
     if emit_bytes == 0 {
         return false;
@@ -330,8 +451,12 @@ fn push_nonempty(events: &mut Vec<ChatOutputEvent>, event: ChatOutputEvent) {
 fn parse_function_call(
     body: &str,
     string_arguments: &BTreeMap<String, BTreeSet<String>>,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
 ) -> Result<ChatFunctionCall> {
     let body = body.trim_matches(['\r', '\n']);
+    if body.starts_with('{') {
+        return parse_json_function_call(body, tool_parameters);
+    }
     let function = body
         .strip_prefix("<function=")
         .ok_or_else(|| Error::Format {
@@ -405,6 +530,94 @@ fn parse_function_call(
         name: name.to_string(),
         arguments,
     })
+}
+
+fn parse_json_function_call(
+    body: &str,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
+) -> Result<ChatFunctionCall> {
+    let call: Value = serde_json::from_str(body).map_err(|error| Error::Format {
+        label: "chat tool call",
+        detail: format!("invalid JSON tool call: {error}"),
+    })?;
+    let object = call.as_object().ok_or_else(|| Error::Format {
+        label: "chat tool call",
+        detail: "JSON tool call must be an object".to_string(),
+    })?;
+    let function = object
+        .get("function")
+        .and_then(Value::as_object)
+        .unwrap_or(object);
+    let arguments = match function
+        .get("arguments")
+        .or_else(|| function.get("parameters"))
+    {
+        None if function.get("name").is_none() => function.clone().into_iter().collect(),
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(arguments)) => arguments.clone().into_iter().collect(),
+        Some(Value::String(arguments)) => {
+            let arguments: Value =
+                serde_json::from_str(arguments).map_err(|error| Error::Format {
+                    label: "chat tool call",
+                    detail: format!("JSON tool call has invalid string arguments: {error}"),
+                })?;
+            arguments
+                .as_object()
+                .cloned()
+                .ok_or_else(|| Error::Format {
+                    label: "chat tool call",
+                    detail: "JSON tool call arguments must be an object".to_string(),
+                })?
+                .into_iter()
+                .collect()
+        }
+        Some(_) => {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: "JSON tool call arguments must be an object".to_string(),
+            });
+        }
+    };
+    let name = match function.get("name").and_then(Value::as_str) {
+        Some(name) => name.to_string(),
+        None => infer_json_function_name(&arguments, tool_parameters)?,
+    };
+    validate_protocol_name("function", &name)?;
+    Ok(ChatFunctionCall { name, arguments })
+}
+
+fn infer_json_function_name(
+    arguments: &BTreeMap<String, Value>,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
+) -> Result<String> {
+    let argument_names: BTreeSet<_> = arguments.keys().collect();
+    let candidates: Vec<_> = tool_parameters
+        .iter()
+        .filter(|(_, parameters)| {
+            !parameters.names.is_empty()
+                && argument_names
+                    .iter()
+                    .all(|name| parameters.names.contains(*name))
+                && parameters
+                    .required
+                    .iter()
+                    .all(|name| argument_names.contains(name))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    match candidates.as_slice() {
+        [name] => Ok((*name).clone()),
+        [] => Err(Error::Format {
+            label: "chat tool call",
+            detail: "JSON tool call is missing its function name and does not match a tool schema"
+                .to_string(),
+        }),
+        _ => Err(Error::Format {
+            label: "chat tool call",
+            detail: "JSON tool call is missing its function name and matches multiple tool schemas"
+                .to_string(),
+        }),
+    }
 }
 
 fn strip_protocol_newlines(mut value: &str) -> &str {
@@ -560,6 +773,115 @@ mod tests {
             .map(|index| &text[index..index + 1])
             .collect();
         assert_eq!(parse_chunks(&chunks), expected());
+    }
+
+    #[test]
+    fn json_tool_protocol_survives_every_chunk_boundary() {
+        let text = concat!(
+            "I will update it.<tool_call>",
+            r#"{"name":"write_file","arguments":{"path":"src/main.rs","contents":"fn main() {\n    println!(\"hi\");\n}","executable":false}}"#,
+            "</tool_call>"
+        );
+        for split in 0..=text.len() {
+            assert_eq!(
+                parse_chunks(&[&text[..split], &text[split..]]),
+                expected(),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn nameless_json_tool_call_uses_a_unique_schema_match() {
+        let tools = vec![
+            ChatTool::function(ChatFunctionDefinition {
+                name: "bash".to_string(),
+                description: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"}
+                    },
+                    "required": ["command"]
+                }),
+            }),
+            ChatTool::function(ChatFunctionDefinition {
+                name: "apty".to_string(),
+                description: None,
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"prompt": {"type": "string"}},
+                    "required": ["prompt"]
+                }),
+            }),
+        ];
+        let mut parser = ChatOutputParser::new(&tools, false).unwrap();
+        let events = parser
+            .push_text(r#"<tool_call>{"command":"git status","timeout":5}</tool_call>"#)
+            .unwrap();
+        assert_eq!(
+            normalized(events),
+            [ChatOutputEvent::ToolCall(ChatToolCall {
+                id: "call_ID".to_string(),
+                function: ChatFunctionCall {
+                    name: "bash".to_string(),
+                    arguments: BTreeMap::from([
+                        ("command".to_string(), json!("git status")),
+                        ("timeout".to_string(), json!(5)),
+                    ]),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn direct_tool_wrapper_survives_every_chunk_boundary() {
+        let tools = vec![ChatTool::function(ChatFunctionDefinition {
+            name: "bash".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"}
+                },
+                "required": ["command"]
+            }),
+        })];
+        let text = "<bash>\ngit diff crates/infer/src/runtime/chat_output.rs\n</bash>";
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&tools, false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                normalized(events),
+                [ChatOutputEvent::ToolCall(ChatToolCall {
+                    id: "call_ID".to_string(),
+                    function: ChatFunctionCall {
+                        name: "bash".to_string(),
+                        arguments: BTreeMap::from([(
+                            "command".to_string(),
+                            json!("git diff crates/infer/src/runtime/chat_output.rs"),
+                        )]),
+                    },
+                })],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn nameless_json_tool_call_rejects_ambiguous_schemas() {
+        let mut alternative = tools().pop().unwrap();
+        alternative.function.name = "rewrite_file".to_string();
+        let tools = vec![tools().pop().unwrap(), alternative];
+        let mut parser = ChatOutputParser::new(&tools, false).unwrap();
+        let error = parser
+            .push_text(r#"<tool_call>{"path":"src/main.rs"}</tool_call>"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("matches multiple tool schemas"));
     }
 
     #[test]

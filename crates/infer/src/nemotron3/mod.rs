@@ -43,6 +43,18 @@ pub enum Nemotron3LayerKind {
     Attention,
 }
 
+/// Dimensions and routing count for one sparse MoE block.
+///
+/// Nemotron 3 Super uses one shape for every MoE block, while Puzzle varies
+/// both values by layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nemotron3MoeLayerConfig {
+    /// Routed expert hidden width.
+    pub intermediate_size: usize,
+    /// Experts selected for each token.
+    pub experts_per_token: usize,
+}
+
 impl Nemotron3LayerKind {
     fn from_name(name: &str) -> Result<Self> {
         match name {
@@ -87,6 +99,10 @@ pub struct Nemotron3Manifest {
     pub hidden_size: usize,
     /// Ordered backbone mixer types.
     pub layers: Vec<Nemotron3LayerKind>,
+    /// Per-layer MoE dimensions and routing count.
+    pub moe_layers: Vec<Option<Nemotron3MoeLayerConfig>>,
+    /// Per-layer MoE dimensions and routing count for the MTP block.
+    pub mtp_moe_layers: Vec<Option<Nemotron3MoeLayerConfig>>,
     /// Attention query-head count.
     pub attention_heads: usize,
     /// Attention key/value-head count.
@@ -144,6 +160,8 @@ struct Nemotron3Config {
     hybrid_override_pattern: Option<String>,
     #[serde(default)]
     num_hidden_layers: Option<usize>,
+    #[serde(default)]
+    block_configs: Option<Vec<Nemotron3BlockConfig>>,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -159,8 +177,10 @@ struct Nemotron3Config {
     #[serde(alias = "mamba_chunk_size")]
     chunk_size: usize,
     n_routed_experts: usize,
-    num_experts_per_tok: usize,
-    moe_intermediate_size: usize,
+    #[serde(default)]
+    num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    moe_intermediate_size: Option<usize>,
     #[serde(default)]
     moe_latent_size: Option<usize>,
     moe_shared_expert_intermediate_size: usize,
@@ -173,11 +193,22 @@ struct Nemotron3Config {
     #[serde(default)]
     mtp_layers_block_type: Option<Vec<String>>,
     #[serde(default)]
+    mtp_block_configs: Option<Vec<Nemotron3BlockConfig>>,
+    #[serde(default)]
     mtp_hybrid_override_pattern: Option<String>,
     #[serde(default)]
     layer_norm_epsilon: Option<f32>,
     #[serde(default)]
     norm_eps: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Nemotron3BlockConfig {
+    block_type: String,
+    #[serde(default)]
+    moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    num_experts_per_tok: Option<usize>,
 }
 
 impl Nemotron3Manifest {
@@ -198,7 +229,7 @@ impl Nemotron3Manifest {
                 label: "Nemotron 3 config json",
                 detail: error.to_string(),
             })?;
-        if config.model_type != "nemotron_h" {
+        if config.model_type != "nemotron_h" && config.model_type != "nemotron_h_puzzle" {
             return Err(Error::Format {
                 label: "Nemotron 3 architecture",
                 detail: format!(
@@ -233,6 +264,28 @@ impl Nemotron3Manifest {
             )?
         };
 
+        let moe_layers = parse_moe_layers(
+            &layers,
+            config.block_configs.as_deref(),
+            config.moe_intermediate_size,
+            config.num_experts_per_tok,
+        )?;
+        let mtp_moe_layers = parse_moe_layers(
+            &mtp_layers,
+            config.mtp_block_configs.as_deref(),
+            config.moe_intermediate_size,
+            config.num_experts_per_tok,
+        )?;
+        let first_moe =
+            moe_layers
+                .iter()
+                .flatten()
+                .copied()
+                .next()
+                .ok_or_else(|| Error::Format {
+                    label: "Nemotron 3 MoE configuration",
+                    detail: "backbone has no MoE layer".to_string(),
+                })?;
         let norm_epsilon = compatible_value(
             config.layer_norm_epsilon,
             config.norm_eps,
@@ -242,6 +295,8 @@ impl Nemotron3Manifest {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
             layers,
+            moe_layers,
+            mtp_moe_layers,
             attention_heads: config.num_attention_heads,
             kv_heads: config.num_key_value_heads,
             attention_head_dim: config.head_dim,
@@ -253,8 +308,8 @@ impl Nemotron3Manifest {
             mamba_conv_kernel: config.conv_kernel,
             mamba_chunk_size: config.chunk_size,
             routed_experts: config.n_routed_experts,
-            experts_per_token: config.num_experts_per_tok,
-            moe_intermediate_size: config.moe_intermediate_size,
+            experts_per_token: first_moe.experts_per_token,
+            moe_intermediate_size: first_moe.intermediate_size,
             moe_latent_size: config.moe_latent_size,
             shared_expert_intermediate_size: config.moe_shared_expert_intermediate_size,
             routed_scaling_factor: config.routed_scaling_factor,
@@ -272,6 +327,30 @@ impl Nemotron3Manifest {
     /// Returns the Mamba projected-state width before the output projection.
     pub fn mamba_intermediate_size(&self) -> usize {
         self.mamba_heads * self.mamba_head_dim
+    }
+
+    /// Returns the dimensions and routing count selected for a backbone MoE layer.
+    pub fn moe_layer_config(&self, layer: usize) -> Result<Nemotron3MoeLayerConfig> {
+        self.moe_layers
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| Error::Format {
+                label: "Nemotron 3 MoE layer",
+                detail: format!("layer {layer} is not an MoE block"),
+            })
+    }
+
+    /// Returns the dimensions and routing count selected for an MTP MoE layer.
+    pub fn mtp_moe_layer_config(&self, layer: usize) -> Result<Nemotron3MoeLayerConfig> {
+        self.mtp_moe_layers
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| Error::Format {
+                label: "Nemotron 3 MTP MoE layer",
+                detail: format!("layer {layer} is not an MoE block"),
+            })
     }
 
     /// Returns the depthwise convolution channel count in each Mamba layer.
@@ -374,13 +453,22 @@ impl Nemotron3Manifest {
                 actual: format!("{} / {}", self.mamba_heads, self.mamba_groups),
             });
         }
-        if self.experts_per_token > self.routed_experts {
+        if self.moe_layers.len() != self.layers.len() {
             return Err(Error::Shape {
-                label: "Nemotron 3 routed experts",
-                expected: format!("top-k <= {}", self.routed_experts),
-                actual: self.experts_per_token.to_string(),
+                label: "Nemotron 3 MoE layer configuration",
+                expected: format!("{} layer entries", self.layers.len()),
+                actual: format!("{} entries", self.moe_layers.len()),
             });
         }
+        self.validate_moe_layers(&self.layers, &self.moe_layers, "backbone")?;
+        if self.mtp_moe_layers.len() != self.mtp_layers.len() {
+            return Err(Error::Shape {
+                label: "Nemotron 3 MTP MoE layer configuration",
+                expected: format!("{} layer entries", self.mtp_layers.len()),
+                actual: format!("{} entries", self.mtp_moe_layers.len()),
+            });
+        }
+        self.validate_moe_layers(&self.mtp_layers, &self.mtp_moe_layers, "MTP")?;
         if !self.routed_experts.is_multiple_of(self.expert_groups)
             || self.topk_groups > self.expert_groups
         {
@@ -414,6 +502,49 @@ impl Nemotron3Manifest {
                     self.routed_scaling_factor
                 ),
             });
+        }
+        Ok(())
+    }
+
+    fn validate_moe_layers(
+        &self,
+        layers: &[Nemotron3LayerKind],
+        moe_layers: &[Option<Nemotron3MoeLayerConfig>],
+        scope: &str,
+    ) -> Result<()> {
+        for (layer, (kind, moe)) in layers.iter().zip(moe_layers).enumerate() {
+            match (kind, moe) {
+                (Nemotron3LayerKind::Moe, Some(moe))
+                    if moe.intermediate_size != 0
+                        && moe.experts_per_token != 0
+                        && moe.experts_per_token <= self.routed_experts => {}
+                (Nemotron3LayerKind::Moe, Some(moe)) => {
+                    return Err(Error::Shape {
+                        label: "Nemotron 3 routed experts",
+                        expected: format!(
+                            "{scope} layer {layer}: non-zero top-k <= {}",
+                            self.routed_experts
+                        ),
+                        actual: format!(
+                            "intermediate={} top-k={}",
+                            moe.intermediate_size, moe.experts_per_token
+                        ),
+                    });
+                }
+                (Nemotron3LayerKind::Moe, None) => {
+                    return Err(Error::Format {
+                        label: "Nemotron 3 MoE layer configuration",
+                        detail: format!("missing configuration for {scope} MoE layer {layer}"),
+                    });
+                }
+                (_, Some(_)) => {
+                    return Err(Error::Format {
+                        label: "Nemotron 3 MoE layer configuration",
+                        detail: format!("non-MoE {scope} layer {layer} has MoE configuration"),
+                    });
+                }
+                (_, None) => {}
+            }
         }
         Ok(())
     }
@@ -496,6 +627,64 @@ fn parse_layers(
         .collect()
 }
 
+fn parse_moe_layers(
+    layers: &[Nemotron3LayerKind],
+    block_configs: Option<&[Nemotron3BlockConfig]>,
+    default_intermediate: Option<usize>,
+    default_top_k: Option<usize>,
+) -> Result<Vec<Option<Nemotron3MoeLayerConfig>>> {
+    if let Some(block_configs) = block_configs
+        && block_configs.len() != layers.len()
+    {
+        return Err(Error::Shape {
+            label: "Nemotron 3 block configs",
+            expected: format!("{} entries", layers.len()),
+            actual: format!("{} entries", block_configs.len()),
+        });
+    }
+
+    layers
+        .iter()
+        .enumerate()
+        .map(|(layer, kind)| {
+            let block = block_configs.and_then(|blocks| blocks.get(layer));
+            if let Some(block) = block
+                && Nemotron3LayerKind::from_name(&block.block_type)? != *kind
+            {
+                return Err(Error::Format {
+                    label: "Nemotron 3 block config",
+                    detail: format!(
+                        "layer {layer} config is {}, but layer list is {}",
+                        block.block_type,
+                        kind.as_str()
+                    ),
+                });
+            }
+            if *kind != Nemotron3LayerKind::Moe {
+                return Ok(None);
+            }
+            let intermediate = block
+                .and_then(|block| block.moe_intermediate_size)
+                .or(default_intermediate)
+                .ok_or_else(|| Error::Format {
+                    label: "Nemotron 3 MoE configuration",
+                    detail: format!("missing moe_intermediate_size for layer {layer}"),
+                })?;
+            let experts_per_token = block
+                .and_then(|block| block.num_experts_per_tok)
+                .or(default_top_k)
+                .ok_or_else(|| Error::Format {
+                    label: "Nemotron 3 MoE configuration",
+                    detail: format!("missing num_experts_per_tok for layer {layer}"),
+                })?;
+            Ok(Some(Nemotron3MoeLayerConfig {
+                intermediate_size: intermediate,
+                experts_per_token,
+            }))
+        })
+        .collect()
+}
+
 fn require_tensor(checkpoint: &ModelOptCheckpoint, tensor: &str) -> Result<()> {
     if checkpoint.contains_tensor(tensor) {
         return Ok(());
@@ -522,7 +711,7 @@ fn compatible_value(current: Option<f32>, legacy: Option<f32>, label: &'static s
 
 #[cfg(test)]
 mod tests {
-    use super::{Nemotron3LayerKind, Nemotron3Manifest};
+    use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig};
 
     const SUPER_CONFIG: &str = r#"{
         "model_type": "nemotron_h",
@@ -581,6 +770,35 @@ mod tests {
         );
         let manifest = Nemotron3Manifest::from_config_str(&config).expect("manifest");
         assert_eq!(manifest.layers[0], Nemotron3LayerKind::Attention);
+    }
+
+    #[test]
+    fn parses_puzzle_blockwise_moe_configuration() {
+        let config = SUPER_CONFIG
+            .replace("\"model_type\": \"nemotron_h\"", "\"model_type\": \"nemotron_h_puzzle\"")
+            .replace(
+                "\"hybrid_override_pattern\": \"MEM*E\"",
+                "\"layers_block_type\": [\"mamba\", \"moe\", \"mamba\", \"attention\", \"moe\"], \"hybrid_override_pattern\": \"MEM*E\"",
+            )
+            .replace(
+                "\"moe_latent_size\": 1024,",
+                "\"block_configs\": [\n          {\"block_type\": \"mamba\"},\n          {\"block_type\": \"moe\", \"moe_intermediate_size\": 1280, \"num_experts_per_tok\": 4},\n          {\"block_type\": \"mamba\"},\n          {\"block_type\": \"attention\"},\n          {\"block_type\": \"moe\", \"moe_intermediate_size\": 2688, \"num_experts_per_tok\": 18}\n        ],",
+            );
+        let manifest = Nemotron3Manifest::from_config_str(&config).expect("Puzzle manifest");
+        assert_eq!(
+            manifest.moe_layer_config(1).expect("first MoE"),
+            Nemotron3MoeLayerConfig {
+                intermediate_size: 1280,
+                experts_per_token: 4,
+            }
+        );
+        assert_eq!(
+            manifest.moe_layer_config(4).expect("second MoE"),
+            Nemotron3MoeLayerConfig {
+                intermediate_size: 2688,
+                experts_per_token: 18,
+            }
+        );
     }
 
     #[test]

@@ -270,6 +270,13 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     pub fn tick(&mut self) -> Result<Nemotron3Tick> {
         let mut tick = Nemotron3Tick::default();
         self.admit(&mut tick)?;
+        for admission in &tick.admitted {
+            self.requests
+                .get_mut(&admission.request_id)
+                .expect("admitted Nemotron request is retained")
+                .usage
+                .cached_prompt_tokens = admission.cached_prompt_tokens;
+        }
         let mut terminal = BTreeMap::new();
 
         let decode_ids = self
@@ -399,13 +406,12 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 .prompt
                 .len()
                 .saturating_sub(request.prompt_position + 1);
-            let before_checkpoint = if request.prefix_cache_checkpointed {
-                available
-            } else {
-                request
-                    .prefix_cache_target
-                    .saturating_sub(request.prompt_position)
-            };
+            let before_checkpoint = prefill_rows_before_checkpoint(
+                available,
+                request.prompt_position,
+                request.prefix_cache_target,
+                request.prefix_cache_checkpointed,
+            );
             let rows = available
                 .min(before_checkpoint)
                 .min(remaining_budget.div_ceil(remaining_sequences));
@@ -710,6 +716,29 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             released_sequence_device_bytes: released,
         });
         Ok(())
+    }
+}
+
+fn prefill_rows_before_checkpoint(
+    available: usize,
+    prompt_position: usize,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
+) -> usize {
+    if prefix_cache_checkpointed || prefix_cache_target == 0 {
+        available
+    } else {
+        prefix_cache_target.saturating_sub(prompt_position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_prompts_are_not_blocked_by_an_absent_prefix_checkpoint() {
+        assert_eq!(prefill_rows_before_checkpoint(21, 0, 0, false), 21);
     }
 }
 

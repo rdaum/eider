@@ -62,6 +62,25 @@
             "cacheRead": 0,
             "cacheWrite": 0
           }
+        },
+        {
+          "id": "eider-nemotron3-puzzle",
+          "name": "Nemotron Labs 3 Puzzle 75B-A9B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
         }
       ]
     }

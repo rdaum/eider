@@ -1,7 +1,7 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{
-    Nemotron3LayerKind, Nemotron3Manifest, Nemotron3Router, Nemotron3RouterRowsWorkspace,
-    Nemotron3RouterWorkspace, Nemotron3StorageConfig,
+    Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig, Nemotron3Router,
+    Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
@@ -16,6 +16,7 @@ use nvfp4::{
 pub struct Nemotron3MoeLayer {
     layer: usize,
     manifest: Nemotron3Manifest,
+    moe: Nemotron3MoeLayerConfig,
     block_norm: DeviceBuffer<f32>,
     router: Nemotron3Router,
     latent_in: Nemotron3Linear,
@@ -106,10 +107,16 @@ impl Nemotron3MoeLayer {
             label: "Nemotron 3 MoE layer",
             detail: "the current MoE execution path requires moe_latent_size".to_string(),
         })?;
+        let moe = if mtp {
+            manifest.mtp_moe_layer_config(layer)?
+        } else {
+            manifest.moe_layer_config(layer)?
+        };
         let mixer = format!("{prefix}.mixer");
         Ok(Self {
             layer,
             manifest: manifest.clone(),
+            moe,
             block_norm: load_bf16_as_f32(
                 checkpoint,
                 &format!("{prefix}.norm.weight"),
@@ -134,7 +141,7 @@ impl Nemotron3MoeLayer {
                 latent,
                 storage,
             )?,
-            experts: Nemotron3ExpertSlab::load(checkpoint, manifest, &mixer, latent)?,
+            experts: Nemotron3ExpertSlab::load(checkpoint, manifest, moe, &mixer, latent)?,
             shared_up: Nemotron3Linear::load(
                 checkpoint,
                 &format!("{mixer}.shared_experts.up_proj"),
@@ -154,12 +161,12 @@ impl Nemotron3MoeLayer {
 
     /// Allocates the scratch buffers and route pointer tables used for one token.
     pub fn workspace(&self) -> Result<Nemotron3MoeWorkspace> {
-        Nemotron3MoeWorkspace::new(&self.manifest)
+        Nemotron3MoeWorkspace::new(&self.manifest, self.moe)
     }
 
     /// Allocates scratch and route tables for a fixed flattened row count.
     pub fn rows_workspace(&self, rows: usize) -> Result<Nemotron3MoeRowsWorkspace> {
-        Nemotron3MoeRowsWorkspace::new(&self.manifest, rows)
+        Nemotron3MoeRowsWorkspace::new(&self.manifest, self.moe, rows)
     }
 
     /// Runs one token through pre-norm, routed and shared experts, and the residual add.
@@ -176,7 +183,7 @@ impl Nemotron3MoeLayer {
                 actual: format!("{} values", hidden.len()),
             });
         }
-        workspace.require_manifest(&self.manifest)?;
+        workspace.require_manifest(&self.manifest, self.moe)?;
         rms_norm_f32_into_on_stream(
             1,
             self.manifest.hidden_size,
@@ -238,7 +245,7 @@ impl Nemotron3MoeLayer {
                 actual: format!("{} values", hidden.len()),
             });
         }
-        workspace.require_manifest(&self.manifest, rows)?;
+        workspace.require_manifest(&self.manifest, self.moe, rows)?;
         rms_norm_f32_into_on_stream(
             rows,
             self.manifest.hidden_size,
@@ -333,11 +340,12 @@ impl Nemotron3ExpertSlab {
     fn load(
         checkpoint: &ModelOptCheckpoint,
         manifest: &Nemotron3Manifest,
+        moe: Nemotron3MoeLayerConfig,
         mixer: &str,
         latent: usize,
     ) -> Result<Self> {
         let experts = manifest.routed_experts;
-        let intermediate = manifest.moe_intermediate_size;
+        let intermediate = moe.intermediate_size;
         let packed_stride = intermediate * latent / 2;
         let scale_stride = intermediate * latent / 16;
         let mut up_packed = Vec::with_capacity(experts * packed_stride);
@@ -605,7 +613,11 @@ pub struct Nemotron3MoeRowsWorkspace {
 }
 
 impl Nemotron3MoeRowsWorkspace {
-    fn new(manifest: &Nemotron3Manifest, rows: usize) -> Result<Self> {
+    fn new(
+        manifest: &Nemotron3Manifest,
+        moe: Nemotron3MoeLayerConfig,
+        rows: usize,
+    ) -> Result<Self> {
         if rows == 0 {
             return Err(Error::Shape {
                 label: "Nemotron 3 MoE row workspace",
@@ -617,9 +629,9 @@ impl Nemotron3MoeRowsWorkspace {
             label: "Nemotron 3 MoE row workspace",
             detail: "the current MoE execution path requires moe_latent_size".to_string(),
         })?;
-        let routes_per_row = manifest.experts_per_token;
+        let routes_per_row = moe.experts_per_token;
         let routes = rows * routes_per_row;
-        let intermediate = manifest.moe_intermediate_size;
+        let intermediate = moe.intermediate_size;
         let latent_buffer = DeviceBuffer::zeroed(rows * latent)?;
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
@@ -631,7 +643,7 @@ impl Nemotron3MoeRowsWorkspace {
         let down_output_table = mutable_pointer_table(&routed_down, routes, latent)?;
         let down_result_table = const_pointer_table(&routed_down, routes, latent)?;
         Ok(Self {
-            router: Nemotron3RouterRowsWorkspace::new(manifest, rows)?,
+            router: Nemotron3RouterRowsWorkspace::new(manifest, moe, rows)?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
             latent: latent_buffer,
             routed_up,
@@ -657,10 +669,15 @@ impl Nemotron3MoeRowsWorkspace {
         })
     }
 
-    fn require_manifest(&self, manifest: &Nemotron3Manifest, rows: usize) -> Result<()> {
+    fn require_manifest(
+        &self,
+        manifest: &Nemotron3Manifest,
+        moe: Nemotron3MoeLayerConfig,
+        rows: usize,
+    ) -> Result<()> {
         let latent = manifest.moe_latent_size.unwrap_or_default();
-        let routes = rows * manifest.experts_per_token;
-        let intermediate = manifest.moe_intermediate_size;
+        let routes = rows * moe.experts_per_token;
+        let intermediate = moe.intermediate_size;
         if self.normed.len() == rows * manifest.hidden_size
             && self.latent.len() == rows * latent
             && self.routed_up.len() == routes * intermediate
@@ -678,7 +695,7 @@ impl Nemotron3MoeRowsWorkspace {
             && self.down_input_table.len() == routes
             && self.down_output_table.len() == routes
             && self.down_result_table.len() == routes
-            && self.routes_per_row == manifest.experts_per_token
+            && self.routes_per_row == moe.experts_per_token
         {
             return Ok(());
         }
@@ -716,13 +733,13 @@ impl Nemotron3MoeRowsWorkspace {
 }
 
 impl Nemotron3MoeWorkspace {
-    fn new(manifest: &Nemotron3Manifest) -> Result<Self> {
+    fn new(manifest: &Nemotron3Manifest, moe: Nemotron3MoeLayerConfig) -> Result<Self> {
         let latent = manifest.moe_latent_size.ok_or_else(|| Error::Format {
             label: "Nemotron 3 MoE workspace",
             detail: "the current MoE execution path requires moe_latent_size".to_string(),
         })?;
-        let routes = manifest.experts_per_token;
-        let intermediate = manifest.moe_intermediate_size;
+        let routes = moe.experts_per_token;
+        let intermediate = moe.intermediate_size;
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_down = DeviceBuffer::zeroed(routes * latent)?;
@@ -731,7 +748,7 @@ impl Nemotron3MoeWorkspace {
         let down_output_table = mutable_pointer_table(&routed_down, routes, latent)?;
         let down_result_table = const_pointer_table(&routed_down, routes, latent)?;
         Ok(Self {
-            router: Nemotron3RouterWorkspace::new(manifest)?,
+            router: Nemotron3RouterWorkspace::new(manifest, moe)?,
             normed: DeviceBuffer::zeroed(manifest.hidden_size)?,
             latent: DeviceBuffer::zeroed(latent)?,
             routed_up,
@@ -751,10 +768,14 @@ impl Nemotron3MoeWorkspace {
         })
     }
 
-    fn require_manifest(&self, manifest: &Nemotron3Manifest) -> Result<()> {
+    fn require_manifest(
+        &self,
+        manifest: &Nemotron3Manifest,
+        moe: Nemotron3MoeLayerConfig,
+    ) -> Result<()> {
         let latent = manifest.moe_latent_size.unwrap_or_default();
-        let routes = manifest.experts_per_token;
-        let intermediate = manifest.moe_intermediate_size;
+        let routes = moe.experts_per_token;
+        let intermediate = moe.intermediate_size;
         if self.normed.len() == manifest.hidden_size
             && self.latent.len() == latent
             && self.routed_up.len() == routes * intermediate
