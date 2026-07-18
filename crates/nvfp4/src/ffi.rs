@@ -598,6 +598,25 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gelu_tanh_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_gelu_tanh_mul_f32_on_stream(
+        gate: *const f32,
+        up: *const f32,
+        output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_gelu_tanh_mul_halves_f32_on_stream(
+        gate_up: *const f32,
+        output: *mut f32,
+        len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_silu_mul_halves_f32_on_stream(
         gate_up: *const f32,
         output: *mut f32,
@@ -778,6 +797,15 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gather_indexed_mul_f32_on_stream(
+        values: *const f32,
+        indices: *const u32,
+        multipliers: *const f32,
+        output: *mut f32,
+        count: u32,
+        values_len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gather_nvfp4_grouped_gemv_ptrs_on_stream(
         indices: *const u32,
         a_values_table: *const *const u8,
@@ -926,6 +954,16 @@ unsafe extern "C" {
         rows: u32,
         head_dim: u32,
         rotary_dim: u32,
+        position: u32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rope_neox_proportional_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        head_dim: u32,
+        rotary_pairs: u32,
         position: u32,
         theta: f32,
         stream: cudaStream_t,

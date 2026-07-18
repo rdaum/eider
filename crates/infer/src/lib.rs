@@ -14,6 +14,9 @@ pub use runtime::kv_cache;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Gemma 4 text-model loading and inference.
+pub mod gemma4;
+
 /// Nemotron 3 hybrid Mamba/attention/MoE model support.
 pub mod nemotron3;
 

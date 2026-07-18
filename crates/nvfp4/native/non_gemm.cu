@@ -476,6 +476,94 @@ extern "C" cudaError_t infer_silu_mul_f32_on_stream(const float* gate,
     return cudaGetLastError();
 }
 
+__global__ void infer_gelu_tanh_f32_kernel(const float* input,
+                                           float* output,
+                                           std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    const float value = input[idx];
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    const float cubic = value * value * value;
+    output[idx] = 0.5f * value * (1.0f + tanhf(kSqrtTwoOverPi * (value + 0.044715f * cubic)));
+}
+
+extern "C" cudaError_t infer_gelu_tanh_f32_on_stream(const float* input,
+                                                       float* output,
+                                                       std::uint32_t len,
+                                                       cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_gelu_tanh_f32_kernel<<<blocks, kThreads, 0, stream>>>(input, output, len);
+    return cudaGetLastError();
+}
+
+__global__ void infer_gelu_tanh_mul_f32_kernel(const float* gate,
+                                                const float* up,
+                                                float* output,
+                                                std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    const float value = gate[idx];
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    const float cubic = value * value * value;
+    const float gelu = 0.5f * value *
+        (1.0f + tanhf(kSqrtTwoOverPi * (value + 0.044715f * cubic)));
+    output[idx] = gelu * up[idx];
+}
+
+extern "C" cudaError_t infer_gelu_tanh_mul_f32_on_stream(
+    const float* gate,
+    const float* up,
+    float* output,
+    std::uint32_t len,
+    cudaStream_t stream) {
+    if (gate == nullptr || up == nullptr || output == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_gelu_tanh_mul_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        gate, up, output, len);
+    return cudaGetLastError();
+}
+
+__global__ void infer_gelu_tanh_mul_halves_f32_kernel(const float* gate_up,
+                                                       float* output,
+                                                       std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    const float gate = gate_up[idx];
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    const float cubic = gate * gate * gate;
+    const float gelu = 0.5f * gate *
+        (1.0f + tanhf(kSqrtTwoOverPi * (gate + 0.044715f * cubic)));
+    output[idx] = gelu * gate_up[len + idx];
+}
+
+extern "C" cudaError_t infer_gelu_tanh_mul_halves_f32_on_stream(
+    const float* gate_up,
+    float* output,
+    std::uint32_t len,
+    cudaStream_t stream) {
+    if (gate_up == nullptr || output == nullptr || len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_gelu_tanh_mul_halves_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        gate_up, output, len);
+    return cudaGetLastError();
+}
+
 __global__ void infer_silu_mul_halves_f32_kernel(const float* gate_up,
                                                        float* output,
                                                        std::uint32_t len) {
@@ -1544,6 +1632,37 @@ extern "C" cudaError_t infer_remap_expert_indices_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_gather_indexed_mul_f32_kernel(
+    const float* values,
+    const std::uint32_t* indices,
+    const float* multipliers,
+    float* output,
+    std::uint32_t count,
+    std::uint32_t values_len) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const std::uint32_t source = indices[index];
+    output[index] = source < values_len ? values[source] * multipliers[index] : 0.0f;
+}
+
+extern "C" cudaError_t infer_gather_indexed_mul_f32_on_stream(
+    const float* values,
+    const std::uint32_t* indices,
+    const float* multipliers,
+    float* output,
+    std::uint32_t count,
+    std::uint32_t values_len,
+    cudaStream_t stream) {
+    if (values == nullptr || indices == nullptr || multipliers == nullptr || output == nullptr ||
+        count == 0 || values_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 128;
+    infer_gather_indexed_mul_f32_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        values, indices, multipliers, output, count, values_len);
+    return cudaGetLastError();
+}
+
 __global__ void infer_gather_nvfp4_grouped_gemv_ptrs_kernel(
     const std::uint32_t* indices,
     const std::uint8_t* const* a_values_table,
@@ -2306,6 +2425,67 @@ extern "C" cudaError_t infer_rope_neox_partial_f32_on_stream(
     const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
     infer_rope_neox_partial_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, rows, head_dim, rotary_dim, position, theta);
+    return cudaGetLastError();
+}
+
+// Proportional partial RoPE keeps the ordinary NeoX pair stride and frequency
+// denominator, but rotates only the leading fraction of frequency pairs. This
+// is the layout used by Gemma 4 full attention: pair i is (i, i+head_dim/2),
+// and pairs after rotary_pairs pass through unchanged.
+__global__ void infer_rope_neox_proportional_f32_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t position,
+    float theta) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t half = head_dim / 2;
+    const std::uint32_t total_pairs = rows * half;
+    if (idx >= total_pairs) {
+        return;
+    }
+
+    const std::uint32_t row = idx / half;
+    const std::uint32_t pair = idx % half;
+    const std::uint32_t row_start = row * head_dim;
+    const float a = input[row_start + pair];
+    const float b = input[row_start + pair + half];
+    if (pair >= rotary_pairs) {
+        output[row_start + pair] = a;
+        output[row_start + pair + half] = b;
+        return;
+    }
+
+    const float inv_freq =
+        powf(theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
+    float sin_value;
+    float cos_value;
+    sincosf(static_cast<float>(position) * inv_freq, &sin_value, &cos_value);
+    output[row_start + pair] = a * cos_value - b * sin_value;
+    output[row_start + pair + half] = a * sin_value + b * cos_value;
+}
+
+extern "C" cudaError_t infer_rope_neox_proportional_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t position,
+    float theta,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || rows == 0 || head_dim == 0 ||
+        (head_dim % 2) != 0 || rotary_pairs == 0 || rotary_pairs > head_dim / 2 ||
+        !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t total_pairs = rows * (head_dim / 2);
+    const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
+    infer_rope_neox_proportional_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, rows, head_dim, rotary_pairs, position, theta);
     return cudaGetLastError();
 }
 

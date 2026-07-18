@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod chat_output;
 pub mod expert_cache;
+pub mod gemma4_serving;
 pub mod generation;
 pub mod kv_cache;
 pub mod nemotron3_serving;

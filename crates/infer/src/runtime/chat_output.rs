@@ -1,4 +1,4 @@
-//! Incremental Qwen chat output decoding.
+//! Incremental structured chat output decoding.
 
 use super::chat::{ChatFunctionCall, ChatTool, ChatToolCall};
 use nvfp4::{Error, Result};
@@ -14,6 +14,10 @@ use tokenizers::{DecodeStream, Tokenizer};
 
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const GEMMA_TOOL_CALL_OPEN: &str = "<|tool_call>";
+const GEMMA_TOOL_CALL_CLOSE: &str = "<tool_call|>";
+const GEMMA_THINK_OPEN: &str = "<|channel>thought\n";
+const GEMMA_THINK_CLOSE: &str = "<channel|>";
 const THINK_CLOSE: &str = "</think>";
 
 static NEXT_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
@@ -46,11 +50,19 @@ enum OutputMode {
     DirectToolCall,
 }
 
-/// Request-scoped tokenizer and Qwen tool-protocol decoder.
+/// Request-scoped tokenizer and model tool-protocol decoder.
 pub struct ChatOutputCodec<'tokenizer> {
     decode_stream: TokenizerDecodeStream<'tokenizer>,
     parser: ChatOutputParser,
+    gemma_special_tokens: Option<GemmaSpecialTokens>,
     finished: bool,
+}
+
+struct GemmaSpecialTokens {
+    channel_open: u32,
+    channel_close: u32,
+    tool_call_open: u32,
+    tool_call_close: u32,
 }
 
 impl<'tokenizer> ChatOutputCodec<'tokenizer> {
@@ -63,9 +75,29 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         tools: &[ChatTool],
         starts_in_reasoning: bool,
     ) -> Result<Self> {
+        let gemma_special_tokens = match (
+            tokenizer.token_to_id("<|channel>"),
+            tokenizer.token_to_id(GEMMA_THINK_CLOSE),
+            tokenizer.token_to_id(GEMMA_TOOL_CALL_OPEN),
+            tokenizer.token_to_id(GEMMA_TOOL_CALL_CLOSE),
+        ) {
+            (
+                Some(channel_open),
+                Some(channel_close),
+                Some(tool_call_open),
+                Some(tool_call_close),
+            ) => Some(GemmaSpecialTokens {
+                channel_open,
+                channel_close,
+                tool_call_open,
+                tool_call_close,
+            }),
+            _ => None,
+        };
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
             parser: ChatOutputParser::new(tools, starts_in_reasoning)?,
+            gemma_special_tokens,
             finished: false,
         })
     }
@@ -77,6 +109,22 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
                 label: "chat output stream",
                 detail: "cannot push a token after finish".to_string(),
             });
+        }
+        if let Some(tokens) = &self.gemma_special_tokens {
+            let marker = if token_id == tokens.channel_open {
+                Some("<|channel>")
+            } else if token_id == tokens.channel_close {
+                Some(GEMMA_THINK_CLOSE)
+            } else if token_id == tokens.tool_call_open {
+                Some(GEMMA_TOOL_CALL_OPEN)
+            } else if token_id == tokens.tool_call_close {
+                Some(GEMMA_TOOL_CALL_CLOSE)
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                return self.parser.push_text(marker);
+            }
         }
         let Some(text) = self
             .decode_stream
@@ -123,6 +171,7 @@ struct ChatOutputParser {
     mode: OutputMode,
     pending: String,
     tool_call: String,
+    tool_call_close: &'static str,
     trim_after_thinking: bool,
     trim_after_tool_call: bool,
     string_arguments: BTreeMap<String, BTreeSet<String>>,
@@ -202,6 +251,7 @@ impl ChatOutputParser {
             },
             pending: String::new(),
             tool_call: String::new(),
+            tool_call_close: TOOL_CALL_CLOSE,
             trim_after_thinking: false,
             trim_after_tool_call: false,
             string_arguments,
@@ -265,19 +315,30 @@ impl ChatOutputParser {
     }
 
     fn parse_reasoning(&mut self, events: &mut Vec<ChatOutputEvent>) -> bool {
-        if let Some(index) = self.pending.find(THINK_CLOSE) {
+        if self.pending.starts_with(GEMMA_THINK_OPEN) {
+            self.pending.drain(..GEMMA_THINK_OPEN.len());
+            return true;
+        }
+        if GEMMA_THINK_OPEN.starts_with(&self.pending) {
+            return false;
+        }
+        let close = [THINK_CLOSE, GEMMA_THINK_CLOSE]
+            .into_iter()
+            .filter_map(|marker| self.pending.find(marker).map(|index| (index, marker)))
+            .min_by_key(|(index, _)| *index);
+        if let Some((index, marker)) = close {
             push_nonempty(
                 events,
                 ChatOutputEvent::Reasoning(self.pending[..index].to_string()),
             );
-            self.pending.drain(..index + THINK_CLOSE.len());
+            self.pending.drain(..index + marker.len());
             self.mode = OutputMode::Text;
             self.trim_after_thinking = true;
             return true;
         }
-        flush_safe_prefix(
+        flush_safe_prefix_with_markers(
             &mut self.pending,
-            THINK_CLOSE,
+            [THINK_CLOSE, GEMMA_THINK_CLOSE].into_iter(),
             events,
             ChatOutputEvent::Reasoning,
         )
@@ -306,15 +367,22 @@ impl ChatOutputParser {
                     .map(|index| (index, tool))
             })
             .min_by_key(|(index, _)| *index);
-        let xml_open = self.pending.find(TOOL_CALL_OPEN);
-        if let Some(index) = xml_open
-            .filter(|index| direct_open.is_none_or(|(direct_index, _)| *index <= direct_index))
-        {
+        let protocol_open = [
+            (TOOL_CALL_OPEN, TOOL_CALL_CLOSE),
+            (GEMMA_TOOL_CALL_OPEN, GEMMA_TOOL_CALL_CLOSE),
+        ]
+        .into_iter()
+        .filter_map(|(open, close)| self.pending.find(open).map(|index| (index, open, close)))
+        .min_by_key(|(index, _, _)| *index);
+        if let Some((index, open, close)) = protocol_open.filter(|(index, _, _)| {
+            direct_open.is_none_or(|(direct_index, _)| *index <= direct_index)
+        }) {
             push_nonempty(
                 events,
                 ChatOutputEvent::Text(self.pending[..index].to_string()),
             );
-            self.pending.drain(..index + TOOL_CALL_OPEN.len());
+            self.pending.drain(..index + open.len());
+            self.tool_call_close = close;
             self.mode = OutputMode::ToolCall;
             return true;
         }
@@ -331,7 +399,8 @@ impl ChatOutputParser {
         }
         flush_safe_prefix_with_markers(
             &mut self.pending,
-            std::iter::once(TOOL_CALL_OPEN)
+            [TOOL_CALL_OPEN, GEMMA_TOOL_CALL_OPEN]
+                .into_iter()
                 .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
             events,
             ChatOutputEvent::Text,
@@ -341,14 +410,18 @@ impl ChatOutputParser {
     fn parse_tool_call(&mut self, events: &mut Vec<ChatOutputEvent>) -> Result<bool> {
         self.tool_call.push_str(&self.pending);
         self.pending.clear();
-        let Some(index) = self.tool_call.find(TOOL_CALL_CLOSE) else {
+        let Some(index) = self.tool_call.find(self.tool_call_close) else {
             return Ok(false);
         };
         let body = self.tool_call[..index].to_string();
-        let remainder = self.tool_call[index + TOOL_CALL_CLOSE.len()..].to_string();
+        let remainder = self.tool_call[index + self.tool_call_close.len()..].to_string();
         self.tool_call.clear();
         self.pending = remainder;
-        let function = parse_function_call(&body, &self.string_arguments, &self.tool_parameters)?;
+        let function = if self.tool_call_close == GEMMA_TOOL_CALL_CLOSE {
+            parse_gemma_function_call(&body, &self.string_arguments, &self.tool_parameters)?
+        } else {
+            parse_function_call(&body, &self.string_arguments, &self.tool_parameters)?
+        };
         let id = next_tool_call_id()?;
         events.push(ChatOutputEvent::ToolCall(ChatToolCall { id, function }));
         self.mode = OutputMode::Text;
@@ -381,23 +454,6 @@ impl ChatOutputParser {
         self.trim_after_tool_call = true;
         Ok(true)
     }
-}
-
-fn flush_safe_prefix(
-    pending: &mut String,
-    marker: &str,
-    events: &mut Vec<ChatOutputEvent>,
-    make_event: fn(String) -> ChatOutputEvent,
-) -> bool {
-    let held = longest_marker_prefix_suffix(pending, marker);
-    let emit_bytes = pending.len() - held;
-    if emit_bytes == 0 {
-        return false;
-    }
-    let emitted = pending[..emit_bytes].to_string();
-    pending.drain(..emit_bytes);
-    push_nonempty(events, make_event(emitted));
-    true
 }
 
 fn flush_safe_prefix_with_markers<'a>(
@@ -446,6 +502,175 @@ fn push_nonempty(events: &mut Vec<ChatOutputEvent>, event: ChatOutputEvent) {
     if !empty {
         events.push(event);
     }
+}
+
+fn parse_gemma_function_call(
+    body: &str,
+    string_arguments: &BTreeMap<String, BTreeSet<String>>,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
+) -> Result<ChatFunctionCall> {
+    let call = body
+        .trim_matches(['\r', '\n'])
+        .strip_prefix("call:")
+        .ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: "expected call:name{...} inside <|tool_call>".to_string(),
+        })?;
+    let open = call.find('{').ok_or_else(|| Error::Format {
+        label: "chat tool call",
+        detail: "Gemma tool call is missing its argument object".to_string(),
+    })?;
+    let name = call[..open].trim();
+    validate_protocol_name("function", name)?;
+    if !tool_parameters.contains_key(name) {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: format!("unknown function {name:?}"),
+        });
+    }
+    let object = call[open..].trim();
+    let inner = object
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: "Gemma tool call has an unterminated argument object".to_string(),
+        })?;
+    let mut arguments = BTreeMap::new();
+    for field in split_gemma_top_level(inner, ',')? {
+        if field.trim().is_empty() {
+            continue;
+        }
+        let (raw_name, raw_value) = split_gemma_field(field)?;
+        let parameter = strip_gemma_quote(raw_name.trim()).to_string();
+        validate_protocol_name("parameter", &parameter)?;
+        let value = if string_arguments
+            .get(name)
+            .is_some_and(|parameters| parameters.contains(&parameter))
+        {
+            Value::String(strip_gemma_quote(raw_value.trim()).to_string())
+        } else {
+            parse_gemma_value(raw_value.trim())?
+        };
+        if arguments.insert(parameter.clone(), value).is_some() {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("duplicate parameter {parameter:?}"),
+            });
+        }
+    }
+    Ok(ChatFunctionCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn parse_gemma_value(raw: &str) -> Result<Value> {
+    let raw = raw.trim();
+    if let Some(value) = raw
+        .strip_prefix("<|\"|>")
+        .and_then(|value| value.strip_suffix("<|\"|>"))
+    {
+        return Ok(Value::String(value.to_string()));
+    }
+    if let Some(inner) = raw
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        let mut object = serde_json::Map::new();
+        for field in split_gemma_top_level(inner, ',')? {
+            if field.trim().is_empty() {
+                continue;
+            }
+            let (name, value) = split_gemma_field(field)?;
+            object.insert(
+                strip_gemma_quote(name.trim()).to_string(),
+                parse_gemma_value(value.trim())?,
+            );
+        }
+        return Ok(Value::Object(object));
+    }
+    if let Some(inner) = raw
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        return split_gemma_top_level(inner, ',')?
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_gemma_value(value.trim()))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array);
+    }
+    serde_json::from_str(raw).or_else(|_| Ok(Value::String(strip_gemma_quote(raw).to_string())))
+}
+
+fn split_gemma_field(field: &str) -> Result<(&str, &str)> {
+    let mut parts = split_gemma_top_level(field, ':')?;
+    if parts.len() != 2 {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: format!("expected parameter:value, got {field:?}"),
+        });
+    }
+    let value = parts.pop().expect("two field parts");
+    let name = parts.pop().expect("two field parts");
+    Ok((name, value))
+}
+
+fn split_gemma_top_level(input: &str, delimiter: char) -> Result<Vec<&str>> {
+    const QUOTE: &str = "<|\"|>";
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    while index < input.len() {
+        let tail = &input[index..];
+        if tail.starts_with(QUOTE) {
+            quoted = !quoted;
+            index += QUOTE.len();
+            continue;
+        }
+        let character = tail.chars().next().expect("index is within input");
+        let width = character.len_utf8();
+        if !quoted {
+            match character {
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| Error::Format {
+                        label: "chat tool call",
+                        detail: "unbalanced Gemma tool argument delimiters".to_string(),
+                    })?;
+                }
+                _ if character == delimiter && depth == 0 => {
+                    parts.push(&input[start..index]);
+                    start = index + width;
+                }
+                _ => {}
+            }
+        }
+        index += width;
+    }
+    if quoted || depth != 0 {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: "unterminated Gemma tool argument".to_string(),
+        });
+    }
+    parts.push(&input[start..]);
+    Ok(parts)
+}
+
+fn strip_gemma_quote(value: &str) -> &str {
+    value
+        .strip_prefix("<|\"|>")
+        .and_then(|value| value.strip_suffix("<|\"|>"))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(value)
 }
 
 fn parse_function_call(
@@ -954,6 +1179,62 @@ mod tests {
     }
 
     #[test]
+    fn gemma_reasoning_channel_survives_every_chunk_boundary() {
+        let text = "<|channel>thought\nchecking details<channel|>\nThe result is ready.";
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&[], true).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                normalized(events),
+                [
+                    ChatOutputEvent::Reasoning("checking details".to_string()),
+                    ChatOutputEvent::Text("The result is ready.".to_string()),
+                ],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_tool_call_survives_every_chunk_boundary() {
+        let tools = vec![ChatTool::function(ChatFunctionDefinition {
+            name: "bash".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"}
+                },
+                "required": ["command"]
+            }),
+        })];
+        let text = r#"<|tool_call>call:bash{command:<|"|>git diff<|"|>,timeout:10}<tool_call|>"#;
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&tools, false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                normalized(events),
+                [ChatOutputEvent::ToolCall(ChatToolCall {
+                    id: "call_ID".to_string(),
+                    function: ChatFunctionCall {
+                        name: "bash".to_string(),
+                        arguments: BTreeMap::from([
+                            ("command".to_string(), json!("git diff")),
+                            ("timeout".to_string(), json!(10)),
+                        ]),
+                    },
+                })],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires the local Qwen3.6 checkpoint"]
     fn local_tokenizer_stream_recovers_reasoning_text_and_tool_call() {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -972,5 +1253,53 @@ mod tests {
         let events = normalized(events);
         assert_eq!(events[0], ChatOutputEvent::Reasoning("checked".to_string()));
         assert_eq!(&events[1..], expected());
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_gemma_tokenizer_stream_recovers_reasoning_and_tool_call() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/gemma-4-26b-a4b-nvfp4");
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+        let tools = vec![ChatTool::function(ChatFunctionDefinition {
+            name: "bash".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"}
+                },
+                "required": ["command"]
+            }),
+        })];
+        let generated = concat!(
+            "<|channel>thought\nchecked<channel|>",
+            "<|tool_call>call:bash{command:<|\"|>git diff<|\"|>,timeout:10}<tool_call|>"
+        );
+        let encoding = tokenizer.encode(generated, false).unwrap();
+        let mut codec = ChatOutputCodec::new(&tokenizer, &tools, true).unwrap();
+        let mut events = Vec::new();
+        for &token in encoding.get_ids() {
+            events.extend(codec.push_token(token).unwrap());
+        }
+        events.extend(codec.finish().unwrap());
+        assert_eq!(
+            normalized(events),
+            [
+                ChatOutputEvent::Reasoning("checked".to_string()),
+                ChatOutputEvent::ToolCall(ChatToolCall {
+                    id: "call_ID".to_string(),
+                    function: ChatFunctionCall {
+                        name: "bash".to_string(),
+                        arguments: BTreeMap::from([
+                            ("command".to_string(), json!("git diff")),
+                            ("timeout".to_string(), json!(10)),
+                        ]),
+                    },
+                }),
+            ]
+        );
     }
 }

@@ -5,10 +5,10 @@
 
 This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
 Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
-Step-3.7-Flash, and NVIDIA's Nemotron 3 Puzzle hybrid model. It includes an
-OpenAI API-compatible server with continuous multi-session scheduling and a
-compact FP4 KV cache for the Qwen and Step attention paths. Nemotron combines
-backbone attention with Mamba recurrent state.
+Step-3.7-Flash, Gemma 4 26B-A4B, and NVIDIA's Nemotron 3 Puzzle hybrid model.
+It includes an OpenAI API-compatible server with continuous multi-session
+scheduling and a compact FP4 KV cache for the Qwen, Step, and Gemma attention
+paths. Nemotron combines backbone attention with Mamba recurrent state.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -87,7 +87,7 @@ The workspace has three crates:
   plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
   grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
 - `crates/infer` owns model loading, model execution, KV-cache state,
-  request-scoped sampling and generation, Qwen3.6, Step-3.7, and Nemotron 3
+  request-scoped sampling and generation, Qwen3.6, Step-3.7, Gemma 4, and Nemotron 3
   scheduling, prefill/decode orchestration, CLI binaries, and runtime
   benchmarks. Its reusable execution state lives under `runtime/`.
 - `crates/eider-api` owns the dedicated inference actor and OpenAI-compatible
@@ -111,6 +111,7 @@ Checkpoints kept under `models/`:
 - `models/qwen3.6-35b-a3b-nvfp4-unsloth`
 - `models/agents-a1-nvfp4`
 - `models/step-3.7-flash-nvfp4`
+- `models/gemma-4-26b-a4b-nvfp4`
 - `models/nemotron-3-super-120b-a12b-nvfp4`
 
 Models are expected to use the repository's supported ModelOpt or
@@ -125,6 +126,11 @@ Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
 retain those types or convert the BF16 weights to FP8 or NVFP4. The checkpoint
 also contains a vision tower, but Eider currently serves its text path only.
+
+[Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4)
+uses native NVFP4 experts alongside BF16 attention, routing, and dense MLP
+weights. Eider serves its heterogeneous local/global attention with a compact
+FP4 KV cache and the checkpoint's thinking and tool-call protocol.
 
 [NVIDIA Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4)
 uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
@@ -161,6 +167,12 @@ Start Step-3.7 with:
 scripts/run-eider-stepfun-server.sh
 ```
 
+Start Gemma 4 with:
+
+```sh
+scripts/run-eider-gemma4-server.sh
+```
+
 Start Nemotron Labs 3 Puzzle with:
 
 ```sh
@@ -193,7 +205,7 @@ The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 additionally push metrics over UDP. The `eider-serve` binary also takes
 `--decode-capacity`, `--prefill-sequence-capacity`, `--prefill-token-capacity`,
 `--max-active-sequences`, and `--max-context-tokens` flags that map directly to
-the scheduler admission limits. Qwen-family and StepFun serving retain up to 2
+the scheduler admission limits. All supported serving paths retain up to 2
 GiB of device-resident prompt checkpoints by default; pass
 `--prefix-cache-gib 0` to disable it or another whole-GiB value to change the
 budget. Responses report reused input tokens as
@@ -207,6 +219,7 @@ Run Pi against the matching server with:
 scripts/run-pi-eider-qwen.sh
 scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
+scripts/run-pi-eider-gemma4.sh
 scripts/run-pi-eider-nemotron3-super.sh
 ```
 

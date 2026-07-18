@@ -163,6 +163,96 @@ pub fn silu_mul_f32_into_on_stream(
     }
 }
 
+/// Applies Gemma's tanh-approximated GELU activation on `stream`.
+pub fn gelu_tanh_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if input.is_empty() || input.len() != output.len() || input.len() > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "GELU-tanh buffers",
+            expected: "equal non-empty u32-sized input and output".to_string(),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gelu_tanh_f32_on_stream",
+            ffi::infer_gelu_tanh_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                input.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies `GELU-tanh(gate) * up` on `stream`.
+pub fn gelu_tanh_mul_f32_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if gate.is_empty()
+        || gate.len() > u32::MAX as usize
+        || gate.len() != up.len()
+        || output.len() != gate.len()
+    {
+        return Err(Error::Shape {
+            label: "GELU-tanh multiply buffers",
+            expected: "equal non-empty u32-sized gate, up, and output".to_string(),
+            actual: format!(
+                "gate={} up={} output={}",
+                gate.len(),
+                up.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gelu_tanh_mul_f32_on_stream",
+            ffi::infer_gelu_tanh_mul_f32_on_stream(
+                gate.ptr,
+                up.ptr,
+                output.buffer_mut().ptr,
+                gate.len() as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies `GELU-tanh(gate) * up` to a concatenated `[gate, up]` vector.
+pub fn gelu_tanh_mul_halves_f32_into_on_stream(
+    gate_up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if len == 0 || len > u32::MAX as usize || gate_up.len() != len * 2 || output.len() != len {
+        return Err(Error::Shape {
+            label: "GELU-tanh multiply halves buffers",
+            expected: format!("gate_up={} output={len}", len * 2),
+            actual: format!("gate_up={} output={}", gate_up.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gelu_tanh_mul_halves_f32_on_stream",
+            ffi::infer_gelu_tanh_mul_halves_f32_on_stream(
+                gate_up.ptr,
+                output.buffer_mut().ptr,
+                len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[allow(missing_docs)]
 pub fn silu_mul_halves_f32_into_on_stream(
     gate_up: &DeviceBuffer<f32>,
@@ -1881,6 +1971,49 @@ pub fn rope_neox_partial_f32_into_on_stream(
     }
 }
 
+/// Enqueues proportional partial NeoX RoPE for one position.
+///
+/// `rotary_dim / 2` leading frequency pairs are rotated using ordinary
+/// full-head NeoX pairing and frequencies. Remaining pairs pass through.
+pub fn rope_neox_proportional_f32_into_on_stream(
+    rows: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    position: usize,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_rope_neox_f32(rows, head_dim, input, &output, Some(position), theta)?;
+    if rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || rotary_dim / 2 > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "proportional partial RoPE dimensions",
+            expected: "non-zero even rotary_dim <= head_dim".to_string(),
+            actual: format!("rotary_dim={rotary_dim} head_dim={head_dim}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rope_neox_proportional_f32_on_stream",
+            ffi::infer_rope_neox_proportional_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                head_dim as u32,
+                (rotary_dim / 2) as u32,
+                position as u32,
+                theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// MRoPE/IMRoPE sections `[v0,v1,v2,v3]` (t,h,w,extra), summing to
 /// `rotary_dim / 2`. For text-only Qwen3.5/3.6, v3 is 0 and the four positions
 /// are `[position, position, position, 0]`.
@@ -2677,6 +2810,55 @@ pub fn copy_row_f32_into_on_stream(
                 output.buffer_mut().ptr,
                 row as u32,
                 cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Gathers `values[indices[i]] * multipliers[i]` into `output` on `stream`.
+///
+/// Out-of-range source indices produce zero, matching the missing-expert
+/// behaviour of the routed-MoE helpers.
+pub fn gather_indexed_mul_f32_into_on_stream(
+    values: &DeviceBuffer<f32>,
+    indices: &DeviceBuffer<u32>,
+    multipliers: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let count = indices.len();
+    if count == 0
+        || count > u32::MAX as usize
+        || values.is_empty()
+        || values.len() > u32::MAX as usize
+        || multipliers.len() != count
+        || output.len() != count
+    {
+        return Err(Error::Shape {
+            label: "indexed f32 gather multiply",
+            expected: format!(
+                "non-empty values, indices/multipliers/output={count}, u32-sized dimensions"
+            ),
+            actual: format!(
+                "values={} indices={} multipliers={} output={}",
+                values.len(),
+                indices.len(),
+                multipliers.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gather_indexed_mul_f32_on_stream",
+            ffi::infer_gather_indexed_mul_f32_on_stream(
+                values.ptr,
+                indices.ptr,
+                multipliers.ptr,
+                output.buffer_mut().ptr,
+                count as u32,
+                values.len() as u32,
                 stream.as_raw(),
             ),
         )
@@ -8916,6 +9098,27 @@ mod tests {
     }
 
     #[test]
+    fn indexed_f32_gather_multiply_stays_on_device() {
+        let values = DeviceBuffer::from_host(&[0.25f32, -2.0, 4.0, 8.0]).expect("values");
+        let indices = DeviceBuffer::from_host(&[2u32, 1, 8, 0]).expect("indices");
+        let multipliers = DeviceBuffer::from_host(&[0.5f32, -1.0, 3.0, 4.0]).expect("multipliers");
+        let mut output = DeviceBuffer::zeroed(4).expect("output");
+        let stream = CudaStream::new_blocking().expect("stream");
+        gather_indexed_mul_f32_into_on_stream(
+            &values,
+            &indices,
+            &multipliers,
+            output.output(),
+            &stream,
+        )
+        .expect("indexed gather multiply");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("readback"),
+            [2.0, 2.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
     fn gpu_token_sampler_keeps_logits_on_device_and_applies_penalties() {
         let vocab = 64usize;
         let mut logits = vec![-20.0f32; 2 * vocab];
@@ -9114,6 +9317,93 @@ mod tests {
             assert!(
                 error <= 1.0e-6,
                 "SiLU multiply mismatch at {idx}: actual={actual} expected={expected} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_tanh_f32_matches_cpu_reference() {
+        let input = (0..513)
+            .map(|idx| ((idx % 47) as f32 - 23.0) * 0.125)
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let mut output_device = DeviceBuffer::zeroed(input.len()).expect("GELU output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        gelu_tanh_f32_into_on_stream(&input_device, output_device.output(), &stream)
+            .expect("GELU launch");
+        let output = output_device.copy_to_host(&stream).expect("GELU download");
+
+        for (idx, (actual, input)) in output.iter().zip(input.iter()).enumerate() {
+            let expected = 0.5
+                * input
+                * (1.0 + (0.797_884_6 * (input + 0.044715 * input * input * input)).tanh());
+            assert!(
+                (actual - expected).abs() <= 1.0e-5,
+                "GELU mismatch at {idx}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_tanh_mul_f32_matches_cpu_reference() {
+        let gate = (0..513)
+            .map(|idx| ((idx % 47) as f32 - 23.0) * 0.125)
+            .collect::<Vec<_>>();
+        let up = (0..513)
+            .map(|idx| ((idx % 31) as f32 - 15.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let gate_device = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let up_device = DeviceBuffer::from_host(&up).expect("up upload");
+        let mut output_device = DeviceBuffer::zeroed(gate.len()).expect("GELU output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        gelu_tanh_mul_f32_into_on_stream(&gate_device, &up_device, output_device.output(), &stream)
+            .expect("GELU multiply launch");
+        let output = output_device
+            .copy_to_host(&stream)
+            .expect("GELU multiply download");
+
+        for idx in 0..gate.len() {
+            let value = gate[idx];
+            let expected = 0.5
+                * value
+                * (1.0 + (0.797_884_6 * (value + 0.044715 * value * value * value)).tanh())
+                * up[idx];
+            assert!(
+                (output[idx] - expected).abs() <= 2.0e-5,
+                "GELU multiply mismatch at {idx}: actual={} expected={expected}",
+                output[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_tanh_mul_halves_matches_cpu_reference() {
+        let len = 513;
+        let gate_up = (0..len * 2)
+            .map(|idx| ((idx % 53) as f32 - 26.0) * 0.125)
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&gate_up).expect("input upload");
+        let mut output_device = DeviceBuffer::zeroed(len).expect("GELU output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        gelu_tanh_mul_halves_f32_into_on_stream(
+            &input_device,
+            output_device.output(),
+            len,
+            &stream,
+        )
+        .expect("GELU multiply launch");
+        let output = output_device.copy_to_host(&stream).expect("GELU download");
+
+        for idx in 0..len {
+            let gate = gate_up[idx];
+            let expected = 0.5
+                * gate
+                * (1.0 + (0.797_884_6 * (gate + 0.044715 * gate * gate * gate)).tanh())
+                * gate_up[len + idx];
+            assert!(
+                (output[idx] - expected).abs() <= 2.0e-5,
+                "GELU multiply mismatch at {idx}: actual={} expected={expected}",
+                output[idx]
             );
         }
     }
@@ -9731,6 +10021,45 @@ mod tests {
             &expected,
             2.0e-6,
             "partial RoPE",
+        );
+    }
+
+    #[test]
+    fn rope_neox_proportional_f32_matches_cpu_reference() {
+        let rows = 3usize;
+        let head_dim = 12usize;
+        let rotary_dim = 4usize;
+        let position = 17usize;
+        let theta = 1_000_000.0f32;
+        let input = (0..rows * head_dim)
+            .map(|idx| ((idx % 31) as f32 - 15.0) * 0.05)
+            .collect::<Vec<_>>();
+        let expected =
+            cpu_rope_neox_proportional(rows, head_dim, rotary_dim, &input, position, theta);
+
+        let input_device = DeviceBuffer::from_host(&input).expect("proportional RoPE input upload");
+        let mut output_device =
+            DeviceBuffer::<f32>::zeroed(input.len()).expect("proportional RoPE alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        rope_neox_proportional_f32_into_on_stream(
+            rows,
+            head_dim,
+            rotary_dim,
+            &input_device,
+            output_device.output(),
+            position,
+            theta,
+            &stream,
+        )
+        .expect("proportional RoPE enqueue");
+
+        assert_close(
+            &output_device
+                .copy_to_host(&stream)
+                .expect("proportional RoPE download"),
+            &expected,
+            2.0e-6,
+            "proportional RoPE",
         );
     }
 
@@ -13386,6 +13715,32 @@ mod tests {
             let row_start = row * head_dim;
             for i in 0..half {
                 let inv_freq = theta.powf(-2.0 * i as f32 / rotary_dim as f32);
+                let angle = position as f32 * inv_freq;
+                let (sin, cos) = angle.sin_cos();
+                let a = input[row_start + i];
+                let b = input[row_start + i + half];
+                output[row_start + i] = a * cos - b * sin;
+                output[row_start + i + half] = a * sin + b * cos;
+            }
+        }
+        output
+    }
+
+    fn cpu_rope_neox_proportional(
+        rows: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        input: &[f32],
+        position: usize,
+        theta: f32,
+    ) -> Vec<f32> {
+        let half = head_dim / 2;
+        let rotary_pairs = rotary_dim / 2;
+        let mut output = input.to_vec();
+        for row in 0..rows {
+            let row_start = row * head_dim;
+            for i in 0..rotary_pairs {
+                let inv_freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
                 let angle = position as f32 * inv_freq;
                 let (sin, cos) = angle.sin_cos();
                 let a = input[row_start + i];

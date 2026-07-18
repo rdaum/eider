@@ -64,6 +64,25 @@
           }
         },
         {
+          "id": "eider-gemma4-26b",
+          "name": "Gemma 4 26B-A4B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-nemotron3-puzzle",
           "name": "Nemotron Labs 3 Puzzle 75B-A9B NVFP4",
           "reasoning": true,

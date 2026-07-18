@@ -394,7 +394,9 @@ fn build_environment(source: String) -> Result<Environment<'static>> {
     let mut environment = Environment::new();
     environment.set_trim_blocks(true);
     environment.set_lstrip_blocks(true);
-    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    // Hugging Face checkpoint templates use Jinja's default falsey behaviour
+    // for optional message and JSON-schema members.
+    environment.set_undefined_behavior(UndefinedBehavior::Lenient);
     environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     environment.add_filter("tojson", tojson_compat);
     environment.add_function(
@@ -569,6 +571,28 @@ mod tests {
     }
 
     #[test]
+    fn missing_optional_schema_members_are_falsey() {
+        let environment = build_environment(
+            concat!(
+                "{% if tools[0]['function']['parameters']['properties']",
+                "['path']['nullable'] %}nullable{% else %}required{% endif %}"
+            )
+            .to_string(),
+        )
+        .unwrap();
+        let rendered = render_with_environment(
+            &environment,
+            &[ChatMessage::user("hello")],
+            &[tool_definition()],
+            ChatTemplateOptions::default(),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(rendered, "required");
+    }
+
+    #[test]
     fn checkpoint_special_tokens_reach_the_template() {
         let environment = build_environment("{{ bos_token }}x{{ eos_token }}".to_string()).unwrap();
         let rendered = render_with_environment(
@@ -631,6 +655,29 @@ mod tests {
                 .text
                 .ends_with("<|im_start|>assistant\n<think>\n")
         );
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_gemma4_template_accepts_standard_tool_schema() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/gemma-4-26b-a4b-nvfp4");
+        let template = CheckpointChatTemplate::from_model_dir(model_dir).unwrap();
+        let prompt = template
+            .render_and_tokenize(
+                &[ChatMessage::user("hello")],
+                &[tool_definition()],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert!(prompt.text.contains("<|tool>"), "{:?}", prompt.text);
+        assert!(
+            prompt.text.contains("declaration:read_file"),
+            "{:?}",
+            prompt.text
+        );
+        assert!(!prompt.token_ids.is_empty());
     }
 
     #[test]
