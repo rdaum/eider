@@ -22,6 +22,9 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+mod batch;
+pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillRow};
+
 fn default_rms_norm_eps() -> f32 {
     1.0e-6
 }
@@ -280,6 +283,7 @@ pub struct Gemma4MlpWorkspace {
 pub struct Gemma4Router {
     input_norm_weight: DeviceBuffer<f32>,
     input_norm_scalar: DeviceBuffer<f32>,
+    input_norm_scalar_value: f32,
     router_scale: DeviceBuffer<f32>,
     projection: Gemma4Linear,
     per_expert_scale: DeviceBuffer<f32>,
@@ -388,6 +392,7 @@ pub struct Gemma4DecoderLayer {
     post_feedforward_norm: Gemma4RmsNorm,
     layer_scale_channels: DeviceBuffer<f32>,
     layer_scalar: DeviceBuffer<f32>,
+    layer_scalar_value: f32,
 }
 
 /// One-token working buffers for a [`Gemma4DecoderLayer`].
@@ -411,6 +416,7 @@ pub struct Gemma4Model {
     embedding: DeviceBuffer<u16>,
     embedding_channel_scale: DeviceBuffer<f32>,
     embedding_scalar: DeviceBuffer<f32>,
+    embedding_scalar_value: f32,
     layers: Vec<Gemma4DecoderLayer>,
     final_norm: Gemma4RmsNorm,
 }
@@ -716,11 +722,11 @@ impl Gemma4Router {
             &format!("{prefix}.per_expert_scale"),
             checkpoint.config.num_experts,
         )?)?;
+        let input_norm_scalar_value = 1.0 / (checkpoint.config.hidden_size as f32).sqrt();
         Ok(Self {
             input_norm_weight: DeviceBuffer::from_host(&vec![1.0; checkpoint.config.hidden_size])?,
-            input_norm_scalar: DeviceBuffer::from_host(&[
-                1.0 / (checkpoint.config.hidden_size as f32).sqrt()
-            ])?,
+            input_norm_scalar: DeviceBuffer::from_host(&[input_norm_scalar_value])?,
+            input_norm_scalar_value,
             router_scale,
             projection,
             per_expert_scale,
@@ -1550,6 +1556,7 @@ impl Gemma4DecoderLayer {
     pub fn load(checkpoint: &Gemma4Checkpoint, layer: usize) -> Result<Self> {
         let prefix = format!("model.language_model.layers.{layer}");
         let hidden_size = checkpoint.config.hidden_size;
+        let layer_scalar = checkpoint.load_bf16_vector_f32(&format!("{prefix}.layer_scalar"), 1)?;
         Ok(Self {
             input_norm: Gemma4RmsNorm::load(
                 checkpoint,
@@ -1590,9 +1597,8 @@ impl Gemma4DecoderLayer {
                 hidden_size,
             )?,
             layer_scale_channels: DeviceBuffer::from_host(&vec![1.0; hidden_size])?,
-            layer_scalar: DeviceBuffer::from_host(
-                &checkpoint.load_bf16_vector_f32(&format!("{prefix}.layer_scalar"), 1)?,
-            )?,
+            layer_scalar: DeviceBuffer::from_host(&layer_scalar)?,
+            layer_scalar_value: layer_scalar[0],
         })
     }
 
@@ -1776,12 +1782,14 @@ impl Gemma4Model {
         for layer in 0..config.num_hidden_layers {
             layers.push(Gemma4DecoderLayer::load(&checkpoint, layer)?);
         }
+        let embedding_scalar_value = nvfp4::format::bf16_to_f32(nvfp4::format::f32_to_bf16(
+            (config.hidden_size as f32).sqrt(),
+        ));
         Ok(Self {
             embedding,
             embedding_channel_scale: DeviceBuffer::from_host(&vec![1.0; config.hidden_size])?,
-            embedding_scalar: DeviceBuffer::from_host(&[nvfp4::format::bf16_to_f32(
-                nvfp4::format::f32_to_bf16((config.hidden_size as f32).sqrt()),
-            )])?,
+            embedding_scalar: DeviceBuffer::from_host(&[embedding_scalar_value])?,
+            embedding_scalar_value,
             final_norm: Gemma4RmsNorm::load(
                 &checkpoint,
                 "model.language_model.norm.weight",
@@ -2523,5 +2531,51 @@ mod tests {
                 actual[output_index]
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_batched_prefill_matches_token_serial_cache() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/gemma-4-26b-a4b-nvfp4");
+        let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
+        let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
+        let next_input = 107;
+        let mut serial = model
+            .new_decode_state(prompt.len() + 1)
+            .expect("serial state");
+        let mut batched = model
+            .new_decode_state(prompt.len() + 1)
+            .expect("batched state");
+        let stream = CudaStream::new_blocking().expect("stream");
+        model
+            .prefill_tokens(&mut serial, &prompt, &stream)
+            .expect("serial prefill");
+        let mut workspace = model
+            .new_prefill_batch_workspace(1, prompt.len(), prompt.len() + 1)
+            .expect("batch workspace");
+        model
+            .prefill_batch(
+                &mut workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &prompt,
+                    state: &mut batched,
+                }],
+                &stream,
+            )
+            .expect("batch prefill");
+        let serial_next = model
+            .decode_one(&mut serial, next_input, &stream)
+            .expect("serial next token");
+        let batched_next = model
+            .decode_one(&mut batched, next_input, &stream)
+            .expect("batched next token");
+        assert_eq!(batched.len(), serial.len());
+        assert_eq!(batched_next.token, serial_next.token);
+        assert!(
+            (batched_next.logit - serial_next.logit).abs() <= 0.5,
+            "serial={serial_next:?} batched={batched_next:?}"
+        );
     }
 }

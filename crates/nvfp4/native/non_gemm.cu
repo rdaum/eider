@@ -2489,6 +2489,68 @@ extern "C" cudaError_t infer_rope_neox_proportional_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_rope_neox_proportional_sequence_f32_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t input_token_offset,
+    std::uint32_t start_position,
+    float theta) {
+    const std::uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t half = head_dim / 2;
+    const std::uint32_t total_pairs = tokens * heads * half;
+    if (pair_idx >= total_pairs) return;
+
+    const std::uint32_t pair = pair_idx % half;
+    const std::uint32_t row = pair_idx / half;
+    const std::uint32_t token = row / heads;
+    const std::uint32_t dense_row = input_token_offset * heads + row;
+    const std::uint32_t row_start = dense_row * head_dim;
+    const float a = input[row_start + pair];
+    const float b = input[row_start + pair + half];
+    if (pair >= rotary_pairs) {
+        output[row_start + pair] = a;
+        output[row_start + pair + half] = b;
+        return;
+    }
+
+    const float inv_freq =
+        powf(theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
+    float sin_value;
+    float cos_value;
+    sincosf(static_cast<float>(start_position + token) * inv_freq, &sin_value, &cos_value);
+    output[row_start + pair] = a * cos_value - b * sin_value;
+    output[row_start + pair + half] = a * sin_value + b * cos_value;
+}
+
+extern "C" cudaError_t infer_rope_neox_proportional_sequence_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t input_token_offset,
+    std::uint32_t start_position,
+    float theta,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || tokens == 0 || heads == 0 ||
+        head_dim == 0 || (head_dim % 2) != 0 || rotary_pairs == 0 ||
+        rotary_pairs > head_dim / 2 || !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t total_pairs = tokens * heads * (head_dim / 2);
+    const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
+    infer_rope_neox_proportional_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, tokens, heads, head_dim, rotary_pairs,
+        input_token_offset, start_position, theta);
+    return cudaGetLastError();
+}
+
 // IMRoPE / MRoPE kernel for Qwen3.5/3.6 full-attention text decode.
 //
 // rotary_dim is the number of channels per head that receive rotation
@@ -4970,6 +5032,56 @@ __global__ void infer_bf16_matvec_logits_warp_rows_kernel(
     if (lane == 0) logits[row] = value;
 }
 
+__global__ void infer_bf16_matvec_logits_reuse_weights_batch_kernel(
+    const float* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    float* __restrict__ logits,
+    std::uint32_t batch_size,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    constexpr std::uint32_t kBatchTile = 8;
+    const std::uint32_t warps = blockDim.x >> 5u;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * warps + warp;
+    if (row >= rows) return;
+    const std::uint32_t batch_base = blockIdx.y * kBatchTile;
+    const std::uint32_t active = min(kBatchTile, batch_size - batch_base);
+    float acc[kBatchTile] = {};
+    const std::uint16_t* row_weight = weight + static_cast<std::size_t>(row) * cols;
+    for (std::uint32_t col = lane * 4; col < cols; col += 32 * 4) {
+        const __nv_bfloat162 w0 =
+            *reinterpret_cast<const __nv_bfloat162*>(row_weight + col);
+        const __nv_bfloat162 w1 =
+            *reinterpret_cast<const __nv_bfloat162*>(row_weight + col + 2);
+        const float w0x = __bfloat162float(__low2bfloat16(w0));
+        const float w0y = __bfloat162float(__high2bfloat16(w0));
+        const float w1x = __bfloat162float(__low2bfloat16(w1));
+        const float w1y = __bfloat162float(__high2bfloat16(w1));
+#pragma unroll
+        for (std::uint32_t batch = 0; batch < kBatchTile; ++batch) {
+            if (batch >= active) continue;
+            const float* input_row = input + static_cast<std::size_t>(batch_base + batch) * cols;
+            acc[batch] = __fmaf_rn(w0x, input_row[col], acc[batch]);
+            acc[batch] = __fmaf_rn(w0y, input_row[col + 1], acc[batch]);
+            acc[batch] = __fmaf_rn(w1x, input_row[col + 2], acc[batch]);
+            acc[batch] = __fmaf_rn(w1y, input_row[col + 3], acc[batch]);
+        }
+    }
+#pragma unroll
+    for (std::uint32_t batch = 0; batch < kBatchTile; ++batch) {
+        if (batch >= active) continue;
+        acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 16);
+        acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 8);
+        acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 4);
+        acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 2);
+        acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 1);
+        if (lane == 0) {
+            logits[static_cast<std::size_t>(batch_base + batch) * rows + row] = acc[batch];
+        }
+    }
+}
+
 __global__ void infer_lm_head_top1_pass1_kernel(
     const float* __restrict__ input,
     const std::uint16_t* __restrict__ weight,
@@ -5164,28 +5276,19 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_batch_on_stream(
         return cudaErrorInvalidValue;
     }
     constexpr int kThreads = 256;
-    if ((cols & 3u) != 0u) {
+    if (batch_size == 1 || (cols & 3u) != 0u) {
         const std::size_t shmem =
             kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
         infer_bf16_matvec_logits_batch_kernel<<<dim3(rows, batch_size, 1), kThreads, shmem, stream>>>(
             input, weight, logits, batch_size, rows, cols);
         return cudaGetLastError();
     }
-    const std::size_t shmem =
-        static_cast<std::size_t>(cols) * sizeof(float);
+    constexpr std::uint32_t kBatchTile = 8;
     const std::uint32_t warps = kThreads / 32;
-    for (std::uint32_t batch = 0; batch < batch_size; ++batch) {
-        infer_bf16_matvec_logits_warp_rows_kernel<<<
-            (rows + warps - 1) / warps, kThreads, shmem, stream>>>(
-            input + static_cast<std::size_t>(batch) * cols,
-            weight,
-            logits + static_cast<std::size_t>(batch) * rows,
-            rows,
-            cols);
-        const cudaError_t status = cudaGetLastError();
-        if (status != cudaSuccess) return status;
-    }
-    return cudaSuccess;
+    infer_bf16_matvec_logits_reuse_weights_batch_kernel<<<
+        dim3((rows + warps - 1) / warps, (batch_size + kBatchTile - 1) / kBatchTile),
+        kThreads, 0, stream>>>(input, weight, logits, batch_size, rows, cols);
+    return cudaGetLastError();
 }
 
 extern "C" cudaError_t infer_bf16_linear_pair_logits_f32_on_stream(

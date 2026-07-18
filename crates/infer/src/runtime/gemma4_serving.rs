@@ -9,7 +9,10 @@ use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::gemma4::{Gemma4DecodeState, Gemma4Model, Gemma4SequenceCheckpoint};
+use crate::gemma4::{
+    Gemma4DecodeState, Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillRow,
+    Gemma4SequenceCheckpoint,
+};
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -102,6 +105,7 @@ pub struct Gemma4ChatService<'model, 'template> {
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
     stream: CudaStream,
+    prefill_workspace: Gemma4PrefillBatchWorkspace,
     next_id: u64,
     waiting: VecDeque<Gemma4RequestId>,
     requests: BTreeMap<Gemma4RequestId, ActiveRequest<'template>>,
@@ -127,11 +131,17 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_workspace = model.new_prefill_batch_workspace(
+            config.prefill_sequence_capacity,
+            config.prefill_token_capacity,
+            config.max_context_tokens,
+        )?;
         Ok(Self {
             model,
             template,
             config,
             stream: CudaStream::new_non_blocking()?,
+            prefill_workspace,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -348,8 +358,9 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             return Ok(());
         }
         let mut budget = self.config.prefill_token_capacity;
+        let mut selected = Vec::with_capacity(ids.len());
         for (index, &id) in ids.iter().enumerate() {
-            let request = self.requests.get_mut(&id).expect("prefill request exists");
+            let request = self.requests.get(&id).expect("prefill request exists");
             let available = request
                 .prompt
                 .len()
@@ -367,29 +378,56 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             if chunk == 0 {
                 continue;
             }
-            let end = request.prompt_position + chunk;
-            let tokens = &request.prompt[request.prompt_position..end];
-            self.model.prefill_tokens(
-                request.state.as_mut().expect("prefill request is admitted"),
-                tokens,
-                &self.stream,
-            )?;
-            request.prompt_position = end;
             budget -= chunk;
+            selected.push((id, chunk));
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let mut requests = selected
+            .iter()
+            .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
+            .collect::<Vec<_>>();
+        let result = {
+            let mut rows = requests
+                .iter_mut()
+                .zip(selected.iter().map(|(_, chunk)| *chunk))
+                .map(|(request, chunk)| {
+                    let start = request.prompt_position;
+                    let end = start + chunk;
+                    Gemma4PrefillRow {
+                        token_ids: &request.prompt[start..end],
+                        state: request.state.as_mut().expect("prefill request is admitted"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.model
+                .prefill_batch(&mut self.prefill_workspace, &mut rows, &self.stream)
+                .and_then(|()| self.stream.synchronize())
+        };
+        if let Err(error) = result {
+            for (request, (id, _)) in requests.into_iter().zip(&selected) {
+                self.requests.insert(*id, request);
+            }
+            return Err(error);
+        }
+        for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
+            request.prompt_position += chunk;
             if request.prompt_position == request.prefix_cache_target {
                 Self::retain_request_checkpoint(
                     self.model,
                     &self.stream,
                     &mut self.prefix_cache,
-                    request,
+                    &mut request,
                 );
             }
             tick.prefilled.push(Gemma4PrefillProgress {
                 request_id: id,
                 prompt_position: request.prompt_position,
             });
+            self.requests.insert(id, request);
         }
-        self.stream.synchronize()
+        Ok(())
     }
 
     fn retain_request_checkpoint(

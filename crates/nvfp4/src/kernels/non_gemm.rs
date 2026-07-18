@@ -2014,6 +2014,74 @@ pub fn rope_neox_proportional_f32_into_on_stream(
     }
 }
 
+/// Enqueues Gemma-style proportional partial NeoX RoPE for a dense sequence span.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    input_token_offset: usize,
+    start_position: usize,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let end_tokens = input_token_offset.saturating_add(tokens);
+    let required = end_tokens.saturating_mul(heads).saturating_mul(head_dim);
+    if tokens == 0
+        || heads == 0
+        || head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || input.len() < required
+        || output.len() < required
+        || tokens > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || rotary_dim > u32::MAX as usize
+        || input_token_offset > u32::MAX as usize
+        || start_position > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "proportional sequence RoPE",
+            expected: "matching non-empty sequence, head, rotary, and offset dimensions"
+                .to_string(),
+            actual: format!(
+                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} input_token_offset={input_token_offset} start_position={start_position}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(Error::Format {
+            label: "proportional sequence RoPE theta",
+            detail: format!("expected positive finite theta, got {theta}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rope_neox_proportional_sequence_f32_on_stream",
+            ffi::infer_rope_neox_proportional_sequence_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                (rotary_dim / 2) as u32,
+                input_token_offset as u32,
+                start_position as u32,
+                theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// MRoPE/IMRoPE sections `[v0,v1,v2,v3]` (t,h,w,extra), summing to
 /// `rotary_dim / 2`. For text-only Qwen3.5/3.6, v3 is 0 and the four positions
 /// are `[position, position, position, 0]`.
@@ -9984,6 +10052,63 @@ mod tests {
                 "sequence RoPE mismatch at {idx}: actual={actual} expected={expected} error={error}"
             );
         }
+    }
+
+    #[test]
+    fn rope_neox_proportional_sequence_at_offset_matches_cpu_reference() {
+        let capacity = 5;
+        let offset = 1;
+        let tokens = 3;
+        let heads = 2;
+        let head_dim = 16;
+        let rotary_dim = 8;
+        let start_position = 29;
+        let theta = 1_000_000.0;
+        let input = (0..capacity * heads * head_dim)
+            .map(|idx| ((idx % 43) as f32 - 21.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0; input.len()];
+        for token in 0..tokens {
+            let row = offset + token;
+            let start = row * heads * head_dim;
+            let end = start + heads * head_dim;
+            expected[start..end].copy_from_slice(&cpu_rope_neox_proportional(
+                heads,
+                head_dim,
+                rotary_dim,
+                &input[start..end],
+                start_position + token,
+                theta,
+            ));
+        }
+
+        let input_device = DeviceBuffer::from_host(&input).expect("sequence RoPE input upload");
+        let mut output_device = DeviceBuffer::zeroed(input.len()).expect("sequence RoPE alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+            tokens,
+            heads,
+            head_dim,
+            rotary_dim,
+            &input_device,
+            output_device.output(),
+            offset,
+            start_position,
+            theta,
+            &stream,
+        )
+        .expect("proportional sequence RoPE launch");
+        let output = output_device
+            .copy_to_host(&stream)
+            .expect("proportional sequence RoPE download");
+        let start = offset * heads * head_dim;
+        let end = (offset + tokens) * heads * head_dim;
+        assert_close(
+            &output[start..end],
+            &expected[start..end],
+            2.0e-5,
+            "sequence RoPE",
+        );
     }
 
     #[test]

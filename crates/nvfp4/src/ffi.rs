@@ -968,6 +968,18 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_rope_neox_proportional_sequence_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        rotary_pairs: u32,
+        input_token_offset: u32,
+        start_position: u32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rope_imrope_f32_on_stream(
         input: *const f32,
         output: *mut f32,
