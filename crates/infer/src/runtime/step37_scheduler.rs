@@ -11,7 +11,7 @@ use crate::step37::{
 };
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Stable scheduler identity for one Step request.
@@ -53,6 +53,8 @@ pub struct Step37AdmissionProgress {
     pub request_id: Step37RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
+    /// Elapsed scheduler-tick time when admission completed.
+    pub admitted_after_tick_start: Duration,
 }
 
 /// Observable result of one multi-session Step scheduler iteration.
@@ -296,15 +298,20 @@ impl Step37Scheduler {
     }
 
     pub fn tick(&mut self) -> Result<Step37SchedulerTick> {
+        let tick_started = Instant::now();
         let mut tick = Step37SchedulerTick::default();
-        self.admit_waiting(&mut tick)?;
+        self.admit_waiting(&mut tick, tick_started)?;
         self.run_decode_phase(&mut tick)?;
         self.run_prefill_phase(&mut tick)?;
         tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
 
-    fn admit_waiting(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
+    fn admit_waiting(
+        &mut self,
+        tick: &mut Step37SchedulerTick,
+        tick_started: Instant,
+    ) -> Result<()> {
         while self.active_sequence_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -357,6 +364,7 @@ impl Step37Scheduler {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
                 cached_prompt_tokens,
+                admitted_after_tick_start: tick_started.elapsed(),
             });
         }
         Ok(())

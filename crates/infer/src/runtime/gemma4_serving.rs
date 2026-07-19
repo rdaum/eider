@@ -15,8 +15,10 @@ use crate::gemma4::{
 };
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
+
+const TAIL_PREFILL_TOKEN_CAPACITY: usize = 512;
 
 /// Stable request identity assigned by a Gemma 4 chat service.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -41,6 +43,8 @@ pub struct Gemma4AdmissionProgress {
     pub request_id: Gemma4RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
+    /// Elapsed scheduler-tick time when admission completed.
+    pub admitted_after_tick_start: Duration,
 }
 
 /// Prompt progress completed during a tick.
@@ -106,6 +110,7 @@ pub struct Gemma4ChatService<'model, 'template> {
     config: SchedulerConfig,
     stream: CudaStream,
     prefill_workspace: Gemma4PrefillBatchWorkspace,
+    tail_prefill_workspace: Option<Gemma4PrefillBatchWorkspace>,
     next_id: u64,
     waiting: VecDeque<Gemma4RequestId>,
     requests: BTreeMap<Gemma4RequestId, ActiveRequest<'template>>,
@@ -136,12 +141,22 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             config.prefill_token_capacity,
             config.max_context_tokens,
         )?;
+        let tail_prefill_workspace = (config.prefill_token_capacity > TAIL_PREFILL_TOKEN_CAPACITY)
+            .then(|| {
+                model.new_prefill_batch_workspace(
+                    config.prefill_sequence_capacity,
+                    TAIL_PREFILL_TOKEN_CAPACITY,
+                    config.max_context_tokens,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             model,
             template,
             config,
             stream: CudaStream::new_non_blocking()?,
             prefill_workspace,
+            tail_prefill_workspace,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -245,8 +260,9 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
     /// Runs one decode-first scheduling iteration across active requests.
     pub fn tick(&mut self) -> Result<Gemma4Tick> {
+        let tick_started = Instant::now();
         let mut tick = Gemma4Tick::default();
-        self.admit(&mut tick)?;
+        self.admit(&mut tick, tick_started)?;
         for admission in &tick.admitted {
             self.requests
                 .get_mut(&admission.request_id)
@@ -317,7 +333,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         self.active_sequences
     }
 
-    fn admit(&mut self, tick: &mut Gemma4Tick) -> Result<()> {
+    fn admit(&mut self, tick: &mut Gemma4Tick, tick_started: Instant) -> Result<()> {
         while self.active_sequences < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -348,6 +364,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
+                admitted_after_tick_start: tick_started.elapsed(),
             });
         }
         Ok(())
@@ -365,16 +382,8 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 .prompt
                 .len()
                 .saturating_sub(request.prompt_position + 1);
-            let before_checkpoint = prefill_rows_before_checkpoint(
-                available,
-                request.prompt_position,
-                request.prefix_cache_target,
-                request.prefix_cache_checkpointed,
-            );
             let remaining_sequences = ids.len() - index;
-            let chunk = available
-                .min(before_checkpoint)
-                .min(budget.div_ceil(remaining_sequences));
+            let chunk = available.min(budget.div_ceil(remaining_sequences));
             if chunk == 0 {
                 continue;
             }
@@ -389,6 +398,12 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
             .collect::<Vec<_>>();
         let result = {
+            let selected_tokens = selected.iter().map(|(_, chunk)| *chunk).sum::<usize>();
+            let workspace = self
+                .tail_prefill_workspace
+                .as_mut()
+                .filter(|_| selected_tokens <= TAIL_PREFILL_TOKEN_CAPACITY)
+                .unwrap_or(&mut self.prefill_workspace);
             let mut rows = requests
                 .iter_mut()
                 .zip(selected.iter().map(|(_, chunk)| *chunk))
@@ -402,7 +417,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 })
                 .collect::<Vec<_>>();
             self.model
-                .prefill_batch(&mut self.prefill_workspace, &mut rows, &self.stream)
+                .prefill_batch(workspace, &mut rows, &self.stream)
                 .and_then(|()| self.stream.synchronize())
         };
         if let Err(error) = result {
@@ -413,7 +428,11 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         }
         for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
             request.prompt_position += chunk;
-            if request.prompt_position == request.prefix_cache_target {
+            if checkpoint_ready(
+                request.prompt_position,
+                request.prefix_cache_target,
+                request.prefix_cache_checkpointed,
+            ) {
                 Self::retain_request_checkpoint(
                     self.model,
                     &self.stream,
@@ -447,17 +466,19 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             request.prefix_cache_checkpointed = true;
             return;
         };
-        if state.len() != request.prefix_cache_target {
+        if state.len() < request.prefix_cache_target {
             return;
         }
         if !cache.contains(key) {
-            let Ok(estimated_bytes) = model.checkpoint_sequence_device_bytes(state) else {
+            let Ok(estimated_bytes) =
+                model.checkpoint_sequence_device_bytes(state, request.prefix_cache_target)
+            else {
                 request.prefix_cache_checkpointed = true;
                 return;
             };
             if cache.prepare_insert(estimated_bytes) {
                 let started = Instant::now();
-                match model.checkpoint_sequence(state, stream) {
+                match model.checkpoint_sequence(state, request.prefix_cache_target, stream) {
                     Ok(checkpoint) => {
                         cache.record_checkpoint(started);
                         let bytes = checkpoint.device_bytes();
@@ -550,17 +571,12 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     }
 }
 
-fn prefill_rows_before_checkpoint(
-    available: usize,
+fn checkpoint_ready(
     prompt_position: usize,
     prefix_cache_target: usize,
     prefix_cache_checkpointed: bool,
-) -> usize {
-    if prefix_cache_checkpointed || prefix_cache_target == 0 {
-        available
-    } else {
-        prefix_cache_target.saturating_sub(prompt_position)
-    }
+) -> bool {
+    !prefix_cache_checkpointed && prefix_cache_target != 0 && prompt_position >= prefix_cache_target
 }
 
 struct ResponseFilter {
@@ -623,19 +639,18 @@ impl ResponseFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::prefill_rows_before_checkpoint;
+    use super::checkpoint_ready;
 
     #[test]
-    fn checkpoint_boundary_limits_a_prefill_chunk() {
-        let available = 400usize;
-        let position = 64usize;
-        let target = 256usize;
-        let before_checkpoint = target.saturating_sub(position);
-        assert_eq!(available.min(before_checkpoint), 192);
+    fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
+        assert!(checkpoint_ready(384, 256, false));
+        assert!(checkpoint_ready(256, 256, false));
+        assert!(!checkpoint_ready(128, 256, false));
     }
 
     #[test]
-    fn disabled_prefix_cache_does_not_limit_prefill() {
-        assert_eq!(prefill_rows_before_checkpoint(400, 0, 0, false), 400);
+    fn disabled_or_completed_checkpoint_is_not_ready() {
+        assert!(!checkpoint_ready(256, 0, false));
+        assert!(!checkpoint_ready(256, 256, true));
     }
 }

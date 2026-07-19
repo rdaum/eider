@@ -422,6 +422,7 @@ struct EngineAdmissionProgress {
     request_id: u64,
     sequence_device_bytes: usize,
     cached_prompt_tokens: usize,
+    admitted_after_tick_start: Duration,
 }
 
 struct EnginePrefillProgress {
@@ -507,6 +508,7 @@ impl ActorService for QwenActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
             prefilled: tick
@@ -607,6 +609,7 @@ impl ActorService for StepActorService<'_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
             prefilled: tick
@@ -707,6 +710,7 @@ impl ActorService for NemotronActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
             prefilled: tick
@@ -808,6 +812,7 @@ impl ActorService for GemmaActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
             prefilled: tick
@@ -929,8 +934,9 @@ fn run_actor_loop(
         }
         for admission in &tick.admitted {
             if let Some(request) = active.get_mut(&admission.request_id) {
+                let admitted_at = tick_start + admission.admitted_after_tick_start;
                 request.metrics.record_admission(
-                    now,
+                    admitted_at,
                     admission.cached_prompt_tokens,
                     admission.sequence_device_bytes,
                 );

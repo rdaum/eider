@@ -2012,41 +2012,52 @@ impl Gemma4Model {
     }
 
     /// Returns the compact device footprint of an aligned prefix checkpoint.
-    pub fn checkpoint_sequence_device_bytes(&self, state: &Gemma4DecodeState) -> Result<usize> {
-        if state.position == 0 || !state.position.is_multiple_of(128) {
+    pub fn checkpoint_sequence_device_bytes(
+        &self,
+        state: &Gemma4DecodeState,
+        prefix_tokens: usize,
+    ) -> Result<usize> {
+        if prefix_tokens == 0
+            || !prefix_tokens.is_multiple_of(128)
+            || prefix_tokens > state.position
+        {
             return Err(Error::Shape {
                 label: "Gemma 4 sequence checkpoint byte estimate",
-                expected: "a nonzero 128-token-aligned position".to_string(),
-                actual: state.position.to_string(),
+                expected: format!(
+                    "a nonzero 128-token-aligned prefix at most {} tokens",
+                    state.position
+                ),
+                actual: prefix_tokens.to_string(),
             });
         }
         state.kv_caches.iter().try_fold(0usize, |total, cache| {
-            let bytes = cache.device_bytes_for_capacity(state.position)?;
+            let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
             total.checked_add(bytes).ok_or_else(|| Error::Shape {
                 label: "Gemma 4 sequence checkpoint byte estimate",
                 expected: "device-byte total without overflow".to_string(),
-                actual: format!("position={}", state.position),
+                actual: format!("prefix_tokens={prefix_tokens}"),
             })
         })
     }
 
-    /// Copies the current aligned K/V prefix into compact retained storage.
+    /// Copies an aligned K/V prefix into compact retained storage.
     pub fn checkpoint_sequence(
         &self,
         state: &Gemma4DecodeState,
+        prefix_tokens: usize,
         stream: &CudaStream,
     ) -> Result<Gemma4SequenceCheckpoint> {
-        self.checkpoint_sequence_device_bytes(state)?;
+        self.checkpoint_sequence_device_bytes(state, prefix_tokens)?;
         let mut kv_caches = Vec::with_capacity(self.layers.len());
         for (layer, source) in self.layers.iter().zip(&state.kv_caches) {
-            let mut cache = layer.new_kv_cache(state.position)?;
-            cache.copy_aligned_prefix_from_on_stream(source, state.position, stream)?;
+            let mut cache = layer.new_kv_cache(prefix_tokens)?;
+            cache.copy_aligned_prefix_from_on_stream(source, prefix_tokens, stream)?;
             kv_caches.push(cache);
         }
         stream.synchronize()?;
         Ok(Gemma4SequenceCheckpoint {
             kv_caches,
-            position: state.position,
+            position: prefix_tokens,
         })
     }
 

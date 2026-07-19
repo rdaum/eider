@@ -10,7 +10,7 @@ use crate::qwen3::qwen36::{
 };
 use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Stable scheduler identity for one request.
@@ -164,6 +164,8 @@ pub struct Qwen36AdmissionProgress {
     pub sequence_device_bytes: usize,
     /// Prompt tokens restored from a reusable hybrid-state checkpoint.
     pub cached_prompt_tokens: usize,
+    /// Elapsed scheduler-tick time when admission completed.
+    pub admitted_after_tick_start: Duration,
 }
 
 /// Observable result of one scheduler tick.
@@ -434,15 +436,20 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Runs one decode-first scheduling iteration followed by bounded prefill.
     pub fn tick(&mut self) -> Result<Qwen36SchedulerTick> {
+        let tick_started = Instant::now();
         let mut tick = Qwen36SchedulerTick::default();
-        self.admit_waiting(&mut tick)?;
+        self.admit_waiting(&mut tick, tick_started)?;
         self.run_decode_phase(&mut tick)?;
         self.run_prefill_phase(&mut tick)?;
         tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
 
-    fn admit_waiting(&mut self, tick: &mut Qwen36SchedulerTick) -> Result<()> {
+    fn admit_waiting(
+        &mut self,
+        tick: &mut Qwen36SchedulerTick,
+        tick_started: Instant,
+    ) -> Result<()> {
         let model = self.model;
         while self.active_sequence_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
@@ -495,6 +502,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
                 cached_prompt_tokens,
+                admitted_after_tick_start: tick_started.elapsed(),
             });
         }
         Ok(())

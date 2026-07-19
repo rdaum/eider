@@ -15,7 +15,7 @@ use crate::nemotron3::{
 };
 use nvfp4::{DeviceBuffer, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Stable request identity assigned by a Nemotron 3 chat service.
@@ -41,6 +41,8 @@ pub struct Nemotron3AdmissionProgress {
     pub request_id: Nemotron3RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
+    /// Elapsed scheduler-tick time when admission completed.
+    pub admitted_after_tick_start: Duration,
 }
 
 /// Prompt progress completed during a tick.
@@ -268,8 +270,9 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     /// Runs one decode-first round-robin scheduling iteration.
     pub fn tick(&mut self) -> Result<Nemotron3Tick> {
+        let tick_started = Instant::now();
         let mut tick = Nemotron3Tick::default();
-        self.admit(&mut tick)?;
+        self.admit(&mut tick, tick_started)?;
         for admission in &tick.admitted {
             self.requests
                 .get_mut(&admission.request_id)
@@ -356,7 +359,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         self.active_sequences
     }
 
-    fn admit(&mut self, tick: &mut Nemotron3Tick) -> Result<()> {
+    fn admit(&mut self, tick: &mut Nemotron3Tick, tick_started: Instant) -> Result<()> {
         while self.active_sequences < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -384,6 +387,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
+                admitted_after_tick_start: tick_started.elapsed(),
             });
         }
         Ok(())
