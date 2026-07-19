@@ -71,7 +71,7 @@ pub struct ResponseReasoning {
 }
 
 impl<T> OneOrMany<T> {
-    fn into_vec(self) -> Vec<T> {
+    pub(crate) fn into_vec(self) -> Vec<T> {
         match self {
             Self::One(value) => vec![value],
             Self::Many(values) => values,

@@ -1,6 +1,7 @@
-//! OpenAI Responses-compatible serving for Eider.
+//! OpenAI-compatible Responses and Chat Completions serving for Eider.
 
 pub mod actor;
+pub mod chat_completions;
 pub mod deployment;
 pub mod metrics;
 pub mod protocol;

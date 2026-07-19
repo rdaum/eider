@@ -102,6 +102,108 @@
           }
         }
       ]
+    },
+    "eider-chat": {
+      "name": "Eider Chat Completions",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "$EIDER_API_KEY",
+      "authHeader": true,
+      "compat": {
+        "supportsDeveloperRole": false
+      },
+      "models": [
+        {
+          "id": "eider-qwen3.6",
+          "name": "Qwen3.6 35B-A3B NVFP4",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-agents-a1",
+          "name": "Agents-A1 35B-A3B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-step3.7",
+          "name": "Step-3.7-Flash NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-gemma4-26b",
+          "name": "Gemma 4 26B-A4B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-nemotron3-puzzle",
+          "name": "Nemotron Labs 3 Puzzle 75B-A9B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
     }
   }
 }

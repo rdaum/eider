@@ -1,6 +1,7 @@
-//! Axum HTTP and SSE surface for the Responses API.
+//! Axum HTTP and SSE surface for the OpenAI-compatible APIs.
 
 use crate::actor::{ActorRequestId, InferenceActor};
+use crate::chat_completions::{ChatCompletionRequest, ChatCompletionStream};
 use crate::metrics::{ServerEndpoint, StreamingMode, metrics as server_metrics};
 use crate::protocol::{ApiError, ErrorEnvelope, ResponseRequest, ResponseStream};
 use axum::Json;
@@ -70,6 +71,10 @@ fn router(actor: InferenceActor, config: ApiConfig) -> Router {
         .route(
             "/v1/responses",
             post(responses).layer(DefaultBodyLimit::max(request_body_limit)),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).layer(DefaultBodyLimit::max(request_body_limit)),
         )
         .with_state(ApiState { actor, config })
 }
@@ -226,6 +231,65 @@ async fn responses(
     non_streaming_response(state.actor, response.id, response.events, stream).await
 }
 
+async fn chat_completions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ChatCompletionRequest>,
+) -> Result<Response, ApiFailure> {
+    server_metrics()
+        .requests
+        .inc(ServerEndpoint::ChatCompletions);
+    let _request_duration = RequestDuration::start();
+    authorise(&state.config, &headers)?;
+    if request.model != state.config.model {
+        server_metrics()
+            .request_errors
+            .inc(ServerEndpoint::ChatCompletions);
+        return Err(ApiFailure::bad_request(ApiError::invalid(
+            "model",
+            format!(
+                "model {:?} is not served; expected {:?}",
+                request.model, state.config.model
+            ),
+        )));
+    }
+    let stream_requested = request.stream;
+    let include_usage = request.include_usage();
+    let model = request.model.clone();
+    let chat = request
+        .into_chat_request(state.actor.generation_defaults())
+        .map_err(|error| {
+            server_metrics()
+                .request_errors
+                .inc(ServerEndpoint::ChatCompletions);
+            ApiFailure::bad_request(error)
+        })?;
+    let response = state.actor.submit(chat).map_err(|error| {
+        server_metrics()
+            .request_errors
+            .inc(ServerEndpoint::ChatCompletions);
+        ApiFailure::server(error)
+    })?;
+    server_metrics()
+        .chat_completions_submitted
+        .inc(if stream_requested {
+            StreamingMode::Stream
+        } else {
+            StreamingMode::NonStream
+        });
+    let stream = ChatCompletionStream::new(model, include_usage);
+
+    if stream_requested {
+        return Ok(streaming_chat_completion(
+            state.actor,
+            response.id,
+            response.events,
+            stream,
+        ));
+    }
+    non_streaming_chat_completion(state.actor, response.id, response.events, stream).await
+}
+
 fn streaming_response(
     actor: InferenceActor,
     request_id: ActorRequestId,
@@ -241,6 +305,35 @@ fn streaming_response(
             }
             if response.is_completed() {
                 cancellation.disarm();
+                break;
+            }
+        }
+    };
+    Sse::new(output)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+fn streaming_chat_completion(
+    actor: InferenceActor,
+    request_id: ActorRequestId,
+    mut events: tokio::sync::mpsc::Receiver<crate::protocol::InferenceEvent>,
+    mut response: ChatCompletionStream,
+) -> Response {
+    let output = async_stream::stream! {
+        let mut cancellation = CancellationGuard::new(actor, request_id);
+        yield Ok::<_, Infallible>(chat_sse_event(response.initial_chunk()));
+        while let Some(inference) = events.recv().await {
+            for chunk in response.push(inference) {
+                yield Ok(chat_sse_event(chunk));
+            }
+            if response.is_completed() {
+                cancellation.disarm();
+                yield Ok(chat_sse_done());
                 break;
             }
         }
@@ -284,12 +377,46 @@ async fn non_streaming_response(
     )))
 }
 
+async fn non_streaming_chat_completion(
+    actor: InferenceActor,
+    request_id: ActorRequestId,
+    mut events: tokio::sync::mpsc::Receiver<crate::protocol::InferenceEvent>,
+    mut response: ChatCompletionStream,
+) -> Result<Response, ApiFailure> {
+    let mut cancellation = CancellationGuard::new(actor, request_id);
+    while let Some(inference) = events.recv().await {
+        response.push(inference);
+        if let Some(message) = response.error() {
+            let message = message.to_string();
+            cancellation.disarm();
+            return Err(ApiFailure::server(ApiError::server(message)));
+        }
+        if let Some(completion) = response.response() {
+            cancellation.disarm();
+            return Ok(Json(completion).into_response());
+        }
+    }
+    Err(ApiFailure::server(ApiError::server(
+        "inference actor closed the chat completion before completion",
+    )))
+}
+
 fn sse_event(value: Value) -> Event {
     let kind = value["type"].as_str().unwrap_or("error").to_string();
     Event::default()
         .event(kind)
         .json_data(value)
         .expect("Responses event is valid JSON")
+}
+
+fn chat_sse_event(value: Value) -> Event {
+    Event::default()
+        .json_data(value)
+        .expect("Chat Completions chunk is valid JSON")
+}
+
+fn chat_sse_done() -> Event {
+    Event::default().data("[DONE]")
 }
 
 fn authorise(config: &ApiConfig, headers: &HeaderMap) -> Result<(), ApiFailure> {

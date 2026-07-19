@@ -3,12 +3,23 @@
 > ... the eider duck: a small northern creature with an unreasonable amount of
 > insulation (ahem)
 
-This is an inference and serving runtime for NVIDIA DGX Spark (GB10, Grace
-Blackwell) running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1, StepFun's
-Step-3.7-Flash, Gemma 4 26B-A4B, and NVIDIA's Nemotron 3 Puzzle hybrid model.
-It includes an OpenAI API-compatible server with continuous multi-session
-scheduling and a compact FP4 KV cache for the Qwen, Step, and Gemma attention
-paths. Nemotron combines backbone attention with Mamba recurrent state.
+Eider is an inference and serving runtime for NVIDIA DGX Spark (GB10,
+Grace Blackwell) and variants thereof.
+
+It is built from scratch (in Rust and CUDA) specifically to take
+advantage of the NVFP4 capabilities of the SM121 GPU.
+
+It is not built on top of any existing tensor or inference library, and does
+not use llama.cpp or vLLM.
+
+It is capable of running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1,
+StepFun's Step-3.7-Flash, Gemma 4 26B-A4B, and NVIDIA's Nemotron 3
+Puzzle hybrid model.  
+
+It includes an OpenAI-compatible Responses and Chat Completions server
+with continuous multi-session scheduling and a compact FP4 KV cache
+for the Qwen, Step, and Gemma attention paths. Nemotron combines
+backbone attention with Mamba recurrent state.
 
 This started as a personal research project and is crawling towards more of a
 production engine -- most parts of the kernel layer are agent-written; see the
@@ -31,12 +42,20 @@ NVIDIA Gemma 4 NVFP4 checkpoint on first use, and listens on
 scripts/run-eider
 ```
 
-In another shell, send a Responses API request using the served model name:
+In another shell, send a request using the served model name:
 
 ```sh
 curl -fsS http://127.0.0.1:8080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"eider-gemma4-26b","input":"What is 2+2?","max_output_tokens":64}'
+```
+
+The same runtime is also available through Chat Completions:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"eider-gemma4-26b","messages":[{"role":"user","content":"What is 2+2?"}],"max_completion_tokens":64}'
 ```
 
 Select another catalogue model with `EIDER_MODEL`, or list the catalogue
@@ -200,7 +219,9 @@ attention projections and LM head default to NVFP4; use
 ### API and agent clients
 
 The server listens on `127.0.0.1:8080` by default and reads an optional bearer
-token from `EIDER_API_KEY`. Use
+token from `EIDER_API_KEY`. Both `/v1/responses` and `/v1/chat/completions`
+support streaming, sampling controls, tool definitions and tool-call history;
+they share the same scheduler and generation path. Use
 `EIDER_MODEL` to change the `scripts/run-eider` model, or pass `--listen`,
 `--served-model-name`, and `--api-key-env` to the server.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
@@ -235,9 +256,13 @@ Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:
 scripts/run-pi-eider-stepfun.sh --print "Reply with one short greeting."
 ```
 
-The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR`,
-selects its native `openai-responses` provider, and does not modify the user's
-global Pi configuration.
+The Pi launcher uses `pi/agent/models.json` through `PI_CODING_AGENT_DIR` and
+does not modify the user's global Pi configuration. It uses Responses by
+default; select the side-by-side Chat Completions provider with:
+
+```sh
+PI_EIDER_PROVIDER=eider-chat scripts/run-pi-eider-gemma4.sh
+```
 
 Point Codex at it with a custom provider in `~/.codex/config.toml`:
 
@@ -513,9 +538,10 @@ default cache.
 
 ### An API request is rejected
 
-Send requests to `/v1/responses` using the API model name from the supported
-models table, not the catalogue ID. When `EIDER_API_KEY` is set on the server,
-include `Authorization: Bearer $EIDER_API_KEY` in the request.
+Send requests to `/v1/responses` or `/v1/chat/completions` using the API model
+name from the supported models table, not the catalogue ID. When
+`EIDER_API_KEY` is set on the server, include
+`Authorization: Bearer $EIDER_API_KEY` in the request.
 
 ## A note about authorship
 
