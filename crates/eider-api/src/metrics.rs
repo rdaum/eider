@@ -26,6 +26,7 @@ pub enum ServerEndpoint {
     Healthz,
     Models,
     Responses,
+    ChatCompletions,
     Metrics,
 }
 
@@ -58,6 +59,9 @@ pub struct ServerMetrics {
 
     #[help = "Responses API requests submitted to the inference actor by streaming mode"]
     pub responses_submitted: LabeledCounter<StreamingMode>,
+
+    #[help = "Chat Completions requests submitted to the inference actor by streaming mode"]
+    pub chat_completions_submitted: LabeledCounter<StreamingMode>,
 
     #[help = "Responses API requests rejected at admission"]
     pub responses_admission_errors: Counter,
@@ -120,6 +124,7 @@ impl ServerMetrics {
             requests: LabeledCounter::new(shard_count),
             request_errors: LabeledCounter::new(shard_count),
             responses_submitted: LabeledCounter::new(shard_count),
+            chat_completions_submitted: LabeledCounter::new(shard_count),
             responses_admission_errors: Counter::new(shard_count),
             responses_completed: LabeledCounter::new(shard_count),
             prompt_tokens: Counter::new(shard_count),
