@@ -1,32 +1,47 @@
 # Eider
 
-CUDA inference and kernel research for Qwen models on NVIDIA GB10 / Blackwell
-(`sm_121`). The workspace contains the `infer` runtime and the
-`nvfp4` CUDA/NVFP4 kernel crate.
+CUDA inference and serving for NVFP4 and mixed-precision models on NVIDIA DGX
+Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
+multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
+families currently include Qwen3.5/3.6 MoE, Step-3.7, Gemma 4, and Nemotron 3.
 
 ## Build / run
 
 ```sh
-cargo build -p infer
-cargo build --release -p infer
+cargo build --workspace
+cargo build --release -p eider-api --bin eider-serve
 cargo test --workspace
 
-cargo run --release -p infer --bin qwen36-generate -- \
-    models/qwen3.6-35b-a3-nvfp4 "What is 2+2?" 30
+scripts/run-eider
+cargo run --release -p eider-api --bin eider-serve -- \
+    gemma-4-26b-a4b-nvfp4 --offline
 ```
 
-The Qwen3.6 fast MoE path is enabled by default: Marlin W4A16 gate/up,
-SM12x down, grouped workspace allocation, and segmented decode graph capture.
-The environment flags are retained for compatibility with older experiments,
-but are not required for normal runs.
+Catalogue starts resolve pinned Hugging Face revisions and keep snapshots
+immutable. Derived model artifacts belong below the Eider XDG cache, not in a
+snapshot or the repository. Use `--model-dir` only for local development
+checkpoints. Catalogue IDs select deployments; API requests use the served
+model names reported by `eider model list` or `/v1/models`.
+
+The server exposes `/v1/responses` and `/v1/chat/completions`; both translate
+into the same `ChatRequest`, inference actor, scheduler, prefix cache, and model
+runtime. Keep cancellation, tool history, sampling, usage, and finish-reason
+semantics aligned across both adapters. Pi launchers default to Responses; set
+`PI_EIDER_PROVIDER=eider-chat` to exercise Chat Completions.
+
+The Qwen3.6 fast MoE path is enabled by default: Marlin W4A16 gate/up, SM12x
+down, grouped workspace allocation, segmented decode graph capture, and the
+shared radix prompt-prefix cache. Compatibility flags from older experiments
+are not required for normal runs.
 
 ## Microbenchmarks
 
 ```sh
 cargo bench -p nvfp4 --bench marlin_routed_gate_up
-cargo bench -p infer --bench qwen36_routed_gate_up
-cargo bench -p nvfp4 --bench lm_head_top1
-cargo bench -p nvfp4 --bench sm12x_indexed_gemv
+cargo bench -p infer --bench qwen36_prefill
+cargo bench -p infer --bench step37_prefill
+cargo bench -p nvfp4 --bench gemma4_prefill_attention
+cargo bench -p nvfp4 --bench nemotron3_dense_linear
 ```
 
 The benches use my [`micromeasure`](https://github.com/rdaum/micromeasure) crate
@@ -50,11 +65,13 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
 
 ## Layout
 
-- `crates/infer/src/` — model loading, Qwen runtime, decode, and probes.
-- `crates/infer/src/runtime/` — reusable KV-cache, sampling, and generation
-  state.
-- `crates/infer/src/qwen3/` — Qwen model formats, layers, and decoding.
-- `crates/infer/benches/` — runtime and routed-MoE micromeasures.
+- `crates/eider-api/src/` — catalogue deployment, inference actor, HTTP APIs,
+  streaming protocol adapters, and server telemetry.
+- `crates/infer/src/runtime/` — shared scheduling, prefix/KV caches, sampling,
+  chat rendering, output parsing, and serving state.
+- `crates/infer/src/{qwen3,step37,gemma4,nemotron3}/` — family-specific model
+  loading and execution.
+- `crates/infer/benches/` — model-runtime and prefill micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.
 - `crates/nvfp4/src/kernels/` — Marlin, non-GEMM, and SM12x operations.
 - `crates/nvfp4/src/diagnostics/` — smoke checks and GPU-counter helpers.
@@ -62,7 +79,10 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
 - `crates/nvfp4/native/` — CUDA kernels and native FFI implementations.
 - `crates/nvfp4/benches/` — focused NVFP4, Marlin, attention, and GEMV
   micromeasures.
-- `scripts/` — CUTLASS setup/probes and external vLLM comparison helpers.
+- `pi/agent/models.json` — repository-local Pi providers for Responses and Chat
+  Completions.
+- `scripts/` — model/Pi launchers, checkpoint preparation, CUTLASS probes, and
+  external vLLM comparison helpers.
 - `docs/` — benchmark findings, kernel notes, and model-specific proposals.
 
 ## Engineering policy
@@ -89,6 +109,10 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
 - Prefer compact, cache-friendly layouts and existing workspace plans over new
   layers of indirection.
 - Add focused correctness coverage for new kernels and regression cases.
+- GB10 device allocations consume the same 128 GB unified memory used by the
+  host. Do not start another full model, vLLM instance, or high-memory benchmark
+  while a server is running. Never assume a near-1.0 vLLM GPU-memory ratio is
+  safe on this architecture.
 
 ## Rust style
 
@@ -112,6 +136,15 @@ Before handing work back:
 
 - Qwen3.6 expert gate/up scaling is per expert and must be applied before
   SiLU; the down path applies its per-expert scale during accumulation.
+- Step-3.7 routed experts use bounded residency and disk-backed paging; its
+  dense and shared weights remain resident. Preserve paging telemetry and do
+  not silently turn paging misses into synchronous default-stream work.
+- Gemma 4 uses heterogeneous local/global attention. Preserve the checkpoint's
+  per-layer attention pattern and validate both prefill and decode when changing
+  its shared kernels.
+- Nemotron 3 combines attention, Mamba recurrent state, latent MoE, and an
+  optional MTP block. Do not treat its sequence state as a conventional KV-only
+  cache.
 - Keep CUDA stream semantics explicit. Non-blocking streams do not synchronize
   with the default stream.
 - Do not add permanent debug flags or probe prints. Do not revert unrelated
