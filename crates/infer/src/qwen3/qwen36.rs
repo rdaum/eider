@@ -11,11 +11,11 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
-    PinnedHostBuffer, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector,
-    Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, MarlinNvfp4Linear, ModelOptCheckpoint,
+    ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers,
+    MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight,
+    Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     device_weight_gemv_on_stream, fill_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
@@ -2366,6 +2366,8 @@ struct LazyQwen36Expert {
 struct Qwen36SharedExpert {
     gate_up: Nvfp4DeviceLinear,
     down: Nvfp4DeviceLinear,
+    marlin_gate_up: MarlinNvfp4Linear,
+    marlin_down: MarlinNvfp4Linear,
 }
 
 struct Qwen36Fp8ExpertTable {
@@ -3114,6 +3116,8 @@ impl Qwen36MoeWeights {
             });
         }
         let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
+            marlin_gate_up: MarlinNvfp4Linear::new(&shared_gate_up)?,
+            marlin_down: MarlinNvfp4Linear::new(&shared_down)?,
             gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
             down: Nvfp4DeviceLinear::from_host(&shared_down)?,
         });
@@ -3238,6 +3242,8 @@ impl Qwen36MoeWeights {
             });
         }
         let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
+            marlin_gate_up: MarlinNvfp4Linear::new(&shared_gate_up)?,
+            marlin_down: MarlinNvfp4Linear::new(&shared_down)?,
             gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
             down: Nvfp4DeviceLinear::from_host(&shared_down)?,
         });

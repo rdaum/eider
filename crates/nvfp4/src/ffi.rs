@@ -2085,6 +2085,24 @@ unsafe extern "C" {
         in_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_marlin_nvfp4_linear_batch_on_stream(
+        input: *const f32,
+        repacked_weight: *const u32,
+        weight_scale: *const u8,
+        global_scale: *const f32,
+        output: *mut f32,
+        input_bf16: *mut u16,
+        output_bf16: *mut u16,
+        reduce_tmp: *mut f32,
+        locks: *mut i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        num_tokens_past_padded: *mut i32,
+        batch_size: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_quantize_fp8_e4m3_f32_on_stream(
         input: *const f32,
         output: *mut u8,

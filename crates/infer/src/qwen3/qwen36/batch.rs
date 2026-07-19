@@ -11,9 +11,10 @@ use std::mem::size_of;
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
-    GpuTokenSampler, MarlinNvfp4GateUpBatchWorkspace, MoeSortedNvfp4Rows, MoeSortedRoutes,
-    MropeSections, Nvfp4Matrix, Nvfp4TnInputs, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
-    Sm12xKvCache, add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
+    GpuTokenSampler, MarlinNvfp4GateUpBatchWorkspace, MarlinNvfp4LinearBatchWorkspace,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix, Nvfp4TnInputs,
+    Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
     causal_window_softmax_f32_to_bf16_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
@@ -1248,8 +1249,7 @@ struct BatchMoeWorkspace {
     shared_output: DeviceBuffer<f32>,
     shared_gate: DeviceBuffer<f32>,
     shared_gate_plan: BatchBf16LinearPlan,
-    shared_gate_up_plan: BatchNvfp4LinearPlan,
-    shared_down_plan: BatchNvfp4LinearPlan,
+    shared_marlin: MarlinNvfp4LinearBatchWorkspace,
     grouped: Option<BatchGroupedMoeWorkspace>,
     output: DeviceBuffer<f32>,
 }
@@ -1433,14 +1433,12 @@ impl BatchMoeWorkspace {
         }
         let routes = capacity * weights.experts_per_token;
         let gate_up_width = weights.expert_intermediate * 2;
-        let Qwen36SharedExpertStorage::Nvfp4(shared) = &weights.shared else {
+        let Qwen36SharedExpertStorage::Nvfp4(_) = &weights.shared else {
             return Err(crate::nvfp4::Error::Format {
                 label: "Qwen3.6 batched shared expert",
                 detail: "the current model does not use NVFP4 shared experts".to_string(),
             });
         };
-        let shared_gate_up_plan = new_nvfp4_batch_linear_plan(model, &shared.gate_up, capacity)?;
-        let shared_down_plan = new_nvfp4_batch_linear_plan(model, &shared.down, capacity)?;
         let grouped = if grouped_prefill && weights.grouped_prefill.is_some() {
             Some(BatchGroupedMoeWorkspace::new(model, weights, capacity)?)
         } else {
@@ -1463,8 +1461,7 @@ impl BatchMoeWorkspace {
             shared_output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
             shared_gate: DeviceBuffer::zeroed(capacity)?,
             shared_gate_plan: BatchBf16LinearPlan::new(model, &weights.shared_gate, capacity)?,
-            shared_gate_up_plan,
-            shared_down_plan,
+            shared_marlin: MarlinNvfp4LinearBatchWorkspace::new(capacity, model.manifest.hidden)?,
             grouped,
             output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
         })
@@ -1482,20 +1479,7 @@ impl BatchMoeWorkspace {
             + self.shared_output.device_bytes()
             + self.shared_gate.device_bytes()
             + self.shared_gate_plan.device_bytes()
-            + self
-                .shared_gate_up_plan
-                .plans
-                .values()
-                .map(Fp4TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self.shared_gate_up_plan.activation.device_bytes()
-            + self
-                .shared_down_plan
-                .plans
-                .values()
-                .map(Fp4TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self.shared_down_plan.activation.device_bytes()
+            + self.shared_marlin.device_bytes()
             + self
                 .grouped
                 .as_ref()
@@ -3035,12 +3019,10 @@ impl Qwen36MoeWeights {
     ) -> Result<()> {
         match &self.shared {
             Qwen36SharedExpertStorage::Nvfp4(shared) => {
-                run_nvfp4_batch(
-                    model,
-                    &shared.gate_up,
-                    &mut workspace.shared_gate_up_plan,
+                shared.marlin_gate_up.run_batch_prefix_on_stream(
+                    &workspace.shared_marlin,
                     ffn_norm,
-                    &mut workspace.shared_gate_up,
+                    workspace.shared_gate_up.output(),
                     capacity,
                     stream,
                 )?;
@@ -3051,12 +3033,10 @@ impl Qwen36MoeWeights {
                     self.expert_intermediate,
                     stream,
                 )?;
-                run_nvfp4_batch(
-                    model,
-                    &shared.down,
-                    &mut workspace.shared_down_plan,
+                shared.marlin_down.run_batch_prefix_on_stream(
+                    &workspace.shared_marlin,
                     &workspace.shared_activated,
-                    &mut workspace.shared_output,
+                    workspace.shared_output.output(),
                     capacity,
                     stream,
                 )?;

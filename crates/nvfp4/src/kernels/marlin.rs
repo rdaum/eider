@@ -75,6 +75,19 @@ pub struct MarlinNvfp4Linear {
     in_features: usize,
 }
 
+/// Reusable W4A16 execution storage for dense batches of shared-expert rows.
+pub struct MarlinNvfp4LinearBatchWorkspace {
+    capacity: usize,
+    max_features: usize,
+    input_bf16: DeviceBuffer<u16>,
+    output_bf16: DeviceBuffer<u16>,
+    reduce_tmp: DeviceBuffer<f32>,
+    locks: DeviceBuffer<i32>,
+    sorted_token_ids: DeviceBuffer<i32>,
+    expert_ids: DeviceBuffer<i32>,
+    num_tokens_past_padded: DeviceBuffer<i32>,
+}
+
 impl MarlinNvfp4GateUp {
     /// Creates a plan from raw ModelOpt gate/up weights in expert-table order.
     pub fn new(weights: &[ModelOptNvfp4Linear]) -> Result<Self> {
@@ -637,9 +650,130 @@ impl MarlinNvfp4Linear {
         }
     }
 
+    /// Runs this projection for an active prefix of a dense row-major batch.
+    pub fn run_batch_prefix_on_stream(
+        &self,
+        workspace: &MarlinNvfp4LinearBatchWorkspace,
+        input: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let input_len = rows
+            .checked_mul(self.in_features)
+            .ok_or_else(|| Error::Shape {
+                label: "Marlin shared linear batch input",
+                expected: "rows * input features without overflow".to_string(),
+                actual: format!("rows={rows} input_features={}", self.in_features),
+            })?;
+        let output_len = rows
+            .checked_mul(self.out_features)
+            .ok_or_else(|| Error::Shape {
+                label: "Marlin shared linear batch output",
+                expected: "rows * output features without overflow".to_string(),
+                actual: format!("rows={rows} output_features={}", self.out_features),
+            })?;
+        if rows == 0
+            || rows > workspace.capacity
+            || self.in_features > workspace.max_features
+            || self.out_features > workspace.max_features
+            || input.len() < input_len
+            || output.len() < output_len
+            || output_len > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "Marlin shared linear batch buffers",
+                expected: format!(
+                    "rows=1..={} features<={} input>={input_len} output>={output_len}",
+                    workspace.capacity, workspace.max_features
+                ),
+                actual: format!(
+                    "rows={rows} in_features={} out_features={} input={} output={}",
+                    self.in_features,
+                    self.out_features,
+                    input.len(),
+                    output.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_marlin_nvfp4_linear_batch_on_stream",
+                ffi::infer_marlin_nvfp4_linear_batch_on_stream(
+                    input.ptr,
+                    self.repacked_weight.ptr,
+                    self.weight_scale.ptr,
+                    self.global_scale.ptr,
+                    output.buffer_mut().ptr,
+                    workspace.input_bf16.ptr,
+                    workspace.output_bf16.ptr,
+                    workspace.reduce_tmp.ptr,
+                    workspace.locks.ptr,
+                    workspace.sorted_token_ids.ptr,
+                    workspace.expert_ids.ptr,
+                    workspace.num_tokens_past_padded.ptr,
+                    rows as u32,
+                    self.out_features as u32,
+                    self.in_features as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Returns `(out_features, in_features)`.
     pub fn shape(&self) -> (usize, usize) {
         (self.out_features, self.in_features)
+    }
+}
+
+impl MarlinNvfp4LinearBatchWorkspace {
+    /// Allocates storage reusable by supported projections up to `max_features`.
+    pub fn new(capacity: usize, max_features: usize) -> Result<Self> {
+        if capacity == 0 || capacity > u32::MAX as usize || max_features == 0 {
+            return Err(Error::Shape {
+                label: "Marlin shared linear batch workspace",
+                expected: "non-zero u32 batch capacity and feature count".to_string(),
+                actual: format!("capacity={capacity} max_features={max_features}"),
+            });
+        }
+        let values = capacity
+            .checked_mul(max_features)
+            .ok_or_else(|| Error::Shape {
+                label: "Marlin shared linear batch workspace values",
+                expected: "capacity * max_features without overflow".to_string(),
+                actual: format!("capacity={capacity} max_features={max_features}"),
+            })?;
+        let reduce_values = values
+            .checked_mul(MOE_BLOCK_SIZE)
+            .ok_or_else(|| Error::Shape {
+                label: "Marlin shared linear reduction workspace values",
+                expected: "workspace values * block size without overflow".to_string(),
+                actual: format!("values={values} block_size={MOE_BLOCK_SIZE}"),
+            })?;
+        let padded_rows = capacity.div_ceil(MOE_BLOCK_SIZE) * MOE_BLOCK_SIZE;
+        Ok(Self {
+            capacity,
+            max_features,
+            input_bf16: DeviceBuffer::zeroed(values)?,
+            output_bf16: DeviceBuffer::zeroed(values)?,
+            reduce_tmp: DeviceBuffer::zeroed(reduce_values)?,
+            locks: DeviceBuffer::zeroed(padded_rows * max_features.div_ceil(128))?,
+            sorted_token_ids: DeviceBuffer::zeroed(padded_rows)?,
+            expert_ids: DeviceBuffer::zeroed(padded_rows / MOE_BLOCK_SIZE)?,
+            num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
+        })
+    }
+
+    /// Returns the number of device bytes owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.input_bf16.device_bytes()
+            + self.output_bf16.device_bytes()
+            + self.reduce_tmp.device_bytes()
+            + self.locks.device_bytes()
+            + self.sorted_token_ids.device_bytes()
+            + self.expert_ids.device_bytes()
+            + self.num_tokens_past_padded.device_bytes()
     }
 }
 

@@ -39,6 +39,7 @@ pub use error::{Error, Result};
 pub use kernels::gemma4_attention::Gemma4LocalPrefillAttention;
 pub use kernels::marlin::{
     MarlinNvfp4GateUp, MarlinNvfp4GateUpBatchWorkspace, MarlinNvfp4HostWeight, MarlinNvfp4Linear,
+    MarlinNvfp4LinearBatchWorkspace,
 };
 pub use kernels::non_gemm::{
     ArgmaxResult, GPU_SAMPLING_MAX_TOP_K, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
