@@ -9106,6 +9106,53 @@ extern "C" cudaError_t infer_qwen36_gdn_gate_batch_bf16_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_qwen36_gdn_gate_paired_batch_bf16_kernel(
+    const float* alpha_beta,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    std::uint16_t* gate,
+    std::uint16_t* beta,
+    std::uint32_t heads,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const std::uint32_t row = idx / heads;
+    const std::uint32_t head = idx - row * heads;
+    const std::uint32_t pair_offset = row * heads * 2;
+    const float a_log = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
+    const float dt_bias = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
+    const float dt = alpha_beta[pair_offset + head] + dt_bias;
+    const float softplus = log1pf(expf(-fabsf(dt))) + fmaxf(dt, 0.0f);
+    const __nv_bfloat16 gate_value = __float2bfloat16(-expf(a_log) * softplus);
+    const __nv_bfloat16 beta_value = __float2bfloat16(
+        1.0f / (1.0f + expf(-alpha_beta[pair_offset + heads + head])));
+    gate[idx] = *reinterpret_cast<const std::uint16_t*>(&gate_value);
+    beta[idx] = *reinterpret_cast<const std::uint16_t*>(&beta_value);
+}
+
+extern "C" cudaError_t infer_qwen36_gdn_gate_paired_batch_bf16_on_stream(
+    const float* alpha_beta,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    std::uint16_t* gate,
+    std::uint16_t* beta,
+    std::uint32_t rows,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (alpha_beta == nullptr || a_log_bf16 == nullptr || dt_bias_bf16 == nullptr ||
+        gate == nullptr || beta == nullptr || rows == 0 || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t len = rows * heads;
+    infer_qwen36_gdn_gate_paired_batch_bf16_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        alpha_beta, a_log_bf16, dt_bias_bf16, gate, beta, heads, len);
+    return cudaGetLastError();
+}
+
 __global__ void infer_qwen36_gdn_gate_batch_kernel(
     const float* alpha,
     const float* beta_input,
@@ -9126,6 +9173,50 @@ __global__ void infer_qwen36_gdn_gate_batch_kernel(
     const float softplus = log1pf(expf(-fabsf(dt))) + fmaxf(dt, 0.0f);
     gate[idx] = -expf(a_log) * softplus;
     beta[idx] = 1.0f / (1.0f + expf(-beta_input[idx]));
+}
+
+__global__ void infer_qwen36_gdn_gate_paired_batch_kernel(
+    const float* alpha_beta,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    float* gate,
+    float* beta,
+    std::uint32_t heads,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const std::uint32_t row = idx / heads;
+    const std::uint32_t head = idx - row * heads;
+    const std::uint32_t pair_offset = row * heads * 2;
+    const float a_log = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
+    const float dt_bias = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
+    const float dt = alpha_beta[pair_offset + head] + dt_bias;
+    const float softplus = log1pf(expf(-fabsf(dt))) + fmaxf(dt, 0.0f);
+    gate[idx] = -expf(a_log) * softplus;
+    beta[idx] = 1.0f / (1.0f + expf(-alpha_beta[pair_offset + heads + head]));
+}
+
+extern "C" cudaError_t infer_qwen36_gdn_gate_paired_batch_on_stream(
+    const float* alpha_beta,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    float* gate,
+    float* beta,
+    std::uint32_t rows,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (alpha_beta == nullptr || a_log_bf16 == nullptr || dt_bias_bf16 == nullptr ||
+        gate == nullptr || beta == nullptr || rows == 0 || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t len = rows * heads;
+    infer_qwen36_gdn_gate_paired_batch_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        alpha_beta, a_log_bf16, dt_bias_bf16, gate, beta, heads, len);
+    return cudaGetLastError();
 }
 
 extern "C" cudaError_t infer_qwen36_gdn_gate_batch_on_stream(

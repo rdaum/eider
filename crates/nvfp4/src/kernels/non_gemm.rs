@@ -9741,6 +9741,131 @@ pub fn qwen36_gdn_gate_batch_bf16_into_on_stream(
     }
 }
 
+/// Computes batched Qwen3.6 GDN gates from a single `[row, alpha | beta]`
+/// projection output.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_gate_paired_batch_into_on_stream(
+    alpha_beta: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    mut gate: DeviceOutput<'_, f32>,
+    mut beta: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = batch_size.checked_mul(heads).ok_or_else(|| Error::Shape {
+        label: "paired batched Qwen3.6 GDN gate",
+        expected: "batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    let paired_len = len.checked_mul(2).ok_or_else(|| Error::Shape {
+        label: "paired batched Qwen3.6 GDN gate",
+        expected: "2 * batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    if batch_size == 0
+        || heads == 0
+        || batch_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || alpha_beta.len() < paired_len
+        || gate.len() < len
+        || beta.len() < len
+        || a_log_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+    {
+        return Err(Error::Shape {
+            label: "paired batched Qwen3.6 GDN gate buffers",
+            expected: format!("alpha_beta={paired_len} gate/beta={len} weights={heads}"),
+            actual: format!(
+                "alpha_beta={} gate={} beta={} a_log={} dt_bias={}",
+                alpha_beta.len(),
+                gate.len(),
+                beta.len(),
+                a_log_bf16.len(),
+                dt_bias_bf16.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_gate_paired_batch_on_stream",
+            ffi::infer_qwen36_gdn_gate_paired_batch_on_stream(
+                alpha_beta.ptr,
+                a_log_bf16.ptr,
+                dt_bias_bf16.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                batch_size as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Computes paired-projection Qwen3.6 GDN gates directly into BF16 chunk inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_gate_paired_batch_bf16_into_on_stream(
+    alpha_beta: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    mut gate: DeviceOutput<'_, u16>,
+    mut beta: DeviceOutput<'_, u16>,
+    batch_size: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = batch_size.checked_mul(heads).ok_or_else(|| Error::Shape {
+        label: "paired batched BF16 Qwen3.6 GDN gate",
+        expected: "batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    let paired_len = len.checked_mul(2).ok_or_else(|| Error::Shape {
+        label: "paired batched BF16 Qwen3.6 GDN gate",
+        expected: "2 * batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    if batch_size == 0
+        || heads == 0
+        || batch_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || alpha_beta.len() < paired_len
+        || gate.len() < len
+        || beta.len() < len
+        || a_log_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+    {
+        return Err(Error::Shape {
+            label: "paired batched BF16 Qwen3.6 GDN gate buffers",
+            expected: format!("alpha_beta={paired_len} gate/beta={len} weights={heads}"),
+            actual: format!(
+                "alpha_beta={} gate={} beta={} a_log={} dt_bias={}",
+                alpha_beta.len(),
+                gate.len(),
+                beta.len(),
+                a_log_bf16.len(),
+                dt_bias_bf16.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_gate_paired_batch_bf16_on_stream",
+            ffi::infer_qwen36_gdn_gate_paired_batch_bf16_on_stream(
+                alpha_beta.ptr,
+                a_log_bf16.ptr,
+                dt_bias_bf16.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                batch_size as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues RMSNorm(input) * silu(gate) into `output`.
 pub fn gated_rms_norm_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
@@ -14889,6 +15014,125 @@ mod tests {
         let actual_state = state_device.copy_to_host(&stream).expect("state download");
         assert_close(&output, &expected_output, 2.0e-6, "gdn output");
         assert_close(&actual_state, &expected_state, 2.0e-6, "gdn state");
+    }
+
+    #[test]
+    fn qwen36_paired_batch_gates_match_separate_inputs() {
+        let rows = 3usize;
+        let heads = 4usize;
+        let alpha = (0..rows * heads)
+            .map(|idx| (idx as f32 - 5.0) * 0.125)
+            .collect::<Vec<_>>();
+        let beta_input = (0..rows * heads)
+            .map(|idx| (7.0 - idx as f32) * 0.1)
+            .collect::<Vec<_>>();
+        let mut alpha_beta = Vec::with_capacity(rows * heads * 2);
+        for row in 0..rows {
+            alpha_beta.extend_from_slice(&alpha[row * heads..(row + 1) * heads]);
+            alpha_beta.extend_from_slice(&beta_input[row * heads..(row + 1) * heads]);
+        }
+        let a_log = (0..heads)
+            .map(|idx| format::f32_to_bf16(-2.0 - idx as f32 * 0.25))
+            .collect::<Vec<_>>();
+        let dt_bias = (0..heads)
+            .map(|idx| format::f32_to_bf16(-0.5 + idx as f32 * 0.125))
+            .collect::<Vec<_>>();
+        let alpha = DeviceBuffer::from_host(&alpha).expect("alpha");
+        let beta_input = DeviceBuffer::from_host(&beta_input).expect("beta input");
+        let alpha_beta = DeviceBuffer::from_host(&alpha_beta).expect("alpha beta");
+        let a_log = DeviceBuffer::from_host(&a_log).expect("a log");
+        let dt_bias = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+        let mut expected_gate = DeviceBuffer::zeroed(rows * heads).expect("expected gate");
+        let mut expected_beta = DeviceBuffer::zeroed(rows * heads).expect("expected beta");
+        let mut actual_gate = DeviceBuffer::zeroed(rows * heads).expect("actual gate");
+        let mut actual_beta = DeviceBuffer::zeroed(rows * heads).expect("actual beta");
+        let mut expected_gate_bf16 =
+            DeviceBuffer::zeroed(rows * heads).expect("expected BF16 gate");
+        let mut expected_beta_bf16 =
+            DeviceBuffer::zeroed(rows * heads).expect("expected BF16 beta");
+        let mut actual_gate_bf16 = DeviceBuffer::zeroed(rows * heads).expect("actual BF16 gate");
+        let mut actual_beta_bf16 = DeviceBuffer::zeroed(rows * heads).expect("actual BF16 beta");
+        let stream = CudaStream::new_blocking().expect("stream");
+
+        qwen36_gdn_gate_batch_into_on_stream(
+            &alpha,
+            &beta_input,
+            &a_log,
+            &dt_bias,
+            expected_gate.output(),
+            expected_beta.output(),
+            rows,
+            heads,
+            &stream,
+        )
+        .expect("separate gate");
+        qwen36_gdn_gate_paired_batch_into_on_stream(
+            &alpha_beta,
+            &a_log,
+            &dt_bias,
+            actual_gate.output(),
+            actual_beta.output(),
+            rows,
+            heads,
+            &stream,
+        )
+        .expect("paired gate");
+        qwen36_gdn_gate_batch_bf16_into_on_stream(
+            &alpha,
+            &beta_input,
+            &a_log,
+            &dt_bias,
+            expected_gate_bf16.output(),
+            expected_beta_bf16.output(),
+            rows,
+            heads,
+            &stream,
+        )
+        .expect("separate BF16 gate");
+        qwen36_gdn_gate_paired_batch_bf16_into_on_stream(
+            &alpha_beta,
+            &a_log,
+            &dt_bias,
+            actual_gate_bf16.output(),
+            actual_beta_bf16.output(),
+            rows,
+            heads,
+            &stream,
+        )
+        .expect("paired BF16 gate");
+
+        assert_eq!(
+            actual_gate
+                .copy_to_host(&stream)
+                .expect("paired gate download"),
+            expected_gate
+                .copy_to_host(&stream)
+                .expect("separate gate download")
+        );
+        assert_eq!(
+            actual_beta
+                .copy_to_host(&stream)
+                .expect("paired beta download"),
+            expected_beta
+                .copy_to_host(&stream)
+                .expect("separate beta download")
+        );
+        assert_eq!(
+            actual_gate_bf16
+                .copy_to_host(&stream)
+                .expect("paired BF16 gate download"),
+            expected_gate_bf16
+                .copy_to_host(&stream)
+                .expect("separate BF16 gate download")
+        );
+        assert_eq!(
+            actual_beta_bf16
+                .copy_to_host(&stream)
+                .expect("paired BF16 beta download"),
+            expected_beta_bf16
+                .copy_to_host(&stream)
+                .expect("separate BF16 beta download")
+        );
     }
 
     #[test]

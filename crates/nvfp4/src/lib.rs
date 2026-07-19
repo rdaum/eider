@@ -111,6 +111,7 @@ pub use kernels::non_gemm::{
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_batch_bf16_into_on_stream,
     qwen36_gdn_gate_batch_into_on_stream, qwen36_gdn_gate_into_on_stream,
+    qwen36_gdn_gate_paired_batch_bf16_into_on_stream, qwen36_gdn_gate_paired_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_bf16_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, qwen36_gdn_prep_into_on_stream,
     ragged_gqa_attention_f32_into_on_stream, relu_squared_f32_into_on_stream,

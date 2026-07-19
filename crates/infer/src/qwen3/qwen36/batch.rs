@@ -27,13 +27,14 @@ use crate::nvfp4::{
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
-    qwen36_full_attn_prep_f32_batch_into_on_stream, qwen36_gdn_gate_batch_bf16_into_on_stream,
-    qwen36_gdn_gate_batch_into_on_stream, qwen36_gdn_prep_batch_into_on_stream,
-    qwen36_gdn_prep_chunks_bf16_into_on_stream, qwen36_gdn_prep_chunks_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
-    round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_row_scalar_in_place_on_stream,
-    scatter_f32_pointer_rows_on_stream, sigmoid_mul_f32_prefix_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,
+    qwen36_full_attn_prep_f32_batch_into_on_stream,
+    qwen36_gdn_gate_paired_batch_bf16_into_on_stream, qwen36_gdn_gate_paired_batch_into_on_stream,
+    qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_bf16_into_on_stream,
+    qwen36_gdn_prep_chunks_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_imrope_text_batch_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
+    scale_channel_f32_device_row_scalar_in_place_on_stream, scatter_f32_pointer_rows_on_stream,
+    sigmoid_mul_f32_prefix_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    unpack_heads_f32_at_offset_into_on_stream,
 };
 
 const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
@@ -451,8 +452,7 @@ struct BatchLinearAttentionWorkspace {
     value_scale: DeviceBuffer<f32>,
     qkv_output: DeviceBuffer<f32>,
     z_output: DeviceBuffer<f32>,
-    alpha: DeviceBuffer<f32>,
-    beta_input: DeviceBuffer<f32>,
+    alpha_beta: DeviceBuffer<f32>,
     gate: DeviceBuffer<f32>,
     beta: DeviceBuffer<f32>,
     q: DeviceBuffer<f32>,
@@ -669,8 +669,7 @@ impl BatchLinearAttentionWorkspace {
             value_scale: DeviceBuffer::zeroed(row_capacity)?,
             qkv_output: DeviceBuffer::zeroed(row_capacity * weights.qkv.rows())?,
             z_output: DeviceBuffer::zeroed(row_capacity * weights.z.rows())?,
-            alpha: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
-            beta_input: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
+            alpha_beta: DeviceBuffer::zeroed(row_capacity * linear.value_heads * 2)?,
             gate: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
             beta: DeviceBuffer::zeroed(row_capacity * linear.value_heads)?,
             q: DeviceBuffer::zeroed(row_capacity * value_dim)?,
@@ -687,7 +686,7 @@ impl BatchLinearAttentionWorkspace {
             qkv_plan: new_batch_linear_plan(model, &weights.qkv, row_capacity)?,
             z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
             out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
-            alpha_beta_plan: BatchBf16LinearPlan::new(model, &weights.alpha, row_capacity)?,
+            alpha_beta_plan: BatchBf16LinearPlan::new(model, &weights.alpha_beta, row_capacity)?,
             chunked_gdn: chunked_prefill
                 .then(|| BatchChunkedGdnWorkspace::new(row_capacity, state_capacity))
                 .transpose()?,
@@ -773,8 +772,7 @@ impl BatchLinearAttentionWorkspace {
             + self.value_scale.device_bytes()
             + self.qkv_output.device_bytes()
             + self.z_output.device_bytes()
-            + self.alpha.device_bytes()
-            + self.beta_input.device_bytes()
+            + self.alpha_beta.device_bytes()
             + self.gate.device_bytes()
             + self.beta.device_bytes()
             + self.q.device_bytes()
@@ -2335,19 +2333,10 @@ impl Qwen36LinearAttentionWeights {
         )?;
         run_bf16_batch(
             model,
-            &self.alpha,
+            &self.alpha_beta,
             &mut workspace.alpha_beta_plan,
             hidden,
-            &mut workspace.alpha,
-            capacity,
-            stream,
-        )?;
-        run_bf16_batch(
-            model,
-            &self.beta,
-            &mut workspace.alpha_beta_plan,
-            hidden,
-            &mut workspace.beta_input,
+            &mut workspace.alpha_beta,
             capacity,
             stream,
         )?;
@@ -2365,9 +2354,8 @@ impl Qwen36LinearAttentionWeights {
             linear.value_head_dim,
             stream,
         )?;
-        qwen36_gdn_gate_batch_into_on_stream(
-            &workspace.alpha,
-            &workspace.beta_input,
+        qwen36_gdn_gate_paired_batch_into_on_stream(
+            &workspace.alpha_beta,
             &self.a_log,
             &self.dt_bias,
             workspace.gate.output(),
@@ -2477,19 +2465,10 @@ impl Qwen36LinearAttentionWeights {
         )?;
         run_bf16_batch(
             model,
-            &self.alpha,
+            &self.alpha_beta,
             &mut workspace.alpha_beta_plan,
             hidden,
-            &mut workspace.alpha,
-            row_capacity,
-            stream,
-        )?;
-        run_bf16_batch(
-            model,
-            &self.beta,
-            &mut workspace.alpha_beta_plan,
-            hidden,
-            &mut workspace.beta_input,
+            &mut workspace.alpha_beta,
             row_capacity,
             stream,
         )?;
@@ -2555,9 +2534,8 @@ impl Qwen36LinearAttentionWeights {
                 .chunked_gdn
                 .as_mut()
                 .expect("prefill workspace has chunked GDN storage");
-            qwen36_gdn_gate_batch_bf16_into_on_stream(
-                &workspace.alpha,
-                &workspace.beta_input,
+            qwen36_gdn_gate_paired_batch_bf16_into_on_stream(
+                &workspace.alpha_beta,
                 &self.a_log,
                 &self.dt_bias,
                 chunked.gate.output(),
@@ -2567,9 +2545,8 @@ impl Qwen36LinearAttentionWeights {
                 stream,
             )?;
         } else {
-            qwen36_gdn_gate_batch_into_on_stream(
-                &workspace.alpha,
-                &workspace.beta_input,
+            qwen36_gdn_gate_paired_batch_into_on_stream(
+                &workspace.alpha_beta,
                 &self.a_log,
                 &self.dt_bias,
                 workspace.gate.output(),

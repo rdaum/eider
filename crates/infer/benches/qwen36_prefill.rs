@@ -297,9 +297,9 @@ fn main() {
         comparison_policy: ComparisonPolicy::None,
         save_results: false,
         runtime: BenchmarkRuntimeOptions {
-            warm_up_duration: Duration::from_millis(20),
-            benchmark_duration: Duration::from_millis(100),
-            min_samples: 1,
+            warm_up_duration: Duration::from_millis(50),
+            benchmark_duration: Duration::from_secs(2),
+            min_samples: 3,
             max_samples: 3,
         },
         ..BenchmarkMainOptions::default()

@@ -173,6 +173,7 @@ pub struct Qwen36LinearAttentionWeights {
     z: Qwen36Linear,
     alpha: Bf16Linear,
     beta: Bf16Linear,
+    alpha_beta: Bf16Linear,
     conv_weight: DeviceBuffer<u16>,
     a_log: DeviceBuffer<u16>,
     dt_bias: DeviceBuffer<u16>,
@@ -974,6 +975,8 @@ impl Qwen36LinearAttentionWeights {
             key_heads,
             value_heads,
         );
+        let mut alpha_beta_host = alpha_host.clone();
+        alpha_beta_host.extend_from_slice(&beta_host);
 
         // Conv1d: BF16 [conv_dim, kernel]
         let conv_host = read_bf16_flat_host(
@@ -995,6 +998,7 @@ impl Qwen36LinearAttentionWeights {
             z,
             alpha: Bf16Linear::from_host(&alpha_host, value_heads, manifest.hidden)?,
             beta: Bf16Linear::from_host(&beta_host, value_heads, manifest.hidden)?,
+            alpha_beta: Bf16Linear::from_host(&alpha_beta_host, value_heads * 2, manifest.hidden)?,
             conv_weight: DeviceBuffer::from_host(&conv_host)?,
             a_log: DeviceBuffer::from_host(&a_log_host)?,
             dt_bias: DeviceBuffer::from_host(&dt_bias_host)?,

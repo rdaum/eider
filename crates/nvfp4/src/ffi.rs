@@ -2255,6 +2255,26 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_gate_paired_batch_on_stream(
+        alpha_beta: *const f32,
+        a_log_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        gate: *mut f32,
+        beta: *mut f32,
+        rows: u32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_gate_paired_batch_bf16_on_stream(
+        alpha_beta: *const f32,
+        a_log_bf16: *const u16,
+        dt_bias_bf16: *const u16,
+        gate: *mut u16,
+        beta: *mut u16,
+        rows: u32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gated_rms_norm_f32_on_stream(
         input: *const f32,
         gate: *const f32,
