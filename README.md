@@ -15,7 +15,42 @@ production engine -- most parts of the kernel layer are agent-written; see the
 authorship note below. It also contains a self-contained Rust crate with NVFP4 /
 GB10 specific kernels that others may potentially reuse in their projects.
 
-### Why... ?
+## Quick start
+
+Eider targets the NVIDIA DGX Spark and its GB10 (`sm_121`) GPU. Building it
+requires a current stable Rust toolchain and CUDA 13.x, including `nvcc` and
+cuBLASLt. Checkpoint and derived-artifact storage varies substantially by
+model; Step-3.7 alone needs roughly 110 GiB for its prepared expert records in
+addition to the Hugging Face snapshot.
+
+The convenience launcher builds the release server, downloads the pinned
+NVIDIA Gemma 4 NVFP4 checkpoint on first use, and listens on
+`127.0.0.1:8080`:
+
+```sh
+scripts/run-eider
+```
+
+In another shell, send a Responses API request using the served model name:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"eider-gemma4-26b","input":"What is 2+2?","max_output_tokens":64}'
+```
+
+Select another catalogue model with `EIDER_MODEL`, or list the catalogue
+without downloading anything:
+
+```sh
+EIDER_MODEL=agents-a1 scripts/run-eider
+cargo run --release -p eider-api --bin eider -- model list
+```
+
+If `EIDER_API_KEY` is set for the server, clients must also send it as a
+Bearer token.
+
+## Why... ?
 
 The Spark is not a datacentre GPU (despite the marketing.) The SM12x Blackwell
 in it is not the same as the heavy duty "grown up" version. So I have a personal
@@ -27,7 +62,7 @@ I wanted to understand more about the Spark's architecture, and I got annoyed by
 how heavy weight vLLM is, and I got frustrated by the state (or lack of it) of
 NVFP4 in `llama.cpp`.
 
-### Performance
+## Performance
 
 Representative single-session results on one GB10 are below. Decode rates are
 through the OpenAI-compatible API; a dash means that a comparable vLLM
@@ -62,55 +97,24 @@ cache leaves more room for model weights and could raise the practical
 model-size ceiling relative to a runtime using BF16 KV. Finding the largest
 useful checkpoint that fits on one Spark is a planned next test.
 
-### A note about authorship
+## Supported models
 
-The opening shape of this project was substantially written by hand
-because the point was to understand the hardware rather than treat it
-as a black box. As the work moved into FFI boilerplate, format
-conversions, CUDA wrappers, and benchmark harnesses, AI assistance
-became a larger part of the implementation, and the performance tuning
-is heavily agent driven.
+Catalogue IDs select pinned checkpoints at startup; API requests use the
+corresponding served model name.
 
-That boundary is deliberate and visible rather than hidden. Not every
-detail of every kernel is something I can yet explain from scratch, and
-turning those pieces back into things I can explain and trust better is
-part of the ongoing work here.
-
-## Workspace
-
-The workspace has three crates:
-
-- `crates/nvfp4` owns device buffers, ModelOpt NVFP4/FP8 loading, cuBLASLt
-  plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
-  grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
-- `crates/infer` owns model loading, model execution, KV-cache state,
-  request-scoped sampling and generation, Qwen3.6, Step-3.7, Gemma 4, and Nemotron 3
-  scheduling, prefill/decode orchestration, CLI binaries, and runtime
-  benchmarks. Its reusable execution state lives under `runtime/`.
-- `crates/eider-api` owns the dedicated inference actor and OpenAI-compatible
-  HTTP/SSE adapter used by agent clients. CUDA state remains on the actor's OS
-  thread while async handlers submit, stream, and cancel requests over bounded
-  channels. It also exposes Prometheus and optional DogStatsD metrics for HTTP
-  requests, scheduler activity, token usage, throughput, and SM12x cache
-preparation.
-
-CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust
-crate by its build script. CUTLASS is optional; when it is unavailable, the
-build uses the cuBLASLt or stub fallback where supported.
-
-## Models
+| Catalogue ID | API model | Notes |
+| --- | --- | --- |
+| [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE; compact FP4 KV cache |
+| [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agentic fine-tune; 262K-token limit |
+| [`step-3.7-flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | `eider-step3.7` | 198B MoE with disk-backed expert paging |
+| [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |
+| [`gemma-4-26b-a4b-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | `eider-gemma4-26b` | Upstream BF16 source served by the same text runtime |
+| [`nemotron-3-puzzle-75b-a9b`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | `eider-nemotron3-puzzle` | Mamba-2, latent-MoE, and attention hybrid |
+| [`nemotron-3-super-120b-a12b`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4) | `eider-nemotron3-super` | 120B-A12B Nemotron hybrid |
 
 Supported catalogue checkpoints are fetched from Hugging Face into its local
 snapshot cache; the repository does not retain model weights under `models/`.
 Use `--model-dir PATH` only for local conversion or development checkpoints.
-
-Models are expected to use the repository's supported ModelOpt or
-compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
-tokenizer files. The Unsloth Fast checkpoint keeps its MoE experts in NVFP4;
-the accuracy-oriented Unsloth checkpoint uses channel-scaled FP8 experts and
-shared experts in layers 32-39. The dense Qwen3 checkpoints (`qwen3-8b`,
-`qwen3-32b`) are still supported by the loader and the dense GEMV/CUTLASS
-path but are not kept on this machine.
 
 Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
@@ -127,16 +131,7 @@ uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
 backbone with layer-specific expert widths and top-k routing. Eider loads those
 checkpoint settings directly and retains 41.9 GiB including its MTP block.
 
-Catalogue deployments keep Hugging Face snapshots immutable. The first Qwen3.6
-or Agents-A1 start builds its SM12x down-weight cache below
-`$XDG_CACHE_HOME/eider/models/`; Step-3.7 expert records are stored there too.
-This is a one-time, down-only repack of roughly 5 GiB for the 35B-A3B
-checkpoint. Mixed-precision checkpoints build it only for layers whose down
-weights are NVFP4. Cache files are written atomically and incomplete layers are
-resumed on the next startup; later runs validate and reuse the completed cache
-automatically.
-
-## Running the server
+## Running and deployment
 
 The convenience launcher builds and runs the release server through Cargo. It
 defaults to the NVIDIA Gemma 4 NVFP4 catalogue entry and forwards all server
@@ -167,12 +162,25 @@ List the current catalogue without downloading anything:
 cargo run --release -p eider-api --bin eider -- model list
 ```
 
+### Checkpoints and prepared artifacts
+
 The first catalogue start resolves the pinned Hugging Face revision, downloads
 the required checkpoint files, prepares any Eider artifacts, and then serves.
 Later starts reuse both caches; pass `--offline` to require a complete local
 snapshot. Use `--model-dir PATH` only for local conversion or development
 checkpoints. The NVIDIA NVFP4 and upstream BF16 Gemma 4 entries both serve the
 Gemma text path; multimodal inputs are not yet exposed through Eider's API.
+
+Catalogue deployments keep Hugging Face snapshots immutable. The first Qwen3.6
+or Agents-A1 start builds its SM12x down-weight cache below
+`$XDG_CACHE_HOME/eider/models/`; Step-3.7 expert records are stored there too.
+This is a one-time, down-only repack of roughly 5 GiB for the 35B-A3B
+checkpoint. Mixed-precision checkpoints build it only for layers whose down
+weights are NVFP4. Cache files are written atomically and incomplete layers are
+resumed on the next startup; later runs validate and reuse the completed cache
+automatically.
+
+### Model-specific controls
 
 The Nemotron launcher stores dense weights in NVFP4 and uses an FP32
 backbone-attention cache by default. Pass `--nemotron-kv-cache nvfp4` when
@@ -187,9 +195,12 @@ with the corresponding `--step-bf16-*` flags. Agents-A1 accepts the checkpoint's
 full 262,144-token context; use `--max-context-tokens` to override it. Its BF16
 attention projections and LM head default to NVFP4; use
 `--qwen-bf16-attention` and `--qwen-bf16-lm-head` to select `bf16`, `fp8`, or
-`nvfp4`. Its Pi entry advertises a 131,072-token working window so compaction
-starts well before that hard limit. The server listens on `127.0.0.1:8080` by
-default and reads an optional bearer token from `EIDER_API_KEY`. Use
+`nvfp4`.
+
+### API and agent clients
+
+The server listens on `127.0.0.1:8080` by default and reads an optional bearer
+token from `EIDER_API_KEY`. Use
 `EIDER_MODEL` to change the `scripts/run-eider` model, or pass `--listen`,
 `--served-model-name`, and `--api-key-env` to the server.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
@@ -204,6 +215,9 @@ budget. Responses report reused input tokens as
 `usage.input_tokens_details.cached_tokens`, and the checkpoint cache exports
 hit, miss, eviction, retained-byte, and copy-latency metrics alongside the other
 scheduler telemetry.
+
+The Agents-A1 Pi entry advertises a 131,072-token working window so compaction
+starts well before the checkpoint's hard limit.
 
 Run Pi against the matching server with:
 
@@ -248,7 +262,28 @@ QWEN36_MODEL=models/qwen3.6-35b-a3-nvfp4 \
 cargo test --release -p eider-api --test codex -- --ignored --nocapture
 ```
 
-## Build and run
+## Development
+
+The workspace has three crates:
+
+- `crates/nvfp4` owns device buffers, ModelOpt NVFP4/FP8 loading, cuBLASLt
+  plans, CUDA FFI, custom kernels, and low-level micromeasures. Its source is
+  grouped into `cublaslt/`, `kernels/`, and `diagnostics/` by topic.
+- `crates/infer` owns model loading, model execution, KV-cache state,
+  request-scoped sampling and generation, model runtimes, prefill/decode
+  orchestration, CLI binaries, and runtime benchmarks. Its reusable execution
+  state lives under `runtime/`.
+- `crates/eider-api` owns the inference actor, catalogue deployment, and
+  OpenAI-compatible HTTP/SSE adapter used by agent clients. CUDA state remains
+  on the actor's OS thread while async handlers submit, stream, and cancel
+  requests over bounded channels. It also exposes Prometheus and optional
+  DogStatsD metrics.
+
+CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust crate
+by its build script. CUTLASS is optional; the normal Qwen3.6 serving path uses
+Marlin, SM12x kernels, and cuBLASLt without a CUTLASS checkout.
+
+### Build and test
 
 Requirements are Rust, CUDA 13.x, cuBLASLt, and an `nvcc` capable of compiling
 `sm_121` code. Build and test with:
@@ -260,7 +295,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-### Smoke test and benchmarks
+### Smoke tests and throughput
 
 Qwen3.6 smoke test:
 
@@ -310,7 +345,7 @@ For decode correctness isolation, set `EIDER_DISABLE_DECODE_GRAPHS=1` to run
 the same model path without segmented CUDA graph replay. This is a diagnostic
 comparison, not the fast default.
 
-## Runtime shape
+### Runtime shape
 
 The steady-state Qwen3.6 path is a device-resident decode loop. Rust owns the
 layer orchestration and state transitions; CUDA, cuBLASLt, Marlin, and SM12x
@@ -383,7 +418,7 @@ around the active-row KV-cache operation. The shared expert overlaps the routed
 experts on a second CUDA stream. `EIDER_DISABLE_DECODE_GRAPHS=1` retains the
 same execution path but submits its layer work eagerly.
 
-## CUTLASS setup
+### CUTLASS setup
 
 CUTLASS is needed when using the dense Qwen GEMV backend or running the
 CUTLASS-specific low-level tests and benchmarks.
@@ -406,7 +441,7 @@ The compile probe is available as:
 scripts/probe-cutlass-sm12x.sh
 ```
 
-## Microbenchmarks
+### Microbenchmarks
 
 Benchmarks use my [`micromeasure`](https://github.com/rdaum/micromeasure) crate.
 
@@ -435,7 +470,7 @@ cargo bench -p infer --bench sampling
 Keep kernel claims tied to a shape-appropriate micromeasure and an end-to-end
 decode run. An isolated faster kernel is not evidence of a faster model.
 
-## Comparison helpers
+### Comparison helpers
 
 For an already-running OpenAI-compatible vLLM server:
 
@@ -449,7 +484,53 @@ scripts/compare-vllm.sh
 and runs the same comparison. The scripts accept environment overrides for the
 model, prompt, token count, repeat count, and endpoint.
 
-Further implementation notes live in:
+## Troubleshooting
+
+### The CUDA build cannot target `sm_121`
+
+Use CUDA 13.x and confirm that `nvcc`, the CUDA headers, and cuBLASLt come from
+the same installation. `scripts/probe-cutlass-sm12x.sh` checks the optional
+CUTLASS toolchain; CUTLASS is not required for normal Qwen3.6 serving.
+
+### A catalogue model will not start offline
+
+An offline start requires the complete pinned Hugging Face snapshot and any
+derived Eider artifacts. Start once without `--offline`, or fetch explicitly
+with `cargo run --release -p eider-api --bin eider -- model fetch MODEL_ID`.
+Snapshots use the Hugging Face cache; prepared weights use
+`$XDG_CACHE_HOME/eider/models/` (or `~/.cache/eider/models/` when
+`XDG_CACHE_HOME` is unset).
+
+### CUDA allocation fails or the process is OOM-killed
+
+GB10 device allocations consume the Spark's shared 128 GB memory. Stop other
+GPU or memory-heavy processes before serving large checkpoints. Reducing
+`--prefill-token-capacity`, concurrent sequences, or requested output length
+lowers workspace or live sequence state. Reducing `--step-expert-capacity`
+trades Step-3.7 throughput for model headroom. Nemotron can use
+`--nemotron-kv-cache nvfp4` when KV capacity matters more than its faster
+default cache.
+
+### An API request is rejected
+
+Send requests to `/v1/responses` using the API model name from the supported
+models table, not the catalogue ID. When `EIDER_API_KEY` is set on the server,
+include `Authorization: Bearer $EIDER_API_KEY` in the request.
+
+## A note about authorship
+
+The opening shape of this project was substantially written by hand because
+the point was to understand the hardware rather than treat it as a black box.
+As the work moved into FFI boilerplate, format conversions, CUDA wrappers, and
+benchmark harnesses, AI assistance became a larger part of the implementation,
+and the performance tuning is heavily agent driven.
+
+That boundary is deliberate and visible rather than hidden. Not every detail
+of every kernel is something I can yet explain from scratch, and turning those
+pieces back into things I can explain and trust better is part of the ongoing
+work here.
+
+## Further notes
 
 - `docs/qwen36-batch-decode-plan.md` for the batch contract, correctness
   evidence, and remaining scheduler-admission measurements.
