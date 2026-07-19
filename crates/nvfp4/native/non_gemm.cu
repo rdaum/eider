@@ -41,6 +41,17 @@ __device__ __forceinline__ float infer_e4m3_value(std::uint8_t code) {
     return __uint_as_float(sign | ((exp + 120U) << 23) | (mant << 20));
 }
 
+__device__ __forceinline__ float infer_e2m1_value(std::uint8_t nibble) {
+    const std::uint32_t magnitude = nibble & 0x7u;
+    const std::uint32_t exponent = magnitude >> 1u;
+    const std::uint32_t mantissa = magnitude & 1u;
+    const std::uint32_t magnitude_bits = exponent == 0
+        ? mantissa * 0x3f000000u
+        : ((exponent + 126u) << 23u) | (mantissa << 22u);
+    const std::uint32_t sign_bit = static_cast<std::uint32_t>(nibble & 0x8u) << 28u;
+    return __uint_as_float(sign_bit | magnitude_bits);
+}
+
 __device__ __forceinline__ float infer_warp_reduce_sum(float value) {
     value += __shfl_down_sync(0xffffffff, value, 16);
     value += __shfl_down_sync(0xffffffff, value, 8);
@@ -176,6 +187,323 @@ extern "C" cudaError_t infer_quantize_nvfp4_col_major_f32_on_stream(
     const std::uint32_t row_blocks = (rows + 15) / 16;
     infer_quantize_nvfp4_col_major_f32_kernel<<<cols * row_blocks, 32, 0, stream>>>(
         input, packed, scales, rows, cols, input_scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rms_norm_quantize_nvfp4_col_major_f32_kernel(
+    const float* input,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    float input_scale) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    constexpr std::uint32_t kWarps = 8;
+    const float* row_input = input + row * cols;
+
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = row_input[col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+
+    const std::uint32_t feature_blocks = (cols + 15) / 16;
+    const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
+    for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
+         feature_pair += kWarps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t feature_block = feature_pair * 2 + half;
+        const std::uint32_t feature = feature_pair * 32 + lane;
+        float value = 0.0f;
+        if (feature < cols) {
+            value = row_input[feature] * inverse_rms * weight[feature] / input_scale;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[infer_ue4m3_tiled_scale_offset(row, feature_block, cols)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < cols) {
+                const std::uint8_t lo = static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp4(
+                        scale == 0.0f ? 0.0f : lo_value / scale,
+                        __NV_E2M1, cudaRoundNearest) & 0x0f);
+                std::uint8_t hi = 0;
+                if (lo_feature + 1 < cols) {
+                    hi = static_cast<std::uint8_t>(
+                        __nv_cvt_float_to_fp4(
+                            scale == 0.0f ? 0.0f : hi_value / scale,
+                            __NV_E2M1, cudaRoundNearest) & 0x0f);
+                }
+                packed[(row * cols + lo_feature) / 2] = lo | (hi << 4);
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t infer_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+    const float* input,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || packed == nullptr || scales == nullptr ||
+        rows == 0 || cols == 0 || input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_rms_norm_quantize_nvfp4_col_major_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, packed, scales, rows, cols, eps, input_scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rms_norm_quantize_nvfp4_pair_col_major_f32_kernel(
+    const float* input,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint8_t* residual_packed,
+    std::uint8_t* residual_scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    float input_scale) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    constexpr std::uint32_t kWarps = 8;
+    const float* row_input = input + row * cols;
+
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = row_input[col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+
+    const std::uint32_t feature_blocks = (cols + 15) / 16;
+    const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
+    for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
+         feature_pair += kWarps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t feature_block = feature_pair * 2 + half;
+        const std::uint32_t feature = feature_pair * 32 + lane;
+        float value = 0.0f;
+        if (feature < cols) {
+            value = row_input[feature] * inverse_rms * weight[feature] / input_scale;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[infer_ue4m3_tiled_scale_offset(row, feature_block, cols)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint8_t code = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp4(
+                scale == 0.0f ? 0.0f : value / scale,
+                __NV_E2M1, cudaRoundNearest) & 0x0f);
+        const float residual = value - infer_e2m1_value(code) * scale;
+
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const std::uint32_t lo_code = __shfl_sync(mask, static_cast<std::uint32_t>(code), pair_lane, 16);
+        const std::uint32_t hi_code = __shfl_sync(mask, static_cast<std::uint32_t>(code), pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < cols) {
+                packed[(row * cols + lo_feature) / 2] =
+                    static_cast<std::uint8_t>(lo_code | (hi_code << 4));
+            }
+        }
+
+        float residual_max_abs = fabsf(residual);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            residual_max_abs =
+                fmaxf(residual_max_abs, __shfl_down_sync(mask, residual_max_abs, offset, 16));
+        }
+        std::uint32_t residual_scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            residual_scale_word = residual_max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(residual_max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            residual_scales[infer_ue4m3_tiled_scale_offset(row, feature_block, cols)] =
+                static_cast<std::uint8_t>(residual_scale_word);
+        }
+        residual_scale_word = __shfl_sync(mask, residual_scale_word, 0, 16);
+        const float residual_scale =
+            infer_e4m3_value(static_cast<std::uint8_t>(residual_scale_word));
+        const std::uint8_t residual_code = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp4(
+                residual_scale == 0.0f ? 0.0f : residual / residual_scale,
+                __NV_E2M1, cudaRoundNearest) & 0x0f);
+        const std::uint32_t lo_residual_code = __shfl_sync(
+            mask, static_cast<std::uint32_t>(residual_code), pair_lane, 16);
+        const std::uint32_t hi_residual_code = __shfl_sync(
+            mask, static_cast<std::uint32_t>(residual_code), pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < cols) {
+                residual_packed[(row * cols + lo_feature) / 2] =
+                    static_cast<std::uint8_t>(lo_residual_code | (hi_residual_code << 4));
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t infer_rms_norm_quantize_nvfp4_pair_col_major_f32_on_stream(
+    const float* input,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint8_t* residual_packed,
+    std::uint8_t* residual_scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || packed == nullptr || scales == nullptr ||
+        residual_packed == nullptr || residual_scales == nullptr || rows == 0 || cols == 0 ||
+        input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_rms_norm_quantize_nvfp4_pair_col_major_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, packed, scales, residual_packed, residual_scales,
+        rows, cols, eps, input_scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_kernel(
+    const float* gate,
+    const float* up,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float input_scale) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    constexpr std::uint32_t kWarps = 8;
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    const std::uint32_t feature_blocks = (cols + 15) / 16;
+    const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
+    for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
+         feature_pair += kWarps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t feature_block = feature_pair * 2 + half;
+        const std::uint32_t feature = feature_pair * 32 + lane;
+        float value = 0.0f;
+        if (feature < cols) {
+            const std::uint32_t index = row * cols + feature;
+            const float gate_value = gate[index];
+            const float cubic = gate_value * gate_value * gate_value;
+            const float gelu = 0.5f * gate_value *
+                (1.0f + tanhf(kSqrtTwoOverPi *
+                               (gate_value + 0.044715f * cubic)));
+            value = gelu * up[index] / input_scale;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[infer_ue4m3_tiled_scale_offset(row, feature_block, cols)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < cols) {
+                const std::uint8_t lo = static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp4(
+                        scale == 0.0f ? 0.0f : lo_value / scale,
+                        __NV_E2M1, cudaRoundNearest) & 0x0f);
+                std::uint8_t hi = 0;
+                if (lo_feature + 1 < cols) {
+                    hi = static_cast<std::uint8_t>(
+                        __nv_cvt_float_to_fp4(
+                            scale == 0.0f ? 0.0f : hi_value / scale,
+                            __NV_E2M1, cudaRoundNearest) & 0x0f);
+                }
+                packed[(row * cols + lo_feature) / 2] = lo | (hi << 4);
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_on_stream(
+    const float* gate,
+    const float* up,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float input_scale,
+    cudaStream_t stream) {
+    if (gate == nullptr || up == nullptr || packed == nullptr || scales == nullptr ||
+        rows == 0 || cols == 0 || input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_kernel<<<
+        rows, kThreads, 0, stream>>>(
+        gate, up, packed, scales, rows, cols, input_scale);
     return cudaGetLastError();
 }
 
@@ -366,6 +694,383 @@ extern "C" cudaError_t infer_rms_norm_f32_on_stream(const float* input,
     constexpr int kThreads = 256;
     infer_rms_norm_f32_kernel<<<rows, kThreads, kThreads * sizeof(float), stream>>>(
         input, weight, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rms_norm_add_f32_kernel(
+    const float* input,
+    const float* weight,
+    const float* residual,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps) {
+    const std::uint32_t row = blockIdx.x;
+    const std::size_t row_offset = static_cast<std::size_t>(row) * cols;
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[row_offset + col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        output[row_offset + col] =
+            input[row_offset + col] * inverse_rms * weight[col] + residual[row_offset + col];
+    }
+}
+
+extern "C" cudaError_t infer_rms_norm_add_f32_on_stream(
+    const float* input,
+    const float* weight,
+    const float* residual,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || residual == nullptr || output == nullptr ||
+        rows == 0 || cols == 0 || eps < 0.0f || !isfinite(eps)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_rms_norm_add_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, residual, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_kernel(
+    const float* input,
+    const float* input_weight,
+    const float* residual,
+    float* output,
+    const float* quant_weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float input_eps,
+    float quant_eps,
+    float input_scale) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    constexpr std::uint32_t kWarps = 8;
+    const std::size_t row_offset = static_cast<std::size_t>(row) * cols;
+    extern __shared__ float staged[];
+
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[row_offset + col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms[2];
+    if (threadIdx.x == 0) {
+        inverse_rms[0] = rsqrtf(square_sum / static_cast<float>(cols) + input_eps);
+    }
+    __syncthreads();
+
+    float output_square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value =
+            input[row_offset + col] * inverse_rms[0] * input_weight[col] +
+            residual[row_offset + col];
+        output[row_offset + col] = value;
+        staged[col] = value;
+        output_square_sum += value * value;
+    }
+    output_square_sum = infer_block_reduce_sum(output_square_sum);
+    if (threadIdx.x == 0) {
+        inverse_rms[1] = rsqrtf(output_square_sum / static_cast<float>(cols) + quant_eps);
+    }
+    __syncthreads();
+
+    const std::uint32_t feature_blocks = (cols + 15) / 16;
+    const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
+    for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
+         feature_pair += kWarps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t feature_block = feature_pair * 2 + half;
+        const std::uint32_t feature = feature_pair * 32 + lane;
+        float value = 0.0f;
+        if (feature < cols) {
+            value = staged[feature] * inverse_rms[1] * quant_weight[feature] / input_scale;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[infer_ue4m3_tiled_scale_offset(row, feature_block, cols)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < cols) {
+                const std::uint8_t lo = static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp4(
+                        scale == 0.0f ? 0.0f : lo_value / scale,
+                        __NV_E2M1, cudaRoundNearest) & 0x0f);
+                std::uint8_t hi = 0;
+                if (lo_feature + 1 < cols) {
+                    hi = static_cast<std::uint8_t>(
+                        __nv_cvt_float_to_fp4(
+                            scale == 0.0f ? 0.0f : hi_value / scale,
+                            __NV_E2M1, cudaRoundNearest) & 0x0f);
+                }
+                packed[(row * cols + lo_feature) / 2] = lo | (hi << 4);
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_on_stream(
+    const float* input,
+    const float* input_weight,
+    const float* residual,
+    float* output,
+    const float* quant_weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float input_eps,
+    float quant_eps,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || input_weight == nullptr || residual == nullptr ||
+        output == nullptr || quant_weight == nullptr || packed == nullptr || scales == nullptr ||
+        rows == 0 || cols == 0 || input_eps < 0.0f || !isfinite(input_eps) ||
+        quant_eps < 0.0f || !isfinite(quant_eps) ||
+        input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_kernel<<<
+        rows, kThreads, static_cast<std::size_t>(cols) * sizeof(float), stream>>>(
+        input, input_weight, residual, output, quant_weight, packed, scales,
+        rows, cols, input_eps, quant_eps, input_scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dual_rms_norm_add_f32_kernel(
+    const float* left,
+    const float* left_weight,
+    const float* right,
+    const float* right_weight,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float left_eps,
+    float right_eps) {
+    const std::uint32_t row = blockIdx.x;
+    const std::size_t row_offset = static_cast<std::size_t>(row) * cols;
+    float left_square_sum = 0.0f;
+    float right_square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float left_value = left[row_offset + col];
+        const float right_value = right[row_offset + col];
+        left_square_sum += left_value * left_value;
+        right_square_sum += right_value * right_value;
+    }
+    left_square_sum = infer_block_reduce_sum(left_square_sum);
+    __shared__ float inverse_rms[2];
+    if (threadIdx.x == 0) {
+        inverse_rms[0] = rsqrtf(left_square_sum / static_cast<float>(cols) + left_eps);
+    }
+    __syncthreads();
+    right_square_sum = infer_block_reduce_sum(right_square_sum);
+    if (threadIdx.x == 0) {
+        inverse_rms[1] = rsqrtf(right_square_sum / static_cast<float>(cols) + right_eps);
+    }
+    __syncthreads();
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        output[row_offset + col] =
+            left[row_offset + col] * inverse_rms[0] * left_weight[col] +
+            right[row_offset + col] * inverse_rms[1] * right_weight[col];
+    }
+}
+
+extern "C" cudaError_t infer_dual_rms_norm_add_f32_on_stream(
+    const float* left,
+    const float* left_weight,
+    const float* right,
+    const float* right_weight,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float left_eps,
+    float right_eps,
+    cudaStream_t stream) {
+    if (left == nullptr || left_weight == nullptr || right == nullptr ||
+        right_weight == nullptr || output == nullptr || rows == 0 || cols == 0 ||
+        left_eps < 0.0f || !isfinite(left_eps) || right_eps < 0.0f || !isfinite(right_eps)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_dual_rms_norm_add_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        left, left_weight, right, right_weight, output, rows, cols, left_eps, right_eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_rms_norm_add_channel_row_scale_f32_kernel(
+    const float* input,
+    const float* weight,
+    const float* residual,
+    const float* channel_scale,
+    const float* row_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps) {
+    const std::uint32_t row = blockIdx.x;
+    const std::size_t row_offset = static_cast<std::size_t>(row) * cols;
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = input[row_offset + col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+    const float row_multiplier = row_scale[row];
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float combined =
+            input[row_offset + col] * inverse_rms * weight[col] + residual[row_offset + col];
+        output[row_offset + col] = combined * channel_scale[col] * row_multiplier;
+    }
+}
+
+extern "C" cudaError_t infer_rms_norm_add_channel_row_scale_f32_on_stream(
+    const float* input,
+    const float* weight,
+    const float* residual,
+    const float* channel_scale,
+    const float* row_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || residual == nullptr ||
+        channel_scale == nullptr || row_scale == nullptr || output == nullptr ||
+        rows == 0 || cols == 0 || eps < 0.0f || !isfinite(eps)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_rms_norm_add_channel_row_scale_f32_kernel<<<rows, kThreads, 0, stream>>>(
+        input, weight, residual, channel_scale, row_scale, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_kernel(
+    const float* left,
+    const float* left_weight,
+    const float* right,
+    const float* right_weight,
+    const float* final_weight,
+    const float* residual,
+    const float* channel_scale,
+    const float* row_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float left_eps,
+    float right_eps,
+    float final_eps) {
+    const std::uint32_t row = blockIdx.x;
+    const std::size_t row_offset = static_cast<std::size_t>(row) * cols;
+    extern __shared__ float combined[];
+    float left_square_sum = 0.0f;
+    float right_square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float left_value = left[row_offset + col];
+        const float right_value = right[row_offset + col];
+        left_square_sum += left_value * left_value;
+        right_square_sum += right_value * right_value;
+    }
+    left_square_sum = infer_block_reduce_sum(left_square_sum);
+    __shared__ float inverse_rms[3];
+    if (threadIdx.x == 0) {
+        inverse_rms[0] = rsqrtf(left_square_sum / static_cast<float>(cols) + left_eps);
+    }
+    __syncthreads();
+    right_square_sum = infer_block_reduce_sum(right_square_sum);
+    if (threadIdx.x == 0) {
+        inverse_rms[1] = rsqrtf(right_square_sum / static_cast<float>(cols) + right_eps);
+    }
+    __syncthreads();
+
+    float combined_square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value =
+            left[row_offset + col] * inverse_rms[0] * left_weight[col] +
+            right[row_offset + col] * inverse_rms[1] * right_weight[col];
+        combined[col] = value;
+        combined_square_sum += value * value;
+    }
+    combined_square_sum = infer_block_reduce_sum(combined_square_sum);
+    if (threadIdx.x == 0) {
+        inverse_rms[2] = rsqrtf(combined_square_sum / static_cast<float>(cols) + final_eps);
+    }
+    __syncthreads();
+
+    const float row_multiplier = row_scale[row];
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value =
+            combined[col] * inverse_rms[2] * final_weight[col] + residual[row_offset + col];
+        output[row_offset + col] = value * channel_scale[col] * row_multiplier;
+    }
+}
+
+extern "C" cudaError_t
+infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_on_stream(
+    const float* left,
+    const float* left_weight,
+    const float* right,
+    const float* right_weight,
+    const float* final_weight,
+    const float* residual,
+    const float* channel_scale,
+    const float* row_scale,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float left_eps,
+    float right_eps,
+    float final_eps,
+    cudaStream_t stream) {
+    if (left == nullptr || left_weight == nullptr || right == nullptr || right_weight == nullptr ||
+        final_weight == nullptr || residual == nullptr || channel_scale == nullptr ||
+        row_scale == nullptr || output == nullptr || rows == 0 || cols == 0 ||
+        left_eps < 0.0f || !isfinite(left_eps) || right_eps < 0.0f ||
+        !isfinite(right_eps) || final_eps < 0.0f || !isfinite(final_eps)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_kernel<<<
+        rows, kThreads, static_cast<std::size_t>(cols) * sizeof(float), stream>>>(
+        left, left_weight, right, right_weight, final_weight, residual,
+        channel_scale, row_scale, output, rows, cols, left_eps, right_eps, final_eps);
     return cudaGetLastError();
 }
 
@@ -1698,46 +2403,49 @@ __global__ void infer_moe_quantize_sorted_routes_nvfp4_kernel(
     std::uint32_t scale_stride,
     bool gather_rows) {
     const std::uint32_t k_blocks = (in_features + 15) / 16;
-    const std::uint32_t task = blockIdx.x;
-    const std::uint32_t sorted = task / k_blocks;
-    const std::uint32_t k_block = task % k_blocks;
+    const std::uint32_t sorted = blockIdx.x;
     if (sorted >= routes) return;
     const std::uint32_t route = sorted_routes[sorted];
     const std::uint32_t source_row = gather_rows ? route / routes_per_row : sorted;
     const std::uint32_t expert = sorted_experts[sorted];
     const std::uint32_t expert_col = sorted - expert_offsets[expert];
-    const std::uint32_t row_start = k_block * 16;
-    const std::uint32_t lane = threadIdx.x;
+    const std::uint32_t warp = threadIdx.x / 32;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t warps = blockDim.x / 32;
     const float* source = input + static_cast<std::size_t>(source_row) * in_features;
 
-    float max_abs = 0.0f;
-    if (row_start + lane < in_features) {
-        const float value = source[row_start + lane];
-        max_abs = isfinite(value) ? fabsf(value) : 0.0f;
-    }
-    max_abs = infer_warp_reduce_max(max_abs);
-    std::uint32_t scale_word = 0;
-    if (lane == 0) {
-        scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
-            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
-        scales[static_cast<std::size_t>(expert) * scale_stride +
-               infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
-            static_cast<std::uint8_t>(scale_word);
-    }
-    scale_word = __shfl_sync(0xffffffffu, scale_word, 0);
-    const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
-    if (lane < 8 && row_start + lane * 2 < in_features) {
-        const std::uint32_t row = row_start + lane * 2;
-        const float lo_value = scale == 0.0f ? 0.0f : source[row] / scale;
-        const std::uint8_t lo = static_cast<std::uint8_t>(
-            __nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
-        std::uint8_t hi = 0;
-        if (row + 1 < in_features) {
-            const float hi_value = scale == 0.0f ? 0.0f : source[row + 1] / scale;
-            hi = static_cast<std::uint8_t>(
-                __nv_cvt_float_to_fp4(hi_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+    for (std::uint32_t k_block = warp; k_block < k_blocks; k_block += warps) {
+        const std::uint32_t row_start = k_block * 16;
+        float max_abs = 0.0f;
+        if (row_start + lane < in_features) {
+            const float value = source[row_start + lane];
+            max_abs = isfinite(value) ? fabsf(value) : 0.0f;
         }
-        packed[(static_cast<std::size_t>(sorted) * in_features + row) / 2] = lo | (hi << 4);
+        max_abs = infer_warp_reduce_max(max_abs);
+        std::uint32_t scale_word = 0;
+        if (lane == 0) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[static_cast<std::size_t>(expert) * scale_stride +
+                   infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(0xffffffffu, scale_word, 0);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        if (lane < 8 && row_start + lane * 2 < in_features) {
+            const std::uint32_t row = row_start + lane * 2;
+            const float lo_value = scale == 0.0f ? 0.0f : source[row] / scale;
+            const std::uint8_t lo = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+            std::uint8_t hi = 0;
+            if (row + 1 < in_features) {
+                const float hi_value = scale == 0.0f ? 0.0f : source[row + 1] / scale;
+                hi = static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp4(hi_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+            }
+            packed[(static_cast<std::size_t>(sorted) * in_features + row) / 2] =
+                lo | (hi << 4);
+        }
     }
 }
 
@@ -1760,11 +2468,237 @@ extern "C" cudaError_t infer_moe_quantize_sorted_routes_nvfp4_on_stream(
         scale_stride == 0) {
         return cudaErrorInvalidValue;
     }
-    const std::uint32_t k_blocks = in_features / 16;
-    infer_moe_quantize_sorted_routes_nvfp4_kernel<<<
-        routes * k_blocks, 32, 0, stream>>>(
+    infer_moe_quantize_sorted_routes_nvfp4_kernel<<<routes, 256, 0, stream>>>(
         input, sorted_routes, sorted_experts, expert_offsets, packed, scales,
         routes, routes_per_row, in_features, scale_stride, gather_rows != 0);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_kernel(
+    const std::uint16_t* __restrict__ gate,
+    const std::uint16_t* __restrict__ up,
+    const std::uint32_t* __restrict__ sorted_experts,
+    const std::uint32_t* __restrict__ expert_offsets,
+    std::uint8_t* __restrict__ packed,
+    std::uint8_t* __restrict__ scales,
+    std::uint32_t routes,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride) {
+    const std::uint32_t sorted = blockIdx.x;
+    if (sorted >= routes) return;
+    const std::uint32_t expert = sorted_experts[sorted];
+    const std::uint32_t expert_col = sorted - expert_offsets[expert];
+    const std::uint32_t k_blocks = in_features / 16;
+    const std::uint32_t warp = threadIdx.x / 32;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t warps = blockDim.x / 32;
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    const std::uint16_t* gate_row = gate + static_cast<std::size_t>(sorted) * in_features;
+    const std::uint16_t* up_row = up + static_cast<std::size_t>(sorted) * in_features;
+
+    const std::uint32_t k_block_pairs = (k_blocks + 1) / 2;
+    for (std::uint32_t k_block_pair = warp; k_block_pair < k_block_pairs;
+         k_block_pair += warps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t k_block = k_block_pair * 2 + half;
+        const std::uint32_t row = k_block_pair * 32 + lane;
+        float value = 0.0f;
+        if (row < in_features) {
+            const float gate_value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(gate_row + row));
+            const float cubic = gate_value * gate_value * gate_value;
+            const float gelu = 0.5f * gate_value *
+                (1.0f + tanhf(kSqrtTwoOverPi *
+                               (gate_value + 0.044715f * cubic)));
+            const float up_value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(up_row + row));
+            value = gelu * up_value;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && k_block < k_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[static_cast<std::size_t>(expert) * scale_stride +
+                   infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && k_block < k_blocks) {
+            const std::uint32_t packed_row = k_block * 16 + half_lane * 2;
+            const std::uint8_t lo = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(
+                    scale == 0.0f ? 0.0f : lo_value / scale,
+                    __NV_E2M1, cudaRoundNearest) & 0x0f);
+            const std::uint8_t hi = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(
+                    scale == 0.0f ? 0.0f : hi_value / scale,
+                    __NV_E2M1, cudaRoundNearest) & 0x0f);
+            packed[(static_cast<std::size_t>(sorted) * in_features + packed_row) / 2] =
+                lo | (hi << 4);
+        }
+    }
+}
+
+extern "C" cudaError_t infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_stream(
+    const std::uint16_t* gate,
+    const std::uint16_t* up,
+    const std::uint32_t* sorted_experts,
+    const std::uint32_t* expert_offsets,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t routes,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    cudaStream_t stream) {
+    if (gate == nullptr || up == nullptr || sorted_experts == nullptr ||
+        expert_offsets == nullptr || packed == nullptr || scales == nullptr ||
+        routes == 0 || in_features == 0 || (in_features % 16) != 0 ||
+        scale_stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_kernel<<<
+        routes, 256, 0, stream>>>(
+        gate, up, sorted_experts, expert_offsets, packed, scales, routes,
+        in_features, scale_stride);
+    return cudaGetLastError();
+}
+
+__global__ void infer_moe_quantize_rows_nvfp4_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    std::uint8_t* __restrict__ packed,
+    std::uint8_t* __restrict__ scales,
+    std::uint32_t rows,
+    std::uint32_t in_features,
+    float eps) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const std::uint32_t k_blocks = in_features / 16;
+    const std::uint32_t warp = threadIdx.x / 32;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t warps = blockDim.x / 32;
+    const float* source = input + static_cast<std::size_t>(row) * in_features;
+    float square_sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        const float value = source[col];
+        square_sum += value * value;
+    }
+    square_sum = infer_block_reduce_sum(square_sum);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(in_features) + eps);
+    }
+    __syncthreads();
+
+    for (std::uint32_t k_block = warp; k_block < k_blocks; k_block += warps) {
+        const std::uint32_t row_start = k_block * 16;
+        float max_abs = 0.0f;
+        if (lane < 16) {
+            const float value =
+                source[row_start + lane] * inverse_rms * weight[row_start + lane];
+            max_abs = isfinite(value) ? fabsf(value) : 0.0f;
+        }
+        max_abs = infer_warp_reduce_max(max_abs);
+        std::uint32_t scale_word = 0;
+        if (lane == 0) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[static_cast<std::size_t>(row) * k_blocks + k_block] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(0xffffffffu, scale_word, 0);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        if (lane < 8) {
+            const std::uint32_t col = row_start + lane * 2;
+            const float lo_value = scale == 0.0f
+                ? 0.0f
+                : source[col] * inverse_rms * weight[col] / scale;
+            const float hi_value = scale == 0.0f
+                ? 0.0f
+                : source[col + 1] * inverse_rms * weight[col + 1] / scale;
+            const std::uint8_t lo = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+            const std::uint8_t hi = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(hi_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
+            packed[(static_cast<std::size_t>(row) * in_features + col) / 2] =
+                lo | (hi << 4);
+        }
+    }
+}
+
+__global__ void infer_moe_scatter_quantized_rows_nvfp4_kernel(
+    const std::uint8_t* __restrict__ source_packed,
+    const std::uint8_t* __restrict__ source_scales,
+    const std::uint32_t* __restrict__ sorted_routes,
+    const std::uint32_t* __restrict__ sorted_experts,
+    const std::uint32_t* __restrict__ expert_offsets,
+    std::uint8_t* __restrict__ packed,
+    std::uint8_t* __restrict__ scales,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride) {
+    const std::uint32_t sorted = blockIdx.x;
+    if (sorted >= routes) return;
+    const std::uint32_t source_row = sorted_routes[sorted] / routes_per_row;
+    const std::uint32_t expert = sorted_experts[sorted];
+    const std::uint32_t expert_col = sorted - expert_offsets[expert];
+    const std::uint32_t packed_bytes = in_features / 2;
+    const std::uint32_t k_blocks = in_features / 16;
+
+    for (std::uint32_t col = threadIdx.x; col < packed_bytes; col += blockDim.x) {
+        packed[static_cast<std::size_t>(sorted) * packed_bytes + col] =
+            source_packed[static_cast<std::size_t>(source_row) * packed_bytes + col];
+    }
+    for (std::uint32_t k_block = threadIdx.x; k_block < k_blocks; k_block += blockDim.x) {
+        scales[static_cast<std::size_t>(expert) * scale_stride +
+               infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
+            source_scales[static_cast<std::size_t>(source_row) * k_blocks + k_block];
+    }
+}
+
+extern "C" cudaError_t infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on_stream(
+    const float* input,
+    const float* weight,
+    const std::uint32_t* sorted_routes,
+    const std::uint32_t* sorted_experts,
+    const std::uint32_t* expert_offsets,
+    std::uint8_t* source_packed,
+    std::uint8_t* source_scales,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    float eps,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
+        expert_offsets == nullptr || source_packed == nullptr || source_scales == nullptr ||
+        packed == nullptr || scales == nullptr || rows == 0 || routes == 0 ||
+        routes_per_row == 0 || routes != rows * routes_per_row || in_features == 0 ||
+        (in_features % 16) != 0 || scale_stride == 0 || !isfinite(eps) || eps < 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    infer_moe_quantize_rows_nvfp4_kernel<<<rows, 256, 0, stream>>>(
+        input, weight, source_packed, source_scales, rows, in_features, eps);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_moe_scatter_quantized_rows_nvfp4_kernel<<<routes, 256, 0, stream>>>(
+        source_packed, source_scales, sorted_routes, sorted_experts, expert_offsets,
+        packed, scales, routes, routes_per_row, in_features, scale_stride);
     return cudaGetLastError();
 }
 
@@ -1772,10 +2706,10 @@ __global__ void infer_moe_grouped_pointer_tables_kernel(
     const std::uint32_t* __restrict__ expert_offsets,
     const std::uint8_t* __restrict__ packed,
     const std::uint8_t* __restrict__ scales,
-    float* __restrict__ output,
+    std::uint16_t* __restrict__ output,
     const std::uint8_t** __restrict__ packed_table,
     const std::uint8_t** __restrict__ scale_table,
-    float** __restrict__ output_table,
+    std::uint16_t** __restrict__ output_table,
     std::uint32_t experts,
     std::uint32_t in_features,
     std::uint32_t out_features,
@@ -1792,10 +2726,10 @@ extern "C" cudaError_t infer_moe_grouped_pointer_tables_on_stream(
     const std::uint32_t* expert_offsets,
     const std::uint8_t* packed,
     const std::uint8_t* scales,
-    float* output,
+    std::uint16_t* output,
     const std::uint8_t** packed_table,
     const std::uint8_t** scale_table,
-    float** output_table,
+    std::uint16_t** output_table,
     std::uint32_t experts,
     std::uint32_t in_features,
     std::uint32_t out_features,
@@ -2316,10 +3250,10 @@ extern "C" cudaError_t infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
-__global__ void infer_moe_weighted_accumulate_sorted_f32_batch_kernel(
+__global__ void infer_moe_weighted_accumulate_sorted_bf16_batch_kernel(
     const std::uint32_t* route_to_sorted,
     const float* route_weights,
-    const float* sorted_inputs,
+    const std::uint16_t* sorted_inputs,
     float* output,
     std::uint32_t rows,
     std::uint32_t len,
@@ -2334,16 +3268,17 @@ __global__ void infer_moe_weighted_accumulate_sorted_f32_batch_kernel(
     for (std::uint32_t slot = 0; slot < routes_per_row; ++slot) {
         const std::uint32_t route = route_begin + slot;
         const std::uint32_t sorted = route_to_sorted[route];
-        sum += sorted_inputs[static_cast<std::size_t>(sorted) * len + col] *
-               route_weights[route];
+        const auto value = *reinterpret_cast<const __nv_bfloat16*>(
+            sorted_inputs + static_cast<std::size_t>(sorted) * len + col);
+        sum += __bfloat162float(value) * route_weights[route];
     }
     output[idx] = sum;
 }
 
-extern "C" cudaError_t infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+extern "C" cudaError_t infer_moe_weighted_accumulate_sorted_bf16_batch_on_stream(
     const std::uint32_t* route_to_sorted,
     const float* route_weights,
-    const float* sorted_inputs,
+    const std::uint16_t* sorted_inputs,
     float* output,
     std::uint32_t rows,
     std::uint32_t len,
@@ -2355,7 +3290,7 @@ extern "C" cudaError_t infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
     }
     constexpr std::uint32_t kThreads = 256;
     const std::uint32_t total = rows * len;
-    infer_moe_weighted_accumulate_sorted_f32_batch_kernel<<<
+    infer_moe_weighted_accumulate_sorted_bf16_batch_kernel<<<
         (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         route_to_sorted, route_weights, sorted_inputs, output, rows, len,
         routes_per_row);
@@ -2806,6 +3741,106 @@ extern "C" cudaError_t infer_rope_neox_proportional_sequence_f32_on_stream(
     infer_rope_neox_proportional_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, tokens, heads, head_dim, rotary_pairs,
         input_token_offset, start_position, theta);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dual_rms_norm_rope_neox_proportional_sequence_f32_kernel(
+    const float* q_input,
+    const float* q_weight,
+    float* q_output,
+    const float* k_input,
+    const float* k_weight,
+    float* k_output,
+    std::uint32_t tokens,
+    std::uint32_t q_heads,
+    std::uint32_t k_heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t input_token_offset,
+    std::uint32_t start_position,
+    float theta,
+    float q_eps,
+    float k_eps) {
+    extern __shared__ float partial[];
+    const std::uint32_t q_rows = tokens * q_heads;
+    const bool is_q = blockIdx.x < q_rows;
+    const std::uint32_t local_row = is_q ? blockIdx.x : blockIdx.x - q_rows;
+    const std::uint32_t heads = is_q ? q_heads : k_heads;
+    const std::uint32_t token = local_row / heads;
+    const std::uint32_t head = local_row % heads;
+    const std::uint32_t dense_row = (input_token_offset + token) * heads + head;
+    const std::size_t row_start = static_cast<std::size_t>(dense_row) * head_dim;
+    const float* input = is_q ? q_input : k_input;
+    const float* weight = is_q ? q_weight : k_weight;
+    float* output = is_q ? q_output : k_output;
+
+    float sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < head_dim; col += blockDim.x) {
+        const float value = input[row_start + col];
+        sum += value * value;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float eps = is_q ? q_eps : k_eps;
+    const float inv_rms = rsqrtf(partial[0] / static_cast<float>(head_dim) + eps);
+    const std::uint32_t half = head_dim / 2;
+    for (std::uint32_t pair = threadIdx.x; pair < half; pair += blockDim.x) {
+        const float a = input[row_start + pair] * inv_rms * weight[pair];
+        const float b = input[row_start + pair + half] * inv_rms * weight[pair + half];
+        if (pair >= rotary_pairs) {
+            output[row_start + pair] = a;
+            output[row_start + pair + half] = b;
+            continue;
+        }
+        const float inv_freq =
+            powf(theta, -2.0f * static_cast<float>(pair) / static_cast<float>(head_dim));
+        float sin_value;
+        float cos_value;
+        sincosf(static_cast<float>(start_position + token) * inv_freq, &sin_value, &cos_value);
+        output[row_start + pair] = a * cos_value - b * sin_value;
+        output[row_start + pair + half] = a * sin_value + b * cos_value;
+    }
+}
+
+extern "C" cudaError_t infer_dual_rms_norm_rope_neox_proportional_sequence_f32_on_stream(
+    const float* q_input,
+    const float* q_weight,
+    float* q_output,
+    const float* k_input,
+    const float* k_weight,
+    float* k_output,
+    std::uint32_t tokens,
+    std::uint32_t q_heads,
+    std::uint32_t k_heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_pairs,
+    std::uint32_t input_token_offset,
+    std::uint32_t start_position,
+    float theta,
+    float q_eps,
+    float k_eps,
+    cudaStream_t stream) {
+    if (q_input == nullptr || q_weight == nullptr || q_output == nullptr ||
+        k_input == nullptr || k_weight == nullptr || k_output == nullptr ||
+        tokens == 0 || q_heads == 0 || k_heads == 0 || head_dim == 0 ||
+        (head_dim % 2) != 0 || rotary_pairs == 0 || rotary_pairs > head_dim / 2 ||
+        !isfinite(theta) || theta <= 0.0f || !isfinite(q_eps) || q_eps < 0.0f ||
+        !isfinite(k_eps) || k_eps < 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t blocks = tokens * (q_heads + k_heads);
+    infer_dual_rms_norm_rope_neox_proportional_sequence_f32_kernel<<<
+        blocks, kThreads, kThreads * sizeof(float), stream>>>(
+        q_input, q_weight, q_output, k_input, k_weight, k_output,
+        tokens, q_heads, k_heads, head_dim, rotary_pairs,
+        input_token_offset, start_position, theta, q_eps, k_eps);
     return cudaGetLastError();
 }
 
@@ -5636,6 +6671,357 @@ extern "C" cudaError_t infer_f32_to_bf16_on_stream(const float* input,
     return cudaGetLastError();
 }
 
+__global__ void infer_pack_token_heads_bf16_kernel(
+    const float* input,
+    std::uint16_t* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t input_row_offset) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = tokens * heads * head_dim;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % heads;
+    const std::uint32_t token = index / (heads * head_dim);
+    const std::uint32_t destination = (head * tokens + token) * head_dim + dim;
+    const std::uint32_t source =
+        ((input_row_offset + token) * heads + head) * head_dim + dim;
+    const __nv_bfloat16 value = __float2bfloat16_rn(input[source]);
+    output[destination] = *reinterpret_cast<const std::uint16_t*>(&value);
+}
+
+extern "C" cudaError_t infer_pack_token_heads_bf16_on_stream(
+    const float* input,
+    std::uint16_t* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t input_row_offset,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || tokens == 0 || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(tokens) * heads * head_dim;
+    if (total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_pack_token_heads_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, tokens, heads, head_dim, input_row_offset);
+    return cudaGetLastError();
+}
+
+__global__ void infer_causal_window_softmax_f32_kernel(
+    float* scores,
+    std::uint32_t query_tokens,
+    std::uint32_t key_tokens,
+    std::uint32_t start_position,
+    std::uint32_t window_tokens,
+    float scale) {
+    extern __shared__ float partial[];
+    const std::uint32_t query = blockIdx.x;
+    const std::uint32_t head = blockIdx.y;
+    const std::uint32_t key_end = min(key_tokens, start_position + query + 1);
+    const std::uint32_t key_start =
+        window_tokens == 0 || key_end <= window_tokens ? 0 : key_end - window_tokens;
+    float* row = scores + (head * query_tokens + query) * key_tokens;
+
+    float local_max = -INFINITY;
+    for (std::uint32_t key = key_start + threadIdx.x; key < key_end; key += blockDim.x) {
+        local_max = fmaxf(local_max, row[key] * scale);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float row_max = partial[0];
+    float local_sum = 0.0f;
+    for (std::uint32_t key = threadIdx.x; key < key_tokens; key += blockDim.x) {
+        float probability = 0.0f;
+        if (key >= key_start && key < key_end) {
+            probability = expf(row[key] * scale - row_max);
+            local_sum += probability;
+        }
+        row[key] = probability;
+    }
+    partial[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse_sum = 1.0f / partial[0];
+    for (std::uint32_t key = key_start + threadIdx.x; key < key_end; key += blockDim.x) {
+        row[key] *= inverse_sum;
+    }
+}
+
+extern "C" cudaError_t infer_causal_window_softmax_f32_on_stream(
+    float* scores,
+    std::uint32_t query_tokens,
+    std::uint32_t key_tokens,
+    std::uint32_t start_position,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t window_tokens,
+    cudaStream_t stream) {
+    if (scores == nullptr || query_tokens == 0 || key_tokens == 0 || heads == 0 ||
+        head_dim == 0 || start_position > key_tokens || query_tokens > key_tokens - start_position) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    infer_causal_window_softmax_f32_kernel<<<
+        dim3(query_tokens, heads, 1), kThreads, kThreads * sizeof(float), stream>>>(
+        scores, query_tokens, key_tokens, start_position, window_tokens, scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_causal_window_softmax_f32_to_bf16_kernel(
+    const float* scores,
+    std::uint16_t* probabilities,
+    std::uint32_t query_tokens,
+    std::uint32_t key_tokens,
+    std::uint32_t start_position,
+    std::uint32_t window_tokens,
+    float scale) {
+    extern __shared__ float partial[];
+    const std::uint32_t query = blockIdx.x;
+    const std::uint32_t head = blockIdx.y;
+    const std::uint32_t key_end = min(key_tokens, start_position + query + 1);
+    const std::uint32_t key_start =
+        window_tokens == 0 || key_end <= window_tokens ? 0 : key_end - window_tokens;
+    const float* row = scores + (head * query_tokens + query) * key_tokens;
+    std::uint16_t* output =
+        probabilities + (head * query_tokens + query) * key_tokens;
+
+    float local_max = -INFINITY;
+    for (std::uint32_t key = key_start + threadIdx.x; key < key_end; key += blockDim.x) {
+        local_max = fmaxf(local_max, row[key] * scale);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = partial[0];
+
+    float local_sum = 0.0f;
+    for (std::uint32_t key = key_start + threadIdx.x; key < key_end; key += blockDim.x) {
+        local_sum += expf(row[key] * scale - row_max);
+    }
+    partial[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse_sum = 1.0f / partial[0];
+    for (std::uint32_t key = threadIdx.x; key < key_tokens; key += blockDim.x) {
+        float probability = 0.0f;
+        if (key >= key_start && key < key_end) {
+            probability = expf(row[key] * scale - row_max) * inverse_sum;
+        }
+        const __nv_bfloat16 value = __float2bfloat16_rn(probability);
+        output[key] = *reinterpret_cast<const std::uint16_t*>(&value);
+    }
+}
+
+extern "C" cudaError_t infer_causal_window_softmax_f32_to_bf16_on_stream(
+    const float* scores,
+    std::uint16_t* probabilities,
+    std::uint32_t query_tokens,
+    std::uint32_t key_tokens,
+    std::uint32_t start_position,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t window_tokens,
+    cudaStream_t stream) {
+    if (scores == nullptr || probabilities == nullptr || query_tokens == 0 ||
+        key_tokens == 0 || heads == 0 || head_dim == 0 ||
+        start_position > key_tokens || query_tokens > key_tokens - start_position) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    infer_causal_window_softmax_f32_to_bf16_kernel<<<
+        dim3(query_tokens, heads, 1), kThreads, kThreads * sizeof(float), stream>>>(
+        scores, probabilities, query_tokens, key_tokens, start_position,
+        window_tokens, scale);
+    return cudaGetLastError();
+}
+
+__global__ void infer_unpack_heads_f32_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = tokens * heads * head_dim;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % heads;
+    const std::uint32_t token = index / (heads * head_dim);
+    const std::uint32_t source = (head * tokens + token) * head_dim + dim;
+    const std::uint32_t destination =
+        ((output_row_offset + token) * heads + head) * head_dim + dim;
+    output[destination] = input[source];
+}
+
+extern "C" cudaError_t infer_unpack_heads_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || tokens == 0 || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(tokens) * heads * head_dim;
+    if (total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_unpack_heads_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, tokens, heads, head_dim, output_row_offset);
+    return cudaGetLastError();
+}
+
+__device__ __forceinline__ float infer_load_attention_output(const float* input,
+                                                              std::size_t index) {
+    return input[index];
+}
+
+__device__ __forceinline__ float infer_load_attention_output(
+    const std::uint16_t* input,
+    std::size_t index) {
+    return __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(input + index));
+}
+
+template <typename Input>
+__global__ void infer_unpack_heads_quantize_nvfp4_col_major_kernel(
+    const Input* input,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset,
+    float input_scale) {
+    const std::uint32_t token = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    constexpr std::uint32_t kWarps = 8;
+    const std::uint32_t features = heads * head_dim;
+    const std::uint32_t feature_blocks = (features + 15) / 16;
+    const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
+    const std::uint32_t output_row = output_row_offset + token;
+
+    for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
+         feature_pair += kWarps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t feature_block = feature_pair * 2 + half;
+        const std::uint32_t feature = feature_pair * 32 + lane;
+        float value = 0.0f;
+        if (feature < features) {
+            const std::uint32_t head = feature / head_dim;
+            const std::uint32_t dim = feature % head_dim;
+            const std::size_t source =
+                (static_cast<std::size_t>(head) * tokens + token) * head_dim + dim;
+            value = infer_load_attention_output(input, source) / input_scale;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && feature_block < feature_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[infer_ue4m3_tiled_scale_offset(output_row, feature_block, features)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && feature_block < feature_blocks) {
+            const std::uint32_t lo_feature = feature_block * 16 + half_lane * 2;
+            if (lo_feature < features) {
+                const std::uint8_t lo = static_cast<std::uint8_t>(
+                    __nv_cvt_float_to_fp4(
+                        scale == 0.0f ? 0.0f : lo_value / scale,
+                        __NV_E2M1, cudaRoundNearest) & 0x0f);
+                std::uint8_t hi = 0;
+                if (lo_feature + 1 < features) {
+                    hi = static_cast<std::uint8_t>(
+                        __nv_cvt_float_to_fp4(
+                            scale == 0.0f ? 0.0f : hi_value / scale,
+                            __NV_E2M1, cudaRoundNearest) & 0x0f);
+                }
+                packed[(static_cast<std::size_t>(output_row) * features + lo_feature) / 2] =
+                    lo | (hi << 4);
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t infer_unpack_heads_quantize_nvfp4_col_major_f32_on_stream(
+    const float* input,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || packed == nullptr || scales == nullptr || tokens == 0 ||
+        heads == 0 || head_dim == 0 || input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_unpack_heads_quantize_nvfp4_col_major_kernel<<<tokens, kThreads, 0, stream>>>(
+        input, packed, scales, tokens, heads, head_dim, output_row_offset, input_scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_unpack_heads_quantize_nvfp4_col_major_bf16_on_stream(
+    const std::uint16_t* input,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || packed == nullptr || scales == nullptr || tokens == 0 ||
+        heads == 0 || head_dim == 0 || input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_unpack_heads_quantize_nvfp4_col_major_kernel<<<tokens, kThreads, 0, stream>>>(
+        input, packed, scales, tokens, heads, head_dim, output_row_offset, input_scale);
+    return cudaGetLastError();
+}
+
 __global__ void infer_round_f32_to_bf16_kernel(const float* input,
                                                      float* output,
                                                      std::uint32_t len) {
@@ -8060,17 +9446,6 @@ extern "C" cudaError_t infer_lm_head_top1_f32_on_stream(
 // row-major, and a scalar weight_scale_2. For W4A16 the activation stays f32;
 // only weight_scale_2 is applied as the output scalar.
 // ---------------------------------------------------------------------------
-
-__device__ __forceinline__ float infer_e2m1_value(std::uint8_t nibble) {
-    const std::uint32_t magnitude = nibble & 0x7u;
-    const std::uint32_t exponent = magnitude >> 1u;
-    const std::uint32_t mantissa = magnitude & 1u;
-    const std::uint32_t magnitude_bits = exponent == 0
-        ? mantissa * 0x3f000000u
-        : ((exponent + 126u) << 23u) | (mantissa << 22u);
-    const std::uint32_t sign_bit = static_cast<std::uint32_t>(nibble & 0x8u) << 28u;
-    return __uint_as_float(sign_bit | magnitude_bits);
-}
 
 __device__ float infer_ue4m3_value(std::uint8_t code) {
     if ((code & 0x80) == 0) {

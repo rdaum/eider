@@ -20,6 +20,12 @@ pub(crate) type cudaGraphExec_t = *mut c_void;
 pub(crate) type cudaMemcpyKind = i32;
 #[allow(non_camel_case_types)]
 pub(crate) type cudaStreamCaptureMode = i32;
+#[allow(non_camel_case_types)]
+pub(crate) type CUresult = i32;
+#[allow(non_camel_case_types)]
+pub(crate) type CUmodule = *mut c_void;
+#[allow(non_camel_case_types)]
+pub(crate) type CUfunction = *mut c_void;
 
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
@@ -30,6 +36,7 @@ pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
 pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 
 #[allow(non_camel_case_types)]
 pub(crate) type cublasStatus_t = i32;
@@ -69,6 +76,8 @@ pub(crate) const CUBLASLT_MATMUL_DESC_A_SCALE_MODE: i32 = 31;
 pub(crate) const CUBLASLT_MATMUL_DESC_B_SCALE_MODE: i32 = 32;
 
 pub(crate) const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: i32 = 1;
+pub(crate) const CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT: i32 = 5;
+pub(crate) const CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET: i32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -87,6 +96,27 @@ pub(crate) struct cublasLtMatmulHeuristicResult_t {
 }
 
 unsafe extern "C" {
+    pub(crate) fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
+    pub(crate) fn cuModuleGetFunction(
+        function: *mut CUfunction,
+        module: CUmodule,
+        name: *const c_char,
+    ) -> CUresult;
+    pub(crate) fn cuModuleUnload(module: CUmodule) -> CUresult;
+    pub(crate) fn cuFuncSetAttribute(function: CUfunction, attribute: i32, value: i32) -> CUresult;
+    pub(crate) fn cuLaunchKernel(
+        function: CUfunction,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_memory_bytes: u32,
+        stream: cudaStream_t,
+        kernel_params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> CUresult;
     pub(crate) fn cudaGetDevice(device: *mut i32) -> cudaError_t;
     pub(crate) fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> cudaError_t;
@@ -197,7 +227,7 @@ unsafe extern "C" {
         a_scales: *const *const u8,
         b_values: *const *const u8,
         b_scales: *const *const u8,
-        output: *const *mut f32,
+        output: *const *mut u16,
         alpha: *const *mut f32,
         tokens_per_expert: *const u32,
         stream: cudaStream_t,
@@ -318,6 +348,9 @@ unsafe extern "C" {
         value_scales: *mut u8,
         key_tail: *mut f32,
         value_tail: *mut f32,
+        key_output: *mut u16,
+        value_output: *mut u16,
+        output_tokens: u32,
         input_row_offset: u32,
         start_position: u32,
         rows: u32,
@@ -336,6 +369,21 @@ unsafe extern "C" {
         key_tail: *mut f32,
         value_tail: *mut f32,
         position: *const u32,
+        max_tokens: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_cache_unpack_bf16_on_stream(
+        key_values: *const u8,
+        key_scales: *const u8,
+        value_values: *const u8,
+        value_scales: *const u8,
+        key_tail: *const f32,
+        value_tail: *const f32,
+        key_output: *mut u16,
+        value_output: *mut u16,
+        cache_len: u32,
         max_tokens: u32,
         kv_heads: u32,
         head_dim: u32,
@@ -605,6 +653,72 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_rms_norm_add_f32_on_stream(
+        input: *const f32,
+        weight: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_on_stream(
+        input: *const f32,
+        input_weight: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        quant_weight: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        rows: u32,
+        cols: u32,
+        input_eps: f32,
+        quant_eps: f32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_dual_rms_norm_add_f32_on_stream(
+        left: *const f32,
+        left_weight: *const f32,
+        right: *const f32,
+        right_weight: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        left_eps: f32,
+        right_eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rms_norm_add_channel_row_scale_f32_on_stream(
+        input: *const f32,
+        weight: *const f32,
+        residual: *const f32,
+        channel_scale: *const f32,
+        row_scale: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_on_stream(
+        left: *const f32,
+        left_weight: *const f32,
+        right: *const f32,
+        right_weight: *const f32,
+        final_weight: *const f32,
+        residual: *const f32,
+        channel_scale: *const f32,
+        row_scale: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        left_eps: f32,
+        right_eps: f32,
+        final_eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rms_norm_rope_neox_f32_indexed_on_stream(
         input: *const f32,
         weight: *const f32,
@@ -839,14 +953,44 @@ unsafe extern "C" {
         gather_rows: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_stream(
+        gate: *const u16,
+        up: *const u16,
+        sorted_experts: *const u32,
+        expert_offsets: *const u32,
+        packed: *mut u8,
+        scales: *mut u8,
+        routes: u32,
+        in_features: u32,
+        scale_stride: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on_stream(
+        input: *const f32,
+        weight: *const f32,
+        sorted_routes: *const u32,
+        sorted_experts: *const u32,
+        expert_offsets: *const u32,
+        source_packed: *mut u8,
+        source_scales: *mut u8,
+        packed: *mut u8,
+        scales: *mut u8,
+        rows: u32,
+        routes: u32,
+        routes_per_row: u32,
+        in_features: u32,
+        scale_stride: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_moe_grouped_pointer_tables_on_stream(
         expert_offsets: *const u32,
         packed: *const u8,
         scales: *const u8,
-        output: *mut f32,
+        output: *mut u16,
         packed_table: *mut *const u8,
         scale_table: *mut *const u8,
-        output_table: *mut *mut f32,
+        output_table: *mut *mut u16,
         experts: u32,
         in_features: u32,
         out_features: u32,
@@ -959,10 +1103,10 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+    pub(crate) fn infer_moe_weighted_accumulate_sorted_bf16_batch_on_stream(
         route_to_sorted: *const u32,
         route_weights: *const f32,
-        sorted_inputs: *const f32,
+        sorted_inputs: *const u16,
         output: *mut f32,
         rows: u32,
         len: u32,
@@ -1053,6 +1197,25 @@ unsafe extern "C" {
         input_token_offset: u32,
         start_position: u32,
         theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_dual_rms_norm_rope_neox_proportional_sequence_f32_on_stream(
+        q_input: *const f32,
+        q_weight: *const f32,
+        q_output: *mut f32,
+        k_input: *const f32,
+        k_weight: *const f32,
+        k_output: *mut f32,
+        tokens: u32,
+        q_heads: u32,
+        k_heads: u32,
+        head_dim: u32,
+        rotary_pairs: u32,
+        input_token_offset: u32,
+        start_position: u32,
+        theta: f32,
+        q_eps: f32,
+        k_eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_rope_imrope_f32_on_stream(
@@ -1230,6 +1393,40 @@ unsafe extern "C" {
     ) -> cudaError_t;
     pub(crate) fn infer_quantize_nvfp4_col_major_f32_on_stream(
         input: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        rows: u32,
+        cols: u32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+        input: *const f32,
+        weight: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_rms_norm_quantize_nvfp4_pair_col_major_f32_on_stream(
+        input: *const f32,
+        weight: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        residual_packed: *mut u8,
+        residual_scales: *mut u8,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_on_stream(
+        gate: *const f32,
+        up: *const f32,
         packed: *mut u8,
         scales: *mut u8,
         rows: u32,
@@ -1483,6 +1680,67 @@ unsafe extern "C" {
         input: *const f32,
         output: *mut u16,
         len: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_pack_token_heads_bf16_on_stream(
+        input: *const f32,
+        output: *mut u16,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        input_row_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_causal_window_softmax_f32_on_stream(
+        scores: *mut f32,
+        query_tokens: u32,
+        key_tokens: u32,
+        start_position: u32,
+        heads: u32,
+        head_dim: u32,
+        window_tokens: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_causal_window_softmax_f32_to_bf16_on_stream(
+        scores: *const f32,
+        probabilities: *mut u16,
+        query_tokens: u32,
+        key_tokens: u32,
+        start_position: u32,
+        heads: u32,
+        head_dim: u32,
+        window_tokens: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_unpack_heads_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        output_row_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_unpack_heads_quantize_nvfp4_col_major_f32_on_stream(
+        input: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        output_row_offset: u32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_unpack_heads_quantize_nvfp4_col_major_bf16_on_stream(
+        input: *const u16,
+        packed: *mut u8,
+        scales: *mut u8,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        output_row_offset: u32,
+        input_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_round_f32_to_bf16_in_place_on_stream(
@@ -2132,6 +2390,12 @@ unsafe extern "C" {
         ld: i64,
     ) -> cublasStatus_t;
     pub(crate) fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> cublasStatus_t;
+    pub(crate) fn cublasLtMatrixLayoutSetAttribute(
+        layout: cublasLtMatrixLayout_t,
+        attr: i32,
+        buf: *const c_void,
+        size_in_bytes: usize,
+    ) -> cublasStatus_t;
 
     pub(crate) fn cublasLtMatmul(
         handle: cublasLtHandle_t,

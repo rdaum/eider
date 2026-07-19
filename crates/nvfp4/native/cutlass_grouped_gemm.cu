@@ -24,14 +24,14 @@ using ElementInput = cutlass::float_e2m1_t;
 using ElementA = cutlass::nv_float4_t<ElementInput>;
 using ElementB = cutlass::nv_float4_t<ElementInput>;
 using ElementSF = cutlass::float_ue4m3_t;
-using ElementC = float;
-using ElementD = float;
+using ElementC = cutlass::bfloat16_t;
+using ElementD = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::ColumnMajor;
 using ClusterShape = Shape<_1, _1, _1>;
-using MmaTileShape = Shape<_128, _128, _128>;
+using MmaTileShape = Shape<_128, _128, _256>;
 
 constexpr int kAlignmentA = 32;
 constexpr int kAlignmentB = 32;
@@ -146,7 +146,7 @@ Gemm::Arguments make_arguments(
     std::uint8_t const** a_scales,
     std::uint8_t const** b_values,
     std::uint8_t const** b_scales,
-    float** output,
+    std::uint16_t** output,
     float** alpha) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
@@ -184,7 +184,7 @@ cudaError_t run(
     std::uint8_t const** a_scales,
     std::uint8_t const** b_values,
     std::uint8_t const** b_scales,
-    float** output,
+    std::uint16_t** output,
     float** alpha,
     std::uint32_t const* tokens_per_expert,
     cudaStream_t stream) {
@@ -276,7 +276,7 @@ extern "C" cudaError_t infer_cutlass_fp4_grouped_gemm_on_stream(
     std::uint8_t const** a_scales,
     std::uint8_t const** b_values,
     std::uint8_t const** b_scales,
-    float** output,
+    std::uint16_t** output,
     float** alpha,
     std::uint32_t const* tokens_per_expert,
     cudaStream_t stream) {

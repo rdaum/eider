@@ -84,6 +84,34 @@ impl MatrixLayout {
         }
         Ok(Self(layout))
     }
+
+    pub(crate) fn set_i32(&self, attr: i32, value: i32, name: &'static str) -> Result<()> {
+        unsafe {
+            check_cublas(
+                name,
+                ffi::cublasLtMatrixLayoutSetAttribute(
+                    self.0,
+                    attr,
+                    (&value as *const i32).cast(),
+                    size_of::<i32>(),
+                ),
+            )
+        }
+    }
+
+    pub(crate) fn set_i64(&self, attr: i32, value: i64, name: &'static str) -> Result<()> {
+        unsafe {
+            check_cublas(
+                name,
+                ffi::cublasLtMatrixLayoutSetAttribute(
+                    self.0,
+                    attr,
+                    (&value as *const i64).cast(),
+                    size_of::<i64>(),
+                ),
+            )
+        }
+    }
 }
 
 impl Drop for MatrixLayout {

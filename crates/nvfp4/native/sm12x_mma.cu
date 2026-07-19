@@ -1224,6 +1224,165 @@ extern "C" cudaError_t infer_sm12x_kv_cache_append_on_stream(
     return status;
 }
 
+__global__ void infer_sm12x_kv_finalize_key_rows_kernel(
+    const float* __restrict__ key,
+    std::uint8_t* __restrict__ key_values,
+    std::uint8_t* __restrict__ key_scales,
+    std::uint16_t* __restrict__ key_output,
+    std::uint32_t output_tokens,
+    std::uint32_t input_row_offset,
+    std::uint32_t start_position,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    __shared__ float values[16];
+    __shared__ float scale;
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t k_block = blockIdx.y;
+    const std::uint32_t token_group = blockIdx.z;
+    const std::uint32_t lane = threadIdx.x;
+    const std::uint32_t width = kv_heads * head_dim;
+    const std::uint32_t token_tiles = (max_tokens + 7) / 8;
+    const std::uint32_t k_tiles = head_dim / 64;
+    const std::uint32_t token_tile = start_position / 8 + token_group;
+    const std::uint32_t k_tile = k_block / 4;
+    const std::uint32_t scale_block = k_block & 3u;
+    const std::uint32_t tile = (head * token_tiles + token_tile) * k_tiles + k_tile;
+    std::uint8_t* packed = key_values + tile * 256;
+    for (std::uint32_t token = 0; token < 8; ++token) {
+        const float value = key[
+            (input_row_offset + token_group * 8 + token) * width
+            + head * head_dim + k_block * 16 + lane];
+        values[lane] = isfinite(value) ? value : 0.0f;
+        __syncthreads();
+        if (lane == 0) {
+            float max_abs = 0.0f;
+            for (int index = 0; index < 16; ++index) {
+                max_abs = fmaxf(max_abs, fabsf(values[index]));
+            }
+            const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            key_scales[(tile * 8 + token) * 4 + scale_block] = scale_code;
+            scale = infer_e4m3_value(scale_code);
+        }
+        __syncthreads();
+        if (lane < 8) {
+            const std::uint8_t low = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane * 2] / scale);
+            const std::uint8_t high = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane * 2 + 1] / scale);
+            const std::uint32_t nibble = token * 64 + scale_block * 16 + lane * 2;
+            packed[nibble / 2] = static_cast<std::uint8_t>(low | (high << 4));
+        }
+        if (key_output != nullptr) {
+            const std::uint8_t code = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane] / scale);
+            const float quantized = infer_e2m1_value(code) * scale;
+            const __nv_bfloat16 bf16 = __float2bfloat16_rn(quantized);
+            const std::uint32_t output_token = start_position + token_group * 8 + token;
+            const std::uint32_t output_dim = k_block * 16 + lane;
+            key_output[(head * output_tokens + output_token) * head_dim + output_dim] =
+                *reinterpret_cast<const std::uint16_t*>(&bf16);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void infer_sm12x_kv_finalize_value_rows_kernel(
+    const float* __restrict__ value,
+    std::uint8_t* __restrict__ value_values,
+    std::uint8_t* __restrict__ value_scales,
+    std::uint16_t* __restrict__ value_output,
+    std::uint32_t output_tokens,
+    std::uint32_t input_row_offset,
+    std::uint32_t start_position,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    __shared__ float values[16];
+    __shared__ float scale;
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t dim_tile = blockIdx.y;
+    const std::uint32_t token_group = blockIdx.z;
+    const std::uint32_t lane = threadIdx.x;
+    const std::uint32_t width = kv_heads * head_dim;
+    const std::uint32_t position = start_position + token_group * 16;
+    const std::uint32_t context_tiles = (max_tokens + 63) / 64;
+    const std::uint32_t token_tile = position / 64;
+    const std::uint32_t scale_block = (position & 63u) / 16;
+    const std::uint32_t tile =
+        (head * (head_dim / 8) + dim_tile) * context_tiles + token_tile;
+    std::uint8_t* packed = value_values + tile * 256;
+    for (std::uint32_t dim = 0; dim < 8; ++dim) {
+        const float element = value[
+            (input_row_offset + token_group * 16 + lane) * width
+            + head * head_dim + dim_tile * 8 + dim];
+        values[lane] = isfinite(element) ? element : 0.0f;
+        __syncthreads();
+        if (lane == 0) {
+            float max_abs = 0.0f;
+            for (int index = 0; index < 16; ++index) {
+                max_abs = fmaxf(max_abs, fabsf(values[index]));
+            }
+            const std::uint8_t scale_code = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            value_scales[(tile * 8 + dim) * 4 + scale_block] = scale_code;
+            scale = infer_e4m3_value(scale_code);
+        }
+        __syncthreads();
+        if (lane < 8) {
+            const std::uint8_t low = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane * 2] / scale);
+            const std::uint8_t high = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane * 2 + 1] / scale);
+            const std::uint32_t nibble = dim * 64 + scale_block * 16 + lane * 2;
+            packed[nibble / 2] = static_cast<std::uint8_t>(low | (high << 4));
+        }
+        if (value_output != nullptr) {
+            const std::uint8_t code = infer_e2m1_code(
+                scale == 0.0f ? 0.0f : values[lane] / scale);
+            const float quantized = infer_e2m1_value(code) * scale;
+            const __nv_bfloat16 bf16 = __float2bfloat16_rn(quantized);
+            const std::uint32_t output_token = position + lane;
+            const std::uint32_t output_dim = dim_tile * 8 + dim;
+            value_output[(head * head_dim + output_dim) * output_tokens + output_token] =
+                *reinterpret_cast<const std::uint16_t*>(&bf16);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void infer_sm12x_kv_stage_tail_bf16_kernel(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    std::uint16_t* __restrict__ key_output,
+    std::uint16_t* __restrict__ value_output,
+    std::uint32_t input_row_offset,
+    std::uint32_t output_row_offset,
+    std::uint32_t rows,
+    std::uint32_t output_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t width = kv_heads * head_dim;
+    if (index >= rows * width) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % kv_heads;
+    const std::uint32_t row = index / width;
+    const std::uint32_t input_index =
+        (input_row_offset + row) * width + head * head_dim + dim;
+    const std::uint32_t output_token = output_row_offset + row;
+    const __nv_bfloat16 key_bf16 = __float2bfloat16_rn(key[input_index]);
+    const __nv_bfloat16 value_bf16 = __float2bfloat16_rn(value[input_index]);
+    key_output[(head * output_tokens + output_token) * head_dim + dim] =
+        *reinterpret_cast<const std::uint16_t*>(&key_bf16);
+    value_output[(head * head_dim + dim) * output_tokens + output_token] =
+        *reinterpret_cast<const std::uint16_t*>(&value_bf16);
+}
+
 extern "C" cudaError_t infer_sm12x_kv_cache_append_rows_on_stream(
     const float* key,
     const float* value,
@@ -1233,6 +1392,9 @@ extern "C" cudaError_t infer_sm12x_kv_cache_append_rows_on_stream(
     std::uint8_t* value_scales,
     float* key_tail,
     float* value_tail,
+    std::uint16_t* key_output,
+    std::uint16_t* value_output,
+    std::uint32_t output_tokens,
     std::uint32_t input_row_offset,
     std::uint32_t start_position,
     std::uint32_t rows,
@@ -1245,31 +1407,197 @@ extern "C" cudaError_t infer_sm12x_kv_cache_append_rows_on_stream(
         value_values == nullptr || value_scales == nullptr || key_tail == nullptr ||
         value_tail == nullptr || rows == 0 || start_position >= max_tokens ||
         rows > max_tokens - start_position || kv_heads == 0 || head_dim == 0 ||
-        (head_dim % 64) != 0) {
+        (head_dim % 64) != 0 ||
+        ((key_output == nullptr) != (value_output == nullptr)) ||
+        (key_output != nullptr && (start_position != 0 || output_tokens < rows))) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t width = kv_heads * head_dim;
-    for (std::uint32_t row = 0; row < rows; ++row) {
-        const std::uint32_t position = start_position + row;
-        const std::uint32_t input_offset = (input_row_offset + row) * width;
-        infer_sm12x_kv_copy_tail_kernel<<<(width + 255) / 256, 256, 0, stream>>>(
+    std::uint32_t processed = 0;
+    if ((start_position & 15u) != 0) {
+        const std::uint32_t position = start_position + processed;
+        const std::uint32_t batch_rows = min(rows - processed, 16 - (position & 15u));
+        const std::uint32_t input_offset = (input_row_offset + processed) * width;
+        infer_sm12x_kv_copy_tail_kernel<<<
+            dim3((width + 255) / 256, batch_rows, 1), 256, 0, stream>>>(
             key + input_offset, value + input_offset, key_tail, value_tail, position, width);
         cudaError_t status = cudaGetLastError();
         if (status != cudaSuccess) return status;
-        if ((position & 7u) == 7u) {
-            infer_sm12x_kv_finalize_key_kernel<<<dim3(kv_heads, head_dim / 16, 1), 1, 0, stream>>>(
-                key_tail, key_values, key_scales, position, max_tokens, kv_heads, head_dim);
-            status = cudaGetLastError();
-            if (status != cudaSuccess) return status;
-        }
-        if ((position & 15u) == 15u) {
-            infer_sm12x_kv_finalize_value_kernel<<<dim3(kv_heads, head_dim / 8, 1), 1, 0, stream>>>(
-                value_tail, value_values, value_scales, position, max_tokens, kv_heads, head_dim);
-            status = cudaGetLastError();
-            if (status != cudaSuccess) return status;
-        }
+        infer_sm12x_kv_finalize_key_kernel<<<
+            dim3(kv_heads, head_dim / 16, batch_rows), 1, 0, stream>>>(
+            key_tail, key_values, key_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        infer_sm12x_kv_finalize_value_kernel<<<
+            dim3(kv_heads, head_dim / 8, batch_rows), 1, 0, stream>>>(
+            value_tail, value_values, value_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        processed += batch_rows;
+    }
+    const std::uint32_t bulk_rows = (rows - processed) / 16 * 16;
+    if (bulk_rows != 0) {
+        const std::uint32_t bulk_position = start_position + processed;
+        const std::uint32_t bulk_input_row = input_row_offset + processed;
+        infer_sm12x_kv_finalize_key_rows_kernel<<<
+            dim3(kv_heads, head_dim / 16, bulk_rows / 8), 16, 0, stream>>>(
+            key, key_values, key_scales, key_output, output_tokens,
+            bulk_input_row, bulk_position,
+            max_tokens, kv_heads, head_dim);
+        cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        infer_sm12x_kv_finalize_value_rows_kernel<<<
+            dim3(kv_heads, head_dim / 8, bulk_rows / 16), 16, 0, stream>>>(
+            value, value_values, value_scales, value_output, output_tokens,
+            bulk_input_row, bulk_position,
+            max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        const std::uint32_t tail_input_row = bulk_input_row + bulk_rows - 16;
+        const std::uint32_t tail_position = bulk_position + bulk_rows - 16;
+        const std::uint32_t tail_input_offset = tail_input_row * width;
+        infer_sm12x_kv_copy_tail_kernel<<<
+            dim3((width + 255) / 256, 16, 1), 256, 0, stream>>>(
+            key + tail_input_offset, value + tail_input_offset, key_tail,
+            value_tail, tail_position, width);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        processed += bulk_rows;
+    }
+    if (processed < rows) {
+        const std::uint32_t position = start_position + processed;
+        const std::uint32_t batch_rows = rows - processed;
+        const std::uint32_t input_offset = (input_row_offset + processed) * width;
+        infer_sm12x_kv_copy_tail_kernel<<<
+            dim3((width + 255) / 256, batch_rows, 1), 256, 0, stream>>>(
+            key + input_offset, value + input_offset, key_tail, value_tail, position, width);
+        cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        infer_sm12x_kv_finalize_key_kernel<<<
+            dim3(kv_heads, head_dim / 16, batch_rows), 1, 0, stream>>>(
+            key_tail, key_values, key_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+        infer_sm12x_kv_finalize_value_kernel<<<
+            dim3(kv_heads, head_dim / 8, batch_rows), 1, 0, stream>>>(
+            value_tail, value_values, value_scales, position, max_tokens, kv_heads, head_dim);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    if (key_output != nullptr && (rows & 15u) != 0) {
+        const std::uint32_t tail_start = rows / 16 * 16;
+        const std::uint32_t tail_rows = rows - tail_start;
+        const std::uint32_t tail_values = tail_rows * width;
+        infer_sm12x_kv_stage_tail_bf16_kernel<<<
+            (tail_values + 255) / 256, 256, 0, stream>>>(
+            key, value, key_output, value_output,
+            input_row_offset + tail_start, tail_start, tail_rows,
+            output_tokens, kv_heads, head_dim);
+        const cudaError_t status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
     }
     return cudaSuccess;
+}
+
+__global__ void infer_sm12x_kv_cache_unpack_bf16_kernel(
+    const std::uint8_t* __restrict__ key_values,
+    const std::uint8_t* __restrict__ key_scales,
+    const std::uint8_t* __restrict__ value_values,
+    const std::uint8_t* __restrict__ value_scales,
+    const float* __restrict__ key_tail,
+    const float* __restrict__ value_tail,
+    std::uint16_t* __restrict__ key_output,
+    std::uint16_t* __restrict__ value_output,
+    std::uint32_t cache_len,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t width = kv_heads * head_dim;
+    const std::uint32_t total = cache_len * width;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % kv_heads;
+    const std::uint32_t token = index / width;
+
+    float key;
+    const std::uint32_t compact_key_tokens = cache_len / 8 * 8;
+    if (token < compact_key_tokens) {
+        const std::uint32_t token_tiles = (max_tokens + 7) / 8;
+        const std::uint32_t k_tiles = head_dim / 64;
+        const std::uint32_t token_tile = token / 8;
+        const std::uint32_t token_in_tile = token & 7u;
+        const std::uint32_t k_tile = dim / 64;
+        const std::uint32_t dim_in_tile = dim & 63u;
+        const std::uint32_t tile =
+            (head * token_tiles + token_tile) * k_tiles + k_tile;
+        const std::uint8_t code = infer_get_packed_nibble(
+            key_values + tile * 256, token_in_tile * 64 + dim_in_tile);
+        const std::uint8_t scale_code =
+            key_scales[(tile * 8 + token_in_tile) * 4 + dim_in_tile / 16];
+        key = infer_e2m1_value(code) * infer_e4m3_value(scale_code);
+    } else {
+        key = key_tail[(token & 15u) * width + head * head_dim + dim];
+    }
+
+    float value;
+    const std::uint32_t compact_value_tokens = cache_len / 16 * 16;
+    if (token < compact_value_tokens) {
+        const std::uint32_t context_tiles = (max_tokens + 63) / 64;
+        const std::uint32_t dim_tile = dim / 8;
+        const std::uint32_t dim_in_tile = dim & 7u;
+        const std::uint32_t token_tile = token / 64;
+        const std::uint32_t token_in_tile = token & 63u;
+        const std::uint32_t tile =
+            (head * (head_dim / 8) + dim_tile) * context_tiles + token_tile;
+        const std::uint8_t code = infer_get_packed_nibble(
+            value_values + tile * 256, dim_in_tile * 64 + token_in_tile);
+        const std::uint8_t scale_code =
+            value_scales[(tile * 8 + dim_in_tile) * 4 + token_in_tile / 16];
+        value = infer_e2m1_value(code) * infer_e4m3_value(scale_code);
+    } else {
+        value = value_tail[(token & 15u) * width + head * head_dim + dim];
+    }
+
+    const __nv_bfloat16 key_bf16 = __float2bfloat16_rn(key);
+    const __nv_bfloat16 value_bf16 = __float2bfloat16_rn(value);
+    key_output[(head * cache_len + token) * head_dim + dim] =
+        *reinterpret_cast<const std::uint16_t*>(&key_bf16);
+    value_output[(head * head_dim + dim) * cache_len + token] =
+        *reinterpret_cast<const std::uint16_t*>(&value_bf16);
+}
+
+extern "C" cudaError_t infer_sm12x_kv_cache_unpack_bf16_on_stream(
+    const std::uint8_t* key_values,
+    const std::uint8_t* key_scales,
+    const std::uint8_t* value_values,
+    const std::uint8_t* value_scales,
+    const float* key_tail,
+    const float* value_tail,
+    std::uint16_t* key_output,
+    std::uint16_t* value_output,
+    std::uint32_t cache_len,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream)
+{
+    if (key_values == nullptr || key_scales == nullptr || value_values == nullptr ||
+        value_scales == nullptr || key_tail == nullptr || value_tail == nullptr ||
+        key_output == nullptr || value_output == nullptr || cache_len == 0 ||
+        cache_len > max_tokens || kv_heads == 0 || head_dim == 0 || (head_dim % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(cache_len) * kv_heads * head_dim;
+    if (total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_sm12x_kv_cache_unpack_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        key_values, key_scales, value_values, value_scales, key_tail, value_tail,
+        key_output, value_output, cache_len, max_tokens, kv_heads, head_dim);
+    return cudaGetLastError();
 }
 
 extern "C" cudaError_t infer_sm12x_kv_cache_append_indexed_on_stream(

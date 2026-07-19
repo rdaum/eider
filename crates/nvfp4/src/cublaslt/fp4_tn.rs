@@ -257,13 +257,8 @@ pub struct Fp4TnPlanMetadata {
 /// heuristic algorithm, preference object, and any workspace required by the
 /// selected algorithm. It does not own A/B/C/D matrices.
 ///
-/// # Current validity rule
-///
-/// cuBLASLt stores raw A and B scale-buffer pointers inside the matmul
-/// descriptor. A plan must therefore be run only with the same A and B scale
-/// buffers that were passed to [`Fp4TnMatmulPlan::new`], and those matrices must
-/// outlive the plan. Prefer [`Fp4TnMatmul`] when the operation can own its
-/// matrices.
+/// The A and B scale-buffer pointers are rebound before every launch, so one
+/// plan can serve different matrices with the same shape.
 pub struct Fp4TnMatmulPlan {
     shape: GemmShape,
     output: Fp4TnOutput,
@@ -321,13 +316,25 @@ impl Fp4TnMatmulPlan {
     ) -> Result<Self> {
         inputs.validate(shape)?;
         validate_f32_layout("FP4 TN F32 C", shape, c)?;
+        Self::new_f32_output_for_shape(lt, shape, inputs, workspace_limit)
+    }
+
+    /// Creates an F32-output plan from its logical shape without allocating a
+    /// placeholder output matrix.
+    pub fn new_f32_output_for_shape(
+        lt: &CublasLt,
+        shape: GemmShape,
+        inputs: Nvfp4TnInputs<'_>,
+        workspace_limit: u64,
+    ) -> Result<Self> {
+        inputs.validate(shape)?;
         Self::new_with_output_type(
             lt,
             shape,
             inputs,
-            c.rows,
-            c.cols,
-            c.ld,
+            shape.m,
+            shape.n,
+            shape.m,
             ffi::CUDA_R_32F,
             Fp4TnOutput::F32,
             workspace_limit,
@@ -610,10 +617,10 @@ impl Fp4TnMatmulPlan {
                 expected: "M * N without overflow".to_string(),
                 actual: format!("M={} N={}", self.shape.m, self.shape.n),
             })?;
-        if output.len() != expected_len {
+        if output.len() < expected_len {
             return Err(Error::Shape {
                 label: "FP4 TN F32 output buffers",
-                expected: format!("{expected_len} values"),
+                expected: format!("at least {expected_len} values"),
                 actual: format!("{} values", output.len()),
             });
         }
@@ -1007,7 +1014,7 @@ impl Drop for CutlassFp4GroupedGemvF32Plan {
     }
 }
 
-/// Persistent CUTLASS grouped NVFP4 GEMM plan for expert-major MoE batches.
+/// Persistent CUTLASS grouped NVFP4 GEMM plan with BF16 expert outputs.
 ///
 /// Each expert has its own weight, activation, scale, output, and scalar pointer.
 /// The token count for every expert remains device-resident, so running the plan
@@ -1076,7 +1083,7 @@ impl CutlassFp4GroupedGemmPlan {
         a_scales: &DeviceBuffer<*const u8>,
         b_values: &DeviceBuffer<*const u8>,
         b_scales: &DeviceBuffer<*const u8>,
-        output: &DeviceBuffer<*mut f32>,
+        output: &DeviceBuffer<*mut u16>,
         alpha: &DeviceBuffer<*mut f32>,
         tokens_per_expert: &DeviceBuffer<u32>,
         stream: &CudaStream,
@@ -1675,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_cutlass_fp4_grouped_gemm_f32_output() {
+    fn randomized_cutlass_fp4_grouped_gemm_bf16_output() {
         let m = 128;
         let k = 256;
         let columns = [3usize, 5usize];
@@ -1737,7 +1744,7 @@ mod tests {
 
         let mut outputs = columns
             .iter()
-            .map(|&n| F32Matrix::zeroed(m, n).expect("D alloc"))
+            .map(|&n| Bf16Matrix::zeroed(m, n).expect("D alloc"))
             .collect::<Vec<_>>();
         let output_ptrs = outputs
             .iter_mut()
@@ -1774,7 +1781,7 @@ mod tests {
 
         for group in 0..groups {
             let actual = outputs[group]
-                .data()
+                .data
                 .copy_to_host(&stream)
                 .expect("copy output");
             let a_t = transpose_col_major(&a_quantized[group].dequantized_values, k, m);
@@ -1786,6 +1793,7 @@ mod tests {
                 k,
             );
             for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                let actual = format::bf16_to_f32(*actual);
                 let error = (actual - expected).abs();
                 let allowed = 0.25f32.max(expected.abs() * 0.02);
                 assert!(

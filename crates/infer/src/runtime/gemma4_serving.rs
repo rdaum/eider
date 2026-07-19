@@ -10,13 +10,13 @@ use super::scheduler::{RequestConfig, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::gemma4::{
-    Gemma4DecodeState, Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillRow,
-    Gemma4SequenceCheckpoint,
+    Gemma4DecodeState, Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput,
+    Gemma4PrefillRow, Gemma4SequenceCheckpoint,
 };
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 const TAIL_PREFILL_TOKEN_CAPACITY: usize = 512;
 
@@ -95,6 +95,7 @@ struct ActiveRequest<'tokenizer> {
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
+    prompt_logits_ready: bool,
     state: Option<Gemma4DecodeState>,
     sampler: Sampler,
     history: TokenHistory,
@@ -136,11 +137,30 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
-        let prefill_workspace = model.new_prefill_batch_workspace(
+        let stream = CudaStream::new_non_blocking()?;
+        let mut prefill_workspace = model.new_prefill_batch_workspace(
             config.prefill_sequence_capacity,
             config.prefill_token_capacity,
             config.max_context_tokens,
         )?;
+        let warmup_started = Instant::now();
+        let warmup_tokens = vec![0; config.prefill_token_capacity];
+        let mut warmup_state = model.new_decode_state(config.prefill_token_capacity)?;
+        model.prefill_batch(
+            &mut prefill_workspace,
+            &mut [Gemma4PrefillRow {
+                token_ids: &warmup_tokens,
+                state: &mut warmup_state,
+                output: Gemma4PrefillOutput::None,
+            }],
+            &stream,
+        )?;
+        stream.synchronize()?;
+        info!(
+            tokens = config.prefill_token_capacity,
+            elapsed_ms = warmup_started.elapsed().as_secs_f64() * 1000.0,
+            "warmed Gemma 4 prefill path"
+        );
         let tail_prefill_workspace = (config.prefill_token_capacity > TAIL_PREFILL_TOKEN_CAPACITY)
             .then(|| {
                 model.new_prefill_batch_workspace(
@@ -154,7 +174,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             model,
             template,
             config,
-            stream: CudaStream::new_non_blocking()?,
+            stream,
             prefill_workspace,
             tail_prefill_workspace,
             next_id: 1,
@@ -235,6 +255,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 generation: request.generation.clone(),
                 generated_tokens: 0,
                 last_token: None,
+                prompt_logits_ready: false,
                 state: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
@@ -276,7 +297,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .iter()
             .filter(|(_, request)| {
                 request.state.is_some()
-                    && request.prompt_position + 1 >= request.prompt.len()
+                    && request.prompt_position >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
             .map(|(&id, _)| id)
@@ -294,7 +315,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .filter(|(_, request)| {
                 request.state.is_some()
                     && request.generation.max_new_tokens != 0
-                    && request.prompt_position + 1 < request.prompt.len()
+                    && request.prompt_position < request.prompt.len()
             })
             .map(|(&id, _)| id)
             .take(self.config.prefill_sequence_capacity)
@@ -378,10 +399,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         let mut selected = Vec::with_capacity(ids.len());
         for (index, &id) in ids.iter().enumerate() {
             let request = self.requests.get(&id).expect("prefill request exists");
-            let available = request
-                .prompt
-                .len()
-                .saturating_sub(request.prompt_position + 1);
+            let available = request.prompt.len().saturating_sub(request.prompt_position);
             let remaining_sequences = ids.len() - index;
             let chunk = available.min(budget.div_ceil(remaining_sequences));
             if chunk == 0 {
@@ -413,6 +431,13 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                     Gemma4PrefillRow {
                         token_ids: &request.prompt[start..end],
                         state: request.state.as_mut().expect("prefill request is admitted"),
+                        output: if end != request.prompt.len() {
+                            Gemma4PrefillOutput::None
+                        } else if request.sampler.config().uses_fast_argmax() {
+                            Gemma4PrefillOutput::Top1
+                        } else {
+                            Gemma4PrefillOutput::FullLogits
+                        },
                     }
                 })
                 .collect::<Vec<_>>();
@@ -428,6 +453,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         }
         for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
             request.prompt_position += chunk;
+            request.prompt_logits_ready = request.prompt_position == request.prompt.len();
             if checkpoint_ready(
                 request.prompt_position,
                 request.prefix_cache_target,
@@ -499,11 +525,19 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         tick: &mut Gemma4Tick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
-        let input = request
-            .last_token
-            .unwrap_or(request.prompt[request.prompt.len() - 1]);
         let state = request.state.as_mut().expect("decode request is admitted");
-        self.model.forward_one(state, input, &self.stream)?;
+        if request.prompt_logits_ready {
+            request.prompt_logits_ready = false;
+        } else {
+            let input = request
+                .last_token
+                .expect("generated Gemma 4 token exists after prompt logits");
+            if request.sampler.config().uses_fast_argmax() {
+                self.model.forward_one_top1(state, input, &self.stream)?;
+            } else {
+                self.model.forward_one(state, input, &self.stream)?;
+            }
+        }
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(state, &self.stream)?;
             super::sampling::SampledToken {

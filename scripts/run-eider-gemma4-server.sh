@@ -7,7 +7,7 @@ model_dir="${EIDER_MODEL_DIR:-$repo_dir/models/gemma-4-26b-a4b-nvfp4}"
 listen="${EIDER_LISTEN:-127.0.0.1:8080}"
 served_model="${EIDER_SERVED_MODEL:-eider-gemma4-26b}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-262144}"
-prefill_token_capacity="${EIDER_PREFILL_TOKEN_CAPACITY:-1536}"
+prefill_token_capacity="${EIDER_PREFILL_TOKEN_CAPACITY:-3072}"
 export EIDER_API_KEY="${EIDER_API_KEY:-local-eider}"
 
 dogstatsd_args=()

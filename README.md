@@ -41,10 +41,10 @@ throughput run has not been completed.
 | [Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | 30.1 | 29.6 | Same ModelOpt NVFP4 weights; compact FP4 KV in Eider, FP8 E4M3 KV in vLLM |
 | [Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | — | — | Throughput comparison pending |
 
-Gemma prefills a fresh roughly 2,700-token API request at about 840 tokens/sec,
-compared with about 7,100 tokens/sec in vLLM; an identical Eider cached-prefix
-request reached first-token latency of 258 ms. An Agents-A1 Pi session sustained
-58-60 decode tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
+Gemma prefills a fresh roughly 2,700-token Pi/API prompt at about 6,740 prompt
+tokens/sec, compared with about 7,060 in vLLM. Prefix reuse brought a typical
+follow-up to 235 ms TTFT. An Agents-A1 Pi session sustained 58-60 decode
+tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
 
 Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
 its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5

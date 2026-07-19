@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format;
 use crate::matrix::{Bf16Matrix, Nvfp4Matrix};
+use std::mem::size_of;
 
 /// Enqueues row-wise RMSNorm into an existing output buffer on `stream`.
 pub fn rms_norm_f32_into_on_stream(
@@ -25,7 +26,7 @@ pub fn rms_norm_f32_into_on_stream(
         expected: "rows * cols without overflow".to_string(),
         actual: format!("rows={rows} cols={cols}"),
     })?;
-    if input.len() != input_len || output.len() != input_len {
+    if input.len() < input_len || output.len() < input_len {
         return Err(Error::Shape {
             label: "RMSNorm buffers",
             expected: format!("{input_len} values"),
@@ -57,6 +58,361 @@ pub fn rms_norm_f32_into_on_stream(
                 rows as u32,
                 cols as u32,
                 eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies row-wise RMSNorm and adds a residual without materializing the normalized input.
+pub fn rms_norm_add_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if len == 0
+        || input.len() < len
+        || weight.len() != cols
+        || residual.len() < len
+        || output.len() < len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return Err(Error::Shape {
+            label: "RMSNorm residual-add buffers",
+            expected: format!("input/residual/output={len} weight={cols} with valid dimensions"),
+            actual: format!(
+                "input={} weight={} residual={} output={} eps={eps}",
+                input.len(),
+                weight.len(),
+                residual.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rms_norm_add_f32_on_stream",
+            ffi::infer_rms_norm_add_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Adds two independently RMS-normalized row sets in one pass.
+#[allow(clippy::too_many_arguments)]
+pub fn dual_rms_norm_add_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    left: &DeviceBuffer<f32>,
+    left_weight: &DeviceBuffer<f32>,
+    left_eps: f32,
+    right: &DeviceBuffer<f32>,
+    right_weight: &DeviceBuffer<f32>,
+    right_eps: f32,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if len == 0
+        || left.len() < len
+        || left_weight.len() != cols
+        || right.len() < len
+        || right_weight.len() != cols
+        || output.len() < len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !left_eps.is_finite()
+        || left_eps < 0.0
+        || !right_eps.is_finite()
+        || right_eps < 0.0
+    {
+        return Err(Error::Shape {
+            label: "dual RMSNorm add buffers",
+            expected: format!("left/right/output={len} weights={cols} with valid dimensions"),
+            actual: format!(
+                "left={} left_weight={} right={} right_weight={} output={} eps={left_eps}/{right_eps}",
+                left.len(),
+                left_weight.len(),
+                right.len(),
+                right_weight.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dual_rms_norm_add_f32_on_stream",
+            ffi::infer_dual_rms_norm_add_f32_on_stream(
+                left.ptr,
+                left_weight.ptr,
+                right.ptr,
+                right_weight.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                left_eps,
+                right_eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies RMSNorm, adds a residual, then applies channel and row scales.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_add_channel_row_scale_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    channel_scale: &DeviceBuffer<f32>,
+    row_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if len == 0
+        || input.len() < len
+        || weight.len() != cols
+        || residual.len() < len
+        || channel_scale.len() != cols
+        || row_scale.len() < rows
+        || output.len() < len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return Err(Error::Shape {
+            label: "scaled RMSNorm residual-add buffers",
+            expected: format!(
+                "input/residual/output={len}, weight/channel={cols}, row_scale={rows}"
+            ),
+            actual: format!(
+                "input={} weight={} residual={} channel={} row_scale={} output={} eps={eps}",
+                input.len(),
+                weight.len(),
+                residual.len(),
+                channel_scale.len(),
+                row_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rms_norm_add_channel_row_scale_f32_on_stream",
+            ffi::infer_rms_norm_add_channel_row_scale_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                residual.ptr,
+                channel_scale.ptr,
+                row_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies RMSNorm and a residual add, then RMS-normalizes and quantizes the result.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_add_then_rms_norm_quantize_nvfp4_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    input_weight: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    input_eps: f32,
+    quant_weight: &DeviceBuffer<f32>,
+    quant_output: &mut Nvfp4Matrix,
+    quant_eps: f32,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "fused RMSNorm residual-add quantization input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let shared_bytes = cols
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| Error::Shape {
+            label: "fused RMSNorm residual-add quantization shared memory",
+            expected: "cols * sizeof(f32) without overflow".to_string(),
+            actual: format!("cols={cols}"),
+        })?;
+    if rows == 0
+        || cols == 0
+        || input.len() < len
+        || input_weight.len() != cols
+        || residual.len() < len
+        || output.len() < len
+        || quant_weight.len() != cols
+        || quant_output.rows != cols
+        || quant_output.cols < rows
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || shared_bytes > max_shared_memory_per_block()?
+        || !input_eps.is_finite()
+        || input_eps < 0.0
+        || !quant_eps.is_finite()
+        || quant_eps < 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "fused RMSNorm residual-add quantization buffers",
+            expected: format!(
+                "input/residual/output={len}, weights={cols}, quant_output={cols}x{rows} with valid dimensions and scales"
+            ),
+            actual: format!(
+                "input={} input_weight={} residual={} output={} quant_weight={} quant_output={}x{} shared_bytes={shared_bytes} input_eps={input_eps} quant_eps={quant_eps} input_scale={input_scale}",
+                input.len(),
+                input_weight.len(),
+                residual.len(),
+                output.len(),
+                quant_weight.len(),
+                quant_output.rows,
+                quant_output.cols,
+            ),
+        });
+    }
+    let mut quant_output = quant_output.output();
+    unsafe {
+        check_cuda(
+            "infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_on_stream",
+            ffi::infer_rms_norm_add_then_rms_norm_quantize_nvfp4_f32_on_stream(
+                input.ptr,
+                input_weight.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                quant_weight.ptr,
+                quant_output.values_mut_ptr().cast(),
+                quant_output.scales_mut_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                input_eps,
+                quant_eps,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies the two Gemma feed-forward RMS paths and final scaled residual in one pass.
+#[allow(clippy::too_many_arguments)]
+pub fn dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    left: &DeviceBuffer<f32>,
+    left_weight: &DeviceBuffer<f32>,
+    left_eps: f32,
+    right: &DeviceBuffer<f32>,
+    right_weight: &DeviceBuffer<f32>,
+    right_eps: f32,
+    final_weight: &DeviceBuffer<f32>,
+    final_eps: f32,
+    residual: &DeviceBuffer<f32>,
+    channel_scale: &DeviceBuffer<f32>,
+    row_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "fused dual RMSNorm final residual input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let shared_bytes = cols
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| Error::Shape {
+            label: "fused dual RMSNorm final residual shared memory",
+            expected: "cols * sizeof(f32) without overflow".to_string(),
+            actual: format!("cols={cols}"),
+        })?;
+    if rows == 0
+        || cols == 0
+        || left.len() < len
+        || left_weight.len() != cols
+        || right.len() < len
+        || right_weight.len() != cols
+        || final_weight.len() != cols
+        || residual.len() < len
+        || channel_scale.len() != cols
+        || row_scale.len() < rows
+        || output.len() < len
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || shared_bytes > max_shared_memory_per_block()?
+        || !left_eps.is_finite()
+        || left_eps < 0.0
+        || !right_eps.is_finite()
+        || right_eps < 0.0
+        || !final_eps.is_finite()
+        || final_eps < 0.0
+    {
+        return Err(Error::Shape {
+            label: "fused dual RMSNorm final residual buffers",
+            expected: format!(
+                "left/right/residual/output={len}, weights/channel={cols}, row_scale={rows} with valid dimensions"
+            ),
+            actual: format!(
+                "left={} left_weight={} right={} right_weight={} final_weight={} residual={} channel={} row_scale={} output={} shared_bytes={shared_bytes} eps={left_eps}/{right_eps}/{final_eps}",
+                left.len(),
+                left_weight.len(),
+                right.len(),
+                right_weight.len(),
+                final_weight.len(),
+                residual.len(),
+                channel_scale.len(),
+                row_scale.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_on_stream",
+            ffi::infer_dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_on_stream(
+                left.ptr,
+                left_weight.ptr,
+                right.ptr,
+                right_weight.ptr,
+                final_weight.ptr,
+                residual.ptr,
+                channel_scale.ptr,
+                row_scale.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                left_eps,
+                right_eps,
+                final_eps,
                 stream.as_raw(),
             ),
         )
@@ -1224,9 +1580,9 @@ pub fn moe_topk_f32_batch_into_on_stream(
         || experts == 0
         || k == 0
         || k > experts
-        || logits.len() != logits_len
-        || out_indices.len() != routes
-        || out_weights.len() != routes
+        || logits.len() < logits_len
+        || out_indices.len() < routes
+        || out_weights.len() < routes
         || rows > u32::MAX as usize
         || experts > u32::MAX as usize
         || k > u32::MAX as usize
@@ -1263,6 +1619,7 @@ pub fn moe_topk_f32_batch_into_on_stream(
 
 /// Reusable device storage for expert-major MoE route ordering.
 pub struct MoeSortedRoutes {
+    capacity_routes: usize,
     routes: usize,
     experts: usize,
     expert_counts: DeviceBuffer<u32>,
@@ -1289,6 +1646,7 @@ impl MoeSortedRoutes {
             });
         }
         Ok(Self {
+            capacity_routes: routes,
             routes,
             experts,
             expert_counts: DeviceBuffer::zeroed(experts)?,
@@ -1300,13 +1658,26 @@ impl MoeSortedRoutes {
         })
     }
 
+    /// Selects an active route prefix while retaining the allocated capacity.
+    pub fn set_routes(&mut self, routes: usize) -> Result<()> {
+        if routes == 0 || routes > self.capacity_routes {
+            return Err(Error::Shape {
+                label: "active MoE sorted routes",
+                expected: format!("1..={}", self.capacity_routes),
+                actual: routes.to_string(),
+            });
+        }
+        self.routes = routes;
+        Ok(())
+    }
+
     /// Sorts `indices` into expert-major route order without host readback.
     pub fn sort_on_stream(
         &mut self,
         indices: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        if indices.len() != self.routes {
+        if indices.len() < self.routes {
             return Err(Error::Shape {
                 label: "MoE route indices",
                 expected: format!("{} indices", self.routes),
@@ -1370,6 +1741,7 @@ impl MoeSortedRoutes {
 
 /// Expert-major NVFP4 activation storage for grouped MoE GEMMs.
 pub struct MoeSortedNvfp4Rows {
+    capacity_routes: usize,
     routes: usize,
     experts: usize,
     routes_per_row: usize,
@@ -1377,6 +1749,8 @@ pub struct MoeSortedNvfp4Rows {
     scale_stride: usize,
     packed: DeviceBuffer<u8>,
     scales: DeviceBuffer<u8>,
+    source_packed: DeviceBuffer<u8>,
+    source_scales: DeviceBuffer<u8>,
     packed_table: DeviceBuffer<*const u8>,
     scale_table: DeviceBuffer<*const u8>,
 }
@@ -1410,7 +1784,9 @@ impl MoeSortedNvfp4Rows {
             });
         }
         let scale_stride = format::ue4m3_scale_layout_len(routes, in_features);
+        let rows = routes / routes_per_row;
         Ok(Self {
+            capacity_routes: routes,
             routes,
             experts,
             routes_per_row,
@@ -1418,20 +1794,89 @@ impl MoeSortedNvfp4Rows {
             scale_stride,
             packed: DeviceBuffer::zeroed(routes * in_features / 2)?,
             scales: DeviceBuffer::zeroed(experts * scale_stride)?,
+            source_packed: DeviceBuffer::zeroed(rows * in_features / 2)?,
+            source_scales: DeviceBuffer::zeroed(rows * in_features / 16)?,
             packed_table: DeviceBuffer::zeroed(experts)?,
             scale_table: DeviceBuffer::zeroed(experts)?,
         })
     }
 
-    /// Gathers token rows in sorted route order and quantizes them to NVFP4.
-    pub fn gather_quantize_on_stream(
+    /// Selects an active token-row prefix while retaining the allocated storage.
+    pub fn set_rows(&mut self, rows: usize) -> Result<()> {
+        let routes = rows.saturating_mul(self.routes_per_row);
+        if rows == 0 || routes > self.capacity_routes {
+            return Err(Error::Shape {
+                label: "active sorted MoE NVFP4 rows",
+                expected: format!("1..={} routes", self.capacity_routes),
+                actual: format!("rows={rows} routes={routes}"),
+            });
+        }
+        self.routes = routes;
+        Ok(())
+    }
+
+    /// RMS-normalizes token rows, then gathers and quantizes them in sorted route order.
+    pub fn gather_rms_norm_quantize_on_stream(
         &mut self,
         input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        eps: f32,
         routes: &MoeSortedRoutes,
         stream: &CudaStream,
     ) -> Result<()> {
         let rows = self.routes / self.routes_per_row;
-        self.quantize_on_stream(input, routes, rows, true, stream)
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || input.len() < rows * self.in_features
+            || weight.len() != self.in_features
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE NVFP4 gather quantization",
+                expected: format!(
+                    "routes={} experts={} input={} weight={}",
+                    self.routes,
+                    self.experts,
+                    rows * self.in_features,
+                    self.in_features,
+                ),
+                actual: format!(
+                    "routes={} experts={} input={} weight={}",
+                    routes.routes,
+                    routes.experts,
+                    input.len(),
+                    weight.len(),
+                ),
+            });
+        }
+        if !eps.is_finite() || eps < 0.0 {
+            return Err(Error::Format {
+                label: "sorted MoE RMSNorm quantization epsilon",
+                detail: format!("expected non-negative finite epsilon, got {eps}"),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on_stream",
+                ffi::infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on_stream(
+                    input.ptr,
+                    weight.ptr,
+                    routes.sorted_routes.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.source_packed.ptr,
+                    self.source_scales.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    rows as u32,
+                    self.routes as u32,
+                    self.routes_per_row as u32,
+                    self.in_features as u32,
+                    self.scale_stride as u32,
+                    eps,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Quantizes already-sorted route rows to NVFP4 without gathering.
@@ -1441,7 +1886,55 @@ impl MoeSortedNvfp4Rows {
         routes: &MoeSortedRoutes,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.quantize_on_stream(input, routes, self.routes, false, stream)
+        self.quantize_on_stream(input, routes, self.routes, stream)
+    }
+
+    /// Fuses sorted-route gated GELU activation with NVFP4 quantization.
+    pub fn gelu_tanh_mul_quantize_sorted_on_stream(
+        &mut self,
+        gate: &DeviceBuffer<u16>,
+        up: &DeviceBuffer<u16>,
+        routes: &MoeSortedRoutes,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let len = self.routes * self.in_features;
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || gate.len() < len
+            || up.len() < len
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE GELU NVFP4 quantization",
+                expected: format!(
+                    "routes={} experts={} gate/up={len}",
+                    self.routes, self.experts
+                ),
+                actual: format!(
+                    "routes={} experts={} gate={} up={}",
+                    routes.routes,
+                    routes.experts,
+                    gate.len(),
+                    up.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_stream",
+                ffi::infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_stream(
+                    gate.ptr,
+                    up.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    self.routes as u32,
+                    self.in_features as u32,
+                    self.scale_stride as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     fn quantize_on_stream(
@@ -1449,12 +1942,11 @@ impl MoeSortedNvfp4Rows {
         input: &DeviceBuffer<f32>,
         routes: &MoeSortedRoutes,
         source_rows: usize,
-        gather_rows: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         if routes.routes != self.routes
             || routes.experts != self.experts
-            || input.len() != source_rows * self.in_features
+            || input.len() < source_rows * self.in_features
         {
             return Err(Error::Shape {
                 label: "sorted MoE NVFP4 quantization",
@@ -1486,7 +1978,7 @@ impl MoeSortedNvfp4Rows {
                     self.routes_per_row as u32,
                     self.in_features as u32,
                     self.scale_stride as u32,
-                    i32::from(gather_rows),
+                    0,
                     stream.as_raw(),
                 ),
             )
@@ -1497,14 +1989,14 @@ impl MoeSortedNvfp4Rows {
     pub fn build_pointer_tables_on_stream(
         &mut self,
         routes: &MoeSortedRoutes,
-        output: &mut DeviceBuffer<f32>,
-        output_table: &mut DeviceBuffer<*mut f32>,
+        output: &mut DeviceBuffer<u16>,
+        output_table: &mut DeviceBuffer<*mut u16>,
         out_features: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         if routes.routes != self.routes
             || routes.experts != self.experts
-            || output.len() != self.routes * out_features
+            || output.len() < self.routes * out_features
             || output_table.len() != self.experts
             || out_features == 0
             || out_features > u32::MAX as usize
@@ -1561,6 +2053,8 @@ impl MoeSortedNvfp4Rows {
     pub fn device_bytes(&self) -> usize {
         self.packed.device_bytes()
             + self.scales.device_bytes()
+            + self.source_packed.device_bytes()
+            + self.source_scales.device_bytes()
             + self.packed_table.device_bytes()
             + self.scale_table.device_bytes()
     }
@@ -1997,26 +2491,27 @@ pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
     }
 }
 
-/// Writes weighted per-row sums from expert-major route output.
-pub fn moe_weighted_accumulate_sorted_f32_batch_on_stream(
+/// Writes weighted per-row sums from expert-major BF16 route output.
+pub fn moe_weighted_accumulate_sorted_bf16_batch_on_stream(
     routes: &MoeSortedRoutes,
     route_weights: &DeviceBuffer<f32>,
-    sorted_inputs: &DeviceBuffer<f32>,
+    sorted_inputs: &DeviceBuffer<u16>,
     mut output: DeviceOutput<'_, f32>,
     rows: usize,
     routes_per_row: usize,
+    features: usize,
     stream: &CudaStream,
 ) -> Result<()> {
     let route_count = rows.saturating_mul(routes_per_row);
-    let len = output.len().checked_div(rows).unwrap_or(0);
     if rows == 0
         || routes_per_row == 0
+        || features == 0
         || route_count != routes.routes
-        || route_weights.len() != route_count
-        || len == 0
-        || sorted_inputs.len() != route_count.saturating_mul(len)
+        || route_weights.len() < route_count
+        || sorted_inputs.len() < route_count.saturating_mul(features)
+        || output.len() < rows.saturating_mul(features)
         || rows > u32::MAX as usize
-        || len > u32::MAX as usize
+        || features > u32::MAX as usize
         || routes_per_row > u32::MAX as usize
     {
         return Err(Error::Shape {
@@ -2025,9 +2520,9 @@ pub fn moe_weighted_accumulate_sorted_f32_batch_on_stream(
                 "routes={} weights={} sorted={} output={}x{}",
                 route_count,
                 route_count,
-                route_count.saturating_mul(len),
+                route_count.saturating_mul(features),
                 rows,
-                len
+                features
             ),
             actual: format!(
                 "routes={} weights={} sorted={} output={} rows={rows} routes_per_row={routes_per_row}",
@@ -2040,14 +2535,14 @@ pub fn moe_weighted_accumulate_sorted_f32_batch_on_stream(
     }
     unsafe {
         check_cuda(
-            "infer_moe_weighted_accumulate_sorted_f32_batch_on_stream",
-            ffi::infer_moe_weighted_accumulate_sorted_f32_batch_on_stream(
+            "infer_moe_weighted_accumulate_sorted_bf16_batch_on_stream",
+            ffi::infer_moe_weighted_accumulate_sorted_bf16_batch_on_stream(
                 routes.route_to_sorted.ptr,
                 route_weights.ptr,
                 sorted_inputs.ptr,
                 output.buffer_mut().ptr,
                 rows as u32,
-                len as u32,
+                features as u32,
                 routes_per_row as u32,
                 stream.as_raw(),
             ),
@@ -2439,6 +2934,117 @@ pub fn rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
                 input_token_offset as u32,
                 start_position as u32,
                 theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// RMS-normalizes and applies Gemma proportional RoPE to Q and K sequence spans.
+#[allow(clippy::too_many_arguments)]
+pub fn dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+    tokens: usize,
+    q_heads: usize,
+    k_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    q_input: &DeviceBuffer<f32>,
+    q_weight: &DeviceBuffer<f32>,
+    mut q_output: DeviceOutput<'_, f32>,
+    q_eps: f32,
+    k_input: &DeviceBuffer<f32>,
+    k_weight: &DeviceBuffer<f32>,
+    mut k_output: DeviceOutput<'_, f32>,
+    k_eps: f32,
+    input_token_offset: usize,
+    start_position: usize,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let end_tokens = input_token_offset
+        .checked_add(tokens)
+        .ok_or_else(|| Error::Shape {
+            label: "dual RMSNorm proportional sequence RoPE",
+            expected: "token offset plus span without overflow".to_string(),
+            actual: format!("offset={input_token_offset} tokens={tokens}"),
+        })?;
+    let q_required = end_tokens
+        .checked_mul(q_heads)
+        .and_then(|rows| rows.checked_mul(head_dim));
+    let k_required = end_tokens
+        .checked_mul(k_heads)
+        .and_then(|rows| rows.checked_mul(head_dim));
+    let total_rows = tokens.saturating_mul(q_heads.saturating_add(k_heads));
+    let dimensions_valid = tokens > 0
+        && q_heads > 0
+        && k_heads > 0
+        && head_dim > 0
+        && head_dim.is_multiple_of(2)
+        && rotary_dim > 0
+        && rotary_dim <= head_dim
+        && rotary_dim.is_multiple_of(2)
+        && tokens <= u32::MAX as usize
+        && q_heads <= u32::MAX as usize
+        && k_heads <= u32::MAX as usize
+        && head_dim <= u32::MAX as usize
+        && rotary_dim <= u32::MAX as usize
+        && input_token_offset <= u32::MAX as usize
+        && start_position <= u32::MAX as usize
+        && total_rows <= u32::MAX as usize;
+    let buffers_valid = q_required
+        .is_some_and(|required| q_input.len() >= required && q_output.len() >= required)
+        && k_required
+            .is_some_and(|required| k_input.len() >= required && k_output.len() >= required)
+        && q_weight.len() == head_dim
+        && k_weight.len() == head_dim;
+    if !dimensions_valid || !buffers_valid {
+        return Err(Error::Shape {
+            label: "dual RMSNorm proportional sequence RoPE",
+            expected: "matching non-empty Q/K sequence, head, rotary, and offset dimensions"
+                .to_string(),
+            actual: format!(
+                "tokens={tokens} q_heads={q_heads} k_heads={k_heads} head_dim={head_dim} rotary_dim={rotary_dim} q_input={} q_weight={} q_output={} k_input={} k_weight={} k_output={} input_token_offset={input_token_offset} start_position={start_position}",
+                q_input.len(),
+                q_weight.len(),
+                q_output.len(),
+                k_input.len(),
+                k_weight.len(),
+                k_output.len(),
+            ),
+        });
+    }
+    if !theta.is_finite()
+        || theta <= 0.0
+        || !q_eps.is_finite()
+        || q_eps < 0.0
+        || !k_eps.is_finite()
+        || k_eps < 0.0
+    {
+        return Err(Error::Format {
+            label: "dual RMSNorm proportional sequence RoPE parameters",
+            detail: format!("theta={theta} q_eps={q_eps} k_eps={k_eps}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dual_rms_norm_rope_neox_proportional_sequence_f32_on_stream",
+            ffi::infer_dual_rms_norm_rope_neox_proportional_sequence_f32_on_stream(
+                q_input.ptr,
+                q_weight.ptr,
+                q_output.buffer_mut().ptr,
+                k_input.ptr,
+                k_weight.ptr,
+                k_output.buffer_mut().ptr,
+                tokens as u32,
+                q_heads as u32,
+                k_heads as u32,
+                head_dim as u32,
+                (rotary_dim / 2) as u32,
+                input_token_offset as u32,
+                start_position as u32,
+                theta,
+                q_eps,
+                k_eps,
                 stream.as_raw(),
             ),
         )
@@ -3255,16 +3861,35 @@ pub fn gather_indexed_mul_f32_into_on_stream(
     values: &DeviceBuffer<f32>,
     indices: &DeviceBuffer<u32>,
     multipliers: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     stream: &CudaStream,
 ) -> Result<()> {
-    let count = indices.len();
+    gather_indexed_mul_f32_prefix_into_on_stream(
+        values,
+        indices,
+        multipliers,
+        output,
+        indices.len(),
+        stream,
+    )
+}
+
+/// Gathers an active prefix of `values[indices[i]] * multipliers[i]`.
+pub fn gather_indexed_mul_f32_prefix_into_on_stream(
+    values: &DeviceBuffer<f32>,
+    indices: &DeviceBuffer<u32>,
+    multipliers: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    count: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     if count == 0
         || count > u32::MAX as usize
         || values.is_empty()
         || values.len() > u32::MAX as usize
-        || multipliers.len() != count
-        || output.len() != count
+        || indices.len() < count
+        || multipliers.len() < count
+        || output.len() < count
     {
         return Err(Error::Shape {
             label: "indexed f32 gather multiply",
@@ -3446,7 +4071,28 @@ pub fn copy_bf16_rows_to_f32_indexed_into_on_stream(
     cols: usize,
     input: &DeviceBuffer<u16>,
     rows: &DeviceBuffer<u32>,
+    output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+        vocab_rows,
+        cols,
+        input,
+        rows,
+        output,
+        rows.len(),
+        stream,
+    )
+}
+
+/// Copies an active prefix of device-resident embedding indices into a dense batch.
+pub fn copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+    vocab_rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<u16>,
+    rows: &DeviceBuffer<u32>,
     mut output: DeviceOutput<'_, f32>,
+    row_count: usize,
     stream: &CudaStream,
 ) -> Result<()> {
     let input_len = vocab_rows.checked_mul(cols).ok_or_else(|| Error::Shape {
@@ -3454,19 +4100,20 @@ pub fn copy_bf16_rows_to_f32_indexed_into_on_stream(
         expected: "vocab_rows * cols without overflow".to_string(),
         actual: format!("vocab_rows={vocab_rows} cols={cols}"),
     })?;
-    let output_len = rows.len().checked_mul(cols).ok_or_else(|| Error::Shape {
+    let output_len = row_count.checked_mul(cols).ok_or_else(|| Error::Shape {
         label: "copy BF16 rows to f32 output",
         expected: "batch_size * cols without overflow".to_string(),
-        actual: format!("batch_size={} cols={cols}", rows.len()),
+        actual: format!("batch_size={row_count} cols={cols}"),
     })?;
     if vocab_rows == 0
         || cols == 0
-        || rows.is_empty()
+        || row_count == 0
         || vocab_rows > u32::MAX as usize
         || cols > u32::MAX as usize
-        || rows.len() > u32::MAX as usize
+        || row_count > u32::MAX as usize
         || input.len() != input_len
-        || output.len() != output_len
+        || rows.len() < row_count
+        || output.len() < output_len
     {
         return Err(Error::Shape {
             label: "copy BF16 rows to f32 buffers",
@@ -3474,7 +4121,7 @@ pub fn copy_bf16_rows_to_f32_indexed_into_on_stream(
             actual: format!(
                 "input={} rows={} output={}",
                 input.len(),
-                rows.len(),
+                row_count,
                 output.len()
             ),
         });
@@ -3486,7 +4133,7 @@ pub fn copy_bf16_rows_to_f32_indexed_into_on_stream(
                 input.ptr,
                 rows.ptr,
                 output.buffer_mut().ptr,
-                rows.len() as u32,
+                row_count as u32,
                 cols as u32,
                 stream.as_raw(),
             ),
@@ -3632,6 +4279,197 @@ pub fn quantize_nvfp4_col_major_f32_device_into_on_stream(
                 input.ptr,
                 values,
                 scales,
+                rows as u32,
+                cols as u32,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Fuses row-wise RMSNorm with column-major NVFP4 activation quantization.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    output: &mut Nvfp4Matrix,
+    eps: f32,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "RMSNorm NVFP4 quantization input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || input.len() < len
+        || weight.len() != cols
+        || output.rows != cols
+        || output.cols < rows
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !eps.is_finite()
+        || eps < 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "RMSNorm NVFP4 quantization buffers",
+            expected: format!(
+                "input={len} weight={cols} output={cols}x{rows} with valid dimensions and scales"
+            ),
+            actual: format!(
+                "input={} weight={} output={}x{} eps={eps} input_scale={input_scale}",
+                input.len(),
+                weight.len(),
+                output.rows,
+                output.cols
+            ),
+        });
+    }
+    let mut output = output.output();
+    unsafe {
+        check_cuda(
+            "infer_rms_norm_quantize_nvfp4_col_major_f32_on_stream",
+            ffi::infer_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                eps,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Quantizes an RMS-normalized matrix as a primary FP4 term and FP4 residual.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_quantize_nvfp4_pair_col_major_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    output: &mut Nvfp4Matrix,
+    residual_output: &mut Nvfp4Matrix,
+    eps: f32,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "paired RMSNorm NVFP4 quantization input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || input.len() < len
+        || weight.len() != cols
+        || output.rows != cols
+        || output.cols < rows
+        || residual_output.rows != cols
+        || residual_output.cols < rows
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !eps.is_finite()
+        || eps < 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "paired RMSNorm NVFP4 quantization buffers",
+            expected: format!(
+                "input={len} weight={cols} outputs={cols}x{rows} with valid dimensions and scales"
+            ),
+            actual: format!(
+                "input={} weight={} output={}x{} residual={}x{} eps={eps} input_scale={input_scale}",
+                input.len(),
+                weight.len(),
+                output.rows,
+                output.cols,
+                residual_output.rows,
+                residual_output.cols
+            ),
+        });
+    }
+    let mut output = output.output();
+    let mut residual_output = residual_output.output();
+    unsafe {
+        check_cuda(
+            "infer_rms_norm_quantize_nvfp4_pair_col_major_f32_on_stream",
+            ffi::infer_rms_norm_quantize_nvfp4_pair_col_major_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
+                residual_output.values_mut_ptr().cast(),
+                residual_output.scales_mut_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                eps,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Fuses gated GELU-tanh activation with column-major NVFP4 quantization.
+#[allow(clippy::too_many_arguments)]
+pub fn gelu_tanh_mul_quantize_nvfp4_col_major_f32_into_on_stream(
+    rows: usize,
+    cols: usize,
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    output: &mut Nvfp4Matrix,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "GELU NVFP4 quantization input",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || gate.len() < len
+        || up.len() < len
+        || output.rows != cols
+        || output.cols < rows
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "GELU NVFP4 quantization buffers",
+            expected: format!("gate/up={len} output={cols}x{rows} with valid scale"),
+            actual: format!(
+                "gate={} up={} output={}x{} input_scale={input_scale}",
+                gate.len(),
+                up.len(),
+                output.rows,
+                output.cols
+            ),
+        });
+    }
+    let mut output = output.output();
+    unsafe {
+        check_cuda(
+            "infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_on_stream",
+            ffi::infer_gelu_tanh_mul_quantize_nvfp4_col_major_f32_on_stream(
+                gate.ptr,
+                up.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
                 rows as u32,
                 cols as u32,
                 input_scale,
@@ -5608,16 +6446,402 @@ pub fn f32_to_bf16_into_on_stream(
     }
 }
 
-/// Rounds a device-resident f32 buffer in place to BF16 precision, stored as f32.
-pub fn round_f32_to_bf16_in_place_on_stream(
-    mut values: DeviceInOut<'_, f32>,
+/// Converts a prefix of device-resident f32 values to BF16 storage on `stream`.
+pub fn f32_to_bf16_prefix_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u16>,
+    len: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    if values.is_empty() || values.len() > u32::MAX as usize {
+    if len == 0 || len > u32::MAX as usize || input.len() < len || output.len() < len {
+        return Err(Error::Shape {
+            label: "F32 to BF16 prefix buffers",
+            expected: format!("input and output >= {len} values for non-zero u32-sized len"),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_f32_to_bf16_on_stream",
+            ffi::infer_f32_to_bf16_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+fn checked_attention_product(label: &'static str, factors: &[usize]) -> Result<usize> {
+    factors.iter().try_fold(1usize, |total, factor| {
+        total.checked_mul(*factor).ok_or_else(|| Error::Shape {
+            label,
+            expected: "dimension product without overflow".to_string(),
+            actual: format!("factors={factors:?}"),
+        })
+    })
+}
+
+/// Packs `[tokens, heads, head_dim]` f32 rows as BF16 `[heads, tokens, head_dim]`.
+pub fn pack_token_heads_bf16_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    output: DeviceOutput<'_, u16>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    pack_token_heads_bf16_at_offset_into_on_stream(
+        input, output, tokens, heads, head_dim, 0, stream,
+    )
+}
+
+/// Packs f32 token/head rows beginning at `input_row_offset` into head-major BF16.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_token_heads_bf16_at_offset_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u16>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    input_row_offset: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = checked_attention_product("packed token heads", &[tokens, heads, head_dim])?;
+    let input_end = input_row_offset
+        .checked_add(tokens)
+        .and_then(|rows| rows.checked_mul(heads))
+        .and_then(|values| values.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    if len == 0
+        || len > u32::MAX as usize
+        || input_row_offset > u32::MAX as usize
+        || input.len() < input_end
+        || output.len() < len
+    {
+        return Err(Error::Shape {
+            label: "packed token heads",
+            expected: format!("input and output >= {len} values"),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_pack_token_heads_bf16_on_stream",
+            ffi::infer_pack_token_heads_bf16_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                input_row_offset as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies causal/windowed softmax to `[heads, queries, keys]` f32 score rows.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_window_softmax_f32_in_place_on_stream(
+    mut scores: DeviceInOut<'_, f32>,
+    query_tokens: usize,
+    key_tokens: usize,
+    start_position: usize,
+    heads: usize,
+    head_dim: usize,
+    window_tokens: Option<usize>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = checked_attention_product("causal score rows", &[heads, query_tokens, key_tokens])?;
+    if len == 0
+        || len > scores.len()
+        || query_tokens > u32::MAX as usize
+        || key_tokens > u32::MAX as usize
+        || start_position > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || window_tokens.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "causal score rows",
+            expected: format!("{len} writable values and u32-sized non-zero dimensions"),
+            actual: format!(
+                "scores={} queries={query_tokens} keys={key_tokens}",
+                scores.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_causal_window_softmax_f32_on_stream",
+            ffi::infer_causal_window_softmax_f32_on_stream(
+                scores.buffer_mut().ptr,
+                query_tokens as u32,
+                key_tokens as u32,
+                start_position as u32,
+                heads as u32,
+                head_dim as u32,
+                window_tokens.unwrap_or(0) as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies causal/windowed softmax and writes BF16 `[heads, queries, keys]` rows.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_window_softmax_f32_to_bf16_on_stream(
+    scores: &DeviceBuffer<f32>,
+    mut probabilities: DeviceOutput<'_, u16>,
+    query_tokens: usize,
+    key_tokens: usize,
+    start_position: usize,
+    heads: usize,
+    head_dim: usize,
+    window_tokens: Option<usize>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = checked_attention_product("causal score rows", &[heads, query_tokens, key_tokens])?;
+    if len == 0
+        || len > scores.len()
+        || len > probabilities.len()
+        || query_tokens > u32::MAX as usize
+        || key_tokens > u32::MAX as usize
+        || start_position > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || window_tokens.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "causal BF16 probability rows",
+            expected: format!("{len} input and output values with u32-sized dimensions"),
+            actual: format!(
+                "scores={} probabilities={} queries={query_tokens} keys={key_tokens}",
+                scores.len(),
+                probabilities.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_causal_window_softmax_f32_to_bf16_on_stream",
+            ffi::infer_causal_window_softmax_f32_to_bf16_on_stream(
+                scores.ptr,
+                probabilities.buffer_mut().ptr,
+                query_tokens as u32,
+                key_tokens as u32,
+                start_position as u32,
+                heads as u32,
+                head_dim as u32,
+                window_tokens.unwrap_or(0) as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Unpacks `[heads, tokens, head_dim]` f32 values to `[tokens, heads, head_dim]`.
+pub fn unpack_heads_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    output: DeviceOutput<'_, f32>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    unpack_heads_f32_at_offset_into_on_stream(input, output, tokens, heads, head_dim, 0, stream)
+}
+
+/// Unpacks head-major f32 values into token rows beginning at `output_row_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_heads_f32_at_offset_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    output_row_offset: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = checked_attention_product("unpacked token heads", &[tokens, heads, head_dim])?;
+    let output_end = output_row_offset
+        .checked_add(tokens)
+        .and_then(|rows| rows.checked_mul(heads))
+        .and_then(|values| values.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    if len == 0
+        || len > u32::MAX as usize
+        || output_row_offset > u32::MAX as usize
+        || input.len() < len
+        || output.len() < output_end
+    {
+        return Err(Error::Shape {
+            label: "unpacked token heads",
+            expected: format!("input and output >= {len} values"),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_unpack_heads_f32_on_stream",
+            ffi::infer_unpack_heads_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                output_row_offset as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Transposes head-major attention output directly into a column-major NVFP4 activation.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    output: &mut Nvfp4Matrix,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    output_row_offset: usize,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_unpack_heads_quantize_nvfp4(
+        input.len(),
+        output,
+        tokens,
+        heads,
+        head_dim,
+        output_row_offset,
+        input_scale,
+    )?;
+    let mut output = output.output();
+    unsafe {
+        check_cuda(
+            "infer_unpack_heads_quantize_nvfp4_col_major_f32_on_stream",
+            ffi::infer_unpack_heads_quantize_nvfp4_col_major_f32_on_stream(
+                input.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                output_row_offset as u32,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Transposes BF16 head-major attention output directly into a column-major NVFP4 activation.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
+    input: &DeviceBuffer<u16>,
+    output: &mut Nvfp4Matrix,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    output_row_offset: usize,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_unpack_heads_quantize_nvfp4(
+        input.len(),
+        output,
+        tokens,
+        heads,
+        head_dim,
+        output_row_offset,
+        input_scale,
+    )?;
+    let mut output = output.output();
+    unsafe {
+        check_cuda(
+            "infer_unpack_heads_quantize_nvfp4_col_major_bf16_on_stream",
+            ffi::infer_unpack_heads_quantize_nvfp4_col_major_bf16_on_stream(
+                input.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                output_row_offset as u32,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_unpack_heads_quantize_nvfp4(
+    input_len: usize,
+    output: &Nvfp4Matrix,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    output_row_offset: usize,
+    input_scale: f32,
+) -> Result<()> {
+    let features = heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "head-major NVFP4 output width",
+        expected: "heads * head_dim without overflow".to_string(),
+        actual: format!("heads={heads} head_dim={head_dim}"),
+    })?;
+    let required_input_len = tokens.saturating_mul(features);
+    let output_rows = output_row_offset.saturating_add(tokens);
+    if tokens == 0
+        || features == 0
+        || input_len < required_input_len
+        || output.rows != features
+        || output.cols < output_rows
+        || tokens > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || output_row_offset > u32::MAX as usize
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "head-major NVFP4 output",
+            expected: format!(
+                "input >= {required_input_len}, output={features}x>={output_rows}, and valid dimensions"
+            ),
+            actual: format!(
+                "input={} output={}x{} tokens={tokens} heads={heads} head_dim={head_dim} input_scale={input_scale}",
+                input_len, output.rows, output.cols
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Rounds a device-resident f32 buffer in place to BF16 precision, stored as f32.
+pub fn round_f32_to_bf16_in_place_on_stream(
+    values: DeviceInOut<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let count = values.len();
+    round_f32_to_bf16_prefix_in_place_on_stream(values, count, stream)
+}
+
+/// Rounds an active prefix of a device-resident f32 buffer to BF16 precision.
+pub fn round_f32_to_bf16_prefix_in_place_on_stream(
+    mut values: DeviceInOut<'_, f32>,
+    count: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if count == 0 || count > u32::MAX as usize || values.len() < count {
         return Err(Error::Shape {
             label: "F32 to BF16 round length",
-            expected: "1..=u32::MAX values".to_string(),
-            actual: format!("{} values", values.len()),
+            expected: format!("at least {count} values with 1..=u32::MAX active"),
+            actual: format!("{} values with {count} active", values.len()),
         });
     }
     unsafe {
@@ -5625,7 +6849,7 @@ pub fn round_f32_to_bf16_in_place_on_stream(
             "infer_round_f32_to_bf16_in_place_on_stream",
             ffi::infer_round_f32_to_bf16_in_place_on_stream(
                 values.buffer_mut().ptr,
-                values.len() as u32,
+                count as u32,
                 stream.as_raw(),
             ),
         )
@@ -6895,9 +8119,9 @@ pub fn scale_channel_f32_device_row_scalar_in_place_on_stream(
         || channels == 0
         || rows > u32::MAX as usize
         || channels > u32::MAX as usize
-        || values.len() != len
+        || values.len() < len
         || channel_scale.len() != channels
-        || row_scale.len() != rows
+        || row_scale.len() < rows
     {
         return Err(Error::Shape {
             label: "channel-scaled device-row-scalar f32 buffers",
@@ -8814,6 +10038,76 @@ mod tests {
     }
 
     #[test]
+    fn sorted_bf16_moe_accumulation_matches_route_order() {
+        let rows = 2;
+        let routes_per_row = 2;
+        let indices = DeviceBuffer::from_host(&[1u32, 0, 1, 0]).expect("route indices");
+        let route_weights = [0.25f32, 0.75, 0.4, 0.6];
+        let route_weights_device = DeviceBuffer::from_host(&route_weights).expect("route weights");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut routes = MoeSortedRoutes::new(rows * routes_per_row, 2).expect("sorted routes");
+        routes
+            .sort_on_stream(&indices, &stream)
+            .expect("sort routes");
+        let sorted_routes = routes
+            .sorted_routes()
+            .copy_to_host(&stream)
+            .expect("sorted route order");
+
+        for features in [5usize, 6] {
+            let source = (0..rows * routes_per_row * features)
+                .map(|index| (index as f32 - 7.0) * 0.125)
+                .collect::<Vec<_>>();
+            let mut sorted = Vec::with_capacity(source.len());
+            for &route in sorted_routes.iter() {
+                let start = route as usize * features;
+                sorted.extend(
+                    source[start..start + features]
+                        .iter()
+                        .copied()
+                        .map(f32_to_bf16),
+                );
+            }
+            let sorted = DeviceBuffer::from_host(&sorted).expect("sorted inputs");
+            let mut output = DeviceBuffer::zeroed(rows * features + 7).expect("output");
+            moe_weighted_accumulate_sorted_bf16_batch_on_stream(
+                &routes,
+                &route_weights_device,
+                &sorted,
+                output.output(),
+                rows,
+                routes_per_row,
+                features,
+                &stream,
+            )
+            .expect("weighted accumulation");
+            let actual = output.copy_to_host(&stream).expect("output download");
+            let expected = (0..rows)
+                .flat_map(|row| {
+                    (0..features).map({
+                        let source = &source;
+                        move |col| {
+                            (0..routes_per_row)
+                                .map(|slot| {
+                                    let route = row * routes_per_row + slot;
+                                    bf16_to_f32(f32_to_bf16(source[route * features + col]))
+                                        * route_weights[route]
+                                })
+                                .sum::<f32>()
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_close(
+                &actual[..rows * features],
+                &expected,
+                1.0e-6,
+                "sorted BF16 weighted accumulation",
+            );
+        }
+    }
+
+    #[test]
     fn speculative_acceptance_stops_at_first_mismatch_and_returns_bonus() {
         const SEQUENCES: usize = 3;
         const DRAFTS: usize = 3;
@@ -10549,6 +11843,206 @@ mod tests {
     }
 
     #[test]
+    fn dual_rms_norm_rope_sequence_matches_staged_operations() {
+        let capacity = 5;
+        let offset = 1;
+        let tokens = 3;
+        let q_heads = 3;
+        let k_heads = 2;
+        let head_dim = 16;
+        let rotary_dim = 8;
+        let start_position = 29;
+        let theta = 1_000_000.0;
+        let q_eps = 1.0e-6;
+        let k_eps = 2.0e-6;
+        let q = (0..capacity * q_heads * head_dim)
+            .map(|idx| ((idx % 43) as f32 - 21.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let k = (0..capacity * k_heads * head_dim)
+            .map(|idx| ((idx % 37) as f32 - 18.0) * 0.046875)
+            .collect::<Vec<_>>();
+        let q_weight = (0..head_dim)
+            .map(|idx| 0.75 + idx as f32 * 0.025)
+            .collect::<Vec<_>>();
+        let k_weight = (0..head_dim)
+            .map(|idx| 1.25 - idx as f32 * 0.02)
+            .collect::<Vec<_>>();
+        let q_device = DeviceBuffer::from_host(&q).expect("Q upload");
+        let k_device = DeviceBuffer::from_host(&k).expect("K upload");
+        let q_weight_device = DeviceBuffer::from_host(&q_weight).expect("Q weight upload");
+        let k_weight_device = DeviceBuffer::from_host(&k_weight).expect("K weight upload");
+        let mut q_normalized = DeviceBuffer::zeroed(q.len()).expect("normalized Q");
+        let mut k_normalized = DeviceBuffer::zeroed(k.len()).expect("normalized K");
+        let mut expected_q = DeviceBuffer::zeroed(q.len()).expect("expected Q");
+        let mut expected_k = DeviceBuffer::zeroed(k.len()).expect("expected K");
+        let mut actual_q = DeviceBuffer::zeroed(q.len()).expect("actual Q");
+        let mut actual_k = DeviceBuffer::zeroed(k.len()).expect("actual K");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        rms_norm_f32_into_on_stream(
+            capacity * q_heads,
+            head_dim,
+            &q_device,
+            &q_weight_device,
+            q_normalized.output(),
+            q_eps,
+            &stream,
+        )
+        .expect("Q RMSNorm");
+        rms_norm_f32_into_on_stream(
+            capacity * k_heads,
+            head_dim,
+            &k_device,
+            &k_weight_device,
+            k_normalized.output(),
+            k_eps,
+            &stream,
+        )
+        .expect("K RMSNorm");
+        rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+            tokens,
+            q_heads,
+            head_dim,
+            rotary_dim,
+            &q_normalized,
+            expected_q.output(),
+            offset,
+            start_position,
+            theta,
+            &stream,
+        )
+        .expect("Q RoPE");
+        rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+            tokens,
+            k_heads,
+            head_dim,
+            rotary_dim,
+            &k_normalized,
+            expected_k.output(),
+            offset,
+            start_position,
+            theta,
+            &stream,
+        )
+        .expect("K RoPE");
+        dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
+            tokens,
+            q_heads,
+            k_heads,
+            head_dim,
+            rotary_dim,
+            &q_device,
+            &q_weight_device,
+            actual_q.output(),
+            q_eps,
+            &k_device,
+            &k_weight_device,
+            actual_k.output(),
+            k_eps,
+            offset,
+            start_position,
+            theta,
+            &stream,
+        )
+        .expect("fused Q/K RMSNorm RoPE");
+
+        let q_start = offset * q_heads * head_dim;
+        let q_end = (offset + tokens) * q_heads * head_dim;
+        let k_start = offset * k_heads * head_dim;
+        let k_end = (offset + tokens) * k_heads * head_dim;
+        let expected_q = expected_q
+            .copy_to_host(&stream)
+            .expect("expected Q download");
+        let expected_k = expected_k
+            .copy_to_host(&stream)
+            .expect("expected K download");
+        let actual_q = actual_q.copy_to_host(&stream).expect("actual Q download");
+        let actual_k = actual_k.copy_to_host(&stream).expect("actual K download");
+        assert_close(
+            &actual_q[q_start..q_end],
+            &expected_q[q_start..q_end],
+            3.0e-5,
+            "fused Q RMSNorm RoPE",
+        );
+        assert_close(
+            &actual_k[k_start..k_end],
+            &expected_k[k_start..k_end],
+            3.0e-5,
+            "fused K RMSNorm RoPE",
+        );
+    }
+
+    #[test]
+    fn moe_gather_rms_norm_quantization_matches_staged_rows() {
+        let rows = 3;
+        let routes_per_row = 2;
+        let experts = 4;
+        let in_features = 64;
+        let input = (0..rows * in_features)
+            .map(|idx| ((idx % 47) as f32 - 23.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let weight = (0..in_features)
+            .map(|idx| 0.75 + idx as f32 * 0.0078125)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let indices = DeviceBuffer::from_host(&[0, 1, 2, 3, 1, 0]).expect("indices upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut routes =
+            MoeSortedRoutes::new(rows * routes_per_row, experts).expect("route workspace");
+        routes
+            .sort_on_stream(&indices, &stream)
+            .expect("route sort");
+        let mut fused = MoeSortedNvfp4Rows::new(rows, routes_per_row, experts, in_features)
+            .expect("fused workspace");
+        fused
+            .gather_rms_norm_quantize_on_stream(&input, &weight, 1.0e-6, &routes, &stream)
+            .expect("fused quantization");
+
+        let mut normalized = DeviceBuffer::zeroed(rows * in_features).expect("normalized rows");
+        rms_norm_f32_into_on_stream(
+            rows,
+            in_features,
+            &input,
+            &weight,
+            normalized.output(),
+            1.0e-6,
+            &stream,
+        )
+        .expect("staged RMSNorm");
+        let mut expected_packed =
+            DeviceBuffer::zeroed(rows * in_features / 2).expect("expected packed");
+        let mut expected_scales =
+            DeviceBuffer::zeroed(rows * in_features / 16).expect("expected scales");
+        quantize_nvfp4_simple_scales_f32_into_on_stream(
+            &normalized,
+            &mut expected_packed,
+            &mut expected_scales,
+            &stream,
+        )
+        .expect("staged quantization");
+
+        assert_eq!(
+            fused
+                .source_scales
+                .copy_to_host(&stream)
+                .expect("fused scales"),
+            expected_scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
+        );
+        assert_eq!(
+            fused
+                .source_packed
+                .copy_to_host(&stream)
+                .expect("fused packed"),
+            expected_packed
+                .copy_to_host(&stream)
+                .expect("expected packed")
+        );
+    }
+
+    #[test]
     fn rope_neox_partial_f32_matches_cpu_reference() {
         let rows = 3usize;
         let head_dim = 12usize;
@@ -11352,6 +12846,552 @@ mod tests {
             .expect("scales download");
         assert_eq!(packed, expected.packed_values);
         assert_eq!(scales, expected.scales);
+    }
+
+    #[test]
+    fn fused_rms_norm_nvfp4_quantization_matches_staged_path() {
+        let rows = 3;
+        let cols = 96;
+        let eps = 1.0e-6;
+        let input_scale = 0.375;
+        let input = (0..rows * cols)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let weight = (0..cols)
+            .map(|idx| 0.75 + (idx % 13) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let mut normalized = DeviceBuffer::zeroed(rows * cols).expect("normalized allocation");
+        let mut expected = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("expected matrix");
+        let mut actual = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("actual matrix");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        rms_norm_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            normalized.output(),
+            eps,
+            &stream,
+        )
+        .expect("staged RMSNorm");
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            cols,
+            rows,
+            &normalized,
+            &mut expected,
+            input_scale,
+            &stream,
+        )
+        .expect("staged quantization");
+        rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            &mut actual,
+            eps,
+            input_scale,
+            &stream,
+        )
+        .expect("fused quantization");
+
+        assert_eq!(
+            actual.values.copy_to_host(&stream).expect("actual values"),
+            expected
+                .values
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
+        assert_eq!(
+            actual.scales.copy_to_host(&stream).expect("actual scales"),
+            expected
+                .scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
+        );
+    }
+
+    #[test]
+    fn fused_rms_norm_residual_paths_match_staged_operations() {
+        let rows = 3;
+        let cols = 96;
+        let eps = 1.0e-6;
+        let input = (0..rows * cols)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let right = (0..rows * cols)
+            .map(|idx| ((idx * 29 % 107) as f32 - 53.0) * 0.01171875)
+            .collect::<Vec<_>>();
+        let residual = (0..rows * cols)
+            .map(|idx| ((idx * 7 % 61) as f32 - 30.0) * 0.0078125)
+            .collect::<Vec<_>>();
+        let weight = (0..cols)
+            .map(|idx| 0.75 + (idx % 13) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let right_weight = (0..cols)
+            .map(|idx| 0.625 + (idx % 11) as f32 * 0.0234375)
+            .collect::<Vec<_>>();
+        let channel_scale = (0..cols)
+            .map(|idx| 0.875 + (idx % 7) as f32 * 0.015625)
+            .collect::<Vec<_>>();
+        let row_scale = vec![0.75, 1.0, 1.25];
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let right = DeviceBuffer::from_host(&right).expect("right upload");
+        let residual = DeviceBuffer::from_host(&residual).expect("residual upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let right_weight = DeviceBuffer::from_host(&right_weight).expect("right weight upload");
+        let channel_scale = DeviceBuffer::from_host(&channel_scale).expect("channel scale upload");
+        let row_scale = DeviceBuffer::from_host(&row_scale).expect("row scale upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut left_norm = DeviceBuffer::zeroed(rows * cols).expect("left norm");
+        let mut right_norm = DeviceBuffer::zeroed(rows * cols).expect("right norm");
+        let mut expected = DeviceBuffer::zeroed(rows * cols).expect("expected");
+        let mut actual = DeviceBuffer::zeroed(rows * cols).expect("actual");
+        rms_norm_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            left_norm.output(),
+            eps,
+            &stream,
+        )
+        .expect("left norm");
+        add_f32_into_on_stream(&left_norm, &residual, expected.output(), &stream)
+            .expect("staged residual add");
+        rms_norm_add_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            &residual,
+            actual.output(),
+            eps,
+            &stream,
+        )
+        .expect("fused residual add");
+        assert_f32_buffers_close(&actual, &expected, &stream, 2.0e-6);
+
+        rms_norm_f32_into_on_stream(
+            rows,
+            cols,
+            &right,
+            &right_weight,
+            right_norm.output(),
+            eps,
+            &stream,
+        )
+        .expect("right norm");
+        add_f32_into_on_stream(&left_norm, &right_norm, expected.output(), &stream)
+            .expect("staged dual add");
+        dual_rms_norm_add_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            eps,
+            &right,
+            &right_weight,
+            eps,
+            actual.output(),
+            &stream,
+        )
+        .expect("fused dual add");
+        assert_f32_buffers_close(&actual, &expected, &stream, 2.0e-6);
+
+        add_f32_into_on_stream(&left_norm, &residual, expected.output(), &stream)
+            .expect("staged scaled add");
+        scale_channel_f32_device_row_scalar_in_place_on_stream(
+            expected.inout(),
+            &channel_scale,
+            &row_scale,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("staged scale");
+        rms_norm_add_channel_row_scale_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &weight,
+            &residual,
+            &channel_scale,
+            &row_scale,
+            actual.output(),
+            eps,
+            &stream,
+        )
+        .expect("fused scaled add");
+        assert_f32_buffers_close(&actual, &expected, &stream, 2.0e-6);
+    }
+
+    #[test]
+    fn fused_gemma_rms_sequences_match_staged_operations() {
+        let rows = 3;
+        let cols = 96;
+        let eps = 1.0e-6;
+        let input_scale = 0.375;
+        let values = |multiplier: usize, modulus: usize, scale: f32| {
+            (0..rows * cols)
+                .map(|idx| ((idx * multiplier % modulus) as f32 - modulus as f32 * 0.5) * scale)
+                .collect::<Vec<_>>()
+        };
+        let weights = |offset: f32, modulus: usize, scale: f32| {
+            (0..cols)
+                .map(|idx| offset + (idx % modulus) as f32 * scale)
+                .collect::<Vec<_>>()
+        };
+        let input = DeviceBuffer::from_host(&values(17, 101, 0.015625)).expect("input upload");
+        let right = DeviceBuffer::from_host(&values(29, 107, 0.01171875)).expect("right upload");
+        let residual = DeviceBuffer::from_host(&values(7, 61, 0.0078125)).expect("residual upload");
+        let input_weight =
+            DeviceBuffer::from_host(&weights(0.75, 13, 0.03125)).expect("input weight upload");
+        let right_weight =
+            DeviceBuffer::from_host(&weights(0.625, 11, 0.0234375)).expect("right weight upload");
+        let quant_weight =
+            DeviceBuffer::from_host(&weights(0.6875, 17, 0.01953125)).expect("quant weight upload");
+        let final_weight =
+            DeviceBuffer::from_host(&weights(0.8125, 19, 0.01171875)).expect("final weight upload");
+        let channel_scale =
+            DeviceBuffer::from_host(&weights(0.875, 7, 0.015625)).expect("channel scale upload");
+        let row_scale = DeviceBuffer::from_host(&[0.75, 1.0, 1.25]).expect("row scale upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut staged_residual = DeviceBuffer::zeroed(rows * cols).expect("staged residual");
+        let mut fused_residual = DeviceBuffer::zeroed(rows * cols).expect("fused residual");
+        let mut staged_quant =
+            Nvfp4Matrix::zeroed_col_major(cols, rows).expect("staged quantization");
+        let mut fused_quant =
+            Nvfp4Matrix::zeroed_col_major(cols, rows).expect("fused quantization");
+        rms_norm_add_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &input_weight,
+            &residual,
+            staged_residual.output(),
+            eps,
+            &stream,
+        )
+        .expect("staged residual add");
+        rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+            rows,
+            cols,
+            &staged_residual,
+            &quant_weight,
+            &mut staged_quant,
+            eps,
+            input_scale,
+            &stream,
+        )
+        .expect("staged residual quantization");
+        rms_norm_add_then_rms_norm_quantize_nvfp4_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &input_weight,
+            &residual,
+            fused_residual.output(),
+            eps,
+            &quant_weight,
+            &mut fused_quant,
+            eps,
+            input_scale,
+            &stream,
+        )
+        .expect("fused residual quantization");
+        assert_f32_buffers_close(&fused_residual, &staged_residual, &stream, 2.0e-6);
+        assert_eq!(
+            fused_quant
+                .values
+                .copy_to_host(&stream)
+                .expect("fused quantized values"),
+            staged_quant
+                .values
+                .copy_to_host(&stream)
+                .expect("staged quantized values")
+        );
+        assert_eq!(
+            fused_quant
+                .scales
+                .copy_to_host(&stream)
+                .expect("fused quantized scales"),
+            staged_quant
+                .scales
+                .copy_to_host(&stream)
+                .expect("staged quantized scales")
+        );
+
+        let mut staged_combined = DeviceBuffer::zeroed(rows * cols).expect("staged combined");
+        let mut staged_output = DeviceBuffer::zeroed(rows * cols).expect("staged output");
+        let mut fused_output = DeviceBuffer::zeroed(rows * cols).expect("fused output");
+        dual_rms_norm_add_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &input_weight,
+            eps,
+            &right,
+            &right_weight,
+            eps,
+            staged_combined.output(),
+            &stream,
+        )
+        .expect("staged dual RMSNorm add");
+        rms_norm_add_channel_row_scale_f32_into_on_stream(
+            rows,
+            cols,
+            &staged_combined,
+            &final_weight,
+            &residual,
+            &channel_scale,
+            &row_scale,
+            staged_output.output(),
+            eps,
+            &stream,
+        )
+        .expect("staged final residual");
+        dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &input_weight,
+            eps,
+            &right,
+            &right_weight,
+            eps,
+            &final_weight,
+            eps,
+            &residual,
+            &channel_scale,
+            &row_scale,
+            fused_output.output(),
+            &stream,
+        )
+        .expect("fused final residual");
+        assert_f32_buffers_close(&fused_output, &staged_output, &stream, 2.0e-6);
+    }
+
+    fn assert_f32_buffers_close(
+        actual: &DeviceBuffer<f32>,
+        expected: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+        tolerance: f32,
+    ) {
+        let actual = actual.copy_to_host(stream).expect("actual download");
+        let expected = expected.copy_to_host(stream).expect("expected download");
+        let max_error = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error <= tolerance, "max_error={max_error}");
+    }
+
+    #[test]
+    fn fused_gelu_nvfp4_quantization_matches_staged_path() {
+        let rows = 3;
+        let cols = 96;
+        let input_scale = 0.375;
+        let gate = (0..rows * cols)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let up = (0..rows * cols)
+            .map(|idx| ((idx * 29 % 107) as f32 - 53.0) * 0.01171875)
+            .collect::<Vec<_>>();
+        let gate = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let up = DeviceBuffer::from_host(&up).expect("up upload");
+        let mut activated = DeviceBuffer::zeroed(rows * cols).expect("activation allocation");
+        let mut expected = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("expected matrix");
+        let mut actual = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("actual matrix");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        gelu_tanh_mul_f32_into_on_stream(&gate, &up, activated.output(), &stream)
+            .expect("staged GELU");
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            cols,
+            rows,
+            &activated,
+            &mut expected,
+            input_scale,
+            &stream,
+        )
+        .expect("staged quantization");
+        gelu_tanh_mul_quantize_nvfp4_col_major_f32_into_on_stream(
+            rows,
+            cols,
+            &gate,
+            &up,
+            &mut actual,
+            input_scale,
+            &stream,
+        )
+        .expect("fused quantization");
+
+        assert_eq!(
+            actual.values.copy_to_host(&stream).expect("actual values"),
+            expected
+                .values
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
+        assert_eq!(
+            actual.scales.copy_to_host(&stream).expect("actual scales"),
+            expected
+                .scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
+        );
+    }
+
+    #[test]
+    fn fused_head_unpack_nvfp4_quantization_matches_staged_path() {
+        let tokens = 5;
+        let heads = 3;
+        let head_dim = 32;
+        let features = heads * head_dim;
+        let output_row_offset = 2;
+        let output_rows = output_row_offset + tokens;
+        let input_scale = 0.375;
+        let token_major = (0..tokens * features)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let mut head_major = vec![0.0; token_major.len()];
+        for token in 0..tokens {
+            for head in 0..heads {
+                for dim in 0..head_dim {
+                    head_major[(head * tokens + token) * head_dim + dim] =
+                        token_major[(token * heads + head) * head_dim + dim];
+                }
+            }
+        }
+        let input = DeviceBuffer::from_host(&head_major).expect("input upload");
+        let mut unpacked = DeviceBuffer::zeroed(output_rows * features).expect("unpacked output");
+        let mut expected =
+            Nvfp4Matrix::zeroed_col_major(features, output_rows).expect("expected matrix");
+        let mut actual =
+            Nvfp4Matrix::zeroed_col_major(features, output_rows).expect("actual matrix");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        unpack_heads_f32_at_offset_into_on_stream(
+            &input,
+            unpacked.output(),
+            tokens,
+            heads,
+            head_dim,
+            output_row_offset,
+            &stream,
+        )
+        .expect("staged unpack");
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            features,
+            output_rows,
+            &unpacked,
+            &mut expected,
+            input_scale,
+            &stream,
+        )
+        .expect("staged quantization");
+        unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream(
+            &input,
+            &mut actual,
+            tokens,
+            heads,
+            head_dim,
+            output_row_offset,
+            input_scale,
+            &stream,
+        )
+        .expect("fused unpack quantization");
+
+        assert_eq!(
+            actual.values.copy_to_host(&stream).expect("actual values"),
+            expected
+                .values
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
+        assert_eq!(
+            actual.scales.copy_to_host(&stream).expect("actual scales"),
+            expected
+                .scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
+        );
+    }
+
+    #[test]
+    fn fused_bf16_head_unpack_nvfp4_quantization_matches_staged_path() {
+        let tokens = 3;
+        let heads = 2;
+        let head_dim = 32;
+        let features = heads * head_dim;
+        let output_row_offset = 1;
+        let output_rows = output_row_offset + tokens;
+        let input_scale = 0.375;
+        let input = (0..tokens * features)
+            .map(|idx| f32_to_bf16(((idx * 17 % 101) as f32 - 50.0) * 0.0137))
+            .collect::<Vec<_>>();
+        let staged_input = input.iter().copied().map(bf16_to_f32).collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("BF16 input upload");
+        let staged_input = DeviceBuffer::from_host(&staged_input).expect("f32 input upload");
+        let mut unpacked = DeviceBuffer::zeroed(output_rows * features).expect("unpacked output");
+        let mut expected =
+            Nvfp4Matrix::zeroed_col_major(features, output_rows).expect("expected matrix");
+        let mut actual =
+            Nvfp4Matrix::zeroed_col_major(features, output_rows).expect("actual matrix");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        unpack_heads_f32_at_offset_into_on_stream(
+            &staged_input,
+            unpacked.output(),
+            tokens,
+            heads,
+            head_dim,
+            output_row_offset,
+            &stream,
+        )
+        .expect("staged unpack");
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            features,
+            output_rows,
+            &unpacked,
+            &mut expected,
+            input_scale,
+            &stream,
+        )
+        .expect("staged quantization");
+        unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
+            &input,
+            &mut actual,
+            tokens,
+            heads,
+            head_dim,
+            output_row_offset,
+            input_scale,
+            &stream,
+        )
+        .expect("fused BF16 unpack quantization");
+
+        assert_eq!(
+            actual.values.copy_to_host(&stream).expect("actual values"),
+            expected
+                .values
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
+        assert_eq!(
+            actual.scales.copy_to_host(&stream).expect("actual scales"),
+            expected
+                .scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
+        );
     }
 
     #[test]

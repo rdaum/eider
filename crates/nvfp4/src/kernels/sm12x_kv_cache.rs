@@ -424,6 +424,9 @@ impl Sm12xKvCache {
                     self.value_scales.as_mut_ptr().cast(),
                     self.key_tail.as_mut_ptr().cast(),
                     self.value_tail.as_mut_ptr().cast(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
                     input_row_offset as u32,
                     self.len as u32,
                     rows as u32,
@@ -436,6 +439,135 @@ impl Sm12xKvCache {
         }
         self.len = cache_end;
         Ok(())
+    }
+
+    /// Appends the first prompt rows while staging the exact BF16 cache values for attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_initial_rows_and_stage_bf16_on_stream(
+        &mut self,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        mut key_output: DeviceOutput<'_, u16>,
+        mut value_output: DeviceOutput<'_, u16>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.kv_heads * self.head_dim;
+        let input_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(width))
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x initial KV row staging",
+                expected: "input row range without overflow".to_string(),
+                actual: format!("input_row_offset={input_row_offset} rows={rows} width={width}"),
+            })?;
+        let output_values = rows.checked_mul(width).ok_or_else(|| Error::Shape {
+            label: "SM12x initial KV row staging",
+            expected: "rows * width without overflow".to_string(),
+            actual: format!("rows={rows} width={width}"),
+        })?;
+        if self.len != 0
+            || rows == 0
+            || rows > self.max_tokens
+            || rows > u32::MAX as usize
+            || input_row_offset > u32::MAX as usize
+            || input_end > key.len()
+            || input_end > value.len()
+            || key_output.len() < output_values
+            || value_output.len() < output_values
+        {
+            return Err(Error::Shape {
+                label: "SM12x initial KV row staging",
+                expected: format!(
+                    "empty cache, non-empty rows through capacity {}, inputs >= {input_end}, outputs >= {output_values}",
+                    self.max_tokens
+                ),
+                actual: format!(
+                    "cache_len={} rows={rows} key={} value={} key_output={} value_output={}",
+                    self.len,
+                    key.len(),
+                    value.len(),
+                    key_output.len(),
+                    value_output.len(),
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_rows_on_stream(
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    self.key_values.as_mut_ptr().cast(),
+                    self.key_scales.as_mut_ptr().cast(),
+                    self.value_values.as_mut_ptr().cast(),
+                    self.value_scales.as_mut_ptr().cast(),
+                    self.key_tail.as_mut_ptr().cast(),
+                    self.value_tail.as_mut_ptr().cast(),
+                    key_output.as_mut_ptr().cast(),
+                    value_output.as_mut_ptr().cast(),
+                    rows as u32,
+                    input_row_offset as u32,
+                    0,
+                    rows as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        self.len = rows;
+        Ok(())
+    }
+
+    /// Dequantizes the logical cache into BF16 matrices for prompt attention.
+    ///
+    /// Keys are written as `[kv_heads, tokens, head_dim]`; values are written
+    /// as `[kv_heads, head_dim, tokens]` for direct tensor-core QK and PV use.
+    pub fn unpack_bf16_on_stream(
+        &self,
+        mut key_output: DeviceOutput<'_, u16>,
+        mut value_output: DeviceOutput<'_, u16>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let values = checked_product(
+            "SM12x KV BF16 unpack",
+            &[self.len, self.kv_heads, self.head_dim],
+        )?;
+        if self.len == 0 || key_output.len() < values || value_output.len() < values {
+            return Err(Error::Shape {
+                label: "SM12x KV BF16 unpack",
+                expected: format!("non-empty cache and K/V output >= {values} values"),
+                actual: format!(
+                    "cache_len={} key={} value={}",
+                    self.len,
+                    key_output.len(),
+                    value_output.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_unpack_bf16_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_unpack_bf16_on_stream(
+                    self.key_values.as_const_ptr().cast(),
+                    self.key_scales.as_const_ptr().cast(),
+                    self.value_values.as_const_ptr().cast(),
+                    self.value_scales.as_const_ptr().cast(),
+                    self.key_tail.as_const_ptr().cast(),
+                    self.value_tail.as_const_ptr().cast(),
+                    key_output.as_mut_ptr().cast(),
+                    value_output.as_mut_ptr().cast(),
+                    self.len as u32,
+                    self.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Enqueues one K/V append using a device-resident position for CUDA graphs.
@@ -1119,6 +1251,7 @@ fn checked_product(label: &'static str, values: &[usize]) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::bf16_to_f32;
 
     fn set_nibble(packed: &mut [u8], index: usize, value: u8) {
         let byte = &mut packed[index / 2];
@@ -1863,5 +1996,76 @@ mod tests {
             .copy_to_host(&stream)
             .expect("offset output copy");
         assert_eq!(&*direct_output, &offset_output[q_width..]);
+    }
+
+    #[test]
+    fn compact_cache_unpacks_to_bf16_tensor_core_layouts() {
+        const TOKENS: usize = 19;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        let width = KV_HEADS * HEAD_DIM;
+        let keys = (0..TOKENS * width)
+            .map(|index| ((index * 29 % 127) as f32 - 63.0) / 64.0)
+            .collect::<Vec<_>>();
+        let values = (0..TOKENS * width)
+            .map(|index| ((index * 43 % 113) as f32 - 56.0) / 64.0)
+            .collect::<Vec<_>>();
+        let key_rows = DeviceBuffer::from_host(&keys).expect("keys");
+        let value_rows = DeviceBuffer::from_host(&values).expect("values");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let mut cache = Sm12xKvCache::new(32, KV_HEADS, HEAD_DIM).expect("cache");
+        cache
+            .append_rows_at_offset_on_stream(&key_rows, &value_rows, 0, TOKENS, &stream)
+            .expect("append rows");
+        let mut key_output = DeviceBuffer::zeroed(TOKENS * width).expect("unpacked keys");
+        let mut value_output = DeviceBuffer::zeroed(TOKENS * width).expect("unpacked values");
+        cache
+            .unpack_bf16_on_stream(key_output.output(), value_output.output(), &stream)
+            .expect("unpack cache");
+        let actual_keys = key_output.copy_to_host(&stream).expect("read keys");
+        let actual_values = value_output.copy_to_host(&stream).expect("read values");
+
+        let mut staged_cache = Sm12xKvCache::new(32, KV_HEADS, HEAD_DIM).expect("staged cache");
+        let mut staged_keys = DeviceBuffer::zeroed(TOKENS * width).expect("staged keys");
+        let mut staged_values = DeviceBuffer::zeroed(TOKENS * width).expect("staged values");
+        staged_cache
+            .append_initial_rows_and_stage_bf16_on_stream(
+                &key_rows,
+                &value_rows,
+                0,
+                TOKENS,
+                staged_keys.output(),
+                staged_values.output(),
+                &stream,
+            )
+            .expect("append and stage rows");
+        assert_eq!(
+            &*staged_keys.copy_to_host(&stream).expect("read staged keys"),
+            &*actual_keys,
+        );
+        assert_eq!(
+            &*staged_values
+                .copy_to_host(&stream)
+                .expect("read staged values"),
+            &*actual_values,
+        );
+
+        let mut max_key_error = 0.0f32;
+        let mut max_value_error = 0.0f32;
+        for token in 0..TOKENS {
+            for head in 0..KV_HEADS {
+                for dim in 0..HEAD_DIM {
+                    let dense = token * width + head * HEAD_DIM + dim;
+                    let packed_key = (head * TOKENS + token) * HEAD_DIM + dim;
+                    let packed_value = (head * HEAD_DIM + dim) * TOKENS + token;
+                    max_key_error = max_key_error
+                        .max((bf16_to_f32(actual_keys[packed_key]) - keys[dense]).abs());
+                    max_value_error = max_value_error
+                        .max((bf16_to_f32(actual_values[packed_value]) - values[dense]).abs());
+                }
+            }
+        }
+        assert!(max_key_error < 0.20, "key max error {max_key_error}");
+        assert!(max_value_error < 0.20, "value max error {max_value_error}");
     }
 }

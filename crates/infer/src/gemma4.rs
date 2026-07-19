@@ -9,7 +9,8 @@ use nvfp4::{
     ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
     bf16_linear_argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
     gather_indexed_mul_f32_into_on_stream, gelu_tanh_mul_f32_into_on_stream,
-    moe_topk_f32_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    lm_head_top1_f32_into_on_stream, moe_topk_f32_into_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
     nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
@@ -21,7 +22,7 @@ use std::fs;
 use std::path::Path;
 
 mod batch;
-pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillRow};
+pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow};
 
 fn default_rms_norm_eps() -> f32 {
     1.0e-6
@@ -430,6 +431,7 @@ pub struct Gemma4DecodeState {
     kv_caches: Vec<Sm12xKvCache>,
     compact_attention: Vec<Sm12xKvAttentionWorkspace>,
     lm_logits: DeviceBuffer<f32>,
+    lm_top1_scratch_index: DeviceBuffer<u32>,
     lm_argmax: DeviceBuffer<u32>,
     lm_argmax_value: DeviceBuffer<f32>,
     position: usize,
@@ -1861,6 +1863,7 @@ impl Gemma4Model {
             kv_caches,
             compact_attention,
             lm_logits: DeviceBuffer::zeroed(self.config.vocab_size)?,
+            lm_top1_scratch_index: DeviceBuffer::zeroed(self.config.vocab_size)?,
             lm_argmax: DeviceBuffer::zeroed(1)?,
             lm_argmax_value: DeviceBuffer::zeroed(1)?,
             position: 0,
@@ -1876,7 +1879,7 @@ impl Gemma4Model {
         stream: &CudaStream,
     ) -> Result<()> {
         for &token in tokens {
-            self.forward_token(state, token, false, stream)?;
+            self.forward_token(state, token, Gemma4PrefillOutput::None, stream)?;
         }
         Ok(())
     }
@@ -1888,14 +1891,23 @@ impl Gemma4Model {
         token: u32,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.forward_token(state, token, true, stream)
+        self.forward_token(state, token, Gemma4PrefillOutput::FullLogits, stream)
+    }
+
+    pub(crate) fn forward_one_top1(
+        &self,
+        state: &mut Gemma4DecodeState,
+        token: u32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.forward_token(state, token, Gemma4PrefillOutput::Top1, stream)
     }
 
     fn forward_token(
         &self,
         state: &mut Gemma4DecodeState,
         token: u32,
-        produce_logits: bool,
+        output: Gemma4PrefillOutput,
         stream: &CudaStream,
     ) -> Result<()> {
         if token as usize >= self.config.vocab_size {
@@ -1943,7 +1955,7 @@ impl Gemma4Model {
                 stream,
             )?;
         }
-        if produce_logits {
+        if output != Gemma4PrefillOutput::None {
             let final_input = self
                 .layers
                 .last()
@@ -1956,16 +1968,30 @@ impl Gemma4Model {
                 &mut state.hidden,
                 stream,
             )?;
-            bf16_linear_argmax_f32_into_on_stream(
-                &state.hidden,
-                &self.embedding,
-                state.lm_logits.output(),
-                state.lm_argmax.output(),
-                state.lm_argmax_value.output(),
-                self.config.vocab_size,
-                self.config.hidden_size,
-                stream,
-            )?;
+            match output {
+                Gemma4PrefillOutput::None => unreachable!(),
+                Gemma4PrefillOutput::FullLogits => bf16_linear_argmax_f32_into_on_stream(
+                    &state.hidden,
+                    &self.embedding,
+                    state.lm_logits.output(),
+                    state.lm_argmax.output(),
+                    state.lm_argmax_value.output(),
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    stream,
+                )?,
+                Gemma4PrefillOutput::Top1 => lm_head_top1_f32_into_on_stream(
+                    &state.hidden,
+                    &self.embedding,
+                    &state.lm_logits,
+                    &state.lm_top1_scratch_index,
+                    &state.lm_argmax,
+                    &state.lm_argmax_value,
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    stream,
+                )?,
+            }
         }
         state.position += 1;
         Ok(())
@@ -2132,6 +2158,7 @@ impl Gemma4DecodeState {
                 .map(Sm12xKvAttentionWorkspace::device_bytes)
                 .sum::<usize>()
             + self.lm_logits.device_bytes()
+            + self.lm_top1_scratch_index.device_bytes()
             + self.lm_argmax.device_bytes()
             + self.lm_argmax_value.device_bytes()
     }
@@ -2566,6 +2593,76 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_batched_prefill_logits_stay_within_serial_tolerance() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/gemma-4-26b-a4b-nvfp4");
+        let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
+        let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
+        let mut serial = model
+            .new_decode_state(prompt.len() + 1)
+            .expect("serial state");
+        let mut batched = model
+            .new_decode_state(prompt.len() + 1)
+            .expect("batched state");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let mut serial_workspace = model
+            .new_prefill_batch_workspace(1, 1, prompt.len() + 1)
+            .expect("serial W4A4 workspace");
+        for token in &prompt[..prompt.len() - 1] {
+            model
+                .prefill_batch(
+                    &mut serial_workspace,
+                    &mut [Gemma4PrefillRow {
+                        token_ids: std::slice::from_ref(token),
+                        state: &mut serial,
+                        output: Gemma4PrefillOutput::None,
+                    }],
+                    &stream,
+                )
+                .expect("serial W4A4 prefill");
+        }
+        model
+            .forward_one(&mut serial, prompt[prompt.len() - 1], &stream)
+            .expect("serial prompt logits");
+        let mut workspace = model
+            .new_prefill_batch_workspace(1, prompt.len(), prompt.len() + 1)
+            .expect("batch workspace");
+        model
+            .prefill_batch(
+                &mut workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &prompt,
+                    state: &mut batched,
+                    output: Gemma4PrefillOutput::FullLogits,
+                }],
+                &stream,
+            )
+            .expect("batch prefill");
+        let serial_logits = model
+            .logits_to_host(&serial, &stream)
+            .expect("serial prompt logits");
+        let batched_logits = model
+            .logits_to_host(&batched, &stream)
+            .expect("batched prompt logits");
+        let error_rms = (serial_logits
+            .iter()
+            .zip(&batched_logits)
+            .map(|(serial, batched)| (serial - batched).powi(2))
+            .sum::<f32>()
+            / serial_logits.len() as f32)
+            .sqrt();
+        let reference_rms = (serial_logits.iter().map(|value| value.powi(2)).sum::<f32>()
+            / serial_logits.len() as f32)
+            .sqrt();
+        assert!(
+            error_rms <= reference_rms * 0.2,
+            "error_rms={error_rms} reference_rms={reference_rms}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
     fn local_batched_prefill_matches_token_serial_cache() {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -2590,6 +2687,7 @@ mod tests {
                     &mut [Gemma4PrefillRow {
                         token_ids: std::slice::from_ref(token),
                         state: &mut serial,
+                        output: Gemma4PrefillOutput::None,
                     }],
                     &stream,
                 )
@@ -2604,6 +2702,7 @@ mod tests {
                 &mut [Gemma4PrefillRow {
                     token_ids: &prompt,
                     state: &mut batched,
+                    output: Gemma4PrefillOutput::None,
                 }],
                 &stream,
             )

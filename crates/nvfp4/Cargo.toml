@@ -70,6 +70,10 @@ name = "nvfp4_kv_attention"
 harness = false
 
 [[bench]]
+name = "gemma4_prefill_attention"
+harness = false
+
+[[bench]]
 name = "nemotron3_dense_linear"
 harness = false
 
