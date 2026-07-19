@@ -35,6 +35,7 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
+    pub artifact_dir: PathBuf,
     pub scheduler: SchedulerConfig,
     pub prefix_cache: PrefixCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
@@ -47,8 +48,10 @@ pub struct InferenceActorConfig {
 
 impl InferenceActorConfig {
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
+        let model_dir = model_dir.into();
         Self {
-            model_dir: model_dir.into(),
+            artifact_dir: model_dir.join(".eider-cache"),
+            model_dir,
             scheduler: SchedulerConfig::default(),
             prefix_cache: PrefixCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
@@ -203,6 +206,7 @@ fn actor_main(
 ) {
     let InferenceActorConfig {
         model_dir,
+        artifact_dir,
         scheduler,
         prefix_cache,
         qwen_bf16_storage,
@@ -251,8 +255,9 @@ fn actor_main(
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
                 "loading Qwen3.6 model"
             );
-            let model = match Qwen36TextModel::open_with_storage(
+            let model = match Qwen36TextModel::open_with_storage_and_artifact_dir(
                 &model_dir,
+                &artifact_dir,
                 qwen_bf16_storage,
                 qwen_fp8_attention_storage,
             ) {
@@ -285,8 +290,9 @@ fn actor_main(
                 bf16_storage = ?step_bf16_storage,
                 "loading Step-3.7 model"
             );
-            let model = match Step37TextModel::open_with_bf16_storage(
+            let model = match Step37TextModel::open_with_bf16_storage_and_artifact_dir(
                 &model_dir,
+                &artifact_dir,
                 step_expert_capacity,
                 step_bf16_storage,
             ) {

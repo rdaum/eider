@@ -26,3 +26,6 @@ async-stream = "0.3"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+hf-hub = "1"
+fs2 = "0.4"
+futures = "0.3"

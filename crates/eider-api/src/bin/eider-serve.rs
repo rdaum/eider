@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use eider_api::deployment::{ArtifactKind, resolve_catalogue_model, resolve_local_model};
 use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 const TOKEN_RATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_LOG_FILTER: &str = "info,hf_xet=warn,xet_client=warn,xet_data=warn";
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum QwenBf16StorageArg {
@@ -121,16 +123,24 @@ impl From<NemotronFp8StorageArg> for Nemotron3Fp8Storage {
 #[derive(Debug, Parser)]
 #[command(about = "Serve Eider through the OpenAI Responses API")]
 struct Args {
-    /// Supported checkpoint directory.
-    model_dir: PathBuf,
+    /// Stable ID of a model in Eider's built-in catalogue.
+    model: Option<String>,
+
+    /// Explicit local checkpoint directory for development or conversion work.
+    #[arg(long, conflicts_with = "model")]
+    model_dir: Option<PathBuf>,
+
+    /// Prohibit network access while resolving a catalogue model.
+    #[arg(long)]
+    offline: bool,
 
     /// Address exposed by the HTTP server.
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
 
     /// Model name accepted in Responses requests.
-    #[arg(long, default_value = "eider-qwen3.6")]
-    served_model_name: String,
+    #[arg(long)]
+    served_model_name: Option<String>,
 
     /// Maximum simultaneous decode rows.
     #[arg(long, default_value_t = 8)]
@@ -141,16 +151,16 @@ struct Args {
     prefill_sequence_capacity: usize,
 
     /// Maximum total prompt tokens in one prefill iteration.
-    #[arg(long, default_value_t = 2_048)]
-    prefill_token_capacity: usize,
+    #[arg(long)]
+    prefill_token_capacity: Option<usize>,
 
     /// Maximum requests retaining device sequence state.
     #[arg(long, default_value_t = 8)]
     max_active_sequences: usize,
 
     /// Maximum prompt plus generated tokens per request.
-    #[arg(long, default_value_t = 32_768)]
-    max_context_tokens: usize,
+    #[arg(long)]
+    max_context_tokens: Option<usize>,
 
     /// Device-memory budget in GiB for prompt-prefix checkpoints; zero disables it.
     #[arg(long, default_value_t = 2)]
@@ -169,8 +179,8 @@ struct Args {
     qwen_fp8_attention: QwenFp8AttentionStorageArg,
 
     /// Resident expert slots per routed Step layer.
-    #[arg(long, default_value_t = 240)]
-    step_expert_capacity: usize,
+    #[arg(long)]
+    step_expert_capacity: Option<usize>,
 
     /// Runtime storage for BF16 Step attention projections.
     #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Nvfp4)]
@@ -222,18 +232,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(true)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .try_init();
     info!("Eider");
     let args = Args::parse();
-    let mut actor_config = InferenceActorConfig::new(&args.model_dir);
+    let resolved = match (args.model.as_deref(), args.model_dir) {
+        (Some(id), None) => resolve_catalogue_model(id, args.offline).await?,
+        (None, Some(path)) => resolve_local_model(path)?,
+        (Some(_), Some(_)) => unreachable!("clap rejects model plus --model-dir"),
+        (None, None) => return Err("provide a supported model ID or --model-dir PATH".into()),
+    };
+    if resolved.preparation == ArtifactKind::Step37Experts {
+        server_metrics().model_preparations.inc();
+        info!(artifact_dir = %resolved.artifact_dir.display(), "preparing Step-3.7 expert artifacts");
+        infer::step37::prepare_all_at(&resolved.checkpoint_dir, &resolved.artifact_dir)?;
+    }
+    let defaults = resolved.defaults;
+    let served_model_name = args
+        .served_model_name
+        .unwrap_or_else(|| defaults.served_model_name.to_string());
+    let max_context_tokens = args
+        .max_context_tokens
+        .unwrap_or(defaults.max_context_tokens);
+    let prefill_token_capacity = args
+        .prefill_token_capacity
+        .unwrap_or(defaults.prefill_token_capacity);
+    let step_expert_capacity = args
+        .step_expert_capacity
+        .unwrap_or(defaults.step_expert_capacity);
+    let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
+    actor_config.artifact_dir = resolved.artifact_dir.clone();
     actor_config.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,
-        prefill_token_capacity: args.prefill_token_capacity,
+        prefill_token_capacity,
         max_active_sequences: args.max_active_sequences,
-        max_context_tokens: args.max_context_tokens,
+        max_context_tokens,
     };
     actor_config.prefix_cache.max_device_bytes = args
         .prefix_cache_gib
@@ -244,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.qwen_bf16_lm_head.into(),
     );
     actor_config.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
-    actor_config.step_expert_capacity = args.step_expert_capacity;
+    actor_config.step_expert_capacity = step_expert_capacity;
     actor_config.step_bf16_storage = Step37Bf16StorageConfig {
         attention: args.step_bf16_attention.into(),
         dense_mlp: args.step_bf16_dense_mlp.into(),
@@ -260,11 +295,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
     let config = ApiConfig {
         listen: args.listen,
-        model: args.served_model_name,
+        model: served_model_name,
         bearer_token: std::env::var(&args.api_key_env).ok(),
-        context_window: args.max_context_tokens,
+        context_window: max_context_tokens,
     };
-    info!(model = %config.model, listen = %config.listen, "serving model");
+    info!(
+        model = %config.model,
+        identity = %resolved.identity,
+        checkpoint_dir = %resolved.checkpoint_dir.display(),
+        artifact_dir = %resolved.artifact_dir.display(),
+        listen = %config.listen,
+        "serving model"
+    );
 
     let metrics_task = match args.dogstatsd_endpoint {
         Some(endpoint) => start_dogstatsd_export(endpoint, args.dogstatsd_interval_secs),

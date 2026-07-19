@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fs2.workspace = true
 fast-telemetry.workspace = true
 rand = "0.9"
 rart.workspace = true

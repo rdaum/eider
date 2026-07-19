@@ -19,7 +19,7 @@ fi
 
 if command -v curl >/dev/null 2>&1 && ! curl --fail --silent --show-error "$health_url" >/dev/null; then
   echo "Eider is not ready at $health_url" >&2
-  echo "start it first with $repo_dir/scripts/run-eider-nemotron3-puzzle-server.sh" >&2
+  echo "start it first with eider-serve nemotron-3-puzzle-75b-a9b" >&2
   exit 1
 fi
 

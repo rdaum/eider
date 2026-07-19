@@ -17,3 +17,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+hf-hub.workspace = true
+fs2.workspace = true
+futures.workspace = true

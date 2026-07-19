@@ -19,7 +19,7 @@ fi
 
 if command -v curl >/dev/null 2>&1 && ! curl --fail --silent --show-error "$health_url" >/dev/null; then
   echo "Eider is not ready at $health_url" >&2
-  echo "start it first with $repo_dir/scripts/run-eider-agents-a1-server.sh" >&2
+  echo "start it first with eider-serve agents-a1" >&2
   exit 1
 fi
 

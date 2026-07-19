@@ -62,6 +62,7 @@ static NEXT_QWEN36_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Qwen36Model {
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
+    artifact_dir: PathBuf,
     bf16_storage: Qwen36Bf16StorageConfig,
     fp8_attention_storage: Qwen36Fp8AttentionStorage,
 }
@@ -342,6 +343,22 @@ impl Qwen36Model {
         bf16_storage: Qwen36Bf16StorageConfig,
         fp8_attention_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
+        let artifact_dir = model_dir.as_ref().join(".eider-cache/qwen36-experts-v1");
+        Self::open_with_storage_and_artifact_dir(
+            model_dir,
+            artifact_dir,
+            bf16_storage,
+            fp8_attention_storage,
+        )
+    }
+
+    /// Opens a checkpoint with a writable root for reconstructed expert data.
+    pub fn open_with_storage_and_artifact_dir(
+        model_dir: impl AsRef<std::path::Path>,
+        artifact_dir: impl Into<PathBuf>,
+        bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
+    ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir.as_ref())?;
         if manifest.architecture != QwenArchitecture::Qwen35Moe {
             return Err(Error::Format {
@@ -373,6 +390,7 @@ impl Qwen36Model {
         Ok(Self {
             manifest,
             checkpoint,
+            artifact_dir: artifact_dir.into(),
             bf16_storage,
             fp8_attention_storage,
         })
@@ -494,11 +512,23 @@ impl Qwen36Model {
                 actual: layer.to_string(),
             });
         }
-        Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer, false)
+        Qwen36MoeWeights::load(
+            &self.checkpoint,
+            &self.manifest,
+            &self.artifact_dir,
+            layer,
+            false,
+        )
     }
 
     fn load_moe_from_prepared_cache(&self, layer: usize) -> Result<Qwen36MoeWeights> {
-        Qwen36MoeWeights::load(&self.checkpoint, &self.manifest, layer, true)
+        Qwen36MoeWeights::load(
+            &self.checkpoint,
+            &self.manifest,
+            &self.artifact_dir,
+            layer,
+            true,
+        )
     }
 
     fn load_moe_from_prepared_cache_paged(
@@ -506,7 +536,14 @@ impl Qwen36Model {
         layer: usize,
         capacity: usize,
     ) -> Result<Qwen36MoeWeights> {
-        Qwen36MoeWeights::load_paged(&self.checkpoint, &self.manifest, layer, true, capacity)
+        Qwen36MoeWeights::load_paged(
+            &self.checkpoint,
+            &self.manifest,
+            &self.artifact_dir,
+            layer,
+            true,
+            capacity,
+        )
     }
 
     /// Allocates workspace for a loaded MoE + shared-expert FFN.
@@ -2586,12 +2623,20 @@ struct Qwen36ParallelMoe<'a> {
 impl Qwen36ExpertPager {
     /// Allocates `capacity` resident slots and retains only per-expert scalar metadata.
     pub fn load(model: &Qwen36Model, layer: usize, capacity: usize) -> Result<Self> {
-        Self::load_from_checkpoint(&model.checkpoint, &model.manifest, layer, capacity, false)
+        Self::load_from_checkpoint(
+            &model.checkpoint,
+            &model.manifest,
+            &model.artifact_dir,
+            layer,
+            capacity,
+            false,
+        )
     }
 
     fn load_from_checkpoint(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
+        artifact_root: &std::path::Path,
         layer: usize,
         capacity: usize,
         cache_prepared: bool,
@@ -2626,9 +2671,9 @@ impl Qwen36ExpertPager {
         }
 
         let cache_dir = if cache_prepared {
-            prepared_layer_dir(checkpoint, layer)
+            prepared_layer_dir(artifact_root, layer)
         } else {
-            ensure_layer_cache(checkpoint, manifest, layer)?
+            ensure_layer_cache(checkpoint, manifest, artifact_root, layer)?
         };
         let prefix = format!("{}.layers.{layer}.mlp.experts", manifest.tensor_prefix);
         let mut down_input_scales_host = Vec::with_capacity(experts);
@@ -2889,6 +2934,7 @@ impl Qwen36MoeWeights {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
+        artifact_root: &std::path::Path,
         layer: usize,
         cache_prepared: bool,
     ) -> Result<Self> {
@@ -2934,9 +2980,9 @@ impl Qwen36MoeWeights {
             );
         }
         let sm12x_cache_dir = if cache_prepared {
-            prepared_layer_dir(checkpoint, layer)
+            prepared_layer_dir(artifact_root, layer)
         } else {
-            ensure_layer_cache(checkpoint, manifest, layer)?
+            ensure_layer_cache(checkpoint, manifest, artifact_root, layer)?
         };
 
         let mut lazy_experts = Vec::with_capacity(experts);
@@ -3165,6 +3211,7 @@ impl Qwen36MoeWeights {
     fn load_paged(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
+        artifact_root: &std::path::Path,
         layer: usize,
         cache_prepared: bool,
         capacity: usize,
@@ -3208,6 +3255,7 @@ impl Qwen36MoeWeights {
         let pager = Qwen36ExpertPager::load_from_checkpoint(
             checkpoint,
             manifest,
+            artifact_root,
             layer,
             capacity,
             cache_prepared,
@@ -5837,6 +5885,7 @@ pub struct Qwen36TextModel {
     model_id: u64,
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
+    artifact_dir: PathBuf,
     lt: CublasLt,
     layers: Vec<Qwen36LayerBlock>,
     embedding: DeviceBuffer<u16>,
@@ -6286,6 +6335,22 @@ impl Qwen36TextModel {
         Self::from_qwen36_model(model)
     }
 
+    /// Loads the model with an explicit writable root for reconstructed experts.
+    pub fn open_with_storage_and_artifact_dir(
+        model_dir: impl AsRef<std::path::Path>,
+        artifact_dir: impl Into<PathBuf>,
+        bf16_storage: Qwen36Bf16StorageConfig,
+        fp8_attention_storage: Qwen36Fp8AttentionStorage,
+    ) -> Result<Self> {
+        let model = Qwen36Model::open_with_storage_and_artifact_dir(
+            model_dir,
+            artifact_dir,
+            bf16_storage,
+            fp8_attention_storage,
+        )?;
+        Self::from_qwen36_model(model)
+    }
+
     /// Loads the model with explicit runtime storage for BF16 weights.
     pub fn open_with_bf16_storage(
         model_dir: impl AsRef<std::path::Path>,
@@ -6333,9 +6398,10 @@ impl Qwen36TextModel {
     ) -> Result<Self> {
         let manifest = model.manifest().clone();
         let checkpoint = model.checkpoint().clone();
+        let artifact_dir = model.artifact_dir.clone();
         let bf16_storage = model.bf16_storage;
         let fp8_attention_storage = model.fp8_attention_storage;
-        ensure_model_cache(&checkpoint, &manifest)?;
+        ensure_model_cache(&checkpoint, &manifest, &artifact_dir)?;
         let lt = CublasLt::new()?;
         let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             &checkpoint,
@@ -6381,6 +6447,7 @@ impl Qwen36TextModel {
             model_id: NEXT_QWEN36_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             manifest,
             checkpoint,
+            artifact_dir,
             lt,
             layers,
             embedding,
@@ -6401,6 +6468,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             bf16_storage: self.bf16_storage,
             fp8_attention_storage: self.fp8_attention_storage,
         };
@@ -6457,6 +6525,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             bf16_storage: self.bf16_storage,
             fp8_attention_storage: self.fp8_attention_storage,
         };
@@ -6525,6 +6594,7 @@ impl Qwen36TextModel {
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
+            artifact_dir: self.artifact_dir.clone(),
             bf16_storage: self.bf16_storage,
             fp8_attention_storage: self.fp8_attention_storage,
         };

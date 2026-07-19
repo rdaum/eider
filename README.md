@@ -100,16 +100,9 @@ build uses the cuBLASLt or stub fallback where supported.
 
 ## Models
 
-Checkpoints kept under `models/`:
-
-- `models/qwen3-30b-a3b-nvfp4`
-- `models/qwen3.6-35b-a3b-nvfp4`
-- `models/qwen3.6-35b-a3b-nvfp4-unsloth-fast`
-- `models/qwen3.6-35b-a3b-nvfp4-unsloth`
-- `models/agents-a1-nvfp4`
-- `models/step-3.7-flash-nvfp4`
-- `models/gemma-4-26b-a4b-nvfp4`
-- `models/nemotron-3-super-120b-a12b-nvfp4`
+Supported catalogue checkpoints are fetched from Hugging Face into its local
+snapshot cache; the repository does not retain model weights under `models/`.
+Use `--model-dir PATH` only for local conversion or development checkpoints.
 
 Models are expected to use the repository's supported ModelOpt or
 compressed-tensors NVFP4/FP8 layouts and include the expected manifest and
@@ -134,69 +127,71 @@ uses an 88-layer Mamba-2, sparse latent-MoE, and grouped-query attention
 backbone with layer-specific expert widths and top-k routing. Eider loads those
 checkpoint settings directly and retains 41.9 GiB including its MTP block.
 
-The first Qwen3.6 startup builds the SM12x down-weight cache under
-`.eider-cache/sm12x-down-v1/` inside the model directory. This is a one-time,
-down-only repack of roughly 5 GiB for the 35B-A3B checkpoint. Mixed-precision
-checkpoints build it only for layers whose down weights are NVFP4. Cache files
-are written atomically and incomplete layers are resumed on the next startup;
-later runs validate and reuse the completed cache automatically.
+Catalogue deployments keep Hugging Face snapshots immutable. The first Qwen3.6
+or Agents-A1 start builds its SM12x down-weight cache below
+`$XDG_CACHE_HOME/eider/models/`; Step-3.7 expert records are stored there too.
+This is a one-time, down-only repack of roughly 5 GiB for the 35B-A3B
+checkpoint. Mixed-precision checkpoints build it only for layers whose down
+weights are NVFP4. Cache files are written atomically and incomplete layers are
+resumed on the next startup; later runs validate and reuse the completed cache
+automatically.
 
 ## Running the server
 
-Start the Qwen3.6 server with:
+The convenience launcher builds and runs the release server through Cargo. It
+defaults to the NVIDIA Gemma 4 NVFP4 catalogue entry and forwards all server
+arguments:
 
 ```sh
-scripts/run-eider-qwen-server.sh
+scripts/run-eider
+scripts/run-eider --offline
+EIDER_MODEL=gemma-4-26b-a4b-it scripts/run-eider
 ```
 
-Its native FP8 attention projections remain FP8 by default. Set
-`EIDER_QWEN_FP8_ATTENTION=nvfp4` to enable the experimental runtime conversion.
-
-Start Agents-A1 with:
+To select any supported model directly, pass its stable catalogue ID to
+`eider-serve`:
 
 ```sh
-scripts/run-eider-agents-a1-server.sh
+eider-serve qwen3.6-35b-a3b
+eider-serve agents-a1
+eider-serve step-3.7-flash
+eider-serve gemma-4-26b-a4b-nvfp4
+eider-serve gemma-4-26b-a4b-it
+eider-serve nemotron-3-puzzle-75b-a9b
+eider-serve nemotron-3-super-120b-a12b
 ```
 
-Start Step-3.7 with:
+List the current catalogue without downloading anything:
 
 ```sh
-scripts/run-eider-stepfun-server.sh
+cargo run --release -p eider-api --bin eider -- model list
 ```
 
-Start Gemma 4 with:
-
-```sh
-scripts/run-eider-gemma4-server.sh
-```
-
-Start Nemotron Labs 3 Puzzle with:
-
-```sh
-scripts/run-eider-nemotron3-puzzle-server.sh
-```
+The first catalogue start resolves the pinned Hugging Face revision, downloads
+the required checkpoint files, prepares any Eider artifacts, and then serves.
+Later starts reuse both caches; pass `--offline` to require a complete local
+snapshot. Use `--model-dir PATH` only for local conversion or development
+checkpoints. The NVIDIA NVFP4 and upstream BF16 Gemma 4 entries both serve the
+Gemma text path; multimodal inputs are not yet exposed through Eider's API.
 
 The Nemotron launcher stores dense weights in NVFP4 and uses an FP32
-backbone-attention cache by default. Set `EIDER_NEMOTRON_KV_CACHE=nvfp4` when
+backbone-attention cache by default. Pass `--nemotron-kv-cache nvfp4` when
 long-context headroom matters more than serving speed. It also uses the shared
-prompt-prefix cache by default; set `--prefix-cache-gib 0` to disable it.
+prompt-prefix cache by default; pass `--prefix-cache-gib 0` to disable it.
 
-The StepFun launcher prepares or validates the disk-backed expert cache before
-starting the server and defaults to 240 resident experts per routed layer. Set
-`EIDER_STEP_EXPERT_CAPACITY` to change that tradeoff. Its BF16 attention,
-dense MLP, shared-expert, and LM-head weights default to NVFP4; override them
-independently with `EIDER_STEP_BF16_ATTENTION`, `EIDER_STEP_BF16_DENSE_MLP`,
-`EIDER_STEP_BF16_SHARED_EXPERT`, and `EIDER_STEP_BF16_LM_HEAD`, each accepting
-`bf16` or `nvfp4`. The Agents-A1 server
-accepts the checkpoint's full 262,144-token context; override it with
-`EIDER_MAX_CONTEXT_TOKENS`. Its BF16 attention projections and LM head default
-to NVFP4; `EIDER_QWEN_BF16_ATTENTION` and `EIDER_QWEN_BF16_LM_HEAD` independently
-accept `bf16`, `fp8`, or `nvfp4`. Its Pi entry advertises a 131,072-token working
-window so compaction starts well before that hard limit. The launchers build
-the release server, listen on `127.0.0.1:8080`, and default the API key to
-`local-eider`.
-Override their model, listen address, served name, or key with `EIDER_MODEL_DIR`,
-`EIDER_LISTEN`, `EIDER_SERVED_MODEL`, and `EIDER_API_KEY`.
+Step-3.7 prepares or validates the disk-backed expert cache before starting the
+server and defaults to 240 resident experts per routed layer; use
+`--step-expert-capacity` to change that tradeoff. Its BF16 attention, dense
+MLP, shared-expert, and LM-head weights default to NVFP4; select their storage
+with the corresponding `--step-bf16-*` flags. Agents-A1 accepts the checkpoint's
+full 262,144-token context; use `--max-context-tokens` to override it. Its BF16
+attention projections and LM head default to NVFP4; use
+`--qwen-bf16-attention` and `--qwen-bf16-lm-head` to select `bf16`, `fp8`, or
+`nvfp4`. Its Pi entry advertises a 131,072-token working window so compaction
+starts well before that hard limit. The server listens on `127.0.0.1:8080` by
+default and reads an optional bearer token from `EIDER_API_KEY`. Use
+`EIDER_MODEL` to change the `scripts/run-eider` model, or pass `--listen`,
+`--served-model-name`, and `--api-key-env` to the server.
 The server exposes Prometheus text at `/metrics` and health at `/healthz`; set
 `EIDER_DOGSTATSD_ENDPOINT` (with optional `EIDER_DOGSTATSD_INTERVAL_SECS`) to
 additionally push metrics over UDP. The `eider-serve` binary also takes

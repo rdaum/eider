@@ -18,7 +18,7 @@ fi
 
 if command -v curl >/dev/null 2>&1 && ! curl --fail --silent --show-error "$health_url" >/dev/null; then
   echo "Eider is not ready at $health_url" >&2
-  echo "start it first with $repo_dir/scripts/run-eider-qwen-server.sh" >&2
+  echo "start it first with eider-serve qwen3.6-35b-a3b" >&2
   exit 1
 fi
 

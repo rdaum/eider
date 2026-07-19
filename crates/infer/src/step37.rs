@@ -4,6 +4,7 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
+use fs2::FileExt as Fs2FileExt;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear,
@@ -143,6 +144,11 @@ pub struct Step37ExpertRecordSource {
 
 impl Step37ExpertRecordSource {
     pub fn open(model_dir: impl AsRef<Path>, layer: usize) -> Result<Self> {
+        Self::open_at(model_dir.as_ref().join(CACHE_DIR), layer)
+    }
+
+    /// Opens prepared records from an explicit artifact root.
+    pub fn open_at(artifact_dir: impl AsRef<Path>, layer: usize) -> Result<Self> {
         if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
             return Err(Error::Shape {
                 label: "Step-3.7 prepared expert layer",
@@ -150,7 +156,7 @@ impl Step37ExpertRecordSource {
                 actual: layer.to_string(),
             });
         }
-        let path = layer_path(model_dir.as_ref(), layer);
+        let path = layer_path(artifact_dir.as_ref(), layer);
         let file = File::open(&path).map_err(|error| cache_io_error("open", &path, error))?;
         let header = read_header(&file, &path)?;
         if header.layer != layer {
@@ -1287,7 +1293,7 @@ impl Step37ExpertStaging {
 impl Step37PagedExperts {
     /// Allocates `capacity` routed-expert slots for `layer`.
     pub fn load(model_dir: impl AsRef<Path>, layer: usize, capacity: usize) -> Result<Self> {
-        let source = Step37ExpertRecordSource::open(model_dir, layer)?;
+        let source = Step37ExpertRecordSource::open_at(model_dir, layer)?;
         let gate_up = MarlinNvfp4GateUp::new_empty_slots(capacity, GATE_UP, HIDDEN)?;
         let mut down = Vec::with_capacity(capacity);
         for _ in 0..capacity {
@@ -1680,6 +1686,7 @@ impl Step37LayerWorkspace {
 impl Step37Layer {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
+        artifact_dir: &Path,
         layer: usize,
         expert_capacity: usize,
         bf16_storage: Step37Bf16StorageConfig,
@@ -1702,7 +1709,7 @@ impl Step37Layer {
                 )?,
                 router: Step37Router::load(checkpoint, layer)?,
                 paged: Box::new(Step37PagedExperts::load(
-                    checkpoint.root(),
+                    artifact_dir,
                     layer,
                     expert_capacity,
                 )?),
@@ -1935,6 +1942,22 @@ impl Step37TextModel {
         expert_capacity: usize,
         bf16_storage: Step37Bf16StorageConfig,
     ) -> Result<Self> {
+        let artifact_dir = model_dir.as_ref().join(CACHE_DIR);
+        Self::open_with_bf16_storage_and_artifact_dir(
+            model_dir,
+            artifact_dir,
+            expert_capacity,
+            bf16_storage,
+        )
+    }
+
+    /// Opens Step-3.7 with a writable root for reconstructed expert records.
+    pub fn open_with_bf16_storage_and_artifact_dir(
+        model_dir: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+        expert_capacity: usize,
+        bf16_storage: Step37Bf16StorageConfig,
+    ) -> Result<Self> {
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let vocab = 128_896;
         let embedding = read_bf16_matrix(
@@ -1950,6 +1973,7 @@ impl Step37TextModel {
         for layer in 0..45 {
             layers.push(Step37Layer::load(
                 &checkpoint,
+                artifact_dir.as_ref(),
                 layer,
                 expert_capacity,
                 bf16_storage,
@@ -2367,7 +2391,8 @@ impl Step37ResidentExperts {
             "reserved fixed Step tensors"
         );
         for layer in FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS {
-            let resident = ResidentLayer::load(&layer_path(model_dir, layer), layer)?;
+            let resident =
+                ResidentLayer::load(&layer_path(&model_dir.join(CACHE_DIR), layer), layer)?;
             loaded += resident.bytes;
             info!(
                 layer,
@@ -2458,17 +2483,37 @@ impl ResidentLayer {
 /// Prepares every MoE layer into fixed-size, randomly addressable expert records.
 pub fn prepare_all(model_dir: impl AsRef<Path>) -> Result<()> {
     let model_dir = model_dir.as_ref();
+    let artifact_dir = model_dir.join(CACHE_DIR);
+    prepare_all_at(model_dir, artifact_dir)
+}
+
+/// Prepares every routed-expert layer below an explicit writable artifact root.
+pub fn prepare_all_at(model_dir: impl AsRef<Path>, artifact_dir: impl AsRef<Path>) -> Result<()> {
+    let model_dir = model_dir.as_ref();
+    let artifact_dir = artifact_dir.as_ref();
     let checkpoint = ModelOptCheckpoint::open(model_dir)?;
-    std::fs::create_dir_all(cache_root(model_dir))
-        .map_err(|error| cache_io_error("create", &cache_root(model_dir), error))?;
+    std::fs::create_dir_all(artifact_dir)
+        .map_err(|error| cache_io_error("create", artifact_dir, error))?;
+    let _lock = lock_artifact_root(artifact_dir)?;
     for layer in FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS {
-        prepare_layer(&checkpoint, layer)?;
+        prepare_layer(&checkpoint, artifact_dir, layer)?;
     }
     Ok(())
 }
 
 /// Prepares one MoE layer into fixed-size, randomly addressable expert records.
 pub fn prepare_one(model_dir: impl AsRef<Path>, layer: usize) -> Result<()> {
+    let model_dir = model_dir.as_ref();
+    let artifact_dir = model_dir.join(CACHE_DIR);
+    prepare_one_at(model_dir, artifact_dir, layer)
+}
+
+/// Prepares one routed-expert layer below an explicit writable artifact root.
+pub fn prepare_one_at(
+    model_dir: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    layer: usize,
+) -> Result<()> {
     if !(FIRST_MOE_LAYER..FIRST_MOE_LAYER + LAYERS).contains(&layer) {
         return Err(Error::Shape {
             label: "Step-3.7 expert preparation layer",
@@ -2477,14 +2522,16 @@ pub fn prepare_one(model_dir: impl AsRef<Path>, layer: usize) -> Result<()> {
         });
     }
     let model_dir = model_dir.as_ref();
+    let artifact_dir = artifact_dir.as_ref();
     let checkpoint = ModelOptCheckpoint::open(model_dir)?;
-    std::fs::create_dir_all(cache_root(model_dir))
-        .map_err(|error| cache_io_error("create", &cache_root(model_dir), error))?;
-    prepare_layer(&checkpoint, layer)
+    std::fs::create_dir_all(artifact_dir)
+        .map_err(|error| cache_io_error("create", artifact_dir, error))?;
+    let _lock = lock_artifact_root(artifact_dir)?;
+    prepare_layer(&checkpoint, artifact_dir, layer)
 }
 
-fn prepare_layer(checkpoint: &ModelOptCheckpoint, layer: usize) -> Result<()> {
-    let path = layer_path(checkpoint.root(), layer);
+fn prepare_layer(checkpoint: &ModelOptCheckpoint, artifact_dir: &Path, layer: usize) -> Result<()> {
+    let path = layer_path(artifact_dir, layer);
     if cache_matches(&path, layer) {
         info!(layer, "Step expert cache layer is already complete");
         return Ok(());
@@ -2726,12 +2773,22 @@ fn cache_matches(path: &Path, layer: usize) -> bool {
         .is_ok_and(|header| header.layer == layer)
 }
 
-fn cache_root(model_dir: &Path) -> PathBuf {
-    model_dir.join(CACHE_DIR)
+fn layer_path(artifact_dir: &Path, layer: usize) -> PathBuf {
+    artifact_dir.join(format!("layer-{layer:03}.experts"))
 }
 
-fn layer_path(model_dir: &Path, layer: usize) -> PathBuf {
-    cache_root(model_dir).join(format!("layer-{layer:03}.experts"))
+fn lock_artifact_root(artifact_dir: &Path) -> Result<File> {
+    let path = artifact_dir.join(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| cache_io_error("open", &path, error))?;
+    file.lock_exclusive()
+        .map_err(|error| cache_io_error("lock", &path, error))?;
+    Ok(file)
 }
 
 fn cache_io_error(action: &'static str, path: &Path, error: std::io::Error) -> Error {

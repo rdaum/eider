@@ -89,6 +89,15 @@ pub struct ServerMetrics {
     #[help = "DogStatsD export ticks completed"]
     pub dogstatsd_export_ticks: Counter,
 
+    #[help = "Model catalogue resolutions started"]
+    pub model_resolutions: Counter,
+
+    #[help = "Checkpoint bytes planned by Hugging Face snapshot downloads"]
+    pub model_download_bytes: Counter,
+
+    #[help = "Model preparation operations started"]
+    pub model_preparations: Counter,
+
     #[help = "HTTP request handling duration in microseconds"]
     pub request_duration_us: Histogram,
 
@@ -121,6 +130,9 @@ impl ServerMetrics {
             dogstatsd_exporters_started: Counter::new(shard_count),
             dogstatsd_configured: Gauge::new(),
             dogstatsd_export_ticks: Counter::new(shard_count),
+            model_resolutions: Counter::new(shard_count),
+            model_download_bytes: Counter::new(shard_count),
+            model_preparations: Counter::new(shard_count),
             request_duration_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             request_admission_duration_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             decode_tokens_per_second: Histogram::new(RATE_BUCKETS, shard_count),

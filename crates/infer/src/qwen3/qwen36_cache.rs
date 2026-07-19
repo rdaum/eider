@@ -1,37 +1,47 @@
 use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
+use fs2::FileExt;
 use nvfp4::{
     Error, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
     Sm12xFp4GemmWeight,
 };
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
-const CACHE_DIR: &str = ".eider-cache/qwen36-experts-v1";
 const CACHE_MARKER_VERSION: &str = "eider-qwen36-experts-v1";
 
 pub(crate) fn ensure_model_cache(
     checkpoint: &ModelOptCheckpoint,
     manifest: &QwenModelManifest,
+    artifact_root: &Path,
 ) -> Result<()> {
     let missing = (0..manifest.layers)
         .filter(|&layer| layer_uses_nvfp4_down(checkpoint, manifest, layer))
-        .filter(|&layer| !layer_cache_complete(checkpoint, manifest, layer))
+        .filter(|&layer| !layer_cache_complete(checkpoint, manifest, artifact_root, layer))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let _lock = lock_artifact_root(artifact_root)?;
+    let missing = (0..manifest.layers)
+        .filter(|&layer| layer_uses_nvfp4_down(checkpoint, manifest, layer))
+        .filter(|&layer| !layer_cache_complete(checkpoint, manifest, artifact_root, layer))
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return Ok(());
     }
 
     let missing_count = missing.len();
-    let cache_root = cache_root(checkpoint);
     info!(
         missing_layers = missing_count,
-        cache_root = %cache_root.display(),
+        cache_root = %artifact_root.display(),
         "preparing SM12x down cache"
     );
     for (completed, layer) in missing.iter().copied().enumerate() {
-        if let Err(error) = build_layer_cache(checkpoint, manifest, layer) {
+        if let Err(error) = build_layer_cache(checkpoint, manifest, artifact_root, layer) {
             metrics().sm12x_cache_errors.inc();
             return Err(error);
         }
@@ -49,6 +59,7 @@ pub(crate) fn ensure_model_cache(
 pub(crate) fn ensure_layer_cache(
     checkpoint: &ModelOptCheckpoint,
     manifest: &QwenModelManifest,
+    artifact_root: &Path,
     layer: usize,
 ) -> Result<PathBuf> {
     if layer >= manifest.layers {
@@ -59,17 +70,17 @@ pub(crate) fn ensure_layer_cache(
         });
     }
     if !layer_uses_nvfp4_down(checkpoint, manifest, layer) {
-        return Ok(layer_dir(checkpoint, layer));
+        return Ok(layer_dir(artifact_root, layer));
     }
-    if !layer_cache_complete(checkpoint, manifest, layer) {
+    if !layer_cache_complete(checkpoint, manifest, artifact_root, layer) {
         info!(layer, "preparing SM12x down cache layer");
-        if let Err(error) = build_layer_cache(checkpoint, manifest, layer) {
+        if let Err(error) = build_layer_cache(checkpoint, manifest, artifact_root, layer) {
             metrics().sm12x_cache_errors.inc();
             return Err(error);
         }
         metrics().sm12x_cache_layers_prepared.inc();
     }
-    Ok(layer_dir(checkpoint, layer))
+    Ok(layer_dir(artifact_root, layer))
 }
 
 fn layer_uses_nvfp4_down(
@@ -86,17 +97,18 @@ fn layer_uses_nvfp4_down(
     ))
 }
 
-pub(crate) fn prepared_layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {
-    layer_dir(checkpoint, layer)
+pub(crate) fn prepared_layer_dir(artifact_root: &Path, layer: usize) -> PathBuf {
+    layer_dir(artifact_root, layer)
 }
 
 fn build_layer_cache(
     checkpoint: &ModelOptCheckpoint,
     manifest: &QwenModelManifest,
+    artifact_root: &Path,
     layer: usize,
 ) -> Result<()> {
     let (experts, intermediate) = moe_shape(manifest)?;
-    let layer_dir = layer_dir(checkpoint, layer);
+    let layer_dir = layer_dir(artifact_root, layer);
     std::fs::create_dir_all(&layer_dir)
         .map_err(|error| cache_fs_error("create", &layer_dir, error))?;
 
@@ -209,12 +221,13 @@ fn build_expert_cache(
 fn layer_cache_complete(
     checkpoint: &ModelOptCheckpoint,
     manifest: &QwenModelManifest,
+    artifact_root: &Path,
     layer: usize,
 ) -> bool {
     let Ok(expected_marker) = marker_contents(checkpoint, manifest, layer) else {
         return false;
     };
-    let layer_dir = layer_dir(checkpoint, layer);
+    let layer_dir = layer_dir(artifact_root, layer);
     if !matches!(
         std::fs::read_to_string(layer_dir.join(".complete")),
         Ok(marker) if marker == expected_marker
@@ -310,12 +323,24 @@ fn moe_shape(manifest: &QwenModelManifest) -> Result<(usize, usize)> {
     }
 }
 
-fn cache_root(checkpoint: &ModelOptCheckpoint) -> PathBuf {
-    checkpoint.root().join(CACHE_DIR)
+fn layer_dir(artifact_root: &Path, layer: usize) -> PathBuf {
+    artifact_root.join(format!("layer-{layer:03}"))
 }
 
-fn layer_dir(checkpoint: &ModelOptCheckpoint, layer: usize) -> PathBuf {
-    cache_root(checkpoint).join(format!("layer-{layer:03}"))
+fn lock_artifact_root(artifact_root: &Path) -> Result<File> {
+    std::fs::create_dir_all(artifact_root)
+        .map_err(|error| cache_fs_error("create", artifact_root, error))?;
+    let path = artifact_root.join(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| cache_fs_error("open", &path, error))?;
+    file.lock_exclusive()
+        .map_err(|error| cache_fs_error("lock", &path, error))?;
+    Ok(file)
 }
 
 pub(crate) fn down_path(layer_dir: &Path, expert: usize) -> PathBuf {
