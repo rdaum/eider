@@ -29,35 +29,32 @@ NVFP4 in `llama.cpp`.
 
 ### Performance
 
-Eider's OpenAI-compatible API sustains about 72.7 decode tokens/sec with
-[Qwen3.6-35B-A3B NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4)
-and the checkpoint's default sampling policy. For a rough comparison, vLLM's
-OpenAI-compatible API reaches about 77 decode tokens/sec with the same model
-using BF16 KV and greedy sampling.
+Representative single-session results on one GB10 are below. Decode rates are
+through the OpenAI-compatible API; a dash means that a comparable vLLM
+throughput run has not been completed.
 
-[Agents-A1](https://internscience.github.io/Agents-A1/) reaches 63.6 decode
-tokens/sec with FP8 conversion, compared with 44.9 using its checkpoint-native
-weights and 37.2 for vLLM in the same API comparison. A Pi
-coding session sustained 58-60 tokens/sec through 4,200-token turns and 44.5 at
-17,748 tokens.
+| Model | Eider decode tok/s | vLLM decode tok/s | Configuration |
+| --- | ---: | ---: | --- |
+| [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | 72.7 | 77.0 | NVFP4 weights; compact FP4 KV in Eider, BF16 KV in vLLM |
+| [Agents-A1](https://internscience.github.io/Agents-A1/) | 63.6 | 37.2 | Eider FP8-converted attention and LM head; checkpoint-native vLLM |
+| [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | 20.4 | — | 240 of 288 routed experts resident per layer |
+| [Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | 30.1 | 29.6 | Same ModelOpt NVFP4 weights; compact FP4 KV in Eider, FP8 E4M3 KV in vLLM |
+| [Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | — | — | Throughput comparison pending |
 
-[Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) is a
-198B checkpoint served with disk-backed expert paging. Eider also converts its
-remaining BF16 attention, dense and shared FFNs, and LM head to NVFP4 at load
-time. With 240 of 288 experts resident per routed layer, this reduces device
-weights from 95.5 to 87.3 GiB and sustains about 20.4 API decode tokens/sec once
-the required experts are resident.
+Gemma prefills a fresh roughly 2,700-token API request at about 840 tokens/sec,
+compared with about 7,100 tokens/sec in vLLM; an identical Eider cached-prefix
+request reached first-token latency of 258 ms. An Agents-A1 Pi session sustained
+58-60 decode tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
 
-[Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4)
-is a compressed hybrid agent model derived from Nemotron 3 Super. Its NVFP4
-checkpoint occupies 41.9 GiB of Eider device weights on Spark.
+Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
+its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5
+to 87.3 GiB. Puzzle occupies 41.9 GiB of Eider device weights.
 
-Compared with a vLLM setup in docker, the more biggest differences is
-operational: Eider starts up substantially faster and has a smaller idle footprint
-because sequence state is allocated on demand rather than as a large up-front
-KV pool. It also supports a compact NVFP4 KV cache directly on SM121; current
-vLLM builds cannot use their NVFP4 KV path for this model on GB10 and fall back
-to BF16.
+The largest differences from vLLM are operational: Eider starts substantially
+faster and has a smaller idle footprint because sequence state is allocated on
+demand rather than as a large up-front KV pool. It also supports a compact
+NVFP4 KV cache directly on SM121. The local vLLM Puzzle control used FP8 E4M3
+KV rather than NVFP4.
 
 Both advantages leave more of the Spark's 128 GB unified memory available for
 longer contexts and concurrent requests. In particular, the smaller NVFP4 KV
