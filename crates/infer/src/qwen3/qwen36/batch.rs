@@ -23,7 +23,7 @@ use crate::nvfp4::{
     moe_silu_quantize_bf16_slots_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
@@ -44,6 +44,7 @@ const GDN_HEADS: usize = 32;
 const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
 const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
+const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
 
 /// One scheduler-selected prompt chunk for batched prefill.
 pub struct Qwen36PrefillRow<'tokens, 'state> {
@@ -157,6 +158,77 @@ impl Qwen36DecodedBatch<'_> {
 struct BatchFp8LinearPlan {
     plans: HashMap<usize, Fp8TnMatmulPlan>,
     scalar_channel_scale: DeviceBuffer<f32>,
+}
+
+#[derive(Clone, Copy)]
+enum BatchFp8InputQuantization {
+    Unused,
+    Dynamic,
+    Static(f32),
+}
+
+fn prepare_fp8_batch_input(
+    linears: &[&Qwen36Linear],
+    input: &DeviceBuffer<f32>,
+    quantized: &mut DeviceBuffer<u8>,
+    dynamic_scale: &mut DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<BatchFp8InputQuantization> {
+    let mut static_scale: Option<f32> = None;
+    let mut has_fp8 = false;
+    for linear in linears {
+        let Qwen36Linear::Fp8(linear) = linear else {
+            continue;
+        };
+        has_fp8 = true;
+        let Some(input_scale) = linear
+            .input_scale
+            .filter(|_| linear.channel_weight_scale.is_none() && !linear.weight_only)
+        else {
+            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                input,
+                quantized,
+                dynamic_scale,
+                rows,
+                cols,
+                stream,
+            )?;
+            return Ok(BatchFp8InputQuantization::Dynamic);
+        };
+        if let Some(scale) = static_scale
+            && scale.to_bits() != input_scale.to_bits()
+        {
+            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                input,
+                quantized,
+                dynamic_scale,
+                rows,
+                cols,
+                stream,
+            )?;
+            return Ok(BatchFp8InputQuantization::Dynamic);
+        }
+        static_scale = Some(input_scale);
+    }
+    if !has_fp8 {
+        return Ok(BatchFp8InputQuantization::Unused);
+    }
+    if rows < STATIC_FP8_PREFILL_MIN_ROWS {
+        quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+            input,
+            quantized,
+            dynamic_scale,
+            rows,
+            cols,
+            stream,
+        )?;
+        return Ok(BatchFp8InputQuantization::Dynamic);
+    }
+    let input_scale = static_scale.expect("FP8 input has a static scale");
+    quantize_fp8_e4m3_f32_into_on_stream(input, quantized.output(), input_scale, stream)?;
+    Ok(BatchFp8InputQuantization::Static(input_scale))
 }
 
 impl BatchFp8LinearPlan {
@@ -278,10 +350,6 @@ fn new_batch_linear_plan(
     }
 }
 
-fn is_fp8_linear(linear: &Qwen36Linear) -> bool {
-    matches!(linear, Qwen36Linear::Fp8(_))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_fp8_batch(
     model: &Qwen36TextModel,
@@ -290,6 +358,7 @@ fn run_fp8_batch(
     _raw_input: &DeviceBuffer<f32>,
     input: &DeviceBuffer<u8>,
     input_scale: &DeviceBuffer<f32>,
+    input_quantization: BatchFp8InputQuantization,
     output: &mut DeviceBuffer<f32>,
     rows: usize,
     _w8a16_threads: usize,
@@ -301,6 +370,32 @@ fn run_fp8_batch(
             GemmShape::new(linear.rows, rows, linear.cols),
             8 << 20,
         )?);
+    }
+    if let BatchFp8InputQuantization::Static(input_scale) = input_quantization {
+        if linear.channel_weight_scale.is_some()
+            || linear.input_scale.map(f32::to_bits) != Some(input_scale.to_bits())
+        {
+            return Err(crate::nvfp4::Error::Format {
+                label: "Qwen3.6 static FP8 batch input",
+                detail: "projection does not match the prepared static activation scale"
+                    .to_string(),
+            });
+        }
+        plan.plans[&rows].run_with_alpha_on_stream(
+            &model.lt,
+            &linear.weight,
+            input,
+            output.output(),
+            linear.weight_scale * input_scale,
+            stream,
+        )?;
+        return maybe_round_device_f32_to_bf16(output, stream);
+    }
+    if matches!(input_quantization, BatchFp8InputQuantization::Unused) {
+        return Err(crate::nvfp4::Error::Format {
+            label: "Qwen3.6 FP8 batch input",
+            detail: "FP8 projection was given no prepared activation".to_string(),
+        });
     }
     plan.plans[&rows].run_with_alpha_on_stream(
         &model.lt,
@@ -403,6 +498,7 @@ fn run_linear_batch(
     raw_input: &DeviceBuffer<f32>,
     input: &DeviceBuffer<u8>,
     input_scale: &DeviceBuffer<f32>,
+    input_quantization: BatchFp8InputQuantization,
     output: &mut DeviceBuffer<f32>,
     rows: usize,
     w8a16_threads: usize,
@@ -429,6 +525,7 @@ fn run_linear_batch(
             raw_input,
             input,
             input_scale,
+            input_quantization,
             output,
             rows,
             w8a16_threads,
@@ -2242,14 +2339,29 @@ impl Qwen36TextModel {
                 stream,
             )?,
             Qwen36LmHead::Fp8 { linear, .. } => {
-                quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
-                    &workspace.final_hidden,
-                    &mut workspace.lm_head_quantized,
-                    &mut workspace.lm_head_scale,
-                    workspace.capacity,
-                    self.manifest.hidden,
-                    stream,
-                )?;
+                let input_quantization = if workspace.capacity >= STATIC_FP8_PREFILL_MIN_ROWS
+                    && let Some(input_scale) = linear
+                        .input_scale
+                        .filter(|_| linear.channel_weight_scale.is_none() && !linear.weight_only)
+                {
+                    quantize_fp8_e4m3_f32_into_on_stream(
+                        &workspace.final_hidden,
+                        workspace.lm_head_quantized.output(),
+                        input_scale,
+                        stream,
+                    )?;
+                    BatchFp8InputQuantization::Static(input_scale)
+                } else {
+                    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                        &workspace.final_hidden,
+                        &mut workspace.lm_head_quantized,
+                        &mut workspace.lm_head_scale,
+                        workspace.capacity,
+                        self.manifest.hidden,
+                        stream,
+                    )?;
+                    BatchFp8InputQuantization::Dynamic
+                };
                 run_fp8_batch(
                     self,
                     linear,
@@ -2266,6 +2378,7 @@ impl Qwen36TextModel {
                     &workspace.final_hidden,
                     &workspace.lm_head_quantized,
                     &workspace.lm_head_scale,
+                    input_quantization,
                     &mut workspace.logits,
                     workspace.capacity,
                     256,
@@ -2299,7 +2412,8 @@ impl Qwen36LinearAttentionWeights {
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+        let hidden_quantization = prepare_fp8_batch_input(
+            &[&self.qkv, &self.z],
             hidden,
             &mut workspace.hidden_quantized,
             &mut workspace.hidden_scale,
@@ -2314,6 +2428,7 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.qkv_output,
             capacity,
             128,
@@ -2326,6 +2441,7 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.z_output,
             capacity,
             128,
@@ -2387,7 +2503,8 @@ impl Qwen36LinearAttentionWeights {
             model.manifest.rms_eps,
             stream,
         )?;
-        quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+        let value_quantization = prepare_fp8_batch_input(
+            &[&self.out],
             &workspace.normed,
             &mut workspace.value_quantized,
             &mut workspace.value_scale,
@@ -2402,6 +2519,7 @@ impl Qwen36LinearAttentionWeights {
             &workspace.normed,
             &workspace.value_quantized,
             &workspace.value_scale,
+            value_quantization,
             &mut workspace.output,
             capacity,
             256,
@@ -2429,16 +2547,15 @@ impl Qwen36LinearAttentionWeights {
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        if is_fp8_linear(&self.qkv) || is_fp8_linear(&self.z) {
-            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
-                hidden,
-                &mut workspace.hidden_quantized,
-                &mut workspace.hidden_scale,
-                row_capacity,
-                model.manifest.hidden,
-                stream,
-            )?;
-        }
+        let hidden_quantization = prepare_fp8_batch_input(
+            &[&self.qkv, &self.z],
+            hidden,
+            &mut workspace.hidden_quantized,
+            &mut workspace.hidden_scale,
+            row_capacity,
+            model.manifest.hidden,
+            stream,
+        )?;
         run_linear_batch(
             model,
             &self.qkv,
@@ -2446,6 +2563,7 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.qkv_output,
             row_capacity,
             128,
@@ -2458,6 +2576,7 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.z_output,
             row_capacity,
             128,
@@ -2611,16 +2730,15 @@ impl Qwen36LinearAttentionWeights {
             model.manifest.rms_eps,
             stream,
         )?;
-        if is_fp8_linear(&self.out) {
-            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
-                &workspace.normed,
-                &mut workspace.value_quantized,
-                &mut workspace.value_scale,
-                row_capacity,
-                value_dim,
-                stream,
-            )?;
-        }
+        let value_quantization = prepare_fp8_batch_input(
+            &[&self.out],
+            &workspace.normed,
+            &mut workspace.value_quantized,
+            &mut workspace.value_scale,
+            row_capacity,
+            value_dim,
+            stream,
+        )?;
         run_linear_batch(
             model,
             &self.out,
@@ -2628,6 +2746,7 @@ impl Qwen36LinearAttentionWeights {
             &workspace.normed,
             &workspace.value_quantized,
             &workspace.value_scale,
+            value_quantization,
             &mut workspace.output,
             row_capacity,
             256,
@@ -2647,16 +2766,15 @@ impl Qwen36FullAttentionWeights {
         capacity: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        if is_fp8_linear(&self.q) || is_fp8_linear(&self.k) || is_fp8_linear(&self.v) {
-            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
-                hidden,
-                &mut workspace.hidden_quantized,
-                &mut workspace.hidden_scale,
-                capacity,
-                model.manifest.hidden,
-                stream,
-            )?;
-        }
+        let hidden_quantization = prepare_fp8_batch_input(
+            &[&self.q, &self.k, &self.v],
+            hidden,
+            &mut workspace.hidden_quantized,
+            &mut workspace.hidden_scale,
+            capacity,
+            model.manifest.hidden,
+            stream,
+        )?;
         run_linear_batch(
             model,
             &self.q,
@@ -2664,6 +2782,7 @@ impl Qwen36FullAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.q_proj,
             capacity,
             128,
@@ -2676,6 +2795,7 @@ impl Qwen36FullAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.k_raw,
             capacity,
             128,
@@ -2688,6 +2808,7 @@ impl Qwen36FullAttentionWeights {
             hidden,
             &workspace.hidden_quantized,
             &workspace.hidden_scale,
+            hidden_quantization,
             &mut workspace.v,
             capacity,
             128,
@@ -2878,16 +2999,15 @@ impl Qwen36FullAttentionWeights {
             capacity * q_width,
             stream,
         )?;
-        if is_fp8_linear(&self.o) {
-            quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
-                &workspace.gated_attention,
-                &mut workspace.value_quantized,
-                &mut workspace.value_scale,
-                capacity,
-                q_width,
-                stream,
-            )?;
-        }
+        let value_quantization = prepare_fp8_batch_input(
+            &[&self.o],
+            &workspace.gated_attention,
+            &mut workspace.value_quantized,
+            &mut workspace.value_scale,
+            capacity,
+            q_width,
+            stream,
+        )?;
         run_linear_batch(
             model,
             &self.o,
@@ -2895,6 +3015,7 @@ impl Qwen36FullAttentionWeights {
             &workspace.gated_attention,
             &workspace.value_quantized,
             &workspace.value_scale,
+            value_quantization,
             &mut workspace.output,
             capacity,
             256,

@@ -226,6 +226,21 @@ fn validate_prefill(model: &Qwen36TextModel) {
     );
     assert_logits_close_with_tolerance("chunked GDN prefill", &actual, &expected, 0.30);
 
+    let static_fp8 = (0..129)
+        .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
+        .collect::<Vec<_>>();
+    let expected = oracle_logits(model, &static_fp8);
+    let mut static_prefill = model
+        .new_prefill_batch_workspace(1, 128, MAX_CONTEXT_TOKENS)
+        .expect("static FP8 validation workspace");
+    let actual = prefill_then_logits(
+        model,
+        &mut static_prefill,
+        &[&static_fp8[..128]],
+        static_fp8[128],
+    );
+    assert_logits_close_with_tolerance("static FP8 prefill", &actual, &expected, 0.40);
+
     let mut states = [
         model
             .new_sequence_state(MAX_CONTEXT_TOKENS)
