@@ -202,7 +202,7 @@ __global__ void infer_rms_norm_quantize_nvfp4_col_major_f32_kernel(
     const std::uint32_t row = blockIdx.x;
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5;
-    constexpr std::uint32_t kWarps = 16;
+    const std::uint32_t warps = blockDim.x / 32;
     const float* row_input = input + row * cols;
 
     float square_sum = 0.0f;
@@ -220,7 +220,7 @@ __global__ void infer_rms_norm_quantize_nvfp4_col_major_f32_kernel(
     const std::uint32_t feature_blocks = (cols + 15) / 16;
     const std::uint32_t feature_pairs = (feature_blocks + 1) / 2;
     for (std::uint32_t feature_pair = warp; feature_pair < feature_pairs;
-         feature_pair += kWarps) {
+         feature_pair += warps) {
         const std::uint32_t half = lane >> 4;
         const std::uint32_t half_lane = lane & 15u;
         const std::uint32_t feature_block = feature_pair * 2 + half;
