@@ -13483,7 +13483,9 @@ mod tests {
     #[test]
     fn fused_rms_norm_nvfp4_quantization_matches_staged_path() {
         let rows = 3;
-        let cols = 96;
+        // More than 16 32-feature pairs catches launch/loop warp-count
+        // mismatches that leave alternating feature bands unwritten.
+        let cols = 544;
         let eps = 1.0e-6;
         let input_scale = 0.375;
         let input = (0..rows * cols)
