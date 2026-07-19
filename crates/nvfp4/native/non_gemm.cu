@@ -202,7 +202,7 @@ __global__ void infer_rms_norm_quantize_nvfp4_col_major_f32_kernel(
     const std::uint32_t row = blockIdx.x;
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5;
-    constexpr std::uint32_t kWarps = 8;
+    constexpr std::uint32_t kWarps = 16;
     const float* row_input = input + row * cols;
 
     float square_sum = 0.0f;
@@ -2574,6 +2574,100 @@ extern "C" cudaError_t infer_moe_gelu_tanh_mul_quantize_sorted_routes_nvfp4_on_s
     return cudaGetLastError();
 }
 
+__global__ void infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_kernel(
+    const std::uint16_t* __restrict__ gate_up,
+    const std::uint32_t* __restrict__ sorted_experts,
+    const std::uint32_t* __restrict__ expert_offsets,
+    std::uint8_t* __restrict__ packed,
+    std::uint8_t* __restrict__ scales,
+    std::uint32_t routes,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride) {
+    const std::uint32_t sorted = blockIdx.x;
+    if (sorted >= routes) return;
+    const std::uint32_t expert = sorted_experts[sorted];
+    const std::uint32_t expert_col = sorted - expert_offsets[expert];
+    const std::uint32_t k_blocks = in_features / 16;
+    const std::uint32_t warp = threadIdx.x / 32;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t warps = blockDim.x / 32;
+    const std::uint16_t* gate_row =
+        gate_up + static_cast<std::size_t>(sorted) * in_features * 2;
+    const std::uint16_t* up_row = gate_row + in_features;
+
+    const std::uint32_t k_block_pairs = (k_blocks + 1) / 2;
+    for (std::uint32_t k_block_pair = warp; k_block_pair < k_block_pairs;
+         k_block_pair += warps) {
+        const std::uint32_t half = lane >> 4;
+        const std::uint32_t half_lane = lane & 15u;
+        const std::uint32_t k_block = k_block_pair * 2 + half;
+        const std::uint32_t row = k_block_pair * 32 + lane;
+        float value = 0.0f;
+        if (row < in_features) {
+            const float gate_value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(gate_row + row));
+            const float silu = gate_value / (1.0f + expf(-gate_value));
+            const float up_value = __bfloat162float(
+                *reinterpret_cast<const __nv_bfloat16*>(up_row + row));
+            value = silu * up_value;
+        }
+        const std::uint32_t mask = half == 0 ? 0x0000ffffu : 0xffff0000u;
+        float max_abs = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+        }
+        std::uint32_t scale_word = 0;
+        if (half_lane == 0 && k_block < k_blocks) {
+            scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+            scales[static_cast<std::size_t>(expert) * scale_stride +
+                   infer_ue4m3_tiled_scale_offset(expert_col, k_block, in_features)] =
+                static_cast<std::uint8_t>(scale_word);
+        }
+        scale_word = __shfl_sync(mask, scale_word, 0, 16);
+        const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+        const std::uint32_t pair_lane = (half_lane & 7u) * 2;
+        const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+        const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+        if (half_lane < 8 && k_block < k_blocks) {
+            const std::uint32_t packed_row = k_block * 16 + half_lane * 2;
+            const std::uint8_t lo = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(
+                    scale == 0.0f ? 0.0f : lo_value / scale,
+                    __NV_E2M1, cudaRoundNearest) & 0x0f);
+            const std::uint8_t hi = static_cast<std::uint8_t>(
+                __nv_cvt_float_to_fp4(
+                    scale == 0.0f ? 0.0f : hi_value / scale,
+                    __NV_E2M1, cudaRoundNearest) & 0x0f);
+            packed[(static_cast<std::size_t>(sorted) * in_features + packed_row) / 2] =
+                lo | (hi << 4);
+        }
+    }
+}
+
+extern "C" cudaError_t infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_on_stream(
+    const std::uint16_t* gate_up,
+    const std::uint32_t* sorted_experts,
+    const std::uint32_t* expert_offsets,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t routes,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    cudaStream_t stream) {
+    if (gate_up == nullptr || sorted_experts == nullptr || expert_offsets == nullptr ||
+        packed == nullptr || scales == nullptr || routes == 0 || in_features == 0 ||
+        (in_features % 16) != 0 || scale_stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_kernel<<<
+        routes, 256, 0, stream>>>(
+        gate_up, sorted_experts, expert_offsets, packed, scales, routes,
+        in_features, scale_stride);
+    return cudaGetLastError();
+}
+
 __global__ void infer_moe_quantize_rows_nvfp4_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
@@ -2590,14 +2684,18 @@ __global__ void infer_moe_quantize_rows_nvfp4_kernel(
     const std::uint32_t warps = blockDim.x / 32;
     const float* source = input + static_cast<std::size_t>(row) * in_features;
     float square_sum = 0.0f;
-    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
-        const float value = source[col];
-        square_sum += value * value;
+    if (weight != nullptr) {
+        for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+            const float value = source[col];
+            square_sum += value * value;
+        }
+        square_sum = infer_block_reduce_sum(square_sum);
     }
-    square_sum = infer_block_reduce_sum(square_sum);
     __shared__ float inverse_rms;
     if (threadIdx.x == 0) {
-        inverse_rms = rsqrtf(square_sum / static_cast<float>(in_features) + eps);
+        inverse_rms = weight == nullptr
+            ? 1.0f
+            : rsqrtf(square_sum / static_cast<float>(in_features) + eps);
     }
     __syncthreads();
 
@@ -2605,8 +2703,9 @@ __global__ void infer_moe_quantize_rows_nvfp4_kernel(
         const std::uint32_t row_start = k_block * 16;
         float max_abs = 0.0f;
         if (lane < 16) {
-            const float value =
-                source[row_start + lane] * inverse_rms * weight[row_start + lane];
+            const float value = weight == nullptr
+                ? source[row_start + lane]
+                : source[row_start + lane] * inverse_rms * weight[row_start + lane];
             max_abs = isfinite(value) ? fabsf(value) : 0.0f;
         }
         max_abs = infer_warp_reduce_max(max_abs);
@@ -2621,12 +2720,14 @@ __global__ void infer_moe_quantize_rows_nvfp4_kernel(
         const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
         if (lane < 8) {
             const std::uint32_t col = row_start + lane * 2;
-            const float lo_value = scale == 0.0f
-                ? 0.0f
-                : source[col] * inverse_rms * weight[col] / scale;
-            const float hi_value = scale == 0.0f
-                ? 0.0f
-                : source[col + 1] * inverse_rms * weight[col + 1] / scale;
+            const float lo_source = weight == nullptr
+                ? source[col]
+                : source[col] * inverse_rms * weight[col];
+            const float hi_source = weight == nullptr
+                ? source[col + 1]
+                : source[col + 1] * inverse_rms * weight[col + 1];
+            const float lo_value = scale == 0.0f ? 0.0f : lo_source / scale;
+            const float hi_value = scale == 0.0f ? 0.0f : hi_source / scale;
             const std::uint8_t lo = static_cast<std::uint8_t>(
                 __nv_cvt_float_to_fp4(lo_value, __NV_E2M1, cudaRoundNearest) & 0x0f);
             const std::uint8_t hi = static_cast<std::uint8_t>(
@@ -2694,6 +2795,38 @@ extern "C" cudaError_t infer_moe_gather_rms_norm_quantize_sorted_routes_nvfp4_on
     }
     infer_moe_quantize_rows_nvfp4_kernel<<<rows, 256, 0, stream>>>(
         input, weight, source_packed, source_scales, rows, in_features, eps);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_moe_scatter_quantized_rows_nvfp4_kernel<<<routes, 256, 0, stream>>>(
+        source_packed, source_scales, sorted_routes, sorted_experts, expert_offsets,
+        packed, scales, routes, routes_per_row, in_features, scale_stride);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_moe_gather_quantize_sorted_routes_nvfp4_on_stream(
+    const float* input,
+    const std::uint32_t* sorted_routes,
+    const std::uint32_t* sorted_experts,
+    const std::uint32_t* expert_offsets,
+    std::uint8_t* source_packed,
+    std::uint8_t* source_scales,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t in_features,
+    std::uint32_t scale_stride,
+    cudaStream_t stream) {
+    if (input == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
+        expert_offsets == nullptr || source_packed == nullptr || source_scales == nullptr ||
+        packed == nullptr || scales == nullptr || rows == 0 || routes == 0 ||
+        routes_per_row == 0 || routes != rows * routes_per_row || in_features == 0 ||
+        (in_features % 16) != 0 || scale_stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_moe_quantize_rows_nvfp4_kernel<<<rows, 256, 0, stream>>>(
+        input, nullptr, source_packed, source_scales, rows, in_features, 0.0f);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     infer_moe_scatter_quantized_rows_nvfp4_kernel<<<routes, 256, 0, stream>>>(
@@ -3389,6 +3522,44 @@ __global__ void infer_qwen36_ffn_finalize_routed_batch_f32_kernel(
     const float shared_scale = 1.0f / (1.0f + expf(-shared_gate_logit[row]));
     const float shared_gated = shared_output[idx] * shared_scale;
     output[idx] = infer_round_f32_to_bf16_value(residual[idx] + routed_sum + shared_gated);
+}
+
+__global__ void infer_qwen36_ffn_finalize_batch_f32_kernel(
+    const float* routed_output,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = rows * cols;
+    if (idx >= len) return;
+    const std::uint32_t row = idx / cols;
+    const float shared_scale = 1.0f / (1.0f + expf(-shared_gate_logit[row]));
+    output[idx] = infer_round_f32_to_bf16_value(
+        residual[idx] + routed_output[idx] + shared_output[idx] * shared_scale);
+}
+
+extern "C" cudaError_t infer_qwen36_ffn_finalize_batch_f32_on_stream(
+    const float* routed_output,
+    const float* shared_gate_logit,
+    const float* shared_output,
+    const float* residual,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (routed_output == nullptr || shared_gate_logit == nullptr || shared_output == nullptr ||
+        residual == nullptr || output == nullptr || rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t len = static_cast<std::uint64_t>(rows) * cols;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_qwen36_ffn_finalize_batch_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        routed_output, shared_gate_logit, shared_output, residual, output, rows, cols);
+    return cudaGetLastError();
 }
 
 extern "C" cudaError_t infer_qwen36_ffn_finalize_routed_f32_on_stream(
@@ -7210,7 +7381,7 @@ extern "C" cudaError_t infer_gated_delta_net_128_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
-__global__ void infer_gated_delta_net_128_f32_chunks_kernel(
+__global__ void infer_gated_delta_net_128_f32_chunks_warp_kernel(
     const float* q,
     const float* k,
     const float* v,
@@ -7225,46 +7396,140 @@ __global__ void infer_gated_delta_net_128_f32_chunks_kernel(
     const std::uint32_t sequence = blockIdx.x / heads;
     const std::uint32_t head = blockIdx.x % heads;
     const std::uint32_t col = blockIdx.y;
-    const std::uint32_t row = threadIdx.x;
-    if (col >= kState || row >= kState) return;
+    const std::uint32_t lane = threadIdx.x;
+    if (col >= kState || lane >= 32) return;
 
     const std::uint32_t offset = sequence_offsets[sequence];
     const std::uint32_t length = sequence_lengths[sequence];
     const std::uint32_t state_base = head * kState * kState + col * kState;
     float* state = state_table[sequence];
-    float state_value = state[state_base + row];
-    __shared__ float partial[128];
+    float state_value[4];
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        state_value[item] = state[state_base + lane + item * 32];
+    }
 
     for (std::uint32_t token = 0; token < length; ++token) {
         const std::uint32_t vector_base = ((offset + token) * heads + head) * kState;
-        const float q_value = q[vector_base + row];
-        const float k_value = k[vector_base + row];
-        partial[row] = state_value * k_value;
-        __syncthreads();
-        for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-            if (row < stride) partial[row] += partial[row + stride];
-            __syncthreads();
+        float q_value[4];
+        float k_value[4];
+        float state_dot_k = 0.0f;
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            const std::uint32_t row = lane + item * 32;
+            q_value[item] = q[vector_base + row];
+            k_value[item] = k[vector_base + row];
+            state_dot_k = fmaf(state_value[item], k_value[item], state_dot_k);
         }
+        state_dot_k = infer_warp_reduce_sum(state_dot_k);
+        state_dot_k = __shfl_sync(0xffffffffu, state_dot_k, 0);
 
-        const float decay = expf(gate[(offset + token) * heads + head]);
-        const float state_dot_k = partial[0];
-        __syncthreads();
-        const float delta =
-            (v[vector_base + col] - decay * state_dot_k) *
-            beta[(offset + token) * heads + head];
-        state_value = decay * state_value + k_value * delta;
-        partial[row] = state_value * q_value;
-        __syncthreads();
-        for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-            if (row < stride) partial[row] += partial[row + stride];
-            __syncthreads();
+        float decay = 0.0f;
+        float delta = 0.0f;
+        if (lane == 0) {
+            decay = expf(gate[(offset + token) * heads + head]);
+            delta = (v[vector_base + col] - decay * state_dot_k) *
+                beta[(offset + token) * heads + head];
         }
-        if (row == 0) {
-            output[vector_base + col] = partial[0] * 0.08838834764831845f;
+        decay = __shfl_sync(0xffffffffu, decay, 0);
+        delta = __shfl_sync(0xffffffffu, delta, 0);
+
+        float output_value = 0.0f;
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            state_value[item] = fmaf(k_value[item], delta, decay * state_value[item]);
+            output_value = fmaf(state_value[item], q_value[item], output_value);
+        }
+        output_value = infer_warp_reduce_sum(output_value);
+        if (lane == 0) {
+            output[vector_base + col] = output_value * 0.08838834764831845f;
+        }
+    }
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        state[state_base + lane + item * 32] = state_value[item];
+    }
+}
+
+__global__ void infer_gated_delta_net_128_f32_chunks_multiwarp_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* const* state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    float* output,
+    std::uint32_t heads) {
+    constexpr std::uint32_t kState = 128;
+    constexpr std::uint32_t kWarps = 8;
+    const std::uint32_t sequence = blockIdx.x / heads;
+    const std::uint32_t head = blockIdx.x % heads;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t col = blockIdx.y * kWarps + warp;
+    if (col >= kState) return;
+
+    const std::uint32_t offset = sequence_offsets[sequence];
+    const std::uint32_t length = sequence_lengths[sequence];
+    const std::uint32_t state_base = head * kState * kState + col * kState;
+    float* state = state_table[sequence];
+    float state_value[4];
+    __shared__ float shared_q[128];
+    __shared__ float shared_k[128];
+    __shared__ float shared_decay;
+    __shared__ float shared_beta;
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        state_value[item] = state[state_base + lane + item * 32];
+    }
+
+    for (std::uint32_t token = 0; token < length; ++token) {
+        const std::uint32_t vector_base = ((offset + token) * heads + head) * kState;
+        if (threadIdx.x < kState) {
+            shared_q[threadIdx.x] = q[vector_base + threadIdx.x];
+            shared_k[threadIdx.x] = k[vector_base + threadIdx.x];
+        }
+        if (threadIdx.x == 0) {
+            shared_decay = expf(gate[(offset + token) * heads + head]);
+            shared_beta = beta[(offset + token) * heads + head];
+        }
+        __syncthreads();
+
+        float state_dot_k = 0.0f;
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            const std::uint32_t row = lane + item * 32;
+            state_dot_k = fmaf(state_value[item], shared_k[row], state_dot_k);
+        }
+        state_dot_k = infer_warp_reduce_sum(state_dot_k);
+        state_dot_k = __shfl_sync(0xffffffffu, state_dot_k, 0);
+
+        float delta = 0.0f;
+        if (lane == 0) {
+            delta = (v[vector_base + col] - shared_decay * state_dot_k) * shared_beta;
+        }
+        delta = __shfl_sync(0xffffffffu, delta, 0);
+
+        float output_value = 0.0f;
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            const std::uint32_t row = lane + item * 32;
+            state_value[item] =
+                fmaf(shared_k[row], delta, shared_decay * state_value[item]);
+            output_value = fmaf(state_value[item], shared_q[row], output_value);
+        }
+        output_value = infer_warp_reduce_sum(output_value);
+        if (lane == 0) {
+            output[vector_base + col] = output_value * 0.08838834764831845f;
         }
         __syncthreads();
     }
-    state[state_base + row] = state_value;
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        state[state_base + lane + item * 32] = state_value[item];
+    }
 }
 
 extern "C" cudaError_t infer_gated_delta_net_128_f32_chunks_on_stream(
@@ -7278,16 +7543,80 @@ extern "C" cudaError_t infer_gated_delta_net_128_f32_chunks_on_stream(
     const std::uint32_t* sequence_lengths,
     float* output,
     std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
     std::uint32_t heads,
     cudaStream_t stream) {
     if (q == nullptr || k == nullptr || v == nullptr || gate == nullptr || beta == nullptr ||
         state_table == nullptr || sequence_offsets == nullptr || sequence_lengths == nullptr ||
-        output == nullptr || sequence_count == 0 || heads == 0) {
+        output == nullptr || sequence_count == 0 || total_tokens == 0 || heads == 0) {
         return cudaErrorInvalidValue;
     }
-    dim3 grid(sequence_count * heads, 128, 1);
-    infer_gated_delta_net_128_f32_chunks_kernel<<<grid, 128, 0, stream>>>(
-        q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
+    if (total_tokens / sequence_count >= 1024) {
+        dim3 grid(sequence_count * heads, 8, 1);
+        infer_gated_delta_net_128_f32_chunks_multiwarp_kernel<<<grid, 512, 0, stream>>>(
+            q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
+    } else {
+        dim3 grid(sequence_count * heads, 128, 1);
+        infer_gated_delta_net_128_f32_chunks_warp_kernel<<<grid, 32, 0, stream>>>(
+            q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
+    }
+    return cudaGetLastError();
+}
+
+__global__ void infer_gather_f32_pointer_rows_kernel(
+    float* const* input_table,
+    float* output,
+    std::uint32_t row_values) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint32_t value = blockIdx.x * blockDim.x + threadIdx.x;
+    if (value < row_values) {
+        output[static_cast<std::size_t>(row) * row_values + value] =
+            input_table[row][value];
+    }
+}
+
+extern "C" cudaError_t infer_gather_f32_pointer_rows_on_stream(
+    float* const* input_table,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t row_values,
+    cudaStream_t stream) {
+    if (input_table == nullptr || output == nullptr || rows == 0 ||
+        row_values == 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t blocks = (row_values + kThreads - 1) / kThreads;
+    infer_gather_f32_pointer_rows_kernel<<<dim3(blocks, rows), kThreads, 0, stream>>>(
+        input_table, output, row_values);
+    return cudaGetLastError();
+}
+
+__global__ void infer_scatter_f32_pointer_rows_kernel(
+    const float* input,
+    float* const* output_table,
+    std::uint32_t row_values) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint32_t value = blockIdx.x * blockDim.x + threadIdx.x;
+    if (value < row_values) {
+        output_table[row][value] = input[static_cast<std::size_t>(row) * row_values + value];
+    }
+}
+
+extern "C" cudaError_t infer_scatter_f32_pointer_rows_on_stream(
+    const float* input,
+    float* const* output_table,
+    std::uint32_t rows,
+    std::uint32_t row_values,
+    cudaStream_t stream) {
+    if (input == nullptr || output_table == nullptr || rows == 0 ||
+        row_values == 0 || rows > 65535) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t blocks = (row_values + kThreads - 1) / kThreads;
+    infer_scatter_f32_pointer_rows_kernel<<<dim3(blocks, rows), kThreads, 0, stream>>>(
+        input, output_table, row_values);
     return cudaGetLastError();
 }
 
@@ -8528,6 +8857,165 @@ extern "C" cudaError_t infer_qwen36_gdn_prep_chunks_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_qwen36_gdn_prep_chunks_bf16_kernel(
+    const float* qkv,
+    const std::uint16_t* conv_weight_bf16,
+    std::uint16_t* q,
+    std::uint16_t* k,
+    std::uint16_t* v,
+    float* const* conv_state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_dim,
+    std::uint32_t conv_dim) {
+    const std::uint32_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = total_tokens * conv_dim;
+    if (linear >= total) return;
+    const std::uint32_t row = linear / conv_dim;
+    const std::uint32_t idx = linear % conv_dim;
+    std::uint32_t sequence = 0;
+    while (sequence + 1 < sequence_count &&
+           row >= sequence_offsets[sequence] + sequence_lengths[sequence]) {
+        ++sequence;
+    }
+    const std::uint32_t offset = sequence_offsets[sequence];
+    const std::uint32_t token = row - offset;
+    const float* conv_state = conv_state_table[sequence] + idx * 3;
+    float mixed = qkv[static_cast<std::size_t>(row) * conv_dim + idx] *
+        __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+            conv_weight_bf16 + idx * 4 + 3));
+#pragma unroll
+    for (std::uint32_t lag = 1; lag <= 3; ++lag) {
+        const float input = token >= lag
+            ? qkv[(static_cast<std::size_t>(row - lag) * conv_dim) + idx]
+            : conv_state[3 + token - lag];
+        mixed = fmaf(
+            input,
+            __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                conv_weight_bf16 + idx * 4 + (3 - lag))),
+            mixed);
+    }
+    const __nv_bfloat16 activated = __float2bfloat16(mixed / (1.0f + expf(-mixed)));
+    const std::uint16_t encoded = *reinterpret_cast<const std::uint16_t*>(&activated);
+    const std::uint32_t key_dim = key_heads * head_dim;
+    const std::uint32_t value_dim = value_heads * head_dim;
+    const std::uint32_t output_base = row * value_dim;
+    if (idx < key_dim) {
+        for (std::uint32_t repeat = 0; repeat < value_heads / key_heads; ++repeat) {
+            q[output_base + repeat * key_dim + idx] = encoded;
+        }
+    } else if (idx < key_dim * 2) {
+        const std::uint32_t k_idx = idx - key_dim;
+        for (std::uint32_t repeat = 0; repeat < value_heads / key_heads; ++repeat) {
+            k[output_base + repeat * key_dim + k_idx] = encoded;
+        }
+    } else {
+        const std::uint32_t v_idx = idx - key_dim * 2;
+        const std::uint32_t v_k_head = v_idx / head_dim;
+        const std::uint32_t v_sub = v_idx % head_dim;
+        const std::uint32_t v_per_k = value_heads / key_heads;
+        const std::uint32_t k_head = v_k_head / v_per_k;
+        const std::uint32_t v_sub_idx = v_k_head % v_per_k;
+        const std::uint32_t tiled_v_idx =
+            v_sub_idx * key_dim + k_head * head_dim + v_sub;
+        v[output_base + tiled_v_idx] = encoded;
+    }
+}
+
+__global__ void infer_qwen36_gdn_update_conv_state_kernel(
+    const float* qkv,
+    float* const* conv_state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    std::uint32_t conv_dim) {
+    const std::uint32_t sequence = blockIdx.y;
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= conv_dim) return;
+    const std::uint32_t offset = sequence_offsets[sequence];
+    const std::uint32_t length = sequence_lengths[sequence];
+    float* state = conv_state_table[sequence] + idx * 3;
+    const float old_state[3] = {state[0], state[1], state[2]};
+#pragma unroll
+    for (std::uint32_t item = 0; item < 3; ++item) {
+        const std::uint32_t timeline = length + item;
+        state[item] = timeline < 3
+            ? old_state[timeline]
+            : qkv[(static_cast<std::size_t>(offset + timeline - 3) * conv_dim) + idx];
+    }
+}
+
+__global__ void infer_l2_norm_heads_128_bf16_kernel(
+    std::uint16_t* values,
+    std::uint32_t heads) {
+    constexpr std::uint32_t kDim = 128;
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x;
+    if (head >= heads || lane >= kDim) return;
+    std::uint16_t* row = values + static_cast<std::size_t>(head) * kDim;
+    const float value = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(row + lane));
+    __shared__ float partial[kDim];
+    partial[lane] = value * value;
+    __syncthreads();
+    for (std::uint32_t stride = kDim / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        __syncthreads();
+    }
+    const __nv_bfloat16 normalized =
+        __float2bfloat16(value / fmaxf(sqrtf(partial[0]), 1.0e-6f));
+    row[lane] = *reinterpret_cast<const std::uint16_t*>(&normalized);
+}
+
+extern "C" cudaError_t infer_qwen36_gdn_prep_chunks_bf16_on_stream(
+    const float* qkv,
+    const std::uint16_t* conv_weight_bf16,
+    std::uint16_t* q,
+    std::uint16_t* k,
+    std::uint16_t* v,
+    float* const* conv_state_table,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (qkv == nullptr || conv_weight_bf16 == nullptr || q == nullptr || k == nullptr ||
+        v == nullptr || conv_state_table == nullptr || sequence_offsets == nullptr ||
+        sequence_lengths == nullptr || sequence_count == 0 || total_tokens == 0 ||
+        key_heads == 0 || value_heads == 0 || head_dim != 128 ||
+        value_heads % key_heads != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t conv_dim = key_heads * head_dim * 2 + value_heads * head_dim;
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t total = total_tokens * conv_dim;
+    infer_qwen36_gdn_prep_chunks_bf16_kernel<<<
+        (total + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        qkv, conv_weight_bf16, q, k, v, conv_state_table, sequence_offsets,
+        sequence_lengths, sequence_count, total_tokens, key_heads, value_heads,
+        head_dim, conv_dim);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_qwen36_gdn_update_conv_state_kernel<<<
+        dim3((conv_dim + kThreads - 1) / kThreads, sequence_count), kThreads, 0, stream>>>(
+        qkv, conv_state_table, sequence_offsets, sequence_lengths, conv_dim);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_l2_norm_heads_128_bf16_kernel<<<total_tokens * value_heads, 128, 0, stream>>>(
+        q, total_tokens * value_heads);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_l2_norm_heads_128_bf16_kernel<<<total_tokens * value_heads, 128, 0, stream>>>(
+        k, total_tokens * value_heads);
+    return cudaGetLastError();
+}
+
 __global__ void infer_qwen36_gdn_gate_kernel(const float* alpha,
                                                    const float* beta_input,
                                                    const std::uint16_t* a_log_bf16,
@@ -8568,6 +9056,53 @@ extern "C" cudaError_t infer_qwen36_gdn_gate_on_stream(
     const int blocks = static_cast<int>((heads + kThreads - 1) / kThreads);
     infer_qwen36_gdn_gate_kernel<<<blocks, kThreads, 0, stream>>>(
         alpha, beta_input, a_log_bf16, dt_bias_bf16, gate, beta, heads);
+    return cudaGetLastError();
+}
+
+__global__ void infer_qwen36_gdn_gate_batch_bf16_kernel(
+    const float* alpha,
+    const float* beta_input,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    std::uint16_t* gate,
+    std::uint16_t* beta,
+    std::uint32_t heads,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const std::uint32_t head = idx % heads;
+    const float a_log = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(a_log_bf16 + head));
+    const float dt_bias = __bfloat162float(
+        *reinterpret_cast<const __nv_bfloat16*>(dt_bias_bf16 + head));
+    const float dt = alpha[idx] + dt_bias;
+    const float softplus = log1pf(expf(-fabsf(dt))) + fmaxf(dt, 0.0f);
+    const __nv_bfloat16 gate_value = __float2bfloat16(-expf(a_log) * softplus);
+    const __nv_bfloat16 beta_value = __float2bfloat16(1.0f / (1.0f + expf(-beta_input[idx])));
+    gate[idx] = *reinterpret_cast<const std::uint16_t*>(&gate_value);
+    beta[idx] = *reinterpret_cast<const std::uint16_t*>(&beta_value);
+}
+
+extern "C" cudaError_t infer_qwen36_gdn_gate_batch_bf16_on_stream(
+    const float* alpha,
+    const float* beta_input,
+    const std::uint16_t* a_log_bf16,
+    const std::uint16_t* dt_bias_bf16,
+    std::uint16_t* gate,
+    std::uint16_t* beta,
+    std::uint32_t rows,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (alpha == nullptr || beta_input == nullptr || a_log_bf16 == nullptr ||
+        dt_bias_bf16 == nullptr || gate == nullptr || beta == nullptr ||
+        rows == 0 || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t len = rows * heads;
+    infer_qwen36_gdn_gate_batch_bf16_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        alpha, beta_input, a_log_bf16, dt_bias_bf16, gate, beta, heads, len);
     return cudaGetLastError();
 }
 

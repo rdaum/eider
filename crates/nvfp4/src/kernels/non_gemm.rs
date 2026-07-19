@@ -694,8 +694,8 @@ pub fn silu_mul_halves_f32_batch_into_on_stream(
     let output_len = rows.saturating_mul(cols);
     if rows == 0
         || cols == 0
-        || gate_up.len() != input_len
-        || output.len() != output_len
+        || gate_up.len() < input_len
+        || output.len() < output_len
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
     {
@@ -876,13 +876,24 @@ pub fn split_q_gate_f32_into_on_stream(
 pub fn sigmoid_mul_f32_into_on_stream(
     gate: &DeviceBuffer<f32>,
     input: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     stream: &CudaStream,
 ) -> Result<()> {
-    if gate.len() != input.len() || output.len() != input.len() {
+    sigmoid_mul_f32_prefix_into_on_stream(gate, input, output, input.len(), stream)
+}
+
+/// Computes `output = input * sigmoid(gate)` for an active prefix.
+pub fn sigmoid_mul_f32_prefix_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if gate.len() < len || input.len() < len || output.len() < len {
         return Err(Error::Shape {
             label: "sigmoid multiply buffers",
-            expected: format!("gate/input/output={} values", input.len()),
+            expected: format!("gate/input/output at least {len} values"),
             actual: format!(
                 "gate={} input={} output={}",
                 gate.len(),
@@ -891,11 +902,11 @@ pub fn sigmoid_mul_f32_into_on_stream(
             ),
         });
     }
-    if input.is_empty() || input.len() > u32::MAX as usize {
+    if len == 0 || len > u32::MAX as usize {
         return Err(Error::Shape {
             label: "sigmoid multiply dimensions",
             expected: "non-empty u32-sized length".to_string(),
-            actual: format!("len={}", input.len()),
+            actual: format!("len={len}"),
         });
     }
     unsafe {
@@ -905,7 +916,7 @@ pub fn sigmoid_mul_f32_into_on_stream(
                 gate.ptr,
                 input.ptr,
                 output.buffer_mut().ptr,
-                input.len() as u32,
+                len as u32,
                 stream.as_raw(),
             ),
         )
@@ -1121,13 +1132,13 @@ pub fn qwen36_full_attn_prep_f32_batch_into_on_stream(
         || head_dim == 0
         || !head_dim.is_power_of_two()
         || head_dim > 1024
-        || q_full.len() != q_full_len
-        || k_raw.len() != kv_len
+        || q_full.len() < q_full_len
+        || k_raw.len() < kv_len
         || q_norm.len() != head_dim
         || k_norm.len() != head_dim
-        || q.len() != q_len
-        || gate.len() != q_len
-        || k.len() != kv_len
+        || q.len() < q_len
+        || gate.len() < q_len
+        || k.len() < kv_len
         || rows > u32::MAX as usize
         || q_heads > u32::MAX as usize
         || kv_heads > u32::MAX as usize
@@ -1886,7 +1897,7 @@ impl MoeSortedNvfp4Rows {
         routes: &MoeSortedRoutes,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.quantize_on_stream(input, routes, self.routes, stream)
+        self.quantize_on_stream(input, routes, self.routes, false, stream)
     }
 
     /// Fuses sorted-route gated GELU activation with NVFP4 quantization.
@@ -1937,11 +1948,105 @@ impl MoeSortedNvfp4Rows {
         }
     }
 
+    /// Fuses sorted-route gated SiLU from a concatenated gate/up tensor with
+    /// NVFP4 quantization.
+    pub fn silu_mul_halves_quantize_sorted_on_stream(
+        &mut self,
+        gate_up: &DeviceBuffer<u16>,
+        routes: &MoeSortedRoutes,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let len = self.routes * self.in_features * 2;
+        if routes.routes != self.routes || routes.experts != self.experts || gate_up.len() < len {
+            return Err(Error::Shape {
+                label: "sorted MoE SiLU NVFP4 quantization",
+                expected: format!(
+                    "routes={} experts={} gate_up={len}",
+                    self.routes, self.experts
+                ),
+                actual: format!(
+                    "routes={} experts={} gate_up={}",
+                    routes.routes,
+                    routes.experts,
+                    gate_up.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_on_stream",
+                ffi::infer_moe_silu_mul_halves_quantize_sorted_routes_nvfp4_on_stream(
+                    gate_up.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    self.routes as u32,
+                    self.in_features as u32,
+                    self.scale_stride as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Gathers token rows into sorted expert order and quantizes them to NVFP4.
+    pub fn gather_quantize_on_stream(
+        &mut self,
+        input: &DeviceBuffer<f32>,
+        routes: &MoeSortedRoutes,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let rows = self.routes / self.routes_per_row;
+        if routes.routes != self.routes
+            || routes.experts != self.experts
+            || input.len() < rows * self.in_features
+        {
+            return Err(Error::Shape {
+                label: "sorted MoE NVFP4 gather quantization",
+                expected: format!(
+                    "routes={} experts={} input={}",
+                    self.routes,
+                    self.experts,
+                    rows * self.in_features
+                ),
+                actual: format!(
+                    "routes={} experts={} input={}",
+                    routes.routes,
+                    routes.experts,
+                    input.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_moe_gather_quantize_sorted_routes_nvfp4_on_stream",
+                ffi::infer_moe_gather_quantize_sorted_routes_nvfp4_on_stream(
+                    input.ptr,
+                    routes.sorted_routes.ptr,
+                    routes.sorted_experts.ptr,
+                    routes.expert_offsets.ptr,
+                    self.source_packed.ptr,
+                    self.source_scales.ptr,
+                    self.packed.ptr,
+                    self.scales.ptr,
+                    rows as u32,
+                    self.routes as u32,
+                    self.routes_per_row as u32,
+                    self.in_features as u32,
+                    self.scale_stride as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     fn quantize_on_stream(
         &mut self,
         input: &DeviceBuffer<f32>,
         routes: &MoeSortedRoutes,
         source_rows: usize,
+        gather_rows: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         if routes.routes != self.routes
@@ -1978,7 +2083,7 @@ impl MoeSortedNvfp4Rows {
                     self.routes_per_row as u32,
                     self.in_features as u32,
                     self.scale_stride as u32,
-                    0,
+                    i32::from(gather_rows),
                     stream.as_raw(),
                 ),
             )
@@ -2624,6 +2729,60 @@ pub fn qwen36_ffn_finalize_f32_into_on_stream(
     }
 }
 
+/// Combines one routed result per batch row with the gated shared FFN and
+/// residual, then writes BF16-rounded F32 output.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_ffn_finalize_batch_f32_into_on_stream(
+    routed_output: &DeviceBuffer<f32>,
+    shared_gate_logit: &DeviceBuffer<f32>,
+    shared_output: &DeviceBuffer<f32>,
+    residual: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || routed_output.len() < len
+        || shared_gate_logit.len() < rows
+        || shared_output.len() < len
+        || residual.len() < len
+        || output.len() < len
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.6 batch FFN finalize",
+            expected: format!("rows={rows} cols={cols} values={len}"),
+            actual: format!(
+                "routed={} gate={} shared={} residual={} output={}",
+                routed_output.len(),
+                shared_gate_logit.len(),
+                shared_output.len(),
+                residual.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_ffn_finalize_batch_f32_on_stream",
+            ffi::infer_qwen36_ffn_finalize_batch_f32_on_stream(
+                routed_output.ptr,
+                shared_gate_logit.ptr,
+                shared_output.ptr,
+                residual.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Accumulates routed slot outputs, applies the shared-expert gate, adds the
 /// residual, and writes BF16-rounded F32 output in one kernel.
 #[allow(clippy::too_many_arguments)]
@@ -2710,14 +2869,14 @@ pub fn qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
     if rows == 0
         || cols == 0
         || groups_per_row == 0
-        || indices.len() != groups
-        || route_weights.len() != groups
-        || routed_outputs.len() != groups
+        || indices.len() < groups
+        || route_weights.len() < groups
+        || routed_outputs.len() < groups
         || alpha_table.is_empty()
-        || shared_gate_logit.len() != rows
-        || shared_output.len() != len
-        || residual.len() != len
-        || output.len() != len
+        || shared_gate_logit.len() < rows
+        || shared_output.len() < len
+        || residual.len() < len
+        || output.len() < len
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
         || groups_per_row > u32::MAX as usize
@@ -3213,9 +3372,9 @@ pub fn rope_imrope_text_batch_f32_into_on_stream(
         || rotary_dim == 0
         || rotary_dim > head_dim
         || !rotary_dim.is_multiple_of(2)
-        || positions.len() != rows
-        || input.len() != len
-        || output.len() != len
+        || positions.len() < rows
+        || input.len() < len
+        || output.len() < len
         || rows > u32::MAX as usize
         || heads_per_row > u32::MAX as usize
         || head_dim > u32::MAX as usize
@@ -3499,7 +3658,7 @@ pub fn rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
 pub fn add_f32_into_on_stream(
     left: &DeviceBuffer<f32>,
     right: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     stream: &CudaStream,
 ) -> Result<()> {
     validate_add_f32(left, right)?;
@@ -3511,6 +3670,35 @@ pub fn add_f32_into_on_stream(
         });
     }
 
+    add_f32_prefix_into_on_stream(left, right, output, left.len(), stream)
+}
+
+/// Enqueues elementwise f32 addition for an active prefix on `stream`.
+pub fn add_f32_prefix_into_on_stream(
+    left: &DeviceBuffer<f32>,
+    right: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if len == 0
+        || len > u32::MAX as usize
+        || left.len() < len
+        || right.len() < len
+        || output.len() < len
+    {
+        return Err(Error::Shape {
+            label: "f32 prefix add",
+            expected: format!("left/right/output at least {len} values"),
+            actual: format!(
+                "left={} right={} output={} active={len}",
+                left.len(),
+                right.len(),
+                output.len()
+            ),
+        });
+    }
+
     unsafe {
         check_cuda(
             "infer_add_f32_on_stream",
@@ -3518,7 +3706,7 @@ pub fn add_f32_into_on_stream(
                 left.ptr,
                 right.ptr,
                 output.buffer_mut().ptr,
-                left.len() as u32,
+                len as u32,
                 stream.as_raw(),
             ),
         )
@@ -4241,10 +4429,10 @@ pub fn quantize_nvfp4_col_major_f32_device_into_on_stream(
         expected: "rows * cols without overflow".to_string(),
         actual: format!("rows={rows} cols={cols}"),
     })?;
-    if input.len() != len {
+    if input.len() < len {
         return Err(Error::Shape {
             label: "NVFP4 device quantization input",
-            expected: format!("{len} values"),
+            expected: format!("at least {len} values"),
             actual: format!("{} values", input.len()),
         });
     }
@@ -6225,9 +6413,9 @@ pub fn bf16_linear_logits_f32_batch_into_on_stream(
         || batch_size > u32::MAX as usize
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
-        || input.len() != input_len
+        || input.len() < input_len
         || weight.len() != weight_len
-        || logits.len() != output_len
+        || logits.len() < output_len
     {
         return Err(Error::Shape {
             label: "batched BF16 linear buffers",
@@ -6409,6 +6597,33 @@ pub fn bf16_matrix_to_f32_into_on_stream(
             "infer_bf16_to_f32_on_stream",
             ffi::infer_bf16_to_f32_on_stream(
                 matrix.data_ptr().cast_mut(),
+                output.buffer_mut().ptr,
+                len as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Converts a prefix of device-resident BF16 values to f32 on `stream`.
+pub fn bf16_to_f32_prefix_into_on_stream(
+    input: &DeviceBuffer<u16>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if len == 0 || len > u32::MAX as usize || input.len() < len || output.len() < len {
+        return Err(Error::Shape {
+            label: "BF16 to f32 prefix buffers",
+            expected: format!("input and output >= {len} values for non-zero u32-sized len"),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_bf16_to_f32_on_stream",
+            ffi::infer_bf16_to_f32_on_stream(
+                input.ptr,
                 output.buffer_mut().ptr,
                 len as u32,
                 stream.as_raw(),
@@ -7088,6 +7303,7 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
         || total_tokens == 0
         || heads == 0
         || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
         || heads > u32::MAX as usize
         || q.len() < vectors
         || k.len() < vectors
@@ -7134,7 +7350,100 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
                 sequence_count as u32,
+                total_tokens as u32,
                 heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Gathers equally sized f32 rows from a device pointer table.
+pub fn gather_f32_pointer_rows_into_on_stream(
+    input_table: &DeviceBuffer<*mut f32>,
+    table_offset: usize,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    row_values: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.checked_mul(row_values).ok_or_else(|| Error::Shape {
+        label: "gathered pointer rows",
+        expected: "rows * row_values without overflow".to_string(),
+        actual: format!("rows={rows} row_values={row_values}"),
+    })?;
+    if rows == 0
+        || rows > u32::MAX as usize
+        || row_values == 0
+        || row_values > u32::MAX as usize
+        || table_offset
+            .checked_add(rows)
+            .is_none_or(|end| end > input_table.len())
+        || output.len() < values
+    {
+        return Err(Error::Shape {
+            label: "gathered pointer row buffers",
+            expected: format!(
+                "table>={} output>={values}",
+                table_offset.saturating_add(rows)
+            ),
+            actual: format!("table={} output={}", input_table.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_gather_f32_pointer_rows_on_stream",
+            ffi::infer_gather_f32_pointer_rows_on_stream(
+                input_table.ptr.add(table_offset),
+                output.buffer_mut().ptr,
+                rows as u32,
+                row_values as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Scatters equally sized f32 rows through a device pointer table.
+pub fn scatter_f32_pointer_rows_on_stream(
+    input: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<*mut f32>,
+    table_offset: usize,
+    rows: usize,
+    row_values: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.checked_mul(row_values).ok_or_else(|| Error::Shape {
+        label: "scattered pointer rows",
+        expected: "rows * row_values without overflow".to_string(),
+        actual: format!("rows={rows} row_values={row_values}"),
+    })?;
+    if rows == 0
+        || rows > u32::MAX as usize
+        || row_values == 0
+        || row_values > u32::MAX as usize
+        || input.len() < values
+        || table_offset
+            .checked_add(rows)
+            .is_none_or(|end| end > output_table.len())
+    {
+        return Err(Error::Shape {
+            label: "scattered pointer row buffers",
+            expected: format!(
+                "input>={values} table>={}",
+                table_offset.saturating_add(rows)
+            ),
+            actual: format!("input={} table={}", input.len(), output_table.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_scatter_f32_pointer_rows_on_stream",
+            ffi::infer_scatter_f32_pointer_rows_on_stream(
+                input.ptr,
+                output_table.ptr.add(table_offset),
+                rows as u32,
+                row_values as u32,
                 stream.as_raw(),
             ),
         )
@@ -7188,9 +7497,9 @@ pub fn fp8_linear_f32_batch_into_on_stream(
     if batch_size == 0
         || rows == 0
         || cols == 0
-        || input.len() != input_len
+        || input.len() < input_len
         || weight.len() != weight_len
-        || output.len() != output_len
+        || output.len() < output_len
         || batch_size > u32::MAX as usize
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
@@ -7544,10 +7853,10 @@ pub fn fp8_linear_channel_scaled_f32_batch_into_on_stream(
     if batch_size == 0
         || rows == 0
         || cols == 0
-        || input.len() != input_len
+        || input.len() < input_len
         || weight.len() != weight_len
         || channel_weight_scale.len() != rows
-        || output.len() != output_len
+        || output.len() < output_len
         || batch_size > u32::MAX as usize
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
@@ -8033,9 +8342,9 @@ pub fn quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
         || cols == 0
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
-        || input.len() != len
+        || input.len() < len
         || quantized_input.len() < len
-        || input_scale.len() != rows
+        || input_scale.len() < rows
     {
         return Err(Error::Shape {
             label: "batched dynamic FP8 quantization buffers",
@@ -8434,8 +8743,8 @@ pub fn nvfp4_w4a16_matvec_f32_batch_into_on_stream(
         || in_features == 0
         || !in_features.is_multiple_of(16)
         || out_features == 0
-        || input.len() != expected_input
-        || output.len() != expected_output
+        || input.len() < expected_input
+        || output.len() < expected_output
         || packed_weight.len() != weight_bytes
         || weight_scale.len() != scale_bytes
         || rows > u32::MAX as usize
@@ -9150,6 +9459,115 @@ pub fn qwen36_gdn_prep_chunks_into_on_stream(
     }
 }
 
+/// Applies token-parallel Qwen3.6 convolution preparation directly to BF16 GDN inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_prep_chunks_bf16_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, u16>,
+    mut k: DeviceOutput<'_, u16>,
+    mut v: DeviceOutput<'_, u16>,
+    conv_state_table: &DeviceBuffer<*mut f32>,
+    state_table_offset: usize,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let key_dim = key_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "BF16 chunked Qwen3.6 GDN prep",
+            expected: "key_heads * head_dim without overflow".to_string(),
+            actual: format!("key_heads={key_heads} head_dim={head_dim}"),
+        })?;
+    let value_dim = value_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "BF16 chunked Qwen3.6 GDN prep",
+            expected: "value_heads * head_dim without overflow".to_string(),
+            actual: format!("value_heads={value_heads} head_dim={head_dim}"),
+        })?;
+    let conv_dim = key_dim * 2 + value_dim;
+    let qkv_len = total_tokens
+        .checked_mul(conv_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "BF16 chunked Qwen3.6 GDN prep",
+            expected: "total_tokens * conv_dim without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} conv_dim={conv_dim}"),
+        })?;
+    let value_len = total_tokens
+        .checked_mul(value_dim)
+        .ok_or_else(|| Error::Shape {
+            label: "BF16 chunked Qwen3.6 GDN prep",
+            expected: "total_tokens * value_dim without overflow".to_string(),
+            actual: format!("total_tokens={total_tokens} value_dim={value_dim}"),
+        })?;
+    if sequence_count == 0
+        || total_tokens == 0
+        || key_heads == 0
+        || value_heads == 0
+        || head_dim != 128
+        || !value_heads.is_multiple_of(key_heads)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || qkv.len() < qkv_len
+        || conv_weight_bf16.len() != conv_dim * 4
+        || q.len() < value_len
+        || k.len() < value_len
+        || v.len() < value_len
+        || state_table_offset
+            .checked_add(sequence_count)
+            .is_none_or(|end| end > conv_state_table.len())
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "BF16 chunked Qwen3.6 GDN prep buffers",
+            expected: format!(
+                "qkv>={qkv_len} conv_weight={} q/k/v>={value_len} metadata/state>={sequence_count}",
+                conv_dim * 4
+            ),
+            actual: format!(
+                "qkv={} conv_weight={} q={} k={} v={} state={} offsets={} lengths={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_prep_chunks_bf16_on_stream",
+            ffi::infer_qwen36_gdn_prep_chunks_bf16_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state_table.ptr.add(state_table_offset),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                key_heads as u32,
+                value_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Computes Qwen3.6 GDN log-decay gate and beta from alpha/beta projections.
 pub fn qwen36_gdn_gate_into_on_stream(
     alpha: &DeviceBuffer<f32>,
@@ -9223,10 +9641,10 @@ pub fn qwen36_gdn_gate_batch_into_on_stream(
         || heads == 0
         || batch_size > u32::MAX as usize
         || heads > u32::MAX as usize
-        || alpha.len() != len
-        || beta_input.len() != len
-        || gate.len() != len
-        || beta.len() != len
+        || alpha.len() < len
+        || beta_input.len() < len
+        || gate.len() < len
+        || beta.len() < len
         || a_log_bf16.len() != heads
         || dt_bias_bf16.len() != heads
     {
@@ -9262,6 +9680,67 @@ pub fn qwen36_gdn_gate_batch_into_on_stream(
     }
 }
 
+/// Computes Qwen3.6 GDN gates directly into BF16 chunk-kernel inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen36_gdn_gate_batch_bf16_into_on_stream(
+    alpha: &DeviceBuffer<f32>,
+    beta_input: &DeviceBuffer<f32>,
+    a_log_bf16: &DeviceBuffer<u16>,
+    dt_bias_bf16: &DeviceBuffer<u16>,
+    mut gate: DeviceOutput<'_, u16>,
+    mut beta: DeviceOutput<'_, u16>,
+    batch_size: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = batch_size.checked_mul(heads).ok_or_else(|| Error::Shape {
+        label: "batched BF16 Qwen3.6 GDN gate",
+        expected: "batch_size * heads without overflow".to_string(),
+        actual: format!("batch_size={batch_size} heads={heads}"),
+    })?;
+    if batch_size == 0
+        || heads == 0
+        || batch_size > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || alpha.len() < len
+        || beta_input.len() < len
+        || gate.len() < len
+        || beta.len() < len
+        || a_log_bf16.len() != heads
+        || dt_bias_bf16.len() != heads
+    {
+        return Err(Error::Shape {
+            label: "batched BF16 Qwen3.6 GDN gate buffers",
+            expected: format!("alpha/beta_input/gate/beta={len} weights={heads}"),
+            actual: format!(
+                "alpha={} beta_input={} gate={} beta={} a_log={} dt_bias={}",
+                alpha.len(),
+                beta_input.len(),
+                gate.len(),
+                beta.len(),
+                a_log_bf16.len(),
+                dt_bias_bf16.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_qwen36_gdn_gate_batch_bf16_on_stream",
+            ffi::infer_qwen36_gdn_gate_batch_bf16_on_stream(
+                alpha.ptr,
+                beta_input.ptr,
+                a_log_bf16.ptr,
+                dt_bias_bf16.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                batch_size as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues RMSNorm(input) * silu(gate) into `output`.
 pub fn gated_rms_norm_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
@@ -9282,9 +9761,9 @@ pub fn gated_rms_norm_f32_into_on_stream(
         || cols == 0
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
-        || input.len() != len
-        || gate.len() != len
-        || output.len() != len
+        || input.len() < len
+        || gate.len() < len
+        || output.len() < len
         || weight.len() != cols
     {
         return Err(Error::Shape {
@@ -9996,6 +10475,34 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn active_prefix_elementwise_ops_preserve_padding() {
+        let left = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0]).expect("left");
+        let right = DeviceBuffer::from_host(&[0.5f32, 1.0, 1.5, 2.0, 2.5]).expect("right");
+        let mut output = DeviceBuffer::from_host(&[99.0f32; 5]).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        add_f32_prefix_into_on_stream(&left, &right, output.output(), 3, &stream)
+            .expect("prefix add");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("add output").as_slice(),
+            [1.5, 3.0, 4.5, 99.0, 99.0]
+        );
+
+        sigmoid_mul_f32_prefix_into_on_stream(&left, &right, output.output(), 3, &stream)
+            .expect("prefix sigmoid multiply");
+        let actual = output.copy_to_host(&stream).expect("sigmoid output");
+        for (actual, (gate, input)) in actual[..3].iter().zip(
+            left.copy_to_host(&stream).expect("left copy")[..3]
+                .iter()
+                .zip(right.copy_to_host(&stream).expect("right copy")[..3].iter()),
+        ) {
+            let expected = input / (1.0 + (-gate).exp());
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert_eq!(&actual[3..], [99.0, 99.0]);
+    }
 
     #[test]
     fn moe_routes_are_grouped_by_expert_on_device() {

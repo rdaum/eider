@@ -1207,7 +1207,7 @@ pub fn moe_silu_quantize_bf16_slots_on_stream(
     if rows == 0
         || !rows.is_multiple_of(64)
         || groups == 0
-        || gate_up_bf16.len() != groups * rows * 2
+        || gate_up_bf16.len() < groups * rows * 2
         || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
         || sfb.len() < groups * k_tiles
         || input_scale_table.is_empty()
@@ -1382,8 +1382,8 @@ pub fn indexed_grouped_gemv_on_stream(
     groups: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    if indices.len() != groups
-        || d.len() != groups
+    if indices.len() < groups
+        || d.len() < groups
         || a_native_tiles_table.len() != table_len
         || a_scales_table.len() != table_len
         || b_native_tiles.len() < groups * k_tiles * TILE_BYTES

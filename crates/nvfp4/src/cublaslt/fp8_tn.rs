@@ -133,10 +133,10 @@ impl Fp8TnMatmulPlan {
                 expected: "M * N without overflow".to_string(),
                 actual: format!("M={} N={}", self.shape.m, self.shape.n),
             })?;
-        if a_kxm.len() != a_len || b_kxn.len() != b_len || output.len() != d_len {
+        if a_kxm.len() != a_len || b_kxn.len() < b_len || output.len() < d_len {
             return Err(Error::Shape {
                 label: "FP8 TN buffers",
-                expected: format!("A={a_len} B={b_len} output={d_len}"),
+                expected: format!("A={a_len} B>={b_len} output>={d_len}"),
                 actual: format!(
                     "A={} B={} output={}",
                     a_kxm.len(),

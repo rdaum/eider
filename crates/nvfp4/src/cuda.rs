@@ -714,6 +714,32 @@ impl<T: Copy> DeviceBuffer<T> {
         }
     }
 
+    /// Copies host values into the prefix of this existing device allocation.
+    pub fn copy_prefix_from_host(&mut self, values: &[T]) -> Result<()> {
+        if values.len() > self.len {
+            return Err(Error::Shape {
+                label: "device prefix copy from host",
+                expected: format!("at most {} values", self.len),
+                actual: format!("{} values", values.len()),
+            });
+        }
+        if values.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::size_of_val(values);
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(H2D existing prefix)",
+                ffi::cudaMemcpy(
+                    self.ptr.cast(),
+                    values.as_ptr().cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_HOST_TO_DEVICE,
+                ),
+            )
+        }
+    }
+
     /// Enqueues a device-to-device copy of the first `len` elements.
     pub fn copy_prefix_from_device_on_stream(
         &mut self,
@@ -1044,5 +1070,23 @@ mod tests {
             .copy_prefix_to_host(5, &stream)
             .expect_err("oversized prefix must fail");
         assert!(error.to_string().contains("at most 4 values"));
+    }
+
+    #[test]
+    fn host_prefix_copy_preserves_the_device_suffix() {
+        let stream = CudaStream::new_blocking().expect("CUDA stream");
+        let mut device = DeviceBuffer::from_host(&[1u32, 2, 3, 4]).expect("device buffer");
+
+        device
+            .copy_prefix_from_host(&[9, 8])
+            .expect("host prefix copy");
+
+        assert_eq!(
+            device
+                .copy_to_host(&stream)
+                .expect("device copy")
+                .as_slice(),
+            [9, 8, 3, 4]
+        );
     }
 }

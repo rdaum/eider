@@ -394,12 +394,28 @@ impl MarlinNvfp4GateUp {
         input: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let batch = workspace.capacity;
-        if indices.len() != batch * ROUTED_TOP_K || input.len() != batch * self.hidden {
+        self.run_batch_bf16_prefix_on_stream(workspace, indices, input, workspace.capacity, stream)
+    }
+
+    /// Runs routed gate/up for an active prefix of a larger batch workspace.
+    pub fn run_batch_bf16_prefix_on_stream(
+        &self,
+        workspace: &MarlinNvfp4GateUpBatchWorkspace,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if batch == 0
+            || batch > workspace.capacity
+            || indices.len() < batch * ROUTED_TOP_K
+            || input.len() < batch * self.hidden
+        {
             return Err(Error::Shape {
-                label: "Marlin batched BF16 gate/up buffers",
+                label: "Marlin active batched BF16 gate/up buffers",
                 expected: format!(
-                    "indices={} input={}",
+                    "batch=1..={} indices>={} input>={}",
+                    workspace.capacity,
                     batch * ROUTED_TOP_K,
                     batch * self.hidden
                 ),

@@ -11,13 +11,14 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptFp8Linear,
-    ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer,
-    Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, device_weight_gemv_on_stream,
-    fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
+    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptCublasLtWeight,
+    ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
+    PinnedHostBuffer, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector,
+    Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    device_weight_gemv_on_stream, fill_f32_into_on_stream,
+    fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
     fp8_linear_f32_into_on_stream, fp8_linear_pair_configured_f32_into_on_stream,
     fp8_linear_triple_configured_f32_into_on_stream, fp8_linear_w8a8_f32_into_on_stream,
@@ -2195,6 +2196,7 @@ pub struct Qwen36MoeWeights {
     gate_up_w4a16_unity_alphas: DeviceBuffer<f32>,
     storage_plan: Qwen36MoeStoragePlan,
     gate_up_storage: Qwen36GateUpStorage,
+    grouped_prefill: Option<Qwen36GroupedPrefillWeights>,
     fp8_experts: Option<Qwen36Fp8Experts>,
     shared: Qwen36SharedExpertStorage,
     shared_gate: Bf16Linear,
@@ -2380,6 +2382,77 @@ enum Qwen36SharedExpertStorage {
     Fp8 { gate_up: Fp8Linear, down: Fp8Linear },
 }
 
+struct Qwen36GroupedPrefillWeights {
+    _gate_up: Vec<ModelOptCublasLtWeight>,
+    _down: Vec<ModelOptCublasLtWeight>,
+    gate_up_values: DeviceBuffer<*const u8>,
+    gate_up_scales: DeviceBuffer<*const u8>,
+    _gate_up_alphas: DeviceBuffer<f32>,
+    gate_up_alpha_table: DeviceBuffer<*mut f32>,
+    down_values: DeviceBuffer<*const u8>,
+    down_scales: DeviceBuffer<*const u8>,
+    _down_alphas: DeviceBuffer<f32>,
+    down_alpha_table: DeviceBuffer<*mut f32>,
+}
+
+impl Qwen36GroupedPrefillWeights {
+    fn new(
+        gate_up: Vec<ModelOptCublasLtWeight>,
+        down: Vec<ModelOptCublasLtWeight>,
+    ) -> Result<Self> {
+        let gate_up_values = gate_up
+            .iter()
+            .map(|weight| weight.matrix().values_ptr())
+            .collect::<Vec<_>>();
+        let gate_up_scales = gate_up
+            .iter()
+            .map(|weight| weight.matrix().scales_ptr())
+            .collect::<Vec<_>>();
+        let down_values = down
+            .iter()
+            .map(|weight| weight.matrix().values_ptr())
+            .collect::<Vec<_>>();
+        let down_scales = down
+            .iter()
+            .map(|weight| weight.matrix().scales_ptr())
+            .collect::<Vec<_>>();
+        let mut gate_up_alphas = DeviceBuffer::from_host(
+            &gate_up
+                .iter()
+                .map(ModelOptCublasLtWeight::weight_scale_2)
+                .collect::<Vec<_>>(),
+        )?;
+        let gate_up_alpha_table = scalar_pointer_table(&mut gate_up_alphas)?;
+        let mut down_alphas = DeviceBuffer::from_host(
+            &down
+                .iter()
+                .map(ModelOptCublasLtWeight::weight_scale_2)
+                .collect::<Vec<_>>(),
+        )?;
+        let down_alpha_table = scalar_pointer_table(&mut down_alphas)?;
+        Ok(Self {
+            gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
+            gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
+            _gate_up_alphas: gate_up_alphas,
+            gate_up_alpha_table,
+            down_values: DeviceBuffer::from_host(&down_values)?,
+            down_scales: DeviceBuffer::from_host(&down_scales)?,
+            _down_alphas: down_alphas,
+            down_alpha_table,
+            _gate_up: gate_up,
+            _down: down,
+        })
+    }
+}
+
+fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
+    let base = values.as_const_ptr().cast::<f32>().cast_mut();
+    let pointers = (0..values.len())
+        .map(|index| unsafe { base.add(index) })
+        .collect::<Vec<_>>();
+    DeviceBuffer::from_host(&pointers)
+}
+
 /// A device-resident NVFP4 linear weight for W4A16 execution.
 ///
 /// Stores the raw ModelOpt packed E2M1 weight and UE4M3 per-block scales
@@ -2388,6 +2461,7 @@ enum Qwen36SharedExpertStorage {
 struct Nvfp4DeviceLinear {
     packed_weight: DeviceBuffer<u8>,
     weight_scale: DeviceBuffer<u8>,
+    cublaslt_weight: ModelOptCublasLtWeight,
     weight_scale_2: f32,
     input_scale: f32,
     out_features: usize,
@@ -2897,6 +2971,8 @@ impl Qwen36MoeWeights {
         let mut gate_up_alphas = Vec::with_capacity(experts);
         let mut gate_up_w4a16_weight_scale_2 = Vec::with_capacity(experts);
         let mut marlin_gate_up_weights = Vec::with_capacity(experts);
+        let mut grouped_prefill_gate_up = Vec::with_capacity(experts);
+        let mut grouped_prefill_down = Vec::with_capacity(experts);
         let mut grouped_gate_up_weights = Vec::with_capacity(experts);
         let mut sm12x_down = Vec::with_capacity(experts);
         let mut sm12x_down_tile_ptrs = Vec::with_capacity(experts);
@@ -2920,6 +2996,7 @@ impl Qwen36MoeWeights {
                 gate_up_alphas.push(weight.weight_scale_2 * weight.input_scale);
             }
             gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
+            grouped_prefill_gate_up.push(weight.as_cublaslt_weight()?);
             marlin_gate_up_weights.push(weight);
 
             match storage_plan.down {
@@ -2936,6 +3013,7 @@ impl Qwen36MoeWeights {
                         checkpoint.load_nvfp4_linear(&format!("{}.down_proj", expert.prefix))?;
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
+                    grouped_prefill_down.push(weight.as_cublaslt_weight()?);
                 }
                 Qwen36DownStorage::Fp8 => {
                     unreachable!("NVFP4 loader cannot select FP8 down storage")
@@ -2979,6 +3057,15 @@ impl Qwen36MoeWeights {
             }
             Err(error) => return Err(error),
         };
+        let grouped_prefill =
+            if grouped_prefill_gate_up.len() == experts && grouped_prefill_down.len() == experts {
+                Some(Qwen36GroupedPrefillWeights::new(
+                    grouped_prefill_gate_up,
+                    grouped_prefill_down,
+                )?)
+            } else {
+                None
+            };
         let expert_ptrs = MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&gate_up_ptrs)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scale_ptrs)?,
@@ -3042,6 +3129,7 @@ impl Qwen36MoeWeights {
             gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan,
             gate_up_storage,
+            grouped_prefill,
             fp8_experts: None,
             shared,
             shared_gate,
@@ -3182,6 +3270,7 @@ impl Qwen36MoeWeights {
                 down: Qwen36DownStorage::Sm12x,
             },
             gate_up_storage: Qwen36GateUpStorage::Paged,
+            grouped_prefill: None,
             fp8_experts: None,
             shared,
             shared_gate,
@@ -3276,6 +3365,7 @@ impl Qwen36MoeWeights {
                 down: Qwen36DownStorage::Fp8,
             },
             gate_up_storage: Qwen36GateUpStorage::Fp8,
+            grouped_prefill: None,
             fp8_experts: Some(fp8_experts),
             shared,
             shared_gate,
@@ -4764,6 +4854,7 @@ impl Nvfp4DeviceLinear {
         Ok(Self {
             packed_weight: DeviceBuffer::from_host(&host.packed_weight)?,
             weight_scale: DeviceBuffer::from_host(&host.weight_scale)?,
+            cublaslt_weight: host.as_cublaslt_weight()?,
             weight_scale_2: host.weight_scale_2,
             input_scale: host.input_scale,
             out_features: host.out_features,

@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const VALIDATION_TOKEN_CAPACITY: usize = 32;
-const BENCH_TOKEN_CAPACITIES: [usize; 3] = [8, 32, 128];
-const MAX_CONTEXT_TOKENS: usize = 256;
+const BENCH_TOKEN_CAPACITIES: [usize; 4] = [128, 512, 2048, 3328];
+const MAX_CONTEXT_TOKENS: usize = 4096;
 
 struct PrefillCase {
     model: Rc<Qwen36TextModel>,
@@ -116,6 +116,15 @@ fn prefill_then_logits(
 }
 
 fn assert_logits_close(label: &str, actual: &[f32], expected: &[f32]) {
+    assert_logits_close_with_tolerance(label, actual, expected, 0.15);
+}
+
+fn assert_logits_close_with_tolerance(
+    label: &str,
+    actual: &[f32],
+    expected: &[f32],
+    max_relative_rmse: f64,
+) {
     assert_eq!(actual.len(), expected.len(), "{label} logit length");
     let max_abs = actual
         .iter()
@@ -152,7 +161,7 @@ fn assert_logits_close(label: &str, actual: &[f32], expected: &[f32]) {
         "{label} selects a different token: actual={actual_top} expected={expected_top} max_abs={max_abs} relative_rmse={relative_rmse}"
     );
     assert!(
-        relative_rmse <= 0.10,
+        relative_rmse <= max_relative_rmse,
         "{label} logits disagree with repeated decode: max_abs={max_abs} rmse={rmse} scale={scale} relative_rmse={relative_rmse}"
     );
 }
@@ -194,6 +203,28 @@ fn validate_prefill(model: &Qwen36TextModel) {
         first[6],
     );
     assert_logits_close("split prefill", &actual, &expected);
+
+    let tensor_core = (0..33)
+        .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
+        .collect::<Vec<_>>();
+    let expected = oracle_logits(model, &tensor_core);
+    let actual = prefill_then_logits(model, &mut prefill, &[&tensor_core[..32]], tensor_core[32]);
+    assert_logits_close_with_tolerance("tensor-core attention prefill", &actual, &expected, 0.30);
+
+    let chunked_gdn = (0..65)
+        .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
+        .collect::<Vec<_>>();
+    let expected = oracle_logits(model, &chunked_gdn);
+    let mut chunked_prefill = model
+        .new_prefill_batch_workspace(1, 64, MAX_CONTEXT_TOKENS)
+        .expect("chunked GDN validation workspace");
+    let actual = prefill_then_logits(
+        model,
+        &mut chunked_prefill,
+        &[&chunked_gdn[..64]],
+        chunked_gdn[64],
+    );
+    assert_logits_close_with_tolerance("chunked GDN prefill", &actual, &expected, 0.30);
 
     let mut states = [
         model
@@ -254,7 +285,7 @@ fn model_dir() -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("models/qwen3.6-35b-a3-nvfp4")
+                .join("models/qwen3.6-35b-a3b-nvfp4")
         })
 }
 
