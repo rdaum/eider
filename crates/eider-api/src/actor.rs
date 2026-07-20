@@ -353,6 +353,11 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Gemma4 => {
+            let mut defaults = defaults;
+            // Gemma's stochastic checkpoint defaults can fall into repetitive
+            // reasoning during interactive tool use. Prefer greedy serving
+            // unless the request explicitly supplies sampling parameters.
+            defaults.sampling.temperature = 0.0;
             info!(
                 model_dir = %model_dir.display(),
                 prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,

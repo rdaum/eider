@@ -879,6 +879,19 @@ mod tests {
     }
 
     #[test]
+    fn omitted_sampling_preserves_greedy_server_defaults() {
+        let mut defaults = defaults();
+        defaults.sampling.temperature = 0.0;
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "hello"
+        }))
+        .unwrap();
+        let chat = request.into_chat_request(&defaults).unwrap();
+        assert_eq!(chat.generation.sampling.temperature, 0.0);
+    }
+
+    #[test]
     fn codex_request_maps_messages_functions_and_ignores_builtin_tools() {
         let request: ResponseRequest = serde_json::from_value(json!({
             "model": "eider",
