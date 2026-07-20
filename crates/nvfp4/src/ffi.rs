@@ -1829,6 +1829,76 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_cumsum_on_stream(
+        gate: *const u16,
+        gate_cumsum: *mut f32,
+        cu_seqlens: *const i32,
+        chunk_indices: *const i32,
+        total_tokens: u32,
+        chunk_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_kkt_on_stream(
+        key: *const u16,
+        beta: *const u16,
+        gate_cumsum: *const f32,
+        a: *mut f32,
+        cu_seqlens: *const i32,
+        chunk_indices: *const i32,
+        total_tokens: u32,
+        chunk_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_solve_on_stream(
+        a: *mut f32,
+        a_inverse: *mut u16,
+        cu_seqlens: *const i32,
+        chunk_indices: *const i32,
+        total_tokens: u32,
+        chunk_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_wu_on_stream(
+        key: *const u16,
+        value: *const u16,
+        a_inverse: *const u16,
+        gate_cumsum: *const f32,
+        w: *mut u16,
+        u: *mut u16,
+        cu_seqlens: *const i32,
+        chunk_indices: *const i32,
+        total_tokens: u32,
+        chunk_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_h_on_stream(
+        key: *const u16,
+        u: *const u16,
+        w: *const u16,
+        value_new: *mut u16,
+        gate_cumsum: *const f32,
+        h: *mut u16,
+        state: *mut f32,
+        cu_seqlens: *const i32,
+        chunk_offsets: *const i64,
+        sequence_count: u32,
+        total_tokens: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen36_gdn_chunk_output_on_stream(
+        query: *const u16,
+        key: *const u16,
+        value_new: *const u16,
+        h: *const u16,
+        gate_cumsum: *const f32,
+        output: *mut u16,
+        cu_seqlens: *const i32,
+        chunk_indices: *const i32,
+        total_tokens: u32,
+        chunk_count: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gather_f32_pointer_rows_on_stream(
         input_table: *const *mut f32,
         output: *mut f32,

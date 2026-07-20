@@ -4,5 +4,7 @@ pub(crate) mod gemma4_attention;
 pub(crate) mod marlin;
 pub(crate) mod non_gemm;
 pub(crate) mod qwen36_gdn;
+#[cfg(test)]
+mod qwen36_gdn_reference;
 pub(crate) mod sm12x_kv_cache;
 pub(crate) mod sm12x_mma;

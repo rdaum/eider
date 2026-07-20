@@ -66,6 +66,10 @@ name = "gated_delta_net"
 harness = false
 
 [[bench]]
+name = "qwen36_chunked_gdn"
+harness = false
+
+[[bench]]
 name = "nvfp4_kv_attention"
 harness = false
 

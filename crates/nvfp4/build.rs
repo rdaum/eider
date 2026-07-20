@@ -66,6 +66,7 @@ fn main() {
     let oracle_object = format!("{out_dir}/fp4_oracle.o");
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
+    let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
     let marlin_moe_object = format!("{out_dir}/marlin_moe.o");
     let cutlass_gemv_object = format!("{out_dir}/cutlass_gemv.o");
@@ -122,6 +123,27 @@ fn main() {
     ]);
     let nvcc_status = nvcc.status().expect("failed to run nvcc for CUDA kernels");
     assert!(nvcc_status.success(), "nvcc failed to build CUDA kernels");
+
+    let mut qwen36_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    qwen36_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-arch=sm_121",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/qwen36_gdn.cu",
+        "-o",
+        &qwen36_gdn_object,
+    ]);
+    let qwen36_status = qwen36_nvcc
+        .status()
+        .expect("failed to run nvcc for Qwen3.6 GDN kernels");
+    assert!(
+        qwen36_status.success(),
+        "nvcc failed to build Qwen3.6 GDN kernels"
+    );
 
     // SM12x MMA code uses a separate architecture target and must not inherit
     // the more conservative target used by the general kernels.
@@ -307,6 +329,7 @@ fn main() {
             &oracle_object,
             &gpu_counters_object,
             &non_gemm_object,
+            &qwen36_gdn_object,
             &sm12x_mma_object,
             &marlin_moe_object,
             &cutlass_gemv_object,
@@ -328,6 +351,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/fp4_oracle.cpp");
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
+    println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");
     println!("cargo:rerun-if-changed=native/marlin_moe.cu");
     println!("cargo:rerun-if-changed=native/marlin");
