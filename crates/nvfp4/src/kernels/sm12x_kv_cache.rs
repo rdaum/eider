@@ -2,6 +2,7 @@
 
 use crate::cuda::check_cuda;
 use crate::{CudaStream, DeviceBuffer, DeviceOutput, Error, Result};
+use std::mem::{align_of, size_of};
 
 const K_TOKEN_TILE: usize = 8;
 const V_TOKEN_BLOCK: usize = 16;
@@ -18,16 +19,32 @@ const SCALE_BYTES_PER_TILE: usize = MMA_K / 16;
 /// K16 scales for each dimension. The V layout needs a bounded f32 tail so a
 /// token-axis scale block can be finalized without rewriting earlier entries.
 pub struct Sm12xKvCache {
-    key_values: DeviceBuffer<u8>,
-    key_scales: DeviceBuffer<u8>,
-    value_values: DeviceBuffer<u8>,
-    value_scales: DeviceBuffer<u8>,
-    key_tail: DeviceBuffer<f32>,
-    value_tail: DeviceBuffer<f32>,
+    storage: DeviceBuffer<u8>,
+    layout: Sm12xKvCacheLayout,
     max_tokens: usize,
     len: usize,
     kv_heads: usize,
     head_dim: usize,
+}
+
+struct Sm12xKvCacheLayout {
+    key_values: usize,
+    key_scales: usize,
+    value_values: usize,
+    value_scales: usize,
+    key_tail: usize,
+    value_tail: usize,
+    #[cfg(test)]
+    key_values_bytes: usize,
+    #[cfg(test)]
+    key_scales_bytes: usize,
+    #[cfg(test)]
+    value_values_bytes: usize,
+    #[cfg(test)]
+    value_scales_bytes: usize,
+    #[cfg(test)]
+    tail_values: usize,
+    total_bytes: usize,
 }
 
 pub(crate) struct Sm12xKvCacheParts {
@@ -79,6 +96,22 @@ impl Sm12xKvCache {
             actual: head_dim.to_string(),
         })?;
 
+        let layout = Self::layout(max_tokens, kv_heads, head_dim)?;
+
+        Ok(Self {
+            // Cache kernels only read positions below `len`. Append writes a
+            // tail row before publishing the new length, and aligned restore
+            // writes every compact tile covered by the restored length.
+            storage: DeviceBuffer::uninitialized(layout.total_bytes)?,
+            layout,
+            max_tokens,
+            len: 0,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    fn layout(max_tokens: usize, kv_heads: usize, head_dim: usize) -> Result<Sm12xKvCacheLayout> {
         let key_tiles = checked_product(
             "SM12x K tile count",
             &[
@@ -92,30 +125,49 @@ impl Sm12xKvCache {
             &[kv_heads, head_dim / MMA_N, max_tokens.div_ceil(MMA_K)],
         )?;
         let tail_values = checked_product("SM12x KV tail", &[V_TOKEN_BLOCK, kv_heads, head_dim])?;
-
-        Ok(Self {
-            key_values: DeviceBuffer::zeroed(checked_product(
-                "SM12x K values",
-                &[key_tiles, COMPACT_TILE_BYTES],
-            )?)?,
-            key_scales: DeviceBuffer::zeroed(checked_product(
-                "SM12x K scales",
-                &[key_tiles, K_TOKEN_TILE, SCALE_BYTES_PER_TILE],
-            )?)?,
-            value_values: DeviceBuffer::zeroed(checked_product(
-                "SM12x V values",
-                &[value_tiles, COMPACT_TILE_BYTES],
-            )?)?,
-            value_scales: DeviceBuffer::zeroed(checked_product(
-                "SM12x V scales",
-                &[value_tiles, MMA_N, SCALE_BYTES_PER_TILE],
-            )?)?,
-            key_tail: DeviceBuffer::zeroed(tail_values)?,
-            value_tail: DeviceBuffer::zeroed(tail_values)?,
-            max_tokens,
-            len: 0,
-            kv_heads,
-            head_dim,
+        let key_values_bytes = checked_product("SM12x K values", &[key_tiles, COMPACT_TILE_BYTES])?;
+        let key_scales_bytes = checked_product(
+            "SM12x K scales",
+            &[key_tiles, K_TOKEN_TILE, SCALE_BYTES_PER_TILE],
+        )?;
+        let value_values_bytes =
+            checked_product("SM12x V values", &[value_tiles, COMPACT_TILE_BYTES])?;
+        let value_scales_bytes = checked_product(
+            "SM12x V scales",
+            &[value_tiles, MMA_N, SCALE_BYTES_PER_TILE],
+        )?;
+        let tail_bytes = checked_product("SM12x KV tail bytes", &[tail_values, size_of::<f32>()])?;
+        let mut offset = 0usize;
+        let key_values = offset;
+        offset = checked_sum("SM12x K values end", offset, key_values_bytes)?;
+        let key_scales = offset;
+        offset = checked_sum("SM12x K scales end", offset, key_scales_bytes)?;
+        let value_values = offset;
+        offset = checked_sum("SM12x V values end", offset, value_values_bytes)?;
+        let value_scales = offset;
+        offset = checked_sum("SM12x V scales end", offset, value_scales_bytes)?;
+        let key_tail = align_up(offset, align_of::<f32>())?;
+        offset = checked_sum("SM12x K tail end", key_tail, tail_bytes)?;
+        let value_tail = offset;
+        let total_bytes = checked_sum("SM12x V tail end", value_tail, tail_bytes)?;
+        Ok(Sm12xKvCacheLayout {
+            key_values,
+            key_scales,
+            value_values,
+            value_scales,
+            key_tail,
+            value_tail,
+            #[cfg(test)]
+            key_values_bytes,
+            #[cfg(test)]
+            key_scales_bytes,
+            #[cfg(test)]
+            value_values_bytes,
+            #[cfg(test)]
+            value_scales_bytes,
+            #[cfg(test)]
+            tail_values,
+            total_bytes,
         })
     }
 
@@ -144,22 +196,17 @@ impl Sm12xKvCache {
 
     /// Returns the number of device bytes owned by this cache.
     pub fn device_bytes(&self) -> usize {
-        self.key_values.device_bytes()
-            + self.key_scales.device_bytes()
-            + self.value_values.device_bytes()
-            + self.value_scales.device_bytes()
-            + self.key_tail.device_bytes()
-            + self.value_tail.device_bytes()
+        self.storage.device_bytes()
     }
 
     pub(crate) fn compact_parts(&self) -> Sm12xKvCacheParts {
         Sm12xKvCacheParts {
-            key_values: self.key_values.as_const_ptr().cast(),
-            key_scales: self.key_scales.as_const_ptr().cast(),
-            value_values: self.value_values.as_const_ptr().cast(),
-            value_scales: self.value_scales.as_const_ptr().cast(),
-            key_tail: self.key_tail.as_const_ptr().cast(),
-            value_tail: self.value_tail.as_const_ptr().cast(),
+            key_values: self.key_values_ptr(),
+            key_scales: self.key_scales_ptr(),
+            value_values: self.value_values_ptr(),
+            value_scales: self.value_scales_ptr(),
+            key_tail: self.key_tail_ptr(),
+            value_tail: self.value_tail_ptr(),
         }
     }
 
@@ -172,51 +219,7 @@ impl Sm12xKvCache {
                 actual: max_tokens.to_string(),
             });
         }
-        let key_tiles = checked_product(
-            "SM12x K tile count",
-            &[
-                self.kv_heads,
-                max_tokens.div_ceil(K_TOKEN_TILE),
-                self.head_dim / MMA_K,
-            ],
-        )?;
-        let value_tiles = checked_product(
-            "SM12x V tile count",
-            &[
-                self.kv_heads,
-                self.head_dim / MMA_N,
-                max_tokens.div_ceil(MMA_K),
-            ],
-        )?;
-        let tail_values = checked_product(
-            "SM12x KV tail",
-            &[V_TOKEN_BLOCK, self.kv_heads, self.head_dim],
-        )?;
-        [
-            checked_product("SM12x K values", &[key_tiles, COMPACT_TILE_BYTES])?,
-            checked_product(
-                "SM12x K scales",
-                &[key_tiles, K_TOKEN_TILE, SCALE_BYTES_PER_TILE],
-            )?,
-            checked_product("SM12x V values", &[value_tiles, COMPACT_TILE_BYTES])?,
-            checked_product(
-                "SM12x V scales",
-                &[value_tiles, MMA_N, SCALE_BYTES_PER_TILE],
-            )?,
-            checked_product("SM12x K tail bytes", &[tail_values, size_of::<f32>()])?,
-            checked_product("SM12x V tail bytes", &[tail_values, size_of::<f32>()])?,
-        ]
-        .into_iter()
-        .try_fold(0usize, |total, bytes| {
-            total.checked_add(bytes).ok_or_else(|| Error::Shape {
-                label: "SM12x KV cache byte estimate",
-                expected: "allocation byte total without overflow".to_string(),
-                actual: format!(
-                    "max_tokens={max_tokens} kv_heads={} head_dim={}",
-                    self.kv_heads, self.head_dim
-                ),
-            })
-        })
+        Ok(Self::layout(max_tokens, self.kv_heads, self.head_dim)?.total_bytes)
     }
 
     /// Returns the number of K tokens finalized into compact 8-token tiles.
@@ -239,34 +242,127 @@ impl Sm12xKvCache {
         self.len % V_TOKEN_BLOCK
     }
 
-    /// Returns compact token-major K codes.
-    pub fn key_values(&self) -> &DeviceBuffer<u8> {
-        &self.key_values
+    fn byte_ptr(&self, offset: usize) -> *const u8 {
+        unsafe { self.storage.as_const_ptr().cast::<u8>().add(offset) }
     }
 
-    /// Returns compact K scale bytes, four per token in each 8-by-64 tile.
-    pub fn key_scales(&self) -> &DeviceBuffer<u8> {
-        &self.key_scales
+    fn byte_mut_ptr(&mut self, offset: usize) -> *mut u8 {
+        unsafe { self.storage.as_mut_ptr().cast::<u8>().add(offset) }
     }
 
-    /// Returns compact transposed-V codes.
-    pub fn value_values(&self) -> &DeviceBuffer<u8> {
-        &self.value_values
+    fn key_values_ptr(&self) -> *const u8 {
+        self.byte_ptr(self.layout.key_values)
     }
 
-    /// Returns compact V scale bytes, four per dimension in each 8-by-64 tile.
-    pub fn value_scales(&self) -> &DeviceBuffer<u8> {
-        &self.value_scales
+    fn key_scales_ptr(&self) -> *const u8 {
+        self.byte_ptr(self.layout.key_scales)
     }
 
-    /// Returns the 16-row circular f32 K staging allocation.
-    pub fn key_tail(&self) -> &DeviceBuffer<f32> {
-        &self.key_tail
+    fn value_values_ptr(&self) -> *const u8 {
+        self.byte_ptr(self.layout.value_values)
     }
 
-    /// Returns the 16-row circular f32 V staging allocation.
-    pub fn value_tail(&self) -> &DeviceBuffer<f32> {
-        &self.value_tail
+    fn value_scales_ptr(&self) -> *const u8 {
+        self.byte_ptr(self.layout.value_scales)
+    }
+
+    fn key_tail_ptr(&self) -> *const f32 {
+        self.byte_ptr(self.layout.key_tail).cast()
+    }
+
+    fn value_tail_ptr(&self) -> *const f32 {
+        self.byte_ptr(self.layout.value_tail).cast()
+    }
+
+    fn key_values_mut_ptr(&mut self) -> *mut u8 {
+        let offset = self.layout.key_values;
+        self.byte_mut_ptr(offset)
+    }
+
+    fn key_scales_mut_ptr(&mut self) -> *mut u8 {
+        let offset = self.layout.key_scales;
+        self.byte_mut_ptr(offset)
+    }
+
+    fn value_values_mut_ptr(&mut self) -> *mut u8 {
+        let offset = self.layout.value_values;
+        self.byte_mut_ptr(offset)
+    }
+
+    fn value_scales_mut_ptr(&mut self) -> *mut u8 {
+        let offset = self.layout.value_scales;
+        self.byte_mut_ptr(offset)
+    }
+
+    fn key_tail_mut_ptr(&mut self) -> *mut f32 {
+        let offset = self.layout.key_tail;
+        self.byte_mut_ptr(offset).cast()
+    }
+
+    fn value_tail_mut_ptr(&mut self) -> *mut f32 {
+        let offset = self.layout.value_tail;
+        self.byte_mut_ptr(offset).cast()
+    }
+
+    #[cfg(test)]
+    fn copy_region_to_host<T: Copy + Default>(
+        &self,
+        pointer: *const T,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<Vec<T>> {
+        stream.synchronize()?;
+        let mut values = vec![T::default(); len];
+        unsafe {
+            check_cuda(
+                "cudaMemcpy(D2H cache region)",
+                crate::ffi::cudaMemcpy(
+                    values.as_mut_ptr().cast(),
+                    pointer.cast(),
+                    len * size_of::<T>(),
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
+                ),
+            )?;
+        }
+        Ok(values)
+    }
+
+    #[cfg(test)]
+    fn key_values_to_host(&self, stream: &CudaStream) -> Result<Vec<u8>> {
+        self.copy_region_to_host(self.key_values_ptr(), self.layout.key_values_bytes, stream)
+    }
+
+    #[cfg(test)]
+    fn key_scales_to_host(&self, stream: &CudaStream) -> Result<Vec<u8>> {
+        self.copy_region_to_host(self.key_scales_ptr(), self.layout.key_scales_bytes, stream)
+    }
+
+    #[cfg(test)]
+    fn value_values_to_host(&self, stream: &CudaStream) -> Result<Vec<u8>> {
+        self.copy_region_to_host(
+            self.value_values_ptr(),
+            self.layout.value_values_bytes,
+            stream,
+        )
+    }
+
+    #[cfg(test)]
+    fn value_scales_to_host(&self, stream: &CudaStream) -> Result<Vec<u8>> {
+        self.copy_region_to_host(
+            self.value_scales_ptr(),
+            self.layout.value_scales_bytes,
+            stream,
+        )
+    }
+
+    #[cfg(test)]
+    fn key_tail_to_host(&self, stream: &CudaStream) -> Result<Vec<f32>> {
+        self.copy_region_to_host(self.key_tail_ptr(), self.layout.tail_values, stream)
+    }
+
+    #[cfg(test)]
+    fn value_tail_to_host(&self, stream: &CudaStream) -> Result<Vec<f32>> {
+        self.copy_region_to_host(self.value_tail_ptr(), self.layout.tail_values, stream)
     }
 
     /// Appends one device-resident K/V row and synchronizes before returning.
@@ -316,12 +412,12 @@ impl Sm12xKvCache {
                 crate::ffi::infer_sm12x_kv_cache_append_on_stream(
                     key.as_const_ptr().cast(),
                     value.as_const_ptr().cast(),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
-                    self.key_tail.as_mut_ptr().cast(),
-                    self.value_tail.as_mut_ptr().cast(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
+                    self.key_tail_mut_ptr(),
+                    self.value_tail_mut_ptr(),
                     position as u32,
                     self.max_tokens as u32,
                     self.kv_heads as u32,
@@ -375,12 +471,12 @@ impl Sm12xKvCache {
                 crate::ffi::infer_sm12x_kv_cache_append_on_stream(
                     key.as_const_ptr().cast::<f32>().add(key_offset),
                     value.as_const_ptr().cast::<f32>().add(value_offset),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
-                    self.key_tail.as_mut_ptr().cast(),
-                    self.value_tail.as_mut_ptr().cast(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
+                    self.key_tail_mut_ptr(),
+                    self.value_tail_mut_ptr(),
                     position as u32,
                     self.max_tokens as u32,
                     self.kv_heads as u32,
@@ -446,12 +542,12 @@ impl Sm12xKvCache {
                 crate::ffi::infer_sm12x_kv_cache_append_rows_on_stream(
                     key.as_const_ptr().cast(),
                     value.as_const_ptr().cast(),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
-                    self.key_tail.as_mut_ptr().cast(),
-                    self.value_tail.as_mut_ptr().cast(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
+                    self.key_tail_mut_ptr(),
+                    self.value_tail_mut_ptr(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     0,
@@ -527,12 +623,12 @@ impl Sm12xKvCache {
                 crate::ffi::infer_sm12x_kv_cache_append_rows_on_stream(
                     key.as_const_ptr().cast(),
                     value.as_const_ptr().cast(),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
-                    self.key_tail.as_mut_ptr().cast(),
-                    self.value_tail.as_mut_ptr().cast(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
+                    self.key_tail_mut_ptr(),
+                    self.value_tail_mut_ptr(),
                     key_output.as_mut_ptr().cast(),
                     value_output.as_mut_ptr().cast(),
                     rows as u32,
@@ -580,12 +676,12 @@ impl Sm12xKvCache {
             check_cuda(
                 "infer_sm12x_kv_cache_unpack_bf16_on_stream",
                 crate::ffi::infer_sm12x_kv_cache_unpack_bf16_on_stream(
-                    self.key_values.as_const_ptr().cast(),
-                    self.key_scales.as_const_ptr().cast(),
-                    self.value_values.as_const_ptr().cast(),
-                    self.value_scales.as_const_ptr().cast(),
-                    self.key_tail.as_const_ptr().cast(),
-                    self.value_tail.as_const_ptr().cast(),
+                    self.key_values_ptr(),
+                    self.key_scales_ptr(),
+                    self.value_values_ptr(),
+                    self.value_scales_ptr(),
+                    self.key_tail_ptr(),
+                    self.value_tail_ptr(),
                     key_output.as_mut_ptr().cast(),
                     value_output.as_mut_ptr().cast(),
                     self.len as u32,
@@ -625,12 +721,12 @@ impl Sm12xKvCache {
                 crate::ffi::infer_sm12x_kv_cache_append_indexed_on_stream(
                     key.as_const_ptr().cast(),
                     value.as_const_ptr().cast(),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
-                    self.key_tail.as_mut_ptr().cast(),
-                    self.value_tail.as_mut_ptr().cast(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
+                    self.key_tail_mut_ptr(),
+                    self.value_tail_mut_ptr(),
                     position.as_const_ptr().cast(),
                     self.max_tokens as u32,
                     self.kv_heads as u32,
@@ -676,14 +772,14 @@ impl Sm12xKvCache {
             check_cuda(
                 "infer_sm12x_kv_cache_copy_aligned_prefix_on_stream",
                 crate::ffi::infer_sm12x_kv_cache_copy_aligned_prefix_on_stream(
-                    source.key_values.as_const_ptr().cast(),
-                    source.key_scales.as_const_ptr().cast(),
-                    source.value_values.as_const_ptr().cast(),
-                    source.value_scales.as_const_ptr().cast(),
-                    self.key_values.as_mut_ptr().cast(),
-                    self.key_scales.as_mut_ptr().cast(),
-                    self.value_values.as_mut_ptr().cast(),
-                    self.value_scales.as_mut_ptr().cast(),
+                    source.key_values_ptr(),
+                    source.key_scales_ptr(),
+                    source.value_values_ptr(),
+                    source.value_scales_ptr(),
+                    self.key_values_mut_ptr(),
+                    self.key_scales_mut_ptr(),
+                    self.value_values_mut_ptr(),
+                    self.value_scales_mut_ptr(),
                     prefix_tokens as u32,
                     source.max_tokens as u32,
                     self.max_tokens as u32,
@@ -850,12 +946,12 @@ impl Sm12xKvAttentionWorkspace {
                 "infer_sm12x_kv_attention_on_stream",
                 crate::ffi::infer_sm12x_kv_attention_on_stream(
                     query.as_const_ptr().cast(),
-                    cache.key_values.as_const_ptr().cast(),
-                    cache.key_scales.as_const_ptr().cast(),
-                    cache.key_tail.as_const_ptr().cast(),
-                    cache.value_values.as_const_ptr().cast(),
-                    cache.value_scales.as_const_ptr().cast(),
-                    cache.value_tail.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -919,12 +1015,12 @@ impl Sm12xKvAttentionWorkspace {
                 "infer_sm12x_kv_attention_window_on_stream",
                 crate::ffi::infer_sm12x_kv_attention_window_on_stream(
                     query.as_const_ptr().cast(),
-                    cache.key_values.as_const_ptr().cast(),
-                    cache.key_scales.as_const_ptr().cast(),
-                    cache.key_tail.as_const_ptr().cast(),
-                    cache.value_values.as_const_ptr().cast(),
-                    cache.value_scales.as_const_ptr().cast(),
-                    cache.value_tail.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -1033,12 +1129,12 @@ impl Sm12xKvAttentionWorkspace {
                     query.as_const_ptr().cast(),
                     key.as_const_ptr().cast(),
                     value.as_const_ptr().cast(),
-                    cache.key_values.as_mut_ptr().cast(),
-                    cache.key_scales.as_mut_ptr().cast(),
-                    cache.value_values.as_mut_ptr().cast(),
-                    cache.value_scales.as_mut_ptr().cast(),
-                    cache.key_tail.as_mut_ptr().cast(),
-                    cache.value_tail.as_mut_ptr().cast(),
+                    cache.key_values_mut_ptr(),
+                    cache.key_scales_mut_ptr(),
+                    cache.value_values_mut_ptr(),
+                    cache.value_scales_mut_ptr(),
+                    cache.key_tail_mut_ptr(),
+                    cache.value_tail_mut_ptr(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -1112,12 +1208,12 @@ impl Sm12xKvAttentionWorkspace {
                 "infer_sm12x_kv_attention_on_stream",
                 crate::ffi::infer_sm12x_kv_attention_on_stream(
                     query.as_const_ptr().cast::<f32>().add(query_offset),
-                    cache.key_values.as_const_ptr().cast(),
-                    cache.key_scales.as_const_ptr().cast(),
-                    cache.key_tail.as_const_ptr().cast(),
-                    cache.value_values.as_const_ptr().cast(),
-                    cache.value_scales.as_const_ptr().cast(),
-                    cache.value_tail.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -1178,12 +1274,12 @@ impl Sm12xKvAttentionWorkspace {
                 "infer_sm12x_kv_attention_indexed_on_stream",
                 crate::ffi::infer_sm12x_kv_attention_indexed_on_stream(
                     query.as_const_ptr().cast(),
-                    cache.key_values.as_const_ptr().cast(),
-                    cache.key_scales.as_const_ptr().cast(),
-                    cache.key_tail.as_const_ptr().cast(),
-                    cache.value_values.as_const_ptr().cast(),
-                    cache.value_scales.as_const_ptr().cast(),
-                    cache.value_tail.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -1244,9 +1340,9 @@ impl Sm12xKvAttentionWorkspace {
                 "infer_sm12x_kv_pv_from_probabilities_on_stream",
                 crate::ffi::infer_sm12x_kv_pv_from_probabilities_on_stream(
                     probabilities.as_const_ptr().cast(),
-                    cache.value_values.as_const_ptr().cast(),
-                    cache.value_scales.as_const_ptr().cast(),
-                    cache.value_tail.as_const_ptr().cast(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
@@ -1274,6 +1370,19 @@ fn checked_product(label: &'static str, values: &[usize]) -> Result<usize> {
             actual: format!("factors={values:?}"),
         })
     })
+}
+
+fn checked_sum(label: &'static str, left: usize, right: usize) -> Result<usize> {
+    left.checked_add(right).ok_or_else(|| Error::Shape {
+        label,
+        expected: "offset without overflow".to_string(),
+        actual: format!("left={left} right={right}"),
+    })
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    let mask = alignment - 1;
+    checked_sum("SM12x KV cache alignment", value, mask).map(|value| value & !mask)
 }
 
 #[cfg(test)]
@@ -1415,38 +1524,34 @@ mod tests {
         assert_eq!(cache.value_tail_len(), 1);
 
         let stream = CudaStream::new_blocking().expect("stream");
-        let key_values = cache.key_values.copy_to_host(&stream).expect("K values");
-        let key_scales = cache.key_scales.copy_to_host(&stream).expect("K scales");
-        let value_values = cache.value_values.copy_to_host(&stream).expect("V values");
-        let value_scales = cache.value_scales.copy_to_host(&stream).expect("V scales");
+        let key_values = cache.key_values_to_host(&stream).expect("K values");
+        let key_scales = cache.key_scales_to_host(&stream).expect("K scales");
+        let value_values = cache.value_values_to_host(&stream).expect("V values");
+        let value_scales = cache.value_scales_to_host(&stream).expect("V scales");
         assert_eq!(rows_cache.len(), cache.len());
         assert_eq!(
-            &*rows_cache
-                .key_values
-                .copy_to_host(&stream)
+            rows_cache
+                .key_values_to_host(&stream)
                 .expect("row K values"),
-            &*key_values
+            key_values
         );
         assert_eq!(
-            &*rows_cache
-                .key_scales
-                .copy_to_host(&stream)
+            rows_cache
+                .key_scales_to_host(&stream)
                 .expect("row K scales"),
-            &*key_scales
+            key_scales
         );
         assert_eq!(
-            &*rows_cache
-                .value_values
-                .copy_to_host(&stream)
+            rows_cache
+                .value_values_to_host(&stream)
                 .expect("row V values"),
-            &*value_values
+            value_values
         );
         assert_eq!(
-            &*rows_cache
-                .value_scales
-                .copy_to_host(&stream)
+            rows_cache
+                .value_scales_to_host(&stream)
                 .expect("row V scales"),
-            &*value_scales
+            value_scales
         );
 
         let key_token_tiles = MAX_TOKENS.div_ceil(K_TOKEN_TILE);
@@ -1483,8 +1588,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(&*key_values, expected_key_values);
-        assert_eq!(&*key_scales, expected_key_scales);
+        assert_eq!(key_values, expected_key_values);
+        assert_eq!(key_scales, expected_key_scales);
 
         let value_token_tiles = MAX_TOKENS.div_ceil(MMA_K);
         let value_dim_tiles = HEAD_DIM / MMA_N;
@@ -1518,24 +1623,18 @@ mod tests {
                 }
             }
         }
-        assert_eq!(&*value_values, expected_value_values);
-        assert_eq!(&*value_scales, expected_value_scales);
+        assert_eq!(value_values, expected_value_values);
+        assert_eq!(value_scales, expected_value_scales);
 
-        let key_tail = cache.key_tail.copy_to_host(&stream).expect("K tail");
-        let value_tail = cache.value_tail.copy_to_host(&stream).expect("V tail");
+        let key_tail = cache.key_tail_to_host(&stream).expect("K tail");
+        let value_tail = cache.value_tail_to_host(&stream).expect("V tail");
         assert_eq!(
-            &*rows_cache
-                .key_tail
-                .copy_to_host(&stream)
-                .expect("row K tail"),
-            &*key_tail
+            rows_cache.key_tail_to_host(&stream).expect("row K tail"),
+            key_tail
         );
         assert_eq!(
-            &*rows_cache
-                .value_tail
-                .copy_to_host(&stream)
-                .expect("row V tail"),
-            &*value_tail
+            rows_cache.value_tail_to_host(&stream).expect("row V tail"),
+            value_tail
         );
         for slot in 0..V_TOKEN_BLOCK {
             let source_token = if slot == 0 { 16 } else { slot };
@@ -1640,23 +1739,17 @@ mod tests {
         assert!(max_abs <= 1.0e-6, "causal row max_abs={max_abs}");
         assert_eq!(chunk_cache.len(), repeated_cache.len());
         assert_eq!(
-            &*chunk_cache
-                .key_tail()
-                .copy_to_host(&stream)
-                .expect("chunk K tail"),
-            &*repeated_cache
-                .key_tail()
-                .copy_to_host(&stream)
+            chunk_cache.key_tail_to_host(&stream).expect("chunk K tail"),
+            repeated_cache
+                .key_tail_to_host(&stream)
                 .expect("repeated K tail")
         );
         assert_eq!(
-            &*chunk_cache
-                .value_tail()
-                .copy_to_host(&stream)
+            chunk_cache
+                .value_tail_to_host(&stream)
                 .expect("chunk V tail"),
-            &*repeated_cache
-                .value_tail()
-                .copy_to_host(&stream)
+            repeated_cache
+                .value_tail_to_host(&stream)
                 .expect("repeated V tail")
         );
     }
@@ -1978,23 +2071,19 @@ mod tests {
             .expect("offset append");
 
         assert_eq!(
-            &*direct_cache
-                .key_tail()
-                .copy_to_host(&stream)
+            direct_cache
+                .key_tail_to_host(&stream)
                 .expect("direct key tail"),
-            &*offset_cache
-                .key_tail()
-                .copy_to_host(&stream)
+            offset_cache
+                .key_tail_to_host(&stream)
                 .expect("offset key tail")
         );
         assert_eq!(
-            &*direct_cache
-                .value_tail()
-                .copy_to_host(&stream)
+            direct_cache
+                .value_tail_to_host(&stream)
                 .expect("direct value tail"),
-            &*offset_cache
-                .value_tail()
-                .copy_to_host(&stream)
+            offset_cache
+                .value_tail_to_host(&stream)
                 .expect("offset value tail")
         );
 

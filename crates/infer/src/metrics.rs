@@ -85,6 +85,12 @@ pub struct InferMetrics {
     #[help = "Prompt tokens restored from cached hybrid-state checkpoints"]
     pub prefix_cache_hit_tokens: Counter,
 
+    #[help = "Gemma 4 local-attention layer rows processed directly from compact KV storage"]
+    pub gemma4_compact_local_prefill_rows: Counter,
+
+    #[help = "Gemma 4 local-attention layer rows processed after BF16 KV staging"]
+    pub gemma4_bf16_local_prefill_rows: Counter,
+
     #[help = "Hybrid-state checkpoints evicted from the prompt-prefix cache"]
     pub prefix_cache_evictions: Counter,
 
@@ -120,6 +126,12 @@ pub struct InferMetrics {
 
     #[help = "Wall time spent restoring a hybrid-state prompt checkpoint in microseconds"]
     pub prefix_cache_restore_us: Histogram,
+
+    #[help = "Wall time spent allocating Gemma 4 active sequence state in microseconds"]
+    pub gemma4_sequence_allocation_us: Histogram,
+
+    #[help = "Wall time spent copying a Gemma 4 prompt checkpoint in microseconds"]
+    pub gemma4_checkpoint_copy_us: Histogram,
 }
 
 impl InferMetrics {
@@ -144,6 +156,8 @@ impl InferMetrics {
             prefix_cache_hits: Counter::new(shard_count),
             prefix_cache_misses: Counter::new(shard_count),
             prefix_cache_hit_tokens: Counter::new(shard_count),
+            gemma4_compact_local_prefill_rows: Counter::new(shard_count),
+            gemma4_bf16_local_prefill_rows: Counter::new(shard_count),
             prefix_cache_evictions: Counter::new(shard_count),
             prefix_cache_entries: Gauge::new(),
             prefix_cache_device_bytes: Gauge::new(),
@@ -156,6 +170,8 @@ impl InferMetrics {
             expert_staging_wait_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             prefix_cache_checkpoint_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             prefix_cache_restore_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            gemma4_sequence_allocation_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
+            gemma4_checkpoint_copy_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
         }
     }
 }
@@ -322,7 +338,7 @@ fn metric_count(value: usize) -> isize {
     value.min(isize::MAX as usize) as isize
 }
 
-fn duration_us(duration: Duration) -> u64 {
+pub(crate) fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
 }
 
@@ -352,6 +368,10 @@ mod tests {
         metrics.prefix_cache_device_bytes.set(4096);
         metrics.prefix_cache_checkpoint_us.record(50);
         metrics.prefix_cache_restore_us.record(60);
+        metrics.gemma4_compact_local_prefill_rows.add(128);
+        metrics.gemma4_bf16_local_prefill_rows.add(64);
+        metrics.gemma4_sequence_allocation_us.record(70);
+        metrics.gemma4_checkpoint_copy_us.record(80);
 
         let mut output = String::new();
         metrics.export_prometheus(&mut output);
@@ -375,6 +395,10 @@ mod tests {
             "eider_infer_prefix_cache_device_bytes",
             "eider_infer_prefix_cache_checkpoint_us",
             "eider_infer_prefix_cache_restore_us",
+            "eider_infer_gemma4_compact_local_prefill_rows",
+            "eider_infer_gemma4_bf16_local_prefill_rows",
+            "eider_infer_gemma4_sequence_allocation_us",
+            "eider_infer_gemma4_checkpoint_copy_us",
         ] {
             assert!(output.contains(name), "missing {name}: {output}");
         }
@@ -402,6 +426,10 @@ mod tests {
             "eider_infer.prefix_cache_device_bytes",
             "eider_infer.prefix_cache_checkpoint_us",
             "eider_infer.prefix_cache_restore_us",
+            "eider_infer.gemma4_compact_local_prefill_rows",
+            "eider_infer.gemma4_bf16_local_prefill_rows",
+            "eider_infer.gemma4_sequence_allocation_us",
+            "eider_infer.gemma4_checkpoint_copy_us",
         ] {
             assert!(dogstatsd.contains(name), "missing {name}: {dogstatsd}");
         }

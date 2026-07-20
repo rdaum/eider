@@ -606,6 +606,28 @@ pub struct DeviceBuffer<T> {
 }
 
 impl<T: Copy> DeviceBuffer<T> {
+    /// Allocates device memory without initializing its contents.
+    ///
+    /// This is crate-private because callers must ensure every element is
+    /// written before it can be observed by a kernel or copied to the host.
+    pub(crate) fn uninitialized(len: usize) -> Result<Self> {
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device uninitialized allocation",
+                expected: "len * element size without overflow".to_string(),
+                actual: format!("len={len} element_size={}", size_of::<T>()),
+            })?;
+        let mut raw = null_mut();
+        unsafe {
+            check_cuda("cudaMalloc", ffi::cudaMalloc(&mut raw, bytes))?;
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len,
+        })
+    }
+
     /// Allocates device memory and copies `values` into it.
     pub fn from_host(values: &[T]) -> Result<Self> {
         let mut raw = null_mut();

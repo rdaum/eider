@@ -428,6 +428,8 @@ struct EngineAdmissionProgress {
     request_id: u64,
     sequence_device_bytes: usize,
     cached_prompt_tokens: usize,
+    allocation_duration: Duration,
+    checkpoint_copy_duration: Duration,
     admitted_after_tick_start: Duration,
 }
 
@@ -514,6 +516,8 @@ impl ActorService for QwenActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    allocation_duration: Duration::ZERO,
+                    checkpoint_copy_duration: Duration::ZERO,
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
@@ -615,6 +619,8 @@ impl ActorService for StepActorService<'_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    allocation_duration: Duration::ZERO,
+                    checkpoint_copy_duration: Duration::ZERO,
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
@@ -716,6 +722,8 @@ impl ActorService for NemotronActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    allocation_duration: Duration::ZERO,
+                    checkpoint_copy_duration: Duration::ZERO,
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
@@ -818,6 +826,8 @@ impl ActorService for GemmaActorService<'_, '_> {
                     request_id: progress.request_id.get(),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
+                    allocation_duration: progress.allocation_duration,
+                    checkpoint_copy_duration: progress.checkpoint_copy_duration,
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 })
                 .collect(),
@@ -952,6 +962,8 @@ fn run_actor_loop(
                     state_bytes = admission.sequence_device_bytes,
                     cached_prompt_tokens = admission.cached_prompt_tokens,
                     admission_ms = request.metrics.admission_duration().as_secs_f64() * 1000.0,
+                    allocation_ms = admission.allocation_duration.as_secs_f64() * 1000.0,
+                    checkpoint_copy_ms = admission.checkpoint_copy_duration.as_secs_f64() * 1000.0,
                     active_sequences = tick.active_sequences,
                     "request admitted"
                 );

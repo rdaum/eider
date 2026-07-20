@@ -13,6 +13,7 @@ use crate::gemma4::{
     Gemma4DecodeState, Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput,
     Gemma4PrefillRow, Gemma4SequenceCheckpoint,
 };
+use crate::metrics::{duration_us, metrics};
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -43,6 +44,10 @@ pub struct Gemma4AdmissionProgress {
     pub request_id: Gemma4RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
+    /// Wall time spent allocating active sequence state.
+    pub allocation_duration: Duration,
+    /// Wall time spent copying a retained checkpoint into active KV storage.
+    pub checkpoint_copy_duration: Duration,
     /// Elapsed scheduler-tick time when admission completed.
     pub admitted_after_tick_start: Duration,
 }
@@ -361,20 +366,43 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
+            let mut allocation_duration = Duration::ZERO;
+            let mut checkpoint_copy_duration = Duration::ZERO;
             let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
                 (Some(cache), Some(key)) => {
                     cache.restore(key, Gemma4SequenceCheckpoint::position, |checkpoint| {
-                        self.model.restore_sequence_checkpoint(
+                        let allocation_started = Instant::now();
+                        let mut state = self.model.new_decode_state(capacity.max(1))?;
+                        allocation_duration = allocation_started.elapsed();
+                        let copy_started = Instant::now();
+                        self.model.restore_sequence_checkpoint_into(
                             checkpoint,
-                            capacity.max(1),
+                            &mut state,
                             &self.stream,
-                        )
+                        )?;
+                        checkpoint_copy_duration = copy_started.elapsed();
+                        Ok(state)
                     })?
                 }
                 _ => None,
             };
             let cached_prompt_tokens = restored.as_ref().map_or(0, Gemma4DecodeState::len);
-            let state = restored.unwrap_or(self.model.new_decode_state(capacity.max(1))?);
+            let state = if let Some(restored) = restored {
+                restored
+            } else {
+                let allocation_started = Instant::now();
+                let state = self.model.new_decode_state(capacity.max(1))?;
+                allocation_duration = allocation_started.elapsed();
+                state
+            };
+            metrics()
+                .gemma4_sequence_allocation_us
+                .record(duration_us(allocation_duration));
+            if checkpoint_copy_duration != Duration::ZERO {
+                metrics()
+                    .gemma4_checkpoint_copy_us
+                    .record(duration_us(checkpoint_copy_duration));
+            }
             let bytes = state.device_bytes();
             request.prompt_position = cached_prompt_tokens;
             request.prefix_cache_checkpointed =
@@ -385,6 +413,8 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
+                allocation_duration,
+                checkpoint_copy_duration,
                 admitted_after_tick_start: tick_started.elapsed(),
             });
         }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::metrics;
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape,
     Gemma4LocalPrefillAttention, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
@@ -400,6 +401,9 @@ impl Gemma4TensorCoreAttentionWorkspace {
                     output_input_scale,
                     stream,
                 )?;
+                metrics()
+                    .gemma4_compact_local_prefill_rows
+                    .add(rows.min(isize::MAX as usize) as isize);
                 return Ok(());
             }
         }
@@ -447,6 +451,9 @@ impl Gemma4TensorCoreAttentionWorkspace {
                 output_input_scale,
                 stream,
             )?;
+            metrics()
+                .gemma4_bf16_local_prefill_rows
+                .add(rows.min(isize::MAX as usize) as isize);
             return Ok(());
         }
 
@@ -1579,7 +1586,10 @@ mod tests {
                     &input,
                     &mut serial_state.layers[0],
                     &mut serial_state.kv_caches[0],
-                    &mut serial_state.compact_attention[0],
+                    serial_state
+                        .compact_attention
+                        .for_layer_mut(true)
+                        .expect("local compact attention workspace"),
                     row,
                     &stream,
                 )

@@ -429,13 +429,59 @@ pub struct Gemma4DecodeState {
     hidden: DeviceBuffer<f32>,
     layers: Vec<Gemma4DecoderLayerWorkspace>,
     kv_caches: Vec<Sm12xKvCache>,
-    compact_attention: Vec<Sm12xKvAttentionWorkspace>,
+    compact_attention: Gemma4CompactAttentionWorkspaces,
     lm_logits: DeviceBuffer<f32>,
     lm_top1_scratch_index: DeviceBuffer<u32>,
     lm_argmax: DeviceBuffer<u32>,
     lm_argmax_value: DeviceBuffer<f32>,
     position: usize,
     max_tokens: usize,
+}
+
+struct Gemma4CompactAttentionWorkspaces {
+    local: Option<Sm12xKvAttentionWorkspace>,
+    global: Option<Sm12xKvAttentionWorkspace>,
+}
+
+impl Gemma4CompactAttentionWorkspaces {
+    fn new(layers: &[Gemma4DecoderLayer], max_tokens: usize) -> Result<Self> {
+        let local = layers
+            .iter()
+            .find(|layer| layer.attention.window.is_some())
+            .map(|layer| layer.new_compact_attention_workspace(max_tokens))
+            .transpose()?;
+        let global = layers
+            .iter()
+            .find(|layer| layer.attention.window.is_none())
+            .map(|layer| layer.new_compact_attention_workspace(max_tokens))
+            .transpose()?;
+        Ok(Self { local, global })
+    }
+
+    fn for_layer_mut(&mut self, local: bool) -> Result<&mut Sm12xKvAttentionWorkspace> {
+        let workspace = if local {
+            self.local.as_mut()
+        } else {
+            self.global.as_mut()
+        };
+        workspace.ok_or_else(|| Error::Format {
+            label: "Gemma 4 compact attention workspace",
+            detail: format!(
+                "missing {} workspace for decoder layer",
+                if local { "local" } else { "global" }
+            ),
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.local
+            .as_ref()
+            .map_or(0, Sm12xKvAttentionWorkspace::device_bytes)
+            + self
+                .global
+                .as_ref()
+                .map_or(0, Sm12xKvAttentionWorkspace::device_bytes)
+    }
 }
 
 /// Compact device-resident state for one reusable aligned prompt prefix.
@@ -1851,12 +1897,11 @@ impl Gemma4Model {
         }
         let mut layers = Vec::with_capacity(self.layers.len());
         let mut kv_caches = Vec::with_capacity(self.layers.len());
-        let mut compact_attention = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             layers.push(layer.new_workspace()?);
             kv_caches.push(layer.new_kv_cache(max_tokens)?);
-            compact_attention.push(layer.new_compact_attention_workspace(max_tokens)?);
         }
+        let compact_attention = Gemma4CompactAttentionWorkspaces::new(&self.layers, max_tokens)?;
         Ok(Gemma4DecodeState {
             hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
             layers,
@@ -1940,6 +1985,7 @@ impl Gemma4Model {
         )?;
         round_f32_to_bf16_in_place_on_stream(state.hidden.inout(), stream)?;
         for layer_index in 0..self.layers.len() {
+            let local_attention = self.layers[layer_index].attention.window.is_some();
             let (previous, current) = state.layers.split_at_mut(layer_index);
             let input = if layer_index == 0 {
                 &state.hidden
@@ -1950,7 +1996,7 @@ impl Gemma4Model {
                 input,
                 &mut current[0],
                 &mut state.kv_caches[layer_index],
-                &mut state.compact_attention[layer_index],
+                state.compact_attention.for_layer_mut(local_attention)?,
                 state.position,
                 stream,
             )?;
@@ -2087,14 +2133,15 @@ impl Gemma4Model {
         })
     }
 
-    /// Creates active sequence state from an aligned prompt checkpoint.
-    pub fn restore_sequence_checkpoint(
+    /// Restores an aligned prompt checkpoint into freshly allocated active state.
+    pub(crate) fn restore_sequence_checkpoint_into(
         &self,
         checkpoint: &Gemma4SequenceCheckpoint,
-        max_tokens: usize,
+        state: &mut Gemma4DecodeState,
         stream: &CudaStream,
-    ) -> Result<Gemma4DecodeState> {
-        if checkpoint.position > max_tokens || checkpoint.kv_caches.len() != self.layers.len() {
+    ) -> Result<()> {
+        if checkpoint.position > state.max_tokens || checkpoint.kv_caches.len() != self.layers.len()
+        {
             return Err(Error::Shape {
                 label: "Gemma 4 sequence checkpoint restore",
                 expected: format!(
@@ -2103,18 +2150,18 @@ impl Gemma4Model {
                     self.layers.len()
                 ),
                 actual: format!(
-                    "capacity={max_tokens} layers={}",
+                    "capacity={} layers={}",
+                    state.max_tokens,
                     checkpoint.kv_caches.len()
                 ),
             });
         }
-        let mut state = self.new_decode_state(max_tokens)?;
         for (destination, source) in state.kv_caches.iter_mut().zip(&checkpoint.kv_caches) {
             destination.copy_aligned_prefix_from_on_stream(source, checkpoint.position, stream)?;
         }
         stream.synchronize()?;
         state.position = checkpoint.position;
-        Ok(state)
+        Ok(())
     }
 
     fn softcap_logit(&self, logit: f32) -> f32 {
@@ -2152,11 +2199,7 @@ impl Gemma4DecodeState {
                 .iter()
                 .map(Sm12xKvCache::device_bytes)
                 .sum::<usize>()
-            + self
-                .compact_attention
-                .iter()
-                .map(Sm12xKvAttentionWorkspace::device_bytes)
-                .sum::<usize>()
+            + self.compact_attention.device_bytes()
             + self.lm_logits.device_bytes()
             + self.lm_top1_scratch_index.device_bytes()
             + self.lm_argmax.device_bytes()
