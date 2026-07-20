@@ -20,13 +20,6 @@ pub(crate) type cudaGraphExec_t = *mut c_void;
 pub(crate) type cudaMemcpyKind = i32;
 #[allow(non_camel_case_types)]
 pub(crate) type cudaStreamCaptureMode = i32;
-#[allow(non_camel_case_types)]
-pub(crate) type CUresult = i32;
-#[allow(non_camel_case_types)]
-pub(crate) type CUmodule = *mut c_void;
-#[allow(non_camel_case_types)]
-pub(crate) type CUfunction = *mut c_void;
-
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: cudaMemcpyKind = 2;
@@ -36,8 +29,6 @@ pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
 pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
-pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
-
 #[allow(non_camel_case_types)]
 pub(crate) type cublasStatus_t = i32;
 #[allow(non_camel_case_types)]
@@ -96,27 +87,16 @@ pub(crate) struct cublasLtMatmulHeuristicResult_t {
 }
 
 unsafe extern "C" {
-    pub(crate) fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
-    pub(crate) fn cuModuleGetFunction(
-        function: *mut CUfunction,
-        module: CUmodule,
-        name: *const c_char,
-    ) -> CUresult;
-    pub(crate) fn cuModuleUnload(module: CUmodule) -> CUresult;
-    pub(crate) fn cuFuncSetAttribute(function: CUfunction, attribute: i32, value: i32) -> CUresult;
-    pub(crate) fn cuLaunchKernel(
-        function: CUfunction,
-        grid_x: u32,
-        grid_y: u32,
-        grid_z: u32,
-        block_x: u32,
-        block_y: u32,
-        block_z: u32,
-        shared_memory_bytes: u32,
+    pub(crate) fn infer_gemma4_local_attention_bf16_on_stream(
+        query: *const u16,
+        key: *const u16,
+        value: *const u16,
+        output: *mut u16,
+        query_tokens: u32,
+        key_tokens: u32,
+        start_position: u32,
         stream: cudaStream_t,
-        kernel_params: *mut *mut c_void,
-        extra: *mut *mut c_void,
-    ) -> CUresult;
+    ) -> cudaError_t;
     pub(crate) fn cudaGetDevice(device: *mut i32) -> cudaError_t;
     pub(crate) fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> cudaError_t;

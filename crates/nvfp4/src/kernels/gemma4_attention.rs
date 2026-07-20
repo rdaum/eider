@@ -1,53 +1,18 @@
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput};
+use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
-use std::ffi::c_void;
-use std::ptr::null_mut;
 
-const CUBIN: &[u8] = include_bytes!("../../native/gemma4_local_attention_sm121.cubin");
-const KERNEL_NAME: &[u8] = b"gemma4_local_attention\0";
 const HEAD_DIM: usize = 256;
 const QUERY_HEADS: usize = 16;
 const KV_HEADS: usize = 8;
-const BLOCK_M: usize = 64;
-const SHARED_MEMORY_BYTES: u32 = 73_728;
 
-/// Loaded SM121 Triton kernel for Gemma 4's 256-wide local prefill attention.
-pub struct Gemma4LocalPrefillAttention {
-    module: ffi::CUmodule,
-    function: ffi::CUfunction,
-}
+/// Native CUDA kernel for Gemma 4's 256-wide local prefill attention.
+pub struct Gemma4LocalPrefillAttention;
 
 impl Gemma4LocalPrefillAttention {
-    /// Loads the checked-in cubin into the current CUDA context.
+    /// Creates the stateless native CUDA launcher.
     pub fn new() -> Result<Self> {
-        let mut module = null_mut();
-        let mut function = null_mut();
-        unsafe {
-            check_driver(
-                "cuModuleLoadData(Gemma 4 local attention)",
-                ffi::cuModuleLoadData(&mut module, CUBIN.as_ptr().cast()),
-            )?;
-            if let Err(error) = check_driver(
-                "cuModuleGetFunction(Gemma 4 local attention)",
-                ffi::cuModuleGetFunction(&mut function, module, KERNEL_NAME.as_ptr().cast()),
-            ) {
-                let _ = ffi::cuModuleUnload(module);
-                return Err(error);
-            }
-            if let Err(error) = check_driver(
-                "cuFuncSetAttribute(Gemma 4 local attention)",
-                ffi::cuFuncSetAttribute(
-                    function,
-                    ffi::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    SHARED_MEMORY_BYTES as i32,
-                ),
-            ) {
-                let _ = ffi::cuModuleUnload(module);
-                return Err(error);
-            }
-        }
-        Ok(Self { module, function })
+        Ok(Self)
     }
 
     /// Runs causal window attention over head-major BF16 Q, K, V, and output.
@@ -105,84 +70,21 @@ impl Gemma4LocalPrefillAttention {
             });
         }
 
-        let mut query_ptr = query.as_const_ptr();
-        let mut key_ptr = key.as_const_ptr();
-        let mut value_ptr = value.as_const_ptr();
-        let mut output_ptr = output.as_mut_ptr();
-        let mut softmax_scale = (HEAD_DIM as f32).sqrt().recip() * std::f32::consts::LOG2_E;
-        let mut query_tokens = query_tokens as u32;
-        let mut key_tokens = key_tokens as u32;
-        let mut start_position = start_position as u32;
-        let mut stride_qt = HEAD_DIM as u32;
-        let mut stride_qh = query_tokens * HEAD_DIM as u32;
-        let mut stride_kt = HEAD_DIM as u32;
-        let mut stride_kh = key_tokens * HEAD_DIM as u32;
-        let mut stride_vt = 1u32;
-        let mut stride_vh = key_tokens * HEAD_DIM as u32;
-        let mut stride_vd = key_tokens;
-        let mut stride_ot = HEAD_DIM as u32;
-        let mut stride_oh = query_tokens * HEAD_DIM as u32;
-        let mut global_scratch: *mut c_void = null_mut();
-        let mut profile_scratch: *mut c_void = null_mut();
-        let mut params = [
-            parameter(&mut query_ptr),
-            parameter(&mut key_ptr),
-            parameter(&mut value_ptr),
-            parameter(&mut output_ptr),
-            parameter(&mut softmax_scale),
-            parameter(&mut query_tokens),
-            parameter(&mut key_tokens),
-            parameter(&mut start_position),
-            parameter(&mut stride_qt),
-            parameter(&mut stride_qh),
-            parameter(&mut stride_kt),
-            parameter(&mut stride_kh),
-            parameter(&mut stride_vt),
-            parameter(&mut stride_vh),
-            parameter(&mut stride_vd),
-            parameter(&mut stride_ot),
-            parameter(&mut stride_oh),
-            parameter(&mut global_scratch),
-            parameter(&mut profile_scratch),
-        ];
         unsafe {
-            check_driver(
-                "cuLaunchKernel(Gemma 4 local attention)",
-                ffi::cuLaunchKernel(
-                    self.function,
-                    1,
-                    QUERY_HEADS as u32,
-                    query_tokens.div_ceil(BLOCK_M as u32),
-                    256,
-                    1,
-                    1,
-                    SHARED_MEMORY_BYTES,
+            check_cuda(
+                "infer_gemma4_local_attention_bf16_on_stream",
+                ffi::infer_gemma4_local_attention_bf16_on_stream(
+                    query.as_const_ptr().cast(),
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    query_tokens as u32,
+                    key_tokens as u32,
+                    start_position as u32,
                     stream.as_raw(),
-                    params.as_mut_ptr(),
-                    null_mut(),
                 ),
             )
         }
-    }
-}
-
-impl Drop for Gemma4LocalPrefillAttention {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = ffi::cuModuleUnload(self.module);
-        }
-    }
-}
-
-fn parameter<T>(value: &mut T) -> *mut c_void {
-    std::ptr::from_mut(value).cast()
-}
-
-fn check_driver(call: &'static str, status: ffi::CUresult) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(Error::Cuda(call, status))
     }
 }
 
@@ -193,7 +95,7 @@ mod tests {
 
     #[test]
     fn local_attention_respects_causal_sliding_window() {
-        let query_tokens = 4;
+        let query_tokens = 65;
         let start_position = 1_100;
         let key_tokens = start_position + query_tokens;
         let query = DeviceBuffer::zeroed(QUERY_HEADS * query_tokens * HEAD_DIM).expect("query");

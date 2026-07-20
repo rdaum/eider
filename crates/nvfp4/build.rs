@@ -67,6 +67,7 @@ fn main() {
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
+    let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
     let marlin_moe_object = format!("{out_dir}/marlin_moe.o");
     let cutlass_gemv_object = format!("{out_dir}/cutlass_gemv.o");
@@ -143,6 +144,27 @@ fn main() {
     assert!(
         qwen36_status.success(),
         "nvcc failed to build Qwen3.6 GDN kernels"
+    );
+
+    let mut gemma4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    gemma4_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "--generate-code=arch=compute_121a,code=sm_121a",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/gemma4_attention.cu",
+        "-o",
+        &gemma4_attention_object,
+    ]);
+    let gemma4_status = gemma4_nvcc
+        .status()
+        .expect("failed to run nvcc for Gemma 4 attention kernel");
+    assert!(
+        gemma4_status.success(),
+        "nvcc failed to build Gemma 4 attention kernel"
     );
 
     // SM12x MMA code uses a separate architecture target and must not inherit
@@ -330,6 +352,7 @@ fn main() {
             &gpu_counters_object,
             &non_gemm_object,
             &qwen36_gdn_object,
+            &gemma4_attention_object,
             &sm12x_mma_object,
             &marlin_moe_object,
             &cutlass_gemv_object,
@@ -352,6 +375,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
+    println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");
     println!("cargo:rerun-if-changed=native/marlin_moe.cu");
     println!("cargo:rerun-if-changed=native/marlin");
