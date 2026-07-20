@@ -30,6 +30,15 @@ pub struct Sm12xKvCache {
     head_dim: usize,
 }
 
+pub(crate) struct Sm12xKvCacheParts {
+    pub key_values: *const u8,
+    pub key_scales: *const u8,
+    pub value_values: *const u8,
+    pub value_scales: *const u8,
+    pub key_tail: *const f32,
+    pub value_tail: *const f32,
+}
+
 /// Reusable device workspace for compact-cache FP4 attention.
 pub struct Sm12xKvAttentionWorkspace {
     query_tiles: DeviceBuffer<u8>,
@@ -125,6 +134,14 @@ impl Sm12xKvCache {
         self.max_tokens
     }
 
+    pub(crate) fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    pub(crate) fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     /// Returns the number of device bytes owned by this cache.
     pub fn device_bytes(&self) -> usize {
         self.key_values.device_bytes()
@@ -133,6 +150,17 @@ impl Sm12xKvCache {
             + self.value_scales.device_bytes()
             + self.key_tail.device_bytes()
             + self.value_tail.device_bytes()
+    }
+
+    pub(crate) fn compact_parts(&self) -> Sm12xKvCacheParts {
+        Sm12xKvCacheParts {
+            key_values: self.key_values.as_const_ptr().cast(),
+            key_scales: self.key_scales.as_const_ptr().cast(),
+            value_values: self.value_values.as_const_ptr().cast(),
+            value_scales: self.value_scales.as_const_ptr().cast(),
+            key_tail: self.key_tail.as_const_ptr().cast(),
+            value_tail: self.value_tail.as_const_ptr().cast(),
+        }
     }
 
     /// Returns the device bytes this cache shape would allocate at another capacity.

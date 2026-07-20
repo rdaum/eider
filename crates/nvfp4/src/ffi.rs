@@ -97,6 +97,21 @@ unsafe extern "C" {
         start_position: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gemma4_local_attention_compact_on_stream(
+        query: *const u16,
+        key_values: *const u8,
+        key_scales: *const u8,
+        value_values: *const u8,
+        value_scales: *const u8,
+        key_tail: *const f32,
+        value_tail: *const f32,
+        output: *mut u16,
+        query_tokens: u32,
+        cache_tokens: u32,
+        cache_capacity: u32,
+        start_position: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn cudaGetDevice(device: *mut i32) -> cudaError_t;
     pub(crate) fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     pub(crate) fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> cudaError_t;

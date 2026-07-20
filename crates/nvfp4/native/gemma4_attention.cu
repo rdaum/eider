@@ -30,6 +30,176 @@ constexpr int kSharedBytes =
     (kQueryElements + kKeyValueElements + kProbabilityElements) * sizeof(Bf16) +
     kStatisticElements * sizeof(float);
 
+__device__ __forceinline__ std::uint8_t packed_nibble(
+    const std::uint8_t* packed,
+    int index) {
+    const std::uint8_t byte = packed[index >> 1];
+    return static_cast<std::uint8_t>((index & 1) == 0 ? byte & 0x0f : byte >> 4);
+}
+
+__device__ __forceinline__ float e2m1_value(std::uint8_t code) {
+    const std::uint32_t magnitude = code & 0x07U;
+    const std::uint32_t exponent = magnitude >> 1U;
+    const std::uint32_t mantissa = magnitude & 1U;
+    const std::uint32_t magnitude_bits = exponent == 0
+        ? mantissa * 0x3f000000U
+        : ((exponent + 126U) << 23U) | (mantissa << 22U);
+    const std::uint32_t sign = static_cast<std::uint32_t>(code & 0x08U) << 28U;
+    return __uint_as_float(sign | magnitude_bits);
+}
+
+__device__ __forceinline__ float e4m3_value(std::uint8_t code) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(code & 0x80) << 24;
+    const std::uint32_t exponent = (code >> 3) & 0x0f;
+    const std::uint32_t mantissa = code & 0x07;
+    if (exponent == 0) {
+        const float value = static_cast<float>(mantissa) * 0x1p-9f;
+        return sign == 0 ? value : -value;
+    }
+    if (exponent == 0x0f && mantissa == 0x07) {
+        return __uint_as_float(sign | 0x7fffffffU);
+    }
+    return __uint_as_float(sign | ((exponent + 120U) << 23) | (mantissa << 20));
+}
+
+__device__ __forceinline__ std::uint32_t pack_bf16_pair(float low, float high) {
+    return static_cast<std::uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(low))) |
+           (static_cast<std::uint32_t>(
+                __bfloat16_as_ushort(__float2bfloat16_rn(high)))
+            << 16);
+}
+
+struct Bf16Cache {
+    const std::uint16_t* key;
+    const std::uint16_t* value;
+    int tokens;
+
+    __device__ __forceinline__ uint4 load_key_vector(
+        int head,
+        int token,
+        int dimension) const {
+        const std::size_t offset =
+            (static_cast<std::size_t>(head) * tokens + token) * kHeadDim + dimension;
+        return *reinterpret_cast<const uint4*>(key + offset);
+    }
+
+    __device__ __forceinline__ Bf16 load_value(
+        int head,
+        int token,
+        int dimension) const {
+        const std::size_t offset =
+            (static_cast<std::size_t>(head) * kHeadDim + dimension) * tokens + token;
+        return __ushort_as_bfloat16(value[offset]);
+    }
+
+};
+
+struct CompactCache {
+    const std::uint8_t* key_values;
+    const std::uint8_t* key_scales;
+    const std::uint8_t* value_values;
+    const std::uint8_t* value_scales;
+    const float* key_tail;
+    const float* value_tail;
+    int tokens;
+    int max_tokens;
+
+    __device__ __forceinline__ float load_key(
+        int head,
+        int token,
+        int dimension) const {
+        const int compact_tokens = tokens / 8 * 8;
+        if (token >= compact_tokens) {
+            const int width = kKvHeads * kHeadDim;
+            return key_tail[(token & 15) * width + head * kHeadDim + dimension];
+        }
+        const int token_tiles = (max_tokens + 7) / 8;
+        const int dimension_tiles = kHeadDim / 64;
+        const int token_tile = token / 8;
+        const int token_in_tile = token & 7;
+        const int dimension_tile = dimension / 64;
+        const int dimension_in_tile = dimension & 63;
+        const int tile =
+            (head * token_tiles + token_tile) * dimension_tiles + dimension_tile;
+        const std::uint8_t code = packed_nibble(
+            key_values + tile * 256,
+            token_in_tile * 64 + dimension_in_tile);
+        const std::uint8_t scale =
+            key_scales[(tile * 8 + token_in_tile) * 4 + dimension_in_tile / 16];
+        return e2m1_value(code) * e4m3_value(scale);
+    }
+
+    __device__ __forceinline__ uint4 load_key_vector(
+        int head,
+        int token,
+        int dimension) const {
+        const int compact_tokens = tokens / 8 * 8;
+        if (token < compact_tokens) {
+            const int token_tiles = (max_tokens + 7) / 8;
+            const int dimension_tiles = kHeadDim / 64;
+            const int token_tile = token / 8;
+            const int token_in_tile = token & 7;
+            const int dimension_tile = dimension / 64;
+            const int dimension_in_tile = dimension & 63;
+            const int tile =
+                (head * token_tiles + token_tile) * dimension_tiles + dimension_tile;
+            const int element = token_in_tile * 64 + dimension_in_tile;
+            const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+                key_values + tile * 256 + element / 2);
+            const float scale = e4m3_value(
+                key_scales[(tile * 8 + token_in_tile) * 4 + dimension_in_tile / 16]);
+            const auto pair = [&](int shift) {
+                return pack_bf16_pair(
+                    e2m1_value((packed >> shift) & 0x0f) * scale,
+                    e2m1_value((packed >> (shift + 4)) & 0x0f) * scale);
+            };
+            return make_uint4(pair(0), pair(8), pair(16), pair(24));
+        }
+        uint4 result;
+        result.x = pack_bf16_pair(
+            load_key(head, token, dimension),
+            load_key(head, token, dimension + 1));
+        result.y = pack_bf16_pair(
+            load_key(head, token, dimension + 2),
+            load_key(head, token, dimension + 3));
+        result.z = pack_bf16_pair(
+            load_key(head, token, dimension + 4),
+            load_key(head, token, dimension + 5));
+        result.w = pack_bf16_pair(
+            load_key(head, token, dimension + 6),
+            load_key(head, token, dimension + 7));
+        return result;
+    }
+
+    __device__ __forceinline__ Bf16 load_value(
+        int head,
+        int token,
+        int dimension) const {
+        const int compact_tokens = tokens / 16 * 16;
+        float value;
+        if (token >= compact_tokens) {
+            const int width = kKvHeads * kHeadDim;
+            value = value_tail[(token & 15) * width + head * kHeadDim + dimension];
+        } else {
+            const int context_tiles = (max_tokens + 63) / 64;
+            const int dimension_tile = dimension / 8;
+            const int dimension_in_tile = dimension & 7;
+            const int token_tile = token / 64;
+            const int token_in_tile = token & 63;
+            const int tile =
+                (head * (kHeadDim / 8) + dimension_tile) * context_tiles + token_tile;
+            const std::uint8_t code = packed_nibble(
+                value_values + tile * 256,
+                dimension_in_tile * 64 + token_in_tile);
+            const std::uint8_t scale =
+                value_scales[(tile * 8 + dimension_in_tile) * 4 + token_in_tile / 16];
+            value = e2m1_value(code) * e4m3_value(scale);
+        }
+        return __float2bfloat16_rn(value);
+    }
+
+};
+
 __device__ __forceinline__ float subgroup_max(float value) {
     value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, 1));
     return fmaxf(value, __shfl_xor_sync(0xffffffff, value, 2));
@@ -125,14 +295,13 @@ __device__ __forceinline__ void mma(Accumulator& accumulator,
           "r"(b.x[offset]), "r"(b.x[offset + 1]));
 }
 
+template <typename Cache>
 __global__ void gemma4_local_attention_kernel(
-                                               const std::uint16_t* __restrict__ query,
-                                               const std::uint16_t* __restrict__ key,
-                                               const std::uint16_t* __restrict__ value,
-                                               std::uint16_t* __restrict__ output,
-                                               int query_tokens,
-                                               int key_tokens,
-                                               int start_position) {
+    const std::uint16_t* __restrict__ query,
+    Cache cache,
+    std::uint16_t* __restrict__ output,
+    int query_tokens,
+    int start_position) {
     extern __shared__ __align__(16) unsigned char shared_storage[];
     auto* shared_query = reinterpret_cast<Bf16*>(shared_storage);
     auto* shared_key_value = shared_query + kQueryElements;
@@ -147,15 +316,10 @@ __global__ void gemma4_local_attention_kernel(
     const int block_query_start = start_position + query_start;
     const int query_rows = min(kBlockM, query_tokens - query_start);
     const int key_start = max(0, block_query_start + 1 - kWindowTokens);
-    const int key_end = min(key_tokens, block_query_start + query_rows);
+    const int key_end = min(cache.tokens, block_query_start + query_rows);
 
     const std::size_t query_head_offset =
         static_cast<std::size_t>(query_head) * query_tokens * kHeadDim;
-    const std::size_t key_head_offset =
-        static_cast<std::size_t>(key_head) * key_tokens * kHeadDim;
-    const std::size_t value_head_offset =
-        static_cast<std::size_t>(key_head) * kHeadDim * key_tokens;
-
 #pragma unroll
     for (int chunk = threadIdx.x;
          chunk < kQueryElements / kBf16PerVector;
@@ -205,10 +369,7 @@ __global__ void gemma4_local_attention_kernel(
             const int dimension =
                 (chunk % (kHeadDim / kBf16PerVector)) * kBf16PerVector;
             const uint4 values = key_row < key_rows
-                ? *reinterpret_cast<const uint4*>(
-                      reinterpret_cast<const Bf16*>(key) + key_head_offset +
-                      static_cast<std::size_t>(key_tile_start + key_row) * kHeadDim +
-                      dimension)
+                ? cache.load_key_vector(key_head, key_tile_start + key_row, dimension)
                 : make_uint4(0, 0, 0, 0);
             *reinterpret_cast<uint4*>(
                 shared_key_value + key_row * kHeadDim +
@@ -364,9 +525,7 @@ __global__ void gemma4_local_attention_kernel(
             shared_key_value[
                 dimension * kBlockN + swizzled_column(dimension, key_row)] =
                 key_row < key_rows
-                ? reinterpret_cast<const Bf16*>(value)[
-                      value_head_offset + static_cast<std::size_t>(dimension) * key_tokens +
-                      key_tile_start + key_row]
+                ? cache.load_value(key_head, key_tile_start + key_row, dimension)
                 : __float2bfloat16(0.0f);
         }
         __syncthreads();
@@ -452,20 +611,60 @@ extern "C" cudaError_t infer_gemma4_local_attention_bf16_on_stream(
     std::uint32_t start_position,
     cudaStream_t stream) {
     static const cudaError_t shared_memory_status = cudaFuncSetAttribute(
-        gemma4_local_attention_kernel,
+        gemma4_local_attention_kernel<Bf16Cache>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         kSharedBytes);
     if (shared_memory_status != cudaSuccess) {
         return shared_memory_status;
     }
     const dim3 grid(1, kQueryHeads, (query_tokens + kBlockM - 1) / kBlockM);
-    gemma4_local_attention_kernel<<<grid, kThreads, kSharedBytes, stream>>>(
+    const Bf16Cache cache = {key, value, static_cast<int>(key_tokens)};
+    gemma4_local_attention_kernel<Bf16Cache><<<grid, kThreads, kSharedBytes, stream>>>(
         query,
-        key,
-        value,
+        cache,
         output,
         static_cast<int>(query_tokens),
-        static_cast<int>(key_tokens),
+        static_cast<int>(start_position));
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_gemma4_local_attention_compact_on_stream(
+    const std::uint16_t* query,
+    const std::uint8_t* key_values,
+    const std::uint8_t* key_scales,
+    const std::uint8_t* value_values,
+    const std::uint8_t* value_scales,
+    const float* key_tail,
+    const float* value_tail,
+    std::uint16_t* output,
+    std::uint32_t query_tokens,
+    std::uint32_t cache_tokens,
+    std::uint32_t cache_capacity,
+    std::uint32_t start_position,
+    cudaStream_t stream) {
+    static const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        gemma4_local_attention_kernel<CompactCache>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kSharedBytes);
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
+    const dim3 grid(1, kQueryHeads, (query_tokens + kBlockM - 1) / kBlockM);
+    const CompactCache cache = {
+        key_values,
+        key_scales,
+        value_values,
+        value_scales,
+        key_tail,
+        value_tail,
+        static_cast<int>(cache_tokens),
+        static_cast<int>(cache_capacity),
+    };
+    gemma4_local_attention_kernel<CompactCache><<<grid, kThreads, kSharedBytes, stream>>>(
+        query,
+        cache,
+        output,
+        static_cast<int>(query_tokens),
         static_cast<int>(start_position));
     return cudaGetLastError();
 }

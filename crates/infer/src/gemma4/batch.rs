@@ -26,6 +26,14 @@ use nvfp4::quantize_nvfp4_col_major_f32_device_into_on_stream;
 const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
 const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const ATTENTION_QUERY_TILE_ROWS: usize = 256;
+// Direct compact-cache attention overtakes whole-cache BF16 staging at a 16:1
+// cached-prefix/query ratio in the integrated local-attention micromeasure.
+const COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY: usize = 16;
+
+fn use_compact_local_attention(start_position: usize, query_rows: usize) -> bool {
+    start_position != 0
+        && start_position >= query_rows.saturating_mul(COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY)
+}
 
 /// One scheduler-selected Gemma prompt chunk and its persistent sequence state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +359,51 @@ impl Gemma4TensorCoreAttentionWorkspace {
     ) -> Result<()> {
         let start_position = cache.len();
         let cache_tokens = start_position + rows;
+
+        if let Some(local) = &self.local {
+            let query_values = rows * self.q_heads * self.head_dim;
+            grow_device_buffer(&mut self.packed_query, query_values)?;
+            grow_device_buffer(&mut self.packed_output, query_values)?;
+            pack_token_heads_bf16_at_offset_into_on_stream(
+                query,
+                self.packed_query.output(),
+                rows,
+                self.q_heads,
+                self.head_dim,
+                input_row_offset,
+                stream,
+            )?;
+
+            if use_compact_local_attention(start_position, rows) {
+                cache.append_rows_at_offset_on_stream(
+                    key,
+                    value,
+                    input_row_offset,
+                    rows,
+                    stream,
+                )?;
+                local.run_compact_on_stream(
+                    &self.packed_query,
+                    cache,
+                    self.packed_output.output(),
+                    rows,
+                    start_position,
+                    stream,
+                )?;
+                unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
+                    &self.packed_output,
+                    output,
+                    rows,
+                    self.q_heads,
+                    self.head_dim,
+                    output_row_offset,
+                    output_input_scale,
+                    stream,
+                )?;
+                return Ok(());
+            }
+        }
+
         let cache_values = cache_tokens * self.kv_heads * self.head_dim;
         grow_device_buffer(&mut self.packed_key, cache_values)?;
         grow_device_buffer(&mut self.packed_value, cache_values)?;
@@ -374,18 +427,6 @@ impl Gemma4TensorCoreAttentionWorkspace {
         }
 
         if let Some(local) = &self.local {
-            let query_values = rows * self.q_heads * self.head_dim;
-            grow_device_buffer(&mut self.packed_query, query_values)?;
-            grow_device_buffer(&mut self.packed_output, query_values)?;
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset,
-                stream,
-            )?;
             local.run_on_stream(
                 &self.packed_query,
                 &self.packed_key,
@@ -1369,6 +1410,15 @@ fn run_moe_prefill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_local_attention_requires_a_long_prefix_relative_to_the_query() {
+        assert!(!use_compact_local_attention(0, 1));
+        assert!(!use_compact_local_attention(4_096, 512));
+        assert!(use_compact_local_attention(8_192, 512));
+        assert!(use_compact_local_attention(2_688, 128));
+    }
+
     #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
     fn local_w4a4_projection_matches_w4a16_reference() {

@@ -1,6 +1,7 @@
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::kernels::sm12x_kv_cache::Sm12xKvCache;
 
 const HEAD_DIM: usize = 256;
 const QUERY_HEADS: usize = 16;
@@ -80,6 +81,78 @@ impl Gemma4LocalPrefillAttention {
                     output.as_mut_ptr().cast(),
                     query_tokens as u32,
                     key_tokens as u32,
+                    start_position as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Runs causal window attention directly from the compact FP4 K/V cache.
+    pub fn run_compact_on_stream(
+        &self,
+        query: &DeviceBuffer<u16>,
+        cache: &Sm12xKvCache,
+        mut output: DeviceOutput<'_, u16>,
+        query_tokens: usize,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let query_values = QUERY_HEADS
+            .checked_mul(query_tokens)
+            .and_then(|values| values.checked_mul(HEAD_DIM))
+            .unwrap_or(usize::MAX);
+        if query_tokens == 0
+            || cache.kv_heads() != KV_HEADS
+            || cache.head_dim() != HEAD_DIM
+            || start_position
+                .checked_add(query_tokens)
+                .is_none_or(|end| end > cache.len())
+            || [
+                query_tokens,
+                cache.len(),
+                cache.max_tokens(),
+                start_position,
+                query_values,
+            ]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+            || query.len() < query_values
+            || output.len() < query_values
+        {
+            return Err(Error::Shape {
+                label: "Gemma 4 compact local prefill attention",
+                expected: format!(
+                    "Q/O >= {query_values}, 8 KV heads, head dim 256, start + query <= cache"
+                ),
+                actual: format!(
+                    "Q={} O={} query={query_tokens} cache={} capacity={} heads={} dim={} start={start_position}",
+                    query.len(),
+                    output.len(),
+                    cache.len(),
+                    cache.max_tokens(),
+                    cache.kv_heads(),
+                    cache.head_dim(),
+                ),
+            });
+        }
+
+        let parts = cache.compact_parts();
+        unsafe {
+            check_cuda(
+                "infer_gemma4_local_attention_compact_on_stream",
+                ffi::infer_gemma4_local_attention_compact_on_stream(
+                    query.as_const_ptr().cast(),
+                    parts.key_values,
+                    parts.key_scales,
+                    parts.value_values,
+                    parts.value_scales,
+                    parts.key_tail,
+                    parts.value_tail,
+                    output.as_mut_ptr().cast(),
+                    query_tokens as u32,
+                    cache.len() as u32,
+                    cache.max_tokens() as u32,
                     start_position as u32,
                     stream.as_raw(),
                 ),
@@ -232,5 +305,71 @@ mod tests {
             }
         }
         assert!(max_error <= 0.04, "max attention error={max_error}");
+    }
+
+    #[test]
+    fn compact_attention_matches_unpacked_cache() {
+        let query_tokens = 65;
+        let start_position = 1_100;
+        let cache_tokens = start_position + query_tokens;
+        let query_host = (0..QUERY_HEADS * query_tokens * HEAD_DIM)
+            .map(|index| f32_to_bf16(((index * 17 % 101) as f32 - 50.0) / 50.0))
+            .collect::<Vec<_>>();
+        let key_host = (0..KV_HEADS * cache_tokens * HEAD_DIM)
+            .map(|index| ((index * 13 % 97) as f32 - 48.0) / 48.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..KV_HEADS * cache_tokens * HEAD_DIM)
+            .map(|index| ((index * 7 % 89) as f32 - 44.0) / 44.0)
+            .collect::<Vec<_>>();
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let key = DeviceBuffer::from_host(&key_host).expect("key");
+        let value = DeviceBuffer::from_host(&value_host).expect("value");
+        let mut cache = Sm12xKvCache::new(cache_tokens, KV_HEADS, HEAD_DIM).expect("cache");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, cache_tokens, &stream)
+            .expect("append cache");
+        let mut unpacked_key =
+            DeviceBuffer::zeroed(KV_HEADS * cache_tokens * HEAD_DIM).expect("unpacked key");
+        let mut unpacked_value =
+            DeviceBuffer::zeroed(KV_HEADS * cache_tokens * HEAD_DIM).expect("unpacked value");
+        cache
+            .unpack_bf16_on_stream(unpacked_key.output(), unpacked_value.output(), &stream)
+            .expect("unpack cache");
+        let mut reference =
+            DeviceBuffer::zeroed(QUERY_HEADS * query_tokens * HEAD_DIM).expect("reference");
+        let mut compact =
+            DeviceBuffer::zeroed(QUERY_HEADS * query_tokens * HEAD_DIM).expect("compact");
+        let attention = Gemma4LocalPrefillAttention::new().expect("attention");
+        attention
+            .run_on_stream(
+                &query,
+                &unpacked_key,
+                &unpacked_value,
+                reference.output(),
+                query_tokens,
+                cache_tokens,
+                start_position,
+                &stream,
+            )
+            .expect("unpacked attention");
+        attention
+            .run_compact_on_stream(
+                &query,
+                &cache,
+                compact.output(),
+                query_tokens,
+                start_position,
+                &stream,
+            )
+            .expect("compact attention");
+        let reference = reference.copy_to_host(&stream).expect("reference readback");
+        let compact = compact.copy_to_host(&stream).expect("compact readback");
+        let max_error = reference
+            .iter()
+            .zip(compact)
+            .map(|(reference, compact)| (bf16_to_f32(*reference) - bf16_to_f32(compact)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error <= 0.01, "compact attention max error={max_error}");
     }
 }

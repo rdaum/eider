@@ -4,14 +4,248 @@ use micromeasure::{
 };
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CudaEvent, CudaStream, DeviceBuffer, GemmShape,
-    Gemma4LocalPrefillAttention, Sm12xKvCache, causal_window_softmax_f32_to_bf16_on_stream,
-    pack_token_heads_bf16_into_on_stream, unpack_heads_f32_into_on_stream,
+    Gemma4LocalPrefillAttention, Nvfp4Matrix, Sm12xKvCache,
+    causal_window_softmax_f32_to_bf16_on_stream, pack_token_heads_bf16_into_on_stream,
+    unpack_heads_f32_into_on_stream,
+    unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream,
 };
 use std::time::Duration;
 
 const TOKENS: usize = 2_613;
 const Q_HEADS: usize = 16;
 const WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
+
+struct GemmaLocalBoundary<const PREFIX: usize, const ROWS: usize> {
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    query: DeviceBuffer<f32>,
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    bf16_cache: Sm12xKvCache,
+    compact_cache: Sm12xKvCache,
+    packed_query: DeviceBuffer<u16>,
+    packed_key: DeviceBuffer<u16>,
+    packed_value: DeviceBuffer<u16>,
+    bf16_output: DeviceBuffer<u16>,
+    compact_output: DeviceBuffer<u16>,
+    bf16_quantized: Nvfp4Matrix,
+    compact_quantized: Nvfp4Matrix,
+    local: Gemma4LocalPrefillAttention,
+}
+
+impl<const PREFIX: usize, const ROWS: usize> BenchContext for GemmaLocalBoundary<PREFIX, ROWS> {
+    fn prepare(_num_chunks: usize) -> Self {
+        const KV_WIDTH: usize = 8 * 256;
+        const Q_WIDTH: usize = Q_HEADS * 256;
+        let cache_tokens = PREFIX + ROWS;
+        let values = |len: usize, factor: usize| {
+            DeviceBuffer::from_host(
+                &(0..len)
+                    .map(|index| ((index * factor % 509) as f32 - 254.0) / 1_024.0)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let query = values(ROWS * Q_WIDTH, 17).expect("query");
+        let key = values(cache_tokens * KV_WIDTH, 29).expect("key");
+        let value = values(cache_tokens * KV_WIDTH, 43).expect("value");
+        let mut bf16_cache = Sm12xKvCache::new(cache_tokens, 8, 256).expect("BF16 cache");
+        let mut compact_cache = Sm12xKvCache::new(cache_tokens, 8, 256).expect("compact cache");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        if PREFIX != 0 {
+            bf16_cache
+                .append_rows_at_offset_on_stream(&key, &value, 0, PREFIX, &stream)
+                .expect("BF16 prefix");
+            compact_cache
+                .append_rows_at_offset_on_stream(&key, &value, 0, PREFIX, &stream)
+                .expect("compact prefix");
+            stream.synchronize().expect("prefix synchronize");
+        }
+        Self {
+            stream,
+            start: CudaEvent::new().expect("start"),
+            stop: CudaEvent::new().expect("stop"),
+            query,
+            key,
+            value,
+            bf16_cache,
+            compact_cache,
+            packed_query: DeviceBuffer::zeroed(ROWS * Q_WIDTH).expect("packed query"),
+            packed_key: DeviceBuffer::zeroed(cache_tokens * KV_WIDTH).expect("packed key"),
+            packed_value: DeviceBuffer::zeroed(cache_tokens * KV_WIDTH).expect("packed value"),
+            bf16_output: DeviceBuffer::zeroed(ROWS * Q_WIDTH).expect("BF16 output"),
+            compact_output: DeviceBuffer::zeroed(ROWS * Q_WIDTH).expect("compact output"),
+            bf16_quantized: Nvfp4Matrix::zeroed_col_major(Q_WIDTH, ROWS)
+                .expect("BF16 quantized output"),
+            compact_quantized: Nvfp4Matrix::zeroed_col_major(Q_WIDTH, ROWS)
+                .expect("compact quantized output"),
+            local: Gemma4LocalPrefillAttention::new().expect("local attention"),
+        }
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
+impl<const PREFIX: usize, const ROWS: usize> GemmaLocalBoundary<PREFIX, ROWS> {
+    fn run_bf16(&mut self) {
+        self.bf16_cache
+            .truncate(PREFIX)
+            .expect("truncate BF16 cache");
+        pack_token_heads_bf16_into_on_stream(
+            &self.query,
+            self.packed_query.output(),
+            ROWS,
+            Q_HEADS,
+            256,
+            &self.stream,
+        )
+        .expect("pack query");
+        if PREFIX == 0 {
+            self.bf16_cache
+                .append_initial_rows_and_stage_bf16_on_stream(
+                    &self.key,
+                    &self.value,
+                    0,
+                    ROWS,
+                    self.packed_key.output(),
+                    self.packed_value.output(),
+                    &self.stream,
+                )
+                .expect("append and stage cache");
+        } else {
+            self.bf16_cache
+                .append_rows_at_offset_on_stream(&self.key, &self.value, PREFIX, ROWS, &self.stream)
+                .expect("append cache");
+            self.bf16_cache
+                .unpack_bf16_on_stream(
+                    self.packed_key.output(),
+                    self.packed_value.output(),
+                    &self.stream,
+                )
+                .expect("unpack cache");
+        }
+        self.local
+            .run_on_stream(
+                &self.packed_query,
+                &self.packed_key,
+                &self.packed_value,
+                self.bf16_output.output(),
+                ROWS,
+                PREFIX + ROWS,
+                PREFIX,
+                &self.stream,
+            )
+            .expect("BF16 attention");
+        unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
+            &self.bf16_output,
+            &mut self.bf16_quantized,
+            ROWS,
+            Q_HEADS,
+            256,
+            0,
+            1.0,
+            &self.stream,
+        )
+        .expect("quantize BF16 output");
+    }
+
+    fn run_compact(&mut self) {
+        self.compact_cache
+            .truncate(PREFIX)
+            .expect("truncate compact cache");
+        pack_token_heads_bf16_into_on_stream(
+            &self.query,
+            self.packed_query.output(),
+            ROWS,
+            Q_HEADS,
+            256,
+            &self.stream,
+        )
+        .expect("pack query");
+        self.compact_cache
+            .append_rows_at_offset_on_stream(&self.key, &self.value, PREFIX, ROWS, &self.stream)
+            .expect("append compact cache");
+        self.local
+            .run_compact_on_stream(
+                &self.packed_query,
+                &self.compact_cache,
+                self.compact_output.output(),
+                ROWS,
+                PREFIX,
+                &self.stream,
+            )
+            .expect("compact attention");
+        unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
+            &self.compact_output,
+            &mut self.compact_quantized,
+            ROWS,
+            Q_HEADS,
+            256,
+            0,
+            1.0,
+            &self.stream,
+        )
+        .expect("quantize compact output");
+    }
+}
+
+fn boundary_bf16_sample<const PREFIX: usize, const ROWS: usize>(
+    context: &mut GemmaLocalBoundary<PREFIX, ROWS>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    context
+        .start
+        .record_on_stream(&context.stream)
+        .expect("start");
+    for _ in 0..chunk {
+        context.run_bf16();
+    }
+    context
+        .stop
+        .record_on_stream(&context.stream)
+        .expect("stop");
+    context.stop.synchronize().expect("synchronize");
+    BenchSampleResult::operations((chunk * ROWS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        context
+            .start
+            .elapsed_ms_until(&context.stop)
+            .expect("elapsed") as f64
+            / chunk as f64,
+        "ms/chunk",
+    ))
+}
+
+fn boundary_compact_sample<const PREFIX: usize, const ROWS: usize>(
+    context: &mut GemmaLocalBoundary<PREFIX, ROWS>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    context
+        .start
+        .record_on_stream(&context.stream)
+        .expect("start");
+    for _ in 0..chunk {
+        context.run_compact();
+    }
+    context
+        .stop
+        .record_on_stream(&context.stream)
+        .expect("stop");
+    context.stop.synchronize().expect("synchronize");
+    BenchSampleResult::operations((chunk * ROWS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        context
+            .start
+            .elapsed_ms_until(&context.stop)
+            .expect("elapsed") as f64
+            / chunk as f64,
+        "ms/chunk",
+    ))
+}
 
 struct GemmaPrefillAttention<const KV_HEADS: usize, const HEAD_DIM: usize, const WINDOW: usize> {
     lt: CublasLt,
@@ -149,6 +383,63 @@ fn fused_local_sample(
                 &context.stream,
             )
             .expect("fused attention");
+    }
+    context
+        .stop
+        .record_on_stream(&context.stream)
+        .expect("stop");
+    context.stop.synchronize().expect("synchronize");
+    black_box(context.fused_output.as_const_ptr());
+    BenchSampleResult::operations((chunk * TOKENS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        context
+            .start
+            .elapsed_ms_until(&context.stop)
+            .expect("elapsed") as f64
+            / chunk as f64,
+        "ms/chunk",
+    ))
+}
+
+fn compact_local_sample(
+    context: &mut GemmaPrefillAttention<8, 256, 1_024>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    pack_token_heads_bf16_into_on_stream(
+        &context.query,
+        context.packed_query.output(),
+        TOKENS,
+        Q_HEADS,
+        256,
+        &context.stream,
+    )
+    .expect("pack query");
+    context.cache.truncate(0).expect("truncate cache");
+    context
+        .cache
+        .append_rows_at_offset_on_stream(&context.key, &context.value, 0, TOKENS, &context.stream)
+        .expect("append cache");
+    context.stream.synchronize().expect("prepare synchronize");
+
+    context
+        .start
+        .record_on_stream(&context.stream)
+        .expect("start");
+    for _ in 0..chunk {
+        context
+            .local
+            .as_ref()
+            .expect("local attention")
+            .run_compact_on_stream(
+                &context.packed_query,
+                &context.cache,
+                context.fused_output.output(),
+                TOKENS,
+                0,
+                &context.stream,
+            )
+            .expect("compact attention");
     }
     context
         .stop
@@ -470,10 +761,61 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
+            runner.group::<GemmaLocalBoundary<0, 2_613>>(
+                "Gemma 4 local boundary cold 2613",
+                |group| {
+                    group.bench_sample("BF16 staged boundary", boundary_bf16_sample::<0, 2_613>);
+                    group.bench_sample(
+                        "compact direct boundary",
+                        boundary_compact_sample::<0, 2_613>,
+                    );
+                },
+            );
+            runner.group::<GemmaLocalBoundary<32_768, 512>>(
+                "Gemma 4 local boundary 32K+512",
+                |group| {
+                    group.bench_sample("BF16 staged boundary", boundary_bf16_sample::<32_768, 512>);
+                    group.bench_sample(
+                        "compact direct boundary",
+                        boundary_compact_sample::<32_768, 512>,
+                    );
+                },
+            );
+            runner.group::<GemmaLocalBoundary<8_192, 512>>(
+                "Gemma 4 local boundary 8K+512",
+                |group| {
+                    group.bench_sample("BF16 staged boundary", boundary_bf16_sample::<8_192, 512>);
+                    group.bench_sample(
+                        "compact direct boundary",
+                        boundary_compact_sample::<8_192, 512>,
+                    );
+                },
+            );
+            runner.group::<GemmaLocalBoundary<4_096, 512>>(
+                "Gemma 4 local boundary 4K+512",
+                |group| {
+                    group.bench_sample("BF16 staged boundary", boundary_bf16_sample::<4_096, 512>);
+                    group.bench_sample(
+                        "compact direct boundary",
+                        boundary_compact_sample::<4_096, 512>,
+                    );
+                },
+            );
+            runner.group::<GemmaLocalBoundary<16_384, 512>>(
+                "Gemma 4 local boundary 16K+512",
+                |group| {
+                    group.bench_sample("BF16 staged boundary", boundary_bf16_sample::<16_384, 512>);
+                    group.bench_sample(
+                        "compact direct boundary",
+                        boundary_compact_sample::<16_384, 512>,
+                    );
+                },
+            );
             runner.group::<GemmaPrefillAttention<8, 256, 1_024>>(
                 "Gemma 4 local attention 2613",
                 |group| {
                     group.bench_sample("fused local attention", fused_local_sample);
+                    group.bench_sample("compact fused local attention", compact_local_sample);
                     group.bench_sample("full-score BF16 staged", sample::<8, 256, 1_024>);
                     group.bench_sample("QK", qk_sample::<8, 256, 1_024>);
                     group.bench_sample("softmax", softmax_sample::<8, 256, 1_024>);
