@@ -85,6 +85,7 @@ struct ActorInner {
     commands: mpsc::UnboundedSender<ActorCommand>,
     next_request_id: AtomicU64,
     event_capacity: usize,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 enum ActorCommand {
@@ -144,7 +145,7 @@ impl InferenceActor {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let event_capacity = config.event_capacity;
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("eider-inference".to_string())
             .spawn(move || actor_main(config, commands_rx, ready_tx))
             .map_err(|error| {
@@ -159,6 +160,7 @@ impl InferenceActor {
                 commands: commands_tx,
                 next_request_id: AtomicU64::new(1),
                 event_capacity,
+                worker: Some(worker),
             }),
             defaults,
         })
@@ -191,11 +193,21 @@ impl InferenceActor {
     pub fn cancel(&self, id: ActorRequestId) {
         let _ = self.inner.commands.send(ActorCommand::Cancel(id));
     }
+
+    /// Stops accepting inference work and cancels active requests.
+    pub fn shutdown(&self) {
+        let _ = self.inner.commands.send(ActorCommand::Shutdown);
+    }
 }
 
 impl Drop for ActorInner {
     fn drop(&mut self) {
         let _ = self.commands.send(ActorCommand::Shutdown);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            error!("inference actor panicked during shutdown");
+        }
     }
 }
 

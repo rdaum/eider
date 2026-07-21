@@ -8,4 +8,4 @@ pub mod protocol;
 pub mod server;
 
 pub use actor::{InferenceActor, InferenceActorConfig};
-pub use server::{ApiConfig, serve};
+pub use server::{ApiConfig, serve, serve_with_shutdown};

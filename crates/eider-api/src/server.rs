@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use infer::metrics::metrics as infer_metrics;
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -51,6 +52,18 @@ struct ApiState {
 pub async fn serve(actor: InferenceActor, config: ApiConfig) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(config.listen).await?;
     serve_listener(listener, actor, config).await
+}
+
+/// Serves until the listener fails or `shutdown` resolves.
+pub async fn serve_with_shutdown(
+    actor: InferenceActor,
+    config: ApiConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(config.listen).await?;
+    axum::serve(listener, router(actor, config))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 /// Serves an already-bound listener, allowing tests to use an ephemeral port.

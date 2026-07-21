@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use eider_api::deployment::{ArtifactKind, resolve_catalogue_model, resolve_local_model};
 use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
-use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve};
+use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve_with_shutdown};
 use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use infer::metrics::metrics as infer_metrics;
 use infer::nemotron3::{
@@ -10,8 +10,11 @@ use infer::nemotron3::{
 use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage};
 use infer::runtime::scheduler::SchedulerConfig;
 use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -235,6 +238,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .try_init();
+    let startup_complete = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
+    let signal = install_shutdown_signal()?;
+    let signal_task = tokio::spawn({
+        let startup_complete = Arc::clone(&startup_complete);
+        let shutdown = shutdown.clone();
+        async move {
+            let signal = signal.await;
+            if !startup_complete.load(Ordering::Acquire) {
+                info!(
+                    signal = signal.name(),
+                    "shutdown signal received during startup; exiting"
+                );
+                std::process::exit(signal.exit_code());
+            }
+            info!(signal = signal.name(), "shutdown signal received");
+            shutdown.cancel();
+        }
+    });
     info!("Eider");
     let args = Args::parse();
     let resolved = match (args.model.as_deref(), args.model_dir) {
@@ -293,6 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let actor = InferenceActor::spawn(actor_config)
         .map_err(|error| format!("failed to initialise inference: {}", error.message))?;
+    startup_complete.store(true, Ordering::Release);
     let config = ApiConfig {
         listen: args.listen,
         model: served_model_name,
@@ -313,11 +336,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => start_token_rate_sampler(),
     };
 
-    let serve_result = serve(actor, config).await;
+    let shutdown_actor = actor.clone();
+    let shutdown_server = shutdown.clone();
+    let serve_result = serve_with_shutdown(actor, config, async move {
+        shutdown_server.cancelled().await;
+        info!("stopping inference");
+        shutdown_actor.shutdown();
+    })
+    .await;
+    signal_task.abort();
     info!("stopping metrics sampler");
     metrics_task.cancel();
     serve_result?;
+    info!("server stopped");
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl ShutdownSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Interrupt => 128 + 2,
+            Self::Terminate => 128 + 15,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal()
+-> Result<impl Future<Output = ShutdownSignal> + Send + 'static, std::io::Error> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => ShutdownSignal::Interrupt,
+            _ = terminate.recv() => ShutdownSignal::Terminate,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal()
+-> Result<impl Future<Output = ShutdownSignal> + Send + 'static, std::io::Error> {
+    Ok(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to wait for interrupt signal");
+            std::future::pending::<()>().await;
+        }
+        ShutdownSignal::Interrupt
+    })
 }
 
 fn start_dogstatsd_export(endpoint: String, interval_secs: u64) -> CancellationToken {
