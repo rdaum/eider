@@ -8,15 +8,22 @@ use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
-use infer::runtime::gemma4_serving::{Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId};
+use infer::runtime::gemma4_serving::{
+    Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
+};
 use infer::runtime::generation::GenerationConfig;
 use infer::runtime::nemotron3_serving::{
-    Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
+    Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
 };
 use infer::runtime::prefix_cache::PrefixCacheConfig;
-use infer::runtime::scheduler::{Qwen36CancelOutcome, Qwen36RequestId, SchedulerConfig};
+use infer::runtime::scheduler::{
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, RequestLifecycleEvent,
+    SchedulerConfig,
+};
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
-use infer::runtime::step37_scheduler::{Step37CancelOutcome, Step37RequestId};
+use infer::runtime::step37_scheduler::{
+    Step37AdmissionProgress, Step37CancelOutcome, Step37RequestId,
+};
 use infer::runtime::step37_serving::Step37ChatService;
 use infer::step37::{Step37Bf16StorageConfig, Step37TextModel};
 use serde::Deserialize;
@@ -108,6 +115,7 @@ struct ActiveRequest {
 struct SessionMetrics {
     submitted_at: Instant,
     admitted_at: Option<Instant>,
+    prefill_started_at: Option<Instant>,
     prompt_tokens: usize,
     cached_prompt_tokens: usize,
     sequence_device_bytes: usize,
@@ -450,6 +458,55 @@ struct EngineAdmissionProgress {
     admitted_after_tick_start: Duration,
 }
 
+fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: Duration::ZERO,
+        checkpoint_copy_duration: Duration::ZERO,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+fn step_admission_progress(progress: Step37AdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: Duration::ZERO,
+        checkpoint_copy_duration: Duration::ZERO,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+fn nemotron_admission_progress(progress: Nemotron3AdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: Duration::ZERO,
+        checkpoint_copy_duration: Duration::ZERO,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+fn gemma_admission_progress(progress: Gemma4AdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: progress.allocation_duration,
+        checkpoint_copy_duration: progress.checkpoint_copy_duration,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+enum EngineLifecycleEvent {
+    Admitted(EngineAdmissionProgress),
+    PrefillStarted(u64),
+}
+
 struct EnginePrefillProgress {
     request_id: u64,
     prompt_position: usize,
@@ -469,7 +526,6 @@ struct EngineFinished {
 
 #[derive(Default)]
 struct EngineTick {
-    admitted: Vec<EngineAdmissionProgress>,
     prefilled: Vec<EnginePrefillProgress>,
     generated: Vec<u64>,
     output: Vec<EngineDelta>,
@@ -487,7 +543,10 @@ enum EngineCancelOutcome {
 
 trait ActorService {
     fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission>;
-    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick>;
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick>;
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
     fn active_sequence_count(&self) -> usize;
 }
@@ -518,26 +577,28 @@ impl ActorService for QwenActorService<'_, '_> {
         })
     }
 
-    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
-        let tick = self.inner.tick()?;
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(qwen_admission_progress(
+                        progress,
+                    )));
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
         let finished_ids = tick
             .finished
             .iter()
             .map(|finished| finished.request_id.get())
             .collect::<Vec<_>>();
         let converted = EngineTick {
-            admitted: tick
-                .admitted
-                .into_iter()
-                .map(|progress| EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
-                    sequence_device_bytes: progress.sequence_device_bytes,
-                    cached_prompt_tokens: progress.cached_prompt_tokens,
-                    allocation_duration: Duration::ZERO,
-                    checkpoint_copy_duration: Duration::ZERO,
-                    admitted_after_tick_start: progress.admitted_after_tick_start,
-                })
-                .collect(),
             prefilled: tick
                 .prefilled
                 .into_iter()
@@ -621,26 +682,28 @@ impl ActorService for StepActorService<'_> {
         })
     }
 
-    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
-        let tick = self.inner.tick()?;
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(step_admission_progress(
+                        progress,
+                    )));
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
         let finished_ids = tick
             .finished
             .iter()
             .map(|finished| finished.request_id.get())
             .collect::<Vec<_>>();
         let converted = EngineTick {
-            admitted: tick
-                .admitted
-                .into_iter()
-                .map(|progress| EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
-                    sequence_device_bytes: progress.sequence_device_bytes,
-                    cached_prompt_tokens: progress.cached_prompt_tokens,
-                    allocation_duration: Duration::ZERO,
-                    checkpoint_copy_duration: Duration::ZERO,
-                    admitted_after_tick_start: progress.admitted_after_tick_start,
-                })
-                .collect(),
             prefilled: tick
                 .prefilled
                 .into_iter()
@@ -724,26 +787,30 @@ impl ActorService for NemotronActorService<'_, '_> {
         })
     }
 
-    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
-        let tick = self.inner.tick()?;
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer = |event: RequestLifecycleEvent<
+            Nemotron3RequestId,
+            Nemotron3AdmissionProgress,
+        >| match event {
+            RequestLifecycleEvent::Admitted(progress) => {
+                on_lifecycle(EngineLifecycleEvent::Admitted(nemotron_admission_progress(
+                    progress,
+                )));
+            }
+            RequestLifecycleEvent::PrefillStarted(id) => {
+                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+            }
+        };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
         let finished_ids = tick
             .finished
             .iter()
             .map(|finished| finished.request_id.get())
             .collect::<Vec<_>>();
         let converted = EngineTick {
-            admitted: tick
-                .admitted
-                .into_iter()
-                .map(|progress| EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
-                    sequence_device_bytes: progress.sequence_device_bytes,
-                    cached_prompt_tokens: progress.cached_prompt_tokens,
-                    allocation_duration: Duration::ZERO,
-                    checkpoint_copy_duration: Duration::ZERO,
-                    admitted_after_tick_start: progress.admitted_after_tick_start,
-                })
-                .collect(),
             prefilled: tick
                 .prefilled
                 .into_iter()
@@ -828,26 +895,28 @@ impl ActorService for GemmaActorService<'_, '_> {
         })
     }
 
-    fn tick(&mut self) -> infer::nvfp4::Result<EngineTick> {
-        let tick = self.inner.tick()?;
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(gemma_admission_progress(
+                        progress,
+                    )));
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
         let finished_ids = tick
             .finished
             .iter()
             .map(|finished| finished.request_id.get())
             .collect::<Vec<_>>();
         let converted = EngineTick {
-            admitted: tick
-                .admitted
-                .into_iter()
-                .map(|progress| EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
-                    sequence_device_bytes: progress.sequence_device_bytes,
-                    cached_prompt_tokens: progress.cached_prompt_tokens,
-                    allocation_duration: progress.allocation_duration,
-                    checkpoint_copy_duration: progress.checkpoint_copy_duration,
-                    admitted_after_tick_start: progress.admitted_after_tick_start,
-                })
-                .collect(),
             prefilled: tick
                 .prefilled
                 .into_iter()
@@ -940,7 +1009,54 @@ fn run_actor_loop(
         }
 
         let tick_start = Instant::now();
-        let tick = match service.tick() {
+        let mut live_active_sequences = service.active_sequence_count();
+        let tick_result = {
+            let mut on_lifecycle = |event| match event {
+                EngineLifecycleEvent::Admitted(admission) => {
+                    let Some(request) = active.get_mut(&admission.request_id) else {
+                        return;
+                    };
+                    let admitted_at = tick_start + admission.admitted_after_tick_start;
+                    request.metrics.record_admission(
+                        admitted_at,
+                        admission.cached_prompt_tokens,
+                        admission.sequence_device_bytes,
+                    );
+                    infer_metrics().requests_admitted.inc();
+                    live_active_sequences += 1;
+                    info!(
+                        session = request.external_id.0,
+                        state_bytes = admission.sequence_device_bytes,
+                        cached_prompt_tokens = admission.cached_prompt_tokens,
+                        admission_ms = request.metrics.admission_duration().as_secs_f64() * 1000.0,
+                        allocation_ms = admission.allocation_duration.as_secs_f64() * 1000.0,
+                        checkpoint_copy_ms =
+                            admission.checkpoint_copy_duration.as_secs_f64() * 1000.0,
+                        active_sequences = live_active_sequences,
+                        "request admitted"
+                    );
+                }
+                EngineLifecycleEvent::PrefillStarted(request_id) => {
+                    let Some(request) = active.get_mut(&request_id) else {
+                        return;
+                    };
+                    let now = Instant::now();
+                    if request.metrics.record_prefill_start(now) {
+                        info!(
+                            session = request.external_id.0,
+                            prompt_tokens = request.metrics.prompt_tokens,
+                            queued_ms = now
+                                .duration_since(request.metrics.submitted_at)
+                                .as_secs_f64()
+                                * 1000.0,
+                            "prefill started"
+                        );
+                    }
+                }
+            };
+            service.tick(&mut on_lifecycle)
+        };
+        let tick = match tick_result {
             Ok(tick) => tick,
             Err(error) => {
                 let message = error.to_string();
@@ -965,31 +1081,8 @@ fn run_actor_loop(
         if !tick.generated.is_empty() {
             infer_metrics().decode_tick_us.record(tick_us);
         }
-        for admission in &tick.admitted {
-            if let Some(request) = active.get_mut(&admission.request_id) {
-                let admitted_at = tick_start + admission.admitted_after_tick_start;
-                request.metrics.record_admission(
-                    admitted_at,
-                    admission.cached_prompt_tokens,
-                    admission.sequence_device_bytes,
-                );
-                infer_metrics().requests_admitted.inc();
-                info!(
-                    session = request.external_id.0,
-                    state_bytes = admission.sequence_device_bytes,
-                    cached_prompt_tokens = admission.cached_prompt_tokens,
-                    admission_ms = request.metrics.admission_duration().as_secs_f64() * 1000.0,
-                    allocation_ms = admission.allocation_duration.as_secs_f64() * 1000.0,
-                    checkpoint_copy_ms = admission.checkpoint_copy_duration.as_secs_f64() * 1000.0,
-                    active_sequences = tick.active_sequences,
-                    "request admitted"
-                );
-            }
-        }
         for progress in &tick.prefilled {
             if let Some(request) = active.get_mut(&progress.request_id) {
-                let starting =
-                    request.metrics.prefilled_tokens == request.metrics.cached_prompt_tokens;
                 let prefill_delta = progress
                     .prompt_position
                     .saturating_sub(request.metrics.prefilled_tokens);
@@ -997,15 +1090,6 @@ fn run_actor_loop(
                 let snapshot = request
                     .metrics
                     .record_prefill(now, progress.prompt_position);
-                if starting {
-                    info!(
-                        session = request.external_id.0,
-                        prompt_tokens = request.metrics.prompt_tokens,
-                        cached_prompt_tokens = request.metrics.cached_prompt_tokens,
-                        state_bytes = request.metrics.sequence_device_bytes,
-                        "prefill started"
-                    );
-                }
                 if let Some(snapshot) = snapshot {
                     info!(
                         session = request.external_id.0,
@@ -1253,6 +1337,7 @@ impl SessionMetrics {
         Self {
             submitted_at,
             admitted_at: None,
+            prefill_started_at: None,
             prompt_tokens,
             cached_prompt_tokens: 0,
             sequence_device_bytes: 0,
@@ -1278,7 +1363,18 @@ impl SessionMetrics {
         self.cached_prompt_tokens = cached_prompt_tokens;
         self.prefilled_tokens = cached_prompt_tokens;
         self.last_prefill_report_tokens = cached_prompt_tokens;
+        if self.prefill_started_at.is_none() {
+            self.last_prefill_report_at = now;
+        }
+    }
+
+    fn record_prefill_start(&mut self, now: Instant) -> bool {
+        if self.prefill_started_at.is_some() {
+            return false;
+        }
+        self.prefill_started_at = Some(now);
         self.last_prefill_report_at = now;
+        true
     }
 
     fn record_prefill(
@@ -1421,10 +1517,10 @@ impl SessionMetrics {
     }
 
     fn prefill_compute_duration(&self, now: Instant) -> Duration {
-        let Some(admitted) = self.admitted_at else {
+        let Some(started) = self.prefill_started_at else {
             return Duration::ZERO;
         };
-        self.first_token_at.unwrap_or(now).duration_since(admitted)
+        self.first_token_at.unwrap_or(now).duration_since(started)
     }
 
     fn effective_prefill_tokens_per_second(&self, now: Instant) -> f64 {
@@ -1509,6 +1605,8 @@ mod tests {
         let submitted = Instant::now();
         let mut metrics = SessionMetrics::new(submitted, 1_000);
         metrics.record_admission(submitted, 0, 0);
+        assert!(metrics.record_prefill_start(submitted));
+        assert!(!metrics.record_prefill_start(submitted + Duration::from_secs(1)));
         assert!(
             metrics
                 .record_prefill(submitted + Duration::from_secs(5), 100)
@@ -1537,6 +1635,7 @@ mod tests {
         let submitted = Instant::now();
         let mut metrics = SessionMetrics::new(submitted, 1_000);
         metrics.record_admission(submitted, 256, 0);
+        metrics.record_prefill_start(submitted);
 
         let snapshot = metrics
             .record_prefill(submitted + Duration::from_secs(10), 456)
@@ -1551,20 +1650,22 @@ mod tests {
     fn session_metrics_separate_admission_compute_and_effective_prefill() {
         let submitted = Instant::now();
         let admitted = submitted + Duration::from_secs(2);
+        let prefill_started = submitted + Duration::from_secs(3);
         let first_token = submitted + Duration::from_secs(5);
         let mut metrics = SessionMetrics::new(submitted, 1_000);
         metrics.record_admission(admitted, 256, 123_456);
+        metrics.record_prefill_start(prefill_started);
         metrics.prefilled_tokens = 456;
         metrics.record_token(first_token);
 
         assert_eq!(metrics.admission_duration(), Duration::from_secs(2));
         assert_eq!(
             metrics.prefill_compute_duration(first_token),
-            Duration::from_secs(3)
+            Duration::from_secs(2)
         );
         assert_eq!(
             metrics.prefill_compute_tokens_per_second(first_token),
-            200.0 / 3.0
+            100.0
         );
         assert_eq!(
             metrics.effective_prefill_tokens_per_second(first_token),

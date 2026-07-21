@@ -6,7 +6,7 @@ use super::prefix_cache::{
     PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
 };
 use super::sampling::{Sampler, TokenHistory};
-use super::scheduler::{RequestConfig, SchedulerConfig};
+use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::nemotron3::{
@@ -37,6 +37,7 @@ pub struct Nemotron3Admission {
 }
 
 /// Device-state allocation completed during a tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nemotron3AdmissionProgress {
     pub request_id: Nemotron3RequestId,
     pub sequence_device_bytes: usize,
@@ -270,9 +271,20 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     /// Runs one decode-first round-robin scheduling iteration.
     pub fn tick(&mut self) -> Result<Nemotron3Tick> {
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    /// Runs one scheduler iteration and reports admission and prefill events
+    /// when they occur.
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
+        ),
+    ) -> Result<Nemotron3Tick> {
         let tick_started = Instant::now();
         let mut tick = Nemotron3Tick::default();
-        self.admit(&mut tick, tick_started)?;
+        self.admit(&mut tick, tick_started, on_lifecycle)?;
         for admission in &tick.admitted {
             self.requests
                 .get_mut(&admission.request_id)
@@ -325,7 +337,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .map(|(&id, _)| id)
             .take(self.config.prefill_sequence_capacity)
             .collect::<Vec<_>>();
-        self.prefill_blocks(&prefill_ids, &mut tick)?;
+        self.prefill_blocks(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
             if request.state.is_some() && request.generation.max_new_tokens == 0 {
@@ -359,7 +371,14 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         self.active_sequences
     }
 
-    fn admit(&mut self, tick: &mut Nemotron3Tick, tick_started: Instant) -> Result<()> {
+    fn admit(
+        &mut self,
+        tick: &mut Nemotron3Tick,
+        tick_started: Instant,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
+        ),
+    ) -> Result<()> {
         while self.active_sequences < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -383,12 +402,14 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             request.state = Some(state);
             self.active_sequences += 1;
-            tick.admitted.push(Nemotron3AdmissionProgress {
+            let progress = Nemotron3AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
                 admitted_after_tick_start: tick_started.elapsed(),
-            });
+            };
+            on_lifecycle(RequestLifecycleEvent::Admitted(progress));
+            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -397,6 +418,9 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         &mut self,
         ids: &[Nemotron3RequestId],
         tick: &mut Nemotron3Tick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
+        ),
     ) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -484,6 +508,9 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .iter_mut()
             .map(|(_, request)| request.state.as_mut().expect("prefill request has state"))
             .collect::<Vec<_>>();
+        for &(id, _, _) in &selected {
+            on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
+        }
         self.model
             .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
         self.model

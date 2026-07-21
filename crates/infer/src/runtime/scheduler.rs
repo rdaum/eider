@@ -168,6 +168,15 @@ pub struct Qwen36AdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
+/// A lifecycle event emitted at the point where scheduler work begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestLifecycleEvent<RequestId, AdmissionProgress> {
+    /// Device-resident sequence state is ready for the request.
+    Admitted(AdmissionProgress),
+    /// The request's next prompt chunk is about to enter the model.
+    PrefillStarted(RequestId),
+}
+
 /// Observable result of one scheduler tick.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Qwen36SchedulerTick {
@@ -436,11 +445,22 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Runs one decode-first scheduling iteration followed by bounded prefill.
     pub fn tick(&mut self) -> Result<Qwen36SchedulerTick> {
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    /// Runs one scheduler iteration and reports admission and prefill events
+    /// when they occur.
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
+    ) -> Result<Qwen36SchedulerTick> {
         let tick_started = Instant::now();
         let mut tick = Qwen36SchedulerTick::default();
-        self.admit_waiting(&mut tick, tick_started)?;
+        self.admit_waiting(&mut tick, tick_started, on_lifecycle)?;
         self.run_decode_phase(&mut tick)?;
-        self.run_prefill_phase(&mut tick)?;
+        self.run_prefill_phase(&mut tick, on_lifecycle)?;
         tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
@@ -449,6 +469,9 @@ impl<'model> Qwen36Scheduler<'model> {
         &mut self,
         tick: &mut Qwen36SchedulerTick,
         tick_started: Instant,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
     ) -> Result<()> {
         let model = self.model;
         while self.active_sequence_count() < self.config.max_active_sequences {
@@ -498,12 +521,14 @@ impl<'model> Qwen36Scheduler<'model> {
             request.device_token_counts = device_token_counts;
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
-            tick.admitted.push(Qwen36AdmissionProgress {
+            let progress = Qwen36AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
                 cached_prompt_tokens,
                 admitted_after_tick_start: tick_started.elapsed(),
-            });
+            };
+            on_lifecycle(RequestLifecycleEvent::Admitted(progress));
+            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -716,7 +741,13 @@ impl<'model> Qwen36Scheduler<'model> {
         request.prefix_cache_checkpointed = true;
     }
 
-    fn run_prefill_phase(&mut self, tick: &mut Qwen36SchedulerTick) -> Result<()> {
+    fn run_prefill_phase(
+        &mut self,
+        tick: &mut Qwen36SchedulerTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
+    ) -> Result<()> {
         let eligible = self
             .prefilling
             .iter()
@@ -767,6 +798,10 @@ impl<'model> Qwen36Scheduler<'model> {
         }
         tick.scheduled
             .extend(selected.iter().map(|request| request.id));
+        let prefill_ids = selected
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
         let prefill_result = {
             let mut rows = selected
                 .iter_mut()
@@ -782,6 +817,9 @@ impl<'model> Qwen36Scheduler<'model> {
                     Qwen36PrefillRow { token_ids, state }
                 })
                 .collect::<Vec<_>>();
+            for id in prefill_ids {
+                on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
+            }
             self.model
                 .prefill_batch(&mut self.prefill_workspace, &mut rows)
         };

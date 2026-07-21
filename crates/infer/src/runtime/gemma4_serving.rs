@@ -6,7 +6,7 @@ use super::prefix_cache::{
     PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
 };
 use super::sampling::{Sampler, TokenHistory};
-use super::scheduler::{RequestConfig, SchedulerConfig};
+use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::gemma4::{
@@ -40,6 +40,7 @@ pub struct Gemma4Admission {
 }
 
 /// Device-state allocation completed during a tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Gemma4AdmissionProgress {
     pub request_id: Gemma4RequestId,
     pub sequence_device_bytes: usize,
@@ -286,9 +287,20 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
     /// Runs one decode-first scheduling iteration across active requests.
     pub fn tick(&mut self) -> Result<Gemma4Tick> {
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    /// Runs one scheduler iteration and reports admission and prefill events
+    /// when they occur.
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
+        ),
+    ) -> Result<Gemma4Tick> {
         let tick_started = Instant::now();
         let mut tick = Gemma4Tick::default();
-        self.admit(&mut tick, tick_started)?;
+        self.admit(&mut tick, tick_started, on_lifecycle)?;
         for admission in &tick.admitted {
             self.requests
                 .get_mut(&admission.request_id)
@@ -325,7 +337,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .map(|(&id, _)| id)
             .take(self.config.prefill_sequence_capacity)
             .collect::<Vec<_>>();
-        self.prefill(&prefill_ids, &mut tick)?;
+        self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
             if request.state.is_some() && request.generation.max_new_tokens == 0 {
@@ -359,7 +371,14 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         self.active_sequences
     }
 
-    fn admit(&mut self, tick: &mut Gemma4Tick, tick_started: Instant) -> Result<()> {
+    fn admit(
+        &mut self,
+        tick: &mut Gemma4Tick,
+        tick_started: Instant,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
+        ),
+    ) -> Result<()> {
         while self.active_sequences < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
@@ -409,19 +428,28 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             request.state = Some(state);
             self.active_sequences += 1;
-            tick.admitted.push(Gemma4AdmissionProgress {
+            let progress = Gemma4AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
                 allocation_duration,
                 checkpoint_copy_duration,
                 admitted_after_tick_start: tick_started.elapsed(),
-            });
+            };
+            on_lifecycle(RequestLifecycleEvent::Admitted(progress));
+            tick.admitted.push(progress);
         }
         Ok(())
     }
 
-    fn prefill(&mut self, ids: &[Gemma4RequestId], tick: &mut Gemma4Tick) -> Result<()> {
+    fn prefill(
+        &mut self,
+        ids: &[Gemma4RequestId],
+        tick: &mut Gemma4Tick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
+        ),
+    ) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -471,6 +499,9 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                     }
                 })
                 .collect::<Vec<_>>();
+            for &(id, _) in &selected {
+                on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
+            }
             self.model
                 .prefill_batch(workspace, &mut rows, &self.stream)
                 .and_then(|()| self.stream.synchronize())

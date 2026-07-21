@@ -4,7 +4,9 @@ use super::prefix_cache::{
     PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
 };
 use super::sampling::{SampledToken, Sampler, TokenHistory};
-use super::scheduler::{RequestConfig, RequestFinishReason, RequestState, SchedulerConfig};
+use super::scheduler::{
+    RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
+};
 use crate::step37::{
     Step37DecodeState, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37SequenceCheckpoint,
     Step37TextModel,
@@ -298,11 +300,20 @@ impl Step37Scheduler {
     }
 
     pub fn tick(&mut self) -> Result<Step37SchedulerTick> {
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
+        ),
+    ) -> Result<Step37SchedulerTick> {
         let tick_started = Instant::now();
         let mut tick = Step37SchedulerTick::default();
-        self.admit_waiting(&mut tick, tick_started)?;
+        self.admit_waiting(&mut tick, tick_started, on_lifecycle)?;
         self.run_decode_phase(&mut tick)?;
-        self.run_prefill_phase(&mut tick)?;
+        self.run_prefill_phase(&mut tick, on_lifecycle)?;
         tick.active_sequences = self.active_sequence_count();
         Ok(tick)
     }
@@ -311,6 +322,9 @@ impl Step37Scheduler {
         &mut self,
         tick: &mut Step37SchedulerTick,
         tick_started: Instant,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
+        ),
     ) -> Result<()> {
         while self.active_sequence_count() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
@@ -360,12 +374,14 @@ impl Step37Scheduler {
             request.device_token_counts = device_token_counts;
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
-            tick.admitted.push(Step37AdmissionProgress {
+            let progress = Step37AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: request.sequence_device_bytes,
                 cached_prompt_tokens,
                 admitted_after_tick_start: tick_started.elapsed(),
-            });
+            };
+            on_lifecycle(RequestLifecycleEvent::Admitted(progress));
+            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -525,7 +541,13 @@ impl Step37Scheduler {
         request.prefix_cache_checkpointed = true;
     }
 
-    fn run_prefill_phase(&mut self, tick: &mut Step37SchedulerTick) -> Result<()> {
+    fn run_prefill_phase(
+        &mut self,
+        tick: &mut Step37SchedulerTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
+        ),
+    ) -> Result<()> {
         let eligible = self
             .prefilling
             .iter()
@@ -592,6 +614,9 @@ impl Step37Scheduler {
                     }
                 })
                 .collect::<Vec<_>>();
+            for &(id, _) in &selected {
+                on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
+            }
             self.model
                 .prefill_batch(&mut self.prefill_workspace, &mut rows)
         };

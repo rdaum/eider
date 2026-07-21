@@ -3,7 +3,7 @@
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::prefix_cache::PrefixCacheConfig;
-use super::scheduler::{RequestFinishReason, RequestState, SchedulerConfig};
+use super::scheduler::{RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::step37_scheduler::{
     Step37AdmissionProgress, Step37CancelOutcome, Step37PrefillProgress, Step37RequestId,
@@ -122,7 +122,16 @@ impl<'template> Step37ChatService<'template> {
     }
 
     pub fn tick(&mut self) -> Result<Step37ChatTick> {
-        let scheduled = self.scheduler.tick()?;
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
+        ),
+    ) -> Result<Step37ChatTick> {
+        let scheduled = self.scheduler.tick_with_lifecycle(on_lifecycle)?;
         for admission in &scheduled.admitted {
             self.requests
                 .get_mut(&admission.request_id)

@@ -5,7 +5,8 @@ use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::prefix_cache::PrefixCacheConfig;
 use super::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
-    Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState, SchedulerConfig,
+    Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState,
+    SchedulerConfig,
 };
 use super::stop::StopBuffer;
 use crate::qwen3::qwen36::Qwen36TextModel;
@@ -206,7 +207,18 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
 
     /// Runs one scheduler iteration and translates token output into chat deltas.
     pub fn tick(&mut self) -> Result<Qwen36ChatTick> {
-        let scheduled = self.scheduler.tick()?;
+        self.tick_with_lifecycle(&mut |_| {})
+    }
+
+    /// Runs one scheduler iteration and reports admission and prefill events
+    /// when they occur.
+    pub fn tick_with_lifecycle(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
+        ),
+    ) -> Result<Qwen36ChatTick> {
+        let scheduled = self.scheduler.tick_with_lifecycle(on_lifecycle)?;
         for admission in &scheduled.admitted {
             self.requests
                 .get_mut(&admission.request_id)
