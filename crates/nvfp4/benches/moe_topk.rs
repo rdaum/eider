@@ -1,12 +1,16 @@
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
-    ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
+    ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,
 };
-use nvfp4::{CudaEvent, CudaStream, DeviceBuffer, moe_topk_f32_into_on_stream};
+use nvfp4::{
+    CudaEvent, CudaStream, DeviceBuffer, moe_topk_f32_batch_into_on_stream,
+    moe_topk_f32_into_on_stream,
+};
 use std::time::Duration;
 
 const EXPERTS: usize = 256;
 const TOP_K: usize = 8;
+const PREFILL_ROWS: usize = 2_048;
 
 struct MoeTopkBench {
     stream: CudaStream,
@@ -15,6 +19,93 @@ struct MoeTopkBench {
     logits: DeviceBuffer<f32>,
     indices: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
+}
+
+struct MoeTopkBatchBench {
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    logits: DeviceBuffer<f32>,
+    indices: DeviceBuffer<u32>,
+    weights: DeviceBuffer<f32>,
+}
+
+impl BenchContext for MoeTopkBatchBench {
+    fn prepare(_num_chunks: usize) -> Self {
+        let logits = (0..PREFILL_ROWS * EXPERTS)
+            .map(|index| {
+                let row = index / EXPERTS;
+                let expert = index % EXPERTS;
+                (((expert * 73 + row * 37) % 509) as f32 - 254.0) * 0.03125
+            })
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut context = Self {
+            stream,
+            start: CudaEvent::new().expect("start"),
+            stop: CudaEvent::new().expect("stop"),
+            logits: DeviceBuffer::from_host(&logits).expect("logits"),
+            indices: DeviceBuffer::zeroed(PREFILL_ROWS * TOP_K).expect("indices"),
+            weights: DeviceBuffer::zeroed(PREFILL_ROWS * TOP_K).expect("weights"),
+        };
+        context.validate(&logits);
+        context
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
+impl MoeTopkBatchBench {
+    fn enqueue(&mut self) {
+        moe_topk_f32_batch_into_on_stream(
+            &self.logits,
+            self.indices.output(),
+            self.weights.output(),
+            PREFILL_ROWS,
+            EXPERTS,
+            TOP_K,
+            true,
+            &self.stream,
+        )
+        .expect("batch top-k");
+    }
+
+    fn validate(&mut self, logits: &[f32]) {
+        self.enqueue();
+        let actual_indices = self
+            .indices
+            .copy_to_host(&self.stream)
+            .expect("batch indices");
+        let actual_weights = self
+            .weights
+            .copy_to_host(&self.stream)
+            .expect("batch weights");
+        for row in [0, PREFILL_ROWS / 2, PREFILL_ROWS - 1] {
+            let row_logits = DeviceBuffer::from_host(&logits[row * EXPERTS..(row + 1) * EXPERTS])
+                .expect("row logits");
+            let mut row_indices = DeviceBuffer::zeroed(TOP_K).expect("row indices");
+            let mut row_weights = DeviceBuffer::zeroed(TOP_K).expect("row weights");
+            moe_topk_f32_into_on_stream(
+                &row_logits,
+                row_indices.output(),
+                row_weights.output(),
+                TOP_K,
+                true,
+                &self.stream,
+            )
+            .expect("row top-k");
+            assert_eq!(
+                &actual_indices[row * TOP_K..(row + 1) * TOP_K],
+                &*row_indices.copy_to_host(&self.stream).expect("row indices")
+            );
+            assert_eq!(
+                &actual_weights[row * TOP_K..(row + 1) * TOP_K],
+                &*row_weights.copy_to_host(&self.stream).expect("row weights")
+            );
+        }
+    }
 }
 
 impl BenchContext for MoeTopkBench {
@@ -62,11 +153,30 @@ fn topk_sample(ctx: &mut MoeTopkBench, chunk_size: usize, _chunk_num: usize) -> 
     )
 }
 
+fn topk_batch_sample(
+    ctx: &mut MoeTopkBatchBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk_size {
+        ctx.enqueue();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
+    black_box(ctx.indices.as_const_ptr());
+    BenchSampleResult::operations((chunk_size * PREFILL_ROWS) as u64).push_metric(
+        MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms/chunk")
+            .with_display_name("CUDA event"),
+    )
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-moe-topk".to_string()),
         comparison_policy: ComparisonPolicy::None,
-        save_results: false,
+        save_results: true,
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(50),
             benchmark_duration: Duration::from_millis(250),
@@ -77,7 +187,15 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<MoeTopkBench>("MoE top-k", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample("qwen36_experts256_top8_normalized", topk_sample);
+        });
+        runner.group::<MoeTopkBatchBench>("MoE top-k batch", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample(
+                "qwen36_rows2048_experts256_top8_normalized",
+                topk_batch_sample,
+            );
         });
     });
 }

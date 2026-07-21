@@ -1,6 +1,6 @@
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
-    ComparisonPolicy, MetricValue, Throughput, black_box, run_benchmark_main,
+    ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
 };
 use nvfp4::{CudaEvent, CudaStream, DeviceBuffer, Qwen36ChunkedGdn};
 use std::time::Duration;
@@ -104,7 +104,7 @@ impl ChunkedGdnBench {
         )
     }
 
-    fn prepare_pipeline(&mut self) {
+    fn enqueue_pipeline(&mut self) {
         let workspace = &mut self.workspace;
         self.kernel
             .cumsum_on_stream(
@@ -156,10 +156,6 @@ impl ChunkedGdnBench {
                 &self.stream,
             )
             .expect("W/U");
-        workspace
-            .pristine_state
-            .copy_prefix_from_device_on_stream(&workspace.state, STATE, &self.stream)
-            .expect("save state");
         self.kernel
             .h_on_stream(
                 &self.key,
@@ -343,7 +339,7 @@ impl BenchContext for ChunkedGdnBench {
             &reference_gate,
             &reference_beta,
         );
-        context.prepare_pipeline();
+        context.enqueue_pipeline();
         context.stream.synchronize().expect("prepare synchronise");
         context
     }
@@ -465,11 +461,21 @@ fn h_sample(
     h(context, chunk_size, chunk_num)
 }
 
+fn pipeline_sample(
+    context: &mut ChunkedGdnBench,
+    chunk_size: usize,
+    _: usize,
+) -> BenchSampleResult {
+    assert_eq!(chunk_size, 1);
+    context.reset_h();
+    context.measure(|context| context.enqueue_pipeline())
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("qwen36-chunked-gdn".to_string()),
         comparison_policy: ComparisonPolicy::None,
-        save_results: false,
+        save_results: true,
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(50),
             benchmark_duration: Duration::from_millis(250),
@@ -480,7 +486,10 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<ChunkedGdnBench>("Qwen3.6 chunked GDN", |group| {
-            group.throughput(Throughput::per_operation(1, "tokens"));
+            let group = group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample("pipeline", pipeline_sample);
             group.bench_sample("cumsum", cumsum);
             group.bench_sample("kkt", kkt);
             group.bench_sample("solve", solve);

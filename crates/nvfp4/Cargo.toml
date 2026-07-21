@@ -70,6 +70,22 @@ name = "qwen36_chunked_gdn"
 harness = false
 
 [[bench]]
+name = "qwen36_prefill_attention"
+harness = false
+
+[[bench]]
+name = "qwen36_grouped_moe_prefill"
+harness = false
+
+[[bench]]
+name = "qwen36_prefill_projections"
+harness = false
+
+[[bench]]
+name = "qwen36_shared_expert_prefill"
+harness = false
+
+[[bench]]
 name = "nvfp4_kv_attention"
 harness = false
 

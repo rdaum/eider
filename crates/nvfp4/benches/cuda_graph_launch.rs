@@ -1,6 +1,6 @@
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
-    ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
+    ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, round_f32_to_bf16_into_on_stream};
 use std::time::Duration;
@@ -161,7 +161,7 @@ fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("nvfp4-cuda-graph-launch".to_string()),
         comparison_policy: ComparisonPolicy::None,
-        save_results: false,
+        save_results: true,
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(50),
             benchmark_duration: Duration::from_millis(250),
@@ -172,6 +172,7 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<GraphLaunchBench>("Qwen3.6 launch chain", |group| {
+            let group = group.measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample("direct_1245_kernels", direct_sample);
             group.bench_sample("graph_1245_kernels", graph_sample);
             group.bench_sample("graph_30_segments_plus_30_direct", segmented_graph_sample);
