@@ -3,6 +3,7 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use infer::gemma4::Gemma4Model;
+use infer::laguna::LagunaModel;
 use infer::metrics::metrics as infer_metrics;
 use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
@@ -12,6 +13,9 @@ use infer::runtime::gemma4_serving::{
     Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
 };
 use infer::runtime::generation::GenerationConfig;
+use infer::runtime::laguna_serving::{
+    LagunaAdmissionProgress, LagunaCancelOutcome, LagunaChatService, LagunaRequestId,
+};
 use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
 };
@@ -409,6 +413,35 @@ fn actor_main(
             let mut service = GemmaActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
+        CheckpointArchitecture::Laguna => {
+            info!(
+                model_dir = %model_dir.display(),
+                artifact_dir = %artifact_dir.display(),
+                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                "loading Laguna-S-2.1 model"
+            );
+            let model = match LagunaModel::load_with_artifact_dir(&model_dir, &artifact_dir) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let service = match LagunaChatService::new_with_prefix_cache(
+                &model,
+                &template,
+                scheduler,
+                prefix_cache,
+            ) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut service = LagunaActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
+        }
     }
 }
 
@@ -418,6 +451,7 @@ enum CheckpointArchitecture {
     Step37,
     Nemotron3,
     Gemma4,
+    Laguna,
 }
 
 #[derive(Deserialize)]
@@ -436,6 +470,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
         "step3p7" => Ok(CheckpointArchitecture::Step37),
         "nemotron_h" | "nemotron_h_puzzle" => Ok(CheckpointArchitecture::Nemotron3),
         "gemma4" => Ok(CheckpointArchitecture::Gemma4),
+        "laguna" => Ok(CheckpointArchitecture::Laguna),
         other => Err(format!(
             "unsupported model_type {other:?} in {}",
             path.display()
@@ -492,6 +527,17 @@ fn nemotron_admission_progress(progress: Nemotron3AdmissionProgress) -> EngineAd
 }
 
 fn gemma_admission_progress(progress: Gemma4AdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: progress.allocation_duration,
+        checkpoint_copy_duration: progress.checkpoint_copy_duration,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+fn laguna_admission_progress(progress: LagunaAdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
         sequence_device_bytes: progress.sequence_device_bytes,
@@ -967,6 +1013,112 @@ impl ActorService for GemmaActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             Gemma4CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+struct LagunaActorService<'model, 'template> {
+    inner: LagunaChatService<'model, 'template>,
+    ids: BTreeMap<u64, LagunaRequestId>,
+}
+
+impl<'model, 'template> LagunaActorService<'model, 'template> {
+    fn new(inner: LagunaChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for LagunaActorService<'_, '_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(laguna_admission_progress(
+                        progress,
+                    )));
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(LagunaRequestId::get)
+                .collect(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            LagunaCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            LagunaCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
@@ -1724,6 +1876,12 @@ mod tests {
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Gemma4
+        );
+        fs::write(directory.join("config.json"), r#"{"model_type":"laguna"}"#)
+            .expect("write Laguna config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Laguna
         );
         fs::remove_dir_all(directory).expect("remove checkpoint directory");
     }

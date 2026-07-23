@@ -20,6 +20,9 @@ pub mod gemma4;
 /// Nemotron 3 hybrid Mamba/attention/MoE model support.
 pub mod nemotron3;
 
+/// Poolside Laguna sparse-MoE model support.
+pub mod laguna;
+
 /// Step-3.7 expert preparation and residency experiments.
 pub mod step37;
 

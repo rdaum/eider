@@ -964,6 +964,47 @@ pub fn sigmoid_scale_heads_f32_into_on_stream(
     }
 }
 
+/// Broadcasts one softplus gate per attention head across its head dimension.
+pub fn softplus_scale_heads_f32_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if gate.is_empty()
+        || head_dim == 0
+        || input.len() != gate.len() * head_dim
+        || output.len() != input.len()
+        || gate.len() > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "softplus head-gate buffers",
+            expected: "input/output=heads*head_dim with one gate per head".to_string(),
+            actual: format!(
+                "gate={} input={} output={} head_dim={head_dim}",
+                gate.len(),
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_softplus_scale_heads_f32_on_stream",
+            ffi::infer_softplus_scale_heads_f32_on_stream(
+                gate.ptr,
+                input.ptr,
+                output.buffer_mut().ptr,
+                gate.len() as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Computes `output = input * sigmoid(gate_logit[0])` elementwise, reading a
 /// single scalar gate and broadcasting it. Used for the Qwen3.6 shared-expert
 /// gate, replacing a host readback + broadcast + sigmoid_mul sequence.
@@ -3600,9 +3641,68 @@ pub fn rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
     rotary_dim: usize,
     input: &DeviceBuffer<f32>,
     inv_freq: &DeviceBuffer<f32>,
+    output: DeviceOutput<'_, f32>,
+    input_token_offset: usize,
+    start_position: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream(
+        tokens,
+        heads,
+        head_dim,
+        rotary_dim,
+        input,
+        inv_freq,
+        output,
+        input_token_offset,
+        start_position,
+        1.0,
+        stream,
+    )
+}
+
+/// Enqueues inverse-frequency sequence NeoX RoPE with scaled rotary channels.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_inv_freq_scaled_sequence_f32_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    inv_freq: &DeviceBuffer<f32>,
+    output: DeviceOutput<'_, f32>,
+    start_position: usize,
+    attention_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream(
+        tokens,
+        heads,
+        head_dim,
+        rotary_dim,
+        input,
+        inv_freq,
+        output,
+        0,
+        start_position,
+        attention_scale,
+        stream,
+    )
+}
+
+/// Enqueues scaled inverse-frequency RoPE at a token offset in dense buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    inv_freq: &DeviceBuffer<f32>,
     mut output: DeviceOutput<'_, f32>,
     input_token_offset: usize,
     start_position: usize,
+    attention_scale: f32,
     stream: &CudaStream,
 ) -> Result<()> {
     let end_tokens = input_token_offset.saturating_add(tokens);
@@ -3621,13 +3721,15 @@ pub fn rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
         || rotary_dim > u32::MAX as usize
         || input_token_offset > u32::MAX as usize
         || start_position > u32::MAX as usize
+        || !attention_scale.is_finite()
+        || attention_scale <= 0.0
     {
         return Err(Error::Shape {
             label: "inverse-frequency sequence RoPE",
             expected: "matching non-empty sequence, head, rotary, and frequency dimensions"
                 .to_string(),
             actual: format!(
-                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} inv_freq={} input_token_offset={input_token_offset} start_position={start_position}",
+                "tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} input={} output={} inv_freq={} input_token_offset={input_token_offset} start_position={start_position} attention_scale={attention_scale}",
                 input.len(),
                 output.len(),
                 inv_freq.len()
@@ -3647,6 +3749,7 @@ pub fn rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
                 rotary_dim as u32,
                 input_token_offset as u32,
                 start_position as u32,
+                attention_scale,
                 stream.as_raw(),
             ),
         )
@@ -11944,6 +12047,47 @@ mod tests {
     }
 
     #[test]
+    fn softplus_scale_heads_f32_matches_cpu_reference() {
+        let heads = 3usize;
+        let head_dim = 5usize;
+        let gate = [-4.0f32, 0.0, 3.0];
+        let input = (0..heads * head_dim)
+            .map(|idx| idx as f32 * 0.125 - 0.75)
+            .collect::<Vec<_>>();
+        let expected = input
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| {
+                let value = gate[idx / head_dim];
+                let softplus = (1.0 + (-value.abs()).exp()).ln() + value.max(0.0);
+                input * softplus
+            })
+            .collect::<Vec<_>>();
+        let gate_device = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+        let mut output_device = DeviceBuffer::zeroed(input.len()).expect("output alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        softplus_scale_heads_f32_into_on_stream(
+            &gate_device,
+            &input_device,
+            output_device.output(),
+            head_dim,
+            &stream,
+        )
+        .expect("softplus scale enqueue");
+
+        assert_close(
+            &output_device
+                .copy_to_host(&stream)
+                .expect("output download"),
+            &expected,
+            1.0e-6,
+            "softplus scale heads",
+        );
+    }
+
+    #[test]
     fn qwen36_full_attn_prep_f32_matches_cpu_reference() {
         let q_heads = 3usize;
         let kv_heads = 2usize;
@@ -14696,6 +14840,25 @@ mod tests {
             .unwrap();
         assert_eq!(argmax.index, expected_argmax.0);
         assert!((argmax.value - expected_argmax.1).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn bf16_linear_supports_laguna_dense_down_width() {
+        let rows = 2;
+        let cols = 12_288;
+        let input = DeviceBuffer::from_host(&vec![1.0f32; cols]).expect("input upload");
+        let weight = DeviceBuffer::from_host(&vec![format::f32_to_bf16(0.0); rows * cols])
+            .expect("weight upload");
+        let logits =
+            bf16_linear_logits_f32(&input, &weight, rows, cols).expect("Laguna-width BF16 logits");
+        let stream = CudaStream::new_blocking().expect("copy stream");
+        assert_eq!(
+            logits
+                .copy_to_host(&stream)
+                .expect("logits download")
+                .as_ref(),
+            &[0.0, 0.0],
+        );
     }
 
     #[test]

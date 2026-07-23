@@ -682,6 +682,9 @@ fn parse_function_call(
     if body.starts_with('{') {
         return parse_json_function_call(body, tool_parameters);
     }
+    if !body.starts_with("<function=") {
+        return parse_poolside_function_call(body, string_arguments);
+    }
     let function = body
         .strip_prefix("<function=")
         .ok_or_else(|| Error::Format {
@@ -751,6 +754,65 @@ fn parse_function_call(
         remaining = &parameter_body[parameter_close + "</parameter>".len()..];
     }
 
+    Ok(ChatFunctionCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+fn parse_poolside_function_call(
+    body: &str,
+    string_arguments: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<ChatFunctionCall> {
+    const KEY_OPEN: &str = "<arg_key>";
+    const KEY_CLOSE: &str = "</arg_key>";
+    const VALUE_OPEN: &str = "<arg_value>";
+    const VALUE_CLOSE: &str = "</arg_value>";
+
+    let body = body.trim_matches(['\r', '\n']);
+    let first_argument = body.find(KEY_OPEN).unwrap_or(body.len());
+    let name = body[..first_argument].trim();
+    validate_protocol_name("function", name)?;
+    let mut remaining = &body[first_argument..];
+    let mut arguments = BTreeMap::new();
+    while !remaining.is_empty() {
+        let key = remaining
+            .strip_prefix(KEY_OPEN)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("unexpected content in Poolside function {name:?}"),
+            })?;
+        let key_end = key.find(KEY_CLOSE).ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("unterminated Poolside argument name in {name:?}"),
+        })?;
+        let parameter = &key[..key_end];
+        validate_protocol_name("parameter", parameter)?;
+        let value = key[key_end + KEY_CLOSE.len()..]
+            .strip_prefix(VALUE_OPEN)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("missing <arg_value> for {parameter:?}"),
+            })?;
+        let value_end = value.find(VALUE_CLOSE).ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("unterminated Poolside value for {parameter:?}"),
+        })?;
+        let raw_value = strip_protocol_newlines(&value[..value_end]);
+        if arguments
+            .insert(
+                parameter.to_string(),
+                decode_argument(name, parameter, raw_value, string_arguments),
+            )
+            .is_some()
+        {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("duplicate parameter {parameter:?}"),
+            });
+        }
+        remaining = &value[value_end + VALUE_CLOSE.len()..];
+    }
     Ok(ChatFunctionCall {
         name: name.to_string(),
         arguments,
@@ -971,6 +1033,34 @@ mod tests {
                 },
             }),
         ]
+    }
+
+    #[test]
+    fn poolside_tool_call_decodes_tagged_arguments() {
+        let mut parser = ChatOutputParser::new(&tools(), false).unwrap();
+        let events = parser
+            .push_text(concat!(
+                "<tool_call>write_file",
+                "<arg_key>path</arg_key><arg_value>src/main.rs</arg_value>",
+                "<arg_key>contents</arg_key><arg_value>fn main() {}</arg_value>",
+                "<arg_key>executable</arg_key><arg_value>false</arg_value>",
+                "</tool_call>"
+            ))
+            .unwrap();
+        assert_eq!(
+            normalized(events),
+            vec![ChatOutputEvent::ToolCall(ChatToolCall {
+                id: "call_ID".to_string(),
+                function: ChatFunctionCall {
+                    name: "write_file".to_string(),
+                    arguments: BTreeMap::from([
+                        ("contents".to_string(), json!("fn main() {}")),
+                        ("executable".to_string(), json!(false)),
+                        ("path".to_string(), json!("src/main.rs")),
+                    ]),
+                },
+            })]
+        );
     }
 
     fn parse_chunks(chunks: &[&str]) -> Vec<ChatOutputEvent> {

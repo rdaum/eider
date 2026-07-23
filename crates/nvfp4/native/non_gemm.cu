@@ -1549,6 +1549,37 @@ extern "C" cudaError_t infer_sigmoid_scale_heads_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_softplus_scale_heads_f32_kernel(
+    const float* gate,
+    const float* input,
+    float* output,
+    std::uint32_t head_dim,
+    std::uint32_t len) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    const float value = gate[idx / head_dim];
+    const float softplus = log1pf(expf(-fabsf(value))) + fmaxf(value, 0.0f);
+    output[idx] = input[idx] * softplus;
+}
+
+extern "C" cudaError_t infer_softplus_scale_heads_f32_on_stream(
+    const float* gate,
+    const float* input,
+    float* output,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (gate == nullptr || input == nullptr || output == nullptr || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t len = heads * head_dim;
+    constexpr int kThreads = 256;
+    infer_softplus_scale_heads_f32_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        gate, input, output, head_dim, len);
+    return cudaGetLastError();
+}
+
 // Fused shared-expert gate: reads a single scalar logit from `gate_logit[0]`,
 // computes sigmoid(scalar), and multiplies it element-wise into `input`,
 // writing `shared_gated`. Replaces a host readback + broadcast + sigmoid_mul
@@ -4300,7 +4331,8 @@ __global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
     std::uint32_t head_dim,
     std::uint32_t rotary_dim,
     std::uint32_t input_token_offset,
-    std::uint32_t start_position) {
+    std::uint32_t start_position,
+    float attention_scale) {
     const std::uint32_t half = rotary_dim / 2;
     const std::uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const std::uint32_t total_pairs = tokens * heads * half;
@@ -4314,8 +4346,8 @@ __global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
     sincosf(static_cast<float>(start_position + token) * inv_freq[i], &sin_value, &cos_value);
     const float a = input[row_start + i];
     const float b = input[row_start + i + half];
-    output[row_start + i] = a * cos_value - b * sin_value;
-    output[row_start + i + half] = a * sin_value + b * cos_value;
+    output[row_start + i] = (a * cos_value - b * sin_value) * attention_scale;
+    output[row_start + i + half] = (a * sin_value + b * cos_value) * attention_scale;
 }
 
 extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
@@ -4328,10 +4360,11 @@ extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
     std::uint32_t rotary_dim,
     std::uint32_t input_token_offset,
     std::uint32_t start_position,
+    float attention_scale,
     cudaStream_t stream) {
     if (input == nullptr || inv_freq == nullptr || output == nullptr || tokens == 0 ||
         heads == 0 || head_dim == 0 || rotary_dim == 0 || rotary_dim > head_dim ||
-        (rotary_dim % 2) != 0) {
+        (rotary_dim % 2) != 0 || !isfinite(attention_scale) || attention_scale <= 0.0f) {
         return cudaErrorInvalidValue;
     }
     const std::size_t value_offset =
@@ -4345,7 +4378,7 @@ extern "C" cudaError_t infer_rope_neox_inv_freq_sequence_f32_on_stream(
     const int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
     infer_rope_neox_inv_freq_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, inv_freq, output, tokens, heads, head_dim, rotary_dim,
-        input_token_offset, start_position);
+        input_token_offset, start_position, attention_scale);
     return cudaGetLastError();
 }
 
@@ -6703,6 +6736,13 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32(const float* input,
     constexpr int kThreads = 256;
     const std::size_t matvec_shmem =
         kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_bf16_matvec_logits_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(matvec_shmem));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
     infer_bf16_matvec_logits_kernel<<<rows, kThreads, matvec_shmem>>>(
         input, weight, logits, rows, cols);
     return cudaGetLastError();
@@ -6722,6 +6762,13 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_on_stream(
     constexpr int kThreads = 256;
     const std::size_t matvec_shmem =
         kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_bf16_matvec_logits_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(matvec_shmem));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
     infer_bf16_matvec_logits_kernel<<<rows, kThreads, matvec_shmem, stream>>>(
         input, weight, logits, rows, cols);
     return cudaGetLastError();
@@ -6743,6 +6790,13 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_batch_on_stream(
     if (batch_size == 1 || (cols & 3u) != 0u) {
         const std::size_t shmem =
             kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+        const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+            infer_bf16_matvec_logits_batch_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shmem));
+        if (shared_memory_status != cudaSuccess) {
+            return shared_memory_status;
+        }
         infer_bf16_matvec_logits_batch_kernel<<<dim3(rows, batch_size, 1), kThreads, shmem, stream>>>(
             input, weight, logits, batch_size, rows, cols);
         return cudaGetLastError();

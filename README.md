@@ -13,12 +13,12 @@ It is not built on top of any existing tensor or inference library, and does
 not use llama.cpp or vLLM.
 
 It is capable of running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1,
-StepFun's Step-3.7-Flash, Gemma 4 26B-A4B, and NVIDIA's Nemotron 3
-Puzzle hybrid model.  
+StepFun's Step-3.7-Flash, Poolside's Laguna-S-2.1, Gemma 4 26B-A4B, and
+NVIDIA's Nemotron 3 Puzzle hybrid model.
 
 It includes an OpenAI-compatible Responses and Chat Completions server
 with continuous multi-session scheduling and a compact FP4 KV cache
-for the Qwen, Step, and Gemma attention paths. Nemotron combines
+for the Qwen, Step, Laguna, and Gemma attention paths. Nemotron combines
 backbone attention with Mamba recurrent state.
 
 This started as a personal research project and is crawling towards more of a
@@ -126,6 +126,7 @@ corresponding served model name.
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE; compact FP4 KV cache |
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agentic fine-tune; 262K-token limit |
 | [`step-3.7-flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | `eider-step3.7` | 198B MoE with disk-backed expert paging |
+| [`laguna-s-2.1`](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | `eider-laguna-s-2.1` | 256-expert MoE; compact FP4 KV cache |
 | [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |
 | [`gemma-4-26b-a4b-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | `eider-gemma4-26b` | Upstream BF16 source served by the same text runtime |
 | [`nemotron-3-puzzle-75b-a9b`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | `eider-nemotron3-puzzle` | Mamba-2, latent-MoE, and attention hybrid |
@@ -169,6 +170,7 @@ To select any supported model directly, pass its stable catalogue ID to
 eider-serve qwen3.6-35b-a3b
 eider-serve agents-a1
 eider-serve step-3.7-flash
+eider-serve laguna-s-2.1
 eider-serve gemma-4-26b-a4b-nvfp4
 eider-serve gemma-4-26b-a4b-it
 eider-serve nemotron-3-puzzle-75b-a9b
@@ -192,7 +194,8 @@ Gemma text path; multimodal inputs are not yet exposed through Eider's API.
 
 Catalogue deployments keep Hugging Face snapshots immutable. The first Qwen3.6
 or Agents-A1 start builds its SM12x down-weight cache below
-`$XDG_CACHE_HOME/eider/models/`; Step-3.7 expert records are stored there too.
+`$XDG_CACHE_HOME/eider/models/`; Laguna's native down weights and Step-3.7
+expert records are stored there too.
 This is a one-time, down-only repack of roughly 5 GiB for the 35B-A3B
 checkpoint. Mixed-precision checkpoints build it only for layers whose down
 weights are NVFP4. Cache files are written atomically and incomplete layers are
@@ -246,6 +249,7 @@ Run Pi against the matching server with:
 scripts/run-pi-eider-qwen.sh
 scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
+scripts/run-pi-eider-laguna.sh
 scripts/run-pi-eider-gemma4.sh
 scripts/run-pi-eider-nemotron3-super.sh
 ```

@@ -3,7 +3,8 @@
 CUDA inference and serving for NVFP4 and mixed-precision models on NVIDIA DGX
 Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
 multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
-families currently include Qwen3.5/3.6 MoE, Step-3.7, Gemma 4, and Nemotron 3.
+families currently include Qwen3.5/3.6 MoE, Step-3.7, Laguna-S-2.1, Gemma 4,
+and Nemotron 3.
 
 ## Build / run
 
@@ -69,8 +70,8 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
   streaming protocol adapters, and server telemetry.
 - `crates/infer/src/runtime/` — shared scheduling, prefix/KV caches, sampling,
   chat rendering, output parsing, and serving state.
-- `crates/infer/src/{qwen3,step37,gemma4,nemotron3}/` — family-specific model
-  loading and execution.
+- `crates/infer/src/{qwen3,step37,laguna,gemma4,nemotron3}/` — family-specific
+  model loading and execution.
 - `crates/infer/benches/` — model-runtime and prefill micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.
 - `crates/nvfp4/src/kernels/` — Marlin, non-GEMM, and SM12x operations.
@@ -139,6 +140,9 @@ Before handing work back:
 - Step-3.7 routed experts use bounded residency and disk-backed paging; its
   dense and shared weights remain resident. Preserve paging telemetry and do
   not silently turn paging misses into synchronous default-stream work.
+- Laguna-S-2.1 alternates global and sliding-window attention, gates attention
+  heads, and routes ten experts with a learned correction bias. Preserve the
+  checkpoint's layer pattern and routing order.
 - Gemma 4 uses heterogeneous local/global attention. Preserve the checkpoint's
   per-layer attention pattern and validate both prefill and decode when changing
   its shared kernels.

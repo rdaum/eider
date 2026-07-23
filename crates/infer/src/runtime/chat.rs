@@ -391,6 +391,7 @@ fn load_template_source(model_dir: &Path) -> Result<(String, PathBuf)> {
 }
 
 fn build_environment(source: String) -> Result<Environment<'static>> {
+    let source = normalise_generation_blocks(source);
     let mut environment = Environment::new();
     environment.set_trim_blocks(true);
     environment.set_lstrip_blocks(true);
@@ -409,6 +410,22 @@ fn build_environment(source: String) -> Result<Environment<'static>> {
         .add_template_owned(TEMPLATE_NAME, source)
         .map_err(template_error)?;
     Ok(environment)
+}
+
+fn normalise_generation_blocks(mut source: String) -> String {
+    for (annotation, ordinary) in [
+        ("{% generation %}", "{% if true %}"),
+        ("{%- generation %}", "{%- if true %}"),
+        ("{% generation -%}", "{% if true -%}"),
+        ("{%- generation -%}", "{%- if true -%}"),
+        ("{% endgeneration %}", "{% endif %}"),
+        ("{%- endgeneration %}", "{%- endif %}"),
+        ("{% endgeneration -%}", "{% endif -%}"),
+        ("{%- endgeneration -%}", "{%- endif -%}"),
+    ] {
+        source = source.replace(annotation, ordinary);
+    }
+    source
 }
 
 fn tojson_compat(
@@ -568,6 +585,24 @@ mod tests {
         )
         .unwrap();
         assert!(rendered.contains("café"), "{rendered}");
+    }
+
+    #[test]
+    fn generation_annotation_renders_as_an_ordinary_block() {
+        let environment = build_environment(
+            "before{%- generation -%}assistant{%- endgeneration -%}after".to_string(),
+        )
+        .unwrap();
+        let rendered = render_with_environment(
+            &environment,
+            &[],
+            &[],
+            ChatTemplateOptions::default(),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(rendered, "beforeassistantafter");
     }
 
     #[test]

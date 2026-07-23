@@ -814,6 +814,14 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_softplus_scale_heads_f32_on_stream(
+        gate: *const f32,
+        input: *const f32,
+        output: *mut f32,
+        heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sigmoid_scale_scalar_f32_on_stream(
         gate_logit: *const f32,
         input: *const f32,
@@ -1317,6 +1325,7 @@ unsafe extern "C" {
         rotary_dim: u32,
         input_token_offset: u32,
         start_position: u32,
+        attention_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_add_f32_on_stream(
@@ -2110,6 +2119,7 @@ unsafe extern "C" {
         sorted_token_ids: *mut i32,
         expert_ids: *mut i32,
         num_tokens_past_padded: *mut i32,
+        top_k: u32,
         gate_up_features: u32,
         hidden_features: u32,
         stream: cudaStream_t,
@@ -2129,6 +2139,7 @@ unsafe extern "C" {
         expert_ids: *mut i32,
         num_tokens_past_padded: *mut i32,
         batch_size: u32,
+        top_k: u32,
         gate_up_features: u32,
         hidden_features: u32,
         stream: cudaStream_t,

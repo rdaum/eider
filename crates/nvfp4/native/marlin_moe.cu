@@ -12,7 +12,6 @@
 
 namespace {
 
-constexpr int kTopK = 8;
 constexpr int kMoeBlockSize = 8;
 constexpr int kThreads = 256;
 // Exact storage used by the four-stage 1x8x8 W4A16 tile: route metadata,
@@ -37,20 +36,21 @@ __global__ void prepare_routes_and_input_kernel(
     std::int32_t* __restrict__ sorted_token_ids,
     std::int32_t* __restrict__ expert_ids,
     std::int32_t* __restrict__ num_tokens_past_padded,
+    std::uint32_t top_k,
     std::uint32_t hidden_features) {
     for (std::uint32_t col = threadIdx.x; col < hidden_features; col += blockDim.x) {
         input_bf16[col] = __bfloat16_as_ushort(__float2bfloat16_rn(input[col]));
     }
-    if (threadIdx.x < kTopK) {
+    if (threadIdx.x < top_k) {
         const int slot = threadIdx.x;
         const std::uint32_t expert = indices[slot];
         expert_ids[slot] = static_cast<std::int32_t>(expert);
         for (int row = 0; row < kMoeBlockSize; ++row) {
-            sorted_token_ids[slot * kMoeBlockSize + row] = row == 0 ? slot : kTopK;
+            sorted_token_ids[slot * kMoeBlockSize + row] = row == 0 ? slot : top_k;
         }
     }
     if (threadIdx.x == 0) {
-        num_tokens_past_padded[0] = kTopK * kMoeBlockSize;
+        num_tokens_past_padded[0] = top_k * kMoeBlockSize;
     }
 }
 
@@ -62,24 +62,25 @@ __global__ void prepare_routes_and_input_batch_kernel(
     std::int32_t* __restrict__ expert_ids,
     std::int32_t* __restrict__ num_tokens_past_padded,
     std::uint32_t batch_size,
+    std::uint32_t top_k,
     std::uint32_t hidden_features) {
     const std::uint32_t batch = blockIdx.x;
     for (std::uint32_t col = threadIdx.x; col < hidden_features; col += blockDim.x) {
         input_bf16[batch * hidden_features + col] = __bfloat16_as_ushort(
             __float2bfloat16_rn(input[batch * hidden_features + col]));
     }
-    if (threadIdx.x < kTopK) {
+    if (threadIdx.x < top_k) {
         const std::uint32_t slot = threadIdx.x;
-        const std::uint32_t group = batch * kTopK + slot;
+        const std::uint32_t group = batch * top_k + slot;
         expert_ids[group] = static_cast<std::int32_t>(indices[group]);
         for (int row = 0; row < kMoeBlockSize; ++row) {
             sorted_token_ids[group * kMoeBlockSize + row] =
                 row == 0 ? static_cast<std::int32_t>(group)
-                         : static_cast<std::int32_t>(batch_size * kTopK);
+                         : static_cast<std::int32_t>(batch_size * top_k);
         }
     }
     if (batch == 0 && threadIdx.x == 0) {
-        num_tokens_past_padded[0] = batch_size * kTopK * kMoeBlockSize;
+        num_tokens_past_padded[0] = batch_size * top_k * kMoeBlockSize;
     }
 }
 
@@ -172,6 +173,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     std::int32_t* sorted_token_ids,
     std::int32_t* expert_ids,
     std::int32_t* num_tokens_past_padded,
+    std::uint32_t top_k,
     std::uint32_t gate_up_features,
     std::uint32_t hidden_features,
     cudaStream_t stream) {
@@ -179,7 +181,8 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
         weight_scale == nullptr || global_scale == nullptr ||
         input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
         locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
-        num_tokens_past_padded == nullptr || gate_up_features == 0 ||
+        num_tokens_past_padded == nullptr || top_k == 0 || top_k > 256 ||
+        gate_up_features == 0 ||
         hidden_features == 0 || gate_up_features % 128 != 0 ||
         hidden_features % 16 != 0) {
         return cudaErrorInvalidValue;
@@ -187,14 +190,12 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
 
     prepare_routes_and_input_kernel<<<1, kThreads, 0, stream>>>(
         indices, input, input_bf16, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, hidden_features);
+        num_tokens_past_padded, top_k, hidden_features);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
 
     auto kernel = marlin_kernel();
-    // Eight expert blocks times eight N tiles. One CUDA block per complete
-    // MN tile avoids split-K reduction for the batch-one top-8 shape.
-    const int grid_blocks = kTopK * (gate_up_features / 128);
+    const int grid_blocks = top_k * (gate_up_features / 128);
     kernel<<<grid_blocks, kThreads, kDynamicSharedBytes, stream>>>(
         reinterpret_cast<const int4*>(input_bf16),
         reinterpret_cast<const int4*>(repacked_weight),
@@ -210,7 +211,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
         expert_ids,
         num_tokens_past_padded,
         nullptr,
-        kTopK,
+        top_k,
         false,
         hidden_features / 16,
         1,
@@ -223,7 +224,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_on_stream(
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
 
-    const std::uint32_t output_len = kTopK * gate_up_features;
+    const std::uint32_t output_len = top_k * gate_up_features;
     constexpr int convert_threads = 256;
     const int convert_blocks = (output_len + convert_threads - 1) / convert_threads;
     if (output != nullptr) {
@@ -248,6 +249,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
     std::int32_t* expert_ids,
     std::int32_t* num_tokens_past_padded,
     std::uint32_t batch_size,
+    std::uint32_t top_k,
     std::uint32_t gate_up_features,
     std::uint32_t hidden_features,
     cudaStream_t stream) {
@@ -256,17 +258,18 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
         input_bf16 == nullptr || output_bf16 == nullptr || reduce_tmp == nullptr ||
         locks == nullptr || sorted_token_ids == nullptr || expert_ids == nullptr ||
         num_tokens_past_padded == nullptr || batch_size == 0 ||
+        top_k == 0 || top_k > 256 ||
         gate_up_features == 0 || hidden_features == 0 ||
         gate_up_features % 128 != 0 || hidden_features % 16 != 0) {
         return cudaErrorInvalidValue;
     }
     prepare_routes_and_input_batch_kernel<<<batch_size, kThreads, 0, stream>>>(
         indices, input, input_bf16, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, batch_size, hidden_features);
+        num_tokens_past_padded, batch_size, top_k, hidden_features);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     auto kernel = marlin_kernel();
-    const int routed_rows = batch_size * kTopK;
+    const int routed_rows = batch_size * top_k;
     const int grid_blocks = routed_rows * (gate_up_features / 128);
     kernel<<<grid_blocks, kThreads, kDynamicSharedBytes, stream>>>(
         reinterpret_cast<const int4*>(input_bf16),
@@ -274,7 +277,7 @@ extern "C" cudaError_t infer_marlin_nvfp4_gate_up_batch_on_stream(
         reinterpret_cast<int4*>(output_bf16),
         reinterpret_cast<int4*>(reduce_tmp), nullptr, nullptr,
         reinterpret_cast<const int4*>(weight_scale), global_scale, nullptr, nullptr,
-        sorted_token_ids, expert_ids, num_tokens_past_padded, nullptr, kTopK, false,
+        sorted_token_ids, expert_ids, num_tokens_past_padded, nullptr, top_k, false,
         hidden_features / 16, batch_size, gate_up_features, hidden_features,
         locks, false, false, true);
     status = cudaGetLastError();

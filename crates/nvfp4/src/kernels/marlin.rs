@@ -27,12 +27,13 @@ pub struct MarlinNvfp4HostWeight {
     pub in_features: usize,
 }
 
-const ROUTED_TOP_K: usize = 8;
+const DEFAULT_ROUTED_TOP_K: usize = 8;
 const MOE_BLOCK_SIZE: usize = 8;
 
-/// Persistent top-8 NVFP4 Marlin gate/up plan.
+/// Persistent routed NVFP4 Marlin gate/up plan.
 pub struct MarlinNvfp4GateUp {
     experts: usize,
+    top_k: usize,
     hidden: usize,
     gate_up: usize,
     repacked_weight: DeviceBuffer<u32>,
@@ -91,6 +92,11 @@ pub struct MarlinNvfp4LinearBatchWorkspace {
 impl MarlinNvfp4GateUp {
     /// Creates a plan from raw ModelOpt gate/up weights in expert-table order.
     pub fn new(weights: &[ModelOptNvfp4Linear]) -> Result<Self> {
+        Self::new_with_top_k(weights, DEFAULT_ROUTED_TOP_K)
+    }
+
+    /// Creates a plan with an explicit number of routed experts per token.
+    pub fn new_with_top_k(weights: &[ModelOptNvfp4Linear], top_k: usize) -> Result<Self> {
         if weights.is_empty() {
             return Err(Error::Shape {
                 label: "Marlin gate/up experts",
@@ -109,11 +115,19 @@ impl MarlinNvfp4GateUp {
         for weight in weights {
             prepared.push(MarlinNvfp4HostWeight::from_modelopt(weight)?);
         }
-        Self::from_prepared(&prepared)
+        Self::from_prepared_with_top_k(&prepared, top_k)
     }
 
     /// Creates a plan from already-repacked expert weights.
     pub fn from_prepared(weights: &[MarlinNvfp4HostWeight]) -> Result<Self> {
+        Self::from_prepared_with_top_k(weights, DEFAULT_ROUTED_TOP_K)
+    }
+
+    /// Creates a plan from repacked weights with an explicit routed top-k.
+    pub fn from_prepared_with_top_k(
+        weights: &[MarlinNvfp4HostWeight],
+        top_k: usize,
+    ) -> Result<Self> {
         ensure_gate_up_device_support()?;
         let Some(first) = weights.first() else {
             return Err(Error::Shape {
@@ -122,6 +136,7 @@ impl MarlinNvfp4GateUp {
                 actual: "0 experts".to_string(),
             });
         };
+        validate_top_k(top_k, weights.len())?;
         validate_gate_up_shape(first.out_features, first.in_features)?;
         let hidden = first.in_features;
         let gate_up = first.out_features;
@@ -137,23 +152,34 @@ impl MarlinNvfp4GateUp {
 
         Ok(Self {
             experts: weights.len(),
+            top_k,
             hidden,
             gate_up,
             repacked_weight: DeviceBuffer::from_host(&repacked_weight)?,
             weight_scale: DeviceBuffer::from_host(&weight_scale)?,
             global_scale: DeviceBuffer::from_host(&global_scale)?,
             input_bf16: DeviceBuffer::zeroed(hidden)?,
-            output_bf16: DeviceBuffer::zeroed(ROUTED_TOP_K * gate_up)?,
-            reduce_tmp: DeviceBuffer::zeroed(gate_up * ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
-            locks: DeviceBuffer::zeroed(ROUTED_TOP_K * (gate_up / 128))?,
-            sorted_token_ids: DeviceBuffer::zeroed(ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
-            expert_ids: DeviceBuffer::zeroed(ROUTED_TOP_K)?,
+            output_bf16: DeviceBuffer::zeroed(top_k * gate_up)?,
+            reduce_tmp: DeviceBuffer::zeroed(gate_up * top_k * MOE_BLOCK_SIZE)?,
+            locks: DeviceBuffer::zeroed(top_k * (gate_up / 128))?,
+            sorted_token_ids: DeviceBuffer::zeroed(top_k * MOE_BLOCK_SIZE)?,
+            expert_ids: DeviceBuffer::zeroed(top_k)?,
             num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
         })
     }
 
     /// Allocates a fixed number of empty expert slots for paging.
     pub fn new_empty_slots(experts: usize, gate_up: usize, hidden: usize) -> Result<Self> {
+        Self::new_empty_slots_with_top_k(experts, DEFAULT_ROUTED_TOP_K, gate_up, hidden)
+    }
+
+    /// Allocates empty expert slots for an explicit routed top-k.
+    pub fn new_empty_slots_with_top_k(
+        experts: usize,
+        top_k: usize,
+        gate_up: usize,
+        hidden: usize,
+    ) -> Result<Self> {
         ensure_gate_up_device_support()?;
         if experts == 0 {
             return Err(Error::Shape {
@@ -162,20 +188,22 @@ impl MarlinNvfp4GateUp {
                 actual: "0 slots".to_string(),
             });
         }
+        validate_top_k(top_k, experts)?;
         validate_gate_up_shape(gate_up, hidden)?;
         Ok(Self {
             experts,
+            top_k,
             hidden,
             gate_up,
             repacked_weight: DeviceBuffer::zeroed(experts * gate_up * hidden / 8)?,
             weight_scale: DeviceBuffer::zeroed(experts * gate_up * hidden / 16)?,
             global_scale: DeviceBuffer::zeroed(experts)?,
             input_bf16: DeviceBuffer::zeroed(hidden)?,
-            output_bf16: DeviceBuffer::zeroed(ROUTED_TOP_K * gate_up)?,
-            reduce_tmp: DeviceBuffer::zeroed(gate_up * ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
-            locks: DeviceBuffer::zeroed(ROUTED_TOP_K * (gate_up / 128))?,
-            sorted_token_ids: DeviceBuffer::zeroed(ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
-            expert_ids: DeviceBuffer::zeroed(ROUTED_TOP_K)?,
+            output_bf16: DeviceBuffer::zeroed(top_k * gate_up)?,
+            reduce_tmp: DeviceBuffer::zeroed(gate_up * top_k * MOE_BLOCK_SIZE)?,
+            locks: DeviceBuffer::zeroed(top_k * (gate_up / 128))?,
+            sorted_token_ids: DeviceBuffer::zeroed(top_k * MOE_BLOCK_SIZE)?,
+            expert_ids: DeviceBuffer::zeroed(top_k)?,
             num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
         })
     }
@@ -315,6 +343,11 @@ impl MarlinNvfp4GateUp {
         self.experts
     }
 
+    /// Returns the number of routed experts consumed per token.
+    pub fn top_k(&self) -> usize {
+        self.top_k
+    }
+
     /// Returns `(gate_up_features, hidden_features)`.
     pub fn shape(&self) -> (usize, usize) {
         (self.gate_up, self.hidden)
@@ -332,13 +365,13 @@ impl MarlinNvfp4GateUp {
         Ok(MarlinNvfp4GateUpBatchWorkspace {
             capacity,
             input_bf16: DeviceBuffer::zeroed(capacity * self.hidden)?,
-            output_bf16: DeviceBuffer::zeroed(capacity * ROUTED_TOP_K * self.gate_up)?,
+            output_bf16: DeviceBuffer::zeroed(capacity * self.top_k * self.gate_up)?,
             reduce_tmp: DeviceBuffer::zeroed(
-                capacity * ROUTED_TOP_K * self.gate_up * MOE_BLOCK_SIZE,
+                capacity * self.top_k * self.gate_up * MOE_BLOCK_SIZE,
             )?,
-            locks: DeviceBuffer::zeroed(capacity * ROUTED_TOP_K * (self.gate_up / 128))?,
-            sorted_token_ids: DeviceBuffer::zeroed(capacity * ROUTED_TOP_K * MOE_BLOCK_SIZE)?,
-            expert_ids: DeviceBuffer::zeroed(capacity * ROUTED_TOP_K)?,
+            locks: DeviceBuffer::zeroed(capacity * self.top_k * (self.gate_up / 128))?,
+            sorted_token_ids: DeviceBuffer::zeroed(capacity * self.top_k * MOE_BLOCK_SIZE)?,
+            expert_ids: DeviceBuffer::zeroed(capacity * self.top_k)?,
             num_tokens_past_padded: DeviceBuffer::zeroed(1)?,
         })
     }
@@ -353,17 +386,17 @@ impl MarlinNvfp4GateUp {
         stream: &CudaStream,
     ) -> Result<()> {
         let batch = workspace.capacity;
-        if indices.len() != batch * ROUTED_TOP_K
+        if indices.len() != batch * self.top_k
             || input.len() != batch * self.hidden
-            || output.len() != batch * ROUTED_TOP_K * self.gate_up
+            || output.len() != batch * self.top_k * self.gate_up
         {
             return Err(Error::Shape {
                 label: "Marlin batched gate/up buffers",
                 expected: format!(
                     "indices={} input={} output={}",
-                    batch * ROUTED_TOP_K,
+                    batch * self.top_k,
                     batch * self.hidden,
-                    batch * ROUTED_TOP_K * self.gate_up
+                    batch * self.top_k * self.gate_up
                 ),
                 actual: format!(
                     "indices={} input={} output={}",
@@ -391,6 +424,7 @@ impl MarlinNvfp4GateUp {
                     workspace.expert_ids.ptr,
                     workspace.num_tokens_past_padded.ptr,
                     batch as u32,
+                    self.top_k as u32,
                     self.gate_up as u32,
                     self.hidden as u32,
                     stream.as_raw(),
@@ -421,7 +455,7 @@ impl MarlinNvfp4GateUp {
     ) -> Result<()> {
         if batch == 0
             || batch > workspace.capacity
-            || indices.len() < batch * ROUTED_TOP_K
+            || indices.len() < batch * self.top_k
             || input.len() < batch * self.hidden
         {
             return Err(Error::Shape {
@@ -429,7 +463,7 @@ impl MarlinNvfp4GateUp {
                 expected: format!(
                     "batch=1..={} indices>={} input>={}",
                     workspace.capacity,
-                    batch * ROUTED_TOP_K,
+                    batch * self.top_k,
                     batch * self.hidden
                 ),
                 actual: format!("indices={} input={}", indices.len(), input.len()),
@@ -453,6 +487,7 @@ impl MarlinNvfp4GateUp {
                     workspace.expert_ids.ptr,
                     workspace.num_tokens_past_padded.ptr,
                     batch as u32,
+                    self.top_k as u32,
                     self.gate_up as u32,
                     self.hidden as u32,
                     stream.as_raw(),
@@ -461,7 +496,7 @@ impl MarlinNvfp4GateUp {
         }
     }
 
-    /// Runs routed gate/up for one token and eight device-resident expert indices.
+    /// Runs routed gate/up for one token and the configured expert count.
     pub fn run_on_stream(
         &self,
         indices: &DeviceBuffer<u32>,
@@ -469,16 +504,17 @@ impl MarlinNvfp4GateUp {
         mut output: DeviceOutput<'_, f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        if indices.len() != ROUTED_TOP_K
+        if indices.len() != self.top_k
             || input.len() != self.hidden
-            || output.len() != ROUTED_TOP_K * self.gate_up
+            || output.len() != self.top_k * self.gate_up
         {
             return Err(Error::Shape {
                 label: "Marlin gate/up buffers",
                 expected: format!(
-                    "indices={ROUTED_TOP_K} input={} output={}",
+                    "indices={} input={} output={}",
+                    self.top_k,
                     self.hidden,
-                    ROUTED_TOP_K * self.gate_up
+                    self.top_k * self.gate_up
                 ),
                 actual: format!(
                     "indices={} input={} output={}",
@@ -505,6 +541,7 @@ impl MarlinNvfp4GateUp {
                     self.sorted_token_ids.ptr,
                     self.expert_ids.ptr,
                     self.num_tokens_past_padded.ptr,
+                    self.top_k as u32,
                     self.gate_up as u32,
                     self.hidden as u32,
                     stream.as_raw(),
@@ -521,10 +558,10 @@ impl MarlinNvfp4GateUp {
         input: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<&DeviceBuffer<u16>> {
-        if indices.len() != ROUTED_TOP_K || input.len() != self.hidden {
+        if indices.len() != self.top_k || input.len() != self.hidden {
             return Err(Error::Shape {
                 label: "Marlin BF16 gate/up buffers",
-                expected: format!("indices={ROUTED_TOP_K} input={}", self.hidden),
+                expected: format!("indices={} input={}", self.top_k, self.hidden),
                 actual: format!("indices={} input={}", indices.len(), input.len()),
             });
         }
@@ -545,6 +582,7 @@ impl MarlinNvfp4GateUp {
                     self.sorted_token_ids.ptr,
                     self.expert_ids.ptr,
                     self.num_tokens_past_padded.ptr,
+                    self.top_k as u32,
                     self.gate_up as u32,
                     self.hidden as u32,
                     stream.as_raw(),
@@ -959,6 +997,17 @@ fn validate_gate_up_shape(gate_up: usize, hidden: usize) -> Result<()> {
     Ok(())
 }
 
+fn validate_top_k(top_k: usize, experts: usize) -> Result<()> {
+    if top_k == 0 || top_k > experts || top_k > 256 || top_k > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "Marlin routed top-k",
+            expected: format!("1..={}", experts.min(256)),
+            actual: top_k.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_gate_up_device_support() -> Result<()> {
     if unsafe { ffi::infer_marlin_nvfp4_gate_up_supported() } == 0 {
         return Err(Error::Format {
@@ -1189,6 +1238,37 @@ mod tests {
         assert_eq!(repacked.packed_weight.len() * 4, weight.packed_weight.len());
         assert_eq!(repacked.weight_scale.len(), weight.weight_scale.len());
         assert!(repacked.global_scale.is_finite());
+    }
+
+    #[test]
+    fn marlin_top10_accepts_laguna_route_shape() {
+        const EXPERTS: usize = 10;
+        const TOP_K: usize = 10;
+        const GATE_UP: usize = 128;
+        const HIDDEN: usize = 128;
+        let weights = (0..EXPERTS)
+            .map(|expert| ModelOptNvfp4Linear {
+                prefix: format!("expert-{expert}"),
+                out_features: GATE_UP,
+                in_features: HIDDEN,
+                packed_weight: vec![0; GATE_UP * HIDDEN / 2],
+                weight_scale: vec![0x38; GATE_UP * HIDDEN / 16],
+                weight_scale_2: 1.0,
+                input_scale: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let plan = MarlinNvfp4GateUp::new_with_top_k(&weights, TOP_K).expect("top-10 plan");
+        assert_eq!(plan.top_k(), TOP_K);
+
+        let indices =
+            DeviceBuffer::from_host(&(0..TOP_K as u32).collect::<Vec<_>>()).expect("indices");
+        let input = DeviceBuffer::from_host(&vec![1.0f32; HIDDEN]).expect("input");
+        let mut output = DeviceBuffer::zeroed(TOP_K * GATE_UP).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        plan.run_on_stream(&indices, &input, output.output(), &stream)
+            .expect("run top-10");
+        let output = output.copy_to_host(&stream).expect("read output");
+        assert!(output.iter().all(|&value| value == 0.0));
     }
 
     #[test]

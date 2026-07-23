@@ -31,6 +31,7 @@ pub enum ArtifactKind {
     None,
     Qwen36Experts,
     Step37Experts,
+    LagunaExperts,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +68,20 @@ const CATALOGUE: &[ModelSpec] = &[
             served_model_name: "eider-agents-a1",
             max_context_tokens: 262_144,
             prefill_token_capacity: 2_048,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
+        id: "laguna-s-2.1",
+        repository: "poolside/Laguna-S-2.1-NVFP4",
+        revision: "07614121b31898586430f189d27a25a0be310843",
+        model_type: "laguna",
+        artifact_kind: ArtifactKind::LagunaExperts,
+        artifact_estimate_bytes: 20 << 30,
+        defaults: ServingDefaults {
+            served_model_name: "eider-laguna-s-2.1",
+            max_context_tokens: 262_144,
+            prefill_token_capacity: 128,
             step_expert_capacity: 240,
         },
     },
@@ -442,7 +457,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     let model_type = checkpoint_model_type(&checkpoint_dir)?;
     if !matches!(
         model_type.as_str(),
-        "qwen3_5_moe" | "step3p7" | "nemotron_h" | "nemotron_h_puzzle" | "gemma4"
+        "qwen3_5_moe" | "step3p7" | "nemotron_h" | "nemotron_h_puzzle" | "gemma4" | "laguna"
     ) {
         return Err(format!(
             "unsupported model_type {model_type:?} in {}",
@@ -464,6 +479,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
         preparation: match model_type.as_str() {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
             "step3p7" => ArtifactKind::Step37Experts,
+            "laguna" => ArtifactKind::LagunaExperts,
             _ => ArtifactKind::None,
         },
     })
@@ -568,6 +584,7 @@ fn artifact_dir(repository: &str, revision: &str, kind: ArtifactKind) -> Result<
         ArtifactKind::None => "none",
         ArtifactKind::Qwen36Experts => "qwen36-experts-v1",
         ArtifactKind::Step37Experts => "step37-experts-v1",
+        ArtifactKind::LagunaExperts => "laguna-experts-v1",
     };
     let root = xdg_cache_home()?;
     Ok(root
@@ -588,6 +605,7 @@ fn local_artifact_dir(checkpoint_dir: &Path, model_type: &str) -> Result<PathBuf
         match model_type {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
             "step3p7" => ArtifactKind::Step37Experts,
+            "laguna" => ArtifactKind::LagunaExperts,
             _ => ArtifactKind::None,
         },
     )
@@ -621,6 +639,14 @@ mod tests {
     }
 
     #[test]
+    fn catalogue_includes_pinned_laguna_checkpoint_and_artifacts() {
+        let model = catalogue_model("laguna-s-2.1").unwrap();
+        assert_eq!(model.model_type, "laguna");
+        assert_eq!(model.artifact_kind, ArtifactKind::LagunaExperts);
+        assert_eq!(model.revision, "07614121b31898586430f189d27a25a0be310843");
+    }
+
+    #[test]
     fn unknown_catalogue_model_lists_choices() {
         let error = catalogue_model("not-a-model").unwrap_err();
         assert!(error.contains("gemma-4-26b-a4b-nvfp4"));
@@ -647,6 +673,12 @@ mod tests {
                 .unwrap()
                 .artifact_estimate_bytes
                 >= 5 << 30
+        );
+        assert!(
+            catalogue_model("laguna-s-2.1")
+                .unwrap()
+                .artifact_estimate_bytes
+                >= 18 << 30
         );
     }
 
