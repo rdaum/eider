@@ -13,7 +13,8 @@ use nvfp4::{
     fill_f32_into_on_stream, indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
-    silu_mul_f32_into_on_stream, softplus_scale_heads_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, silu_mul_f32_into_on_stream,
+    softplus_scale_heads_f32_into_on_stream,
 };
 use serde::Deserialize;
 use std::f32::consts::PI;
@@ -21,6 +22,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::info;
+
+mod batch;
+pub use batch::{LagunaPrefillBatchWorkspace, LagunaPrefillRow};
 
 const HIDDEN: usize = 3_072;
 const LAYERS: usize = 48;
@@ -319,7 +323,8 @@ impl Bf16Linear {
         .map_err(|error| Error::Format {
             label: "Laguna BF16 linear execution",
             detail: format!("{} [{}, {}]: {error}", self.name, self.rows, self.cols),
-        })
+        })?;
+        round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -353,7 +358,8 @@ impl LagunaRmsNorm {
             output.output(),
             RMS_EPS,
             stream,
-        )
+        )?;
+        round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -505,12 +511,15 @@ impl LagunaMlp {
             HIDDEN,
             stream,
         )?;
+        round_f32_to_bf16_in_place_on_stream(workspace.gate.inout(), stream)?;
+        round_f32_to_bf16_in_place_on_stream(workspace.up.inout(), stream)?;
         silu_mul_f32_into_on_stream(
             &workspace.gate,
             &workspace.up,
             workspace.activated.output(),
             stream,
         )?;
+        round_f32_to_bf16_in_place_on_stream(workspace.activated.inout(), stream)?;
         self.down
             .run_into(&workspace.activated, &mut workspace.output, stream)?;
         Ok(&workspace.output)
@@ -651,6 +660,7 @@ impl LagunaAttention {
             self.rope_scale,
             stream,
         )?;
+        round_f32_to_bf16_in_place_on_stream(workspace.q_rope.inout(), stream)?;
         rope_neox_inv_freq_scaled_sequence_f32_into_on_stream(
             1,
             KV_HEADS,
@@ -663,6 +673,7 @@ impl LagunaAttention {
             self.rope_scale,
             stream,
         )?;
+        round_f32_to_bf16_in_place_on_stream(workspace.k_rope.inout(), stream)?;
         cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
         if let Some(window) = self.window {
             compact.attention_window_into_on_stream(
@@ -688,6 +699,7 @@ impl LagunaAttention {
             HEAD_DIM,
             stream,
         )?;
+        round_f32_to_bf16_in_place_on_stream(workspace.gated.inout(), stream)?;
         self.o
             .run_into(&workspace.gated, &mut workspace.output, stream)?;
         Ok(&workspace.output)
@@ -1625,6 +1637,12 @@ impl LagunaSequenceCheckpoint {
 mod tests {
     use super::*;
 
+    fn local_checkpoint() -> Option<(PathBuf, PathBuf)> {
+        let model_dir = std::env::var_os("LAGUNA_MODEL").map(PathBuf::from)?;
+        let artifact_dir = std::env::var_os("LAGUNA_ARTIFACT_DIR").map(PathBuf::from)?;
+        Some((model_dir, artifact_dir))
+    }
+
     #[test]
     fn official_config_is_accepted() {
         let model_dir =
@@ -1644,5 +1662,73 @@ mod tests {
         assert!((frequencies[0] - 1.0).abs() < 1.0e-7);
         assert!(frequencies.windows(2).all(|pair| pair[0] > pair[1]));
         assert!((frequencies[31] - 9.418_306_5e-8).abs() < 1.0e-12);
+    }
+
+    #[test]
+    #[ignore = "requires LAGUNA_MODEL and LAGUNA_ARTIFACT_DIR"]
+    fn local_batched_prefill_is_stable_across_chunks() {
+        let (model_dir, artifact_dir) =
+            local_checkpoint().expect("set LAGUNA_MODEL and LAGUNA_ARTIFACT_DIR");
+        let model =
+            LagunaModel::load_with_artifact_dir(model_dir, artifact_dir).expect("load Laguna");
+        batch::validate_initial_batch_layers(&model, 9707);
+        let prompt = [9707, 3710, 9707, 3710, 9707, 3710, 9707, 3710];
+        let final_token = 9707;
+        let mut batched = model.new_decode_state(32).expect("whole validation state");
+        let mut workspace = model
+            .new_prefill_batch_workspace(1, 128, 32)
+            .expect("batch validation workspace");
+        model
+            .prefill_batch(
+                &mut workspace,
+                &mut [LagunaPrefillRow {
+                    token_ids: &prompt,
+                    state: &mut batched,
+                }],
+            )
+            .expect("whole validation prefill");
+        let whole = model
+            .logits_one(&mut batched, final_token)
+            .expect("whole validation logits");
+
+        let mut split = model.new_decode_state(32).expect("split validation state");
+        for chunk in [&prompt[..3], &prompt[3..]] {
+            model
+                .prefill_batch(
+                    &mut workspace,
+                    &mut [LagunaPrefillRow {
+                        token_ids: chunk,
+                        state: &mut split,
+                    }],
+                )
+                .expect("split validation prefill");
+        }
+        let split = model
+            .logits_one(&mut split, final_token)
+            .expect("split validation logits");
+        let top = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .expect("non-empty logits")
+                .0
+        };
+        let squared_error = split
+            .iter()
+            .zip(&whole)
+            .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
+            .sum::<f64>();
+        let expected_norm = whole
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>();
+        let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
+        assert_eq!(
+            top(&split),
+            top(&whole),
+            "split batched prefill selected a different token; nrmse={nrmse:.6}"
+        );
+        assert!(nrmse <= 0.12, "split batched prefill nrmse={nrmse:.6}");
     }
 }

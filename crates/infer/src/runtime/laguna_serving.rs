@@ -9,11 +9,16 @@ use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::laguna::{LagunaDecodeState, LagunaModel, LagunaNextToken, LagunaSequenceCheckpoint};
+use crate::laguna::{
+    LagunaDecodeState, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace, LagunaPrefillRow,
+    LagunaSequenceCheckpoint,
+};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+const TAIL_PREFILL_TOKEN_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LagunaRequestId(u64);
@@ -101,6 +106,8 @@ pub struct LagunaChatService<'model, 'template> {
     requests: BTreeMap<LagunaRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
     prefix_cache: Option<PrefixCache<LagunaSequenceCheckpoint>>,
+    prefill_workspace: LagunaPrefillBatchWorkspace,
+    tail_prefill_workspace: Option<LagunaPrefillBatchWorkspace>,
 }
 
 impl<'model, 'template> LagunaChatService<'model, 'template> {
@@ -119,6 +126,20 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_workspace = model.new_prefill_batch_workspace(
+            config.prefill_sequence_capacity,
+            config.prefill_token_capacity,
+            config.max_context_tokens,
+        )?;
+        let tail_prefill_workspace = (config.prefill_token_capacity > TAIL_PREFILL_TOKEN_CAPACITY)
+            .then(|| {
+                model.new_prefill_batch_workspace(
+                    config.prefill_sequence_capacity,
+                    TAIL_PREFILL_TOKEN_CAPACITY,
+                    config.max_context_tokens,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             model,
             template,
@@ -129,6 +150,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             active_sequences: 0,
             prefix_cache: (prefix_cache.max_device_bytes != 0)
                 .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
+            prefill_workspace,
+            tail_prefill_workspace,
         })
     }
 
@@ -372,45 +395,105 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>,
         ),
     ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let mut budget = self.config.prefill_token_capacity;
+        let mut selected = Vec::with_capacity(ids.len());
         for (index, &id) in ids.iter().enumerate() {
             if budget == 0 {
                 break;
             }
-            let remaining_sequences = ids.len() - index;
-            let request = self.requests.get_mut(&id).expect("prefill request exists");
+            let request = self.requests.get(&id).expect("prefill request exists");
             let available = request.prompt.len() - request.prompt_position;
-            let chunk = available.min(budget.div_ceil(remaining_sequences));
+            let batchable = available.saturating_sub(1);
+            let remaining_sequences = ids.len() - index;
+            let chunk = batchable.min(budget.div_ceil(remaining_sequences));
             if chunk == 0 {
                 continue;
             }
             budget -= chunk;
-            on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
-            let end = request.prompt_position + chunk;
-            while request.prompt_position < end {
-                let token = request.prompt[request.prompt_position];
-                request.prompt_position += 1;
-                if request.prompt_position == request.prompt.len() {
-                    let sampled = if request.sampler.config().uses_fast_argmax() {
-                        sampled_from_top1(self.model.decode_one(
-                            request.state.as_mut().expect("prefill request is admitted"),
-                            token,
-                        )?)
-                    } else {
-                        let logits = self.model.logits_one(
-                            request.state.as_mut().expect("prefill request is admitted"),
-                            token,
-                        )?;
-                        request.sampler.sample(&logits, &request.history)?
-                    };
-                    request.pending_sample = Some(sampled);
-                } else {
-                    self.model.consume_one(
-                        request.state.as_mut().expect("prefill request is admitted"),
-                        token,
-                    )?;
+            selected.push((id, chunk));
+        }
+        if !selected.is_empty() {
+            let mut requests = selected
+                .iter()
+                .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
+                .collect::<Vec<_>>();
+            let result = {
+                let selected_tokens = selected.iter().map(|(_, chunk)| *chunk).sum::<usize>();
+                let workspace = self
+                    .tail_prefill_workspace
+                    .as_mut()
+                    .filter(|_| selected_tokens <= TAIL_PREFILL_TOKEN_CAPACITY)
+                    .unwrap_or(&mut self.prefill_workspace);
+                let mut rows = requests
+                    .iter_mut()
+                    .zip(selected.iter().map(|(_, chunk)| *chunk))
+                    .map(|(request, chunk)| {
+                        let start = request.prompt_position;
+                        LagunaPrefillRow {
+                            token_ids: &request.prompt[start..start + chunk],
+                            state: request.state.as_mut().expect("prefill request is admitted"),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for &(id, _) in &selected {
+                    on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
                 }
+                self.model
+                    .prefill_batch(workspace, &mut rows)
+                    .and_then(|()| self.model.synchronize())
+            };
+            if let Err(error) = result {
+                for (request, (id, _)) in requests.into_iter().zip(&selected) {
+                    self.requests.insert(*id, request);
+                }
+                return Err(error);
             }
+            for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
+                request.prompt_position += chunk;
+                if checkpoint_ready(
+                    request.prompt_position,
+                    request.prefix_cache_target,
+                    request.prefix_cache_checkpointed,
+                ) {
+                    Self::retain_request_checkpoint(
+                        self.model,
+                        &mut self.prefix_cache,
+                        &mut request,
+                    );
+                }
+                tick.prefilled.push(LagunaPrefillProgress {
+                    request_id: id,
+                    prompt_position: request.prompt_position,
+                });
+                self.requests.insert(id, request);
+            }
+            return Ok(());
+        }
+
+        for &id in ids {
+            let request = self.requests.get_mut(&id).expect("prefill request exists");
+            if request.prompt_position + 1 != request.prompt.len() {
+                continue;
+            }
+            on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
+            let token = request.prompt[request.prompt_position];
+            request.prompt_position += 1;
+            let sampled = if request.sampler.config().uses_fast_argmax() {
+                sampled_from_top1(self.model.decode_one(
+                    request.state.as_mut().expect("prefill request is admitted"),
+                    token,
+                )?)
+            } else {
+                let logits = self.model.logits_one(
+                    request.state.as_mut().expect("prefill request is admitted"),
+                    token,
+                )?;
+                request.sampler.sample(&logits, &request.history)?
+            };
+            request.pending_sample = Some(sampled);
             self.model.synchronize()?;
             if checkpoint_ready(
                 request.prompt_position,

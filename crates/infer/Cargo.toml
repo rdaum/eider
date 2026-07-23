@@ -47,5 +47,9 @@ name = "step37_prefill"
 harness = false
 
 [[bench]]
+name = "laguna_prefill"
+harness = false
+
+[[bench]]
 name = "nemotron3_speculative_decode"
 harness = false

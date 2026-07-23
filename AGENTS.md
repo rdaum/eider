@@ -41,6 +41,7 @@ are not required for normal runs.
 cargo bench -p nvfp4 --bench marlin_routed_gate_up
 cargo bench -p infer --bench qwen36_prefill
 cargo bench -p infer --bench step37_prefill
+cargo bench -p infer --bench laguna_prefill
 cargo bench -p nvfp4 --bench gemma4_prefill_attention
 cargo bench -p nvfp4 --bench nemotron3_dense_linear
 ```

@@ -92,6 +92,7 @@ throughput run has not been completed.
 | [Qwen3.6-35B-A3B](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | 72.7 | 77.0 | NVFP4 weights; compact FP4 KV in Eider, BF16 KV in vLLM |
 | [Agents-A1](https://internscience.github.io/Agents-A1/) | 63.6 | 37.2 | Eider FP8-converted attention and LM head; checkpoint-native vLLM |
 | [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | 20.4 | — | 240 of 288 routed experts resident per layer |
+| [Laguna-S-2.1](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | 16.2 | — | Resident NVFP4 experts; compact FP4 KV cache |
 | [Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | 30.1 | 29.6 | Same ModelOpt NVFP4 weights; compact FP4 KV in Eider, FP8 E4M3 KV in vLLM |
 | [Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | — | — | Throughput comparison pending |
 
@@ -99,6 +100,7 @@ Gemma prefills a fresh roughly 2,700-token Pi/API prompt at about 6,740 prompt
 tokens/sec, compared with about 7,060 in vLLM. Prefix reuse brought a typical
 follow-up to 235 ms TTFT. An Agents-A1 Pi session sustained 58-60 decode
 tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
+Laguna prefills a fresh 2,549-token API prompt at about 120 prompt tokens/sec.
 
 Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
 its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5
