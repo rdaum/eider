@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use crate::cuda::check_cuda;
-use crate::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, Result};
+use crate::{CudaStream, DeviceBuffer, DeviceOutput, MoeSortedRoutes, PinnedHostBuffer, Result};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -1248,6 +1248,72 @@ pub fn moe_silu_quantize_bf16_slots_on_stream(
     }
 }
 
+/// Sorts routed BF16 gate/up rows by expert while quantizing them into native
+/// SM12x activation tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_bf16_sorted_slots_on_stream(
+    routes: &MoeSortedRoutes,
+    indices: &DeviceBuffer<u32>,
+    gate_up_bf16: &DeviceBuffer<u16>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    input_scale_table: &DeviceBuffer<f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k_tiles = rows / 64;
+    if rows == 0
+        || !rows.is_multiple_of(64)
+        || groups == 0
+        || routes.sorted_routes().len() < groups
+        || routes.sorted_experts().len() < groups
+        || indices.len() < groups
+        || gate_up_bf16.len() < groups * rows * 2
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || input_scale_table.is_empty()
+        || gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x sorted MoE BF16 SiLU quantize slots",
+            expected:
+                "rows multiple of 64 and matching sorted routes, BF16 gate/up, native tiles, and scales"
+                    .to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} routes={} experts={} indices={} gate_up={} B={} SFB={}",
+                routes.sorted_routes().len(),
+                routes.sorted_experts().len(),
+                indices.len(),
+                gate_up_bf16.len(),
+                b_native_tiles.len(),
+                sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_moe_silu_quantize_bf16_sorted_slots_on_stream",
+            crate::ffi::infer_sm12x_moe_silu_quantize_bf16_sorted_slots_on_stream(
+                indices.as_const_ptr().cast(),
+                routes.sorted_routes().as_const_ptr().cast(),
+                routes.sorted_experts().as_const_ptr().cast(),
+                gate_up_bf16.as_const_ptr().cast(),
+                b_native_tiles.as_mut_ptr().cast(),
+                sfb.as_mut_ptr().cast(),
+                input_scale_table.as_const_ptr().cast(),
+                gate_up_alpha_table.as_const_ptr().cast(),
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Runs the retained serial implementation used to validate and benchmark the
 /// parallel SM12x routed activation quantizer.
 #[allow(clippy::too_many_arguments)]
@@ -2020,6 +2086,7 @@ pub(crate) fn native_gemv_on_stream(
 mod tests {
     use super::*;
     use crate::F32Matrix;
+    use crate::format::f32_to_bf16;
 
     #[test]
     fn sm12x_mma_zero_probe_runs() {
@@ -2403,6 +2470,93 @@ mod tests {
                     actual[row]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sorted_bf16_moe_quantization_is_an_exact_permutation() {
+        const ROWS: usize = 128;
+        const GROUPS: usize = 8;
+        const EXPERTS: usize = 4;
+        let indices = DeviceBuffer::from_host(&[3u32, 1, 3, 0, 1, 2, 3, 2]).expect("route indices");
+        let gate_up = (0..GROUPS * ROWS * 2)
+            .map(|index| {
+                let route = index / (ROWS * 2);
+                let feature = index % (ROWS * 2);
+                f32_to_bf16((((feature * (route + 5) + route * 11) % 101) as f32 - 50.0) * 0.03125)
+            })
+            .collect::<Vec<_>>();
+        let gate_up = DeviceBuffer::from_host(&gate_up).expect("gate/up");
+        let input_scales =
+            DeviceBuffer::from_host(&[0.5f32, 0.75, 1.0, 1.25]).expect("input scales");
+        let gate_up_alphas =
+            DeviceBuffer::from_host(&[0.875f32, 1.0, 1.125, 1.25]).expect("gate/up alphas");
+        let tiles_per_route = ROWS / 64 * TILE_BYTES;
+        let scales_per_route = ROWS / 64;
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut unsorted_tiles =
+            DeviceBuffer::zeroed(GROUPS * tiles_per_route).expect("unsorted tiles");
+        let mut unsorted_scales =
+            DeviceBuffer::zeroed(GROUPS * scales_per_route).expect("unsorted scales");
+        moe_silu_quantize_bf16_slots_on_stream(
+            &indices,
+            &gate_up,
+            &mut unsorted_tiles,
+            &mut unsorted_scales,
+            &input_scales,
+            &gate_up_alphas,
+            ROWS,
+            GROUPS,
+            &stream,
+        )
+        .expect("unsorted quantization");
+
+        let mut routes = MoeSortedRoutes::new(GROUPS, EXPERTS).expect("route ordering");
+        routes
+            .sort_on_stream(&indices, &stream)
+            .expect("sort routes");
+        let mut sorted_tiles =
+            DeviceBuffer::zeroed(GROUPS * tiles_per_route).expect("sorted tiles");
+        let mut sorted_scales =
+            DeviceBuffer::zeroed(GROUPS * scales_per_route).expect("sorted scales");
+        moe_silu_quantize_bf16_sorted_slots_on_stream(
+            &routes,
+            &indices,
+            &gate_up,
+            &mut sorted_tiles,
+            &mut sorted_scales,
+            &input_scales,
+            &gate_up_alphas,
+            ROWS,
+            GROUPS,
+            &stream,
+        )
+        .expect("sorted quantization");
+
+        let route_order = routes
+            .sorted_routes()
+            .copy_to_host(&stream)
+            .expect("route order");
+        let unsorted_tiles = unsorted_tiles
+            .copy_to_host(&stream)
+            .expect("unsorted tiles");
+        let unsorted_scales = unsorted_scales
+            .copy_to_host(&stream)
+            .expect("unsorted scales");
+        let sorted_tiles = sorted_tiles.copy_to_host(&stream).expect("sorted tiles");
+        let sorted_scales = sorted_scales.copy_to_host(&stream).expect("sorted scales");
+        for (sorted, &route) in route_order.iter().enumerate() {
+            let route = route as usize;
+            assert_eq!(
+                &sorted_tiles[sorted * tiles_per_route..(sorted + 1) * tiles_per_route],
+                &unsorted_tiles[route * tiles_per_route..(route + 1) * tiles_per_route],
+                "tile mismatch for sorted slot {sorted} from route {route}"
+            );
+            assert_eq!(
+                &sorted_scales[sorted * scales_per_route..(sorted + 1) * scales_per_route],
+                &unsorted_scales[route * scales_per_route..(route + 1) * scales_per_route],
+                "scale mismatch for sorted slot {sorted} from route {route}"
+            );
         }
     }
 

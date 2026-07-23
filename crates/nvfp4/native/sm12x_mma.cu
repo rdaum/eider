@@ -2479,6 +2479,8 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_reference_on_stream(
 template <bool Bf16Input>
 __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
     const std::uint32_t* __restrict__ indices,
+    const std::uint32_t* __restrict__ sorted_routes,
+    const std::uint32_t* __restrict__ sorted_experts,
     const float* const* __restrict__ gate_up_table,
     const std::uint16_t* __restrict__ gate_up_bf16,
     std::uint8_t* __restrict__ b_native_tiles,
@@ -2503,11 +2505,13 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
         tile[idx] = 0;
     }
 
-    const std::uint32_t expert = indices[slot];
+    const std::uint32_t route = sorted_routes == nullptr ? slot : sorted_routes[slot];
+    const std::uint32_t expert =
+        sorted_experts == nullptr ? indices[route] : sorted_experts[slot];
     const float input_scale = input_scale_table[expert];
     if (input_scale <= 0.0f || !isfinite(input_scale)) return;
     const float gate_up_alpha = gate_up_alpha_table[expert];
-    const float* gate_up = Bf16Input ? nullptr : gate_up_table[slot];
+    const float* gate_up = Bf16Input ? nullptr : gate_up_table[route];
     const int scale_group = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
 
@@ -2515,7 +2519,7 @@ __global__ void infer_sm12x_moe_silu_quantize_slots_kernel(
     if (lane < 16) {
         const std::uint32_t row = kt * 64 + scale_group * 16 + lane;
         if (row < rows) {
-            const std::uint32_t base = slot * rows * 2;
+            const std::uint32_t base = route * rows * 2;
             const float gate_value = (Bf16Input
                     ? __bfloat162float(__ushort_as_bfloat16(gate_up_bf16[base + row]))
                     : gate_up[row]) * gate_up_alpha;
@@ -2583,7 +2587,9 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_slots_on_stream(
         return cudaErrorInvalidValue;
     }
     const std::uint32_t k_tiles = rows / 64;
-    infer_sm12x_moe_silu_quantize_slots_kernel<false><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, gate_up_table, nullptr, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    infer_sm12x_moe_silu_quantize_slots_kernel<false><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(
+        indices, nullptr, nullptr, gate_up_table, nullptr, b_native_tiles, sfb,
+        input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
     return cudaGetLastError();
 }
 
@@ -2748,7 +2754,37 @@ extern "C" cudaError_t infer_sm12x_moe_silu_quantize_bf16_slots_on_stream(
         return cudaErrorInvalidValue;
     }
     const std::uint32_t k_tiles = rows / 64;
-    infer_sm12x_moe_silu_quantize_slots_kernel<true><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(indices, nullptr, gate_up_bf16, b_native_tiles, sfb, input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    infer_sm12x_moe_silu_quantize_slots_kernel<true><<<dim3(groups, k_tiles, 1), 128, 0, stream>>>(
+        indices, nullptr, nullptr, nullptr, gate_up_bf16, b_native_tiles, sfb,
+        input_scale_table, gate_up_alpha_table, rows, k_tiles, groups);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_moe_silu_quantize_bf16_sorted_slots_on_stream(
+    const std::uint32_t* indices,
+    const std::uint32_t* sorted_routes,
+    const std::uint32_t* sorted_experts,
+    const std::uint16_t* gate_up_bf16,
+    std::uint8_t* b_native_tiles,
+    std::uint32_t* sfb,
+    const float* input_scale_table,
+    const float* gate_up_alpha_table,
+    std::uint32_t rows,
+    std::uint32_t groups,
+    cudaStream_t stream)
+{
+    if (indices == nullptr || sorted_routes == nullptr || sorted_experts == nullptr ||
+        gate_up_bf16 == nullptr || b_native_tiles == nullptr || sfb == nullptr ||
+        input_scale_table == nullptr || gate_up_alpha_table == nullptr ||
+        rows == 0 || groups == 0 || (rows % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t k_tiles = rows / 64;
+    infer_sm12x_moe_silu_quantize_slots_kernel<true><<<
+        dim3(groups, k_tiles, 1), 128, 0, stream>>>(
+        indices, sorted_routes, sorted_experts, nullptr, gate_up_bf16,
+        b_native_tiles, sfb, input_scale_table, gate_up_alpha_table,
+        rows, k_tiles, groups);
     return cudaGetLastError();
 }
 

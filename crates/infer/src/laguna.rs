@@ -13,8 +13,8 @@ use nvfp4::{
     fill_f32_into_on_stream, indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
-    round_f32_to_bf16_in_place_on_stream, silu_mul_f32_into_on_stream,
-    softplus_scale_heads_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
+    silu_mul_f32_into_on_stream, softplus_scale_heads_f32_into_on_stream,
 };
 use serde::Deserialize;
 use std::f32::consts::PI;
@@ -359,7 +359,7 @@ impl LagunaRmsNorm {
             RMS_EPS,
             stream,
         )?;
-        round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
+        round_f32_to_bf16_prefix_in_place_on_stream(output.inout(), rows * self.cols, stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -1730,5 +1730,57 @@ mod tests {
             "split batched prefill selected a different token; nrmse={nrmse:.6}"
         );
         assert!(nrmse <= 0.12, "split batched prefill nrmse={nrmse:.6}");
+
+        let prompt = (0usize..64)
+            .map(|index| if index.is_multiple_of(2) { 9707 } else { 3710 })
+            .collect::<Vec<_>>();
+        let mut tensor_core_workspace = model
+            .new_prefill_batch_workspace(1, 128, 96)
+            .expect("tensor-core validation workspace");
+        let mut whole_state = model.new_decode_state(96).expect("whole tensor-core state");
+        model
+            .prefill_batch(
+                &mut tensor_core_workspace,
+                &mut [LagunaPrefillRow {
+                    token_ids: &prompt,
+                    state: &mut whole_state,
+                }],
+            )
+            .expect("whole tensor-core prefill");
+        let whole = model
+            .logits_one(&mut whole_state, final_token)
+            .expect("whole tensor-core logits");
+
+        let mut split_state = model.new_decode_state(96).expect("split tensor-core state");
+        for chunk in prompt.chunks(32) {
+            model
+                .prefill_batch(
+                    &mut tensor_core_workspace,
+                    &mut [LagunaPrefillRow {
+                        token_ids: chunk,
+                        state: &mut split_state,
+                    }],
+                )
+                .expect("split tensor-core prefill");
+        }
+        let split = model
+            .logits_one(&mut split_state, final_token)
+            .expect("split tensor-core logits");
+        let squared_error = split
+            .iter()
+            .zip(&whole)
+            .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
+            .sum::<f64>();
+        let expected_norm = whole
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>();
+        let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
+        assert_eq!(
+            top(&split),
+            top(&whole),
+            "split tensor-core prefill selected a different token; nrmse={nrmse:.6}"
+        );
+        assert!(nrmse <= 0.12, "split tensor-core prefill nrmse={nrmse:.6}");
     }
 }

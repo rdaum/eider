@@ -100,7 +100,8 @@ Gemma prefills a fresh roughly 2,700-token Pi/API prompt at about 6,740 prompt
 tokens/sec, compared with about 7,060 in vLLM. Prefix reuse brought a typical
 follow-up to 235 ms TTFT. An Agents-A1 Pi session sustained 58-60 decode
 tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
-Laguna prefills a fresh 2,549-token API prompt at about 120 prompt tokens/sec.
+Laguna prefills a fresh roughly 3,300-token API prompt at about 135 prompt
+tokens/sec.
 
 Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
 its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5

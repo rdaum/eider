@@ -482,7 +482,7 @@ pub fn rms_norm_rope_neox_f32_indexed_into_on_stream(
 pub fn silu_mul_f32_into_on_stream(
     gate: &DeviceBuffer<f32>,
     up: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     stream: &CudaStream,
 ) -> Result<()> {
     if gate.len() != up.len() || output.len() != gate.len() {
@@ -497,11 +497,32 @@ pub fn silu_mul_f32_into_on_stream(
             ),
         });
     }
-    if gate.is_empty() || gate.len() > u32::MAX as usize {
+    silu_mul_f32_prefix_into_on_stream(gate, up, output, gate.len(), stream)
+}
+
+/// Enqueues `silu(gate) * up` for an active prefix on `stream`.
+pub fn silu_mul_f32_prefix_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if len == 0
+        || len > u32::MAX as usize
+        || gate.len() < len
+        || up.len() < len
+        || output.len() < len
+    {
         return Err(Error::Shape {
-            label: "SiLU multiply",
-            expected: "1..=u32::MAX values".to_string(),
-            actual: format!("{} values", gate.len()),
+            label: "SiLU multiply prefix",
+            expected: format!("gate/up/output at least {len} values"),
+            actual: format!(
+                "gate={} up={} output={} active={len}",
+                gate.len(),
+                up.len(),
+                output.len()
+            ),
         });
     }
 
@@ -512,7 +533,7 @@ pub fn silu_mul_f32_into_on_stream(
                 gate.ptr,
                 up.ptr,
                 output.buffer_mut().ptr,
-                gate.len() as u32,
+                len as u32,
                 stream.as_raw(),
             ),
         )
@@ -777,15 +798,26 @@ pub fn silu_mul_halves_clamped_f32_batch_into_on_stream(
 
 #[allow(missing_docs)]
 pub fn fill_f32_into_on_stream(
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     value: f32,
     stream: &CudaStream,
 ) -> Result<()> {
-    if output.is_empty() || output.len() > u32::MAX as usize || !value.is_finite() {
+    let len = output.len();
+    fill_f32_prefix_into_on_stream(output, value, len, stream)
+}
+
+/// Fills an active prefix of an F32 buffer on `stream`.
+pub fn fill_f32_prefix_into_on_stream(
+    mut output: DeviceOutput<'_, f32>,
+    value: f32,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if len == 0 || len > u32::MAX as usize || output.len() < len || !value.is_finite() {
         return Err(Error::Shape {
-            label: "fill f32",
-            expected: "non-empty u32-sized output and finite value".to_string(),
-            actual: format!("len={} value={value}", output.len()),
+            label: "fill f32 prefix",
+            expected: format!("output at least {len} values and finite value"),
+            actual: format!("output={} active={len} value={value}", output.len()),
         });
     }
     unsafe {
@@ -794,7 +826,7 @@ pub fn fill_f32_into_on_stream(
             ffi::infer_fill_f32_on_stream(
                 output.buffer_mut().ptr,
                 value,
-                output.len() as u32,
+                len as u32,
                 stream.as_raw(),
             ),
         )
@@ -968,22 +1000,43 @@ pub fn sigmoid_scale_heads_f32_into_on_stream(
 pub fn softplus_scale_heads_f32_into_on_stream(
     gate: &DeviceBuffer<f32>,
     input: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     head_dim: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    if gate.is_empty()
+    softplus_scale_heads_f32_prefix_into_on_stream(
+        gate,
+        input,
+        output,
+        head_dim,
+        gate.len(),
+        stream,
+    )
+}
+
+/// Broadcasts an active prefix of softplus head gates across head dimensions.
+pub fn softplus_scale_heads_f32_prefix_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    head_dim: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = heads.saturating_mul(head_dim);
+    if heads == 0
         || head_dim == 0
-        || input.len() != gate.len() * head_dim
-        || output.len() != input.len()
-        || gate.len() > u32::MAX as usize
+        || heads > u32::MAX as usize
         || head_dim > u32::MAX as usize
+        || gate.len() < heads
+        || input.len() < values
+        || output.len() < values
     {
         return Err(Error::Shape {
-            label: "softplus head-gate buffers",
-            expected: "input/output=heads*head_dim with one gate per head".to_string(),
+            label: "softplus head-gate prefix buffers",
+            expected: format!("gate>={heads} input/output>={values}"),
             actual: format!(
-                "gate={} input={} output={} head_dim={head_dim}",
+                "gate={} input={} output={} heads={heads} head_dim={head_dim}",
                 gate.len(),
                 input.len(),
                 output.len()
@@ -997,7 +1050,7 @@ pub fn softplus_scale_heads_f32_into_on_stream(
                 gate.ptr,
                 input.ptr,
                 output.buffer_mut().ptr,
-                gate.len() as u32,
+                heads as u32,
                 head_dim as u32,
                 stream.as_raw(),
             ),
@@ -1457,7 +1510,7 @@ pub fn nemotron3_sigmoid_topk_f32_batch_into_on_stream(
     if rows == 0
         || experts == 0
         || experts > 512
-        || logits.len() != logits_len
+        || logits.len() < logits_len
         || k == 0
         || k > experts
         || groups == 0
@@ -1465,8 +1518,8 @@ pub fn nemotron3_sigmoid_topk_f32_batch_into_on_stream(
         || !experts.is_multiple_of(groups)
         || topk_groups == 0
         || topk_groups > groups
-        || out_indices.len() != routes
-        || out_weights.len() != routes
+        || out_indices.len() < routes
+        || out_weights.len() < routes
         || rows > u32::MAX as usize
         || !scaling_factor.is_finite()
     {
@@ -2630,6 +2683,69 @@ pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
                 output.buffer_mut().ptr,
                 rows as u32,
                 len as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Writes weighted row sums from expert-major F32 route outputs.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+    routes: &MoeSortedRoutes,
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    sorted_inputs: &DeviceBuffer<*const f32>,
+    alpha_table: &DeviceBuffer<f32>,
+    mut output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let route_count = rows.saturating_mul(groups);
+    if rows == 0
+        || groups == 0
+        || features == 0
+        || output.len() < rows.saturating_mul(features)
+        || routes.route_to_sorted().len() < route_count
+        || indices.len() < route_count
+        || route_weights.len() < route_count
+        || sorted_inputs.len() < route_count
+        || alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || features > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "sorted batched MoE weighted slot accumulate",
+            expected: format!(
+                "output={rows}xnonzero routes={route_count} matching ordering/indices/weights/inputs"
+            ),
+            actual: format!(
+                "output={} ordering={} indices={} weights={} inputs={} alphas={}",
+                output.len(),
+                routes.route_to_sorted().len(),
+                indices.len(),
+                route_weights.len(),
+                sorted_inputs.len(),
+                alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_moe_weighted_accumulate_sorted_slots_f32_batch_on_stream",
+            ffi::infer_moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+                routes.route_to_sorted.ptr,
+                indices.ptr,
+                route_weights.ptr,
+                sorted_inputs.ptr,
+                alpha_table.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                features as u32,
                 groups as u32,
                 stream.as_raw(),
             ),
@@ -10730,6 +10846,52 @@ mod tests {
             assert!((actual - expected).abs() < 1.0e-6);
         }
         assert_eq!(&actual[3..], [99.0, 99.0]);
+        let untouched_active_value = actual[2];
+        drop(actual);
+
+        fill_f32_prefix_into_on_stream(output.output(), -7.0, 2, &stream).expect("prefix fill");
+        assert_eq!(
+            output
+                .copy_to_host(&stream)
+                .expect("fill output")
+                .as_slice(),
+            [-7.0, -7.0, untouched_active_value, 99.0, 99.0]
+        );
+
+        silu_mul_f32_prefix_into_on_stream(&left, &right, output.output(), 3, &stream)
+            .expect("prefix SiLU multiply");
+        let actual = output.copy_to_host(&stream).expect("SiLU output");
+        for (actual, (gate, input)) in actual[..3].iter().zip(
+            left.copy_to_host(&stream).expect("left copy")[..3]
+                .iter()
+                .zip(right.copy_to_host(&stream).expect("right copy")[..3].iter()),
+        ) {
+            let expected = gate / (1.0 + (-gate).exp()) * input;
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert_eq!(&actual[3..], [99.0, 99.0]);
+
+        let gates = DeviceBuffer::from_host(&[-1.0f32, 2.0, 8.0]).expect("head gates");
+        let values =
+            DeviceBuffer::from_host(&[0.25f32, 0.5, 0.75, 1.0, 1.25, 1.5]).expect("head values");
+        let mut scaled = DeviceBuffer::from_host(&[99.0f32; 6]).expect("scaled output");
+        softplus_scale_heads_f32_prefix_into_on_stream(
+            &gates,
+            &values,
+            scaled.output(),
+            2,
+            2,
+            &stream,
+        )
+        .expect("prefix softplus head scale");
+        let actual = scaled.copy_to_host(&stream).expect("softplus output");
+        let values = values.copy_to_host(&stream).expect("values copy");
+        for index in 0..4 {
+            let gate = [-1.0f32, 2.0][index / 2];
+            let softplus = (1.0 + (-gate.abs()).exp()).ln() + gate.max(0.0);
+            assert!((actual[index] - values[index] * softplus).abs() < 1.0e-6);
+        }
+        assert_eq!(&actual[4..], [99.0, 99.0]);
     }
 
     #[test]
@@ -13234,6 +13396,93 @@ mod tests {
                 &format!("batched route accumulation row {row}"),
             );
         }
+    }
+
+    #[test]
+    fn sorted_f32_moe_accumulation_matches_route_order() {
+        const ROWS: usize = 3;
+        const GROUPS: usize = 4;
+        const LEN: usize = 19;
+        let indices = [2u32, 0, 3, 1, 1, 3, 0, 2, 3, 2, 1, 0];
+        let weights = [
+            0.4f32, 0.3, 0.2, 0.1, 0.35, 0.3, 0.2, 0.15, 0.5, 0.25, 0.15, 0.1,
+        ];
+        let alphas = [0.75f32, 1.0, 1.25, 0.875];
+        let routed = (0..ROWS * GROUPS)
+            .map(|route| {
+                DeviceBuffer::from_host(
+                    &(0..LEN)
+                        .map(|column| {
+                            (((column * 7 + route * 11) % 101) as f32 - 50.0) * 0.00390625
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .expect("routed output")
+            })
+            .collect::<Vec<_>>();
+        let indices_device = DeviceBuffer::from_host(&indices).expect("indices");
+        let weights_device = DeviceBuffer::from_host(&weights).expect("weights");
+        let alphas_device = DeviceBuffer::from_host(&alphas).expect("alphas");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut routes = MoeSortedRoutes::new(ROWS * GROUPS, alphas.len()).expect("route ordering");
+        routes
+            .sort_on_stream(&indices_device, &stream)
+            .expect("sort routes");
+        let sorted_routes = routes
+            .sorted_routes()
+            .copy_to_host(&stream)
+            .expect("sorted routes");
+        let sorted_ptrs = DeviceBuffer::from_host(
+            &sorted_routes
+                .iter()
+                .map(|&route| routed[route as usize].as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("sorted routed pointers");
+        let unsorted_ptrs = DeviceBuffer::from_host(
+            &routed
+                .iter()
+                .map(|values| values.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("unsorted routed pointers");
+        let mut expected = DeviceBuffer::zeroed(ROWS * LEN).expect("reference output");
+        moe_weighted_accumulate_slots_f32_batch_on_stream(
+            &indices_device,
+            &weights_device,
+            &unsorted_ptrs,
+            &alphas_device,
+            expected.inout(),
+            ROWS,
+            GROUPS,
+            &stream,
+        )
+        .expect("route-order accumulation");
+        let mut actual = DeviceBuffer::zeroed(ROWS * LEN).expect("sorted output");
+        moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+            &routes,
+            &indices_device,
+            &weights_device,
+            &sorted_ptrs,
+            &alphas_device,
+            actual.inout(),
+            ROWS,
+            GROUPS,
+            LEN,
+            &stream,
+        )
+        .expect("sorted accumulation");
+
+        assert_eq!(
+            actual
+                .copy_to_host(&stream)
+                .expect("sorted output download")
+                .as_ref(),
+            expected
+                .copy_to_host(&stream)
+                .expect("reference output download")
+                .as_ref()
+        );
     }
 
     #[test]

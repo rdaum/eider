@@ -3414,6 +3414,58 @@ extern "C" cudaError_t infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_moe_weighted_accumulate_sorted_slots_f32_batch_kernel(
+    const std::uint32_t* route_to_sorted,
+    const std::uint32_t* indices,
+    const float* route_weights,
+    const float* const* sorted_inputs,
+    const float* alpha_table,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t len,
+    std::uint32_t groups) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = rows * len;
+    if (idx >= total) return;
+    const std::uint32_t row = idx / len;
+    const std::uint32_t col = idx % len;
+    const std::uint32_t route_begin = row * groups;
+    float sum = 0.0f;
+    for (std::uint32_t slot = 0; slot < groups; ++slot) {
+        const std::uint32_t route = route_begin + slot;
+        const std::uint32_t sorted = route_to_sorted[route];
+        const std::uint32_t expert = indices[route];
+        sum += sorted_inputs[sorted][col] * route_weights[route] * alpha_table[expert];
+    }
+    output[idx] = sum;
+}
+
+extern "C" cudaError_t infer_moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+    const std::uint32_t* route_to_sorted,
+    const std::uint32_t* indices,
+    const float* route_weights,
+    const float* const* sorted_inputs,
+    const float* alpha_table,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t len,
+    std::uint32_t groups,
+    cudaStream_t stream) {
+    if (route_to_sorted == nullptr || indices == nullptr || route_weights == nullptr ||
+        sorted_inputs == nullptr || alpha_table == nullptr || output == nullptr ||
+        rows == 0 || len == 0 || groups == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t total = rows * len;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_moe_weighted_accumulate_sorted_slots_f32_batch_kernel<<<
+        blocks, kThreads, 0, stream>>>(
+        route_to_sorted, indices, route_weights, sorted_inputs, alpha_table,
+        output, rows, len, groups);
+    return cudaGetLastError();
+}
+
 __global__ void infer_moe_weighted_accumulate_sorted_bf16_batch_kernel(
     const std::uint32_t* route_to_sorted,
     const float* route_weights,

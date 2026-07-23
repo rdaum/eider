@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-const TOKEN_CAPACITY: usize = 128;
+const TOKEN_CAPACITY: usize = 256;
 const VALIDATION_TOKENS: usize = 8;
-const MAX_CONTEXT_TOKENS: usize = 256;
+const MAX_CONTEXT_TOKENS: usize = 512;
 const REVISION: &str = "07614121b31898586430f189d27a25a0be310843";
 
 struct PrefillCase {

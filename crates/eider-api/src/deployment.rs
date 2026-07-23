@@ -81,7 +81,7 @@ const CATALOGUE: &[ModelSpec] = &[
         defaults: ServingDefaults {
             served_model_name: "eider-laguna-s-2.1",
             max_context_tokens: 262_144,
-            prefill_token_capacity: 128,
+            prefill_token_capacity: 256,
             step_expert_capacity: 240,
         },
     },

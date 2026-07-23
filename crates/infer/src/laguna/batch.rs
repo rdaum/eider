@@ -1,14 +1,24 @@
 use super::*;
 use nvfp4::{
-    Bf16TnMatmulPlan, CublasLt, GemmShape, MarlinNvfp4GateUpBatchWorkspace,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, f32_to_bf16_into_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_weighted_accumulate_slots_f32_batch_on_stream,
+    Bf16TnMatmulPlan, CublasLt, GemmShape, MarlinNvfp4GateUpBatchWorkspace, MoeSortedRoutes,
+    add_f32_prefix_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
+    fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_sorted_slots_on_stream,
+    moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
+    pack_token_heads_bf16_at_offset_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream,
+    round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_prefix_into_on_stream,
+    softplus_scale_heads_f32_prefix_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,
 };
 use std::collections::HashMap;
+use std::mem::size_of;
 
 const CUBLAS_WORKSPACE_LIMIT: u64 = 32 << 20;
+const PREFILL_ATTENTION_WORKSPACE_LIMIT: u64 = 4 << 20;
+const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 << 20;
+const ATTENTION_QUERY_TILE_ROWS: usize = 256;
+const TENSOR_CORE_ATTENTION_MIN_ROWS: usize = 32;
 const MAX_Q_HEADS: usize = 72;
 
 /// One ragged Laguna prompt chunk and its persistent sequence state.
@@ -53,9 +63,7 @@ impl LagunaBatchLinearWorkspace {
             expected: "rows * output features without overflow".to_string(),
             actual: format!("rows={rows} output_features={}", linear.rows),
         })?;
-        if input.len() != input_len
-            || output.len() != output_len
-            || input_len > self.input_bf16.len()
+        if input.len() < input_len || output.len() < output_len || input_len > self.input_bf16.len()
         {
             return Err(Error::Shape {
                 label: "Laguna prefill BF16 buffers",
@@ -68,7 +76,7 @@ impl LagunaBatchLinearWorkspace {
                 ),
             });
         }
-        f32_to_bf16_into_on_stream(input, self.input_bf16.output(), stream)?;
+        f32_to_bf16_prefix_into_on_stream(input, self.input_bf16.output(), input_len, stream)?;
         let key = (linear.rows, rows, linear.cols);
         if !self.plans.contains_key(&key) {
             self.plans.insert(
@@ -95,13 +103,14 @@ impl LagunaBatchLinearWorkspace {
                     linear.name, linear.rows, linear.cols
                 ),
             })?;
-        round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
+        round_f32_to_bf16_prefix_in_place_on_stream(output.inout(), output_len, stream)
     }
 }
 
 struct LagunaBatchAttentionWorkspace {
     q_heads: usize,
     compact: Sm12xKvAttentionWorkspace,
+    tensor_core: LagunaTensorCoreAttentionWorkspace,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -126,7 +135,13 @@ impl LagunaBatchAttentionWorkspace {
                 q_heads,
                 KV_HEADS,
                 HEAD_DIM,
-                8,
+                16,
+            )?,
+            tensor_core: LagunaTensorCoreAttentionWorkspace::new(
+                token_capacity,
+                q_heads,
+                KV_HEADS,
+                HEAD_DIM,
             )?,
             q: DeviceBuffer::zeroed(q_values)?,
             k: DeviceBuffer::zeroed(kv_values)?,
@@ -141,6 +156,221 @@ impl LagunaBatchAttentionWorkspace {
             output: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
         })
     }
+}
+
+struct LagunaTensorCoreAttentionWorkspace {
+    lt: CublasLt,
+    qk_plans: HashMap<(usize, usize), Bf16TnMatmulPlan>,
+    pv_plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
+    packed_query: DeviceBuffer<u16>,
+    packed_key: DeviceBuffer<u16>,
+    packed_value: DeviceBuffer<u16>,
+    scores: DeviceBuffer<f32>,
+    packed_probabilities: DeviceBuffer<u16>,
+    packed_output: DeviceBuffer<f32>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+impl LagunaTensorCoreAttentionWorkspace {
+    fn new(rows: usize, q_heads: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
+        let q_values = rows * q_heads * head_dim;
+        let kv_values = rows * kv_heads * head_dim;
+        Ok(Self {
+            lt: CublasLt::new()?,
+            qk_plans: HashMap::new(),
+            pv_plans: HashMap::new(),
+            packed_query: DeviceBuffer::zeroed(q_values)?,
+            packed_key: DeviceBuffer::zeroed(kv_values)?,
+            packed_value: DeviceBuffer::zeroed(kv_values)?,
+            scores: DeviceBuffer::zeroed(rows * q_heads * rows)?,
+            packed_probabilities: DeviceBuffer::zeroed(rows * q_heads * rows)?,
+            packed_output: DeviceBuffer::zeroed(q_values)?,
+            q_heads,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    fn tile_rows(&self, requested: usize, key_tokens: usize) -> usize {
+        let values_per_row = self.q_heads.saturating_mul(key_tokens).max(1);
+        let budget_rows = (ATTENTION_SCORE_BUDGET_BYTES / size_of::<f32>())
+            .checked_div(values_per_row)
+            .unwrap_or(0)
+            .max(1);
+        let rows = requested.min(budget_rows).min(ATTENTION_QUERY_TILE_ROWS);
+        if rows >= 16 { rows / 16 * 16 } else { rows }
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        query_rows: usize,
+        cache_tokens: usize,
+        score_key_tokens: usize,
+    ) -> Result<()> {
+        grow_device_buffer(
+            &mut self.packed_query,
+            query_rows * self.q_heads * self.head_dim,
+        )?;
+        let kv_values = cache_tokens * self.kv_heads * self.head_dim;
+        grow_device_buffer(&mut self.packed_key, kv_values)?;
+        grow_device_buffer(&mut self.packed_value, kv_values)?;
+        let score_values = query_rows * self.q_heads * score_key_tokens;
+        grow_device_buffer(&mut self.scores, score_values)?;
+        grow_device_buffer(&mut self.packed_probabilities, score_values)?;
+        grow_device_buffer(
+            &mut self.packed_output,
+            query_rows * self.q_heads * self.head_dim,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_sequence(
+        &mut self,
+        cache: &mut Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        window_tokens: Option<usize>,
+        output: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let start_position = cache.len();
+        let cache_tokens = start_position + rows;
+        let cache_values = cache_tokens * self.kv_heads * self.head_dim;
+        grow_device_buffer(&mut self.packed_key, cache_values)?;
+        grow_device_buffer(&mut self.packed_value, cache_values)?;
+        if start_position == 0 {
+            cache.append_initial_rows_and_stage_bf16_on_stream(
+                key,
+                value,
+                input_row_offset,
+                rows,
+                self.packed_key.output(),
+                self.packed_value.output(),
+                stream,
+            )?;
+        } else {
+            cache.append_rows_at_offset_on_stream(key, value, input_row_offset, rows, stream)?;
+            cache.unpack_bf16_on_stream(
+                self.packed_key.output(),
+                self.packed_value.output(),
+                stream,
+            )?;
+        }
+
+        let queries_per_kv = self.q_heads / self.kv_heads;
+        let mut query_offset = 0;
+        while query_offset < rows {
+            let requested = rows - query_offset;
+            let absolute_query_start = start_position + query_offset;
+            let tentative_key_start = window_tokens
+                .map(|window| (absolute_query_start + 1).saturating_sub(window))
+                .unwrap_or(0);
+            let tentative_key_tokens = absolute_query_start + requested - tentative_key_start;
+            let query_rows = self.tile_rows(requested, tentative_key_tokens);
+            let key_start = window_tokens
+                .map(|window| (absolute_query_start + 1).saturating_sub(window))
+                .unwrap_or(0);
+            let key_end = absolute_query_start + query_rows;
+            let key_tokens = key_end - key_start;
+            self.ensure_capacity(query_rows, cache_tokens, key_tokens)?;
+            pack_token_heads_bf16_at_offset_into_on_stream(
+                query,
+                self.packed_query.output(),
+                query_rows,
+                self.q_heads,
+                self.head_dim,
+                input_row_offset + query_offset,
+                stream,
+            )?;
+
+            let qk_key = (key_tokens, query_rows);
+            if !self.qk_plans.contains_key(&qk_key) {
+                self.qk_plans.insert(
+                    qk_key,
+                    Bf16TnMatmulPlan::new_strided_batch(
+                        &self.lt,
+                        GemmShape::new(key_tokens, query_rows * queries_per_kv, self.head_dim),
+                        self.kv_heads,
+                        cache_tokens * self.head_dim,
+                        queries_per_kv * query_rows * self.head_dim,
+                        queries_per_kv * query_rows * key_tokens,
+                        PREFILL_ATTENTION_WORKSPACE_LIMIT,
+                    )?,
+                );
+            }
+            self.qk_plans[&qk_key].run_offsets_on_stream(
+                &self.lt,
+                &self.packed_key,
+                key_start * self.head_dim,
+                &self.packed_query,
+                0,
+                self.scores.output(),
+                0,
+                stream,
+            )?;
+            causal_window_softmax_f32_to_bf16_on_stream(
+                &self.scores,
+                self.packed_probabilities.output(),
+                query_rows,
+                key_tokens,
+                absolute_query_start - key_start,
+                self.q_heads,
+                self.head_dim,
+                window_tokens,
+                stream,
+            )?;
+
+            let pv_key = (key_tokens, query_rows, cache_tokens);
+            if !self.pv_plans.contains_key(&pv_key) {
+                self.pv_plans.insert(
+                    pv_key,
+                    Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
+                        &self.lt,
+                        GemmShape::new(self.head_dim, query_rows * queries_per_kv, key_tokens),
+                        cache_tokens,
+                        self.kv_heads,
+                        self.head_dim * cache_tokens,
+                        queries_per_kv * query_rows * key_tokens,
+                        queries_per_kv * query_rows * self.head_dim,
+                        PREFILL_ATTENTION_WORKSPACE_LIMIT,
+                    )?,
+                );
+            }
+            self.pv_plans[&pv_key].run_offsets_on_stream(
+                &self.lt,
+                &self.packed_value,
+                key_start,
+                &self.packed_probabilities,
+                0,
+                self.packed_output.output(),
+                0,
+                stream,
+            )?;
+            unpack_heads_f32_at_offset_into_on_stream(
+                &self.packed_output,
+                output.output(),
+                query_rows,
+                self.q_heads,
+                self.head_dim,
+                input_row_offset + query_offset,
+                stream,
+            )?;
+            query_offset += query_rows;
+        }
+        Ok(())
+    }
+}
+
+fn grow_device_buffer<T: Copy>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
+    if buffer.len() < required {
+        *buffer = DeviceBuffer::zeroed(required)?;
+    }
+    Ok(())
 }
 
 struct LagunaBatchMlpWorkspace {
@@ -194,6 +424,7 @@ struct LagunaBatchMoeWorkspace {
     router_logits: DeviceBuffer<f32>,
     route_indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
+    sorted_routes: MoeSortedRoutes,
     marlin: MarlinNvfp4GateUpBatchWorkspace,
     down: LagunaBatchDownWorkspace,
     routed: DeviceBuffer<f32>,
@@ -208,6 +439,7 @@ impl LagunaBatchMoeWorkspace {
             router_logits: DeviceBuffer::zeroed(token_capacity * EXPERTS)?,
             route_indices: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
+            sorted_routes: MoeSortedRoutes::new(routes, EXPERTS)?,
             marlin: moe.gate_up.new_batch_workspace(token_capacity)?,
             down: LagunaBatchDownWorkspace::new(routes)?,
             routed: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
@@ -306,12 +538,13 @@ impl LagunaModel {
             .collect::<Vec<_>>();
         tokens.resize(workspace.token_capacity, 0);
         workspace.token_ids.copy_from_host(&tokens)?;
-        copy_bf16_rows_to_f32_indexed_into_on_stream(
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
             VOCAB,
             HIDDEN,
             &self.embedding,
             &workspace.token_ids,
             workspace.hidden.output(),
+            total_tokens,
             &self.stream,
         )?;
 
@@ -321,6 +554,7 @@ impl LagunaModel {
                 layer_index,
                 workspace,
                 rows,
+                total_tokens,
                 &self.stream,
             )?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
@@ -424,12 +658,15 @@ fn run_layer_prefill(
     layer_index: usize,
     workspace: &mut LagunaPrefillBatchWorkspace,
     rows: &mut [LagunaPrefillRow<'_, '_>],
+    active_tokens: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    let capacity = workspace.token_capacity;
-    layer
-        .input_norm
-        .run_into(&workspace.hidden, &mut workspace.normed, capacity, stream)?;
+    layer.input_norm.run_into(
+        &workspace.hidden,
+        &mut workspace.normed,
+        active_tokens,
+        stream,
+    )?;
     let attention_workspace = if layer.attention.q_heads == 48 {
         &mut workspace.full_attention
     } else {
@@ -442,19 +679,20 @@ fn run_layer_prefill(
         &workspace.normed,
         rows,
         layer_index,
-        capacity,
+        active_tokens,
         stream,
     )?;
-    add_f32_into_on_stream(
+    add_f32_prefix_into_on_stream(
         &workspace.hidden,
         &attention_workspace.output,
         workspace.post_attention.output(),
+        active_tokens * HIDDEN,
         stream,
     )?;
     layer.post_attention_norm.run_into(
         &workspace.post_attention,
         &mut workspace.ffn_input,
-        capacity,
+        active_tokens,
         stream,
     )?;
     match &layer.ffn {
@@ -464,13 +702,14 @@ fn run_layer_prefill(
                 &mut workspace.dense,
                 &mut workspace.linear,
                 &workspace.ffn_input,
-                capacity,
+                active_tokens,
                 stream,
             )?;
-            add_f32_into_on_stream(
+            add_f32_prefix_into_on_stream(
                 &workspace.post_attention,
                 &workspace.dense.output,
                 workspace.layer_output.output(),
+                active_tokens * HIDDEN,
                 stream,
             )
         }
@@ -480,13 +719,14 @@ fn run_layer_prefill(
                 &mut workspace.moe,
                 &mut workspace.linear,
                 &workspace.ffn_input,
-                capacity,
+                active_tokens,
                 stream,
             )?;
-            add_f32_into_on_stream(
+            add_f32_prefix_into_on_stream(
                 &workspace.post_attention,
                 &workspace.moe.output,
                 workspace.layer_output.output(),
+                active_tokens * HIDDEN,
                 stream,
             )
         }
@@ -551,13 +791,20 @@ fn run_attention_prefill(
         )?;
         row_offset += row.token_ids.len();
     }
-    round_f32_to_bf16_in_place_on_stream(workspace.q_rope.inout(), stream)?;
-    round_f32_to_bf16_in_place_on_stream(workspace.k_rope.inout(), stream)?;
+    round_f32_to_bf16_prefix_in_place_on_stream(
+        workspace.q_rope.inout(),
+        capacity * attention.q_heads * HEAD_DIM,
+        stream,
+    )?;
+    round_f32_to_bf16_prefix_in_place_on_stream(
+        workspace.k_rope.inout(),
+        capacity * KV_HEADS * HEAD_DIM,
+        stream,
+    )?;
     row_offset = 0;
     for row in rows {
-        workspace
-            .compact
-            .append_causal_rows_at_offset_into_on_stream(
+        if row.token_ids.len() >= TENSOR_CORE_ATTENTION_MIN_ROWS {
+            workspace.tensor_core.run_sequence(
                 &mut row.state.kv_cache[layer_index],
                 &workspace.q_rope,
                 &workspace.k_rope,
@@ -565,9 +812,24 @@ fn run_attention_prefill(
                 row_offset,
                 row.token_ids.len(),
                 attention.window,
-                workspace.attended.output(),
+                &mut workspace.attended,
                 stream,
             )?;
+        } else {
+            workspace
+                .compact
+                .append_causal_rows_at_offset_into_on_stream(
+                    &mut row.state.kv_cache[layer_index],
+                    &workspace.q_rope,
+                    &workspace.k_rope,
+                    &workspace.v,
+                    row_offset,
+                    row.token_ids.len(),
+                    attention.window,
+                    workspace.attended.output(),
+                    stream,
+                )?;
+        }
         row_offset += row.token_ids.len();
     }
     linear.run_bf16(
@@ -577,14 +839,19 @@ fn run_attention_prefill(
         capacity,
         stream,
     )?;
-    softplus_scale_heads_f32_into_on_stream(
+    softplus_scale_heads_f32_prefix_into_on_stream(
         &workspace.gate,
         &workspace.attended,
         workspace.gated.output(),
         HEAD_DIM,
+        capacity * attention.q_heads,
         stream,
     )?;
-    round_f32_to_bf16_in_place_on_stream(workspace.gated.inout(), stream)?;
+    round_f32_to_bf16_prefix_in_place_on_stream(
+        workspace.gated.inout(),
+        capacity * attention.q_heads * HEAD_DIM,
+        stream,
+    )?;
     linear.run_bf16(
         &attention.o,
         &workspace.gated,
@@ -604,13 +871,19 @@ fn run_mlp_prefill(
 ) -> Result<()> {
     linear.run_bf16(&mlp.gate, input, &mut workspace.gate, capacity, stream)?;
     linear.run_bf16(&mlp.up, input, &mut workspace.up, capacity, stream)?;
-    silu_mul_f32_into_on_stream(
+    silu_mul_f32_prefix_into_on_stream(
         &workspace.gate,
         &workspace.up,
         workspace.activated.output(),
+        capacity * mlp.gate.rows,
         stream,
     )?;
-    round_f32_to_bf16_in_place_on_stream(workspace.activated.inout(), stream)?;
+    let active_values = capacity * mlp.gate.rows;
+    round_f32_to_bf16_prefix_in_place_on_stream(
+        workspace.activated.inout(),
+        active_values,
+        stream,
+    )?;
     linear.run_bf16(
         &mlp.down,
         &workspace.activated,
@@ -655,7 +928,12 @@ fn run_moe_prefill(
         capacity,
         stream,
     )?;
-    moe_silu_quantize_bf16_slots_on_stream(
+    workspace.sorted_routes.set_routes(capacity * TOP_K)?;
+    workspace
+        .sorted_routes
+        .sort_on_stream(&workspace.route_indices, stream)?;
+    moe_silu_quantize_bf16_sorted_slots_on_stream(
+        &workspace.sorted_routes,
         &workspace.route_indices,
         workspace.marlin.output_bf16(),
         &mut workspace.down.b_tiles,
@@ -667,7 +945,7 @@ fn run_moe_prefill(
         stream,
     )?;
     indexed_grouped_gemv_on_stream(
-        &workspace.route_indices,
+        workspace.sorted_routes.sorted_experts(),
         &moe.down_tiles,
         &moe.down_scales,
         EXPERTS,
@@ -679,8 +957,9 @@ fn run_moe_prefill(
         capacity * TOP_K,
         stream,
     )?;
-    fill_f32_into_on_stream(workspace.routed.output(), 0.0, stream)?;
-    moe_weighted_accumulate_slots_f32_batch_on_stream(
+    fill_f32_prefix_into_on_stream(workspace.routed.output(), 0.0, capacity * HIDDEN, stream)?;
+    moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+        &workspace.sorted_routes,
         &workspace.route_indices,
         &workspace.route_weights,
         &workspace.down.inputs,
@@ -688,6 +967,7 @@ fn run_moe_prefill(
         workspace.routed.inout(),
         capacity,
         TOP_K,
+        HIDDEN,
         stream,
     )?;
     run_mlp_prefill(
@@ -698,10 +978,11 @@ fn run_moe_prefill(
         capacity,
         stream,
     )?;
-    add_f32_into_on_stream(
+    add_f32_prefix_into_on_stream(
         &workspace.routed,
         &workspace.shared.output,
         workspace.output.output(),
+        capacity * HIDDEN,
         stream,
     )
 }
@@ -736,12 +1017,13 @@ pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
         .token_ids
         .copy_from_host(&[token])
         .expect("batch diagnostic token");
-    copy_bf16_rows_to_f32_indexed_into_on_stream(
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
         VOCAB,
         HIDDEN,
         &model.embedding,
         &workspace.token_ids,
         workspace.hidden.output(),
+        1,
         &model.stream,
     )
     .expect("batch diagnostic embedding");
@@ -794,6 +1076,7 @@ pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
             token_ids: &[token],
             state: &mut batch_state,
         }],
+        1,
         &model.stream,
     )
     .expect("batch diagnostic layer");
@@ -837,6 +1120,7 @@ pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
             token_ids: &[token],
             state: &mut batch_state,
         }],
+        1,
         &model.stream,
     )
     .expect("batch diagnostic second layer");
