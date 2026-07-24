@@ -92,7 +92,7 @@
             "xhigh": "high"
           },
           "input": ["text"],
-          "contextWindow": 262144,
+          "contextWindow": 65536,
           "maxTokens": 4096,
           "cost": {
             "input": 0,
@@ -213,7 +213,7 @@
             "xhigh": "high"
           },
           "input": ["text"],
-          "contextWindow": 262144,
+          "contextWindow": 65536,
           "maxTokens": 4096,
           "cost": {
             "input": 0,

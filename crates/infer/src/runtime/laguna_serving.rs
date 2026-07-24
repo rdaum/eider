@@ -19,6 +19,15 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const TAIL_PREFILL_TOKEN_CAPACITY: usize = 64;
+const MAX_CONTINUATION_PREFILL_TOKENS: usize = 1_024;
+
+fn prefill_chunk_capacity(prompt_position: usize, fair_share: usize) -> usize {
+    if prompt_position == 0 {
+        fair_share
+    } else {
+        fair_share.min(MAX_CONTINUATION_PREFILL_TOKENS)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LagunaRequestId(u64);
@@ -408,7 +417,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             let available = request.prompt.len() - request.prompt_position;
             let batchable = available.saturating_sub(1);
             let remaining_sequences = ids.len() - index;
-            let chunk = batchable.min(budget.div_ceil(remaining_sequences));
+            let fair_share = budget.div_ceil(remaining_sequences);
+            let chunk = batchable.min(prefill_chunk_capacity(request.prompt_position, fair_share));
             if chunk == 0 {
                 continue;
             }
@@ -710,7 +720,7 @@ impl ResponseFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_ready;
+    use super::{MAX_CONTINUATION_PREFILL_TOKENS, checkpoint_ready, prefill_chunk_capacity};
 
     #[test]
     fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
@@ -723,5 +733,20 @@ mod tests {
     fn disabled_or_completed_checkpoint_is_not_ready() {
         assert!(!checkpoint_ready(256, 0, false));
         assert!(!checkpoint_ready(256, 256, true));
+    }
+
+    #[test]
+    fn initial_prefill_uses_the_full_scheduler_share() {
+        assert_eq!(prefill_chunk_capacity(0, 4_096), 4_096);
+        assert_eq!(prefill_chunk_capacity(0, 512), 512);
+    }
+
+    #[test]
+    fn continuation_prefill_is_bounded_for_actor_responsiveness() {
+        assert_eq!(
+            prefill_chunk_capacity(4_096, 4_096),
+            MAX_CONTINUATION_PREFILL_TOKENS
+        );
+        assert_eq!(prefill_chunk_capacity(4_096, 512), 512);
     }
 }

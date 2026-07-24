@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics::metrics;
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, GemmShape, MarlinNvfp4GateUpBatchWorkspace, MoeSortedRoutes,
     add_f32_prefix_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
@@ -20,6 +21,10 @@ const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 << 20;
 const ATTENTION_QUERY_TILE_ROWS: usize = 256;
 const TENSOR_CORE_ATTENTION_MIN_ROWS: usize = 32;
 const MAX_Q_HEADS: usize = 72;
+
+fn use_compact_prefill_attention(start_position: usize, query_rows: usize) -> bool {
+    start_position != 0 || query_rows < TENSOR_CORE_ATTENTION_MIN_ROWS
+}
 
 /// One ragged Laguna prompt chunk and its persistent sequence state.
 pub struct LagunaPrefillRow<'tokens, 'state> {
@@ -803,19 +808,7 @@ fn run_attention_prefill(
     )?;
     row_offset = 0;
     for row in rows {
-        if row.state.position == 0 && row.token_ids.len() >= TENSOR_CORE_ATTENTION_MIN_ROWS {
-            workspace.tensor_core.run_sequence(
-                &mut row.state.kv_cache[layer_index],
-                &workspace.q_rope,
-                &workspace.k_rope,
-                &workspace.v,
-                row_offset,
-                row.token_ids.len(),
-                attention.window,
-                &mut workspace.attended,
-                stream,
-            )?;
-        } else {
+        if use_compact_prefill_attention(row.state.position, row.token_ids.len()) {
             workspace
                 .compact
                 .append_causal_rows_at_offset_into_on_stream(
@@ -829,6 +822,24 @@ fn run_attention_prefill(
                     workspace.attended.output(),
                     stream,
                 )?;
+            metrics()
+                .laguna_compact_prefill_attention_rows
+                .add(row.token_ids.len().min(isize::MAX as usize) as isize);
+        } else {
+            workspace.tensor_core.run_sequence(
+                &mut row.state.kv_cache[layer_index],
+                &workspace.q_rope,
+                &workspace.k_rope,
+                &workspace.v,
+                row_offset,
+                row.token_ids.len(),
+                attention.window,
+                &mut workspace.attended,
+                stream,
+            )?;
+            metrics()
+                .laguna_tensor_core_prefill_attention_rows
+                .add(row.token_ids.len().min(isize::MAX as usize) as isize);
         }
         row_offset += row.token_ids.len();
     }
@@ -1190,6 +1201,14 @@ pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_path_keeps_continuations_on_compact_storage() {
+        assert!(!use_compact_prefill_attention(0, 4_096));
+        assert!(!use_compact_prefill_attention(0, 32));
+        assert!(use_compact_prefill_attention(0, 31));
+        assert!(use_compact_prefill_attention(4_096, 1_024));
+    }
 
     #[test]
     fn tensor_core_attention_is_stable_across_prompt_chunks() {
