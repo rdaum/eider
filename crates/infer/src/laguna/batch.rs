@@ -1,10 +1,10 @@
 use super::*;
 use crate::metrics::metrics;
 use nvfp4::{
-    Bf16TnMatmulPlan, CublasLt, GemmShape, MarlinNvfp4GateUpBatchWorkspace, MoeSortedRoutes,
-    add_f32_prefix_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, GemmShape, MoeSortedNvfp4Rows,
+    MoeSortedRoutes, add_f32_prefix_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_sorted_slots_on_stream,
+    fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream,
@@ -430,7 +430,10 @@ struct LagunaBatchMoeWorkspace {
     route_indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
     sorted_routes: MoeSortedRoutes,
-    marlin: MarlinNvfp4GateUpBatchWorkspace,
+    gate_up_input: MoeSortedNvfp4Rows,
+    gate_up_plan: CutlassFp4GroupedGemmPlan,
+    gate_up_output: DeviceBuffer<u16>,
+    gate_up_output_table: DeviceBuffer<*mut u16>,
     down: LagunaBatchDownWorkspace,
     routed: DeviceBuffer<f32>,
     shared: LagunaBatchMlpWorkspace,
@@ -438,14 +441,22 @@ struct LagunaBatchMoeWorkspace {
 }
 
 impl LagunaBatchMoeWorkspace {
-    fn new(moe: &LagunaMoe, token_capacity: usize) -> Result<Self> {
+    fn new(token_capacity: usize) -> Result<Self> {
         let routes = token_capacity * TOP_K;
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(token_capacity * EXPERTS)?,
             route_indices: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
             sorted_routes: MoeSortedRoutes::new(routes, EXPERTS)?,
-            marlin: moe.gate_up.new_batch_workspace(token_capacity)?,
+            gate_up_input: MoeSortedNvfp4Rows::new(token_capacity, TOP_K, EXPERTS, HIDDEN)?,
+            gate_up_plan: CutlassFp4GroupedGemmPlan::new(
+                EXPERT_INTERMEDIATE * 2,
+                routes,
+                HIDDEN,
+                EXPERTS,
+            )?,
+            gate_up_output: DeviceBuffer::zeroed(routes * EXPERT_INTERMEDIATE * 2)?,
+            gate_up_output_table: DeviceBuffer::zeroed(EXPERTS)?,
             down: LagunaBatchDownWorkspace::new(routes)?,
             routed: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             shared: LagunaBatchMlpWorkspace::new(token_capacity, SHARED_INTERMEDIATE)?,
@@ -489,17 +500,6 @@ impl LagunaModel {
                 ),
             });
         }
-        let moe = self
-            .layers
-            .iter()
-            .find_map(|layer| match &layer.ffn {
-                LagunaFfn::Moe(moe) => Some(moe.as_ref()),
-                LagunaFfn::Dense(_) => None,
-            })
-            .ok_or_else(|| Error::Format {
-                label: "Laguna prefill workspace",
-                detail: "model has no routed MoE layer".to_string(),
-            })?;
         Ok(LagunaPrefillBatchWorkspace {
             sequence_capacity,
             token_capacity,
@@ -521,7 +521,7 @@ impl LagunaModel {
             post_attention: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             ffn_input: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
             dense: LagunaBatchMlpWorkspace::new(token_capacity, DENSE_INTERMEDIATE)?,
-            moe: LagunaBatchMoeWorkspace::new(moe, token_capacity)?,
+            moe: LagunaBatchMoeWorkspace::new(token_capacity)?,
             linear: LagunaBatchLinearWorkspace::new(
                 token_capacity,
                 DENSE_INTERMEDIATE.max(MAX_Q_HEADS * HEAD_DIM),
@@ -932,21 +932,34 @@ fn run_moe_prefill(
         ROUTED_SCALE,
         stream,
     )?;
-    moe.gate_up.run_batch_bf16_prefix_on_stream(
-        &workspace.marlin,
-        &workspace.route_indices,
-        input,
-        capacity,
-        stream,
-    )?;
     workspace.sorted_routes.set_routes(capacity * TOP_K)?;
     workspace
         .sorted_routes
         .sort_on_stream(&workspace.route_indices, stream)?;
-    moe_silu_quantize_bf16_sorted_slots_on_stream(
+    workspace.gate_up_input.set_rows(capacity)?;
+    workspace
+        .gate_up_input
+        .gather_quantize_on_stream(input, &workspace.sorted_routes, stream)?;
+    workspace.gate_up_input.build_pointer_tables_on_stream(
         &workspace.sorted_routes,
-        &workspace.route_indices,
-        workspace.marlin.output_bf16(),
+        &mut workspace.gate_up_output,
+        &mut workspace.gate_up_output_table,
+        EXPERT_INTERMEDIATE * 2,
+        stream,
+    )?;
+    workspace.gate_up_plan.run_on_stream(
+        &moe.gate_up_values,
+        &moe.gate_up_scales,
+        workspace.gate_up_input.packed_table(),
+        workspace.gate_up_input.scale_table(),
+        &workspace.gate_up_output_table,
+        &moe.gate_up_alpha_table,
+        workspace.sorted_routes.expert_counts(),
+        stream,
+    )?;
+    moe_silu_quantize_bf16_expert_sorted_slots_on_stream(
+        workspace.sorted_routes.sorted_experts(),
+        &workspace.gate_up_output,
         &mut workspace.down.b_tiles,
         &mut workspace.down.b_scales,
         &moe.down_input_scales,

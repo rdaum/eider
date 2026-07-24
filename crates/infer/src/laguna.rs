@@ -5,16 +5,18 @@
 //! and LM-head weights remain BF16.
 
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    fill_f32_into_on_stream, indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
+    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
+    GpuSamplingRow, GpuTokenSampler, ModelOptCheckpoint, ModelOptCublasLtWeight,
+    ModelOptNvfp4Linear, Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, fill_f32_into_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
-    round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
-    silu_mul_f32_into_on_stream, softplus_scale_heads_f32_into_on_stream,
+    quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_inv_freq_scaled_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
+    round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_into_on_stream,
+    softplus_scale_heads_f32_into_on_stream,
 };
 use serde::Deserialize;
 use std::f32::consts::PI;
@@ -720,7 +722,11 @@ impl LagunaAttention {
 struct LagunaMoe {
     router: Bf16Linear,
     correction_bias: DeviceBuffer<f32>,
-    gate_up: MarlinNvfp4GateUp,
+    _gate_up: Vec<ModelOptCublasLtWeight>,
+    gate_up_values: DeviceBuffer<*const u8>,
+    gate_up_scales: DeviceBuffer<*const u8>,
+    gate_up_alphas: DeviceBuffer<f32>,
+    gate_up_alpha_table: DeviceBuffer<*mut f32>,
     _down: Vec<Sm12xFp4DeviceGemmWeight>,
     down_tiles: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
@@ -734,8 +740,12 @@ struct LagunaMoeWorkspace {
     router_logits: DeviceBuffer<f32>,
     route_indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
+    gate_up_input: Nvfp4Matrix,
+    gate_up_c: F32Matrix,
+    gate_up_plan: CutlassFp4GroupedGemvF32Plan,
     gate_up_output: DeviceBuffer<f32>,
     gate_up_table: DeviceBuffer<*const f32>,
+    gate_up_output_table: DeviceBuffer<*mut f32>,
     down_tiles: DeviceBuffer<u8>,
     down_scales: DeviceBuffer<u32>,
     _down_outputs: Vec<F32Matrix>,
@@ -751,8 +761,11 @@ impl LagunaMoeWorkspace {
         self.router_logits.device_bytes()
             + self.route_indices.device_bytes()
             + self.route_weights.device_bytes()
+            + self.gate_up_input.device_bytes()
+            + self.gate_up_c.device_bytes()
             + self.gate_up_output.device_bytes()
             + self.gate_up_table.device_bytes()
+            + self.gate_up_output_table.device_bytes()
             + self.down_tiles.device_bytes()
             + self.down_scales.device_bytes()
             + self
@@ -784,7 +797,33 @@ impl LagunaMoe {
             &format!("{prefix}.experts.e_score_correction_bias"),
             &[EXPERTS],
         )?;
-        let gate_up = prepare_gate_up(checkpoint, &prefix)?;
+        let gate_up = load_gate_up(checkpoint, &prefix)?;
+        if let Some((expert, weight)) = gate_up.iter().enumerate().find(|(_, weight)| {
+            let shape = weight.matrix().shape();
+            (shape.rows, shape.cols) != (HIDDEN, EXPERT_INTERMEDIATE * 2)
+        }) {
+            let shape = weight.matrix().shape();
+            return Err(Error::Shape {
+                label: "Laguna gate/up expert TN storage",
+                expected: format!("{}x{}", HIDDEN, EXPERT_INTERMEDIATE * 2),
+                actual: format!("expert {expert}: {}x{}", shape.rows, shape.cols),
+            });
+        }
+        let gate_up_values = gate_up
+            .iter()
+            .map(|weight| weight.matrix().values_ptr())
+            .collect::<Vec<_>>();
+        let gate_up_scales = gate_up
+            .iter()
+            .map(|weight| weight.matrix().scales_ptr())
+            .collect::<Vec<_>>();
+        let mut gate_up_alphas = DeviceBuffer::from_host(
+            &gate_up
+                .iter()
+                .map(ModelOptCublasLtWeight::weight_scale_2)
+                .collect::<Vec<_>>(),
+        )?;
+        let gate_up_alpha_table = scalar_pointer_table(&mut gate_up_alphas)?;
         let mut down = Vec::with_capacity(EXPERTS);
         let mut down_tiles = Vec::with_capacity(EXPERTS);
         let mut down_scales = Vec::with_capacity(EXPERTS);
@@ -806,7 +845,11 @@ impl LagunaMoe {
         Ok(Self {
             router,
             correction_bias,
-            gate_up: MarlinNvfp4GateUp::from_prepared_with_top_k(&gate_up, TOP_K)?,
+            _gate_up: gate_up,
+            gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
+            gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
+            gate_up_alphas,
+            gate_up_alpha_table,
             _down: down,
             down_tiles: DeviceBuffer::from_host(&down_tiles)?,
             down_scales: DeviceBuffer::from_host(&down_scales)?,
@@ -830,6 +873,11 @@ impl LagunaMoe {
                 .map(|slot| unsafe { gate_up_base.add(slot * gate_up_width) })
                 .collect::<Vec<_>>(),
         )?;
+        let gate_up_output_table = DeviceBuffer::from_host(
+            &(0..TOP_K)
+                .map(|slot| unsafe { gate_up_base.cast_mut().add(slot * gate_up_width) })
+                .collect::<Vec<_>>(),
+        )?;
         let mut down_outputs = Vec::with_capacity(TOP_K);
         let mut down_inputs = Vec::with_capacity(TOP_K);
         let mut down_output_ptrs = Vec::with_capacity(TOP_K);
@@ -843,8 +891,12 @@ impl LagunaMoe {
             router_logits: DeviceBuffer::zeroed(EXPERTS)?,
             route_indices: DeviceBuffer::zeroed(TOP_K)?,
             route_weights: DeviceBuffer::zeroed(TOP_K)?,
+            gate_up_input: Nvfp4Matrix::zeroed_col_major(HIDDEN, 1)?,
+            gate_up_c: F32Matrix::zeroed(gate_up_width, 1)?,
+            gate_up_plan: CutlassFp4GroupedGemvF32Plan::new(gate_up_width, HIDDEN, TOP_K)?,
             gate_up_output,
             gate_up_table,
+            gate_up_output_table,
             down_tiles: DeviceBuffer::zeroed(TOP_K * (EXPERT_INTERMEDIATE / 64) * 512)?,
             down_scales: DeviceBuffer::zeroed(TOP_K * (EXPERT_INTERMEDIATE / 64))?,
             _down_outputs: down_outputs,
@@ -876,12 +928,26 @@ impl LagunaMoe {
             ROUTED_SCALE,
             stream,
         )?;
-        self.gate_up.run_on_stream(
-            &workspace.route_indices,
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            HIDDEN,
+            1,
             input,
-            workspace.gate_up_output.output(),
+            &mut workspace.gate_up_input,
+            1.0,
             stream,
         )?;
+        workspace
+            .gate_up_plan
+            .run_indexed_a_tiled_scales_on_stream(
+                &workspace.route_indices,
+                &self.gate_up_values,
+                &self.gate_up_scales,
+                &self.gate_up_alphas,
+                &workspace.gate_up_input,
+                &workspace.gate_up_c,
+                &workspace.gate_up_output_table,
+                stream,
+            )?;
         moe_silu_quantize_slots_on_stream(
             &workspace.route_indices,
             &workspace.gate_up_table,
@@ -923,7 +989,15 @@ impl LagunaMoe {
     fn device_bytes(&self) -> usize {
         self.router.device_bytes()
             + self.correction_bias.device_bytes()
-            + self.gate_up.expert_device_bytes()
+            + self
+                ._gate_up
+                .iter()
+                .map(ModelOptCublasLtWeight::device_bytes)
+                .sum::<usize>()
+            + self.gate_up_values.device_bytes()
+            + self.gate_up_scales.device_bytes()
+            + self.gate_up_alphas.device_bytes()
+            + self.gate_up_alpha_table.device_bytes()
             + self
                 ._down
                 .iter()
@@ -938,10 +1012,10 @@ impl LagunaMoe {
     }
 }
 
-fn prepare_gate_up(
+fn load_gate_up(
     checkpoint: &ModelOptCheckpoint,
     layer_prefix: &str,
-) -> Result<Vec<MarlinNvfp4HostWeight>> {
+) -> Result<Vec<ModelOptCublasLtWeight>> {
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(8);
@@ -967,9 +1041,9 @@ fn prepare_gate_up(
                         &up,
                     )?;
                     sender
-                        .send((expert, MarlinNvfp4HostWeight::from_modelopt(&gate_up)?))
+                        .send((expert, gate_up))
                         .map_err(|error| Error::Format {
-                            label: "Laguna Marlin preparation",
+                            label: "Laguna gate/up loading",
                             detail: error.to_string(),
                         })?;
                 }
@@ -980,19 +1054,31 @@ fn prepare_gate_up(
         let mut prepared = receiver.into_iter().collect::<Vec<_>>();
         for handle in handles {
             handle.join().map_err(|_| Error::Format {
-                label: "Laguna Marlin preparation",
+                label: "Laguna gate/up loading",
                 detail: "worker panicked".to_string(),
             })??;
         }
         prepared.sort_unstable_by_key(|(expert, _)| *expert);
         if prepared.len() != EXPERTS {
             return Err(Error::Format {
-                label: "Laguna Marlin preparation",
-                detail: format!("prepared {} of {EXPERTS} experts", prepared.len()),
+                label: "Laguna gate/up loading",
+                detail: format!("loaded {} of {EXPERTS} experts", prepared.len()),
             });
         }
-        Ok(prepared.into_iter().map(|(_, weight)| weight).collect())
+        prepared
+            .into_iter()
+            .map(|(_, weight)| weight.as_cublaslt_weight())
+            .collect()
     })
+}
+
+fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
+    let base = values.as_const_ptr().cast::<f32>().cast_mut();
+    DeviceBuffer::from_host(
+        &(0..values.len())
+            .map(|index| unsafe { base.add(index) })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn ensure_down_artifacts(
@@ -1059,7 +1145,7 @@ enum LagunaFfn {
 
 enum LagunaFfnWorkspace {
     Dense(LagunaMlpWorkspace),
-    Moe(LagunaMoeWorkspace),
+    Moe(Box<LagunaMoeWorkspace>),
 }
 
 impl LagunaFfnWorkspace {
@@ -1133,7 +1219,7 @@ impl LagunaLayer {
             ffn_normalized: DeviceBuffer::zeroed(HIDDEN)?,
             ffn: match &self.ffn {
                 LagunaFfn::Dense(mlp) => LagunaFfnWorkspace::Dense(mlp.new_workspace()?),
-                LagunaFfn::Moe(moe) => LagunaFfnWorkspace::Moe(moe.new_workspace()?),
+                LagunaFfn::Moe(moe) => LagunaFfnWorkspace::Moe(Box::new(moe.new_workspace()?)),
             },
             output: DeviceBuffer::zeroed(HIDDEN)?,
         })

@@ -1314,6 +1314,67 @@ pub fn moe_silu_quantize_bf16_sorted_slots_on_stream(
     }
 }
 
+/// Quantizes expert-sorted BF16 gate/up rows into native SM12x activation tiles.
+///
+/// Unlike [`moe_silu_quantize_bf16_sorted_slots_on_stream`], the input rows
+/// already follow `sorted_experts` order and therefore require no route gather.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_bf16_expert_sorted_slots_on_stream(
+    sorted_experts: &DeviceBuffer<u32>,
+    gate_up_bf16: &DeviceBuffer<u16>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    input_scale_table: &DeviceBuffer<f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k_tiles = rows / 64;
+    if rows == 0
+        || !rows.is_multiple_of(64)
+        || groups == 0
+        || sorted_experts.len() < groups
+        || gate_up_bf16.len() < groups * rows * 2
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || input_scale_table.is_empty()
+        || gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x expert-sorted MoE BF16 SiLU quantize slots",
+            expected:
+                "rows multiple of 64 and matching expert-sorted BF16 gate/up, native tiles, and scales"
+                    .to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} experts={} gate_up={} B={} SFB={}",
+                sorted_experts.len(),
+                gate_up_bf16.len(),
+                b_native_tiles.len(),
+                sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_moe_silu_quantize_bf16_expert_sorted_slots_on_stream",
+            crate::ffi::infer_sm12x_moe_silu_quantize_bf16_expert_sorted_slots_on_stream(
+                sorted_experts.as_const_ptr().cast(),
+                gate_up_bf16.as_const_ptr().cast(),
+                b_native_tiles.as_mut_ptr().cast(),
+                sfb.as_mut_ptr().cast(),
+                input_scale_table.as_const_ptr().cast(),
+                gate_up_alpha_table.as_const_ptr().cast(),
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Runs the retained serial implementation used to validate and benchmark the
 /// parallel SM12x routed activation quantizer.
 #[allow(clippy::too_many_arguments)]

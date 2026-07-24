@@ -193,6 +193,19 @@ unsafe extern "C" {
         alpha: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_cutlass_fp4_grouped_gemv_f32_indexed_a_tiled_scales_on_stream(
+        plan: *mut c_void,
+        indices: *const u32,
+        a_values_table: *const *const u8,
+        a_scales_table: *const *const u8,
+        alpha_table: *const f32,
+        table_len: u32,
+        b_values: *const u8,
+        b_scales: *const u8,
+        c: *const f32,
+        d: *const *mut f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_cutlass_fp4_grouped_gemv_f32_contiguous_b_on_stream(
         plan: *mut c_void,
         a_values_table: *const *const u8,
@@ -553,6 +566,17 @@ unsafe extern "C" {
     pub(crate) fn infer_sm12x_moe_silu_quantize_bf16_sorted_slots_on_stream(
         indices: *const u32,
         sorted_routes: *const u32,
+        sorted_experts: *const u32,
+        gate_up_bf16: *const u16,
+        b_native_tiles: *mut u8,
+        sfb: *mut u32,
+        input_scale_table: *const f32,
+        gate_up_alpha_table: *const f32,
+        rows: u32,
+        groups: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_moe_silu_quantize_bf16_expert_sorted_slots_on_stream(
         sorted_experts: *const u32,
         gate_up_bf16: *const u16,
         b_native_tiles: *mut u8,

@@ -944,6 +944,76 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
+    /// Launches hardware block-scaled grouped GEMV with A selected by device indices.
+    ///
+    /// The shared B vector and expert scale matrices use the tiled
+    /// cuBLASLt/CUTLASS layout rather than the compact grouped-SIMT layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_indexed_a_tiled_scales_on_stream(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        a_values_table: &DeviceBuffer<*const u8>,
+        a_scales_table: &DeviceBuffer<*const u8>,
+        alpha_table: &DeviceBuffer<f32>,
+        b: &Nvfp4Matrix,
+        c: &F32Matrix,
+        d: &DeviceBuffer<*mut f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if indices.len() != self.groups || d.len() != self.groups {
+            return Err(Error::Shape {
+                label: "CUTLASS indexed block-scaled FP4 GEMV route arrays",
+                expected: format!("{} entries", self.groups),
+                actual: format!("indices={} D={}", indices.len(), d.len()),
+            });
+        }
+        let table_len = a_values_table.len();
+        if table_len == 0 || a_scales_table.len() != table_len || alpha_table.len() != table_len {
+            return Err(Error::Shape {
+                label: "CUTLASS indexed block-scaled FP4 GEMV expert tables",
+                expected: "matching non-empty value, scale, and alpha tables".to_string(),
+                actual: format!(
+                    "values={} scales={} alphas={}",
+                    table_len,
+                    a_scales_table.len(),
+                    alpha_table.len()
+                ),
+            });
+        }
+        if table_len > u32::MAX as usize {
+            return Err(Error::Shape {
+                label: "CUTLASS indexed block-scaled FP4 GEMV expert table",
+                expected: "at most u32::MAX entries".to_string(),
+                actual: table_len.to_string(),
+            });
+        }
+        if (b.rows, b.cols) != (self.k, 1) || (c.rows, c.cols) != (self.m, 1) {
+            return Err(Error::Shape {
+                label: "CUTLASS indexed block-scaled FP4 GEMV operands",
+                expected: format!("B={}x1 C={}x1", self.k, self.m),
+                actual: format!("B={}x{} C={}x{}", b.rows, b.cols, c.rows, c.cols),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_cutlass_fp4_grouped_gemv_f32_indexed_a_tiled_scales_on_stream",
+                ffi::infer_cutlass_fp4_grouped_gemv_f32_indexed_a_tiled_scales_on_stream(
+                    self.raw,
+                    indices.as_const_ptr().cast(),
+                    a_values_table.as_const_ptr().cast(),
+                    a_scales_table.as_const_ptr().cast(),
+                    alpha_table.as_const_ptr().cast(),
+                    table_len as u32,
+                    b.values_ptr(),
+                    b.scales_ptr(),
+                    c.data_ptr(),
+                    d.as_const_ptr().cast(),
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Launches grouped GEMV with contiguous per-slot B operands and contiguous F32 output.
     #[allow(clippy::too_many_arguments)]
     pub fn run_contiguous_b_on_stream(

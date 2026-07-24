@@ -38,6 +38,10 @@ name = "marlin_routed_gate_up"
 harness = false
 
 [[bench]]
+name = "laguna_routed_gate_up"
+harness = false
+
+[[bench]]
 name = "step35_expert"
 harness = false
 

@@ -92,6 +92,76 @@ private:
     Params const& params_;
 };
 
+template <typename BaseKernel>
+struct SparkInferIndexedAGemvBlockScaled {
+    using ElementA = typename BaseKernel::ElementA;
+    using LayoutA = typename BaseKernel::LayoutA;
+    using ElementB = typename BaseKernel::ElementB;
+    using ElementC = typename BaseKernel::ElementC;
+    using ElementSFA = typename BaseKernel::ElementSFA;
+    using ElementSFB = typename BaseKernel::ElementSFB;
+    using ElementAccumulator = typename BaseKernel::ElementAccumulator;
+    using EpilogueOutputOp = typename BaseKernel::EpilogueOutputOp;
+    using SharedStorage = typename BaseKernel::SharedStorage;
+    using BaseParams = typename BaseKernel::Params;
+    using LayoutC = typename BaseKernel::LayoutC;
+    using TensorRefD = typename EpilogueOutputOp::TensorRefD;
+
+    static constexpr cutlass::ComplexTransform kTransformA = BaseKernel::kTransformA;
+    static constexpr cutlass::ComplexTransform kTransformB = BaseKernel::kTransformB;
+    static constexpr int kThreadCount = BaseKernel::kThreadCount;
+    static constexpr int kThreadsPerRow = BaseKernel::kThreadsPerRow;
+
+    struct Params {
+        BaseParams base;
+        const std::uint32_t* indices;
+        const std::uint8_t* const* a_values_table;
+        const std::uint8_t* const* a_scales_table;
+        const float* alpha_table;
+        float* const* d_table;
+        std::uint32_t table_len;
+    };
+
+    using Arguments = Params;
+
+    static cutlass::Status can_implement(Arguments const& args) {
+        if (args.indices == nullptr || args.a_values_table == nullptr ||
+            args.a_scales_table == nullptr || args.alpha_table == nullptr ||
+            args.d_table == nullptr || args.table_len == 0) {
+            return cutlass::Status::kErrorInvalidProblem;
+        }
+        return BaseKernel::can_implement(args.base);
+    }
+
+    CUTLASS_DEVICE
+    void operator()(Params const& params, SharedStorage& shared_storage) {
+        const std::uint32_t group = blockIdx.y;
+        const std::uint32_t expert = params.indices[group];
+        if (expert >= params.table_len) {
+            return;
+        }
+
+        BaseParams base = params.base;
+        auto* a_values = reinterpret_cast<ElementA*>(
+            const_cast<std::uint8_t*>(params.a_values_table[expert]));
+        base.ref_A.reset(a_values);
+        base.ptr_SFA = reinterpret_cast<ElementSFA const*>(params.a_scales_table[expert]);
+        base.batch_count = 1;
+        base.batch_stride_A = 0;
+        base.batch_stride_B = 0;
+        base.batch_stride_C = 0;
+        base.batch_stride_D = 0;
+
+        float* d = params.d_table[group];
+        base.ptr_D = d;
+        base.epilogue.tensor_d =
+            TensorRefD(d, LayoutC::packed({base.problem_size.row(), 1}));
+        base.epilogue.alpha = params.alpha_table[expert];
+        base.epilogue.stride_d = 0;
+        BaseKernel{}(base, shared_storage);
+    }
+};
+
 extern "C" int infer_cutlass_fp4_gemv_f32_supported(std::uint32_t m, std::uint32_t k) {
     return m > 0 && k > 0 && (k % 32) == 0;
 }
@@ -711,6 +781,97 @@ extern "C" cudaError_t infer_cutlass_fp4_grouped_gemv_f32_indexed_a_on_stream(
         plan->groups,
         table_len);
 
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_cutlass_fp4_grouped_gemv_f32_indexed_a_tiled_scales_on_stream(
+    void* raw_plan,
+    const std::uint32_t* indices,
+    const std::uint8_t* const* a_values_table,
+    const std::uint8_t* const* a_scales_table,
+    const float* alpha_table,
+    std::uint32_t table_len,
+    const std::uint8_t* b_values,
+    const std::uint8_t* b_scales,
+    const float* c,
+    float* const* d,
+    cudaStream_t stream)
+{
+    using namespace infer_grouped_fp4;
+    if (raw_plan == nullptr || indices == nullptr || a_values_table == nullptr ||
+        a_scales_table == nullptr || alpha_table == nullptr || table_len == 0 ||
+        b_values == nullptr || b_scales == nullptr || c == nullptr || d == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    auto* plan = reinterpret_cast<GroupedGemvPlan*>(raw_plan);
+
+    using ElementA = cutlass::float_e2m1_t;
+    using ElementB = cutlass::float_e2m1_t;
+    using ElementC = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutC = cutlass::layout::ColumnMajor;
+    using ElementAccumulatorMainloop = cutlass::half_t;
+    using ElementAccumulator = float;
+    using ElementCompute = float;
+    static constexpr int kVectorSize = 16;
+    static constexpr int kElementsPerAccess = 128 / cutlass::sizeof_bits<ElementA>::value;
+    using ThreadShape = cutlass::gemm::GemmShape<16, 8>;
+    using EpilogueOp = SparkInferGemvF32Epilogue<
+        kVectorSize, ThreadShape, ElementCompute, ElementAccumulator, ElementC, ElementC, LayoutC>;
+    using BaseKernel = cutlass::gemm::kernel::GemvBlockScaled<
+        ElementA, LayoutA, ElementB, ElementC, ElementAccumulatorMainloop, EpilogueOp,
+        kElementsPerAccess, 0, 0, cutlass::float_ue4m3_t, cutlass::float_ue4m3_t, 16>;
+    using IndexedKernel = SparkInferIndexedAGemvBlockScaled<BaseKernel>;
+
+    typename EpilogueOp::Params epilogue{
+        cutlass::TensorRef<ElementC, LayoutC>(
+            const_cast<float*>(c), LayoutC::packed({static_cast<int>(plan->m), 1})),
+        1.0f,
+        0.0f,
+        0,
+    };
+    typename BaseKernel::Arguments base{
+        cutlass::MatrixCoord{static_cast<int>(plan->m), static_cast<int>(plan->k)},
+        1,
+        epilogue,
+        cutlass::TensorRef<ElementA, LayoutA>(
+            reinterpret_cast<ElementA*>(const_cast<std::uint8_t*>(
+                reinterpret_cast<const std::uint8_t*>(a_values_table))),
+            LayoutA::packed({static_cast<int>(plan->m), static_cast<int>(plan->k)})),
+        reinterpret_cast<ElementB const*>(b_values),
+        c,
+        const_cast<float*>(c),
+        reinterpret_cast<cutlass::float_ue4m3_t const*>(a_scales_table),
+        reinterpret_cast<cutlass::float_ue4m3_t const*>(b_scales),
+        static_cast<int64_t>(plan->k),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+    typename IndexedKernel::Arguments arguments{
+        base,
+        indices,
+        a_values_table,
+        a_scales_table,
+        alpha_table,
+        d,
+        table_len,
+    };
+    if (IndexedKernel::can_implement(arguments) != cutlass::Status::kSuccess) {
+        return cudaErrorInvalidValue;
+    }
+
+    dim3 block(BaseKernel::kThreadsPerRow, BaseKernel::kThreadCount / BaseKernel::kThreadsPerRow, 1);
+    dim3 grid(
+        (plan->m + block.y - 1) / block.y,
+        plan->groups,
+        1);
+    const int smem_size = static_cast<int>(sizeof(typename IndexedKernel::SharedStorage));
+    cutlass::Kernel<IndexedKernel><<<grid, block, smem_size, stream>>>(arguments);
     return cudaGetLastError();
 }
 
