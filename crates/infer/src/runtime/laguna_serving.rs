@@ -1,6 +1,6 @@
 //! Multi-session chat serving for Laguna-S-2.1.
 
-use super::chat::CheckpointChatTemplate;
+use super::chat::{ChatReasoningEffort, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::prefix_cache::{
     PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
@@ -20,6 +20,7 @@ use tracing::warn;
 
 const TAIL_PREFILL_TOKEN_CAPACITY: usize = 64;
 const MAX_CONTINUATION_PREFILL_TOKENS: usize = 1_024;
+const REASONING_END: &str = "</think>";
 
 fn prefill_chunk_capacity(prompt_position: usize, fair_share: usize) -> usize {
     if prompt_position == 0 {
@@ -27,6 +28,32 @@ fn prefill_chunk_capacity(prompt_position: usize, fair_share: usize) -> usize {
     } else {
         fair_share.min(MAX_CONTINUATION_PREFILL_TOKENS)
     }
+}
+
+fn reasoning_token_budget(
+    effort: Option<ChatReasoningEffort>,
+    max_output_tokens: usize,
+) -> Option<usize> {
+    // This is deliberately a runtime workaround, not a fix for Laguna's
+    // reasoning termination. Remove it when a checkpoint resolves the model's
+    // tendency to reopen completed reasoning:
+    // https://huggingface.co/poolside/Laguna-S-2.1-FP8/discussions/1
+    let numerator = match effort? {
+        ChatReasoningEffort::Low => 1,
+        ChatReasoningEffort::Medium => 2,
+        ChatReasoningEffort::High => 3,
+    };
+    if max_output_tokens < 2 {
+        return None;
+    }
+    Some(
+        max_output_tokens
+            .saturating_mul(numerator)
+            .checked_div(4)
+            .unwrap_or(0)
+            .max(1)
+            .min(max_output_tokens - 1),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -96,6 +123,7 @@ struct ActiveRequest<'tokenizer> {
     prefix_cache_checkpointed: bool,
     generation: RequestConfig,
     generated_tokens: usize,
+    reasoning_token_budget: Option<usize>,
     last_token: Option<u32>,
     pending_sample: Option<SampledToken>,
     state: Option<LagunaDecodeState>,
@@ -117,6 +145,7 @@ pub struct LagunaChatService<'model, 'template> {
     prefix_cache: Option<PrefixCache<LagunaSequenceCheckpoint>>,
     prefill_workspace: LagunaPrefillBatchWorkspace,
     tail_prefill_workspace: Option<LagunaPrefillBatchWorkspace>,
+    reasoning_end_token: u32,
 }
 
 impl<'model, 'template> LagunaChatService<'model, 'template> {
@@ -149,6 +178,14 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 )
             })
             .transpose()?;
+        let reasoning_end_token =
+            template
+                .tokenizer()
+                .token_to_id(REASONING_END)
+                .ok_or_else(|| Error::Format {
+                    label: "Laguna reasoning token",
+                    detail: format!("tokenizer does not define {REASONING_END:?}"),
+                })?;
         Ok(Self {
             model,
             template,
@@ -161,6 +198,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
             prefill_workspace,
             tail_prefill_workspace,
+            reasoning_end_token,
         })
     }
 
@@ -221,6 +259,14 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
+        let reasoning_token_budget = if request.template.enable_thinking {
+            reasoning_token_budget(
+                request.template.reasoning_effort,
+                request.generation.max_new_tokens,
+            )
+        } else {
+            None
+        };
         self.requests.insert(
             id,
             ActiveRequest {
@@ -231,6 +277,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 prefix_cache_checkpointed: false,
                 generation: request.generation.clone(),
                 generated_tokens: 0,
+                reasoning_token_budget,
                 last_token: None,
                 pending_sample: None,
                 state: None,
@@ -569,7 +616,24 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         tick: &mut LagunaTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
-        let sampled = if let Some(sampled) = request.pending_sample.take() {
+        let reasoning_budget_reached = request.output.is_reasoning()
+            && request
+                .reasoning_token_budget
+                .is_some_and(|budget| request.usage.reasoning_tokens >= budget);
+        let sampled = if reasoning_budget_reached {
+            let token = request
+                .last_token
+                .expect("budgeted Laguna request has generated reasoning");
+            self.model.consume_one(
+                request.state.as_mut().expect("decode request is admitted"),
+                token,
+            )?;
+            SampledToken {
+                id: self.reasoning_end_token,
+                logit: 0.0,
+                adjusted_logit: 0.0,
+            }
+        } else if let Some(sampled) = request.pending_sample.take() {
             sampled
         } else {
             let token = request
@@ -720,7 +784,10 @@ impl ResponseFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONTINUATION_PREFILL_TOKENS, checkpoint_ready, prefill_chunk_capacity};
+    use super::{
+        ChatReasoningEffort, MAX_CONTINUATION_PREFILL_TOKENS, checkpoint_ready,
+        prefill_chunk_capacity, reasoning_token_budget,
+    };
 
     #[test]
     fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
@@ -748,5 +815,30 @@ mod tests {
             MAX_CONTINUATION_PREFILL_TOKENS
         );
         assert_eq!(prefill_chunk_capacity(4_096, 512), 512);
+    }
+
+    #[test]
+    fn reasoning_effort_reserves_output_capacity_for_the_answer() {
+        assert_eq!(
+            reasoning_token_budget(Some(ChatReasoningEffort::Low), 4_096),
+            Some(1_024)
+        );
+        assert_eq!(
+            reasoning_token_budget(Some(ChatReasoningEffort::Medium), 4_096),
+            Some(2_048)
+        );
+        assert_eq!(
+            reasoning_token_budget(Some(ChatReasoningEffort::High), 4_096),
+            Some(3_072)
+        );
+        assert_eq!(reasoning_token_budget(None, 4_096), None);
+        assert_eq!(
+            reasoning_token_budget(Some(ChatReasoningEffort::Low), 2),
+            Some(1)
+        );
+        assert_eq!(
+            reasoning_token_budget(Some(ChatReasoningEffort::Low), 1),
+            None
+        );
     }
 }

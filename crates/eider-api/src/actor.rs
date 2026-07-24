@@ -414,6 +414,10 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Laguna => {
+            let mut defaults = defaults;
+            defaults.sampling.temperature = 0.7;
+            defaults.sampling.top_k = 20;
+            defaults.sampling.top_p = 0.95;
             info!(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
