@@ -139,6 +139,9 @@ impl ResponseRequest {
         if messages.is_empty() {
             return Err(ApiError::invalid("input", "input must not be empty"));
         }
+        let preserve_thinking = messages
+            .iter()
+            .any(|message| message.reasoning_content.is_some());
 
         let tools = if expose_tools {
             self.tools
@@ -202,6 +205,7 @@ impl ResponseRequest {
             tools,
             template: ChatTemplateOptions {
                 enable_thinking,
+                preserve_thinking,
                 reasoning_effort,
                 ..ChatTemplateOptions::default()
             },
@@ -298,6 +302,7 @@ fn parse_input(input: Value) -> Result<Vec<ChatMessage>, ApiError> {
 
 fn parse_input_items(items: Vec<Value>) -> Result<Vec<ChatMessage>, ApiError> {
     let mut messages = Vec::new();
+    let mut assistant = None;
     for item in items {
         let kind = match item.get("type").and_then(Value::as_str) {
             Some(kind) => kind.to_string(),
@@ -310,10 +315,31 @@ fn parse_input_items(items: Vec<Value>) -> Result<Vec<ChatMessage>, ApiError> {
             }
         };
         match kind.as_str() {
-            "message" => messages.push(parse_message(&item)?),
-            "function_call" => messages.push(parse_function_call(&item)?),
-            "function_call_output" => messages.push(parse_function_output(&item)?),
-            "reasoning" => {}
+            "message" => {
+                let message = parse_message(&item)?;
+                if message.role == ChatRole::Assistant {
+                    append_assistant_message(&mut assistant, message);
+                } else {
+                    flush_assistant_message(&mut messages, &mut assistant);
+                    messages.push(message);
+                }
+            }
+            "function_call" => {
+                let call = parse_function_call(&item)?;
+                pending_assistant(&mut assistant).tool_calls.push(call);
+            }
+            "function_call_output" => {
+                flush_assistant_message(&mut messages, &mut assistant);
+                messages.push(parse_function_output(&item)?);
+            }
+            "reasoning" => {
+                if let Some(reasoning) = parse_reasoning(&item)? {
+                    append_text(
+                        &mut pending_assistant(&mut assistant).reasoning_content,
+                        reasoning,
+                    );
+                }
+            }
             other => {
                 return Err(ApiError::invalid(
                     "input",
@@ -322,7 +348,36 @@ fn parse_input_items(items: Vec<Value>) -> Result<Vec<ChatMessage>, ApiError> {
             }
         }
     }
+    flush_assistant_message(&mut messages, &mut assistant);
     Ok(messages)
+}
+
+fn pending_assistant(assistant: &mut Option<ChatMessage>) -> &mut ChatMessage {
+    assistant.get_or_insert_with(|| ChatMessage::assistant_tool_calls(None, None, Vec::new()))
+}
+
+fn append_assistant_message(assistant: &mut Option<ChatMessage>, mut message: ChatMessage) {
+    let pending = pending_assistant(assistant);
+    if let Some(content) = message.content.take() {
+        append_text(&mut pending.content, content);
+    }
+    if let Some(reasoning) = message.reasoning_content.take() {
+        append_text(&mut pending.reasoning_content, reasoning);
+    }
+    pending.tool_calls.append(&mut message.tool_calls);
+}
+
+fn append_text(target: &mut Option<String>, text: String) {
+    match target {
+        Some(target) => target.push_str(&text),
+        None => *target = Some(text),
+    }
+}
+
+fn flush_assistant_message(messages: &mut Vec<ChatMessage>, assistant: &mut Option<ChatMessage>) {
+    if let Some(assistant) = assistant.take() {
+        messages.push(assistant);
+    }
 }
 
 fn parse_message(value: &Value) -> Result<ChatMessage, ApiError> {
@@ -380,7 +435,27 @@ fn parse_content(value: Option<&Value>) -> Result<String, ApiError> {
     }
 }
 
-fn parse_function_call(value: &Value) -> Result<ChatMessage, ApiError> {
+fn parse_reasoning(value: &Value) -> Result<Option<String>, ApiError> {
+    let Some(summary) = value.get("summary") else {
+        return Ok(None);
+    };
+    let Value::Array(parts) = summary else {
+        return Err(ApiError::invalid(
+            "input",
+            "reasoning summary must be an array",
+        ));
+    };
+    let mut reasoning = String::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("summary_text") {
+            continue;
+        }
+        reasoning.push_str(&required_string(part, "text", "input")?);
+    }
+    Ok((!reasoning.is_empty()).then_some(reasoning))
+}
+
+fn parse_function_call(value: &Value) -> Result<ChatToolCall, ApiError> {
     let call_id = required_string(value, "call_id", "input")?;
     let name = required_string(value, "name", "input")?;
     let arguments = required_string(value, "arguments", "input")?;
@@ -391,14 +466,10 @@ fn parse_function_call(value: &Value) -> Result<ChatMessage, ApiError> {
                 format!("function call {name:?} has invalid JSON arguments: {error}"),
             )
         })?;
-    Ok(ChatMessage::assistant_tool_calls(
-        None,
-        None,
-        vec![ChatToolCall {
-            id: call_id,
-            function: ChatFunctionCall { name, arguments },
-        }],
-    ))
+    Ok(ChatToolCall {
+        id: call_id,
+        function: ChatFunctionCall { name, arguments },
+    })
 }
 
 fn parse_function_output(value: &Value) -> Result<ChatMessage, ApiError> {
@@ -892,6 +963,34 @@ mod tests {
     }
 
     #[test]
+    fn sampled_server_defaults_are_preserved_and_individually_overridden() {
+        let mut defaults = defaults();
+        defaults.sampling.temperature = 0.7;
+        defaults.sampling.top_k = 20;
+        defaults.sampling.top_p = 0.95;
+        let omitted: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "hello"
+        }))
+        .unwrap();
+        let omitted = omitted.into_chat_request(&defaults).unwrap();
+        assert_eq!(omitted.generation.sampling.temperature, 0.7);
+        assert_eq!(omitted.generation.sampling.top_k, 20);
+        assert_eq!(omitted.generation.sampling.top_p, 0.95);
+
+        let overridden: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": "hello",
+            "top_p": 0.8
+        }))
+        .unwrap();
+        let overridden = overridden.into_chat_request(&defaults).unwrap();
+        assert_eq!(overridden.generation.sampling.temperature, 0.7);
+        assert_eq!(overridden.generation.sampling.top_k, 20);
+        assert_eq!(overridden.generation.sampling.top_p, 0.8);
+    }
+
+    #[test]
     fn codex_request_maps_messages_functions_and_ignores_builtin_tools() {
         let request: ResponseRequest = serde_json::from_value(json!({
             "model": "eider",
@@ -941,6 +1040,91 @@ mod tests {
         );
         assert_eq!(chat.messages[2].tool_calls[0].id, "call_1");
         assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn pi_responses_history_preserves_one_assistant_turn() {
+        let request: ResponseRequest = serde_json::from_value(json!({
+            "model": "eider",
+            "input": [
+                {"role":"user","content":[{"type":"input_text","text":"inspect the repository"}]},
+                {
+                    "type":"reasoning",
+                    "summary":[
+                        {"type":"summary_text","text":"I should inspect the git history and status."}
+                    ]
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[
+                        {"type":"output_text","text":"I'll inspect the repository.","annotations":[]}
+                    ]
+                },
+                {
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"bash",
+                    "arguments":"{\"command\":\"git status --short\"}"
+                },
+                {
+                    "type":"function_call_output",
+                    "call_id":"call_1",
+                    "output":" M README.md"
+                },
+                {
+                    "type":"reasoning",
+                    "summary":[
+                        {"type":"summary_text","text":"Now I can report the result."}
+                    ]
+                },
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[
+                        {"type":"output_text","text":"README.md is modified.","annotations":[]}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let chat = request.into_chat_request(&defaults()).unwrap();
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(
+            chat.messages[0],
+            ChatMessage::user("inspect the repository")
+        );
+        assert_eq!(
+            chat.messages[1],
+            ChatMessage::assistant_tool_calls(
+                Some("I'll inspect the repository.".into()),
+                Some("I should inspect the git history and status.".into()),
+                vec![ChatToolCall {
+                    id: "call_1".into(),
+                    function: ChatFunctionCall {
+                        name: "bash".into(),
+                        arguments: BTreeMap::from([(
+                            "command".into(),
+                            json!("git status --short")
+                        )]),
+                    },
+                }],
+            )
+        );
+        assert_eq!(
+            chat.messages[2],
+            ChatMessage::tool("call_1", " M README.md")
+        );
+        assert_eq!(
+            chat.messages[3],
+            ChatMessage::assistant_tool_calls(
+                Some("README.md is modified.".into()),
+                Some("Now I can report the result.".into()),
+                Vec::new(),
+            )
+        );
+        assert!(chat.template.preserve_thinking);
     }
 
     #[test]

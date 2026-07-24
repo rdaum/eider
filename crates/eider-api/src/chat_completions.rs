@@ -647,6 +647,38 @@ mod tests {
     }
 
     #[test]
+    fn sampled_server_defaults_are_preserved_and_individually_overridden() {
+        let mut defaults = defaults();
+        defaults.sampling.temperature = 0.7;
+        defaults.sampling.top_k = 20;
+        defaults.sampling.top_p = 0.95;
+        let omitted: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"eider",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .expect("request without sampling");
+        let omitted = omitted
+            .into_chat_request(&defaults)
+            .expect("chat request without sampling");
+        assert_eq!(omitted.generation.sampling.temperature, 0.7);
+        assert_eq!(omitted.generation.sampling.top_k, 20);
+        assert_eq!(omitted.generation.sampling.top_p, 0.95);
+
+        let overridden: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"eider",
+            "messages":[{"role":"user","content":"hello"}],
+            "top_p":0.8
+        }))
+        .expect("request with sampling");
+        let overridden = overridden
+            .into_chat_request(&defaults)
+            .expect("chat request with sampling");
+        assert_eq!(overridden.generation.sampling.temperature, 0.7);
+        assert_eq!(overridden.generation.sampling.top_k, 20);
+        assert_eq!(overridden.generation.sampling.top_p, 0.8);
+    }
+
+    #[test]
     fn request_accepts_legacy_token_limit_and_none_tool_choice() {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
             "model":"eider",

@@ -434,12 +434,7 @@ fn tojson_compat(
     kwargs: Kwargs,
 ) -> std::result::Result<TemplateValue, TemplateError> {
     let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
-    if ensure_ascii == Some(true) {
-        return Err(TemplateError::new(
-            ErrorKind::InvalidOperation,
-            "tojson ensure_ascii=true is not supported",
-        ));
-    }
+    let ensure_ascii = ensure_ascii.unwrap_or(true);
     let indent = match indent {
         Some(indent) => Some(indent),
         None => kwargs.get("indent")?,
@@ -453,20 +448,35 @@ fn tojson_compat(
             None => Some(usize::try_from(value)?),
         },
     };
-    let serialized = if let Some(indent) = indent {
+    // Hugging Face renders checkpoint templates with Jinja's `tojson` filter.
+    // Its default JSON policy sorts object keys and uses Python's `", "` and
+    // `": "` separators. Preserve that exact prompt text: compact serde JSON
+    // measurably changes tokenization for tool-heavy prompts.
+    let value = serde_json::to_value(value).map_err(|error| {
+        TemplateError::new(ErrorKind::InvalidOperation, "cannot serialize to JSON")
+            .with_source(error)
+    })?;
+    let mut serialized = if let Some(indent) = indent {
         let mut output = Vec::new();
         let whitespace = " ".repeat(indent);
         let formatter = serde_json::ser::PrettyFormatter::with_indent(whitespace.as_bytes());
         let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
-        serde::Serialize::serialize(value, &mut serializer)
+        serde::Serialize::serialize(&value, &mut serializer)
             .map(|()| String::from_utf8(output).expect("serde_json emitted valid UTF-8"))
     } else {
-        serde_json::to_string(value)
+        let mut output = Vec::new();
+        let mut serializer =
+            serde_json::Serializer::with_formatter(&mut output, JinjaJsonFormatter);
+        serde::Serialize::serialize(&value, &mut serializer)
+            .map(|()| String::from_utf8(output).expect("serde_json emitted valid UTF-8"))
     }
     .map_err(|error| {
         TemplateError::new(ErrorKind::InvalidOperation, "cannot serialize to JSON")
             .with_source(error)
     })?;
+    if ensure_ascii {
+        serialized = escape_non_ascii(&serialized);
+    }
     let mut safe = String::with_capacity(serialized.len());
     for character in serialized.chars() {
         match character {
@@ -478,6 +488,59 @@ fn tojson_compat(
         }
     }
     Ok(TemplateValue::from_safe_string(safe))
+}
+
+struct JinjaJsonFormatter;
+
+impl serde_json::ser::Formatter for JinjaJsonFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+}
+
+fn escape_non_ascii(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii() {
+            escaped.push(character);
+            continue;
+        }
+        let scalar = character as u32;
+        if scalar <= 0xffff {
+            use std::fmt::Write;
+            write!(escaped, "\\u{scalar:04x}").expect("writing to a String cannot fail");
+        } else {
+            let scalar = scalar - 0x1_0000;
+            let high = 0xd800 + (scalar >> 10);
+            let low = 0xdc00 + (scalar & 0x3ff);
+            use std::fmt::Write;
+            write!(escaped, "\\u{high:04x}\\u{low:04x}").expect("writing to a String cannot fail");
+        }
+    }
+    escaped
 }
 
 fn render_with_environment(
@@ -565,8 +628,32 @@ mod tests {
         )
         .unwrap();
         assert!(rendered.starts_with("user:hello|"));
-        assert!(rendered.contains(r#""name":"read_file""#));
+        assert!(rendered.contains(r#""name": "read_file""#));
         assert!(rendered.ends_with("|true:false:true"));
+    }
+
+    #[test]
+    fn tojson_matches_jinja_key_order_spacing_and_ascii_defaults() {
+        let environment = build_environment("{{ tools[0] | tojson }}".to_string()).unwrap();
+        let mut tool = tool_definition();
+        tool.function.description = Some("Read café paths".to_string());
+        let rendered = render_with_environment(
+            &environment,
+            &[ChatMessage::user("hello")],
+            &[tool],
+            ChatTemplateOptions::default(),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            concat!(
+                r#"{"function": {"description": "Read caf\u00e9 paths", "#,
+                r#""name": "read_file", "parameters": {"properties": {"path": {"type": "#,
+                r#""string"}}, "required": ["path"], "type": "object"}}, "type": "function"}"#
+            )
+        );
     }
 
     #[test]

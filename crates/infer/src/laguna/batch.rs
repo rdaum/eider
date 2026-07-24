@@ -803,7 +803,7 @@ fn run_attention_prefill(
     )?;
     row_offset = 0;
     for row in rows {
-        if row.token_ids.len() >= TENSOR_CORE_ATTENTION_MIN_ROWS {
+        if row.state.position == 0 && row.token_ids.len() >= TENSOR_CORE_ATTENTION_MIN_ROWS {
             workspace.tensor_core.run_sequence(
                 &mut row.state.kv_cache[layer_index],
                 &workspace.q_rope,
@@ -1185,4 +1185,97 @@ pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
         .sum::<f64>();
     let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
     assert!(nrmse <= 0.05, "batched second layer nrmse={nrmse:.6}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_core_attention_is_stable_across_prompt_chunks() {
+        const TOKENS: usize = 64;
+        const CHUNK: usize = 32;
+        const Q_HEADS: usize = 48;
+        const MAX_TOKENS: usize = 96;
+
+        let q_width = Q_HEADS * HEAD_DIM;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let values = |len: usize, factor: usize| {
+            (0..len)
+                .map(|index| ((index * factor % 251) as f32 - 125.0) / 256.0)
+                .collect::<Vec<_>>()
+        };
+        let query = DeviceBuffer::from_host(&values(TOKENS * q_width, 17)).expect("query buffer");
+        let key = DeviceBuffer::from_host(&values(TOKENS * kv_width, 29)).expect("key buffer");
+        let value = DeviceBuffer::from_host(&values(TOKENS * kv_width, 43)).expect("value buffer");
+        let stream = CudaStream::new_blocking().expect("stream");
+
+        let mut whole_workspace =
+            LagunaTensorCoreAttentionWorkspace::new(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("whole workspace");
+        let mut whole_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("whole cache");
+        let mut whole_output = DeviceBuffer::zeroed(TOKENS * q_width).expect("whole output");
+        whole_workspace
+            .run_sequence(
+                &mut whole_cache,
+                &query,
+                &key,
+                &value,
+                0,
+                TOKENS,
+                None,
+                &mut whole_output,
+                &stream,
+            )
+            .expect("whole attention");
+
+        let mut split_workspace =
+            LagunaTensorCoreAttentionWorkspace::new(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("split workspace");
+        let mut split_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("split cache");
+        let mut split_output = DeviceBuffer::zeroed(TOKENS * q_width).expect("split output");
+        for offset in [0, CHUNK] {
+            split_workspace
+                .run_sequence(
+                    &mut split_cache,
+                    &query,
+                    &key,
+                    &value,
+                    offset,
+                    CHUNK,
+                    None,
+                    &mut split_output,
+                    &stream,
+                )
+                .expect("split attention");
+        }
+
+        let whole = whole_output
+            .copy_to_host(&stream)
+            .expect("whole output download");
+        let split = split_output
+            .copy_to_host(&stream)
+            .expect("split output download");
+        let squared_error = split
+            .iter()
+            .zip(whole.iter())
+            .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
+            .sum::<f64>();
+        let expected_norm = whole
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>();
+        let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
+        let max_error = split
+            .iter()
+            .zip(whole.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            nrmse <= 0.01,
+            "split tensor-core attention nrmse={nrmse:.6} max_error={max_error:.6}"
+        );
+    }
 }

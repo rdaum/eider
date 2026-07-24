@@ -81,7 +81,7 @@ const CATALOGUE: &[ModelSpec] = &[
         defaults: ServingDefaults {
             served_model_name: "eider-laguna-s-2.1",
             max_context_tokens: 262_144,
-            prefill_token_capacity: 256,
+            prefill_token_capacity: 4_096,
             step_expert_capacity: 240,
         },
     },
@@ -644,6 +644,7 @@ mod tests {
         assert_eq!(model.model_type, "laguna");
         assert_eq!(model.artifact_kind, ArtifactKind::LagunaExperts);
         assert_eq!(model.revision, "07614121b31898586430f189d27a25a0be310843");
+        assert_eq!(model.defaults.prefill_token_capacity, 4_096);
     }
 
     #[test]

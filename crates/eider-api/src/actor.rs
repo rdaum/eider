@@ -1133,7 +1133,15 @@ fn run_actor_loop(
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
     defaults: GenerationConfig,
 ) {
-    info!("inference actor ready");
+    info!(
+        temperature = %defaults.sampling.temperature,
+        top_k = defaults.sampling.top_k,
+        top_p = %defaults.sampling.top_p,
+        seed = ?defaults.sampling.seed,
+        presence_penalty = %defaults.sampling.presence_penalty,
+        frequency_penalty = %defaults.sampling.frequency_penalty,
+        "inference actor ready"
+    );
     if ready.send(Ok(defaults)).is_err() {
         return;
     }
