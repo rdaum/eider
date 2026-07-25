@@ -560,6 +560,251 @@ __global__ void attention_f32_kernel(
     }
 }
 
+__device__ __forceinline__ const float* causal_attention_entry(
+    const float* sliding,
+    std::uint32_t sliding_length,
+    std::uint32_t sliding_start,
+    std::uint32_t sliding_capacity,
+    const float* current,
+    std::uint32_t current_start,
+    std::uint32_t query_offset,
+    const float* compressed,
+    std::uint32_t compressed_length,
+    const std::int32_t* selected,
+    std::uint32_t selected_count,
+    std::uint32_t causal_compressed_length,
+    std::uint32_t entry,
+    std::uint32_t head_dim) {
+    const std::uint32_t current_visible = query_offset + 1;
+    const std::uint32_t window = sliding_capacity + 1;
+    const std::uint32_t total_visible = sliding_length + current_visible;
+    const std::uint32_t skipped =
+        total_visible > window ? total_visible - window : 0;
+    const std::uint32_t prior_skipped =
+        skipped < sliding_length ? skipped : sliding_length;
+    const std::uint32_t prior_visible = sliding_length - prior_skipped;
+    const std::uint32_t current_skipped = skipped - prior_skipped;
+    const std::uint32_t current_kept = current_visible - current_skipped;
+    if (entry < prior_visible) {
+        const std::uint32_t logical = prior_skipped + entry;
+        const std::uint32_t slot =
+            (sliding_start + logical) % sliding_capacity;
+        return sliding + static_cast<std::size_t>(slot) * head_dim;
+    }
+    entry -= prior_visible;
+    if (entry < current_kept) {
+        return current
+            + static_cast<std::size_t>(
+                  current_start + current_skipped + entry)
+                * head_dim;
+    }
+    const std::uint32_t compressed_entry = entry - current_kept;
+    const std::int32_t index =
+        selected_count == 0
+            ? static_cast<std::int32_t>(compressed_entry)
+            : selected[compressed_entry];
+    if (index < 0
+        || static_cast<std::uint32_t>(index) >= compressed_length
+        || static_cast<std::uint32_t>(index) >= causal_compressed_length) {
+        return nullptr;
+    }
+    return compressed + static_cast<std::size_t>(index) * head_dim;
+}
+
+__global__ void causal_attention_f32_kernel(
+    const float* __restrict__ query,
+    const float* const* __restrict__ sliding_tables,
+    const std::uint32_t* __restrict__ sliding_lengths,
+    const std::uint32_t* __restrict__ sliding_starts,
+    const float* __restrict__ current_kv,
+    const std::uint32_t* __restrict__ current_sequence_starts,
+    const std::uint32_t* __restrict__ query_offsets,
+    const std::uint32_t* __restrict__ positions,
+    const float* const* __restrict__ compressed_tables,
+    const std::uint32_t* __restrict__ compressed_lengths,
+    const std::int32_t* __restrict__ selected_indices,
+    const float* __restrict__ sinks,
+    float* __restrict__ output,
+    std::uint32_t batch_rows,
+    std::uint32_t current_rows,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t sliding_capacity,
+    std::uint32_t compression_ratio,
+    std::uint32_t selected_count,
+    float scaling) {
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t batch = blockIdx.y;
+    if (head >= heads || batch >= batch_rows) {
+        return;
+    }
+    const std::uint32_t current_start = current_sequence_starts[batch];
+    const std::uint32_t query_offset = query_offsets[batch];
+    if (current_start >= current_rows
+        || query_offset >= current_rows - current_start) {
+        return;
+    }
+    const float* q =
+        query + (static_cast<std::size_t>(batch) * heads + head) * head_dim;
+    const float* sliding = sliding_tables[batch];
+    const std::uint32_t sliding_length = sliding_lengths[batch];
+    const float* compressed = compressed_tables[batch];
+    const std::uint32_t compressed_length = compressed_lengths[batch];
+    const std::int32_t* selected =
+        selected_count == 0
+            ? nullptr
+            : selected_indices + static_cast<std::size_t>(batch) * selected_count;
+    const std::uint32_t causal_compressed_length =
+        compression_ratio == 0
+            ? 0
+            : min(
+                  compressed_length,
+                  (positions[batch] + 1) / compression_ratio);
+    const std::uint32_t current_visible = query_offset + 1;
+    const std::uint32_t window = sliding_capacity + 1;
+    const std::uint32_t total_visible = sliding_length + current_visible;
+    const std::uint32_t sliding_entries =
+        total_visible < window ? total_visible : window;
+    const std::uint32_t compressed_entries =
+        selected_count == 0 ? causal_compressed_length : selected_count;
+    const std::uint32_t entries = sliding_entries + compressed_entries;
+
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float old_scale;
+    __shared__ float entry_scale;
+    if (threadIdx.x == 0) {
+        maximum = sinks[head];
+        denominator = 1.0f;
+    }
+    float accumulators[2] = {0.0f, 0.0f};
+    __syncthreads();
+    for (std::uint32_t entry = 0; entry < entries; ++entry) {
+        const float* kv = causal_attention_entry(
+            sliding,
+            sliding_length,
+            sliding_starts[batch],
+            sliding_capacity,
+            current_kv,
+            current_start,
+            query_offset,
+            compressed,
+            compressed_length,
+            selected,
+            selected_count,
+            causal_compressed_length,
+            entry,
+            head_dim);
+        float dot = 0.0f;
+        if (kv != nullptr) {
+            for (std::uint32_t feature = threadIdx.x; feature < head_dim;
+                 feature += blockDim.x) {
+                dot = fmaf(q[feature], kv[feature], dot);
+            }
+            dot = block_sum(dot) * scaling;
+        } else {
+            dot = -__int_as_float(0x7f800000);
+        }
+        if (threadIdx.x == 0) {
+            const float next_maximum = fmaxf(maximum, dot);
+            old_scale = expf(maximum - next_maximum);
+            entry_scale = kv == nullptr ? 0.0f : expf(dot - next_maximum);
+            denominator =
+                denominator * old_scale + entry_scale;
+            maximum = next_maximum;
+        }
+        __syncthreads();
+        std::uint32_t accumulator_index = 0;
+        for (std::uint32_t feature = threadIdx.x; feature < head_dim;
+             feature += blockDim.x, ++accumulator_index) {
+            const float value = kv == nullptr ? 0.0f : kv[feature];
+            accumulators[accumulator_index] =
+                accumulators[accumulator_index] * old_scale
+                + entry_scale * value;
+        }
+        __syncthreads();
+    }
+    float* out =
+        output + (static_cast<std::size_t>(batch) * heads + head) * head_dim;
+    std::uint32_t accumulator_index = 0;
+    for (std::uint32_t feature = threadIdx.x; feature < head_dim;
+         feature += blockDim.x, ++accumulator_index) {
+        out[feature] = accumulators[accumulator_index] / denominator;
+    }
+}
+
+__global__ void indexer_topk_f32_kernel(
+    const float* __restrict__ query,
+    const float* __restrict__ head_weights,
+    const float* const* __restrict__ compressed_tables,
+    const std::uint32_t* __restrict__ compressed_lengths,
+    const std::uint32_t* __restrict__ positions,
+    std::int32_t* __restrict__ selected_indices,
+    std::uint32_t batch_rows,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t compression_ratio,
+    std::uint32_t top_k,
+    float query_scale,
+    float weights_scale) {
+    const std::uint32_t batch = blockIdx.x;
+    if (batch >= batch_rows) {
+        return;
+    }
+    extern __shared__ unsigned char shared_storage[];
+    float* best_scores = reinterpret_cast<float*>(shared_storage);
+    std::int32_t* best_indices =
+        reinterpret_cast<std::int32_t*>(best_scores + top_k);
+    for (std::uint32_t slot = threadIdx.x; slot < top_k;
+         slot += blockDim.x) {
+        best_scores[slot] = -__int_as_float(0x7f800000);
+        best_indices[slot] = -1;
+    }
+    __syncthreads();
+
+    const float* compressed = compressed_tables[batch];
+    const std::uint32_t causal_length = min(
+        compressed_lengths[batch],
+        (positions[batch] + 1) / compression_ratio);
+    for (std::uint32_t entry = 0; entry < causal_length; ++entry) {
+        float contribution = 0.0f;
+        if (threadIdx.x < heads) {
+            const float* q =
+                query
+                + (static_cast<std::size_t>(batch) * heads + threadIdx.x)
+                    * head_dim;
+            const float* key =
+                compressed + static_cast<std::size_t>(entry) * head_dim;
+            float dot = 0.0f;
+            for (std::uint32_t feature = 0; feature < head_dim; ++feature) {
+                dot = fmaf(q[feature], key[feature], dot);
+            }
+            contribution =
+                head_weights[static_cast<std::size_t>(batch) * heads + threadIdx.x]
+                * fmaxf(0.0f, dot * query_scale)
+                * weights_scale;
+        }
+        const float score = block_sum(contribution);
+        if (threadIdx.x == 0 && score > best_scores[top_k - 1]) {
+            std::uint32_t insert = top_k - 1;
+            while (insert > 0 && score > best_scores[insert - 1]) {
+                best_scores[insert] = best_scores[insert - 1];
+                best_indices[insert] = best_indices[insert - 1];
+                --insert;
+            }
+            best_scores[insert] = score;
+            best_indices[insert] = static_cast<std::int32_t>(entry);
+        }
+        __syncthreads();
+    }
+    for (std::uint32_t slot = threadIdx.x; slot < top_k;
+         slot += blockDim.x) {
+        selected_indices[
+            static_cast<std::size_t>(batch) * top_k + slot] =
+            best_indices[slot];
+    }
+}
+
 __device__ __forceinline__ float sqrt_softplus(float value) {
     const float softplus =
         value > 20.0f ? value : (value < -20.0f ? expf(value) : log1pf(expf(value)));
@@ -728,6 +973,44 @@ __global__ void compress_windows_f32_kernel(
     if (threadIdx.x == 0) {
         output[static_cast<std::size_t>(window) * compressed_width + feature] =
             compressed;
+    }
+}
+
+__global__ void store_compression_overlap_f32_kernel(
+    const float* __restrict__ kv,
+    const float* __restrict__ gate,
+    const float* __restrict__ position_bias,
+    float* __restrict__ overlap_kv,
+    float* __restrict__ overlap_gate,
+    std::uint32_t window,
+    std::uint32_t ratio,
+    std::uint32_t compressed_width) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t values = ratio * compressed_width;
+    if (index >= values) {
+        return;
+    }
+    const std::uint32_t slot = index / compressed_width;
+    const std::uint32_t feature = index % compressed_width;
+    const std::uint32_t projected_width = 2 * compressed_width;
+    const std::size_t source =
+        (static_cast<std::size_t>(window) * ratio + slot) * projected_width
+        + feature;
+    overlap_kv[index] = kv[source];
+    overlap_gate[index] =
+        gate[source]
+        + position_bias[
+            static_cast<std::size_t>(slot) * projected_width + feature];
+}
+
+__global__ void arithmetic_positions_u32_kernel(
+    std::uint32_t* __restrict__ positions,
+    std::uint32_t len,
+    std::uint32_t start,
+    std::uint32_t stride) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < len) {
+        positions[index] = start + index * stride;
     }
 }
 
@@ -973,6 +1256,108 @@ extern "C" cudaError_t infer_deepseek4_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t infer_deepseek4_causal_attention_f32_on_stream(
+    const float* query,
+    const float* const* sliding_tables,
+    const std::uint32_t* sliding_lengths,
+    const std::uint32_t* sliding_starts,
+    const float* current_kv,
+    const std::uint32_t* current_sequence_starts,
+    const std::uint32_t* query_offsets,
+    const std::uint32_t* positions,
+    const float* const* compressed_tables,
+    const std::uint32_t* compressed_lengths,
+    const std::int32_t* selected_indices,
+    const float* sinks,
+    float* output,
+    std::uint32_t batch_rows,
+    std::uint32_t current_rows,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t sliding_capacity,
+    std::uint32_t compression_ratio,
+    std::uint32_t selected_count,
+    float scaling,
+    cudaStream_t stream) {
+    if (query == nullptr || sliding_tables == nullptr
+        || sliding_lengths == nullptr || sliding_starts == nullptr
+        || current_kv == nullptr || current_sequence_starts == nullptr
+        || query_offsets == nullptr || positions == nullptr
+        || compressed_tables == nullptr || compressed_lengths == nullptr
+        || sinks == nullptr || output == nullptr || batch_rows == 0
+        || current_rows == 0 || heads == 0 || head_dim == 0
+        || head_dim > 2 * kThreads || sliding_capacity == 0
+        || (selected_count != 0 && selected_indices == nullptr)
+        || !isfinite(scaling) || scaling <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 grid(heads, batch_rows);
+    causal_attention_f32_kernel<<<grid, kThreads, 0, stream>>>(
+        query,
+        sliding_tables,
+        sliding_lengths,
+        sliding_starts,
+        current_kv,
+        current_sequence_starts,
+        query_offsets,
+        positions,
+        compressed_tables,
+        compressed_lengths,
+        selected_indices,
+        sinks,
+        output,
+        batch_rows,
+        current_rows,
+        heads,
+        head_dim,
+        sliding_capacity,
+        compression_ratio,
+        selected_count,
+        scaling);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_indexer_topk_f32_on_stream(
+    const float* query,
+    const float* head_weights,
+    const float* const* compressed_tables,
+    const std::uint32_t* compressed_lengths,
+    const std::uint32_t* positions,
+    std::int32_t* selected_indices,
+    std::uint32_t batch_rows,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t compression_ratio,
+    std::uint32_t top_k,
+    cudaStream_t stream) {
+    if (query == nullptr || head_weights == nullptr
+        || compressed_tables == nullptr || compressed_lengths == nullptr
+        || positions == nullptr || selected_indices == nullptr
+        || batch_rows == 0 || heads == 0 || heads > kThreads
+        || head_dim == 0 || compression_ratio == 0 || top_k == 0
+        || top_k > 4096) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(top_k)
+        * (sizeof(float) + sizeof(std::int32_t));
+    indexer_topk_f32_kernel<<<batch_rows, kThreads, shared_bytes, stream>>>(
+        query,
+        head_weights,
+        compressed_tables,
+        compressed_lengths,
+        positions,
+        selected_indices,
+        batch_rows,
+        heads,
+        head_dim,
+        compression_ratio,
+        top_k,
+        rsqrtf(static_cast<float>(head_dim)),
+        rsqrtf(static_cast<float>(heads)));
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_deepseek4_router_topk_f32_on_stream(
     const float* logits,
     const float* bias,
@@ -1057,6 +1442,52 @@ extern "C" cudaError_t infer_deepseek4_compress_windows_f32_on_stream(
         compressed_width,
         overlapping,
         has_prior);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_store_compression_overlap_f32_on_stream(
+    const float* kv,
+    const float* gate,
+    const float* position_bias,
+    float* overlap_kv,
+    float* overlap_gate,
+    std::uint32_t window,
+    std::uint32_t ratio,
+    std::uint32_t compressed_width,
+    cudaStream_t stream) {
+    if (kv == nullptr || gate == nullptr || position_bias == nullptr
+        || overlap_kv == nullptr || overlap_gate == nullptr || ratio == 0
+        || compressed_width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t values = ratio * compressed_width;
+    const std::uint32_t blocks =
+        (values + kThreads - 1) / kThreads;
+    store_compression_overlap_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        kv,
+        gate,
+        position_bias,
+        overlap_kv,
+        overlap_gate,
+        window,
+        ratio,
+        compressed_width);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_arithmetic_positions_u32_on_stream(
+    std::uint32_t* positions,
+    std::uint32_t len,
+    std::uint32_t start,
+    std::uint32_t stride,
+    cudaStream_t stream) {
+    if (positions == nullptr || len == 0 || stride == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t blocks =
+        (len + kThreads - 1) / kThreads;
+    arithmetic_positions_u32_kernel<<<blocks, kThreads, 0, stream>>>(
+        positions, len, start, stride);
     return cudaGetLastError();
 }
 

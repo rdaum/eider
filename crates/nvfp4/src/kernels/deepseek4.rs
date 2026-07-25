@@ -24,6 +24,30 @@ pub struct Deepseek4AttentionBatch<'a> {
     pub selected_indices: Option<&'a DeviceBuffer<i32>>,
 }
 
+/// Prior cache and current-chunk metadata for causal prefill or decode.
+pub struct Deepseek4CausalAttentionBatch<'a> {
+    /// Per-query pointers to `[sliding_capacity, head_dim]` prior ring storage.
+    pub sliding_tables: &'a DeviceBuffer<*const f32>,
+    /// Number of valid prior entries for each query.
+    pub sliding_lengths: &'a DeviceBuffer<u32>,
+    /// Oldest valid physical prior slot for each query.
+    pub sliding_starts: &'a DeviceBuffer<u32>,
+    /// Current chunks concatenated as `[current_rows, head_dim]`.
+    pub current_kv: &'a DeviceBuffer<f32>,
+    /// Row at which each query's current sequence chunk begins.
+    pub current_sequence_starts: &'a DeviceBuffer<u32>,
+    /// Query row relative to its current sequence chunk.
+    pub query_offsets: &'a DeviceBuffer<u32>,
+    /// Absolute token position for every query.
+    pub positions: &'a DeviceBuffer<u32>,
+    /// Per-query pointers to completed compressed entries.
+    pub compressed_tables: &'a DeviceBuffer<*const f32>,
+    /// Number of completed compressed entries for each query.
+    pub compressed_lengths: &'a DeviceBuffer<u32>,
+    /// CSA selections and their logical per-row width.
+    pub selected_indices: Option<(&'a DeviceBuffer<i32>, usize)>,
+}
+
 /// Applies a row-major block-scaled E4M3 weight to F32 activation rows.
 pub fn block_fp8_linear_f32_batch_into_on_stream(
     input: &DeviceBuffer<f32>,
@@ -556,6 +580,206 @@ pub fn attention_f32_batch_into_on_stream(
     }
 }
 
+/// Computes causal DeepSeek attention over prior state and current chunks.
+///
+/// A ring contains at most `sliding_capacity` tokens preceding the current
+/// chunk, so the effective sliding window is `sliding_capacity + 1` including
+/// the current query token. Completed compressed entries are independently
+/// bounded by each query's absolute causal threshold.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_attention_f32_batch_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    state: Deepseek4CausalAttentionBatch<'_>,
+    sinks: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    batch_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    sliding_capacity: usize,
+    compression_ratio: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values_len = batch_rows
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    let current_rows = if head_dim == 0 || !state.current_kv.len().is_multiple_of(head_dim) {
+        0
+    } else {
+        state.current_kv.len() / head_dim
+    };
+    let selected_count = match state.selected_indices {
+        Some((indices, count))
+            if count != 0 && indices.len() >= batch_rows.saturating_mul(count) =>
+        {
+            count
+        }
+        Some((indices, count)) => {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 causal CSA indices",
+                expected: format!("at least batch * count values for batch {batch_rows}"),
+                actual: format!("indices={} count={count}", indices.len()),
+            });
+        }
+        None => 0,
+    };
+    let metadata_lengths = [
+        state.sliding_tables.len(),
+        state.sliding_lengths.len(),
+        state.sliding_starts.len(),
+        state.current_sequence_starts.len(),
+        state.query_offsets.len(),
+        state.positions.len(),
+        state.compressed_tables.len(),
+        state.compressed_lengths.len(),
+    ];
+    if batch_rows == 0
+        || current_rows == 0
+        || heads == 0
+        || head_dim == 0
+        || head_dim > 512
+        || sliding_capacity == 0
+        || [
+            batch_rows,
+            current_rows,
+            heads,
+            head_dim,
+            sliding_capacity,
+            compression_ratio,
+            selected_count,
+        ]
+        .into_iter()
+        .any(|value| value > u32::MAX as usize)
+        || query.len() < values_len
+        || output.len() < values_len
+        || sinks.len() != heads
+        || metadata_lengths.into_iter().any(|len| len < batch_rows)
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 causal attention",
+            expected: format!(
+                "query/output>={values_len} current rows>0 head_dim<=512 sinks={heads} metadata>={batch_rows}"
+            ),
+            actual: format!(
+                "batch={batch_rows} current_rows={current_rows} heads={heads} head_dim={head_dim} sliding_capacity={sliding_capacity} compression_ratio={compression_ratio} query={} output={} sinks={} metadata={metadata_lengths:?} selected={selected_count}",
+                query.len(),
+                output.len(),
+                sinks.len(),
+            ),
+        });
+    }
+    let selected_ptr = state
+        .selected_indices
+        .map_or(std::ptr::null(), |(indices, _)| {
+            indices.as_const_ptr().cast()
+        });
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_causal_attention_f32_on_stream",
+            ffi::infer_deepseek4_causal_attention_f32_on_stream(
+                query.as_const_ptr().cast(),
+                state.sliding_tables.as_const_ptr().cast(),
+                state.sliding_lengths.as_const_ptr().cast(),
+                state.sliding_starts.as_const_ptr().cast(),
+                state.current_kv.as_const_ptr().cast(),
+                state.current_sequence_starts.as_const_ptr().cast(),
+                state.query_offsets.as_const_ptr().cast(),
+                state.positions.as_const_ptr().cast(),
+                state.compressed_tables.as_const_ptr().cast(),
+                state.compressed_lengths.as_const_ptr().cast(),
+                selected_ptr,
+                sinks.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                batch_rows as u32,
+                current_rows as u32,
+                heads as u32,
+                head_dim as u32,
+                sliding_capacity as u32,
+                compression_ratio as u32,
+                selected_count as u32,
+                1.0 / (head_dim as f32).sqrt(),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Selects causal compressed entries with DeepSeek's Lightning Indexer score.
+#[allow(clippy::too_many_arguments)]
+pub fn indexer_topk_f32_batch_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    head_weights: &DeviceBuffer<f32>,
+    compressed_tables: &DeviceBuffer<*const f32>,
+    compressed_lengths: &DeviceBuffer<u32>,
+    positions: &DeviceBuffer<u32>,
+    mut selected_indices: DeviceOutput<'_, i32>,
+    batch_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    compression_ratio: usize,
+    top_k: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_values = batch_rows
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(head_dim))
+        .unwrap_or(usize::MAX);
+    let weight_values = batch_rows.saturating_mul(heads);
+    let selected_values = batch_rows.saturating_mul(top_k);
+    if batch_rows == 0
+        || heads == 0
+        || heads > 256
+        || head_dim == 0
+        || compression_ratio == 0
+        || top_k == 0
+        || top_k > 4096
+        || [batch_rows, heads, head_dim, compression_ratio, top_k]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query.len() < query_values
+        || head_weights.len() < weight_values
+        || compressed_tables.len() < batch_rows
+        || compressed_lengths.len() < batch_rows
+        || positions.len() < batch_rows
+        || selected_indices.len() < selected_values
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 indexer top-k",
+            expected: format!(
+                "query>={query_values} weights>={weight_values} metadata>={batch_rows} selected>={selected_values}"
+            ),
+            actual: format!(
+                "batch={batch_rows} heads={heads} dim={head_dim} ratio={compression_ratio} top_k={top_k} query={} weights={} tables={} lengths={} positions={} selected={}",
+                query.len(),
+                head_weights.len(),
+                compressed_tables.len(),
+                compressed_lengths.len(),
+                positions.len(),
+                selected_indices.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_indexer_topk_f32_on_stream",
+            ffi::infer_deepseek4_indexer_topk_f32_on_stream(
+                query.as_const_ptr().cast(),
+                head_weights.as_const_ptr().cast(),
+                compressed_tables.as_const_ptr().cast(),
+                compressed_lengths.as_const_ptr().cast(),
+                positions.as_const_ptr().cast(),
+                selected_indices.as_mut_ptr().cast(),
+                batch_rows as u32,
+                heads as u32,
+                head_dim as u32,
+                compression_ratio as u32,
+                top_k as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Selects and weights DeepSeek's learned `sqrtsoftplus` routes.
 #[allow(clippy::too_many_arguments)]
 pub fn router_topk_f32_batch_into_on_stream(
@@ -744,6 +968,110 @@ pub fn compress_windows_f32_into_on_stream(
     }
 }
 
+/// Retains the final CSA Ca half-window with its position-biased gate.
+#[allow(clippy::too_many_arguments)]
+pub fn store_compression_overlap_f32_into_on_stream(
+    kv: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    position_bias: &DeviceBuffer<f32>,
+    mut overlap_kv: DeviceOutput<'_, f32>,
+    mut overlap_gate: DeviceOutput<'_, f32>,
+    windows: usize,
+    ratio: usize,
+    compressed_width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let projected_width = compressed_width.saturating_mul(2);
+    let input_values = windows
+        .checked_mul(ratio)
+        .and_then(|value| value.checked_mul(projected_width))
+        .unwrap_or(usize::MAX);
+    let overlap_values = ratio.saturating_mul(compressed_width);
+    let bias_values = ratio.saturating_mul(projected_width);
+    if windows == 0
+        || ratio == 0
+        || compressed_width == 0
+        || [windows - 1, ratio, compressed_width]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || kv.len() < input_values
+        || gate.len() < input_values
+        || position_bias.len() != bias_values
+        || overlap_kv.len() < overlap_values
+        || overlap_gate.len() < overlap_values
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 compression overlap",
+            expected: format!(
+                "kv/gate>={input_values} bias={bias_values} overlap>={overlap_values}"
+            ),
+            actual: format!(
+                "windows={windows} ratio={ratio} width={compressed_width} kv={} gate={} bias={} overlap_kv={} overlap_gate={}",
+                kv.len(),
+                gate.len(),
+                position_bias.len(),
+                overlap_kv.len(),
+                overlap_gate.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_store_compression_overlap_f32_on_stream",
+            ffi::infer_deepseek4_store_compression_overlap_f32_on_stream(
+                kv.as_const_ptr().cast(),
+                gate.as_const_ptr().cast(),
+                position_bias.as_const_ptr().cast(),
+                overlap_kv.as_mut_ptr().cast(),
+                overlap_gate.as_mut_ptr().cast(),
+                (windows - 1) as u32,
+                ratio as u32,
+                compressed_width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Fills arithmetic absolute positions without a host transfer.
+pub fn arithmetic_positions_u32_into_on_stream(
+    mut positions: DeviceOutput<'_, u32>,
+    len: usize,
+    start: usize,
+    stride: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let last = start.saturating_add(len.saturating_sub(1).saturating_mul(stride));
+    if len == 0
+        || stride == 0
+        || [len, start, stride, last]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || positions.len() < len
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 arithmetic positions",
+            expected: format!("output>={len} and u32 arithmetic without overflow"),
+            actual: format!(
+                "output={} len={len} start={start} stride={stride} last={last}",
+                positions.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_arithmetic_positions_u32_on_stream",
+            ffi::infer_deepseek4_arithmetic_positions_u32_on_stream(
+                positions.as_mut_ptr().cast(),
+                len as u32,
+                start as u32,
+                stride as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies DeepSeek's separately projected, clamped SwiGLU activation.
 pub fn swiglu_pair_clamped_f32_batch_into_on_stream(
     gate: &DeviceBuffer<f32>,
@@ -884,14 +1212,17 @@ fn validate_router_buffers(
 #[cfg(test)]
 mod tests {
     use super::{
-        Deepseek4AttentionBatch, HYPER_MIX, HYPER_STREAMS, SCALE_BLOCK,
-        attention_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
-        block_fp8_linear_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
-        hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
-        hyper_prepare_f32_batch_into_on_stream,
+        Deepseek4AttentionBatch, Deepseek4CausalAttentionBatch, HYPER_MIX, HYPER_STREAMS,
+        SCALE_BLOCK, arithmetic_positions_u32_into_on_stream, attention_f32_batch_into_on_stream,
+        block_fp8_grouped_linear_f32_batch_into_on_stream,
+        block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
+        compress_windows_f32_into_on_stream, hyper_apply_f32_batch_into_on_stream,
+        hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
+        indexer_topk_f32_batch_into_on_stream,
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
         routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
-        router_topk_f32_batch_into_on_stream, swiglu_pair_clamped_f32_batch_into_on_stream,
+        router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
+        swiglu_pair_clamped_f32_batch_into_on_stream,
     };
     use crate::{CudaStream, DeviceBuffer, format};
 
@@ -1306,6 +1637,196 @@ mod tests {
     }
 
     #[test]
+    fn causal_attention_masks_prior_current_and_compressed_entries() {
+        const ROWS: usize = 3;
+        const HEADS: usize = 1;
+        const DIM: usize = 4;
+        const PRIOR_CAPACITY: usize = 3;
+        const RATIO: usize = 4;
+        let query = test_rows(ROWS, DIM, -0.15);
+        let prior_chronological = test_rows(PRIOR_CAPACITY, DIM, 0.1);
+        let mut prior_physical = vec![0.0; PRIOR_CAPACITY * DIM];
+        for logical in 0..PRIOR_CAPACITY {
+            let slot = (1 + logical) % PRIOR_CAPACITY;
+            prior_physical[slot * DIM..(slot + 1) * DIM]
+                .copy_from_slice(&prior_chronological[logical * DIM..(logical + 1) * DIM]);
+        }
+        let current = test_rows(ROWS, DIM, 0.55);
+        let compressed = test_rows(2, DIM, -0.7);
+        let sinks = [0.2f32];
+        let positions = [5u32, 6, 7];
+        let mut expected = Vec::with_capacity(ROWS * DIM);
+        for row in 0..ROWS {
+            let mut sources = prior_chronological.clone();
+            sources.extend_from_slice(&current[..(row + 1) * DIM]);
+            let visible = sources.len() / DIM;
+            let keep = (PRIOR_CAPACITY + 1).min(visible);
+            let mut rows = sources[(visible - keep) * DIM..].to_vec();
+            let compressed_visible = (((positions[row] as usize) + 1) / RATIO).min(2);
+            rows.extend_from_slice(&compressed[..compressed_visible * DIM]);
+            let q = &query[row * DIM..(row + 1) * DIM];
+            let logits = rows
+                .chunks_exact(DIM)
+                .map(|kv| {
+                    q.iter()
+                        .zip(kv)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>()
+                        / (DIM as f32).sqrt()
+                })
+                .collect::<Vec<_>>();
+            let maximum = logits.iter().copied().fold(sinks[0], f32::max);
+            let denominator = (sinks[0] - maximum).exp()
+                + logits
+                    .iter()
+                    .map(|logit| (*logit - maximum).exp())
+                    .sum::<f32>();
+            for feature in 0..DIM {
+                expected.push(
+                    rows.chunks_exact(DIM)
+                        .zip(&logits)
+                        .map(|(kv, logit)| kv[feature] * (*logit - maximum).exp() / denominator)
+                        .sum(),
+                );
+            }
+        }
+
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let prior = DeviceBuffer::from_host(&prior_physical).expect("prior");
+        let current = DeviceBuffer::from_host(&current).expect("current");
+        let compressed = DeviceBuffer::from_host(&compressed).expect("compressed");
+        let prior_pointer = prior.input().as_const_ptr().cast::<f32>();
+        let compressed_pointer = compressed.input().as_const_ptr().cast::<f32>();
+        let prior_tables = DeviceBuffer::from_host(&[prior_pointer; ROWS]).expect("prior pointers");
+        let compressed_tables =
+            DeviceBuffer::from_host(&[compressed_pointer; ROWS]).expect("compressed pointers");
+        let prior_lengths =
+            DeviceBuffer::from_host(&[PRIOR_CAPACITY as u32; ROWS]).expect("prior lengths");
+        let prior_starts = DeviceBuffer::from_host(&[1u32; ROWS]).expect("prior starts");
+        let current_starts = DeviceBuffer::from_host(&[0u32; ROWS]).expect("current starts");
+        let query_offsets = DeviceBuffer::from_host(&[0u32, 1, 2]).expect("query offsets");
+        let positions = DeviceBuffer::from_host(&positions).expect("positions");
+        let compressed_lengths =
+            DeviceBuffer::from_host(&[2u32; ROWS]).expect("compressed lengths");
+        let sinks = DeviceBuffer::from_host(&sinks).expect("sinks");
+        let mut output = DeviceBuffer::zeroed(ROWS * HEADS * DIM).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        causal_attention_f32_batch_into_on_stream(
+            &query,
+            Deepseek4CausalAttentionBatch {
+                sliding_tables: &prior_tables,
+                sliding_lengths: &prior_lengths,
+                sliding_starts: &prior_starts,
+                current_kv: &current,
+                current_sequence_starts: &current_starts,
+                query_offsets: &query_offsets,
+                positions: &positions,
+                compressed_tables: &compressed_tables,
+                compressed_lengths: &compressed_lengths,
+                selected_indices: None,
+            },
+            &sinks,
+            output.output(),
+            ROWS,
+            HEADS,
+            DIM,
+            PRIOR_CAPACITY,
+            RATIO,
+            &stream,
+        )
+        .expect("causal attention");
+        assert_close(
+            &output.copy_to_host(&stream).expect("causal output"),
+            &expected,
+            3.0e-5,
+        );
+    }
+
+    #[test]
+    fn indexer_topk_matches_causal_cpu_scores() {
+        const ROWS: usize = 2;
+        const HEADS: usize = 3;
+        const DIM: usize = 4;
+        const RATIO: usize = 2;
+        const TOP_K: usize = 3;
+        let query = test_rows(ROWS * HEADS, DIM, -0.4);
+        let head_weights = test_rows(ROWS, HEADS, 0.15);
+        let compressed_a = test_rows(4, DIM, -0.25);
+        let compressed_b = test_rows(3, DIM, 0.6);
+        let compressed_lengths = [4u32, 3];
+        let positions = [4u32, 2];
+        let mut expected = Vec::with_capacity(ROWS * TOP_K);
+        for row in 0..ROWS {
+            let compressed = if row == 0 {
+                &compressed_a
+            } else {
+                &compressed_b
+            };
+            let causal =
+                (compressed_lengths[row] as usize).min((positions[row] as usize + 1) / RATIO);
+            let mut scores = (0..causal)
+                .map(|entry| {
+                    let score = (0..HEADS)
+                        .map(|head| {
+                            let q =
+                                &query[(row * HEADS + head) * DIM..(row * HEADS + head + 1) * DIM];
+                            let key = &compressed[entry * DIM..(entry + 1) * DIM];
+                            let dot = q
+                                .iter()
+                                .zip(key)
+                                .map(|(left, right)| left * right)
+                                .sum::<f32>()
+                                / (DIM as f32).sqrt();
+                            head_weights[row * HEADS + head] * dot.max(0.0) / (HEADS as f32).sqrt()
+                        })
+                        .sum::<f32>();
+                    (score, entry as i32)
+                })
+                .collect::<Vec<_>>();
+            scores.sort_by(|left, right| right.0.total_cmp(&left.0));
+            expected.extend(scores.iter().take(TOP_K).map(|(_, index)| *index));
+            expected.resize((row + 1) * TOP_K, -1);
+        }
+
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let head_weights = DeviceBuffer::from_host(&head_weights).expect("head weights");
+        let compressed_a = DeviceBuffer::from_host(&compressed_a).expect("compressed a");
+        let compressed_b = DeviceBuffer::from_host(&compressed_b).expect("compressed b");
+        let compressed_tables = DeviceBuffer::from_host(&[
+            compressed_a.input().as_const_ptr().cast::<f32>(),
+            compressed_b.input().as_const_ptr().cast::<f32>(),
+        ])
+        .expect("compressed tables");
+        let compressed_lengths =
+            DeviceBuffer::from_host(&compressed_lengths).expect("compressed lengths");
+        let positions = DeviceBuffer::from_host(&positions).expect("positions");
+        let mut selected = DeviceBuffer::zeroed(ROWS * TOP_K).expect("selected");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        indexer_topk_f32_batch_into_on_stream(
+            &query,
+            &head_weights,
+            &compressed_tables,
+            &compressed_lengths,
+            &positions,
+            selected.output(),
+            ROWS,
+            HEADS,
+            DIM,
+            RATIO,
+            TOP_K,
+            &stream,
+        )
+        .expect("indexer");
+        assert_eq!(
+            selected
+                .copy_to_host(&stream)
+                .expect("selected host")
+                .as_slice(),
+            expected
+        );
+    }
+
+    #[test]
     fn learned_and_hash_routers_match_sqrtsoftplus_reference() {
         const BATCH: usize = 2;
         const EXPERTS: usize = 8;
@@ -1427,7 +1948,59 @@ mod tests {
                 &expected,
                 4.0e-5,
             );
+            if overlapping {
+                let mut overlap_kv = DeviceBuffer::zeroed(RATIO * WIDTH).expect("overlap kv");
+                let mut overlap_gate = DeviceBuffer::zeroed(RATIO * WIDTH).expect("overlap gate");
+                store_compression_overlap_f32_into_on_stream(
+                    &kv,
+                    &gate,
+                    &bias,
+                    overlap_kv.output(),
+                    overlap_gate.output(),
+                    WINDOWS,
+                    RATIO,
+                    WIDTH,
+                    &stream,
+                )
+                .expect("store overlap");
+                let kv = kv.copy_to_host(&stream).expect("kv host");
+                let gate = gate.copy_to_host(&stream).expect("gate host");
+                let bias = bias.copy_to_host(&stream).expect("bias host");
+                let mut expected_kv = Vec::with_capacity(RATIO * WIDTH);
+                let mut expected_gate = Vec::with_capacity(RATIO * WIDTH);
+                for slot in 0..RATIO {
+                    for feature in 0..WIDTH {
+                        let source = ((WINDOWS - 1) * RATIO + slot) * projected + feature;
+                        expected_kv.push(kv[source]);
+                        expected_gate.push(gate[source] + bias[slot * projected + feature]);
+                    }
+                }
+                assert_close(
+                    &overlap_kv.copy_to_host(&stream).expect("overlap kv host"),
+                    &expected_kv,
+                    0.0,
+                );
+                assert_close(
+                    &overlap_gate
+                        .copy_to_host(&stream)
+                        .expect("overlap gate host"),
+                    &expected_gate,
+                    0.0,
+                );
+            }
         }
+
+        let mut positions = DeviceBuffer::zeroed(4).expect("positions");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        arithmetic_positions_u32_into_on_stream(positions.output(), 4, 12, 4, &stream)
+            .expect("positions");
+        assert_eq!(
+            positions
+                .copy_to_host(&stream)
+                .expect("positions host")
+                .as_slice(),
+            &[12, 16, 20, 24]
+        );
     }
 
     #[test]

@@ -1,15 +1,18 @@
 use super::{
-    Deepseek4AttentionKind, Deepseek4ExpertLayer, Deepseek4ExpertWorkspace, Deepseek4Manifest,
-    Deepseek4ModelConfig,
+    Deepseek4AttentionKind, Deepseek4CompressionState, Deepseek4ExpertLayer,
+    Deepseek4ExpertWorkspace, Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
 };
 use crate::nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, Result,
-    add_f32_prefix_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear,
+    ModelOptCheckpoint, PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
+    arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
+    causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
     hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
-    hyper_prepare_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
+    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
-    swiglu_pair_clamped_f32_batch_into_on_stream,
+    store_compression_overlap_f32_into_on_stream, swiglu_pair_clamped_f32_batch_into_on_stream,
 };
 use std::path::Path;
 use tracing::info;
@@ -544,6 +547,22 @@ pub struct Deepseek4CompressorWeights {
     pub compressed_width: usize,
 }
 
+/// Reusable projection and assembly storage for one compressor kind.
+pub struct Deepseek4CompressorWorkspace {
+    projected_kv: DeviceBuffer<f32>,
+    projected_gate: DeviceBuffer<f32>,
+    assembled_kv: DeviceBuffer<f32>,
+    assembled_gate: DeviceBuffer<f32>,
+    compressed: DeviceBuffer<f32>,
+    normalized: DeviceBuffer<f32>,
+    positions: DeviceBuffer<u32>,
+    batch_capacity: usize,
+    max_windows: usize,
+    ratio: usize,
+    projected_width: usize,
+    compressed_width: usize,
+}
+
 impl Deepseek4CompressorWeights {
     fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -594,6 +613,273 @@ impl Deepseek4CompressorWeights {
             + self.position_bias.device_bytes()
             + self.norm.device_bytes()
     }
+
+    pub fn allocate_workspace(
+        &self,
+        batch_capacity: usize,
+    ) -> Result<Deepseek4CompressorWorkspace> {
+        if batch_capacity == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compressor workspace",
+                expected: "positive batch capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let assembled_rows =
+            batch_capacity
+                .checked_add(self.ratio - 1)
+                .ok_or_else(|| Error::Shape {
+                    label: "DeepSeek V4 compressor workspace",
+                    expected: "batch plus pending rows without overflow".to_string(),
+                    actual: format!("batch={batch_capacity} ratio={}", self.ratio),
+                })?;
+        let max_windows = assembled_rows / self.ratio;
+        Ok(Deepseek4CompressorWorkspace {
+            projected_kv: DeviceBuffer::zeroed(
+                batch_capacity.saturating_mul(self.projected_width),
+            )?,
+            projected_gate: DeviceBuffer::zeroed(
+                batch_capacity.saturating_mul(self.projected_width),
+            )?,
+            assembled_kv: DeviceBuffer::zeroed(
+                assembled_rows.saturating_mul(self.projected_width),
+            )?,
+            assembled_gate: DeviceBuffer::zeroed(
+                assembled_rows.saturating_mul(self.projected_width),
+            )?,
+            compressed: DeviceBuffer::zeroed(max_windows.saturating_mul(self.compressed_width))?,
+            normalized: DeviceBuffer::zeroed(max_windows.saturating_mul(self.compressed_width))?,
+            positions: DeviceBuffer::zeroed(max_windows)?,
+            batch_capacity,
+            max_windows,
+            ratio: self.ratio,
+            projected_width: self.projected_width,
+            compressed_width: self.compressed_width,
+        })
+    }
+
+    /// Projects all current rows once; individual sequences can then consume
+    /// contiguous row ranges without rebuilding projection workspaces.
+    pub fn project_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Deepseek4CompressorWorkspace,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        workspace.validate(self, batch_rows)?;
+        self.kv
+            .run_rows(hidden, &mut workspace.projected_kv, batch_rows, stream)?;
+        self.gate
+            .run_rows(hidden, &mut workspace.projected_gate, batch_rows, stream)
+    }
+
+    /// Closes every complete window for one sequence and retains its remainder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_projected_rows(
+        &self,
+        workspace: &mut Deepseek4CompressorWorkspace,
+        state: &mut Deepseek4CompressionState,
+        source_row: usize,
+        rows: usize,
+        rope_inv_freq: &DeviceBuffer<f32>,
+        rope_dim: usize,
+        stream: &CudaStream,
+    ) -> Result<usize> {
+        workspace.validate(self, source_row.saturating_add(rows))?;
+        if rows == 0
+            || state.ratio() != self.ratio
+            || state.projected_width() != self.projected_width
+            || state.compressed_width() != self.compressed_width
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compressor append",
+                expected: format!(
+                    "positive rows, ratio={}, projected_width={}, compressed_width={}",
+                    self.ratio, self.projected_width, self.compressed_width
+                ),
+                actual: format!(
+                    "source_row={source_row} rows={rows} state_ratio={} state_projected={} state_compressed={}",
+                    state.ratio(),
+                    state.projected_width(),
+                    state.compressed_width()
+                ),
+            });
+        }
+        let pending = state.pending_len();
+        let total_rows = pending.checked_add(rows).ok_or_else(|| Error::Shape {
+            label: "DeepSeek V4 compressor append",
+            expected: "pending plus rows without overflow".to_string(),
+            actual: format!("pending={pending} rows={rows}"),
+        })?;
+        let windows = total_rows / self.ratio;
+        let leftover = total_rows % self.ratio;
+        if windows > workspace.max_windows {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compressor windows",
+                expected: format!("at most {} windows", workspace.max_windows),
+                actual: windows.to_string(),
+            });
+        }
+        let pending_values = pending * self.projected_width;
+        workspace.assembled_kv.copy_range_from_device_on_stream(
+            0,
+            state.pending_kv(),
+            0,
+            pending_values,
+            stream,
+        )?;
+        workspace.assembled_gate.copy_range_from_device_on_stream(
+            0,
+            state.pending_gate(),
+            0,
+            pending_values,
+            stream,
+        )?;
+        let source_offset = source_row * self.projected_width;
+        let source_values = rows * self.projected_width;
+        workspace.assembled_kv.copy_range_from_device_on_stream(
+            pending_values,
+            &workspace.projected_kv,
+            source_offset,
+            source_values,
+            stream,
+        )?;
+        workspace.assembled_gate.copy_range_from_device_on_stream(
+            pending_values,
+            &workspace.projected_gate,
+            source_offset,
+            source_values,
+            stream,
+        )?;
+
+        if windows != 0 {
+            state.ensure_compressed_append(windows)?;
+            compress_windows_f32_into_on_stream(
+                &workspace.assembled_kv,
+                &workspace.assembled_gate,
+                &self.position_bias,
+                state.overlap(),
+                workspace.compressed.output(),
+                windows,
+                self.ratio,
+                self.compressed_width,
+                self.projected_width != self.compressed_width,
+                stream,
+            )?;
+            self.norm.run_rows(
+                &workspace.compressed,
+                &mut workspace.normalized,
+                windows,
+                stream,
+            )?;
+            let first_position = state.compressed_len().saturating_mul(self.ratio);
+            arithmetic_positions_u32_into_on_stream(
+                workspace.positions.output(),
+                windows,
+                first_position,
+                self.ratio,
+                stream,
+            )?;
+            rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+                workspace.normalized.inout(),
+                rope_inv_freq,
+                &workspace.positions,
+                windows,
+                1,
+                self.compressed_width,
+                rope_dim,
+                1.0,
+                stream,
+            )?;
+            let destination_entry = state.compressed_len();
+            state.compressed_mut().copy_range_from_device_on_stream(
+                destination_entry * self.compressed_width,
+                &workspace.normalized,
+                0,
+                windows * self.compressed_width,
+                stream,
+            )?;
+            if self.projected_width != self.compressed_width {
+                let (overlap_kv, overlap_gate) =
+                    state.overlap_mut().ok_or_else(|| Error::Shape {
+                        label: "DeepSeek V4 compressor overlap",
+                        expected: "overlap state for a two-series compressor".to_string(),
+                        actual: "missing overlap state".to_string(),
+                    })?;
+                store_compression_overlap_f32_into_on_stream(
+                    &workspace.assembled_kv,
+                    &workspace.assembled_gate,
+                    &self.position_bias,
+                    overlap_kv.output(),
+                    overlap_gate.output(),
+                    windows,
+                    self.ratio,
+                    self.compressed_width,
+                    stream,
+                )?;
+                state.set_overlap_valid();
+            }
+            state.append_compressed_len(windows)?;
+        }
+
+        let consumed_rows = windows * self.ratio;
+        let leftover_values = leftover * self.projected_width;
+        state.pending_kv_mut().copy_range_from_device_on_stream(
+            0,
+            &workspace.assembled_kv,
+            consumed_rows * self.projected_width,
+            leftover_values,
+            stream,
+        )?;
+        state.pending_gate_mut().copy_range_from_device_on_stream(
+            0,
+            &workspace.assembled_gate,
+            consumed_rows * self.projected_width,
+            leftover_values,
+            stream,
+        )?;
+        state.set_pending_len(leftover)?;
+        Ok(windows)
+    }
+}
+
+impl Deepseek4CompressorWorkspace {
+    fn validate(&self, weights: &Deepseek4CompressorWeights, rows: usize) -> Result<()> {
+        if rows == 0
+            || rows > self.batch_capacity
+            || self.ratio != weights.ratio
+            || self.projected_width != weights.projected_width
+            || self.compressed_width != weights.compressed_width
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compressor workspace",
+                expected: format!(
+                    "rows in 1..={} ratio={} projected={} compressed={}",
+                    self.batch_capacity,
+                    weights.ratio,
+                    weights.projected_width,
+                    weights.compressed_width
+                ),
+                actual: format!(
+                    "rows={rows} ratio={} projected={} compressed={}",
+                    self.ratio, self.projected_width, self.compressed_width
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.projected_kv
+            .device_bytes()
+            .saturating_add(self.projected_gate.device_bytes())
+            .saturating_add(self.assembled_kv.device_bytes())
+            .saturating_add(self.assembled_gate.device_bytes())
+            .saturating_add(self.compressed.device_bytes())
+            .saturating_add(self.normalized.device_bytes())
+            .saturating_add(self.positions.device_bytes())
+    }
 }
 
 /// Lightning Indexer weights attached to compressed-sparse attention.
@@ -601,6 +887,18 @@ pub struct Deepseek4IndexerWeights {
     pub compressor: Deepseek4CompressorWeights,
     pub query: Deepseek4BlockFp8Linear,
     pub head_weights: Deepseek4Bf16Linear,
+}
+
+/// Reusable compressor, query, score-weight, and selection storage.
+pub struct Deepseek4IndexerWorkspace {
+    pub compressor: Deepseek4CompressorWorkspace,
+    query: DeviceBuffer<f32>,
+    head_weights: DeviceBuffer<f32>,
+    selected: DeviceBuffer<i32>,
+    batch_capacity: usize,
+    heads: usize,
+    head_dim: usize,
+    top_k: usize,
 }
 
 impl Deepseek4IndexerWeights {
@@ -638,6 +936,124 @@ impl Deepseek4IndexerWeights {
         self.compressor.device_bytes()
             + self.query.device_bytes()
             + self.head_weights.device_bytes()
+    }
+
+    pub fn allocate_workspace(
+        &self,
+        batch_capacity: usize,
+        heads: usize,
+        head_dim: usize,
+        top_k: usize,
+    ) -> Result<Deepseek4IndexerWorkspace> {
+        if batch_capacity == 0 || heads == 0 || head_dim == 0 || top_k == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 indexer workspace",
+                expected: "positive batch, heads, head dimension, and top-k".to_string(),
+                actual: format!(
+                    "batch={batch_capacity} heads={heads} head_dim={head_dim} top_k={top_k}"
+                ),
+            });
+        }
+        Ok(Deepseek4IndexerWorkspace {
+            compressor: self.compressor.allocate_workspace(batch_capacity)?,
+            query: DeviceBuffer::zeroed(
+                batch_capacity
+                    .saturating_mul(heads)
+                    .saturating_mul(head_dim),
+            )?,
+            head_weights: DeviceBuffer::zeroed(batch_capacity.saturating_mul(heads))?,
+            selected: DeviceBuffer::zeroed(batch_capacity.saturating_mul(top_k))?,
+            batch_capacity,
+            heads,
+            head_dim,
+            top_k,
+        })
+    }
+
+    /// Projects current rows for both the index compressor and its scorer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        q_residual: &DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        rope_inv_freq: &DeviceBuffer<f32>,
+        rope_dim: usize,
+        workspace: &mut Deepseek4IndexerWorkspace,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        workspace.validate(batch_rows)?;
+        self.compressor
+            .project_rows(hidden, &mut workspace.compressor, batch_rows, stream)?;
+        self.query
+            .run_rows(q_residual, &mut workspace.query, batch_rows, stream)?;
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.query.inout(),
+            rope_inv_freq,
+            positions,
+            batch_rows,
+            workspace.heads,
+            workspace.head_dim,
+            rope_dim,
+            1.0,
+            stream,
+        )?;
+        self.head_weights
+            .run_rows(hidden, &mut workspace.head_weights, batch_rows, stream)
+    }
+
+    /// Selects the exact causal top-k entries after sequence compressors update.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_rows(
+        &self,
+        workspace: &mut Deepseek4IndexerWorkspace,
+        compressed_tables: &DeviceBuffer<*const f32>,
+        compressed_lengths: &DeviceBuffer<u32>,
+        positions: &DeviceBuffer<u32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        workspace.validate(batch_rows)?;
+        indexer_topk_f32_batch_into_on_stream(
+            &workspace.query,
+            &workspace.head_weights,
+            compressed_tables,
+            compressed_lengths,
+            positions,
+            workspace.selected.output(),
+            batch_rows,
+            workspace.heads,
+            workspace.head_dim,
+            self.compressor.ratio,
+            workspace.top_k,
+            stream,
+        )
+    }
+}
+
+impl Deepseek4IndexerWorkspace {
+    fn validate(&self, batch_rows: usize) -> Result<()> {
+        if batch_rows == 0 || batch_rows > self.batch_capacity {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 indexer workspace",
+                expected: format!("rows in 1..={}", self.batch_capacity),
+                actual: batch_rows.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn selected(&self) -> &DeviceBuffer<i32> {
+        &self.selected
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.compressor
+            .device_bytes()
+            .saturating_add(self.query.device_bytes())
+            .saturating_add(self.head_weights.device_bytes())
+            .saturating_add(self.selected.device_bytes())
     }
 }
 
@@ -707,6 +1123,649 @@ impl Deepseek4CompressedAttentionWeights {
             Self::HeavilyCompressed { compressor } => compressor.device_bytes(),
         }
     }
+}
+
+/// One contiguous sequence chunk participating in a ragged attention batch.
+pub struct Deepseek4AttentionRow<'a> {
+    pub state: &'a mut Deepseek4LayerSequenceState,
+    pub rows: usize,
+    pub position: usize,
+}
+
+/// Reusable buffers for the common attention projections and one layer kind.
+pub struct Deepseek4AttentionWorkspace {
+    q_a: DeviceBuffer<f32>,
+    q_residual: DeviceBuffer<f32>,
+    query: DeviceBuffer<f32>,
+    kv: DeviceBuffer<f32>,
+    attended: DeviceBuffer<f32>,
+    grouped: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+    metadata: Deepseek4AttentionMetadata,
+    index_metadata: Deepseek4CompressedMetadata,
+    compression: Deepseek4AttentionCompressionWorkspace,
+    batch_capacity: usize,
+    heads: usize,
+    head_dim: usize,
+    sliding_capacity: usize,
+}
+
+enum Deepseek4AttentionCompressionWorkspace {
+    Sliding,
+    CompressedSparse {
+        compressor: Deepseek4CompressorWorkspace,
+        indexer: Box<Deepseek4IndexerWorkspace>,
+    },
+    HeavilyCompressed {
+        compressor: Deepseek4CompressorWorkspace,
+    },
+}
+
+struct Deepseek4AttentionMetadata {
+    sliding_tables: StagedMetadata<*const f32>,
+    sliding_lengths: StagedMetadata<u32>,
+    sliding_starts: StagedMetadata<u32>,
+    current_starts: StagedMetadata<u32>,
+    query_offsets: StagedMetadata<u32>,
+    positions: StagedMetadata<u32>,
+    compressed: Deepseek4CompressedMetadata,
+}
+
+struct Deepseek4CompressedMetadata {
+    tables: StagedMetadata<*const f32>,
+    lengths: StagedMetadata<u32>,
+}
+
+struct StagedMetadata<T: Copy> {
+    host: PinnedHostBuffer<T>,
+    device: DeviceBuffer<T>,
+}
+
+impl<T: Copy> StagedMetadata<T> {
+    fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            host: PinnedHostBuffer::zeroed(capacity)?,
+            device: DeviceBuffer::zeroed(capacity)?,
+        })
+    }
+
+    fn upload(&mut self, stream: &CudaStream) -> Result<()> {
+        self.device
+            .copy_range_from_pinned_on_stream(0, &self.host, stream)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.device.device_bytes()
+    }
+}
+
+impl Deepseek4CompressedMetadata {
+    fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            tables: StagedMetadata::new(capacity)?,
+            lengths: StagedMetadata::new(capacity)?,
+        })
+    }
+
+    fn upload(&mut self, stream: &CudaStream) -> Result<()> {
+        self.tables.upload(stream)?;
+        self.lengths.upload(stream)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.tables
+            .device_bytes()
+            .saturating_add(self.lengths.device_bytes())
+    }
+}
+
+impl Deepseek4AttentionMetadata {
+    fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            sliding_tables: StagedMetadata::new(capacity)?,
+            sliding_lengths: StagedMetadata::new(capacity)?,
+            sliding_starts: StagedMetadata::new(capacity)?,
+            current_starts: StagedMetadata::new(capacity)?,
+            query_offsets: StagedMetadata::new(capacity)?,
+            positions: StagedMetadata::new(capacity)?,
+            compressed: Deepseek4CompressedMetadata::new(capacity)?,
+        })
+    }
+
+    fn upload_prior(&mut self, stream: &CudaStream) -> Result<()> {
+        self.sliding_tables.upload(stream)?;
+        self.sliding_lengths.upload(stream)?;
+        self.sliding_starts.upload(stream)?;
+        self.current_starts.upload(stream)?;
+        self.query_offsets.upload(stream)?;
+        self.positions.upload(stream)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.sliding_tables
+            .device_bytes()
+            .saturating_add(self.sliding_lengths.device_bytes())
+            .saturating_add(self.sliding_starts.device_bytes())
+            .saturating_add(self.current_starts.device_bytes())
+            .saturating_add(self.query_offsets.device_bytes())
+            .saturating_add(self.positions.device_bytes())
+            .saturating_add(self.compressed.device_bytes())
+    }
+}
+
+impl Deepseek4AttentionWeights {
+    pub fn allocate_workspace(
+        &self,
+        compressed: &Deepseek4CompressedAttentionWeights,
+        config: &Deepseek4ModelConfig,
+        batch_capacity: usize,
+    ) -> Result<Deepseek4AttentionWorkspace> {
+        if batch_capacity == 0 || config.sliding_window < 2 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 attention workspace",
+                expected: "positive batch and sliding window at least two".to_string(),
+                actual: format!("batch={batch_capacity} sliding={}", config.sliding_window),
+            });
+        }
+        let query_width = config.num_attention_heads * config.head_dim;
+        let grouped_width = config.o_groups * config.o_lora_rank;
+        let compression = match compressed {
+            Deepseek4CompressedAttentionWeights::Sliding => {
+                Deepseek4AttentionCompressionWorkspace::Sliding
+            }
+            Deepseek4CompressedAttentionWeights::CompressedSparse {
+                compressor,
+                indexer,
+            } => Deepseek4AttentionCompressionWorkspace::CompressedSparse {
+                compressor: compressor.allocate_workspace(batch_capacity)?,
+                indexer: Box::new(indexer.allocate_workspace(
+                    batch_capacity,
+                    config.index_heads,
+                    config.index_head_dim,
+                    config.index_topk,
+                )?),
+            },
+            Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor } => {
+                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed {
+                    compressor: compressor.allocate_workspace(batch_capacity)?,
+                }
+            }
+        };
+        Ok(Deepseek4AttentionWorkspace {
+            q_a: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
+            q_residual: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
+            query: DeviceBuffer::zeroed(batch_capacity * query_width)?,
+            kv: DeviceBuffer::zeroed(batch_capacity * config.head_dim)?,
+            attended: DeviceBuffer::zeroed(batch_capacity * query_width)?,
+            grouped: DeviceBuffer::zeroed(batch_capacity * grouped_width)?,
+            output: DeviceBuffer::zeroed(batch_capacity * config.hidden_size)?,
+            metadata: Deepseek4AttentionMetadata::new(batch_capacity)?,
+            index_metadata: Deepseek4CompressedMetadata::new(batch_capacity)?,
+            compression,
+            batch_capacity,
+            heads: config.num_attention_heads,
+            head_dim: config.head_dim,
+            sliding_capacity: config.sliding_window - 1,
+        })
+    }
+
+    /// Runs exact ragged causal attention and commits every sequence cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_rows<'a>(
+        &self,
+        compressed_weights: &Deepseek4CompressedAttentionWeights,
+        workspace: &'a mut Deepseek4AttentionWorkspace,
+        rows: &mut [Deepseek4AttentionRow<'_>],
+        hidden: &DeviceBuffer<f32>,
+        rope_inv_freq: &DeviceBuffer<f32>,
+        config: &Deepseek4ModelConfig,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        let batch_rows = validate_attention_rows(rows, workspace.batch_capacity)?;
+        fill_prior_attention_metadata(&mut workspace.metadata, rows)?;
+        workspace.metadata.upload_prior(stream)?;
+
+        self.q_a
+            .run_rows(hidden, &mut workspace.q_a, batch_rows, stream)?;
+        self.q_norm.run_rows(
+            &workspace.q_a,
+            &mut workspace.q_residual,
+            batch_rows,
+            stream,
+        )?;
+        self.q_b.run_rows(
+            &workspace.q_residual,
+            &mut workspace.query,
+            batch_rows,
+            stream,
+        )?;
+        self.q_b_norm.run_rows(
+            &workspace.query,
+            &mut workspace.attended,
+            batch_rows * workspace.heads,
+            stream,
+        )?;
+        std::mem::swap(&mut workspace.query, &mut workspace.attended);
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.query.inout(),
+            rope_inv_freq,
+            &workspace.metadata.positions.device,
+            batch_rows,
+            workspace.heads,
+            workspace.head_dim,
+            config.qk_rope_head_dim,
+            1.0,
+            stream,
+        )?;
+        self.kv
+            .run_rows(hidden, &mut workspace.kv, batch_rows, stream)?;
+        self.kv_norm
+            .run_rows(&workspace.kv, &mut workspace.grouped, batch_rows, stream)?;
+        workspace.kv.copy_range_from_device_on_stream(
+            0,
+            &workspace.grouped,
+            0,
+            batch_rows * workspace.head_dim,
+            stream,
+        )?;
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.kv.inout(),
+            rope_inv_freq,
+            &workspace.metadata.positions.device,
+            batch_rows,
+            1,
+            workspace.head_dim,
+            config.qk_rope_head_dim,
+            1.0,
+            stream,
+        )?;
+
+        let compression_ratio = match (compressed_weights, &mut workspace.compression) {
+            (
+                Deepseek4CompressedAttentionWeights::Sliding,
+                Deepseek4AttentionCompressionWorkspace::Sliding,
+            ) => {
+                fill_sliding_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
+                0
+            }
+            (
+                Deepseek4CompressedAttentionWeights::CompressedSparse {
+                    compressor,
+                    indexer,
+                },
+                Deepseek4AttentionCompressionWorkspace::CompressedSparse {
+                    compressor: compressor_workspace,
+                    indexer: indexer_workspace,
+                },
+            ) => {
+                compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
+                indexer.project_rows(
+                    hidden,
+                    &workspace.q_residual,
+                    &workspace.metadata.positions.device,
+                    rope_inv_freq,
+                    config.qk_rope_head_dim,
+                    indexer_workspace,
+                    batch_rows,
+                    stream,
+                )?;
+                append_compressed_rows(
+                    compressor,
+                    compressor_workspace,
+                    rows,
+                    rope_inv_freq,
+                    config.qk_rope_head_dim,
+                    false,
+                    stream,
+                )?;
+                append_index_rows(
+                    indexer,
+                    indexer_workspace,
+                    rows,
+                    rope_inv_freq,
+                    config.qk_rope_head_dim,
+                    stream,
+                )?;
+                fill_index_metadata(&mut workspace.index_metadata, rows)?;
+                workspace.index_metadata.upload(stream)?;
+                indexer.select_rows(
+                    indexer_workspace,
+                    &workspace.index_metadata.tables.device,
+                    &workspace.index_metadata.lengths.device,
+                    &workspace.metadata.positions.device,
+                    batch_rows,
+                    stream,
+                )?;
+                fill_main_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
+                compressor.ratio
+            }
+            (
+                Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor },
+                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed {
+                    compressor: compressor_workspace,
+                },
+            ) => {
+                compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
+                append_compressed_rows(
+                    compressor,
+                    compressor_workspace,
+                    rows,
+                    rope_inv_freq,
+                    config.qk_rope_head_dim,
+                    false,
+                    stream,
+                )?;
+                fill_main_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
+                compressor.ratio
+            }
+            _ => {
+                return Err(Error::Shape {
+                    label: "DeepSeek V4 attention workspace kind",
+                    expected: format!("{:?}", compressed_attention_name(compressed_weights)),
+                    actual: compressed_workspace_name(&workspace.compression).to_string(),
+                });
+            }
+        };
+        workspace.metadata.compressed.upload(stream)?;
+        let selected = match &workspace.compression {
+            Deepseek4AttentionCompressionWorkspace::CompressedSparse { indexer, .. } => {
+                Some(indexer.selected())
+            }
+            Deepseek4AttentionCompressionWorkspace::Sliding
+            | Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { .. } => None,
+        };
+        causal_attention_f32_batch_into_on_stream(
+            &workspace.query,
+            Deepseek4CausalAttentionBatch {
+                sliding_tables: &workspace.metadata.sliding_tables.device,
+                sliding_lengths: &workspace.metadata.sliding_lengths.device,
+                sliding_starts: &workspace.metadata.sliding_starts.device,
+                current_kv: &workspace.kv,
+                current_sequence_starts: &workspace.metadata.current_starts.device,
+                query_offsets: &workspace.metadata.query_offsets.device,
+                positions: &workspace.metadata.positions.device,
+                compressed_tables: &workspace.metadata.compressed.tables.device,
+                compressed_lengths: &workspace.metadata.compressed.lengths.device,
+                selected_indices: selected.map(|indices| (indices, config.index_topk)),
+            },
+            &self.sink,
+            workspace.attended.output(),
+            batch_rows,
+            workspace.heads,
+            workspace.head_dim,
+            workspace.sliding_capacity,
+            compression_ratio,
+            stream,
+        )?;
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.attended.inout(),
+            rope_inv_freq,
+            &workspace.metadata.positions.device,
+            batch_rows,
+            workspace.heads,
+            workspace.head_dim,
+            config.qk_rope_head_dim,
+            -1.0,
+            stream,
+        )?;
+        self.o_a.run_grouped_rows(
+            &workspace.attended,
+            &mut workspace.grouped,
+            batch_rows,
+            config.o_groups,
+            stream,
+        )?;
+        self.o_b.run_rows(
+            &workspace.grouped,
+            &mut workspace.output,
+            batch_rows,
+            stream,
+        )?;
+        let mut source_row = 0;
+        for row in rows {
+            row.state
+                .append_sliding(&workspace.kv, source_row, row.rows, stream)?;
+            source_row += row.rows;
+        }
+        Ok(&workspace.output)
+    }
+}
+
+impl Deepseek4AttentionWorkspace {
+    pub fn device_bytes(&self) -> usize {
+        self.q_a
+            .device_bytes()
+            .saturating_add(self.q_residual.device_bytes())
+            .saturating_add(self.query.device_bytes())
+            .saturating_add(self.kv.device_bytes())
+            .saturating_add(self.attended.device_bytes())
+            .saturating_add(self.grouped.device_bytes())
+            .saturating_add(self.output.device_bytes())
+            .saturating_add(self.metadata.device_bytes())
+            .saturating_add(self.index_metadata.device_bytes())
+            .saturating_add(match &self.compression {
+                Deepseek4AttentionCompressionWorkspace::Sliding => 0,
+                Deepseek4AttentionCompressionWorkspace::CompressedSparse {
+                    compressor,
+                    indexer,
+                } => compressor
+                    .device_bytes()
+                    .saturating_add(indexer.device_bytes()),
+                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { compressor } => {
+                    compressor.device_bytes()
+                }
+            })
+    }
+}
+
+fn validate_attention_rows(rows: &[Deepseek4AttentionRow<'_>], capacity: usize) -> Result<usize> {
+    let batch_rows = rows.iter().try_fold(0usize, |total, row| {
+        if row.rows == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 attention row",
+                expected: "positive row count".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let end = row
+            .position
+            .checked_add(row.rows)
+            .ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 attention row position",
+                expected: "position plus rows without overflow".to_string(),
+                actual: format!("position={} rows={}", row.position, row.rows),
+            })?;
+        if end > u32::MAX as usize {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 attention row position",
+                expected: "ending position fitting u32".to_string(),
+                actual: end.to_string(),
+            });
+        }
+        total.checked_add(row.rows).ok_or_else(|| Error::Shape {
+            label: "DeepSeek V4 attention batch",
+            expected: "total rows without overflow".to_string(),
+            actual: format!("total={total} rows={}", row.rows),
+        })
+    })?;
+    if batch_rows == 0 || batch_rows > capacity {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 attention batch",
+            expected: format!("rows in 1..={capacity}"),
+            actual: batch_rows.to_string(),
+        });
+    }
+    Ok(batch_rows)
+}
+
+fn fill_prior_attention_metadata(
+    metadata: &mut Deepseek4AttentionMetadata,
+    rows: &[Deepseek4AttentionRow<'_>],
+) -> Result<()> {
+    let mut output_row = 0;
+    for row in rows {
+        let sliding_pointer = row.state.sliding().input().as_const_ptr().cast::<f32>();
+        let sliding_len = u32_value("sliding length", row.state.sliding_len())?;
+        let sliding_start = u32_value("sliding start", row.state.sliding_start())?;
+        let current_start = u32_value("current start", output_row)?;
+        for offset in 0..row.rows {
+            metadata.sliding_tables.host.as_mut_slice()[output_row + offset] = sliding_pointer;
+            metadata.sliding_lengths.host.as_mut_slice()[output_row + offset] = sliding_len;
+            metadata.sliding_starts.host.as_mut_slice()[output_row + offset] = sliding_start;
+            metadata.current_starts.host.as_mut_slice()[output_row + offset] = current_start;
+            metadata.query_offsets.host.as_mut_slice()[output_row + offset] =
+                u32_value("query offset", offset)?;
+            metadata.positions.host.as_mut_slice()[output_row + offset] =
+                u32_value("query position", row.position + offset)?;
+        }
+        output_row += row.rows;
+    }
+    Ok(())
+}
+
+fn fill_sliding_compressed_metadata(
+    metadata: &mut Deepseek4CompressedMetadata,
+    rows: &[Deepseek4AttentionRow<'_>],
+) -> Result<()> {
+    let mut output_row = 0;
+    for row in rows {
+        let pointer = row.state.sliding().input().as_const_ptr().cast::<f32>();
+        for offset in 0..row.rows {
+            metadata.tables.host.as_mut_slice()[output_row + offset] = pointer;
+            metadata.lengths.host.as_mut_slice()[output_row + offset] = 0;
+        }
+        output_row += row.rows;
+    }
+    Ok(())
+}
+
+fn fill_main_compressed_metadata(
+    metadata: &mut Deepseek4CompressedMetadata,
+    rows: &[Deepseek4AttentionRow<'_>],
+) -> Result<()> {
+    fill_compressed_metadata(metadata, rows, false)
+}
+
+fn fill_index_metadata(
+    metadata: &mut Deepseek4CompressedMetadata,
+    rows: &[Deepseek4AttentionRow<'_>],
+) -> Result<()> {
+    fill_compressed_metadata(metadata, rows, true)
+}
+
+fn fill_compressed_metadata(
+    metadata: &mut Deepseek4CompressedMetadata,
+    rows: &[Deepseek4AttentionRow<'_>],
+    indexer: bool,
+) -> Result<()> {
+    let mut output_row = 0;
+    for row in rows {
+        let state = if indexer {
+            row.state.indexer()
+        } else {
+            row.state.compressor()
+        }
+        .ok_or_else(|| Error::Shape {
+            label: "DeepSeek V4 compressed state",
+            expected: if indexer {
+                "indexer state".to_string()
+            } else {
+                "compressor state".to_string()
+            },
+            actual: "missing".to_string(),
+        })?;
+        let pointer = state.compressed().input().as_const_ptr().cast::<f32>();
+        let len = u32_value("compressed length", state.compressed_len())?;
+        for offset in 0..row.rows {
+            metadata.tables.host.as_mut_slice()[output_row + offset] = pointer;
+            metadata.lengths.host.as_mut_slice()[output_row + offset] = len;
+        }
+        output_row += row.rows;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_compressed_rows(
+    weights: &Deepseek4CompressorWeights,
+    workspace: &mut Deepseek4CompressorWorkspace,
+    rows: &mut [Deepseek4AttentionRow<'_>],
+    rope_inv_freq: &DeviceBuffer<f32>,
+    rope_dim: usize,
+    indexer: bool,
+    stream: &CudaStream,
+) -> Result<()> {
+    let mut source_row = 0;
+    for row in rows {
+        let state = if indexer {
+            row.state.indexer_mut()
+        } else {
+            row.state.compressor_mut()
+        }
+        .ok_or_else(|| Error::Shape {
+            label: "DeepSeek V4 compressor state",
+            expected: if indexer {
+                "indexer state".to_string()
+            } else {
+                "compressor state".to_string()
+            },
+            actual: "missing".to_string(),
+        })?;
+        weights.append_projected_rows(
+            workspace,
+            state,
+            source_row,
+            row.rows,
+            rope_inv_freq,
+            rope_dim,
+            stream,
+        )?;
+        source_row += row.rows;
+    }
+    Ok(())
+}
+
+fn append_index_rows(
+    weights: &Deepseek4IndexerWeights,
+    workspace: &mut Deepseek4IndexerWorkspace,
+    rows: &mut [Deepseek4AttentionRow<'_>],
+    rope_inv_freq: &DeviceBuffer<f32>,
+    rope_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    append_compressed_rows(
+        &weights.compressor,
+        &mut workspace.compressor,
+        rows,
+        rope_inv_freq,
+        rope_dim,
+        true,
+        stream,
+    )
+}
+
+fn compressed_attention_name(weights: &Deepseek4CompressedAttentionWeights) -> &'static str {
+    match weights {
+        Deepseek4CompressedAttentionWeights::Sliding => "sliding",
+        Deepseek4CompressedAttentionWeights::CompressedSparse { .. } => "compressed sparse",
+        Deepseek4CompressedAttentionWeights::HeavilyCompressed { .. } => "heavily compressed",
+    }
+}
+
+fn compressed_workspace_name(workspace: &Deepseek4AttentionCompressionWorkspace) -> &'static str {
+    match workspace {
+        Deepseek4AttentionCompressionWorkspace::Sliding => "sliding",
+        Deepseek4AttentionCompressionWorkspace::CompressedSparse { .. } => "compressed sparse",
+        Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { .. } => "heavily compressed",
+    }
+}
+
+fn u32_value(label: &'static str, value: usize) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::Shape {
+        label,
+        expected: "value fitting u32".to_string(),
+        actual: value.to_string(),
+    })
 }
 
 /// Shared dense expert weights resident alongside every routed-expert layer.
@@ -1024,6 +2083,19 @@ pub struct Deepseek4FfnWorkspace {
     hidden: usize,
 }
 
+/// Reusable attention, MoE, mHC, and residual storage for one layer.
+pub struct Deepseek4LayerWorkspace {
+    attention_hyper: Deepseek4HyperWorkspace,
+    ffn_hyper: Deepseek4HyperWorkspace,
+    attention: Deepseek4AttentionWorkspace,
+    ffn: Deepseek4FfnWorkspace,
+    normalized: DeviceBuffer<f32>,
+    after_attention: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+    batch_capacity: usize,
+    hidden: usize,
+}
+
 impl Deepseek4ResidentLayer {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -1091,6 +2163,112 @@ impl Deepseek4ResidentLayer {
         })
     }
 
+    pub fn allocate_layer_workspace(
+        &self,
+        config: &Deepseek4ModelConfig,
+        batch_capacity: usize,
+    ) -> Result<Deepseek4LayerWorkspace> {
+        Ok(Deepseek4LayerWorkspace {
+            attention_hyper: self.attention_hyper.allocate_workspace(batch_capacity)?,
+            ffn_hyper: self.ffn_hyper.allocate_workspace(batch_capacity)?,
+            attention: self.attention.allocate_workspace(
+                &self.compressed_attention,
+                config,
+                batch_capacity,
+            )?,
+            ffn: self.allocate_ffn_workspace(config, batch_capacity)?,
+            normalized: DeviceBuffer::zeroed(batch_capacity.saturating_mul(config.hidden_size))?,
+            after_attention: DeviceBuffer::zeroed(
+                batch_capacity
+                    .saturating_mul(HYPER_STREAMS)
+                    .saturating_mul(config.hidden_size),
+            )?,
+            output: DeviceBuffer::zeroed(
+                batch_capacity
+                    .saturating_mul(HYPER_STREAMS)
+                    .saturating_mul(config.hidden_size),
+            )?,
+            batch_capacity,
+            hidden: config.hidden_size,
+        })
+    }
+
+    /// Runs both mHC sites, exact attention, and shared plus routed MoE.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_layer_rows<'a>(
+        &self,
+        routed_experts: &mut Deepseek4ExpertLayer,
+        workspace: &'a mut Deepseek4LayerWorkspace,
+        rows: &mut [Deepseek4AttentionRow<'_>],
+        streams: &DeviceBuffer<f32>,
+        token_ids: &DeviceBuffer<u32>,
+        rope_inv_freq: &DeviceBuffer<f32>,
+        config: &Deepseek4ModelConfig,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        let batch_rows = validate_attention_rows(rows, workspace.batch_capacity)?;
+        workspace.validate(batch_rows, config.hidden_size)?;
+        self.attention_hyper.prepare_rows(
+            streams,
+            &mut workspace.attention_hyper,
+            batch_rows,
+            stream,
+        )?;
+        self.attention_norm.run_rows(
+            workspace.attention_hyper.collapsed(),
+            &mut workspace.normalized,
+            batch_rows,
+            stream,
+        )?;
+        let attention_output = self.attention.run_rows(
+            &self.compressed_attention,
+            &mut workspace.attention,
+            rows,
+            &workspace.normalized,
+            rope_inv_freq,
+            config,
+            stream,
+        )?;
+        self.attention_hyper.apply_rows(
+            streams,
+            attention_output,
+            &workspace.attention_hyper,
+            &mut workspace.after_attention,
+            batch_rows,
+            stream,
+        )?;
+        self.ffn_hyper.prepare_rows(
+            &workspace.after_attention,
+            &mut workspace.ffn_hyper,
+            batch_rows,
+            stream,
+        )?;
+        self.ffn_norm.run_rows(
+            workspace.ffn_hyper.collapsed(),
+            &mut workspace.normalized,
+            batch_rows,
+            stream,
+        )?;
+        let ffn_output = self.run_ffn_rows(
+            routed_experts,
+            &mut workspace.ffn,
+            &workspace.normalized,
+            token_ids,
+            batch_rows,
+            config,
+            stream,
+        )?;
+        self.ffn_hyper.apply_rows(
+            &workspace.after_attention,
+            ffn_output,
+            &workspace.ffn_hyper,
+            &mut workspace.output,
+            batch_rows,
+            stream,
+        )?;
+        Ok(&workspace.output)
+    }
+
     /// Runs the exact shared plus routed DeepSeek MoE branch.
     #[allow(clippy::too_many_arguments)]
     pub fn run_ffn_rows<'a>(
@@ -1135,6 +2313,33 @@ impl Deepseek4ResidentLayer {
             stream,
         )?;
         Ok(&workspace.output)
+    }
+}
+
+impl Deepseek4LayerWorkspace {
+    fn validate(&self, batch_rows: usize, hidden: usize) -> Result<()> {
+        if batch_rows == 0 || batch_rows > self.batch_capacity || hidden != self.hidden {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 layer workspace",
+                expected: format!(
+                    "batch in 1..={} hidden={}",
+                    self.batch_capacity, self.hidden
+                ),
+                actual: format!("batch={batch_rows} hidden={hidden}"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.attention_hyper
+            .device_bytes()
+            .saturating_add(self.ffn_hyper.device_bytes())
+            .saturating_add(self.attention.device_bytes())
+            .saturating_add(self.ffn.device_bytes())
+            .saturating_add(self.normalized.device_bytes())
+            .saturating_add(self.after_attention.device_bytes())
+            .saturating_add(self.output.device_bytes())
     }
 }
 
@@ -1340,5 +2545,352 @@ fn linear_shape_error(
         label: "DeepSeek V4 linear",
         expected: format!("{format} rows={rows} cols={cols}"),
         actual: format!("{prefix} rows={actual_rows} cols={actual_cols}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Deepseek4AttentionRow, Deepseek4AttentionWeights, Deepseek4Bf16Linear,
+        Deepseek4BlockFp8Linear, Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights,
+        Deepseek4ModelConfig, Deepseek4RmsNorm, Deepseek4UnweightedRmsNorm,
+    };
+    use crate::deepseek4::Deepseek4SequenceState;
+    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, format};
+
+    const CONFIG: &str = r#"{
+        "architectures":["DeepseekV4ForCausalLM"],
+        "model_type":"deepseek_v4",
+        "vocab_size":256,
+        "hidden_size":128,
+        "num_hidden_layers":1,
+        "num_attention_heads":1,
+        "num_key_value_heads":1,
+        "head_dim":128,
+        "q_lora_rank":128,
+        "qk_rope_head_dim":16,
+        "o_groups":1,
+        "o_lora_rank":128,
+        "sliding_window":4,
+        "compress_ratios":[0],
+        "compress_rope_theta":160000,
+        "rope_theta":10000,
+        "rope_scaling":{"type":"yarn","factor":4,"original_max_position_embeddings":16},
+        "max_position_embeddings":64,
+        "index_n_heads":1,
+        "index_head_dim":128,
+        "index_topk":4,
+        "n_routed_experts":4,
+        "num_experts_per_tok":2,
+        "moe_intermediate_size":128,
+        "n_shared_experts":1,
+        "num_hash_layers":0,
+        "routed_scaling_factor":1.5,
+        "scoring_func":"sqrtsoftplus",
+        "topk_method":"noaux_tc",
+        "swiglu_limit":10.0,
+        "rms_norm_eps":1e-6,
+        "hc_mult":4,
+        "hc_sinkhorn_iters":4,
+        "hc_eps":1e-6,
+        "num_nextn_predict_layers":0
+    }"#;
+
+    #[test]
+    fn sliding_attention_matches_across_prefill_chunk_boundaries() {
+        const WIDTH: usize = 128;
+        let config = Deepseek4ModelConfig::from_json(CONFIG.as_bytes()).expect("config");
+        let attention = test_attention(&config);
+        let compressed = Deepseek4CompressedAttentionWeights::Sliding;
+        let input = (0..5 * WIDTH)
+            .map(|index| (index % 29) as f32 / 17.0 - 0.7)
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let second_device = DeviceBuffer::from_host(&input[3 * WIDTH..]).expect("second input");
+        let rope = DeviceBuffer::from_host(&config.sliding_rope_inv_freq()).expect("rope");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut full_state = Deepseek4SequenceState::new(&config, 8).expect("full state");
+        let mut full_workspace = attention
+            .allocate_workspace(&compressed, &config, 5)
+            .expect("full workspace");
+        let full_output = {
+            let layer = full_state.layer_mut(0).expect("full layer");
+            let mut rows = [Deepseek4AttentionRow {
+                state: layer,
+                rows: 5,
+                position: 0,
+            }];
+            attention
+                .run_rows(
+                    &compressed,
+                    &mut full_workspace,
+                    &mut rows,
+                    &input_device,
+                    &rope,
+                    &config,
+                    &stream,
+                )
+                .expect("full attention")
+                .copy_prefix_to_host(5 * WIDTH, &stream)
+                .expect("full output")
+                .into_vec()
+        };
+
+        let mut split_state = Deepseek4SequenceState::new(&config, 8).expect("split state");
+        let mut split_workspace = attention
+            .allocate_workspace(&compressed, &config, 3)
+            .expect("split workspace");
+        {
+            let layer = split_state.layer_mut(0).expect("first layer");
+            let mut rows = [Deepseek4AttentionRow {
+                state: layer,
+                rows: 3,
+                position: 0,
+            }];
+            attention
+                .run_rows(
+                    &compressed,
+                    &mut split_workspace,
+                    &mut rows,
+                    &input_device,
+                    &rope,
+                    &config,
+                    &stream,
+                )
+                .expect("first attention");
+        }
+        let split_output = {
+            let layer = split_state.layer_mut(0).expect("second layer");
+            let mut rows = [Deepseek4AttentionRow {
+                state: layer,
+                rows: 2,
+                position: 3,
+            }];
+            attention
+                .run_rows(
+                    &compressed,
+                    &mut split_workspace,
+                    &mut rows,
+                    &second_device,
+                    &rope,
+                    &config,
+                    &stream,
+                )
+                .expect("second attention")
+                .copy_prefix_to_host(2 * WIDTH, &stream)
+                .expect("split output")
+                .into_vec()
+        };
+        for (&full, &split) in full_output[3 * WIDTH..].iter().zip(&split_output) {
+            assert!((full - split).abs() < 2.0e-4, "full={full} split={split}");
+        }
+        let layer = split_state.layer(0).expect("split layer");
+        assert_eq!(layer.sliding_len(), 3);
+        assert_eq!(layer.sliding_start(), 2);
+    }
+
+    #[test]
+    fn csa_compressor_matches_across_pending_and_overlap_boundaries() {
+        const WIDTH: usize = 128;
+        const ROWS: usize = 11;
+        let config_json = CONFIG.replace("\"compress_ratios\":[0]", "\"compress_ratios\":[4]");
+        let config = Deepseek4ModelConfig::from_json(config_json.as_bytes()).expect("CSA config");
+        let compressor = test_compressor(&config);
+        let hidden = (0..ROWS * WIDTH)
+            .map(|index| (index % 31) as f32 / 19.0 - 0.8)
+            .collect::<Vec<_>>();
+        let hidden_device = DeviceBuffer::from_host(&hidden).expect("hidden");
+        let second_device = DeviceBuffer::from_host(&hidden[5 * WIDTH..]).expect("second hidden");
+        let rope = DeviceBuffer::from_host(&config.compressed_rope_inv_freq()).expect("rope");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut full_sequence = Deepseek4SequenceState::new(&config, 12).expect("full sequence");
+        let mut full_workspace = compressor.allocate_workspace(ROWS).expect("full workspace");
+        compressor
+            .project_rows(&hidden_device, &mut full_workspace, ROWS, &stream)
+            .expect("full projection");
+        {
+            let state = full_sequence
+                .layer_mut(0)
+                .expect("full layer")
+                .compressor_mut()
+                .expect("full compressor");
+            assert_eq!(
+                compressor
+                    .append_projected_rows(
+                        &mut full_workspace,
+                        state,
+                        0,
+                        ROWS,
+                        &rope,
+                        config.qk_rope_head_dim,
+                        &stream,
+                    )
+                    .expect("full append"),
+                2
+            );
+        }
+
+        let mut split_sequence = Deepseek4SequenceState::new(&config, 12).expect("split sequence");
+        let mut split_workspace = compressor.allocate_workspace(6).expect("split workspace");
+        compressor
+            .project_rows(&hidden_device, &mut split_workspace, 5, &stream)
+            .expect("first projection");
+        {
+            let state = split_sequence
+                .layer_mut(0)
+                .expect("first layer")
+                .compressor_mut()
+                .expect("first compressor");
+            assert_eq!(
+                compressor
+                    .append_projected_rows(
+                        &mut split_workspace,
+                        state,
+                        0,
+                        5,
+                        &rope,
+                        config.qk_rope_head_dim,
+                        &stream,
+                    )
+                    .expect("first append"),
+                1
+            );
+        }
+        compressor
+            .project_rows(&second_device, &mut split_workspace, 6, &stream)
+            .expect("second projection");
+        {
+            let state = split_sequence
+                .layer_mut(0)
+                .expect("second layer")
+                .compressor_mut()
+                .expect("second compressor");
+            assert_eq!(
+                compressor
+                    .append_projected_rows(
+                        &mut split_workspace,
+                        state,
+                        0,
+                        6,
+                        &rope,
+                        config.qk_rope_head_dim,
+                        &stream,
+                    )
+                    .expect("second append"),
+                1
+            );
+        }
+
+        let full = full_sequence
+            .layer(0)
+            .expect("full layer")
+            .compressor()
+            .expect("full compressor");
+        let split = split_sequence
+            .layer(0)
+            .expect("split layer")
+            .compressor()
+            .expect("split compressor");
+        assert_eq!(full.compressed_len(), 2);
+        assert_eq!(split.compressed_len(), 2);
+        assert_eq!(full.pending_len(), 3);
+        assert_eq!(split.pending_len(), 3);
+        let full_values = full
+            .compressed()
+            .copy_prefix_to_host(2 * WIDTH, &stream)
+            .expect("full compressed");
+        let split_values = split
+            .compressed()
+            .copy_prefix_to_host(2 * WIDTH, &stream)
+            .expect("split compressed");
+        for (&full, &split) in full_values.iter().zip(split_values.iter()) {
+            assert!((full - split).abs() < 2.0e-4, "full={full} split={split}");
+        }
+    }
+
+    fn test_attention(config: &Deepseek4ModelConfig) -> Deepseek4AttentionWeights {
+        Deepseek4AttentionWeights {
+            q_a: test_linear(128, 128, 0.5),
+            q_b: test_linear(128, 128, 0.5),
+            kv: test_linear(128, 128, 0.5),
+            o_a: test_linear(128, 128, 0.5),
+            o_b: test_linear(128, 128, 0.5),
+            q_norm: Deepseek4RmsNorm {
+                weight: DeviceBuffer::from_host(&vec![1.0; 128]).expect("q norm"),
+                width: 128,
+                eps: config.rms_norm_eps,
+            },
+            q_b_norm: Deepseek4UnweightedRmsNorm::new(128, config.rms_norm_eps).expect("q b norm"),
+            kv_norm: Deepseek4RmsNorm {
+                weight: DeviceBuffer::from_host(&vec![1.0; 128]).expect("kv norm"),
+                width: 128,
+                eps: config.rms_norm_eps,
+            },
+            sink: DeviceBuffer::from_host(&[0.0]).expect("sink"),
+        }
+    }
+
+    fn test_linear(rows: usize, cols: usize, diagonal: f32) -> Deepseek4BlockFp8Linear {
+        let mut weight = vec![format::cuda_e4m3_code(0.0); rows * cols];
+        for index in 0..rows.min(cols) {
+            weight[index * cols + index] = format::cuda_e4m3_code(diagonal);
+        }
+        Deepseek4BlockFp8Linear::from_host(ModelOptBlockScaledFp8Linear {
+            prefix: "test".to_string(),
+            out_features: rows,
+            in_features: cols,
+            weight,
+            weight_scale: vec![127; (rows / 128) * (cols / 128)],
+        })
+        .expect("linear")
+    }
+
+    fn test_compressor(config: &Deepseek4ModelConfig) -> Deepseek4CompressorWeights {
+        let projected_width = 2 * config.head_dim;
+        Deepseek4CompressorWeights {
+            kv: test_bf16_linear(projected_width, config.hidden_size, 0.25, 0.5),
+            gate: test_bf16_linear(projected_width, config.hidden_size, -0.125, 0.25),
+            position_bias: DeviceBuffer::from_host(
+                &(0..4 * projected_width)
+                    .map(|index| (index % 7) as f32 / 50.0 - 0.05)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("position bias"),
+            norm: Deepseek4RmsNorm {
+                weight: DeviceBuffer::from_host(&vec![1.0; config.head_dim])
+                    .expect("compressor norm"),
+                width: config.head_dim,
+                eps: config.rms_norm_eps,
+            },
+            ratio: 4,
+            projected_width,
+            compressed_width: config.head_dim,
+        }
+    }
+
+    fn test_bf16_linear(
+        rows: usize,
+        cols: usize,
+        first_diagonal: f32,
+        second_diagonal: f32,
+    ) -> Deepseek4Bf16Linear {
+        let mut weight = vec![0u16; rows * cols];
+        for index in 0..rows.min(cols) {
+            weight[index * cols + index] = bf16_bits(first_diagonal);
+        }
+        for index in 0..(rows - cols).min(cols) {
+            weight[(cols + index) * cols + index] = bf16_bits(second_diagonal);
+        }
+        Deepseek4Bf16Linear {
+            weight: DeviceBuffer::from_host(&weight).expect("BF16 weight"),
+            rows,
+            cols,
+        }
+    }
+
+    fn bf16_bits(value: f32) -> u16 {
+        (value.to_bits() >> 16) as u16
     }
 }

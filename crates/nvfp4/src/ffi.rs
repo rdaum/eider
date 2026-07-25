@@ -174,6 +174,44 @@ unsafe extern "C" {
         scaling: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_causal_attention_f32_on_stream(
+        query: *const f32,
+        sliding_tables: *const *const f32,
+        sliding_lengths: *const u32,
+        sliding_starts: *const u32,
+        current_kv: *const f32,
+        current_sequence_starts: *const u32,
+        query_offsets: *const u32,
+        positions: *const u32,
+        compressed_tables: *const *const f32,
+        compressed_lengths: *const u32,
+        selected_indices: *const i32,
+        sinks: *const f32,
+        output: *mut f32,
+        batch_rows: u32,
+        current_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        sliding_capacity: u32,
+        compression_ratio: u32,
+        selected_count: u32,
+        scaling: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_indexer_topk_f32_on_stream(
+        query: *const f32,
+        head_weights: *const f32,
+        compressed_tables: *const *const f32,
+        compressed_lengths: *const u32,
+        positions: *const u32,
+        selected_indices: *mut i32,
+        batch_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        compression_ratio: u32,
+        top_k: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_router_topk_f32_on_stream(
         logits: *const f32,
         bias: *const f32,
@@ -210,6 +248,24 @@ unsafe extern "C" {
         compressed_width: u32,
         overlapping: bool,
         has_prior: bool,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_store_compression_overlap_f32_on_stream(
+        kv: *const f32,
+        gate: *const f32,
+        position_bias: *const f32,
+        overlap_kv: *mut f32,
+        overlap_gate: *mut f32,
+        window: u32,
+        ratio: u32,
+        compressed_width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_arithmetic_positions_u32_on_stream(
+        positions: *mut u32,
+        len: u32,
+        start: u32,
+        stride: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_swiglu_pair_clamped_f32_on_stream(
