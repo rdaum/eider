@@ -59,6 +59,7 @@ pub struct InferenceActorConfig {
     pub deepseek_hot_expert_capacity: usize,
     pub deepseek_hot_expert_cache_dir: Option<PathBuf>,
     pub deepseek_hotset_plan_output: Option<PathBuf>,
+    pub deepseek_hotset_plan_capacity: usize,
     pub step_bf16_storage: Step37Bf16StorageConfig,
     pub nemotron_storage: Nemotron3StorageConfig,
     pub event_capacity: usize,
@@ -78,6 +79,7 @@ impl InferenceActorConfig {
             deepseek_hot_expert_capacity: 1,
             deepseek_hot_expert_cache_dir: None,
             deepseek_hotset_plan_output: None,
+            deepseek_hotset_plan_capacity: 1,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
             nemotron_storage: Nemotron3StorageConfig::default(),
             event_capacity: 256,
@@ -249,6 +251,7 @@ fn actor_main(
         deepseek_hot_expert_capacity,
         deepseek_hot_expert_cache_dir,
         deepseek_hotset_plan_output,
+        deepseek_hotset_plan_capacity,
         step_bf16_storage,
         nemotron_storage,
         ..
@@ -499,7 +502,7 @@ fn actor_main(
             let mut service = DeepseekActorService::new(
                 service,
                 deepseek_hotset_plan_output,
-                deepseek_hot_expert_capacity,
+                deepseek_hotset_plan_capacity,
             );
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }

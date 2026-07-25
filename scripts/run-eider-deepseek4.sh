@@ -13,6 +13,7 @@ max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-32768}"
 prefill_token_capacity="${EIDER_PREFILL_TOKEN_CAPACITY:-2048}"
 hot_expert_capacity="${DEEPSEEK4_HOT_EXPERT_CAPACITY:-8}"
 hotset_plan_output="${DEEPSEEK4_HOTSET_PLAN_OUTPUT:-}"
+hotset_plan_capacity="${DEEPSEEK4_HOTSET_PLAN_CAPACITY:-$hot_expert_capacity}"
 
 if [[ ! -f "$model_dir/model.safetensors.index.json" ]]; then
   echo "DeepSeek V4 thin checkpoint is not prepared: $model_dir" >&2
@@ -30,7 +31,10 @@ deepseek_args=(
   --deepseek-hot-expert-cache-dir "$hot_cache_dir"
 )
 if [[ -n "$hotset_plan_output" ]]; then
-  deepseek_args+=(--deepseek-hotset-plan-output "$hotset_plan_output")
+  deepseek_args+=(
+    --deepseek-hotset-plan-output "$hotset_plan_output"
+    --deepseek-hotset-plan-capacity "$hotset_plan_capacity"
+  )
 fi
 
 exec cargo run --release \

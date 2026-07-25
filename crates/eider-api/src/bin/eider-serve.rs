@@ -201,6 +201,10 @@ struct Args {
     #[arg(long)]
     deepseek_hotset_plan_output: Option<PathBuf>,
 
+    /// Maximum observed experts retained per layer in a DeepSeek V4 hotset plan.
+    #[arg(long)]
+    deepseek_hotset_plan_capacity: Option<usize>,
+
     /// Runtime storage for BF16 Step attention projections.
     #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Nvfp4)]
     step_bf16_attention: StepBf16StorageArg,
@@ -324,6 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     actor_config.deepseek_hot_expert_capacity = args.deepseek_hot_expert_capacity;
     actor_config.deepseek_hot_expert_cache_dir = args.deepseek_hot_expert_cache_dir;
     actor_config.deepseek_hotset_plan_output = args.deepseek_hotset_plan_output;
+    actor_config.deepseek_hotset_plan_capacity = args
+        .deepseek_hotset_plan_capacity
+        .unwrap_or(args.deepseek_hot_expert_capacity);
     actor_config.step_bf16_storage = Step37Bf16StorageConfig {
         attention: args.step_bf16_attention.into(),
         dense_mlp: args.step_bf16_dense_mlp.into(),
