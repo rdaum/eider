@@ -760,14 +760,14 @@ pub fn silu_mul_halves_clamped_f32_batch_into_on_stream(
     let output_len = rows.saturating_mul(cols);
     if rows == 0
         || cols == 0
-        || gate_up.len() != input_len
-        || output.len() != output_len
+        || gate_up.len() < input_len
+        || output.len() < output_len
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "batched clamped SiLU halves buffers",
-            expected: format!("gate_up={input_len} output={output_len}"),
+            expected: format!("gate_up>={input_len} output>={output_len}"),
             actual: format!(
                 "gate_up={} output={} rows={rows} cols={cols}",
                 gate_up.len(),
@@ -11795,9 +11795,12 @@ mod tests {
     fn clamped_silu_halves_matches_step_reference_for_single_and_batch_rows() {
         let stream = CudaStream::new_non_blocking().expect("stream");
         let limit = 7.0f32;
-        let rows = [10.0f32, -10.0, 20.0, -20.0, 2.0, 8.0, -3.0, 9.0];
+        let rows = [
+            10.0f32, -10.0, 20.0, -20.0, 2.0, 8.0, -3.0, 9.0, 91.0, 92.0, 93.0, 94.0,
+        ];
         let input = DeviceBuffer::from_host(&rows).expect("gate/up");
-        let mut batch = DeviceBuffer::zeroed(4).expect("batch output");
+        let mut batch =
+            DeviceBuffer::from_host(&[0.0, 0.0, 0.0, 0.0, 101.0, 102.0]).expect("batch output");
         silu_mul_halves_clamped_f32_batch_into_on_stream(
             &input,
             batch.output(),
@@ -11831,6 +11834,7 @@ mod tests {
         for (actual, expected) in actual.iter().zip(&expected) {
             assert!((actual - expected).abs() <= 1.0e-6);
         }
+        assert_eq!(&actual[4..], [101.0, 102.0]);
         assert_eq!(
             single.copy_to_host(&stream).expect("single readback"),
             actual[..2]
