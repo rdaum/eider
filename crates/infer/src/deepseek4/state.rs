@@ -46,6 +46,11 @@ pub struct Deepseek4SequenceState {
     device_bytes: usize,
 }
 
+/// Compact device checkpoint retained by the shared prompt-prefix cache.
+pub struct Deepseek4SequenceCheckpoint {
+    sequence: Deepseek4SequenceState,
+}
+
 struct Deepseek4SlidingState {
     values: DeviceBuffer<f32>,
     capacity: usize,
@@ -222,6 +227,73 @@ impl Deepseek4CompressionState {
                     .saturating_add(overlap.gate.device_bytes())
             }))
     }
+
+    fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        if self.ratio != source.ratio
+            || self.projected_width != source.projected_width
+            || self.compressed_width != source.compressed_width
+            || self.compressed_capacity < source.compressed_len
+            || self.pending_kv.len() < source.pending_len * source.projected_width
+            || self.pending_gate.len() < source.pending_len * source.projected_width
+            || self.overlap.is_some() != source.overlap.is_some()
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compression checkpoint",
+                expected: format!(
+                    "ratio={} projected={} compressed={} capacity>={}",
+                    source.ratio,
+                    source.projected_width,
+                    source.compressed_width,
+                    source.compressed_len
+                ),
+                actual: format!(
+                    "ratio={} projected={} compressed={} capacity={}",
+                    self.ratio,
+                    self.projected_width,
+                    self.compressed_width,
+                    self.compressed_capacity
+                ),
+            });
+        }
+        self.compressed.copy_range_from_device_on_stream(
+            0,
+            &source.compressed,
+            0,
+            source.compressed_len * source.compressed_width,
+            stream,
+        )?;
+        let pending_values = source.pending_len * source.projected_width;
+        self.pending_kv.copy_range_from_device_on_stream(
+            0,
+            &source.pending_kv,
+            0,
+            pending_values,
+            stream,
+        )?;
+        self.pending_gate.copy_range_from_device_on_stream(
+            0,
+            &source.pending_gate,
+            0,
+            pending_values,
+            stream,
+        )?;
+        if let (Some(target), Some(source)) = (&mut self.overlap, &source.overlap) {
+            if source.valid {
+                target
+                    .kv
+                    .copy_prefix_from_device_on_stream(&source.kv, source.kv.len(), stream)?;
+                target.gate.copy_prefix_from_device_on_stream(
+                    &source.gate,
+                    source.gate.len(),
+                    stream,
+                )?;
+            }
+            target.valid = source.valid;
+        }
+        self.compressed_len = source.compressed_len;
+        self.pending_len = source.pending_len;
+        Ok(())
+    }
 }
 
 impl Deepseek4SlidingState {
@@ -311,6 +383,24 @@ impl Deepseek4SlidingState {
 
     fn device_bytes(&self) -> usize {
         self.values.device_bytes()
+    }
+
+    fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        if self.capacity != source.capacity || self.width != source.width {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 sliding checkpoint",
+                expected: format!("capacity={} width={}", source.capacity, source.width),
+                actual: format!("capacity={} width={}", self.capacity, self.width),
+            });
+        }
+        self.values.copy_prefix_from_device_on_stream(
+            &source.values,
+            source.values.len(),
+            stream,
+        )?;
+        self.len = source.len;
+        self.start = source.start;
+        Ok(())
     }
 }
 
@@ -434,6 +524,38 @@ impl Deepseek4LayerSequenceState {
                 }
             }
     }
+
+    fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        self.sliding.copy_from_on_stream(&source.sliding, stream)?;
+        match (&mut self.compression, &source.compression) {
+            (Deepseek4LayerCompressionState::Sliding, Deepseek4LayerCompressionState::Sliding) => {
+                Ok(())
+            }
+            (
+                Deepseek4LayerCompressionState::CompressedSparse {
+                    compressor,
+                    indexer,
+                },
+                Deepseek4LayerCompressionState::CompressedSparse {
+                    compressor: source_compressor,
+                    indexer: source_indexer,
+                },
+            ) => {
+                compressor.copy_from_on_stream(source_compressor, stream)?;
+                indexer.copy_from_on_stream(source_indexer, stream)
+            }
+            (
+                Deepseek4LayerCompressionState::HeavilyCompressed { compressor },
+                Deepseek4LayerCompressionState::HeavilyCompressed {
+                    compressor: source_compressor,
+                },
+            ) => compressor.copy_from_on_stream(source_compressor, stream),
+            _ => Err(Error::Format {
+                label: "DeepSeek V4 layer checkpoint",
+                detail: "attention kinds do not match".to_string(),
+            }),
+        }
+    }
 }
 
 impl Deepseek4SequenceState {
@@ -504,6 +626,70 @@ impl Deepseek4SequenceState {
     pub fn device_bytes(&self) -> usize {
         self.device_bytes
     }
+
+    pub(crate) fn checkpoint_on_stream(
+        &self,
+        config: &Deepseek4ModelConfig,
+        stream: &CudaStream,
+    ) -> Result<Deepseek4SequenceCheckpoint> {
+        if self.position == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 sequence checkpoint",
+                expected: "non-empty sequence".to_string(),
+                actual: "position=0".to_string(),
+            });
+        }
+        let mut sequence = Self::new(config, self.position)?;
+        sequence.copy_from_on_stream(self, stream)?;
+        Ok(Deepseek4SequenceCheckpoint { sequence })
+    }
+
+    pub(crate) fn restore_checkpoint_on_stream(
+        config: &Deepseek4ModelConfig,
+        checkpoint: &Deepseek4SequenceCheckpoint,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        if checkpoint.position() > max_tokens {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 checkpoint restore",
+                expected: format!("checkpoint position <= {max_tokens}"),
+                actual: checkpoint.position().to_string(),
+            });
+        }
+        let mut sequence = Self::new(config, max_tokens)?;
+        sequence.copy_from_on_stream(&checkpoint.sequence, stream)?;
+        Ok(sequence)
+    }
+
+    fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        if self.layers.len() != source.layers.len() || self.max_tokens < source.position {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 sequence checkpoint",
+                expected: format!(
+                    "layers={} capacity>={}",
+                    source.layers.len(),
+                    source.position
+                ),
+                actual: format!("layers={} capacity={}", self.layers.len(), self.max_tokens),
+            });
+        }
+        for (target, source) in self.layers.iter_mut().zip(&source.layers) {
+            target.copy_from_on_stream(source, stream)?;
+        }
+        self.position = source.position;
+        Ok(())
+    }
+}
+
+impl Deepseek4SequenceCheckpoint {
+    pub fn position(&self) -> usize {
+        self.sequence.position()
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.sequence.device_bytes()
+    }
 }
 
 fn state_overflow(label: &'static str, left: usize, right: usize) -> Error {
@@ -565,5 +751,75 @@ mod tests {
         assert_eq!(state.append_compressed_len(2).expect("append"), 0);
         assert_eq!(state.append_compressed_len(2).expect("append"), 2);
         assert!(state.append_compressed_len(1).is_err());
+    }
+
+    #[test]
+    fn compression_checkpoint_preserves_completed_pending_and_overlap_state() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut source =
+            Deepseek4CompressionState::new(4, 2, true, 16).expect("source compression");
+        source
+            .compressed
+            .copy_from_host(&[1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0])
+            .expect("compressed values");
+        source
+            .pending_kv
+            .copy_from_host(&[
+                5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ])
+            .expect("pending kv");
+        source
+            .pending_gate
+            .copy_from_host(&[
+                -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, -11.0, -12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0,
+            ])
+            .expect("pending gate");
+        let overlap = source.overlap.as_mut().expect("overlap");
+        overlap
+            .kv
+            .copy_from_host(&[13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0])
+            .expect("overlap kv");
+        overlap
+            .gate
+            .copy_from_host(&[-13.0, -14.0, -15.0, -16.0, -17.0, -18.0, -19.0, -20.0])
+            .expect("overlap gate");
+        overlap.valid = true;
+        source.compressed_len = 2;
+        source.pending_len = 2;
+
+        let mut restored =
+            Deepseek4CompressionState::new(4, 2, true, 32).expect("restored compression");
+        restored
+            .copy_from_on_stream(&source, &stream)
+            .expect("copy checkpoint");
+        assert_eq!(restored.compressed_len, 2);
+        assert_eq!(restored.pending_len, 2);
+        assert_eq!(
+            restored
+                .compressed
+                .copy_prefix_to_host(4, &stream)
+                .expect("compressed read")
+                .as_slice(),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            restored
+                .pending_kv
+                .copy_prefix_to_host(8, &stream)
+                .expect("pending read")
+                .as_slice(),
+            &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
+        let overlap = restored.overlap.as_ref().expect("restored overlap");
+        assert!(overlap.valid);
+        assert_eq!(
+            overlap
+                .kv
+                .copy_to_host(&stream)
+                .expect("overlap read")
+                .as_slice(),
+            &[13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        );
     }
 }

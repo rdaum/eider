@@ -1,6 +1,7 @@
 use super::{
     Deepseek4AttentionKind, Deepseek4CompressionState, Deepseek4ExpertLayer,
     Deepseek4ExpertWorkspace, Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
+    Deepseek4SequenceCheckpoint, Deepseek4SequenceState,
 };
 use crate::nvfp4::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear,
@@ -8,8 +9,9 @@ use crate::nvfp4::{
     arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
     causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
-    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
-    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, hyper_apply_f32_batch_into_on_stream,
+    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
+    indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
     store_compression_overlap_f32_into_on_stream, swiglu_pair_clamped_f32_batch_into_on_stream,
@@ -1151,6 +1153,15 @@ pub struct Deepseek4AttentionWorkspace {
 }
 
 enum Deepseek4AttentionCompressionWorkspace {
+    Single(Deepseek4SingleAttentionCompressionWorkspace),
+    All {
+        csa_compressor: Deepseek4CompressorWorkspace,
+        csa_indexer: Box<Deepseek4IndexerWorkspace>,
+        hca_compressor: Deepseek4CompressorWorkspace,
+    },
+}
+
+enum Deepseek4SingleAttentionCompressionWorkspace {
     Sliding,
     CompressedSparse {
         compressor: Deepseek4CompressorWorkspace,
@@ -1267,16 +1278,14 @@ impl Deepseek4AttentionWeights {
                 actual: format!("batch={batch_capacity} sliding={}", config.sliding_window),
             });
         }
-        let query_width = config.num_attention_heads * config.head_dim;
-        let grouped_width = config.o_groups * config.o_lora_rank;
         let compression = match compressed {
             Deepseek4CompressedAttentionWeights::Sliding => {
-                Deepseek4AttentionCompressionWorkspace::Sliding
+                Deepseek4SingleAttentionCompressionWorkspace::Sliding
             }
             Deepseek4CompressedAttentionWeights::CompressedSparse {
                 compressor,
                 indexer,
-            } => Deepseek4AttentionCompressionWorkspace::CompressedSparse {
+            } => Deepseek4SingleAttentionCompressionWorkspace::CompressedSparse {
                 compressor: compressor.allocate_workspace(batch_capacity)?,
                 indexer: Box::new(indexer.allocate_workspace(
                     batch_capacity,
@@ -1286,27 +1295,69 @@ impl Deepseek4AttentionWeights {
                 )?),
             },
             Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor } => {
-                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed {
+                Deepseek4SingleAttentionCompressionWorkspace::HeavilyCompressed {
                     compressor: compressor.allocate_workspace(batch_capacity)?,
                 }
             }
         };
-        Ok(Deepseek4AttentionWorkspace {
-            q_a: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
-            q_residual: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
-            query: DeviceBuffer::zeroed(batch_capacity * query_width)?,
-            kv: DeviceBuffer::zeroed(batch_capacity * config.head_dim)?,
-            attended: DeviceBuffer::zeroed(batch_capacity * query_width)?,
-            grouped: DeviceBuffer::zeroed(batch_capacity * grouped_width)?,
-            output: DeviceBuffer::zeroed(batch_capacity * config.hidden_size)?,
-            metadata: Deepseek4AttentionMetadata::new(batch_capacity)?,
-            index_metadata: Deepseek4CompressedMetadata::new(batch_capacity)?,
-            compression,
+        Deepseek4AttentionWorkspace::new(
+            config,
             batch_capacity,
-            heads: config.num_attention_heads,
-            head_dim: config.head_dim,
-            sliding_capacity: config.sliding_window - 1,
-        })
+            Deepseek4AttentionCompressionWorkspace::Single(compression),
+        )
+    }
+
+    fn allocate_all_kinds_workspace(
+        config: &Deepseek4ModelConfig,
+        layers: &[Deepseek4ResidentLayer],
+        batch_capacity: usize,
+    ) -> Result<Deepseek4AttentionWorkspace> {
+        let csa = layers.iter().find_map(|layer| {
+            if let Deepseek4CompressedAttentionWeights::CompressedSparse {
+                compressor,
+                indexer,
+            } = &layer.compressed_attention
+            {
+                Some((compressor, indexer.as_ref()))
+            } else {
+                None
+            }
+        });
+        let hca = layers.iter().find_map(|layer| {
+            if let Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor } =
+                &layer.compressed_attention
+            {
+                Some(compressor)
+            } else {
+                None
+            }
+        });
+        let Some((csa_compressor, csa_indexer)) = csa else {
+            return Err(Error::Format {
+                label: "DeepSeek V4 attention workspace",
+                detail: "model has no compressed-sparse layer".to_string(),
+            });
+        };
+        let Some(hca_compressor) = hca else {
+            return Err(Error::Format {
+                label: "DeepSeek V4 attention workspace",
+                detail: "model has no heavily-compressed layer".to_string(),
+            });
+        };
+        Deepseek4AttentionWorkspace::new(
+            config,
+            batch_capacity,
+            Deepseek4AttentionCompressionWorkspace::All {
+                csa_compressor: csa_compressor.allocate_workspace(batch_capacity)?,
+                csa_indexer: Box::new(csa_indexer.allocate_workspace(
+                    batch_capacity,
+                    config.index_heads,
+                    config.index_head_dim,
+                    config.index_topk,
+                )?),
+                hca_compressor: hca_compressor.allocate_workspace(batch_capacity)?,
+            },
+        )
     }
 
     /// Runs exact ragged causal attention and commits every sequence cache.
@@ -1380,12 +1431,19 @@ impl Deepseek4AttentionWeights {
             stream,
         )?;
 
+        let q_residual = &workspace.q_residual;
+        let positions = &workspace.metadata.positions.device;
+        let compressed_metadata = &mut workspace.metadata.compressed;
+        let index_metadata = &mut workspace.index_metadata;
         let compression_ratio = match (compressed_weights, &mut workspace.compression) {
             (
                 Deepseek4CompressedAttentionWeights::Sliding,
-                Deepseek4AttentionCompressionWorkspace::Sliding,
+                Deepseek4AttentionCompressionWorkspace::Single(
+                    Deepseek4SingleAttentionCompressionWorkspace::Sliding,
+                )
+                | Deepseek4AttentionCompressionWorkspace::All { .. },
             ) => {
-                fill_sliding_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
+                fill_sliding_compressed_metadata(compressed_metadata, rows)?;
                 0
             }
             (
@@ -1393,71 +1451,86 @@ impl Deepseek4AttentionWeights {
                     compressor,
                     indexer,
                 },
-                Deepseek4AttentionCompressionWorkspace::CompressedSparse {
-                    compressor: compressor_workspace,
-                    indexer: indexer_workspace,
-                },
-            ) => {
-                compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
-                indexer.project_rows(
-                    hidden,
-                    &workspace.q_residual,
-                    &workspace.metadata.positions.device,
-                    rope_inv_freq,
-                    config.qk_rope_head_dim,
-                    indexer_workspace,
-                    batch_rows,
-                    stream,
-                )?;
-                append_compressed_rows(
+                Deepseek4AttentionCompressionWorkspace::Single(
+                    Deepseek4SingleAttentionCompressionWorkspace::CompressedSparse {
+                        compressor: compressor_workspace,
+                        indexer: indexer_workspace,
+                    },
+                ),
+            ) => run_csa_compression(
+                compressor,
+                indexer,
+                compressor_workspace,
+                indexer_workspace,
+                rows,
+                hidden,
+                q_residual,
+                positions,
+                compressed_metadata,
+                index_metadata,
+                rope_inv_freq,
+                config,
+                batch_rows,
+                stream,
+            )?,
+            (
+                Deepseek4CompressedAttentionWeights::CompressedSparse {
                     compressor,
-                    compressor_workspace,
-                    rows,
-                    rope_inv_freq,
-                    config.qk_rope_head_dim,
-                    false,
-                    stream,
-                )?;
-                append_index_rows(
                     indexer,
-                    indexer_workspace,
-                    rows,
-                    rope_inv_freq,
-                    config.qk_rope_head_dim,
-                    stream,
-                )?;
-                fill_index_metadata(&mut workspace.index_metadata, rows)?;
-                workspace.index_metadata.upload(stream)?;
-                indexer.select_rows(
-                    indexer_workspace,
-                    &workspace.index_metadata.tables.device,
-                    &workspace.index_metadata.lengths.device,
-                    &workspace.metadata.positions.device,
-                    batch_rows,
-                    stream,
-                )?;
-                fill_main_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
-                compressor.ratio
-            }
+                },
+                Deepseek4AttentionCompressionWorkspace::All {
+                    csa_compressor,
+                    csa_indexer,
+                    ..
+                },
+            ) => run_csa_compression(
+                compressor,
+                indexer,
+                csa_compressor,
+                csa_indexer,
+                rows,
+                hidden,
+                q_residual,
+                positions,
+                compressed_metadata,
+                index_metadata,
+                rope_inv_freq,
+                config,
+                batch_rows,
+                stream,
+            )?,
             (
                 Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor },
-                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed {
-                    compressor: compressor_workspace,
-                },
-            ) => {
-                compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
-                append_compressed_rows(
-                    compressor,
-                    compressor_workspace,
-                    rows,
-                    rope_inv_freq,
-                    config.qk_rope_head_dim,
-                    false,
-                    stream,
-                )?;
-                fill_main_compressed_metadata(&mut workspace.metadata.compressed, rows)?;
-                compressor.ratio
-            }
+                Deepseek4AttentionCompressionWorkspace::Single(
+                    Deepseek4SingleAttentionCompressionWorkspace::HeavilyCompressed {
+                        compressor: compressor_workspace,
+                    },
+                ),
+            ) => run_hca_compression(
+                compressor,
+                compressor_workspace,
+                rows,
+                hidden,
+                compressed_metadata,
+                rope_inv_freq,
+                config,
+                batch_rows,
+                stream,
+            )?,
+            (
+                Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor },
+                Deepseek4AttentionCompressionWorkspace::All { hca_compressor, .. },
+            ) => run_hca_compression(
+                compressor,
+                hca_compressor,
+                rows,
+                hidden,
+                compressed_metadata,
+                rope_inv_freq,
+                config,
+                batch_rows,
+                stream,
+            )?,
             _ => {
                 return Err(Error::Shape {
                     label: "DeepSeek V4 attention workspace kind",
@@ -1468,11 +1541,22 @@ impl Deepseek4AttentionWeights {
         };
         workspace.metadata.compressed.upload(stream)?;
         let selected = match &workspace.compression {
-            Deepseek4AttentionCompressionWorkspace::CompressedSparse { indexer, .. } => {
-                Some(indexer.selected())
+            Deepseek4AttentionCompressionWorkspace::Single(
+                Deepseek4SingleAttentionCompressionWorkspace::CompressedSparse { indexer, .. },
+            ) => Some(indexer.selected()),
+            Deepseek4AttentionCompressionWorkspace::All { csa_indexer, .. }
+                if matches!(
+                    compressed_weights,
+                    Deepseek4CompressedAttentionWeights::CompressedSparse { .. }
+                ) =>
+            {
+                Some(csa_indexer.selected())
             }
-            Deepseek4AttentionCompressionWorkspace::Sliding
-            | Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { .. } => None,
+            Deepseek4AttentionCompressionWorkspace::Single(
+                Deepseek4SingleAttentionCompressionWorkspace::Sliding
+                | Deepseek4SingleAttentionCompressionWorkspace::HeavilyCompressed { .. },
+            )
+            | Deepseek4AttentionCompressionWorkspace::All { .. } => None,
         };
         causal_attention_f32_batch_into_on_stream(
             &workspace.query,
@@ -1532,6 +1616,31 @@ impl Deepseek4AttentionWeights {
 }
 
 impl Deepseek4AttentionWorkspace {
+    fn new(
+        config: &Deepseek4ModelConfig,
+        batch_capacity: usize,
+        compression: Deepseek4AttentionCompressionWorkspace,
+    ) -> Result<Self> {
+        let query_width = config.num_attention_heads * config.head_dim;
+        let grouped_width = config.o_groups * config.o_lora_rank;
+        Ok(Deepseek4AttentionWorkspace {
+            q_a: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
+            q_residual: DeviceBuffer::zeroed(batch_capacity * config.q_lora_rank)?,
+            query: DeviceBuffer::zeroed(batch_capacity * query_width)?,
+            kv: DeviceBuffer::zeroed(batch_capacity * config.head_dim)?,
+            attended: DeviceBuffer::zeroed(batch_capacity * query_width)?,
+            grouped: DeviceBuffer::zeroed(batch_capacity * grouped_width)?,
+            output: DeviceBuffer::zeroed(batch_capacity * config.hidden_size)?,
+            metadata: Deepseek4AttentionMetadata::new(batch_capacity)?,
+            index_metadata: Deepseek4CompressedMetadata::new(batch_capacity)?,
+            compression,
+            batch_capacity,
+            heads: config.num_attention_heads,
+            head_dim: config.head_dim,
+            sliding_capacity: config.sliding_window - 1,
+        })
+    }
+
     pub fn device_bytes(&self) -> usize {
         self.q_a
             .device_bytes()
@@ -1543,18 +1652,7 @@ impl Deepseek4AttentionWorkspace {
             .saturating_add(self.output.device_bytes())
             .saturating_add(self.metadata.device_bytes())
             .saturating_add(self.index_metadata.device_bytes())
-            .saturating_add(match &self.compression {
-                Deepseek4AttentionCompressionWorkspace::Sliding => 0,
-                Deepseek4AttentionCompressionWorkspace::CompressedSparse {
-                    compressor,
-                    indexer,
-                } => compressor
-                    .device_bytes()
-                    .saturating_add(indexer.device_bytes()),
-                Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { compressor } => {
-                    compressor.device_bytes()
-                }
-            })
+            .saturating_add(self.compression.device_bytes())
     }
 }
 
@@ -1744,6 +1842,116 @@ fn append_index_rows(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_csa_compression(
+    compressor: &Deepseek4CompressorWeights,
+    indexer: &Deepseek4IndexerWeights,
+    compressor_workspace: &mut Deepseek4CompressorWorkspace,
+    indexer_workspace: &mut Deepseek4IndexerWorkspace,
+    rows: &mut [Deepseek4AttentionRow<'_>],
+    hidden: &DeviceBuffer<f32>,
+    q_residual: &DeviceBuffer<f32>,
+    positions: &DeviceBuffer<u32>,
+    compressed_metadata: &mut Deepseek4CompressedMetadata,
+    index_metadata: &mut Deepseek4CompressedMetadata,
+    rope_inv_freq: &DeviceBuffer<f32>,
+    config: &Deepseek4ModelConfig,
+    batch_rows: usize,
+    stream: &CudaStream,
+) -> Result<usize> {
+    compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
+    indexer.project_rows(
+        hidden,
+        q_residual,
+        positions,
+        rope_inv_freq,
+        config.qk_rope_head_dim,
+        indexer_workspace,
+        batch_rows,
+        stream,
+    )?;
+    append_compressed_rows(
+        compressor,
+        compressor_workspace,
+        rows,
+        rope_inv_freq,
+        config.qk_rope_head_dim,
+        false,
+        stream,
+    )?;
+    append_index_rows(
+        indexer,
+        indexer_workspace,
+        rows,
+        rope_inv_freq,
+        config.qk_rope_head_dim,
+        stream,
+    )?;
+    fill_index_metadata(index_metadata, rows)?;
+    index_metadata.upload(stream)?;
+    indexer.select_rows(
+        indexer_workspace,
+        &index_metadata.tables.device,
+        &index_metadata.lengths.device,
+        positions,
+        batch_rows,
+        stream,
+    )?;
+    fill_main_compressed_metadata(compressed_metadata, rows)?;
+    Ok(compressor.ratio)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hca_compression(
+    compressor: &Deepseek4CompressorWeights,
+    compressor_workspace: &mut Deepseek4CompressorWorkspace,
+    rows: &mut [Deepseek4AttentionRow<'_>],
+    hidden: &DeviceBuffer<f32>,
+    compressed_metadata: &mut Deepseek4CompressedMetadata,
+    rope_inv_freq: &DeviceBuffer<f32>,
+    config: &Deepseek4ModelConfig,
+    batch_rows: usize,
+    stream: &CudaStream,
+) -> Result<usize> {
+    compressor.project_rows(hidden, compressor_workspace, batch_rows, stream)?;
+    append_compressed_rows(
+        compressor,
+        compressor_workspace,
+        rows,
+        rope_inv_freq,
+        config.qk_rope_head_dim,
+        false,
+        stream,
+    )?;
+    fill_main_compressed_metadata(compressed_metadata, rows)?;
+    Ok(compressor.ratio)
+}
+
+impl Deepseek4AttentionCompressionWorkspace {
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Single(Deepseek4SingleAttentionCompressionWorkspace::Sliding) => 0,
+            Self::Single(Deepseek4SingleAttentionCompressionWorkspace::CompressedSparse {
+                compressor,
+                indexer,
+            }) => compressor
+                .device_bytes()
+                .saturating_add(indexer.device_bytes()),
+            Self::Single(Deepseek4SingleAttentionCompressionWorkspace::HeavilyCompressed {
+                compressor,
+            }) => compressor.device_bytes(),
+            Self::All {
+                csa_compressor,
+                csa_indexer,
+                hca_compressor,
+            } => csa_compressor
+                .device_bytes()
+                .saturating_add(csa_indexer.device_bytes())
+                .saturating_add(hca_compressor.device_bytes()),
+        }
+    }
+}
+
 fn compressed_attention_name(weights: &Deepseek4CompressedAttentionWeights) -> &'static str {
     match weights {
         Deepseek4CompressedAttentionWeights::Sliding => "sliding",
@@ -1754,9 +1962,16 @@ fn compressed_attention_name(weights: &Deepseek4CompressedAttentionWeights) -> &
 
 fn compressed_workspace_name(workspace: &Deepseek4AttentionCompressionWorkspace) -> &'static str {
     match workspace {
-        Deepseek4AttentionCompressionWorkspace::Sliding => "sliding",
-        Deepseek4AttentionCompressionWorkspace::CompressedSparse { .. } => "compressed sparse",
-        Deepseek4AttentionCompressionWorkspace::HeavilyCompressed { .. } => "heavily compressed",
+        Deepseek4AttentionCompressionWorkspace::Single(
+            Deepseek4SingleAttentionCompressionWorkspace::Sliding,
+        ) => "sliding",
+        Deepseek4AttentionCompressionWorkspace::Single(
+            Deepseek4SingleAttentionCompressionWorkspace::CompressedSparse { .. },
+        ) => "compressed sparse",
+        Deepseek4AttentionCompressionWorkspace::Single(
+            Deepseek4SingleAttentionCompressionWorkspace::HeavilyCompressed { .. },
+        ) => "heavily compressed",
+        Deepseek4AttentionCompressionWorkspace::All { .. } => "all layer kinds",
     }
 }
 
@@ -2091,7 +2306,6 @@ pub struct Deepseek4LayerWorkspace {
     ffn: Deepseek4FfnWorkspace,
     normalized: DeviceBuffer<f32>,
     after_attention: DeviceBuffer<f32>,
-    output: DeviceBuffer<f32>,
     batch_capacity: usize,
     hidden: usize,
 }
@@ -2168,22 +2382,27 @@ impl Deepseek4ResidentLayer {
         config: &Deepseek4ModelConfig,
         batch_capacity: usize,
     ) -> Result<Deepseek4LayerWorkspace> {
+        let attention = self.attention.allocate_workspace(
+            &self.compressed_attention,
+            config,
+            batch_capacity,
+        )?;
+        self.allocate_layer_workspace_with_attention(config, batch_capacity, attention)
+    }
+
+    fn allocate_layer_workspace_with_attention(
+        &self,
+        config: &Deepseek4ModelConfig,
+        batch_capacity: usize,
+        attention: Deepseek4AttentionWorkspace,
+    ) -> Result<Deepseek4LayerWorkspace> {
         Ok(Deepseek4LayerWorkspace {
             attention_hyper: self.attention_hyper.allocate_workspace(batch_capacity)?,
             ffn_hyper: self.ffn_hyper.allocate_workspace(batch_capacity)?,
-            attention: self.attention.allocate_workspace(
-                &self.compressed_attention,
-                config,
-                batch_capacity,
-            )?,
+            attention,
             ffn: self.allocate_ffn_workspace(config, batch_capacity)?,
             normalized: DeviceBuffer::zeroed(batch_capacity.saturating_mul(config.hidden_size))?,
             after_attention: DeviceBuffer::zeroed(
-                batch_capacity
-                    .saturating_mul(HYPER_STREAMS)
-                    .saturating_mul(config.hidden_size),
-            )?,
-            output: DeviceBuffer::zeroed(
                 batch_capacity
                     .saturating_mul(HYPER_STREAMS)
                     .saturating_mul(config.hidden_size),
@@ -2195,19 +2414,30 @@ impl Deepseek4ResidentLayer {
 
     /// Runs both mHC sites, exact attention, and shared plus routed MoE.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_layer_rows<'a>(
+    pub fn run_layer_rows(
         &self,
         routed_experts: &mut Deepseek4ExpertLayer,
-        workspace: &'a mut Deepseek4LayerWorkspace,
+        workspace: &mut Deepseek4LayerWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         streams: &DeviceBuffer<f32>,
         token_ids: &DeviceBuffer<u32>,
         rope_inv_freq: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
         config: &Deepseek4ModelConfig,
         stream: &CudaStream,
-    ) -> Result<&'a DeviceBuffer<f32>> {
+    ) -> Result<()> {
         let batch_rows = validate_attention_rows(rows, workspace.batch_capacity)?;
         workspace.validate(batch_rows, config.hidden_size)?;
+        let output_len = batch_rows
+            .saturating_mul(HYPER_STREAMS)
+            .saturating_mul(config.hidden_size);
+        if output.len() < output_len {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 layer output",
+                expected: format!("at least {output_len} values"),
+                actual: output.len().to_string(),
+            });
+        }
         self.attention_hyper.prepare_rows(
             streams,
             &mut workspace.attention_hyper,
@@ -2262,11 +2492,11 @@ impl Deepseek4ResidentLayer {
             &workspace.after_attention,
             ffn_output,
             &workspace.ffn_hyper,
-            &mut workspace.output,
+            output,
             batch_rows,
             stream,
         )?;
-        Ok(&workspace.output)
+        Ok(())
     }
 
     /// Runs the exact shared plus routed DeepSeek MoE branch.
@@ -2339,7 +2569,6 @@ impl Deepseek4LayerWorkspace {
             .saturating_add(self.ffn.device_bytes())
             .saturating_add(self.normalized.device_bytes())
             .saturating_add(self.after_attention.device_bytes())
-            .saturating_add(self.output.device_bytes())
     }
 }
 
@@ -2460,6 +2689,379 @@ impl Deepseek4ModelWeights {
             .saturating_add(self.sliding_rope_inv_freq.device_bytes())
             .saturating_add(self.compressed_rope_inv_freq.device_bytes())
     }
+}
+
+/// One contiguous sequence chunk for a complete DeepSeek model step.
+pub struct Deepseek4BatchRow<'tokens, 'state> {
+    /// Tokens appended to this sequence.
+    pub token_ids: &'tokens [u32],
+    /// Persistent attention and compression state updated by the step.
+    pub state: &'state mut Deepseek4SequenceState,
+}
+
+/// Device-resident final-token logits in the same order as the input rows.
+pub struct Deepseek4LogitsBatch<'a> {
+    logits: &'a DeviceBuffer<f32>,
+    rows: usize,
+    vocab: usize,
+}
+
+impl Deepseek4LogitsBatch<'_> {
+    pub fn logits(&self) -> &DeviceBuffer<f32> {
+        self.logits
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+}
+
+/// Shared scratch for ragged prefill and one-token decode batches.
+pub struct Deepseek4BatchWorkspace {
+    stream: CudaStream,
+    token_ids: DeviceBuffer<u32>,
+    host_token_ids: Vec<u32>,
+    embedding: DeviceBuffer<f32>,
+    streams: DeviceBuffer<f32>,
+    next_streams: DeviceBuffer<f32>,
+    final_streams: DeviceBuffer<f32>,
+    final_hidden: DeviceBuffer<f32>,
+    final_normed: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    layer: Deepseek4LayerWorkspace,
+    sequence_capacity: usize,
+    token_capacity: usize,
+    max_context_tokens: usize,
+}
+
+impl Deepseek4BatchWorkspace {
+    pub fn device_bytes(&self) -> usize {
+        self.token_ids
+            .device_bytes()
+            .saturating_add(self.embedding.device_bytes())
+            .saturating_add(self.streams.device_bytes())
+            .saturating_add(self.next_streams.device_bytes())
+            .saturating_add(self.final_streams.device_bytes())
+            .saturating_add(self.final_hidden.device_bytes())
+            .saturating_add(self.final_normed.device_bytes())
+            .saturating_add(self.logits.device_bytes())
+            .saturating_add(self.layer.device_bytes())
+    }
+}
+
+/// Complete DeepSeek V4 text model with resident non-expert weights and Q2 experts.
+pub struct Deepseek4TextModel {
+    pub weights: Deepseek4ModelWeights,
+    routed_experts: Vec<Deepseek4ExpertLayer>,
+}
+
+impl Deepseek4TextModel {
+    /// Loads the thin resident checkpoint and every prepared routed-expert table.
+    pub fn load(
+        model_dir: impl AsRef<Path>,
+        expert_artifact_dir: impl AsRef<Path>,
+        hot_capacity_per_layer: usize,
+    ) -> Result<Self> {
+        let weights = Deepseek4ModelWeights::load(model_dir)?;
+        let manifest = Deepseek4Manifest::from(&weights.config);
+        let mut routed_experts = Vec::with_capacity(manifest.layers);
+        for layer in 0..manifest.layers {
+            routed_experts.push(Deepseek4ExpertLayer::load(
+                expert_artifact_dir.as_ref(),
+                &manifest,
+                layer,
+                hot_capacity_per_layer,
+            )?);
+        }
+        Ok(Self {
+            weights,
+            routed_experts,
+        })
+    }
+
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Deepseek4SequenceState> {
+        Deepseek4SequenceState::new(&self.weights.config, max_tokens)
+    }
+
+    pub fn checkpoint_sequence(
+        &self,
+        source: &Deepseek4SequenceState,
+        workspace: &Deepseek4BatchWorkspace,
+    ) -> Result<Deepseek4SequenceCheckpoint> {
+        let checkpoint = source.checkpoint_on_stream(&self.weights.config, &workspace.stream)?;
+        workspace.stream.synchronize()?;
+        Ok(checkpoint)
+    }
+
+    pub fn restore_sequence_checkpoint(
+        &self,
+        checkpoint: &Deepseek4SequenceCheckpoint,
+        max_tokens: usize,
+        workspace: &Deepseek4BatchWorkspace,
+    ) -> Result<Deepseek4SequenceState> {
+        let state = Deepseek4SequenceState::restore_checkpoint_on_stream(
+            &self.weights.config,
+            checkpoint,
+            max_tokens,
+            &workspace.stream,
+        )?;
+        workspace.stream.synchronize()?;
+        Ok(state)
+    }
+
+    pub fn new_batch_workspace(
+        &self,
+        sequence_capacity: usize,
+        token_capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<Deepseek4BatchWorkspace> {
+        if sequence_capacity == 0
+            || token_capacity == 0
+            || max_context_tokens == 0
+            || max_context_tokens > self.weights.config.max_position_embeddings
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 batch workspace",
+                expected: format!(
+                    "positive capacities and context <= {}",
+                    self.weights.config.max_position_embeddings
+                ),
+                actual: format!(
+                    "sequences={sequence_capacity} tokens={token_capacity} context={max_context_tokens}"
+                ),
+            });
+        }
+        let config = &self.weights.config;
+        let attention = Deepseek4AttentionWeights::allocate_all_kinds_workspace(
+            config,
+            &self.weights.layers,
+            token_capacity,
+        )?;
+        let first_layer = self.weights.layers.first().ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 model",
+            detail: "model has no decoder layers".to_string(),
+        })?;
+        let layer = first_layer.allocate_layer_workspace_with_attention(
+            config,
+            token_capacity,
+            attention,
+        )?;
+        let stream_values = token_capacity
+            .saturating_mul(HYPER_STREAMS)
+            .saturating_mul(config.hidden_size);
+        Ok(Deepseek4BatchWorkspace {
+            stream: CudaStream::new_blocking()?,
+            token_ids: DeviceBuffer::zeroed(token_capacity)?,
+            host_token_ids: vec![0; token_capacity],
+            embedding: DeviceBuffer::zeroed(token_capacity * config.hidden_size)?,
+            streams: DeviceBuffer::zeroed(stream_values)?,
+            next_streams: DeviceBuffer::zeroed(stream_values)?,
+            final_streams: DeviceBuffer::zeroed(
+                sequence_capacity * HYPER_STREAMS * config.hidden_size,
+            )?,
+            final_hidden: DeviceBuffer::zeroed(sequence_capacity * config.hidden_size)?,
+            final_normed: DeviceBuffer::zeroed(sequence_capacity * config.hidden_size)?,
+            logits: DeviceBuffer::zeroed(sequence_capacity * config.vocab_size)?,
+            layer,
+            sequence_capacity,
+            token_capacity,
+            max_context_tokens,
+        })
+    }
+
+    /// Executes the exact embedding, decoder, hyper-head, norm, and LM-head path.
+    ///
+    /// Only the final token of each ragged row is projected to logits.
+    pub fn forward_batch<'a>(
+        &mut self,
+        workspace: &'a mut Deepseek4BatchWorkspace,
+        rows: &mut [Deepseek4BatchRow<'_, '_>],
+    ) -> Result<Deepseek4LogitsBatch<'a>> {
+        let total_tokens = validate_model_rows(&self.weights.config, workspace, rows)?;
+        let sequence_count = rows.len();
+        let mut token_offset = 0;
+        for row in rows.iter() {
+            let end = token_offset + row.token_ids.len();
+            workspace.host_token_ids[token_offset..end].copy_from_slice(row.token_ids);
+            token_offset = end;
+        }
+        workspace
+            .token_ids
+            .copy_prefix_from_host(&workspace.host_token_ids[..total_tokens])?;
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+            self.weights.config.vocab_size,
+            self.weights.config.hidden_size,
+            &self.weights.embedding,
+            &workspace.token_ids,
+            workspace.embedding.output(),
+            total_tokens,
+            &workspace.stream,
+        )?;
+        repeat_hyper_streams_f32_into_on_stream(
+            &workspace.embedding,
+            workspace.streams.output(),
+            total_tokens,
+            self.weights.config.hidden_size,
+            &workspace.stream,
+        )?;
+
+        for layer_index in 0..self.weights.layers.len() {
+            let mut attention_rows = rows
+                .iter_mut()
+                .map(|row| {
+                    let position = row.state.position();
+                    let row_count = row.token_ids.len();
+                    Ok(Deepseek4AttentionRow {
+                        state: row.state.layer_mut(layer_index)?,
+                        rows: row_count,
+                        position,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let rope_inv_freq = match self.weights.config.attention_kind(layer_index)? {
+                Deepseek4AttentionKind::Sliding => &self.weights.sliding_rope_inv_freq,
+                Deepseek4AttentionKind::CompressedSparse
+                | Deepseek4AttentionKind::HeavilyCompressed => {
+                    &self.weights.compressed_rope_inv_freq
+                }
+            };
+            self.weights.layers[layer_index].run_layer_rows(
+                &mut self.routed_experts[layer_index],
+                &mut workspace.layer,
+                &mut attention_rows,
+                &workspace.streams,
+                &workspace.token_ids,
+                rope_inv_freq,
+                &mut workspace.next_streams,
+                &self.weights.config,
+                &workspace.stream,
+            )?;
+            std::mem::swap(&mut workspace.streams, &mut workspace.next_streams);
+        }
+
+        let final_width = HYPER_STREAMS * self.weights.config.hidden_size;
+        let mut source_row = 0;
+        for (sequence, row) in rows.iter().enumerate() {
+            let final_row = source_row + row.token_ids.len() - 1;
+            workspace.final_streams.copy_range_from_device_on_stream(
+                sequence * final_width,
+                &workspace.streams,
+                final_row * final_width,
+                final_width,
+                &workspace.stream,
+            )?;
+            source_row += row.token_ids.len();
+        }
+        self.weights.hyper_head.run_rows(
+            &workspace.final_streams,
+            &mut workspace.final_hidden,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        self.weights.final_norm.run_rows(
+            &workspace.final_hidden,
+            &mut workspace.final_normed,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        self.weights.lm_head.run_rows(
+            &workspace.final_normed,
+            &mut workspace.logits,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        workspace.stream.synchronize()?;
+        for row in rows {
+            row.state.advance(row.token_ids.len())?;
+        }
+        Ok(Deepseek4LogitsBatch {
+            logits: &workspace.logits,
+            rows: sequence_count,
+            vocab: self.weights.config.vocab_size,
+        })
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.weights.device_bytes().saturating_add(
+            self.routed_experts
+                .iter()
+                .map(Deepseek4ExpertLayer::device_bytes)
+                .sum::<usize>(),
+        )
+    }
+}
+
+fn validate_model_rows(
+    config: &Deepseek4ModelConfig,
+    workspace: &Deepseek4BatchWorkspace,
+    rows: &[Deepseek4BatchRow<'_, '_>],
+) -> Result<usize> {
+    if rows.is_empty() || rows.len() > workspace.sequence_capacity {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 model rows",
+            expected: format!("1..={} sequences", workspace.sequence_capacity),
+            actual: rows.len().to_string(),
+        });
+    }
+    let total_tokens = rows.iter().try_fold(0usize, |total, row| {
+        if row.token_ids.is_empty() {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 model row",
+                expected: "at least one token".to_string(),
+                actual: "0 tokens".to_string(),
+            });
+        }
+        if let Some(token) = row
+            .token_ids
+            .iter()
+            .find(|&&token| token as usize >= config.vocab_size)
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 token id",
+                expected: format!("token < {}", config.vocab_size),
+                actual: token.to_string(),
+            });
+        }
+        let end = row
+            .state
+            .position()
+            .checked_add(row.token_ids.len())
+            .ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 sequence capacity",
+                expected: "position plus row length without overflow".to_string(),
+                actual: format!(
+                    "position={} rows={}",
+                    row.state.position(),
+                    row.token_ids.len()
+                ),
+            })?;
+        if end > row.state.max_tokens() || row.state.max_tokens() > workspace.max_context_tokens {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 sequence capacity",
+                expected: format!("end <= state capacity <= {}", workspace.max_context_tokens),
+                actual: format!("end={end} capacity={}", row.state.max_tokens()),
+            });
+        }
+        total
+            .checked_add(row.token_ids.len())
+            .ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 model batch",
+                expected: "total tokens without overflow".to_string(),
+                actual: format!("total={total} rows={}", row.token_ids.len()),
+            })
+    })?;
+    if total_tokens > workspace.token_capacity {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 model batch",
+            expected: format!("at most {} tokens", workspace.token_capacity),
+            actual: total_tokens.to_string(),
+        });
+    }
+    Ok(total_tokens)
 }
 
 fn load_bf16(

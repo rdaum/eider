@@ -1014,6 +1014,23 @@ __global__ void arithmetic_positions_u32_kernel(
     }
 }
 
+__global__ void repeat_hyper_streams_f32_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    std::uint32_t rows,
+    std::uint32_t hidden) {
+    const std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t values =
+        static_cast<std::size_t>(rows) * kHyperStreams * hidden;
+    if (index >= values) {
+        return;
+    }
+    const std::size_t feature = index % hidden;
+    const std::size_t row = index / (static_cast<std::size_t>(kHyperStreams) * hidden);
+    output[index] = input[row * hidden + feature];
+}
+
 __global__ void swiglu_pair_clamped_f32_kernel(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -1488,6 +1505,24 @@ extern "C" cudaError_t infer_deepseek4_arithmetic_positions_u32_on_stream(
         (len + kThreads - 1) / kThreads;
     arithmetic_positions_u32_kernel<<<blocks, kThreads, 0, stream>>>(
         positions, len, start, stride);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_repeat_hyper_streams_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t hidden,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || rows == 0 || hidden == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t values =
+        static_cast<std::size_t>(rows) * kHyperStreams * hidden;
+    const std::uint32_t blocks =
+        static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
+    repeat_hyper_streams_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, rows, hidden);
     return cudaGetLastError();
 }
 

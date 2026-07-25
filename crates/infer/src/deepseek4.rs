@@ -10,13 +10,15 @@ mod state;
 pub use config::{Deepseek4AttentionKind, Deepseek4ModelConfig};
 pub use model::{
     Deepseek4AttentionRow, Deepseek4AttentionWeights, Deepseek4AttentionWorkspace,
-    Deepseek4Bf16Linear, Deepseek4BlockFp8Linear, Deepseek4CompressedAttentionWeights,
-    Deepseek4CompressorWeights, Deepseek4CompressorWorkspace, Deepseek4FfnWorkspace,
-    Deepseek4HyperConnection, Deepseek4HyperHead, Deepseek4HyperWorkspace, Deepseek4IndexerWeights,
-    Deepseek4IndexerWorkspace, Deepseek4LayerWorkspace, Deepseek4ModelWeights,
-    Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4Router, Deepseek4RouterWorkspace,
-    Deepseek4SharedExpertWeights, Deepseek4SharedExpertWorkspace, Deepseek4UnweightedRmsNorm,
+    Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4Bf16Linear, Deepseek4BlockFp8Linear,
+    Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights, Deepseek4CompressorWorkspace,
+    Deepseek4FfnWorkspace, Deepseek4HyperConnection, Deepseek4HyperHead, Deepseek4HyperWorkspace,
+    Deepseek4IndexerWeights, Deepseek4IndexerWorkspace, Deepseek4LayerWorkspace,
+    Deepseek4LogitsBatch, Deepseek4ModelWeights, Deepseek4ResidentLayer, Deepseek4RmsNorm,
+    Deepseek4Router, Deepseek4RouterWorkspace, Deepseek4SharedExpertWeights,
+    Deepseek4SharedExpertWorkspace, Deepseek4TextModel, Deepseek4UnweightedRmsNorm,
 };
+pub use state::Deepseek4SequenceCheckpoint;
 pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek4SequenceState};
 
 use crate::nvfp4::{

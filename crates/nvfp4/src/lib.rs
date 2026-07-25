@@ -44,7 +44,7 @@ pub use kernels::deepseek4::{
     block_fp8_linear_f32_into_on_stream, causal_attention_f32_batch_into_on_stream,
     compress_windows_f32_into_on_stream, hyper_apply_f32_batch_into_on_stream,
     hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-    indexer_topk_f32_batch_into_on_stream,
+    indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
     rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
     router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,

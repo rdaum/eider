@@ -1072,6 +1072,47 @@ pub fn arithmetic_positions_u32_into_on_stream(
     }
 }
 
+/// Duplicates each hidden row into DeepSeek's four initial mHC streams.
+pub fn repeat_hyper_streams_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    hidden: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows.saturating_mul(hidden);
+    let output_len = input_len.saturating_mul(HYPER_STREAMS);
+    if rows == 0
+        || hidden == 0
+        || rows > u32::MAX as usize
+        || hidden > u32::MAX as usize
+        || input.len() < input_len
+        || output.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 initial hyper streams",
+            expected: format!("input>={input_len} output>={output_len}"),
+            actual: format!(
+                "rows={rows} hidden={hidden} input={} output={}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_repeat_hyper_streams_f32_on_stream",
+            ffi::infer_deepseek4_repeat_hyper_streams_f32_on_stream(
+                input.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                hidden as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies DeepSeek's separately projected, clamped SwiGLU activation.
 pub fn swiglu_pair_clamped_f32_batch_into_on_stream(
     gate: &DeviceBuffer<f32>,
@@ -1218,7 +1259,7 @@ mod tests {
         block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
         compress_windows_f32_into_on_stream, hyper_apply_f32_batch_into_on_stream,
         hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-        indexer_topk_f32_batch_into_on_stream,
+        indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
         routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
         router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
@@ -1551,6 +1592,31 @@ mod tests {
             &values.copy_to_host(&stream).expect("read conjugate"),
             &original,
             2.0e-6,
+        );
+    }
+
+    #[test]
+    fn initial_hyper_streams_repeat_each_embedding_row() {
+        const ROWS: usize = 3;
+        const HIDDEN: usize = 5;
+        let input = (0..ROWS * HIDDEN)
+            .map(|index| index as f32 - 4.0)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(HIDDEN)
+            .flat_map(|row| std::iter::repeat_n(row, HYPER_STREAMS).flatten().copied())
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input");
+        let mut output = DeviceBuffer::zeroed(ROWS * HYPER_STREAMS * HIDDEN).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        repeat_hyper_streams_f32_into_on_stream(&input, output.output(), ROWS, HIDDEN, &stream)
+            .expect("repeat streams");
+        assert_eq!(
+            output
+                .copy_to_host(&stream)
+                .expect("read output")
+                .as_slice(),
+            expected
         );
     }
 
