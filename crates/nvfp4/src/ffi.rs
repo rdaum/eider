@@ -275,6 +275,14 @@ unsafe extern "C" {
         hidden: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_swiglu_pair_f32_on_stream(
+        gate: *const f32,
+        up: *const f32,
+        output: *mut f32,
+        rows: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_swiglu_pair_clamped_f32_on_stream(
         gate: *const f32,
         up: *const f32,

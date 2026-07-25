@@ -1049,6 +1049,22 @@ __global__ void swiglu_pair_clamped_f32_kernel(
     output[index] = gate_value * sigmoid(gate_value) * up_value;
 }
 
+__global__ void swiglu_pair_f32_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ output,
+    std::uint32_t rows,
+    std::uint32_t width) {
+    const std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t values = static_cast<std::size_t>(rows) * width;
+    if (index >= values) {
+        return;
+    }
+    const float gate_value = gate[index];
+    output[index] = gate_value * sigmoid(gate_value) * up[index];
+}
+
 __global__ void routed_accumulate_f32_kernel(
     const float* __restrict__ route_output,
     const float* __restrict__ route_weights,
@@ -1523,6 +1539,25 @@ extern "C" cudaError_t infer_deepseek4_repeat_hyper_streams_f32_on_stream(
         static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
     repeat_hyper_streams_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, rows, hidden);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_swiglu_pair_f32_on_stream(
+    const float* gate,
+    const float* up,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t width,
+    cudaStream_t stream) {
+    if (gate == nullptr || up == nullptr || output == nullptr || rows == 0
+        || width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t values = static_cast<std::size_t>(rows) * width;
+    const std::uint32_t blocks =
+        static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
+    swiglu_pair_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        gate, up, output, rows, width);
     return cudaGetLastError();
 }
 

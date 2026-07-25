@@ -48,7 +48,7 @@ pub use kernels::deepseek4::{
     rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
     router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
-    swiglu_pair_clamped_f32_batch_into_on_stream,
+    swiglu_pair_clamped_f32_batch_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
 };
 pub use kernels::gemma4_attention::Gemma4LocalPrefillAttention;
 pub use kernels::marlin::{

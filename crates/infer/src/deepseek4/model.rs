@@ -14,7 +14,7 @@ use crate::nvfp4::{
     indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
-    store_compression_overlap_f32_into_on_stream, swiglu_pair_clamped_f32_batch_into_on_stream,
+    store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
 };
 use std::path::Path;
 use tracing::info;
@@ -2063,7 +2063,6 @@ impl Deepseek4SharedExpertWeights {
         input: &DeviceBuffer<f32>,
         workspace: &'a mut Deepseek4SharedExpertWorkspace,
         batch_rows: usize,
-        swiglu_limit: f32,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         workspace.validate(batch_rows, self)?;
@@ -2071,13 +2070,12 @@ impl Deepseek4SharedExpertWeights {
             .run_rows(input, &mut workspace.gate, batch_rows, stream)?;
         self.up
             .run_rows(input, &mut workspace.up, batch_rows, stream)?;
-        swiglu_pair_clamped_f32_batch_into_on_stream(
+        swiglu_pair_f32_batch_into_on_stream(
             &workspace.gate,
             &workspace.up,
             workspace.activated.output(),
             batch_rows,
             workspace.intermediate,
-            swiglu_limit,
             stream,
         )?;
         self.down.run_rows(
@@ -2528,13 +2526,9 @@ impl Deepseek4ResidentLayer {
             batch_rows,
             stream,
         )?;
-        let shared = self.shared_expert.run_rows(
-            input,
-            &mut workspace.shared,
-            batch_rows,
-            config.swiglu_limit,
-            stream,
-        )?;
+        let shared =
+            self.shared_expert
+                .run_rows(input, &mut workspace.shared, batch_rows, stream)?;
         add_f32_prefix_into_on_stream(
             routed,
             shared,

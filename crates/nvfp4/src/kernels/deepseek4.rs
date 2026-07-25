@@ -1113,6 +1113,50 @@ pub fn repeat_hyper_streams_f32_into_on_stream(
     }
 }
 
+/// Applies an unclamped SwiGLU activation to separately projected gate and up tensors.
+pub fn swiglu_pair_f32_batch_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.saturating_mul(width);
+    if rows == 0
+        || width == 0
+        || rows > u32::MAX as usize
+        || width > u32::MAX as usize
+        || gate.len() < values
+        || up.len() < values
+        || output.len() < values
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 SwiGLU",
+            expected: format!("gate/up/output>={values}"),
+            actual: format!(
+                "rows={rows} width={width} gate={} up={} output={}",
+                gate.len(),
+                up.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_swiglu_pair_f32_on_stream",
+            ffi::infer_deepseek4_swiglu_pair_f32_on_stream(
+                gate.as_const_ptr().cast(),
+                up.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies DeepSeek's separately projected, clamped SwiGLU activation.
 pub fn swiglu_pair_clamped_f32_batch_into_on_stream(
     gate: &DeviceBuffer<f32>,
@@ -1263,7 +1307,7 @@ mod tests {
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
         routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
         router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
-        swiglu_pair_clamped_f32_batch_into_on_stream,
+        swiglu_pair_clamped_f32_batch_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
     };
     use crate::{CudaStream, DeviceBuffer, format};
 
@@ -2127,6 +2171,29 @@ mod tests {
             &expected,
             2.0e-6,
         );
+    }
+
+    #[test]
+    fn unclamped_swiglu_pair_matches_cpu_and_preserves_capacity_tail() {
+        const ROWS: usize = 2;
+        const WIDTH: usize = 3;
+        let gate = vec![12.0f32, -12.0, 2.0, -3.0, 0.5, 9.0, 101.0, 102.0];
+        let up = vec![4.0f32, -5.0, 6.0, 7.0, -8.0, 9.0, 103.0, 104.0];
+        let expected = gate[..ROWS * WIDTH]
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| gate * (1.0 / (1.0 + (-gate).exp())) * up)
+            .collect::<Vec<_>>();
+        let gate = DeviceBuffer::from_host(&gate).expect("gate");
+        let up = DeviceBuffer::from_host(&up).expect("up");
+        let mut output = DeviceBuffer::from_host(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 105.0, 106.0])
+            .expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        swiglu_pair_f32_batch_into_on_stream(&gate, &up, output.output(), ROWS, WIDTH, &stream)
+            .expect("SwiGLU");
+        let actual = output.copy_to_host(&stream).expect("read output");
+        assert_close(&actual[..ROWS * WIDTH], &expected, 2.0e-6);
+        assert_eq!(&actual[ROWS * WIDTH..], &[105.0, 106.0]);
     }
 
     #[allow(clippy::too_many_arguments)]
