@@ -1629,22 +1629,44 @@ pub fn remap_expert_indices_at_offset_into_on_stream(
     expert_indices: &DeviceBuffer<u32>,
     expert_offset: usize,
     expert_to_slot: &DeviceBuffer<u32>,
-    mut slot_indices: DeviceOutput<'_, u32>,
+    slot_indices: DeviceOutput<'_, u32>,
     stream: &CudaStream,
 ) -> Result<()> {
-    let expert_end = expert_offset.saturating_add(slot_indices.len());
+    let count = slot_indices.len();
+    remap_expert_indices_range_into_on_stream(
+        expert_indices,
+        expert_offset,
+        expert_to_slot,
+        slot_indices,
+        count,
+        stream,
+    )
+}
+
+/// Remaps a logical-expert range into an active prefix of a larger output.
+pub fn remap_expert_indices_range_into_on_stream(
+    expert_indices: &DeviceBuffer<u32>,
+    expert_offset: usize,
+    expert_to_slot: &DeviceBuffer<u32>,
+    mut slot_indices: DeviceOutput<'_, u32>,
+    count: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let expert_end = expert_offset.saturating_add(count);
     if slot_indices.is_empty()
+        || count == 0
+        || count > slot_indices.len()
         || expert_to_slot.is_empty()
         || expert_end > expert_indices.len()
         || expert_offset > u32::MAX as usize
-        || slot_indices.len() > u32::MAX as usize
+        || count > u32::MAX as usize
         || expert_to_slot.len() > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "expert slot remap",
             expected: "non-empty in-range source/output and non-empty expert table".to_string(),
             actual: format!(
-                "indices={} offset={expert_offset} slots={} table={}",
+                "indices={} offset={expert_offset} slots={} active={count} table={}",
                 expert_indices.len(),
                 slot_indices.len(),
                 expert_to_slot.len()
@@ -1659,7 +1681,7 @@ pub fn remap_expert_indices_at_offset_into_on_stream(
                 expert_to_slot.ptr,
                 slot_indices.buffer_mut().ptr,
                 expert_offset as u32,
-                slot_indices.len() as u32,
+                count as u32,
                 expert_to_slot.len() as u32,
                 stream.as_raw(),
             ),
@@ -1903,6 +1925,11 @@ impl MoeSortedRoutes {
     /// Returns the inverse mapping from original route to sorted position.
     pub fn route_to_sorted(&self) -> &DeviceBuffer<u32> {
         &self.route_to_sorted
+    }
+
+    /// Number of routes active in the current ordering.
+    pub fn active_routes(&self) -> usize {
+        self.routes
     }
 
     /// Returns device bytes retained by the route ordering workspace.

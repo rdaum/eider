@@ -11382,6 +11382,7 @@ __global__ void infer_nvfp4_slot_routed_matvec_f32_kernel(
     std::uint32_t routes_per_input,
     std::uint32_t out_features,
     std::uint32_t in_features,
+    std::uint32_t output_route_offset,
     std::uint32_t output_stride,
     std::uint32_t output_offset) {
     constexpr std::uint32_t kWarpsPerBlock = 16;
@@ -11416,7 +11417,8 @@ __global__ void infer_nvfp4_slot_routed_matvec_f32_kernel(
         in_features) * weight_scale_2_table[slot];
     if (lane == 0) {
         output[
-            static_cast<std::size_t>(route) * output_stride + output_offset + row] =
+            static_cast<std::size_t>(output_route_offset + route) * output_stride +
+            output_offset + row] =
             value;
     }
 }
@@ -11433,6 +11435,7 @@ extern "C" cudaError_t infer_nvfp4_slot_routed_matvec_f32_on_stream(
     std::uint32_t routes_per_input,
     std::uint32_t out_features,
     std::uint32_t in_features,
+    std::uint32_t output_route_offset,
     std::uint32_t output_stride,
     std::uint32_t output_offset,
     cudaStream_t stream) {
@@ -11456,7 +11459,8 @@ extern "C" cudaError_t infer_nvfp4_slot_routed_matvec_f32_on_stream(
         grid, kThreads, shared_bytes, stream>>>(
         slots, input, packed_weight_table, weight_scale_table,
         weight_scale_2_table, output, capacity, routes, routes_per_input,
-        out_features, in_features, output_stride, output_offset);
+        out_features, in_features, output_route_offset, output_stride,
+        output_offset);
     return cudaGetLastError();
 }
 

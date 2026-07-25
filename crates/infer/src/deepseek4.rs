@@ -23,10 +23,12 @@ pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek
 
 use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Nvfp4LinearSlots,
-    PinnedHostBuffer, Q3ExpertTable, Q3ExpertTableCacheInfo, Q3ExpertTableCacheWriter,
-    Q3Nvfp4ExpertOverlay, QuantizedQ3, Result, SafeTensorShard,
-    routed_accumulate_f32_batch_into_on_stream, silu_mul_halves_clamped_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, MoeSortedRoutes,
+    Nvfp4LinearSlots, PinnedHostBuffer, Q3ExpertTable, Q3ExpertTableCacheInfo,
+    Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result, SafeTensorShard,
+    gather_sorted_route_rows_f32_into_on_stream, routed_accumulate_f32_batch_into_on_stream,
+    routed_accumulate_sorted_f32_batch_into_on_stream,
+    silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
 use crate::runtime::expert_cache::{ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator};
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
@@ -355,6 +357,8 @@ pub struct Deepseek4ExpertWorkspace {
     paged_input: DeviceBuffer<f32>,
     paged_route_weights: DeviceBuffer<f32>,
     paged_output: DeviceBuffer<f32>,
+    paged_slot_indices: DeviceBuffer<u32>,
+    sorted_routes: MoeSortedRoutes,
     batch_capacity: usize,
     routes_per_row: usize,
     intermediate: usize,
@@ -391,9 +395,11 @@ impl Deepseek4ExpertWorkspace {
             activated: DeviceBuffer::zeroed(routes.saturating_mul(manifest.expert_intermediate))?,
             down: DeviceBuffer::zeroed(routes.saturating_mul(manifest.hidden))?,
             output: DeviceBuffer::zeroed(batch_capacity.saturating_mul(manifest.hidden))?,
-            paged_input: DeviceBuffer::zeroed(manifest.hidden)?,
+            paged_input: DeviceBuffer::zeroed(batch_capacity.saturating_mul(manifest.hidden))?,
             paged_route_weights: DeviceBuffer::zeroed(manifest.experts_per_token)?,
             paged_output: DeviceBuffer::zeroed(manifest.hidden)?,
+            paged_slot_indices: DeviceBuffer::zeroed(batch_capacity)?,
+            sorted_routes: MoeSortedRoutes::new(routes, manifest.routed_experts)?,
             batch_capacity,
             routes_per_row: manifest.experts_per_token,
             intermediate: manifest.expert_intermediate,
@@ -415,6 +421,8 @@ impl Deepseek4ExpertWorkspace {
             + self.paged_input.device_bytes()
             + self.paged_route_weights.device_bytes()
             + self.paged_output.device_bytes()
+            + self.paged_slot_indices.device_bytes()
+            + self.sorted_routes.device_bytes()
     }
 
     fn validate(&self, rows: usize, manifest: &Deepseek4Manifest) -> Result<()> {
@@ -653,94 +661,202 @@ impl Deepseek4PagedExpertLayer {
                 ),
             });
         }
-        let host_indices = indices.copy_prefix_to_host(routes, stream)?.into_vec();
-        for row in 0..rows {
-            let route_offset = row * top_k;
-            workspace.paged_input.copy_range_from_device_on_stream(
-                0,
-                input,
-                row * self.manifest.hidden,
-                self.manifest.hidden,
-                stream,
-            )?;
-            workspace
-                .paged_route_weights
-                .copy_range_from_device_on_stream(0, route_weights, route_offset, top_k, stream)?;
-            self.resolve(
-                &host_indices[route_offset..route_offset + top_k],
-                indices,
-                route_offset,
-                stream,
-            )?;
-            let slot_indices = self.slots.slot_indices();
-            let gate_up_stride = 2 * self.manifest.expert_intermediate;
-            self.w1.run_routed_rows(
-                slot_indices,
-                &workspace.paged_input,
-                workspace.gate_up.output(),
-                top_k,
-                gate_up_stride,
-                0,
-                stream,
-            )?;
-            self.w3.run_routed_rows(
-                slot_indices,
-                &workspace.paged_input,
-                workspace.gate_up.output(),
-                top_k,
-                gate_up_stride,
-                self.manifest.expert_intermediate,
-                stream,
-            )?;
-            silu_mul_halves_clamped_f32_batch_into_on_stream(
-                &workspace.gate_up,
-                workspace.activated.output(),
-                top_k,
-                self.manifest.expert_intermediate,
-                self.manifest.swiglu_limit,
-                stream,
-            )?;
-            self.w2.run_routed_rows(
-                slot_indices,
-                &workspace.activated,
-                workspace.down.output(),
-                1,
-                self.manifest.hidden,
-                0,
-                stream,
-            )?;
-            routed_accumulate_f32_batch_into_on_stream(
-                &workspace.down,
-                &workspace.paged_route_weights,
-                workspace.paged_output.output(),
-                1,
-                top_k,
-                self.manifest.hidden,
-                stream,
-            )?;
-            workspace.output.copy_range_from_device_on_stream(
-                row * self.manifest.hidden,
-                &workspace.paged_output,
-                0,
-                self.manifest.hidden,
-                stream,
-            )?;
+        if rows == 1 {
+            return self.run_single_row(workspace, indices, route_weights, input, stream);
         }
+
+        workspace.sorted_routes.set_routes(routes)?;
+        workspace.sorted_routes.sort_on_stream(indices, stream)?;
+        let expert_offsets = workspace
+            .sorted_routes
+            .expert_offsets()
+            .copy_to_host(stream)?
+            .into_vec();
+        let active_experts = expert_offsets
+            .windows(2)
+            .enumerate()
+            .filter_map(|(expert, offsets)| {
+                (offsets[0] != offsets[1]).then_some((
+                    expert as u32,
+                    offsets[0] as usize,
+                    offsets[1] as usize,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let gate_up_stride = 2 * self.manifest.expert_intermediate;
+        for expert_group in active_experts.chunks(self.staging.len()) {
+            let working_set = expert_group
+                .iter()
+                .map(|&(expert, _, _)| expert)
+                .collect::<Vec<_>>();
+            self.resolve_working_set(&working_set, stream)?;
+            for &(expert, route_offset, route_end) in expert_group {
+                let route_count = route_end - route_offset;
+                if route_count > rows {
+                    return Err(Error::Shape {
+                        label: "DeepSeek V4 grouped expert routes",
+                        expected: format!("at most one route per row ({rows}) for expert {expert}"),
+                        actual: format!("{route_count} routes"),
+                    });
+                }
+                self.slots.remap_range_into_on_stream(
+                    workspace.sorted_routes.sorted_experts(),
+                    route_offset,
+                    route_count,
+                    workspace.paged_slot_indices.output(),
+                    stream,
+                )?;
+                gather_sorted_route_rows_f32_into_on_stream(
+                    input,
+                    &workspace.sorted_routes,
+                    workspace.paged_input.output(),
+                    route_offset,
+                    route_count,
+                    rows,
+                    top_k,
+                    self.manifest.hidden,
+                    stream,
+                )?;
+                self.w1.run_routed_rows_prefix_at(
+                    &workspace.paged_slot_indices,
+                    route_count,
+                    &workspace.paged_input,
+                    workspace.gate_up.output(),
+                    1,
+                    0,
+                    gate_up_stride,
+                    0,
+                    stream,
+                )?;
+                self.w3.run_routed_rows_prefix_at(
+                    &workspace.paged_slot_indices,
+                    route_count,
+                    &workspace.paged_input,
+                    workspace.gate_up.output(),
+                    1,
+                    0,
+                    gate_up_stride,
+                    self.manifest.expert_intermediate,
+                    stream,
+                )?;
+                silu_mul_halves_clamped_f32_batch_into_on_stream(
+                    &workspace.gate_up,
+                    workspace.activated.output(),
+                    route_count,
+                    self.manifest.expert_intermediate,
+                    self.manifest.swiglu_limit,
+                    stream,
+                )?;
+                self.w2.run_routed_rows_prefix_at(
+                    &workspace.paged_slot_indices,
+                    route_count,
+                    &workspace.activated,
+                    workspace.down.output(),
+                    1,
+                    route_offset,
+                    self.manifest.hidden,
+                    0,
+                    stream,
+                )?;
+            }
+        }
+        routed_accumulate_sorted_f32_batch_into_on_stream(
+            &workspace.down,
+            &workspace.sorted_routes,
+            route_weights,
+            workspace.output.output(),
+            rows,
+            top_k,
+            self.manifest.hidden,
+            stream,
+        )?;
         Ok(&workspace.output)
     }
 
-    fn resolve(
+    fn run_single_row<'a>(
         &mut self,
-        expert_ids: &[u32],
-        device_expert_ids: &DeviceBuffer<u32>,
-        expert_offset: usize,
+        workspace: &'a mut Deepseek4ExpertWorkspace,
+        indices: &DeviceBuffer<u32>,
+        route_weights: &DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
         stream: &CudaStream,
-    ) -> Result<()> {
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        let top_k = self.manifest.experts_per_token;
+        let host_indices = indices.copy_prefix_to_host(top_k, stream)?.into_vec();
+        workspace.paged_input.copy_range_from_device_on_stream(
+            0,
+            input,
+            0,
+            self.manifest.hidden,
+            stream,
+        )?;
+        workspace
+            .paged_route_weights
+            .copy_range_from_device_on_stream(0, route_weights, 0, top_k, stream)?;
+        self.resolve_working_set(&host_indices, stream)?;
+        self.slots.remap_at_offset_on_stream(indices, 0, stream)?;
+        let slot_indices = self.slots.slot_indices();
+        let gate_up_stride = 2 * self.manifest.expert_intermediate;
+        self.w1.run_routed_rows(
+            slot_indices,
+            &workspace.paged_input,
+            workspace.gate_up.output(),
+            top_k,
+            gate_up_stride,
+            0,
+            stream,
+        )?;
+        self.w3.run_routed_rows(
+            slot_indices,
+            &workspace.paged_input,
+            workspace.gate_up.output(),
+            top_k,
+            gate_up_stride,
+            self.manifest.expert_intermediate,
+            stream,
+        )?;
+        silu_mul_halves_clamped_f32_batch_into_on_stream(
+            &workspace.gate_up,
+            workspace.activated.output(),
+            top_k,
+            self.manifest.expert_intermediate,
+            self.manifest.swiglu_limit,
+            stream,
+        )?;
+        self.w2.run_routed_rows(
+            slot_indices,
+            &workspace.activated,
+            workspace.down.output(),
+            1,
+            self.manifest.hidden,
+            0,
+            stream,
+        )?;
+        routed_accumulate_f32_batch_into_on_stream(
+            &workspace.down,
+            &workspace.paged_route_weights,
+            workspace.paged_output.output(),
+            1,
+            top_k,
+            self.manifest.hidden,
+            stream,
+        )?;
+        workspace.output.copy_range_from_device_on_stream(
+            0,
+            &workspace.paged_output,
+            0,
+            self.manifest.hidden,
+            stream,
+        )?;
+        Ok(&workspace.output)
+    }
+
+    fn resolve_working_set(&mut self, expert_ids: &[u32], stream: &CudaStream) -> Result<()> {
         if let Some(timing) = self.uploads.wait_for_staging_reuse()? {
             self.paging_metrics.record_page_upload(timing.upload);
             self.paging_metrics.record_staging_wait(timing.staging_wait);
         }
-        let plan = self.slots.plan(expert_ids)?;
+        let plan = self.slots.plan_experts(expert_ids)?;
         let misses = plan.misses.len();
         let resolve_started = (misses != 0).then(Instant::now);
         if misses != 0 {
@@ -795,8 +911,6 @@ impl Deepseek4PagedExpertLayer {
             self.slots.enqueue_mapping_upload(self.uploads.stream())?;
             self.uploads.finish(stream)?;
         }
-        self.slots
-            .remap_at_offset_on_stream(device_expert_ids, expert_offset, stream)?;
         let bytes_read = misses.saturating_mul(self.layout.record_bytes);
         self.stats.hits = self.stats.hits.saturating_add(plan.hits as u64);
         self.stats.misses = self.stats.misses.saturating_add(misses as u64);
@@ -1117,9 +1231,9 @@ impl Deepseek4ExpertLayer {
 /// Routed-expert execution backend selected when the model is loaded.
 pub enum Deepseek4RoutedExpertLayer {
     /// Resident Q3 weights with an optional static original-NVFP4 overlay.
-    ResidentQ3(Deepseek4ExpertLayer),
+    ResidentQ3(Box<Deepseek4ExpertLayer>),
     /// Exact original NVFP4 weights loaded through bounded resident slots.
-    PagedNvfp4(Deepseek4PagedExpertLayer),
+    PagedNvfp4(Box<Deepseek4PagedExpertLayer>),
 }
 
 impl Deepseek4RoutedExpertLayer {

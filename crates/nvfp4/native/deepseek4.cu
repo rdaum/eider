@@ -1092,6 +1092,57 @@ __global__ void routed_accumulate_f32_kernel(
     output[index] = value;
 }
 
+__global__ void gather_sorted_route_rows_f32_kernel(
+    const float* __restrict__ input,
+    const std::uint32_t* __restrict__ sorted_routes,
+    float* __restrict__ output,
+    std::uint32_t route_offset,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t width) {
+    const std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t values = static_cast<std::size_t>(routes) * width;
+    if (index >= values) {
+        return;
+    }
+    const std::uint32_t route = index / width;
+    const std::uint32_t feature = index % width;
+    const std::uint32_t source_route = sorted_routes[route_offset + route];
+    const std::uint32_t source_row = source_route / routes_per_row;
+    output[index] =
+        input[static_cast<std::size_t>(source_row) * width + feature];
+}
+
+__global__ void routed_accumulate_sorted_f32_kernel(
+    const float* __restrict__ sorted_route_output,
+    const std::uint32_t* __restrict__ route_to_sorted,
+    const float* __restrict__ route_weights,
+    float* __restrict__ output,
+    std::uint32_t rows,
+    std::uint32_t routes_per_row,
+    std::uint32_t width) {
+    const std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t values = static_cast<std::size_t>(rows) * width;
+    if (index >= values) {
+        return;
+    }
+    const std::uint32_t row = index / width;
+    const std::uint32_t feature = index % width;
+    float value = 0.0f;
+    for (std::uint32_t route = 0; route < routes_per_row; ++route) {
+        const std::uint32_t original_route = row * routes_per_row + route;
+        const std::uint32_t sorted_route = route_to_sorted[original_route];
+        value = fmaf(
+            route_weights[original_route],
+            sorted_route_output[
+                static_cast<std::size_t>(sorted_route) * width + feature],
+            value);
+    }
+    output[index] = value;
+}
+
 }  // namespace
 
 extern "C" cudaError_t infer_deepseek4_block_fp8_linear_f32_on_stream(
@@ -1598,5 +1649,50 @@ extern "C" cudaError_t infer_deepseek4_routed_accumulate_f32_on_stream(
         static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
     routed_accumulate_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         route_output, route_weights, output, rows, routes_per_row, width);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_gather_sorted_route_rows_f32_on_stream(
+    const float* input,
+    const std::uint32_t* sorted_routes,
+    float* output,
+    std::uint32_t route_offset,
+    std::uint32_t routes,
+    std::uint32_t routes_per_row,
+    std::uint32_t width,
+    cudaStream_t stream) {
+    if (input == nullptr || sorted_routes == nullptr || output == nullptr ||
+        routes == 0 || routes_per_row == 0 || width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t values = static_cast<std::size_t>(routes) * width;
+    const std::uint32_t blocks =
+        static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
+    gather_sorted_route_rows_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, sorted_routes, output, route_offset, routes, routes_per_row,
+        width);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_deepseek4_routed_accumulate_sorted_f32_on_stream(
+    const float* sorted_route_output,
+    const std::uint32_t* route_to_sorted,
+    const float* route_weights,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t routes_per_row,
+    std::uint32_t width,
+    cudaStream_t stream) {
+    if (sorted_route_output == nullptr || route_to_sorted == nullptr ||
+        route_weights == nullptr || output == nullptr || rows == 0 ||
+        routes_per_row == 0 || width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t values = static_cast<std::size_t>(rows) * width;
+    const std::uint32_t blocks =
+        static_cast<std::uint32_t>((values + kThreads - 1) / kThreads);
+    routed_accumulate_sorted_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        sorted_route_output, route_to_sorted, route_weights, output, rows,
+        routes_per_row, width);
     return cudaGetLastError();
 }

@@ -301,6 +301,26 @@ unsafe extern "C" {
         width: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_gather_sorted_route_rows_f32_on_stream(
+        input: *const f32,
+        sorted_routes: *const u32,
+        output: *mut f32,
+        route_offset: u32,
+        routes: u32,
+        routes_per_row: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_routed_accumulate_sorted_f32_on_stream(
+        sorted_route_output: *const f32,
+        route_to_sorted: *const u32,
+        route_weights: *const f32,
+        output: *mut f32,
+        rows: u32,
+        routes_per_row: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gemma4_local_attention_bf16_on_stream(
         query: *const u16,
         key: *const u16,
@@ -2626,6 +2646,7 @@ unsafe extern "C" {
         routes_per_input: u32,
         out_features: u32,
         in_features: u32,
+        output_route_offset: u32,
         output_stride: u32,
         output_offset: u32,
         stream: cudaStream_t,

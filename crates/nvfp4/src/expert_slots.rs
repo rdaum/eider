@@ -146,16 +146,43 @@ impl Nvfp4LinearSlots {
         &self,
         slots: &DeviceBuffer<u32>,
         input: &DeviceBuffer<f32>,
-        mut output: DeviceOutput<'_, f32>,
+        output: DeviceOutput<'_, f32>,
         routes_per_input: usize,
         output_stride: usize,
         output_offset: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let routes = slots.len();
+        self.run_routed_rows_prefix_at(
+            slots,
+            slots.len(),
+            input,
+            output,
+            routes_per_input,
+            0,
+            output_stride,
+            output_offset,
+            stream,
+        )
+    }
+
+    /// Runs an active slot prefix and writes it at a route-major output offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_routed_rows_prefix_at(
+        &self,
+        slots: &DeviceBuffer<u32>,
+        routes: usize,
+        input: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        routes_per_input: usize,
+        output_route_offset: usize,
+        output_stride: usize,
+        output_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let input_rows = routes.checked_div(routes_per_input).unwrap_or(0);
         let required_input = input_rows.saturating_mul(self.cols);
-        let required_output = routes
+        let required_output = output_route_offset
+            .saturating_add(routes)
             .saturating_sub(1)
             .saturating_mul(output_stride)
             .saturating_add(output_offset)
@@ -164,6 +191,7 @@ impl Nvfp4LinearSlots {
         if routes == 0
             || routes_per_input == 0
             || !routes.is_multiple_of(routes_per_input)
+            || slots.len() < routes
             || input.len() < required_input
             || output.len() < required_output
             || output_stride < self.rows
@@ -175,6 +203,7 @@ impl Nvfp4LinearSlots {
                 routes_per_input,
                 self.rows,
                 self.cols,
+                output_route_offset,
                 output_stride,
                 output_offset,
             ]
@@ -187,8 +216,9 @@ impl Nvfp4LinearSlots {
                     "routes divisible by routes/input, input>={required_input}, output>={required_output}, valid output layout"
                 ),
                 actual: format!(
-                    "capacity={} routes={routes} routes/input={routes_per_input} input={} output={} rows={} cols={} stride={output_stride} offset={output_offset} shared={shared_bytes}",
+                    "capacity={} routes={routes} routes/input={routes_per_input} slots={} input={} output={} rows={} cols={} route_offset={output_route_offset} stride={output_stride} offset={output_offset} shared={shared_bytes}",
                     self.capacity,
+                    slots.len(),
                     input.len(),
                     output.len(),
                     self.rows,
@@ -211,6 +241,7 @@ impl Nvfp4LinearSlots {
                     routes_per_input as u32,
                     self.rows as u32,
                     self.cols as u32,
+                    output_route_offset as u32,
                     output_stride as u32,
                     output_offset as u32,
                     stream.as_raw(),
@@ -300,6 +331,44 @@ mod tests {
                 assert!(
                     (value - expected).abs() <= tolerance,
                     "route={route} row={row} actual={value} expected={expected}"
+                );
+            }
+        }
+
+        let stride = ROWS + 5;
+        let mut offset_output =
+            DeviceBuffer::from_host(&vec![99.0f32; 4 * stride]).expect("offset output");
+        slots
+            .run_routed_rows_prefix_at(
+                &indices,
+                2,
+                &input,
+                offset_output.output(),
+                2,
+                1,
+                stride,
+                3,
+                &stream,
+            )
+            .expect("run slots at route offset");
+        let actual = offset_output
+            .copy_to_host(&stream)
+            .expect("read offset output");
+        assert_eq!(&actual[..stride], vec![99.0f32; stride]);
+        assert_eq!(&actual[3 * stride..], vec![99.0f32; stride]);
+        for route in 1..3 {
+            for row in 0..ROWS {
+                let expected = dequantized[row * COLS..(row + 1) * COLS]
+                    .iter()
+                    .zip(&input_host)
+                    .map(|(&left, &right)| left * right)
+                    .sum::<f32>()
+                    * weight.weight_scale_2;
+                let value = actual[route * stride + 3 + row];
+                let tolerance = 2.0e-4f32.max(expected.abs() * 2.0e-4);
+                assert!(
+                    (value - expected).abs() <= tolerance,
+                    "offset route={route} row={row} actual={value} expected={expected}"
                 );
             }
         }

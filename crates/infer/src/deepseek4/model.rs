@@ -2815,7 +2815,7 @@ impl Deepseek4TextModel {
                 device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 "loaded DeepSeek V4 routed expert layer"
             );
-            routed_experts.push(Deepseek4RoutedExpertLayer::ResidentQ3(loaded));
+            routed_experts.push(Deepseek4RoutedExpertLayer::ResidentQ3(Box::new(loaded)));
         }
         let mut model = Self {
             weights,
@@ -2863,7 +2863,7 @@ impl Deepseek4TextModel {
                 device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 "allocated DeepSeek V4 paged NVFP4 expert layer"
             );
-            routed_experts.push(Deepseek4RoutedExpertLayer::PagedNvfp4(loaded));
+            routed_experts.push(Deepseek4RoutedExpertLayer::PagedNvfp4(Box::new(loaded)));
         }
         Ok(Self {
             weights,
@@ -3403,10 +3403,10 @@ mod tests {
         });
         let mut routed = if let Some(capacity) = paged_capacity {
             let hot_source = hot_source.as_ref().expect("paged expert source");
-            Deepseek4RoutedExpertLayer::PagedNvfp4(
+            Deepseek4RoutedExpertLayer::PagedNvfp4(Box::new(
                 Deepseek4PagedExpertLayer::load(&hot_source.root, &manifest, layer, capacity)
                     .expect("paged routed experts"),
-            )
+            ))
         } else {
             let hot_capacity = hot_source.as_ref().map_or(1, |source| {
                 source.resident_capacity(layer).expect("hot capacity")
@@ -3423,7 +3423,7 @@ mod tests {
                     .install_cached_hotset(hot_source)
                     .expect("install hot experts");
             }
-            Deepseek4RoutedExpertLayer::ResidentQ3(routed)
+            Deepseek4RoutedExpertLayer::ResidentQ3(Box::new(routed))
         };
         let resident =
             Deepseek4ResidentLayer::load(&checkpoint, &config, layer).expect("resident layer");
@@ -3611,7 +3611,7 @@ mod tests {
             routed
                 .install_cached_hotset(&hot_source)
                 .expect("install hot experts");
-            let mut routed = Deepseek4RoutedExpertLayer::ResidentQ3(routed);
+            let mut routed = Deepseek4RoutedExpertLayer::ResidentQ3(Box::new(routed));
             let mut workspace = resident
                 .allocate_layer_workspace(&config, token_count)
                 .expect("layer workspace");

@@ -3,6 +3,7 @@
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::kernels::non_gemm::MoeSortedRoutes;
 
 const SCALE_BLOCK: usize = 128;
 const HYPER_STREAMS: usize = 4;
@@ -1257,6 +1258,118 @@ pub fn routed_accumulate_f32_batch_into_on_stream(
     }
 }
 
+/// Gathers token rows for one contiguous expert-major route segment.
+pub fn gather_sorted_route_rows_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    routes: &MoeSortedRoutes,
+    mut output: DeviceOutput<'_, f32>,
+    route_offset: usize,
+    route_count: usize,
+    input_rows: usize,
+    routes_per_row: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let route_end = route_offset.saturating_add(route_count);
+    let input_values = input_rows.saturating_mul(width);
+    let output_values = route_count.saturating_mul(width);
+    if route_count == 0
+        || input_rows == 0
+        || routes_per_row == 0
+        || width == 0
+        || route_end > routes.active_routes()
+        || input.len() < input_values
+        || output.len() < output_values
+        || [route_offset, route_count, input_rows, routes_per_row, width]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 sorted route gather",
+            expected: format!(
+                "non-empty route range ending at or before {}, input>={input_values}, output>={output_values}",
+                routes.active_routes()
+            ),
+            actual: format!(
+                "offset={route_offset} routes={route_count} input_rows={input_rows} routes/row={routes_per_row} width={width} input={} output={}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_gather_sorted_route_rows_f32_on_stream",
+            ffi::infer_deepseek4_gather_sorted_route_rows_f32_on_stream(
+                input.as_const_ptr().cast(),
+                routes.sorted_routes().as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                route_offset as u32,
+                route_count as u32,
+                routes_per_row as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Reduces expert-major route outputs back into their original token rows.
+pub fn routed_accumulate_sorted_f32_batch_into_on_stream(
+    sorted_route_output: &DeviceBuffer<f32>,
+    routes: &MoeSortedRoutes,
+    route_weights: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    routes_per_row: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let route_count = rows.saturating_mul(routes_per_row);
+    let route_values = route_count.saturating_mul(width);
+    let output_values = rows.saturating_mul(width);
+    if rows == 0
+        || routes_per_row == 0
+        || width == 0
+        || route_count != routes.active_routes()
+        || sorted_route_output.len() < route_values
+        || route_weights.len() < route_count
+        || output.len() < output_values
+        || [rows, routes_per_row, width]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 sorted routed accumulation",
+            expected: format!(
+                "active routes={route_count}, route_output>={route_values}, weights>={route_count}, output>={output_values}"
+            ),
+            actual: format!(
+                "active_routes={} rows={rows} routes/row={routes_per_row} width={width} route_output={} weights={} output={}",
+                routes.active_routes(),
+                sorted_route_output.len(),
+                route_weights.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_routed_accumulate_sorted_f32_on_stream",
+            ffi::infer_deepseek4_routed_accumulate_sorted_f32_on_stream(
+                sorted_route_output.as_const_ptr().cast(),
+                routes.route_to_sorted().as_const_ptr().cast(),
+                route_weights.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                routes_per_row as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn validate_router_buffers(
     logits_len: usize,
     indices_len: usize,
@@ -1305,11 +1418,15 @@ mod tests {
         hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
         indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
-        routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
+        routed_accumulate_f32_batch_into_on_stream,
+        routed_accumulate_sorted_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
         router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
         swiglu_pair_clamped_f32_batch_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
     };
-    use crate::{CudaStream, DeviceBuffer, format};
+    use crate::{
+        CudaStream, DeviceBuffer, MoeSortedRoutes, format,
+        gather_sorted_route_rows_f32_into_on_stream,
+    };
 
     #[test]
     fn block_scaled_fp8_linear_matches_cpu_reference() {
@@ -2171,6 +2288,99 @@ mod tests {
             &expected,
             2.0e-6,
         );
+    }
+
+    #[test]
+    fn sorted_route_gather_and_accumulation_match_original_order() {
+        const ROWS: usize = 3;
+        const ROUTES_PER_ROW: usize = 2;
+        const WIDTH: usize = 4;
+        let route_indices = [2u32, 0, 1, 2, 0, 1];
+        let route_weights = [0.25f32, 0.75, 0.4, 0.6, 0.2, 0.8];
+        let input = (0..ROWS * WIDTH)
+            .map(|index| index as f32 * 0.125 - 0.5)
+            .collect::<Vec<_>>();
+        let route_output = (0..ROWS * ROUTES_PER_ROW * WIDTH)
+            .map(|index| index as f32 * 0.0625 - 0.75)
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let route_indices_device = DeviceBuffer::from_host(&route_indices).expect("route indices");
+        let route_weights_device = DeviceBuffer::from_host(&route_weights).expect("route weights");
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let mut routes = MoeSortedRoutes::new(ROWS * ROUTES_PER_ROW, 3).expect("sorted routes");
+        routes
+            .sort_on_stream(&route_indices_device, &stream)
+            .expect("sort routes");
+        let offsets = routes
+            .expert_offsets()
+            .copy_to_host(&stream)
+            .expect("expert offsets")
+            .into_vec();
+        let sorted_route_ids = routes
+            .sorted_routes()
+            .copy_to_host(&stream)
+            .expect("sorted routes")
+            .into_vec();
+        let mut gathered = DeviceBuffer::zeroed(ROWS * WIDTH).expect("gathered rows");
+        for expert in 0..3 {
+            let start = offsets[expert] as usize;
+            let end = offsets[expert + 1] as usize;
+            let count = end - start;
+            gather_sorted_route_rows_f32_into_on_stream(
+                &input_device,
+                &routes,
+                gathered.output(),
+                start,
+                count,
+                ROWS,
+                ROUTES_PER_ROW,
+                WIDTH,
+                &stream,
+            )
+            .expect("gather expert rows");
+            let actual = gathered
+                .copy_to_host(&stream)
+                .expect("gathered rows readback");
+            for segment_row in 0..count {
+                let source_row = sorted_route_ids[start + segment_row] as usize / ROUTES_PER_ROW;
+                assert_eq!(
+                    &actual[segment_row * WIDTH..(segment_row + 1) * WIDTH],
+                    &input[source_row * WIDTH..(source_row + 1) * WIDTH]
+                );
+            }
+        }
+
+        let mut sorted_output = vec![0.0f32; route_output.len()];
+        for (sorted, &original) in sorted_route_ids.iter().enumerate() {
+            let source = original as usize * WIDTH;
+            sorted_output[sorted * WIDTH..(sorted + 1) * WIDTH]
+                .copy_from_slice(&route_output[source..source + WIDTH]);
+        }
+        let sorted_output = DeviceBuffer::from_host(&sorted_output).expect("sorted output");
+        let mut output = DeviceBuffer::zeroed(ROWS * WIDTH).expect("output");
+        routed_accumulate_sorted_f32_batch_into_on_stream(
+            &sorted_output,
+            &routes,
+            &route_weights_device,
+            output.output(),
+            ROWS,
+            ROUTES_PER_ROW,
+            WIDTH,
+            &stream,
+        )
+        .expect("sorted accumulation");
+        let actual = output.copy_to_host(&stream).expect("output readback");
+        for row in 0..ROWS {
+            for feature in 0..WIDTH {
+                let expected = (0..ROUTES_PER_ROW)
+                    .map(|route| {
+                        let original = row * ROUTES_PER_ROW + route;
+                        route_weights[original] * route_output[original * WIDTH + feature]
+                    })
+                    .sum::<f32>();
+                assert!((actual[row * WIDTH + feature] - expected).abs() <= 1.0e-6);
+            }
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Model-neutral resident-slot policy and CUDA upload ordering for paged experts.
 
 use crate::nvfp4::{
-    CudaEvent, CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result,
+    CudaEvent, CudaStream, DeviceBuffer, DeviceOutput, Error, PinnedHostBuffer, Result,
     remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
+    remap_expert_indices_range_into_on_stream,
 };
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,18 @@ impl ExpertSlotCache {
                 actual: format!("{} expert IDs", expert_ids.len()),
             });
         }
+        self.plan_experts(expert_ids)
+    }
+
+    /// Resolves an arbitrary non-empty expert working set that fits the cache.
+    pub fn plan_experts(&mut self, expert_ids: &[u32]) -> Result<ExpertSlotPlan> {
+        if expert_ids.is_empty() || expert_ids.len() > self.slot_to_expert.len() {
+            return Err(Error::Shape {
+                label: "expert slot working set",
+                expected: format!("1..={} expert IDs", self.slot_to_expert.len()),
+                actual: format!("{} expert IDs", expert_ids.len()),
+            });
+        }
         for &expert in expert_ids {
             if expert as usize >= self.expert_to_slot.len() {
                 return Err(Error::Shape {
@@ -214,6 +227,24 @@ impl ExpertSlotCache {
         )
     }
 
+    pub fn remap_range_into_on_stream(
+        &mut self,
+        expert_ids: &DeviceBuffer<u32>,
+        expert_offset: usize,
+        count: usize,
+        slot_indices: DeviceOutput<'_, u32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        remap_expert_indices_range_into_on_stream(
+            expert_ids,
+            expert_offset,
+            &self.device_map,
+            slot_indices,
+            count,
+            stream,
+        )
+    }
+
     pub fn slot_indices(&self) -> &DeviceBuffer<u32> {
         &self.slot_indices
     }
@@ -306,6 +337,26 @@ mod tests {
         assert_eq!(third.evictions, 1);
         assert_eq!(third.resident_slots, 2);
         assert_eq!(third.slots[1], second.slots[1]);
+    }
+
+    #[test]
+    fn arbitrary_working_sets_share_the_same_lru_policy() {
+        let mut cache = ExpertSlotCache::new(8, 4, 2).expect("cache");
+        let first = cache
+            .plan_experts(&[0, 1, 2, 3])
+            .expect("larger working set");
+        assert_eq!(first.misses.len(), 4);
+        assert_eq!(first.resident_slots, 4);
+
+        let second = cache.plan_experts(&[2]).expect("single expert");
+        assert_eq!(second.hits, 1);
+        assert!(second.misses.is_empty());
+
+        let third = cache.plan_experts(&[4, 5, 2]).expect("mixed working set");
+        assert_eq!(third.hits, 1);
+        assert_eq!(third.misses.len(), 2);
+        assert_eq!(third.evictions, 2);
+        assert_eq!(third.resident_slots, 4);
     }
 
     #[test]
