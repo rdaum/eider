@@ -2596,6 +2596,24 @@ unsafe extern "C" {
         in_features: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_q3_nvfp4_mixed_routed_matvec_f32_on_stream(
+        indices: *const u32,
+        input: *const f32,
+        q3_packed_weight_table: *const *const u8,
+        q3_weight_scale_table: *const *const u16,
+        expert_to_hot: *const u32,
+        hot_packed_weight_table: *const *const u8,
+        hot_weight_scale_table: *const *const u8,
+        hot_weight_scale_2_table: *const *const f32,
+        output: *mut f32,
+        experts: u32,
+        hot_capacity: u32,
+        routes: u32,
+        routes_per_input: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_nvfp4_w4a16_top1_f32_on_stream(
         input: *const f32,
         packed_weight: *const u8,

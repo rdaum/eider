@@ -103,7 +103,7 @@
         },
         {
           "id": "eider-deepseek-v4",
-          "name": "DeepSeek V4 Flash NVFP4/Q2",
+          "name": "DeepSeek V4 Flash NVFP4/Q3",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -243,7 +243,7 @@
         },
         {
           "id": "eider-deepseek-v4",
-          "name": "DeepSeek V4 Flash NVFP4/Q2",
+          "name": "DeepSeek V4 Flash NVFP4/Q3",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",

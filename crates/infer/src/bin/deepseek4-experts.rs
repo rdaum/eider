@@ -1,4 +1,4 @@
-//! Prepare and inspect DeepSeek V4 routed-expert Q2 artifacts.
+//! Prepare and inspect DeepSeek V4 routed-expert Q3 artifacts.
 
 use infer::deepseek4::{
     finalise_thin_checkpoint, inspect_expert_artifacts, inspect_hot_expert_cache,

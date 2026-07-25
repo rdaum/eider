@@ -4,7 +4,7 @@ CUDA inference and serving for NVFP4 and mixed-precision models on NVIDIA DGX
 Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
 multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
 families currently include Qwen3.5/3.6 MoE, Step-3.7, Laguna-S-2.1, Gemma 4,
-and Nemotron 3.
+Nemotron 3, and DeepSeek V4 Flash.
 
 ## Build / run
 
@@ -71,8 +71,8 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
   streaming protocol adapters, and server telemetry.
 - `crates/infer/src/runtime/` — shared scheduling, prefix/KV caches, sampling,
   chat rendering, output parsing, and serving state.
-- `crates/infer/src/{qwen3,step37,laguna,gemma4,nemotron3}/` — family-specific
-  model loading and execution.
+- `crates/infer/src/{qwen3,step37,laguna,gemma4,nemotron3,deepseek4}/` —
+  family-specific model loading and execution.
 - `crates/infer/benches/` — model-runtime and prefill micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.
 - `crates/nvfp4/src/kernels/` — Marlin, non-GEMM, and SM12x operations.
@@ -150,6 +150,11 @@ Before handing work back:
 - Nemotron 3 combines attention, Mamba recurrent state, latent MoE, and an
   optional MTP block. Do not treat its sequence state as a conventional KV-only
   cache.
+- DeepSeek V4 combines sliding, compressed sparse, and hierarchical compressed
+  attention with mHC streams, hash and learned routers, and shared experts.
+  Preserve the checkpoint's layer schedule and routing order. Its complete
+  routed table is resident in blockwise Q3; original NVFP4 hot overlays must
+  keep gate/up and down mappings consistent.
 - Keep CUDA stream semantics explicit. Non-blocking streams do not synchronize
   with the default stream.
 - Do not add permanent debug flags or probe prints. Do not revert unrelated

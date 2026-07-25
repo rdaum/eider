@@ -14,7 +14,7 @@ not use llama.cpp or vLLM.
 
 It is capable of running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1,
 StepFun's Step-3.7-Flash, Poolside's Laguna-S-2.1, Gemma 4 26B-A4B, and
-NVIDIA's Nemotron 3 Puzzle hybrid model.
+NVIDIA's Nemotron 3 Puzzle hybrid model and DeepSeek V4 Flash.
 
 It includes an OpenAI-compatible Responses and Chat Completions server
 with continuous multi-session scheduling and a compact FP4 KV cache
@@ -139,6 +139,12 @@ Supported catalogue checkpoints are fetched from Hugging Face into its local
 snapshot cache; the repository does not retain model weights under `models/`.
 Use `--model-dir PATH` only for local conversion or development checkpoints.
 
+[DeepSeek V4 Flash](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4)
+uses a separate prepared-local workflow because its complete source checkpoint
+is larger than the Spark's unified memory. Its launcher serves
+`eider-deepseek-v4` from a thin checkpoint, resident Q3 experts, and bounded
+original-NVFP4 hot slots.
+
 Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
 retain those types or convert the BF16 weights to FP8 or NVFP4. The checkpoint
@@ -205,6 +211,11 @@ weights are NVFP4. Cache files are written atomically and incomplete layers are
 resumed on the next startup; later runs validate and reuse the completed cache
 automatically.
 
+DeepSeek V4 requires a bounded streaming conversion before serving because its
+complete source checkpoint is larger than the Spark's unified memory. See
+[DeepSeek V4 expert storage](docs/deepseek4-experts.md) for its Q3 expert
+layout, memory budget, and preparation commands.
+
 ### Model-specific controls
 
 The Nemotron launcher stores dense weights in NVFP4 and uses an FP32
@@ -221,6 +232,11 @@ full 262,144-token context; use `--max-context-tokens` to override it. Its BF16
 attention projections and LM head default to NVFP4; use
 `--qwen-bf16-attention` and `--qwen-bf16-lm-head` to select `bf16`, `fp8`, or
 `nvfp4`.
+
+DeepSeek V4 accepts at most eight cached original-NVFP4 experts per layer by
+default and sizes each overlay from the cache's actual contents. It defaults
+to a 32,768-token context. Use `--deepseek-hot-expert-capacity` and
+`--max-context-tokens` to change those limits.
 
 ### API and agent clients
 
@@ -255,6 +271,7 @@ scripts/run-pi-eider-stepfun.sh
 scripts/run-pi-eider-laguna.sh
 scripts/run-pi-eider-gemma4.sh
 scripts/run-pi-eider-nemotron3-super.sh
+scripts/run-pi-eider-deepseek4.sh
 ```
 
 Arguments are forwarded to `pi`, so a non-interactive smoke request looks like:

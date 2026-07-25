@@ -1,7 +1,7 @@
 //! DeepSeek V4 Flash model support and expert artifact preparation.
 //!
 //! Routed experts are converted one at a time from the ModelOpt NVFP4
-//! checkpoint into resident Q2 tables. The original checkpoint remains the
+//! checkpoint into resident Q3 tables. The original checkpoint remains the
 //! source for the bounded NVFP4 hot-expert overlay.
 
 mod config;
@@ -22,8 +22,8 @@ pub use state::Deepseek4SequenceCheckpoint;
 pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek4SequenceState};
 
 use crate::nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Q2ExpertTable,
-    Q2ExpertTableCacheInfo, Q2ExpertTableCacheWriter, Q2Nvfp4ExpertOverlay, QuantizedQ2, Result,
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Q3ExpertTable,
+    Q3ExpertTableCacheInfo, Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result,
     SafeTensorShard, routed_accumulate_f32_batch_into_on_stream,
     silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
@@ -37,7 +37,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const ARTIFACT_FORMAT: &str = "deepseek4-q2-experts-v3";
+const ARTIFACT_FORMAT: &str = "deepseek4-q3-experts-v1";
 const HOT_EXPERT_MAGIC: &[u8; 8] = b"EIDDS4H1";
 const EXPERT_PREPARATION_BATCH: usize = 16;
 const HOT_EXPERT_VERSION: u32 = 1;
@@ -63,8 +63,8 @@ impl Deepseek4Manifest {
         Ok(Self::from(&config))
     }
 
-    /// Q2 expert bytes retained across every layer, excluding tiny headers.
-    pub fn q2_expert_payload_bytes(&self) -> Result<u64> {
+    /// Q3 expert bytes retained across every layer, excluding tiny headers.
+    pub fn q3_expert_payload_bytes(&self) -> Result<u64> {
         let weights_per_expert = self
             .expert_intermediate
             .checked_mul(self.hidden)
@@ -85,7 +85,7 @@ impl Deepseek4Manifest {
                 expected: "weights * experts * layers without overflow".to_string(),
                 actual: format!("experts={} layers={}", self.routed_experts, self.layers),
             })?;
-        Ok((weights as u64) * 9 / 32)
+        Ok((weights as u64) * 25 / 64)
     }
 }
 
@@ -137,7 +137,7 @@ pub struct Deepseek4HotExpert {
     pub w2: ModelOptNvfp4Linear,
 }
 
-/// Bounded disk source used to promote observed experts from Q2 to NVFP4.
+/// Bounded disk source used to promote observed experts from Q3 to NVFP4.
 ///
 /// The cache stores at most `capacity_per_layer` complete experts for each
 /// layer. It is populated at a maintenance boundary from one checkpoint shard
@@ -395,12 +395,12 @@ impl Deepseek4ExpertWorkspace {
     }
 }
 
-/// One resident-Q2 DeepSeek V4 routed-expert layer with bounded NVFP4 hot slots.
+/// One resident-Q3 DeepSeek V4 routed-expert layer with bounded NVFP4 hot slots.
 pub struct Deepseek4ExpertLayer {
     layer: usize,
     manifest: Deepseek4Manifest,
-    gate_up: Q2Nvfp4ExpertOverlay,
-    down: Q2Nvfp4ExpertOverlay,
+    gate_up: Q3Nvfp4ExpertOverlay,
+    down: Q3Nvfp4ExpertOverlay,
     usage: ExpertUsageTracker,
 }
 
@@ -437,9 +437,9 @@ impl Deepseek4ExpertLayer {
         let (gate_up_path, down_path) = layer_paths(artifact_dir.as_ref(), layer);
         validate_layer_files(manifest, &gate_up_path, &down_path)?;
         let gate_up =
-            Q2Nvfp4ExpertOverlay::new(Q2ExpertTable::read_cache_file(gate_up_path)?, hot_capacity)?;
+            Q3Nvfp4ExpertOverlay::new(Q3ExpertTable::read_cache_file(gate_up_path)?, hot_capacity)?;
         let down =
-            Q2Nvfp4ExpertOverlay::new(Q2ExpertTable::read_cache_file(down_path)?, hot_capacity)?;
+            Q3Nvfp4ExpertOverlay::new(Q3ExpertTable::read_cache_file(down_path)?, hot_capacity)?;
         Ok(Self {
             layer,
             manifest: manifest.clone(),
@@ -614,7 +614,7 @@ impl Deepseek4ExpertLayer {
                     return Err(Error::Format {
                         label: "DeepSeek V4 expert hotset",
                         detail: format!(
-                            "refresh failed ({error}); restoring the all-Q2 mapping also failed ({clear_error})"
+                            "refresh failed ({error}); restoring the all-Q3 mapping also failed ({clear_error})"
                         ),
                     });
                 }
@@ -664,7 +664,7 @@ impl Deepseek4ExpertLayer {
         select_top_experts(&self.usage.snapshot(stream)?, capacity)
     }
 
-    /// Device bytes retained by Q2 weights, hot slots, and usage counts.
+    /// Device bytes retained by Q3 weights, hot slots, and usage counts.
     pub fn device_bytes(&self) -> usize {
         self.gate_up.device_bytes() + self.down.device_bytes() + self.usage.device_bytes()
     }
@@ -948,11 +948,11 @@ pub fn inspect_expert_artifacts(
     })
 }
 
-/// Paths of the resident Q2 gate/up and down tables for one layer.
+/// Paths of the resident Q3 gate/up and down tables for one layer.
 pub fn layer_paths(artifact_dir: &Path, layer: usize) -> (PathBuf, PathBuf) {
     (
-        artifact_dir.join(format!("layer-{layer:02}-gate-up.q2t")),
-        artifact_dir.join(format!("layer-{layer:02}-down.q2t")),
+        artifact_dir.join(format!("layer-{layer:02}-gate-up.q3t")),
+        artifact_dir.join(format!("layer-{layer:02}-down.q3t")),
     )
 }
 
@@ -1047,12 +1047,12 @@ fn thin_checkpoint_io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ 
 }
 
 fn missing_artifact_bytes(artifact_dir: &Path, manifest: &Deepseek4Manifest) -> Result<u64> {
-    let gate_up_bytes = Q2ExpertTableCacheInfo::expected_file_bytes(
+    let gate_up_bytes = Q3ExpertTableCacheInfo::expected_file_bytes(
         manifest.routed_experts,
         manifest.expert_intermediate * 2,
         manifest.hidden,
     )?;
-    let down_bytes = Q2ExpertTableCacheInfo::expected_file_bytes(
+    let down_bytes = Q3ExpertTableCacheInfo::expected_file_bytes(
         manifest.routed_experts,
         manifest.hidden,
         manifest.expert_intermediate,
@@ -1098,8 +1098,8 @@ fn validate_layer_files(
     gate_up_path: &Path,
     down_path: &Path,
 ) -> Result<u64> {
-    let gate_up = Q2ExpertTableCacheInfo::read(gate_up_path)?;
-    let down = Q2ExpertTableCacheInfo::read(down_path)?;
+    let gate_up = Q3ExpertTableCacheInfo::read(gate_up_path)?;
+    let down = Q3ExpertTableCacheInfo::read(down_path)?;
     let expected_gate_up = (
         manifest.routed_experts,
         manifest.expert_intermediate * 2,
@@ -1137,16 +1137,16 @@ fn prepare_layer(
         tracing::info!(layer, "reusing prepared DeepSeek V4 expert layer");
         return Ok(());
     }
-    let gate_up_tmp = gate_up_path.with_extension("q2t.tmp");
-    let down_tmp = down_path.with_extension("q2t.tmp");
+    let gate_up_tmp = gate_up_path.with_extension("q3t.tmp");
+    let down_tmp = down_path.with_extension("q3t.tmp");
     let result = (|| {
-        let mut gate_up_writer = Q2ExpertTableCacheWriter::create(
+        let mut gate_up_writer = Q3ExpertTableCacheWriter::create(
             &gate_up_tmp,
             manifest.routed_experts,
             manifest.expert_intermediate * 2,
             manifest.hidden,
         )?;
-        let mut down_writer = Q2ExpertTableCacheWriter::create(
+        let mut down_writer = Q3ExpertTableCacheWriter::create(
             &down_tmp,
             manifest.routed_experts,
             manifest.hidden,
@@ -1156,18 +1156,18 @@ fn prepare_layer(
             let end = (start + EXPERT_PREPARATION_BATCH).min(manifest.routed_experts);
             let prepared = (start..end)
                 .into_par_iter()
-                .map(|expert| prepare_q2_expert(checkpoint, manifest, layer, expert))
+                .map(|expert| prepare_q3_expert(checkpoint, manifest, layer, expert))
                 .collect::<Result<Vec<_>>>()?;
-            for (offset, (gate_up_q2, down_q2)) in prepared.iter().enumerate() {
+            for (offset, (gate_up_q3, down_q3)) in prepared.iter().enumerate() {
                 let expert = start + offset;
-                gate_up_writer.write_expert(expert, gate_up_q2)?;
-                down_writer.write_expert(expert, down_q2)?;
+                gate_up_writer.write_expert(expert, gate_up_q3)?;
+                down_writer.write_expert(expert, down_q3)?;
             }
             tracing::info!(
                 layer,
                 prepared_experts = end,
                 total_experts = manifest.routed_experts,
-                "prepared DeepSeek V4 Q2 experts"
+                "prepared DeepSeek V4 Q3 experts"
             );
         }
         gate_up_writer.finish()?;
@@ -1198,12 +1198,12 @@ fn prepare_layer(
     result
 }
 
-fn prepare_q2_expert(
+fn prepare_q3_expert(
     checkpoint: &ModelOptCheckpoint,
     manifest: &Deepseek4Manifest,
     layer: usize,
     expert: usize,
-) -> Result<(QuantizedQ2, QuantizedQ2)> {
+) -> Result<(QuantizedQ3, QuantizedQ3)> {
     let prefix = format!("layers.{layer}.ffn.experts.{expert}");
     let w1 = load_expert_linear(
         checkpoint,
@@ -1211,7 +1211,7 @@ fn prepare_q2_expert(
         manifest.expert_intermediate,
         manifest.hidden,
     )?;
-    let w1_q2 = QuantizedQ2::from_modelopt(&w1)?;
+    let w1_q3 = QuantizedQ3::from_modelopt(&w1)?;
     drop(w1);
     let w3 = load_expert_linear(
         checkpoint,
@@ -1219,14 +1219,14 @@ fn prepare_q2_expert(
         manifest.expert_intermediate,
         manifest.hidden,
     )?;
-    let w3_q2 = QuantizedQ2::from_modelopt(&w3)?;
+    let w3_q3 = QuantizedQ3::from_modelopt(&w3)?;
     drop(w3);
-    let gate_up_q2 = QuantizedQ2::concat_rows(
+    let gate_up_q3 = QuantizedQ3::concat_rows(
         manifest.expert_intermediate,
         manifest.expert_intermediate,
         manifest.hidden,
-        &w1_q2,
-        &w3_q2,
+        &w1_q3,
+        &w3_q3,
     )?;
     let w2 = load_expert_linear(
         checkpoint,
@@ -1234,8 +1234,8 @@ fn prepare_q2_expert(
         manifest.hidden,
         manifest.expert_intermediate,
     )?;
-    let down_q2 = QuantizedQ2::from_modelopt(&w2)?;
-    Ok((gate_up_q2, down_q2))
+    let down_q3 = QuantizedQ3::from_modelopt(&w2)?;
+    Ok((gate_up_q3, down_q3))
 }
 
 fn load_expert_linear(
@@ -1637,14 +1637,14 @@ mod tests {
         layer_paths, prepare_thin_checkpoint_shard, write_hot_expert,
     };
     use crate::nvfp4::{
-        CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q2ExpertTableCacheWriter, format,
-        quantize_q2_row_major,
+        CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q3ExpertTableCacheWriter, format,
+        quantize_q3_row_major,
     };
     use serde_json::json;
     use std::io::Write;
 
     #[test]
-    fn flash_q2_expert_payload_matches_storage_formula() {
+    fn flash_q3_expert_payload_matches_storage_formula() {
         let manifest = Deepseek4Manifest {
             hidden: 4096,
             layers: 43,
@@ -1656,13 +1656,13 @@ mod tests {
             swiglu_limit: 10.0,
         };
         assert_eq!(
-            manifest.q2_expert_payload_bytes().expect("Q2 bytes"),
-            77_913_391_104
+            manifest.q3_expert_payload_bytes().expect("Q3 bytes"),
+            108_213_043_200
         );
     }
 
     #[test]
-    #[ignore = "requires prepared DeepSeek V4 model, Q2 artifacts, and hot cache"]
+    #[ignore = "requires prepared DeepSeek V4 model, Q3 artifacts, and hot cache"]
     fn real_checkpoint_hot_nvfp4_expert_matches_cpu_dequantization() {
         let model_dir =
             std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
@@ -1768,13 +1768,13 @@ mod tests {
     }
 
     #[test]
-    fn prepared_q2_layer_runs_and_records_routes() {
+    fn prepared_q3_layer_runs_and_records_routes() {
         let manifest = Deepseek4Manifest {
-            hidden: 64,
+            hidden: 128,
             layers: 1,
             routed_experts: 3,
             experts_per_token: 2,
-            expert_intermediate: 64,
+            expert_intermediate: 128,
             shared_experts: 1,
             hash_layers: 0,
             swiglu_limit: 10.0,
@@ -1787,21 +1787,22 @@ mod tests {
         std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
         let (gate_up_path, down_path) = layer_paths(&artifact_dir, 0);
         let mut gate_up =
-            Q2ExpertTableCacheWriter::create(&gate_up_path, 3, 128, 64).expect("gate/up cache");
-        let mut down = Q2ExpertTableCacheWriter::create(&down_path, 3, 64, 64).expect("down cache");
+            Q3ExpertTableCacheWriter::create(&gate_up_path, 3, 256, 128).expect("gate/up cache");
+        let mut down =
+            Q3ExpertTableCacheWriter::create(&down_path, 3, 128, 128).expect("down cache");
         for expert in 0..3 {
-            let gate_value = (expert + 1) as f32 / 32.0;
-            let down_value = (expert + 1) as f32 / 64.0;
+            let gate_value = 7.0 * (expert + 1) as f32 / 128.0;
+            let down_value = 7.0 * (expert + 1) as f32 / 256.0;
             gate_up
                 .write_expert(
                     expert,
-                    &quantize_q2_row_major(128, 64, &vec![gate_value; 128 * 64])
-                        .expect("gate/up Q2"),
+                    &quantize_q3_row_major(256, 128, &vec![gate_value; 256 * 128])
+                        .expect("gate/up Q3"),
                 )
                 .expect("write gate/up");
             down.write_expert(
                 expert,
-                &quantize_q2_row_major(64, 64, &vec![down_value; 64 * 64]).expect("down Q2"),
+                &quantize_q3_row_major(128, 128, &vec![down_value; 128 * 128]).expect("down Q3"),
             )
             .expect("write down");
         }
@@ -1812,7 +1813,7 @@ mod tests {
             Deepseek4ExpertLayer::load(&artifact_dir, &manifest, 0, 1).expect("load layer");
         let mut workspace = Deepseek4ExpertWorkspace::new(&manifest).expect("workspace");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        let input_host = vec![0.125f32; 64];
+        let input_host = vec![0.125f32; 128];
         let input = DeviceBuffer::from_host(&input_host).expect("input");
         let indices = DeviceBuffer::from_host(&[0u32, 2]).expect("indices");
         let weights = DeviceBuffer::from_host(&[0.25f32, 0.75]).expect("weights");
@@ -1821,11 +1822,11 @@ mod tests {
             .expect("run layer");
         let actual = workspace.output().copy_to_host(&stream).expect("output");
         let expert_output = |expert: usize| {
-            let gate_value = (expert + 1) as f32 / 32.0;
-            let down_value = (expert + 1) as f32 / 64.0;
+            let gate_value = 7.0 * (expert + 1) as f32 / 128.0;
+            let down_value = 7.0 * (expert + 1) as f32 / 256.0;
             let projected = input_host.iter().sum::<f32>() * gate_value;
             let activated = projected / (1.0 + (-projected).exp()) * projected;
-            64.0 * activated * down_value
+            128.0 * activated * down_value
         };
         let expected = 0.25 * expert_output(0) + 0.75 * expert_output(2);
         for value in actual.iter() {
@@ -1845,9 +1846,9 @@ mod tests {
             .expect("NVFP4 weight")
         };
         let hot = Deepseek4HotExpert {
-            w1: make_weight("w1", 64, 64, 0.125),
-            w3: make_weight("w3", 64, 64, 0.0625),
-            w2: make_weight("w2", 64, 64, 0.03125),
+            w1: make_weight("w1", 128, 128, 0.125),
+            w3: make_weight("w3", 128, 128, 0.0625),
+            w2: make_weight("w2", 128, 128, 0.03125),
         };
         let hot_path = hot_expert_path(&hot_dir, 0, 2);
         write_hot_expert(&hot_path, &manifest, 0, 2, &hot).expect("write hot expert");

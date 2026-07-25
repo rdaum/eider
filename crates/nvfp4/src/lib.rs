@@ -22,6 +22,7 @@ mod kernels;
 mod matrix;
 mod modelopt;
 mod q2;
+mod q3;
 mod safetensors;
 mod tensor;
 
@@ -193,6 +194,11 @@ pub use q2::{
     q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream,
     q2_w2a16_grouped_inputs_matvec_f32_into_on_stream, q2_w2a16_grouped_matvec_f32_into_on_stream,
     quantize_q2_row_major,
+};
+pub use q3::{
+    Q3_BLOCK_SIZE, Q3ExpertTable, Q3ExpertTableCacheInfo, Q3ExpertTableCacheWriter,
+    Q3Nvfp4ExpertOverlay, QuantizedQ3, dequantize_q3_row_major,
+    q3_nvfp4_mixed_routed_matvec_f32_into_on_stream, quantize_q3_row_major,
 };
 pub use safetensors::{SafeTensorInfo, SafeTensorShard};
 pub use tensor::{Bf16Tensor2d, Nvfp4Tensor2d, Tensor2dLayout, Tensor2dView};

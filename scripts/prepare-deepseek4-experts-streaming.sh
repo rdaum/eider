@@ -8,7 +8,7 @@ revision="${DEEPSEEK4_REVISION:-e3cd60e7de98e9867116860d522499a728de1cf9}"
 template_repository="${DEEPSEEK4_TEMPLATE_REPOSITORY:-deepseek-ai/DeepSeek-V4-Flash}"
 template_revision="${DEEPSEEK4_TEMPLATE_REVISION:-014a5cfe6d1349d3d1096b2f8c15faaaa11819d5}"
 staging_dir="${DEEPSEEK4_STAGING_DIR:-$cache_root/eider/staging/deepseek-v4-flash-nvfp4-$revision}"
-artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision/deepseek4-experts-q2-v3}"
+artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision/deepseek4-experts-q3-v1}"
 thin_dir="${DEEPSEEK4_THIN_DIR:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision/deepseek4-thin-nvfp4-v1}"
 binary="$repo_root/target/release/deepseek4-experts"
 
@@ -72,8 +72,8 @@ embed_shard="$(jq -er '.weight_map["embed.weight"]' "$index")"
 prepare_thin_shard "$embed_shard"
 
 for ((layer = 0; layer < layers; layer++)); do
-    gate_up="$artifact_dir/layer-$(printf '%02d' "$layer")-gate-up.q2t"
-    down="$artifact_dir/layer-$(printf '%02d' "$layer")-down.q2t"
+    gate_up="$artifact_dir/layer-$(printf '%02d' "$layer")-gate-up.q3t"
+    down="$artifact_dir/layer-$(printf '%02d' "$layer")-down.q3t"
     prefix="layers.$layer.ffn.experts."
     mapfile -t shards < <(
         jq -r --arg prefix "$prefix" '
@@ -89,16 +89,16 @@ for ((layer = 0; layer < layers; layer++)); do
         exit 1
     fi
     shard="${shards[0]}"
-    q2_ready=false
+    q3_ready=false
     if [[ -f "$gate_up" && -f "$down" ]] &&
         "$binary" prepare-layer "$staging_dir" "$artifact_dir" "$layer"; then
-        q2_ready=true
+        q3_ready=true
     fi
     thin_ready=false
     if "$binary" inspect-thin-shard "$staging_dir" "$thin_dir" "$shard" >/dev/null 2>&1; then
         thin_ready=true
     fi
-    if [[ "$q2_ready" == true && "$thin_ready" == true ]]; then
+    if [[ "$q3_ready" == true && "$thin_ready" == true ]]; then
         continue
     fi
 
@@ -107,7 +107,7 @@ for ((layer = 0; layer < layers; layer++)); do
         --revision "$revision" \
         --local-dir "$staging_dir" \
         --include "$shard"
-    if [[ "$q2_ready" != true ]]; then
+    if [[ "$q3_ready" != true ]]; then
         "$binary" prepare-layer "$staging_dir" "$artifact_dir" "$layer"
     fi
     if [[ "$thin_ready" != true ]]; then
@@ -130,5 +130,5 @@ prepare_thin_shard "$head_shard"
 "$binary" finalise-thin "$staging_dir" "$thin_dir"
 "$binary" inspect-thin "$thin_dir"
 
-echo "DeepSeek V4 Q2 experts: $artifact_dir"
+echo "DeepSeek V4 Q3 experts: $artifact_dir"
 echo "DeepSeek V4 thin serving checkpoint: $thin_dir"
