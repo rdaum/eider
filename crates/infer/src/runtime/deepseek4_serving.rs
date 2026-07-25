@@ -532,13 +532,23 @@ impl<'template> Deepseek4ChatService<'template> {
             }
         };
         let vocab = self.model.weights.config.vocab_size;
-        for ((mut request, id), row_logits) in requests
-            .into_iter()
-            .zip(tail_ids)
+        let sampled = requests
+            .iter_mut()
             .zip(logits.chunks_exact(vocab))
-        {
+            .map(|(request, row_logits)| request.sampler.sample(row_logits, &request.history))
+            .collect::<Result<Vec<_>>>();
+        let sampled = match sampled {
+            Ok(sampled) => sampled,
+            Err(error) => {
+                for (request, id) in requests.into_iter().zip(&tail_ids) {
+                    self.requests.insert(*id, request);
+                }
+                return Err(error);
+            }
+        };
+        for ((mut request, id), sampled) in requests.into_iter().zip(tail_ids).zip(sampled) {
             request.prompt_position += 1;
-            request.pending_sample = Some(request.sampler.sample(row_logits, &request.history)?);
+            request.pending_sample = Some(sampled);
             if checkpoint_ready(
                 request.prompt_position,
                 request.prefix_cache_target,
@@ -655,25 +665,30 @@ impl<'template> Deepseek4ChatService<'template> {
 
         let vocab = self.model.weights.config.vocab_size;
         let mut logits_rows = logits.chunks_exact(vocab);
-        let mut terminal = Vec::new();
-        for (mut request, &id) in requests.into_iter().zip(ids) {
-            let sampled = if let Some(sampled) = request.pending_sample.take() {
-                sampled
-            } else {
-                request.sampler.sample(
-                    logits_rows
-                        .next()
-                        .expect("one logits row exists per forwarded request"),
-                    &request.history,
-                )?
-            };
-            if let Some(reason) = apply_sample(&mut request, id, sampled, tick)? {
-                terminal.push((id, reason));
+        let result = (|| {
+            let mut terminal = Vec::new();
+            for (request, &id) in requests.iter_mut().zip(ids) {
+                let sampled = if let Some(sampled) = request.pending_sample.take() {
+                    sampled
+                } else {
+                    request.sampler.sample(
+                        logits_rows
+                            .next()
+                            .expect("one logits row exists per forwarded request"),
+                        &request.history,
+                    )?
+                };
+                if let Some(reason) = apply_sample(request, id, sampled, tick)? {
+                    terminal.push((id, reason));
+                }
             }
+            debug_assert!(logits_rows.next().is_none());
+            Ok(terminal)
+        })();
+        for (request, &id) in requests.into_iter().zip(ids) {
             self.requests.insert(id, request);
         }
-        debug_assert!(logits_rows.next().is_none());
-        Ok(terminal)
+        result
     }
 
     fn finish_request(
@@ -765,6 +780,7 @@ impl ResponseFilter {
         events: Vec<ChatOutputEvent>,
         output: &mut Vec<Deepseek4ChatDelta>,
     ) -> Option<ChatFinishReason> {
+        let mut emitted_tool_call = false;
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
@@ -788,11 +804,11 @@ impl ResponseFilter {
                     self.flush(request_id, output);
                     output.push(Deepseek4ChatDelta { request_id, event });
                     self.saw_tool_calls = true;
-                    return Some(ChatFinishReason::ToolCalls);
+                    emitted_tool_call = true;
                 }
             }
         }
-        None
+        emitted_tool_call.then_some(ChatFinishReason::ToolCalls)
     }
 
     fn flush(&mut self, request_id: Deepseek4RequestId, output: &mut Vec<Deepseek4ChatDelta>) {
@@ -809,9 +825,14 @@ impl ResponseFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CONTINUATION_PREFILL_TOKENS, checkpoint_bounded_chunk, checkpoint_ready,
-        prefill_chunk_capacity,
+        Deepseek4RequestId, MAX_CONTINUATION_PREFILL_TOKENS, ResponseFilter,
+        checkpoint_bounded_chunk, checkpoint_ready, prefill_chunk_capacity,
     };
+    use crate::runtime::chat::{ChatFunctionCall, ChatToolCall};
+    use crate::runtime::chat_output::ChatOutputEvent;
+    use crate::runtime::serving::ChatFinishReason;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
@@ -853,5 +874,32 @@ mod tests {
             1_024
         );
         assert_eq!(checkpoint_bounded_chunk(1_024, 128, 512, true, true), 1_024);
+    }
+
+    #[test]
+    fn response_filter_preserves_every_tool_call_in_one_dsml_block() {
+        let events = ["read_file", "write_file"]
+            .into_iter()
+            .map(|name| {
+                ChatOutputEvent::ToolCall(ChatToolCall {
+                    id: format!("call_{name}"),
+                    function: ChatFunctionCall {
+                        name: name.to_string(),
+                        arguments: BTreeMap::from([("path".to_string(), json!("README.md"))]),
+                    },
+                })
+            })
+            .collect();
+        let mut filter = ResponseFilter::new(Vec::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            filter.apply(Deepseek4RequestId(1), events, &mut output),
+            Some(ChatFinishReason::ToolCalls)
+        );
+        assert_eq!(output.len(), 2);
+        assert!(output.iter().all(|delta| {
+            matches!(delta.event, ChatOutputEvent::ToolCall(_))
+                && delta.request_id == Deepseek4RequestId(1)
+        }));
     }
 }

@@ -28,6 +28,7 @@ use crate::nvfp4::{
     silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -38,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 const ARTIFACT_FORMAT: &str = "deepseek4-q2-experts-v2";
 const HOT_EXPERT_MAGIC: &[u8; 8] = b"EIDDS4H1";
+const EXPERT_PREPARATION_BATCH: usize = 16;
 const HOT_EXPERT_VERSION: u32 = 1;
 const HOT_EXPERT_HEADER_BYTES: u64 = 8 + 5 * 4 + 6 * 4;
 
@@ -1082,48 +1084,23 @@ fn prepare_layer(
             manifest.hidden,
             manifest.expert_intermediate,
         )?;
-        for expert in 0..manifest.routed_experts {
-            let prefix = format!("layers.{layer}.ffn.experts.{expert}");
-            let w1 = load_expert_linear(
-                checkpoint,
-                &format!("{prefix}.w1"),
-                manifest.expert_intermediate,
-                manifest.hidden,
-            )?;
-            let w1_q2 = QuantizedQ2::from_modelopt(&w1)?;
-            drop(w1);
-            let w3 = load_expert_linear(
-                checkpoint,
-                &format!("{prefix}.w3"),
-                manifest.expert_intermediate,
-                manifest.hidden,
-            )?;
-            let w3_q2 = QuantizedQ2::from_modelopt(&w3)?;
-            drop(w3);
-            let gate_up_q2 = QuantizedQ2::concat_rows(
-                manifest.expert_intermediate,
-                manifest.expert_intermediate,
-                manifest.hidden,
-                &w1_q2,
-                &w3_q2,
-            )?;
-            gate_up_writer.write_expert(expert, &gate_up_q2)?;
-            let w2 = load_expert_linear(
-                checkpoint,
-                &format!("{prefix}.w2"),
-                manifest.hidden,
-                manifest.expert_intermediate,
-            )?;
-            let down_q2 = QuantizedQ2::from_modelopt(&w2)?;
-            down_writer.write_expert(expert, &down_q2)?;
-            if (expert + 1).is_multiple_of(16) || expert + 1 == manifest.routed_experts {
-                tracing::info!(
-                    layer,
-                    prepared_experts = expert + 1,
-                    total_experts = manifest.routed_experts,
-                    "prepared DeepSeek V4 Q2 experts"
-                );
+        for start in (0..manifest.routed_experts).step_by(EXPERT_PREPARATION_BATCH) {
+            let end = (start + EXPERT_PREPARATION_BATCH).min(manifest.routed_experts);
+            let prepared = (start..end)
+                .into_par_iter()
+                .map(|expert| prepare_q2_expert(checkpoint, manifest, layer, expert))
+                .collect::<Result<Vec<_>>>()?;
+            for (offset, (gate_up_q2, down_q2)) in prepared.iter().enumerate() {
+                let expert = start + offset;
+                gate_up_writer.write_expert(expert, gate_up_q2)?;
+                down_writer.write_expert(expert, down_q2)?;
             }
+            tracing::info!(
+                layer,
+                prepared_experts = end,
+                total_experts = manifest.routed_experts,
+                "prepared DeepSeek V4 Q2 experts"
+            );
         }
         gate_up_writer.finish()?;
         down_writer.finish()?;
@@ -1151,6 +1128,46 @@ fn prepare_layer(
         let _ = fs::remove_file(&down_tmp);
     }
     result
+}
+
+fn prepare_q2_expert(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+    expert: usize,
+) -> Result<(QuantizedQ2, QuantizedQ2)> {
+    let prefix = format!("layers.{layer}.ffn.experts.{expert}");
+    let w1 = load_expert_linear(
+        checkpoint,
+        &format!("{prefix}.w1"),
+        manifest.expert_intermediate,
+        manifest.hidden,
+    )?;
+    let w1_q2 = QuantizedQ2::from_modelopt(&w1)?;
+    drop(w1);
+    let w3 = load_expert_linear(
+        checkpoint,
+        &format!("{prefix}.w3"),
+        manifest.expert_intermediate,
+        manifest.hidden,
+    )?;
+    let w3_q2 = QuantizedQ2::from_modelopt(&w3)?;
+    drop(w3);
+    let gate_up_q2 = QuantizedQ2::concat_rows(
+        manifest.expert_intermediate,
+        manifest.expert_intermediate,
+        manifest.hidden,
+        &w1_q2,
+        &w3_q2,
+    )?;
+    let w2 = load_expert_linear(
+        checkpoint,
+        &format!("{prefix}.w2"),
+        manifest.hidden,
+        manifest.expert_intermediate,
+    )?;
+    let down_q2 = QuantizedQ2::from_modelopt(&w2)?;
+    Ok((gate_up_q2, down_q2))
 }
 
 fn load_expert_linear(

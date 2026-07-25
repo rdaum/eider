@@ -2785,13 +2785,21 @@ impl Deepseek4TextModel {
         let weights = Deepseek4ModelWeights::load(model_dir)?;
         let manifest = Deepseek4Manifest::from(&weights.config);
         let mut routed_experts = Vec::with_capacity(manifest.layers);
+        let mut device_bytes = weights.device_bytes();
         for layer in 0..manifest.layers {
-            routed_experts.push(Deepseek4ExpertLayer::load(
+            let loaded = Deepseek4ExpertLayer::load(
                 expert_artifact_dir.as_ref(),
                 &manifest,
                 layer,
                 hot_capacity_per_layer,
-            )?);
+            )?;
+            device_bytes = device_bytes.saturating_add(loaded.device_bytes());
+            info!(
+                layer,
+                device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                "loaded DeepSeek V4 routed expert layer"
+            );
+            routed_experts.push(loaded);
         }
         Ok(Self {
             weights,

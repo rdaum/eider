@@ -8,6 +8,7 @@ fs2.workspace = true
 fast-telemetry.workspace = true
 rand = "0.9"
 rart.workspace = true
+rayon = "1"
 serde_json.workspace = true
 nvfp4.workspace = true
 tokenizers = "0.22"
@@ -20,7 +21,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 micromeasure.workspace = true
-rayon = "1"
 
 [[bench]]
 name = "qwen36_routed_gate_up"

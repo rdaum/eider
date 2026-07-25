@@ -855,6 +855,49 @@ mod tests {
             prompt.text
         );
         assert!(!prompt.token_ids.is_empty());
+
+        let history = [
+            ChatMessage::user("inspect README.md"),
+            ChatMessage::assistant_tool_calls(
+                None,
+                Some("I should read the file.".to_string()),
+                vec![ChatToolCall {
+                    id: "call_read".to_string(),
+                    function: ChatFunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: BTreeMap::from([("path".to_string(), json!("README.md"))]),
+                    },
+                }],
+            ),
+            ChatMessage::tool("call_read", "Eider documentation"),
+            ChatMessage::user("summarize it"),
+        ];
+        let history_prompt = template
+            .render_and_tokenize(
+                &history,
+                &[tool_definition()],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            history_prompt
+                .text
+                .contains("<｜DSML｜invoke name=\"read_file\">"),
+            "{:?}",
+            history_prompt.text
+        );
+        assert!(
+            history_prompt
+                .text
+                .contains("<tool_result>Eider documentation</tool_result>"),
+            "{:?}",
+            history_prompt.text
+        );
+        assert!(
+            history_prompt.text.ends_with("<｜Assistant｜><think>"),
+            "{:?}",
+            history_prompt.text
+        );
     }
 
     #[test]

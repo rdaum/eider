@@ -16,6 +16,12 @@ const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 const GEMMA_TOOL_CALL_OPEN: &str = "<|tool_call>";
 const GEMMA_TOOL_CALL_CLOSE: &str = "<tool_call|>";
+const DSML_TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
+const DSML_TOOL_CALLS_CLOSE: &str = "</｜DSML｜tool_calls>";
+const DSML_INVOKE_OPEN: &str = "<｜DSML｜invoke";
+const DSML_INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
+const DSML_PARAMETER_OPEN: &str = "<｜DSML｜parameter";
+const DSML_PARAMETER_CLOSE: &str = "</｜DSML｜parameter>";
 const GEMMA_THINK_OPEN: &str = "<|channel>thought\n";
 const GEMMA_THINK_CLOSE: &str = "<channel|>";
 const THINK_CLOSE: &str = "</think>";
@@ -48,6 +54,23 @@ enum OutputMode {
     Text,
     ToolCall,
     DirectToolCall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolCallProtocol {
+    Standard,
+    Gemma,
+    Dsml,
+}
+
+impl ToolCallProtocol {
+    fn close(self) -> &'static str {
+        match self {
+            Self::Standard => TOOL_CALL_CLOSE,
+            Self::Gemma => GEMMA_TOOL_CALL_CLOSE,
+            Self::Dsml => DSML_TOOL_CALLS_CLOSE,
+        }
+    }
 }
 
 /// Request-scoped tokenizer and model tool-protocol decoder.
@@ -171,7 +194,7 @@ struct ChatOutputParser {
     mode: OutputMode,
     pending: String,
     tool_call: String,
-    tool_call_close: &'static str,
+    tool_call_protocol: ToolCallProtocol,
     trim_after_thinking: bool,
     trim_after_tool_call: bool,
     string_arguments: BTreeMap<String, BTreeSet<String>>,
@@ -251,7 +274,7 @@ impl ChatOutputParser {
             },
             pending: String::new(),
             tool_call: String::new(),
-            tool_call_close: TOOL_CALL_CLOSE,
+            tool_call_protocol: ToolCallProtocol::Standard,
             trim_after_thinking: false,
             trim_after_tool_call: false,
             string_arguments,
@@ -304,7 +327,10 @@ impl ChatOutputParser {
             OutputMode::ToolCall if truncated => Ok(Vec::new()),
             OutputMode::ToolCall => Err(Error::Format {
                 label: "chat tool call",
-                detail: "generation ended inside an unterminated <tool_call>".to_string(),
+                detail: format!(
+                    "generation ended before {}",
+                    self.tool_call_protocol.close()
+                ),
             }),
             OutputMode::DirectToolCall if truncated => Ok(Vec::new()),
             OutputMode::DirectToolCall => Err(Error::Format {
@@ -368,13 +394,14 @@ impl ChatOutputParser {
             })
             .min_by_key(|(index, _)| *index);
         let protocol_open = [
-            (TOOL_CALL_OPEN, TOOL_CALL_CLOSE),
-            (GEMMA_TOOL_CALL_OPEN, GEMMA_TOOL_CALL_CLOSE),
+            (TOOL_CALL_OPEN, ToolCallProtocol::Standard),
+            (GEMMA_TOOL_CALL_OPEN, ToolCallProtocol::Gemma),
+            (DSML_TOOL_CALLS_OPEN, ToolCallProtocol::Dsml),
         ]
         .into_iter()
-        .filter_map(|(open, close)| self.pending.find(open).map(|index| (index, open, close)))
+        .filter_map(|(open, protocol)| self.pending.find(open).map(|index| (index, open, protocol)))
         .min_by_key(|(index, _, _)| *index);
-        if let Some((index, open, close)) = protocol_open.filter(|(index, _, _)| {
+        if let Some((index, open, protocol)) = protocol_open.filter(|(index, _, _)| {
             direct_open.is_none_or(|(direct_index, _)| *index <= direct_index)
         }) {
             push_nonempty(
@@ -382,7 +409,7 @@ impl ChatOutputParser {
                 ChatOutputEvent::Text(self.pending[..index].to_string()),
             );
             self.pending.drain(..index + open.len());
-            self.tool_call_close = close;
+            self.tool_call_protocol = protocol;
             self.mode = OutputMode::ToolCall;
             return true;
         }
@@ -399,7 +426,7 @@ impl ChatOutputParser {
         }
         flush_safe_prefix_with_markers(
             &mut self.pending,
-            [TOOL_CALL_OPEN, GEMMA_TOOL_CALL_OPEN]
+            [TOOL_CALL_OPEN, GEMMA_TOOL_CALL_OPEN, DSML_TOOL_CALLS_OPEN]
                 .into_iter()
                 .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
             events,
@@ -410,20 +437,31 @@ impl ChatOutputParser {
     fn parse_tool_call(&mut self, events: &mut Vec<ChatOutputEvent>) -> Result<bool> {
         self.tool_call.push_str(&self.pending);
         self.pending.clear();
-        let Some(index) = self.tool_call.find(self.tool_call_close) else {
+        let close = self.tool_call_protocol.close();
+        let Some(index) = self.tool_call.find(close) else {
             return Ok(false);
         };
         let body = self.tool_call[..index].to_string();
-        let remainder = self.tool_call[index + self.tool_call_close.len()..].to_string();
+        let remainder = self.tool_call[index + close.len()..].to_string();
         self.tool_call.clear();
         self.pending = remainder;
-        let function = if self.tool_call_close == GEMMA_TOOL_CALL_CLOSE {
-            parse_gemma_function_call(&body, &self.string_arguments, &self.tool_parameters)?
-        } else {
-            parse_function_call(&body, &self.string_arguments, &self.tool_parameters)?
+        let functions = match self.tool_call_protocol {
+            ToolCallProtocol::Standard => vec![parse_function_call(
+                &body,
+                &self.string_arguments,
+                &self.tool_parameters,
+            )?],
+            ToolCallProtocol::Gemma => vec![parse_gemma_function_call(
+                &body,
+                &self.string_arguments,
+                &self.tool_parameters,
+            )?],
+            ToolCallProtocol::Dsml => parse_dsml_function_calls(&body, &self.tool_parameters)?,
         };
-        let id = next_tool_call_id()?;
-        events.push(ChatOutputEvent::ToolCall(ChatToolCall { id, function }));
+        for function in functions {
+            let id = next_tool_call_id()?;
+            events.push(ChatOutputEvent::ToolCall(ChatToolCall { id, function }));
+        }
         self.mode = OutputMode::Text;
         self.trim_after_tool_call = true;
         Ok(true)
@@ -477,7 +515,10 @@ fn flush_safe_prefix_with_markers<'a>(
 }
 
 fn longest_marker_prefix_suffix(text: &str, marker: &str) -> usize {
-    (1..marker.len())
+    marker
+        .char_indices()
+        .map(|(index, _)| index)
+        .filter(|&length| length != 0)
         .rev()
         .find(|&length| text.ends_with(&marker[..length]))
         .unwrap_or(0)
@@ -502,6 +543,182 @@ fn push_nonempty(events: &mut Vec<ChatOutputEvent>, event: ChatOutputEvent) {
     if !empty {
         events.push(event);
     }
+}
+
+fn parse_dsml_function_calls(
+    body: &str,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
+) -> Result<Vec<ChatFunctionCall>> {
+    let mut remaining = body;
+    let mut functions = Vec::new();
+    loop {
+        remaining = trim_protocol_whitespace_start(remaining);
+        if remaining.is_empty() {
+            break;
+        }
+        let (mut attributes, invoke_body) =
+            parse_dsml_open_tag(remaining, DSML_INVOKE_OPEN, "invoke")?;
+        let name = take_dsml_attribute(&mut attributes, "name", "invoke")?;
+        reject_dsml_attributes(&attributes, "invoke")?;
+        validate_protocol_name("function", &name)?;
+        if !tool_parameters.contains_key(&name) {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("unknown function {name:?} in DSML invocation"),
+            });
+        }
+        let close = invoke_body
+            .find(DSML_INVOKE_CLOSE)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("missing {DSML_INVOKE_CLOSE} for {name:?}"),
+            })?;
+        let arguments = parse_dsml_parameters(&name, &invoke_body[..close])?;
+        functions.push(ChatFunctionCall { name, arguments });
+        remaining = &invoke_body[close + DSML_INVOKE_CLOSE.len()..];
+    }
+    if functions.is_empty() {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: "DSML tool_calls block does not contain an invocation".to_string(),
+        });
+    }
+    Ok(functions)
+}
+
+fn parse_dsml_parameters(function: &str, body: &str) -> Result<BTreeMap<String, Value>> {
+    let mut remaining = body;
+    let mut arguments = BTreeMap::new();
+    loop {
+        remaining = trim_protocol_whitespace_start(remaining);
+        if remaining.is_empty() {
+            break;
+        }
+        let (mut attributes, parameter_body) =
+            parse_dsml_open_tag(remaining, DSML_PARAMETER_OPEN, "parameter")?;
+        let name = take_dsml_attribute(&mut attributes, "name", "parameter")?;
+        let string = take_dsml_attribute(&mut attributes, "string", "parameter")?;
+        reject_dsml_attributes(&attributes, "parameter")?;
+        validate_protocol_name("parameter", &name)?;
+        let close = parameter_body
+            .find(DSML_PARAMETER_CLOSE)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("missing {DSML_PARAMETER_CLOSE} for {name:?}"),
+            })?;
+        let raw_value = &parameter_body[..close];
+        let value = match string.as_str() {
+            "true" => Value::String(raw_value.to_string()),
+            "false" => serde_json::from_str(raw_value).map_err(|error| Error::Format {
+                label: "chat tool call",
+                detail: format!(
+                    "invalid JSON value for DSML parameter {name:?} in {function:?}: {error}"
+                ),
+            })?,
+            value => {
+                return Err(Error::Format {
+                    label: "chat tool call",
+                    detail: format!(
+                        "DSML parameter {name:?} has invalid string attribute {value:?}"
+                    ),
+                });
+            }
+        };
+        if arguments.insert(name.clone(), value).is_some() {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("duplicate parameter {name:?} in DSML invocation {function:?}"),
+            });
+        }
+        remaining = &parameter_body[close + DSML_PARAMETER_CLOSE.len()..];
+    }
+    Ok(arguments)
+}
+
+fn parse_dsml_open_tag<'a>(
+    input: &'a str,
+    marker: &str,
+    kind: &str,
+) -> Result<(BTreeMap<String, String>, &'a str)> {
+    let tag = input.strip_prefix(marker).ok_or_else(|| Error::Format {
+        label: "chat tool call",
+        detail: format!("expected {marker} in DSML tool call"),
+    })?;
+    if !tag.starts_with(|character: char| character == '>' || character.is_ascii_whitespace()) {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: format!("invalid DSML {kind} opening tag"),
+        });
+    }
+    let end = tag.find('>').ok_or_else(|| Error::Format {
+        label: "chat tool call",
+        detail: format!("unterminated DSML {kind} opening tag"),
+    })?;
+    let attributes = parse_dsml_attributes(&tag[..end], kind)?;
+    Ok((attributes, &tag[end + 1..]))
+}
+
+fn parse_dsml_attributes(input: &str, kind: &str) -> Result<BTreeMap<String, String>> {
+    let mut remaining = input;
+    let mut attributes = BTreeMap::new();
+    loop {
+        remaining = remaining.trim_start_matches(char::is_whitespace);
+        if remaining.is_empty() {
+            return Ok(attributes);
+        }
+        let name_end = remaining
+            .find(|character: char| character == '=' || character.is_whitespace())
+            .unwrap_or(remaining.len());
+        let name = &remaining[..name_end];
+        validate_protocol_name("attribute", name)?;
+        remaining = remaining[name_end..].trim_start_matches(char::is_whitespace);
+        remaining = remaining.strip_prefix('=').ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("DSML {kind} attribute {name:?} is missing '='"),
+        })?;
+        remaining = remaining.trim_start_matches(char::is_whitespace);
+        remaining = remaining.strip_prefix('"').ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("DSML {kind} attribute {name:?} must use double quotes"),
+        })?;
+        let value_end = remaining.find('"').ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("unterminated DSML {kind} attribute {name:?}"),
+        })?;
+        let value = remaining[..value_end].to_string();
+        if attributes.insert(name.to_string(), value).is_some() {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("duplicate DSML {kind} attribute {name:?}"),
+            });
+        }
+        remaining = &remaining[value_end + 1..];
+    }
+}
+
+fn take_dsml_attribute(
+    attributes: &mut BTreeMap<String, String>,
+    name: &str,
+    kind: &str,
+) -> Result<String> {
+    attributes.remove(name).ok_or_else(|| Error::Format {
+        label: "chat tool call",
+        detail: format!("DSML {kind} is missing its {name:?} attribute"),
+    })
+}
+
+fn reject_dsml_attributes(attributes: &BTreeMap<String, String>, kind: &str) -> Result<()> {
+    let Some(name) = attributes.keys().next() else {
+        return Ok(());
+    };
+    Err(Error::Format {
+        label: "chat tool call",
+        detail: format!("unexpected DSML {kind} attribute {name:?}"),
+    })
+}
+
+fn trim_protocol_whitespace_start(input: &str) -> &str {
+    input.trim_start_matches([' ', '\t', '\r', '\n'])
 }
 
 fn parse_gemma_function_call(
@@ -994,6 +1211,60 @@ mod tests {
         )
     }
 
+    fn dsml_tools() -> Vec<ChatTool> {
+        vec![
+            ChatTool::function(ChatFunctionDefinition {
+                name: "write_file".to_string(),
+                description: Some("Write a file".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "contents": {"type": "string"},
+                        "executable": {"type": "boolean"}
+                    },
+                    "required": ["path", "contents"]
+                }),
+            }),
+            ChatTool::function(ChatFunctionDefinition {
+                name: "bash".to_string(),
+                description: Some("Run a command".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "options": {"type": "object"}
+                    },
+                    "required": ["command"]
+                }),
+            }),
+        ]
+    }
+
+    fn dsml_protocol_text() -> &'static str {
+        concat!(
+            "I will update it.",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"write_file\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs",
+            "</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"contents\" string=\"true\">",
+            "fn main() {\n    println!(\"hi\");\n}",
+            "</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"executable\" string=\"false\">false",
+            "</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜invoke name=\"bash\">\n",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">cargo test",
+            "</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"options\" string=\"false\">",
+            "{\"cwd\":\"/workspace\"}",
+            "</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>"
+        )
+    }
+
     fn normalized(events: Vec<ChatOutputEvent>) -> Vec<ChatOutputEvent> {
         let mut normalized = Vec::new();
         for event in events {
@@ -1029,6 +1300,36 @@ mod tests {
                         ),
                         ("executable".to_string(), json!(false)),
                         ("path".to_string(), json!("src/main.rs")),
+                    ]),
+                },
+            }),
+        ]
+    }
+
+    fn dsml_expected() -> Vec<ChatOutputEvent> {
+        vec![
+            ChatOutputEvent::Text("I will update it.".to_string()),
+            ChatOutputEvent::ToolCall(ChatToolCall {
+                id: "call_ID".to_string(),
+                function: ChatFunctionCall {
+                    name: "write_file".to_string(),
+                    arguments: BTreeMap::from([
+                        (
+                            "contents".to_string(),
+                            json!("fn main() {\n    println!(\"hi\");\n}"),
+                        ),
+                        ("executable".to_string(), json!(false)),
+                        ("path".to_string(), json!("src/main.rs")),
+                    ]),
+                },
+            }),
+            ChatOutputEvent::ToolCall(ChatToolCall {
+                id: "call_ID".to_string(),
+                function: ChatFunctionCall {
+                    name: "bash".to_string(),
+                    arguments: BTreeMap::from([
+                        ("command".to_string(), json!("cargo test")),
+                        ("options".to_string(), json!({"cwd": "/workspace"})),
                     ]),
                 },
             }),
@@ -1088,6 +1389,73 @@ mod tests {
             .map(|index| &text[index..index + 1])
             .collect();
         assert_eq!(parse_chunks(&chunks), expected());
+    }
+
+    #[test]
+    fn dsml_tool_protocol_survives_every_character_boundary() {
+        let text = dsml_protocol_text();
+        for split in text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+        {
+            let mut parser = ChatOutputParser::new(&dsml_tools(), false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(normalized(events), dsml_expected(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn dsml_tool_protocol_rejects_malformed_calls() {
+        let cases = [
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"unknown\"></｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>"
+            ),
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"bash\">",
+                "<｜DSML｜parameter name=\"options\" string=\"false\">not-json",
+                "</｜DSML｜parameter>",
+                "</｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>"
+            ),
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"bash\" extra=\"value\"></｜DSML｜invoke>",
+                "</｜DSML｜tool_calls>"
+            ),
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>",
+        ];
+        for input in cases {
+            let mut parser = ChatOutputParser::new(&dsml_tools(), false).unwrap();
+            assert!(parser.push_text(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn dsml_truncation_discards_an_incomplete_tool_block() {
+        let mut parser = ChatOutputParser::new(&dsml_tools(), false).unwrap();
+        let events = parser
+            .push_text(concat!(
+                "working",
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"bash\">",
+                "<｜DSML｜parameter name=\"command\" string=\"true\">git status"
+            ))
+            .unwrap();
+        assert_eq!(events, [ChatOutputEvent::Text("working".to_string())]);
+        assert!(parser.finish_truncated().unwrap().is_empty());
+
+        let mut parser = ChatOutputParser::new(&dsml_tools(), false).unwrap();
+        parser
+            .push_text("<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">")
+            .unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(error.to_string().contains(DSML_TOOL_CALLS_CLOSE));
     }
 
     #[test]
@@ -1343,6 +1711,26 @@ mod tests {
         let events = normalized(events);
         assert_eq!(events[0], ChatOutputEvent::Reasoning("checked".to_string()));
         assert_eq!(&events[1..], expected());
+    }
+
+    #[test]
+    #[ignore = "requires a prepared local DeepSeek V4 thin checkpoint"]
+    fn local_deepseek_tokenizer_stream_recovers_reasoning_and_dsml_tools() {
+        let model_dir =
+            std::env::var("DEEPSEEK4_THIN_DIR").expect("DEEPSEEK4_THIN_DIR must be set");
+        let tokenizer = Tokenizer::from_file(Path::new(&model_dir).join("tokenizer.json")).unwrap();
+        let generated = format!("checked</think>\n\n{}", dsml_protocol_text());
+        let encoding = tokenizer.encode(generated, false).unwrap();
+        let mut codec = ChatOutputCodec::new(&tokenizer, &dsml_tools(), true).unwrap();
+        let mut events = Vec::new();
+        for &token in encoding.get_ids() {
+            events.extend(codec.push_token(token).unwrap());
+        }
+        events.extend(codec.finish().unwrap());
+
+        let events = normalized(events);
+        assert_eq!(events[0], ChatOutputEvent::Reasoning("checked".to_string()));
+        assert_eq!(&events[1..], dsml_expected());
     }
 
     #[test]
