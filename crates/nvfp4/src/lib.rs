@@ -17,6 +17,7 @@ mod cublaslt;
 mod cuda;
 mod diagnostics;
 mod error;
+mod expert_slots;
 mod ffi;
 mod kernels;
 mod matrix;
@@ -38,6 +39,7 @@ pub use cuda::{
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
 pub use error::{Error, Result};
+pub use expert_slots::Nvfp4LinearSlots;
 pub use kernels::deepseek4::{
     Deepseek4AttentionBatch, Deepseek4CausalAttentionBatch,
     arithmetic_positions_u32_into_on_stream, attention_f32_batch_into_on_stream,

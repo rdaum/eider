@@ -11370,6 +11370,96 @@ extern "C" cudaError_t infer_q3_nvfp4_mixed_routed_matvec_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_nvfp4_slot_routed_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ slots,
+    const float* __restrict__ input,
+    const std::uint8_t* const* __restrict__ packed_weight_table,
+    const std::uint8_t* const* __restrict__ weight_scale_table,
+    const float* __restrict__ weight_scale_2_table,
+    float* __restrict__ output,
+    std::uint32_t capacity,
+    std::uint32_t routes,
+    std::uint32_t routes_per_input,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    std::uint32_t output_stride,
+    std::uint32_t output_offset) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    extern __shared__ float input_sh[];
+    const std::uint32_t route = blockIdx.y;
+    if (route >= routes) {
+        return;
+    }
+    const float* input_row =
+        input + static_cast<std::size_t>(route / routes_per_input) * in_features;
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input_row[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= out_features) {
+        return;
+    }
+    const std::uint32_t slot = slots[route];
+    if (slot >= capacity) {
+        return;
+    }
+    const std::uint32_t row_byte_base = row * (in_features / 2);
+    const std::uint32_t row_scale_base = row * (in_features / 16);
+    const float value = infer_nvfp4_row_dot_warp(
+        packed_weight_table[slot] + row_byte_base,
+        weight_scale_table[slot] + row_scale_base,
+        input_sh,
+        in_features) * weight_scale_2_table[slot];
+    if (lane == 0) {
+        output[
+            static_cast<std::size_t>(route) * output_stride + output_offset + row] =
+            value;
+    }
+}
+
+extern "C" cudaError_t infer_nvfp4_slot_routed_matvec_f32_on_stream(
+    const std::uint32_t* slots,
+    const float* input,
+    const std::uint8_t* const* packed_weight_table,
+    const std::uint8_t* const* weight_scale_table,
+    const float* weight_scale_2_table,
+    float* output,
+    std::uint32_t capacity,
+    std::uint32_t routes,
+    std::uint32_t routes_per_input,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    std::uint32_t output_stride,
+    std::uint32_t output_offset,
+    cudaStream_t stream) {
+    if (slots == nullptr || input == nullptr || packed_weight_table == nullptr ||
+        weight_scale_table == nullptr || weight_scale_2_table == nullptr ||
+        output == nullptr || capacity == 0 || routes == 0 ||
+        routes_per_input == 0 || (routes % routes_per_input) != 0 ||
+        out_features == 0 || in_features == 0 || (in_features % 16) != 0 ||
+        output_stride < out_features ||
+        output_offset > output_stride - out_features) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const dim3 grid(
+        (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock,
+        routes);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_nvfp4_slot_routed_matvec_f32_kernel<<<
+        grid, kThreads, shared_bytes, stream>>>(
+        slots, input, packed_weight_table, weight_scale_table,
+        weight_scale_2_table, output, capacity, routes, routes_per_input,
+        out_features, in_features, output_stride, output_offset);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_nvfp4_w4a16_top1_f32_on_stream(
     const float* input,
     const std::uint8_t* packed_weight,

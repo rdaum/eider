@@ -3252,8 +3252,8 @@ mod tests {
     use super::{
         Deepseek4AttentionRow, Deepseek4AttentionWeights, Deepseek4Bf16Linear,
         Deepseek4BlockFp8Linear, Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights,
-        Deepseek4ModelConfig, Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4UnweightedRmsNorm,
-        load_bf16,
+        Deepseek4HyperHead, Deepseek4ModelConfig, Deepseek4ResidentLayer, Deepseek4RmsNorm,
+        Deepseek4UnweightedRmsNorm, load_bf16,
     };
     use crate::deepseek4::{
         Deepseek4ExpertLayer, Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4SequenceState,
@@ -3344,29 +3344,27 @@ mod tests {
         );
     }
 
-    fn run_real_layer_three(install_original_hotset: bool) -> (Vec<f32>, Vec<f32>) {
-        const LAYER: usize = 3;
+    fn run_real_layer(
+        layer: usize,
+        input_path: impl AsRef<std::path::Path>,
+        reference_path: impl AsRef<std::path::Path>,
+        hot_cache_dir: Option<impl AsRef<std::path::Path>>,
+    ) -> (Vec<f32>, Vec<f32>) {
         let model_dir =
             std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
         let artifact_dir = std::env::var_os("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
             .expect("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR");
-        let input_path = std::env::var_os("EIDER_DEEPSEEK4_LAYER2_REFERENCE")
-            .expect("EIDER_DEEPSEEK4_LAYER2_REFERENCE");
-        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LAYER3_REFERENCE")
-            .expect("EIDER_DEEPSEEK4_LAYER3_REFERENCE");
         let config = Deepseek4ModelConfig::load(&model_dir).expect("config");
         let manifest = Deepseek4Manifest::from(&config);
         let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
-        let hot_source = install_original_hotset.then(|| {
-            let hot_cache_dir = std::env::var_os("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR")
-                .expect("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR");
-            Deepseek4HotExpertCache::open(&hot_cache_dir, &manifest, manifest.routed_experts)
+        let hot_source = hot_cache_dir.map(|cache_dir| {
+            Deepseek4HotExpertCache::open(cache_dir, &manifest, manifest.routed_experts)
                 .expect("hot cache")
         });
         let hot_capacity = hot_source.as_ref().map_or(1, |source| {
-            source.resident_capacity(LAYER).expect("hot capacity")
+            source.resident_capacity(layer).expect("hot capacity")
         });
-        let mut routed = Deepseek4ExpertLayer::load(&artifact_dir, &manifest, LAYER, hot_capacity)
+        let mut routed = Deepseek4ExpertLayer::load(&artifact_dir, &manifest, layer, hot_capacity)
             .expect("routed experts");
         if let Some(hot_source) = &hot_source {
             routed
@@ -3374,7 +3372,7 @@ mod tests {
                 .expect("install hot experts");
         }
         let resident =
-            Deepseek4ResidentLayer::load(&checkpoint, &config, LAYER).expect("resident layer");
+            Deepseek4ResidentLayer::load(&checkpoint, &config, layer).expect("resident layer");
 
         let token_ids = [
             0u32, 128_803, 19_905, 418, 9_045, 28, 44_388, 128_804, 128_821,
@@ -3396,7 +3394,7 @@ mod tests {
             .allocate_layer_workspace(&config, token_count)
             .expect("layer workspace");
         let mut rows = [Deepseek4AttentionRow {
-            state: state.layer_mut(LAYER).expect("layer state"),
+            state: state.layer_mut(layer).expect("layer state"),
             rows: token_count,
             position: 0,
         }];
@@ -3420,6 +3418,18 @@ mod tests {
                 .into_vec(),
             read_f32_reference(reference_path),
         )
+    }
+
+    fn run_real_layer_three(install_original_hotset: bool) -> (Vec<f32>, Vec<f32>) {
+        let input_path = std::env::var_os("EIDER_DEEPSEEK4_LAYER2_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LAYER2_REFERENCE");
+        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LAYER3_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LAYER3_REFERENCE");
+        let hot_cache_dir = install_original_hotset.then(|| {
+            std::env::var_os("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR")
+                .expect("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR")
+        });
+        run_real_layer(3, input_path, reference_path, hot_cache_dir)
     }
 
     #[test]
@@ -3595,6 +3605,122 @@ mod tests {
             relative_l2 < 0.12 && cosine > 0.99,
             "layer 3 cold Q3: relative_l2={relative_l2} cosine={cosine}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a prepared late DeepSeek V4 layer and an independent reference"]
+    fn real_checkpoint_late_layer_matches_reference() {
+        let layer = std::env::var("EIDER_DEEPSEEK4_LATE_LAYER")
+            .expect("EIDER_DEEPSEEK4_LATE_LAYER")
+            .parse::<usize>()
+            .expect("numeric late layer");
+        let input_path =
+            std::env::var_os("EIDER_DEEPSEEK4_LATE_INPUT").expect("EIDER_DEEPSEEK4_LATE_INPUT");
+        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LATE_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LATE_REFERENCE");
+        let hot_cache_dir = std::env::var_os("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR")
+            .expect("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR");
+        let (actual, expected) =
+            run_real_layer(layer, input_path, reference_path, Some(hot_cache_dir));
+        let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
+        assert!(
+            relative_l2 < 0.01 && cosine > 0.999,
+            "layer {layer}: relative_l2={relative_l2} cosine={cosine}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a prepared late DeepSeek V4 Q3 layer and an independent reference"]
+    fn real_checkpoint_q3_late_layer_meets_quality_gate() {
+        let layer = std::env::var("EIDER_DEEPSEEK4_LATE_LAYER")
+            .expect("EIDER_DEEPSEEK4_LATE_LAYER")
+            .parse::<usize>()
+            .expect("numeric late layer");
+        let input_path =
+            std::env::var_os("EIDER_DEEPSEEK4_LATE_INPUT").expect("EIDER_DEEPSEEK4_LATE_INPUT");
+        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LATE_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LATE_REFERENCE");
+        let (actual, expected) =
+            run_real_layer(layer, input_path, reference_path, None::<&std::path::Path>);
+        let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
+        assert!(
+            relative_l2 < 0.12 && cosine > 0.99,
+            "layer {layer} cold Q3: relative_l2={relative_l2} cosine={cosine}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a prepared DeepSeek V4 checkpoint and independent final-head references"]
+    fn real_checkpoint_final_head_matches_reference() {
+        let model_dir =
+            std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
+        let input_path =
+            std::env::var_os("EIDER_DEEPSEEK4_FINAL_INPUT").expect("EIDER_DEEPSEEK4_FINAL_INPUT");
+        let collapsed_path = std::env::var_os("EIDER_DEEPSEEK4_FINAL_COLLAPSED")
+            .expect("EIDER_DEEPSEEK4_FINAL_COLLAPSED");
+        let normed_path =
+            std::env::var_os("EIDER_DEEPSEEK4_FINAL_NORMED").expect("EIDER_DEEPSEEK4_FINAL_NORMED");
+        let logits_path =
+            std::env::var_os("EIDER_DEEPSEEK4_FINAL_LOGITS").expect("EIDER_DEEPSEEK4_FINAL_LOGITS");
+        let config = Deepseek4ModelConfig::load(&model_dir).expect("config");
+        let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
+        let input = read_f32_reference(input_path);
+        assert_eq!(input.len(), config.hc_mult * config.hidden_size);
+
+        let hyper_head = Deepseek4HyperHead::load(&checkpoint, &config).expect("hyper head");
+        let norm = Deepseek4RmsNorm::load(
+            &checkpoint,
+            "norm.weight",
+            config.hidden_size,
+            config.rms_norm_eps,
+        )
+        .expect("final norm");
+        let head =
+            Deepseek4Bf16Linear::load(&checkpoint, "head", config.vocab_size, config.hidden_size)
+                .expect("LM head");
+        let input = DeviceBuffer::from_host(&input).expect("input");
+        let mut collapsed = DeviceBuffer::zeroed(config.hidden_size).expect("collapsed");
+        let mut normed = DeviceBuffer::zeroed(config.hidden_size).expect("normed");
+        let mut logits = DeviceBuffer::zeroed(config.vocab_size).expect("logits");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        hyper_head
+            .run_rows(&input, &mut collapsed, 1, &stream)
+            .expect("run hyper head");
+        norm.run_rows(&collapsed, &mut normed, 1, &stream)
+            .expect("run final norm");
+        head.run_rows(&normed, &mut logits, 1, &stream)
+            .expect("run LM head");
+
+        for (label, actual, expected_path, max_relative_l2, min_cosine) in [
+            (
+                "collapsed",
+                collapsed.copy_to_host(&stream).expect("read collapsed"),
+                collapsed_path,
+                2.0e-5,
+                0.999_999,
+            ),
+            (
+                "normed",
+                normed.copy_to_host(&stream).expect("read normed"),
+                normed_path,
+                2.0e-5,
+                0.999_999,
+            ),
+            (
+                "logits",
+                logits.copy_to_host(&stream).expect("read logits"),
+                logits_path,
+                2.0e-4,
+                0.999_99,
+            ),
+        ] {
+            let expected = read_f32_reference(expected_path);
+            let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
+            assert!(
+                relative_l2 < max_relative_l2 && cosine > min_cosine,
+                "{label}: relative_l2={relative_l2} cosine={cosine}"
+            );
+        }
     }
 
     #[test]
