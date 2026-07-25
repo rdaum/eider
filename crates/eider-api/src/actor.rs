@@ -56,10 +56,7 @@ pub struct InferenceActorConfig {
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
     pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
-    pub deepseek_hot_expert_capacity: usize,
-    pub deepseek_hot_expert_cache_dir: Option<PathBuf>,
-    pub deepseek_hotset_plan_output: Option<PathBuf>,
-    pub deepseek_hotset_plan_capacity: usize,
+    pub deepseek_expert_capacity: usize,
     pub step_bf16_storage: Step37Bf16StorageConfig,
     pub nemotron_storage: Nemotron3StorageConfig,
     pub event_capacity: usize,
@@ -76,10 +73,7 @@ impl InferenceActorConfig {
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
             qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
-            deepseek_hot_expert_capacity: 1,
-            deepseek_hot_expert_cache_dir: None,
-            deepseek_hotset_plan_output: None,
-            deepseek_hotset_plan_capacity: 1,
+            deepseek_expert_capacity: 8,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
             nemotron_storage: Nemotron3StorageConfig::default(),
             event_capacity: 256,
@@ -248,10 +242,7 @@ fn actor_main(
         qwen_bf16_storage,
         qwen_fp8_attention_storage,
         step_expert_capacity,
-        deepseek_hot_expert_capacity,
-        deepseek_hot_expert_cache_dir,
-        deepseek_hotset_plan_output,
-        deepseek_hotset_plan_capacity,
+        deepseek_expert_capacity,
         step_bf16_storage,
         nemotron_storage,
         ..
@@ -465,17 +456,15 @@ fn actor_main(
         CheckpointArchitecture::Deepseek4 => {
             info!(
                 model_dir = %model_dir.display(),
-                artifact_dir = %artifact_dir.display(),
-                hot_expert_capacity = deepseek_hot_expert_capacity,
-                hot_expert_cache_dir = ?deepseek_hot_expert_cache_dir,
+                expert_store_dir = %artifact_dir.display(),
+                expert_capacity = deepseek_expert_capacity,
                 prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
                 "loading DeepSeek V4 model"
             );
-            let model = match Deepseek4TextModel::load_with_hot_cache(
+            let model = match Deepseek4TextModel::load_paged_nvfp4(
                 &model_dir,
                 &artifact_dir,
-                deepseek_hot_expert_capacity,
-                deepseek_hot_expert_cache_dir.as_deref(),
+                deepseek_expert_capacity,
             ) {
                 Ok(model) => model,
                 Err(error) => {
@@ -499,11 +488,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = DeepseekActorService::new(
-                service,
-                deepseek_hotset_plan_output,
-                deepseek_hotset_plan_capacity,
-            );
+            let mut service = DeepseekActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
     }
@@ -1210,21 +1195,13 @@ impl ActorService for LagunaActorService<'_, '_> {
 struct DeepseekActorService<'template> {
     inner: Deepseek4ChatService<'template>,
     ids: BTreeMap<u64, Deepseek4RequestId>,
-    hotset_plan_output: Option<PathBuf>,
-    hotset_capacity: usize,
 }
 
 impl<'template> DeepseekActorService<'template> {
-    fn new(
-        inner: Deepseek4ChatService<'template>,
-        hotset_plan_output: Option<PathBuf>,
-        hotset_capacity: usize,
-    ) -> Self {
+    fn new(inner: Deepseek4ChatService<'template>) -> Self {
         Self {
             inner,
             ids: BTreeMap::new(),
-            hotset_plan_output,
-            hotset_capacity,
         }
     }
 }
@@ -1320,20 +1297,6 @@ impl ActorService for DeepseekActorService<'_> {
 
     fn active_sequence_count(&self) -> usize {
         self.inner.active_sequence_count()
-    }
-
-    fn shutdown(&mut self) -> infer::nvfp4::Result<()> {
-        let Some(path) = self.hotset_plan_output.as_ref() else {
-            return Ok(());
-        };
-        let experts = self.inner.write_hotset_plan(path, self.hotset_capacity)?;
-        info!(
-            path = %path.display(),
-            experts,
-            capacity_per_layer = self.hotset_capacity,
-            "wrote DeepSeek V4 hotset plan"
-        );
-        Ok(())
     }
 }
 

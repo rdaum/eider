@@ -142,8 +142,8 @@ Use `--model-dir PATH` only for local conversion or development checkpoints.
 [DeepSeek V4 Flash](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4)
 uses a separate prepared-local workflow because its complete source checkpoint
 is larger than the Spark's unified memory. Its launcher serves
-`eider-deepseek-v4` from a thin checkpoint, resident Q3 experts, and bounded
-original-NVFP4 hot slots.
+`eider-deepseek-v4` from a thin checkpoint and bounded, disk-backed exact
+NVFP4 expert slots.
 
 Agents-A1 uses the same Qwen3.5-MoE runtime as Qwen3.6. Its checkpoint has BF16
 attention projections and a BF16 LM head alongside its NVFP4 experts; Eider can
@@ -213,7 +213,7 @@ automatically.
 
 DeepSeek V4 requires a bounded streaming conversion before serving because its
 complete source checkpoint is larger than the Spark's unified memory. See
-[DeepSeek V4 expert storage](docs/deepseek4-experts.md) for its Q3 expert
+[DeepSeek V4 expert storage](docs/deepseek4-experts.md) for its paged NVFP4
 layout, memory budget, and preparation commands.
 
 ### Model-specific controls
@@ -233,9 +233,8 @@ attention projections and LM head default to NVFP4; use
 `--qwen-bf16-attention` and `--qwen-bf16-lm-head` to select `bf16`, `fp8`, or
 `nvfp4`.
 
-DeepSeek V4 accepts at most eight cached original-NVFP4 experts per layer by
-default and sizes each overlay from the cache's actual contents. It defaults
-to a 32,768-token context. Use `--deepseek-hot-expert-capacity` and
+DeepSeek V4 defaults to eight resident exact-NVFP4 expert slots per layer and
+a 32,768-token context. Use `--deepseek-expert-capacity` and
 `--max-context-tokens` to change those limits.
 
 ### API and agent clients

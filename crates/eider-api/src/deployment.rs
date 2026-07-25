@@ -593,7 +593,7 @@ fn artifact_dir(repository: &str, revision: &str, kind: ArtifactKind) -> Result<
         ArtifactKind::Qwen36Experts => "qwen36-experts-v1",
         ArtifactKind::Step37Experts => "step37-experts-v1",
         ArtifactKind::LagunaExperts => "laguna-experts-v1",
-        ArtifactKind::Deepseek4Experts => "deepseek4-experts-q3-v1",
+        ArtifactKind::Deepseek4Experts => "deepseek4-experts-nvfp4-v1",
     };
     let root = xdg_cache_home()?;
     Ok(root
@@ -706,7 +706,11 @@ mod tests {
         let fixture = CheckpointFixture::new("deepseek_v4", true);
         let resolved = resolve_local_model(fixture.path()).expect("resolve DeepSeek fixture");
         assert_eq!(resolved.preparation, ArtifactKind::Deepseek4Experts);
-        assert!(resolved.artifact_dir.ends_with("deepseek4-experts-q3-v1"));
+        assert!(
+            resolved
+                .artifact_dir
+                .ends_with("deepseek4-experts-nvfp4-v1")
+        );
     }
 
     #[test]

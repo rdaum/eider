@@ -2,7 +2,8 @@ use super::{
     Deepseek4AttentionKind, Deepseek4CompressionState, Deepseek4ExpertLayer,
     Deepseek4ExpertWorkspace, Deepseek4HotExpertCache, Deepseek4HotsetPlan,
     Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
-    Deepseek4SequenceCheckpoint, Deepseek4SequenceState,
+    Deepseek4PagedExpertLayer, Deepseek4RoutedExpertLayer, Deepseek4SequenceCheckpoint,
+    Deepseek4SequenceState,
 };
 use crate::nvfp4::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear,
@@ -2415,7 +2416,7 @@ impl Deepseek4ResidentLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn run_layer_rows(
         &self,
-        routed_experts: &mut Deepseek4ExpertLayer,
+        routed_experts: &mut Deepseek4RoutedExpertLayer,
         workspace: &mut Deepseek4LayerWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         streams: &DeviceBuffer<f32>,
@@ -2502,7 +2503,7 @@ impl Deepseek4ResidentLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn run_ffn_rows<'a>(
         &self,
-        routed_experts: &mut Deepseek4ExpertLayer,
+        routed_experts: &mut Deepseek4RoutedExpertLayer,
         workspace: &'a mut Deepseek4FfnWorkspace,
         input: &DeviceBuffer<f32>,
         token_ids: &DeviceBuffer<u32>,
@@ -2764,10 +2765,10 @@ impl Deepseek4BatchWorkspace {
     }
 }
 
-/// Complete DeepSeek V4 text model with resident non-expert weights and Q3 experts.
+/// Complete DeepSeek V4 text model with resident non-expert weights.
 pub struct Deepseek4TextModel {
     pub weights: Deepseek4ModelWeights,
-    routed_experts: Vec<Deepseek4ExpertLayer>,
+    routed_experts: Vec<Deepseek4RoutedExpertLayer>,
 }
 
 impl Deepseek4TextModel {
@@ -2814,7 +2815,7 @@ impl Deepseek4TextModel {
                 device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 "loaded DeepSeek V4 routed expert layer"
             );
-            routed_experts.push(loaded);
+            routed_experts.push(Deepseek4RoutedExpertLayer::ResidentQ3(loaded));
         }
         let mut model = Self {
             weights,
@@ -2823,6 +2824,9 @@ impl Deepseek4TextModel {
         if let Some(source) = hot_source.as_ref() {
             let mut installed = 0usize;
             for layer in &mut model.routed_experts {
+                let Deepseek4RoutedExpertLayer::ResidentQ3(layer) = layer else {
+                    unreachable!("newly loaded Q3 model has a paged expert layer");
+                };
                 installed =
                     installed.saturating_add(layer.install_cached_hotset(source)?.installed);
             }
@@ -2833,6 +2837,38 @@ impl Deepseek4TextModel {
             );
         }
         Ok(model)
+    }
+
+    /// Loads exact original-NVFP4 experts through bounded resident slots.
+    pub fn load_paged_nvfp4(
+        model_dir: impl AsRef<Path>,
+        expert_store_dir: impl AsRef<Path>,
+        capacity_per_layer: usize,
+    ) -> Result<Self> {
+        let weights = Deepseek4ModelWeights::load(model_dir)?;
+        let manifest = Deepseek4Manifest::from(&weights.config);
+        let mut routed_experts = Vec::with_capacity(manifest.layers);
+        let mut device_bytes = weights.device_bytes();
+        for layer in 0..manifest.layers {
+            let loaded = Deepseek4PagedExpertLayer::load(
+                expert_store_dir.as_ref(),
+                &manifest,
+                layer,
+                capacity_per_layer,
+            )?;
+            device_bytes = device_bytes.saturating_add(loaded.device_bytes());
+            info!(
+                layer,
+                expert_slots = capacity_per_layer,
+                device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                "allocated DeepSeek V4 paged NVFP4 expert layer"
+            );
+            routed_experts.push(Deepseek4RoutedExpertLayer::PagedNvfp4(loaded));
+        }
+        Ok(Self {
+            weights,
+            routed_experts,
+        })
     }
 
     pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Deepseek4SequenceState> {
@@ -3063,7 +3099,7 @@ impl Deepseek4TextModel {
         self.weights.device_bytes().saturating_add(
             self.routed_experts
                 .iter()
-                .map(Deepseek4ExpertLayer::device_bytes)
+                .map(Deepseek4RoutedExpertLayer::device_bytes)
                 .sum::<usize>(),
         )
     }
@@ -3256,7 +3292,8 @@ mod tests {
         Deepseek4UnweightedRmsNorm, load_bf16,
     };
     use crate::deepseek4::{
-        Deepseek4ExpertLayer, Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4SequenceState,
+        Deepseek4ExpertLayer, Deepseek4HotExpertCache, Deepseek4Manifest,
+        Deepseek4PagedExpertLayer, Deepseek4RoutedExpertLayer, Deepseek4SequenceState,
     };
     use crate::nvfp4::{
         CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
@@ -3349,11 +3386,14 @@ mod tests {
         input_path: impl AsRef<std::path::Path>,
         reference_path: impl AsRef<std::path::Path>,
         hot_cache_dir: Option<impl AsRef<std::path::Path>>,
+        paged_capacity: Option<usize>,
     ) -> (Vec<f32>, Vec<f32>) {
         let model_dir =
             std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
-        let artifact_dir = std::env::var_os("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
-            .expect("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR");
+        let artifact_dir = paged_capacity.is_none().then(|| {
+            std::env::var_os("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
+                .expect("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
+        });
         let config = Deepseek4ModelConfig::load(&model_dir).expect("config");
         let manifest = Deepseek4Manifest::from(&config);
         let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
@@ -3361,16 +3401,30 @@ mod tests {
             Deepseek4HotExpertCache::open(cache_dir, &manifest, manifest.routed_experts)
                 .expect("hot cache")
         });
-        let hot_capacity = hot_source.as_ref().map_or(1, |source| {
-            source.resident_capacity(layer).expect("hot capacity")
-        });
-        let mut routed = Deepseek4ExpertLayer::load(&artifact_dir, &manifest, layer, hot_capacity)
+        let mut routed = if let Some(capacity) = paged_capacity {
+            let hot_source = hot_source.as_ref().expect("paged expert source");
+            Deepseek4RoutedExpertLayer::PagedNvfp4(
+                Deepseek4PagedExpertLayer::load(&hot_source.root, &manifest, layer, capacity)
+                    .expect("paged routed experts"),
+            )
+        } else {
+            let hot_capacity = hot_source.as_ref().map_or(1, |source| {
+                source.resident_capacity(layer).expect("hot capacity")
+            });
+            let mut routed = Deepseek4ExpertLayer::load(
+                artifact_dir.as_ref().expect("Q3 expert artifact"),
+                &manifest,
+                layer,
+                hot_capacity,
+            )
             .expect("routed experts");
-        if let Some(hot_source) = &hot_source {
-            routed
-                .install_cached_hotset(hot_source)
-                .expect("install hot experts");
-        }
+            if let Some(hot_source) = &hot_source {
+                routed
+                    .install_cached_hotset(hot_source)
+                    .expect("install hot experts");
+            }
+            Deepseek4RoutedExpertLayer::ResidentQ3(routed)
+        };
         let resident =
             Deepseek4ResidentLayer::load(&checkpoint, &config, layer).expect("resident layer");
 
@@ -3429,7 +3483,7 @@ mod tests {
             std::env::var_os("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR")
                 .expect("EIDER_DEEPSEEK4_LAYER3_HOT_CACHE_DIR")
         });
-        run_real_layer(3, input_path, reference_path, hot_cache_dir)
+        run_real_layer(3, input_path, reference_path, hot_cache_dir, None)
     }
 
     #[test]
@@ -3557,6 +3611,7 @@ mod tests {
             routed
                 .install_cached_hotset(&hot_source)
                 .expect("install hot experts");
+            let mut routed = Deepseek4RoutedExpertLayer::ResidentQ3(routed);
             let mut workspace = resident
                 .allocate_layer_workspace(&config, token_count)
                 .expect("layer workspace");
@@ -3621,7 +3676,7 @@ mod tests {
         let hot_cache_dir = std::env::var_os("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR")
             .expect("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR");
         let (actual, expected) =
-            run_real_layer(layer, input_path, reference_path, Some(hot_cache_dir));
+            run_real_layer(layer, input_path, reference_path, Some(hot_cache_dir), None);
         let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
         assert!(
             relative_l2 < 0.01 && cosine > 0.999,
@@ -3640,12 +3695,39 @@ mod tests {
             std::env::var_os("EIDER_DEEPSEEK4_LATE_INPUT").expect("EIDER_DEEPSEEK4_LATE_INPUT");
         let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LATE_REFERENCE")
             .expect("EIDER_DEEPSEEK4_LATE_REFERENCE");
-        let (actual, expected) =
-            run_real_layer(layer, input_path, reference_path, None::<&std::path::Path>);
+        let (actual, expected) = run_real_layer(
+            layer,
+            input_path,
+            reference_path,
+            None::<&std::path::Path>,
+            None,
+        );
         let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
         assert!(
             relative_l2 < 0.12 && cosine > 0.99,
             "layer {layer} cold Q3: relative_l2={relative_l2} cosine={cosine}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a prepared exact-NVFP4 late layer and an independent reference"]
+    fn real_checkpoint_paged_late_layer_matches_reference() {
+        let layer = std::env::var("EIDER_DEEPSEEK4_LATE_LAYER")
+            .expect("EIDER_DEEPSEEK4_LATE_LAYER")
+            .parse::<usize>()
+            .expect("numeric late layer");
+        let input_path =
+            std::env::var_os("EIDER_DEEPSEEK4_LATE_INPUT").expect("EIDER_DEEPSEEK4_LATE_INPUT");
+        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LATE_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LATE_REFERENCE");
+        let source_dir = std::env::var_os("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR")
+            .expect("EIDER_DEEPSEEK4_LATE_HOT_CACHE_DIR");
+        let (actual, expected) =
+            run_real_layer(layer, input_path, reference_path, Some(source_dir), Some(8));
+        let (relative_l2, cosine) = layer_reference_metrics(&actual, &expected);
+        assert!(
+            relative_l2 < 0.01 && cosine > 0.999,
+            "paged layer {layer}: relative_l2={relative_l2} cosine={cosine}"
         );
     }
 
