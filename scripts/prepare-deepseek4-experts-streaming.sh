@@ -5,6 +5,8 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cache_root="${XDG_CACHE_HOME:-$HOME/.cache}"
 repository="${DEEPSEEK4_REPOSITORY:-nvidia/DeepSeek-V4-Flash-NVFP4}"
 revision="${DEEPSEEK4_REVISION:-e3cd60e7de98e9867116860d522499a728de1cf9}"
+template_repository="${DEEPSEEK4_TEMPLATE_REPOSITORY:-deepseek-ai/DeepSeek-V4-Flash}"
+template_revision="${DEEPSEEK4_TEMPLATE_REVISION:-014a5cfe6d1349d3d1096b2f8c15faaaa11819d5}"
 staging_dir="${DEEPSEEK4_STAGING_DIR:-$cache_root/eider/staging/deepseek-v4-flash-nvfp4-$revision}"
 artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision/deepseek4-experts-q2-v2}"
 thin_dir="${DEEPSEEK4_THIN_DIR:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision/deepseek4-thin-nvfp4-v1}"
@@ -34,6 +36,13 @@ hf download "$repository" \
     --include tokenizer_config.json \
     --include chat_template.jinja \
     --include model.safetensors.index.json
+
+if [[ ! -f "$staging_dir/chat_template.jinja" ]]; then
+    hf download "$template_repository" \
+        --revision "$template_revision" \
+        --local-dir "$staging_dir" \
+        --include chat_template.jinja
+fi
 
 config="$staging_dir/config.json"
 index="$staging_dir/model.safetensors.index.json"

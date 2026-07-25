@@ -565,6 +565,8 @@ fn render_with_environment(
             add_generation_prompt => options.add_generation_prompt,
             enable_thinking => options.enable_thinking,
             preserve_thinking => options.preserve_thinking,
+            thinking_mode => if options.enable_thinking { "thinking" } else { "chat" },
+            drop_thinking => !options.preserve_thinking,
             reasoning_effort => reasoning_effort,
             add_vision_id => false,
             bos_token => bos_token,
@@ -630,6 +632,26 @@ mod tests {
         assert!(rendered.starts_with("user:hello|"));
         assert!(rendered.contains(r#""name": "read_file""#));
         assert!(rendered.ends_with("|true:false:true"));
+    }
+
+    #[test]
+    fn deepseek_thinking_aliases_follow_common_template_options() {
+        let environment =
+            build_environment("{{ thinking_mode }}:{{ drop_thinking }}".to_string()).unwrap();
+        let rendered = render_with_environment(
+            &environment,
+            &[ChatMessage::user("hello")],
+            &[],
+            ChatTemplateOptions {
+                enable_thinking: false,
+                preserve_thinking: true,
+                ..ChatTemplateOptions::default()
+            },
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(rendered, "chat:false");
     }
 
     #[test]
@@ -796,6 +818,39 @@ mod tests {
         assert!(prompt.text.contains("<|tool>"), "{:?}", prompt.text);
         assert!(
             prompt.text.contains("declaration:read_file"),
+            "{:?}",
+            prompt.text
+        );
+        assert!(!prompt.token_ids.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a prepared local DeepSeek V4 thin checkpoint"]
+    fn local_deepseek4_template_renders_tool_generation_prefix() {
+        let model_dir = PathBuf::from(
+            std::env::var("DEEPSEEK4_THIN_DIR")
+                .expect("set DEEPSEEK4_THIN_DIR to the prepared thin checkpoint"),
+        );
+        let template = CheckpointChatTemplate::from_model_dir(model_dir).unwrap();
+        let prompt = template
+            .render_and_tokenize(
+                &[ChatMessage::user("inspect the repository")],
+                &[tool_definition()],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            prompt.text.starts_with("<｜begin▁of▁sentence｜>"),
+            "{:?}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.contains("<｜DSML｜tool_calls>"),
+            "{:?}",
+            prompt.text
+        );
+        assert!(
+            prompt.text.ends_with("<｜Assistant｜><think>"),
             "{:?}",
             prompt.text
         );

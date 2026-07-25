@@ -102,6 +102,25 @@
           }
         },
         {
+          "id": "eider-deepseek-v4",
+          "name": "DeepSeek V4 Flash NVFP4/Q2",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-nemotron3-puzzle",
           "name": "Nemotron Labs 3 Puzzle 75B-A9B NVFP4",
           "reasoning": true,
@@ -214,6 +233,25 @@
           },
           "input": ["text"],
           "contextWindow": 65536,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-deepseek-v4",
+          "name": "DeepSeek V4 Flash NVFP4/Q2",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 32768,
           "maxTokens": 4096,
           "cost": {
             "input": 0,

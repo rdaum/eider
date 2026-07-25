@@ -2,6 +2,7 @@
 
 pub mod chat;
 pub mod chat_output;
+pub mod deepseek4_serving;
 pub mod expert_cache;
 pub mod expert_hotset;
 pub mod gemma4_serving;

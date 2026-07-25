@@ -2702,6 +2702,7 @@ pub struct Deepseek4BatchRow<'tokens, 'state> {
 /// Device-resident final-token logits in the same order as the input rows.
 pub struct Deepseek4LogitsBatch<'a> {
     logits: &'a DeviceBuffer<f32>,
+    stream: &'a CudaStream,
     rows: usize,
     vocab: usize,
 }
@@ -2717,6 +2718,21 @@ impl Deepseek4LogitsBatch<'_> {
 
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    pub fn copy_to_host(&self) -> Result<Vec<f32>> {
+        let values = self
+            .rows
+            .checked_mul(self.vocab)
+            .ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 logits batch",
+                expected: "rows times vocabulary without overflow".to_string(),
+                actual: format!("rows={} vocab={}", self.rows, self.vocab),
+            })?;
+        Ok(self
+            .logits
+            .copy_prefix_to_host(values, self.stream)?
+            .into_vec())
     }
 }
 
@@ -2797,6 +2813,10 @@ impl Deepseek4TextModel {
         Ok(checkpoint)
     }
 
+    pub fn checkpoint_sequence_device_bytes(&self, position: usize) -> Result<usize> {
+        Deepseek4SequenceState::device_bytes_for(&self.weights.config, position)
+    }
+
     pub fn restore_sequence_checkpoint(
         &self,
         checkpoint: &Deepseek4SequenceCheckpoint,
@@ -2873,7 +2893,18 @@ impl Deepseek4TextModel {
         })
     }
 
-    /// Executes the exact embedding, decoder, hyper-head, norm, and LM-head path.
+    /// Advances ragged prompt chunks without running the final vocabulary projection.
+    pub fn prefill_batch(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        rows: &mut [Deepseek4BatchRow<'_, '_>],
+    ) -> Result<()> {
+        self.run_decoder_batch(workspace, rows)?;
+        workspace.stream.synchronize()?;
+        advance_model_rows(rows)
+    }
+
+    /// Executes the embedding, decoder, hyper-head, norm, and LM-head path.
     ///
     /// Only the final token of each ragged row is projected to logits.
     pub fn forward_batch<'a>(
@@ -2881,8 +2912,55 @@ impl Deepseek4TextModel {
         workspace: &'a mut Deepseek4BatchWorkspace,
         rows: &mut [Deepseek4BatchRow<'_, '_>],
     ) -> Result<Deepseek4LogitsBatch<'a>> {
-        let total_tokens = validate_model_rows(&self.weights.config, workspace, rows)?;
+        self.run_decoder_batch(workspace, rows)?;
         let sequence_count = rows.len();
+        let final_width = HYPER_STREAMS * self.weights.config.hidden_size;
+        let mut source_row = 0;
+        for (sequence, row) in rows.iter().enumerate() {
+            let final_row = source_row + row.token_ids.len() - 1;
+            workspace.final_streams.copy_range_from_device_on_stream(
+                sequence * final_width,
+                &workspace.streams,
+                final_row * final_width,
+                final_width,
+                &workspace.stream,
+            )?;
+            source_row += row.token_ids.len();
+        }
+        self.weights.hyper_head.run_rows(
+            &workspace.final_streams,
+            &mut workspace.final_hidden,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        self.weights.final_norm.run_rows(
+            &workspace.final_hidden,
+            &mut workspace.final_normed,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        self.weights.lm_head.run_rows(
+            &workspace.final_normed,
+            &mut workspace.logits,
+            rows.len(),
+            &workspace.stream,
+        )?;
+        workspace.stream.synchronize()?;
+        advance_model_rows(rows)?;
+        Ok(Deepseek4LogitsBatch {
+            logits: &workspace.logits,
+            stream: &workspace.stream,
+            rows: sequence_count,
+            vocab: self.weights.config.vocab_size,
+        })
+    }
+
+    fn run_decoder_batch(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        rows: &mut [Deepseek4BatchRow<'_, '_>],
+    ) -> Result<()> {
+        let total_tokens = validate_model_rows(&self.weights.config, workspace, rows)?;
         let mut token_offset = 0;
         for row in rows.iter() {
             let end = token_offset + row.token_ids.len();
@@ -2942,47 +3020,7 @@ impl Deepseek4TextModel {
             )?;
             std::mem::swap(&mut workspace.streams, &mut workspace.next_streams);
         }
-
-        let final_width = HYPER_STREAMS * self.weights.config.hidden_size;
-        let mut source_row = 0;
-        for (sequence, row) in rows.iter().enumerate() {
-            let final_row = source_row + row.token_ids.len() - 1;
-            workspace.final_streams.copy_range_from_device_on_stream(
-                sequence * final_width,
-                &workspace.streams,
-                final_row * final_width,
-                final_width,
-                &workspace.stream,
-            )?;
-            source_row += row.token_ids.len();
-        }
-        self.weights.hyper_head.run_rows(
-            &workspace.final_streams,
-            &mut workspace.final_hidden,
-            rows.len(),
-            &workspace.stream,
-        )?;
-        self.weights.final_norm.run_rows(
-            &workspace.final_hidden,
-            &mut workspace.final_normed,
-            rows.len(),
-            &workspace.stream,
-        )?;
-        self.weights.lm_head.run_rows(
-            &workspace.final_normed,
-            &mut workspace.logits,
-            rows.len(),
-            &workspace.stream,
-        )?;
-        workspace.stream.synchronize()?;
-        for row in rows {
-            row.state.advance(row.token_ids.len())?;
-        }
-        Ok(Deepseek4LogitsBatch {
-            logits: &workspace.logits,
-            rows: sequence_count,
-            vocab: self.weights.config.vocab_size,
-        })
+        Ok(())
     }
 
     pub fn device_bytes(&self) -> usize {
@@ -2993,6 +3031,13 @@ impl Deepseek4TextModel {
                 .sum::<usize>(),
         )
     }
+}
+
+fn advance_model_rows(rows: &mut [Deepseek4BatchRow<'_, '_>]) -> Result<()> {
+    for row in rows {
+        row.state.advance(row.token_ids.len())?;
+    }
+    Ok(())
 }
 
 fn validate_model_rows(

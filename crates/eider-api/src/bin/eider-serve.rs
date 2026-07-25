@@ -133,6 +133,10 @@ struct Args {
     #[arg(long, conflicts_with = "model")]
     model_dir: Option<PathBuf>,
 
+    /// Explicit derived-artifact directory for a local development checkpoint.
+    #[arg(long, requires = "model_dir")]
+    artifact_dir: Option<PathBuf>,
+
     /// Prohibit network access while resolving a catalogue model.
     #[arg(long)]
     offline: bool,
@@ -184,6 +188,10 @@ struct Args {
     /// Resident expert slots per routed Step layer.
     #[arg(long)]
     step_expert_capacity: Option<usize>,
+
+    /// NVFP4 hot-overlay slots allocated per routed DeepSeek V4 layer.
+    #[arg(long, default_value_t = 1)]
+    deepseek_hot_expert_capacity: usize,
 
     /// Runtime storage for BF16 Step attention projections.
     #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Nvfp4)]
@@ -259,12 +267,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!("Eider");
     let args = Args::parse();
-    let resolved = match (args.model.as_deref(), args.model_dir) {
+    let mut resolved = match (args.model.as_deref(), args.model_dir) {
         (Some(id), None) => resolve_catalogue_model(id, args.offline).await?,
         (None, Some(path)) => resolve_local_model(path)?,
         (Some(_), Some(_)) => unreachable!("clap rejects model plus --model-dir"),
         (None, None) => return Err("provide a supported model ID or --model-dir PATH".into()),
     };
+    if let Some(artifact_dir) = args.artifact_dir {
+        resolved.artifact_dir = artifact_dir;
+    }
     if resolved.preparation == ArtifactKind::Step37Experts {
         server_metrics().model_preparations.inc();
         info!(artifact_dir = %resolved.artifact_dir.display(), "preparing Step-3.7 expert artifacts");
@@ -302,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     actor_config.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
     actor_config.step_expert_capacity = step_expert_capacity;
+    actor_config.deepseek_hot_expert_capacity = args.deepseek_hot_expert_capacity;
     actor_config.step_bf16_storage = Step37Bf16StorageConfig {
         attention: args.step_bf16_attention.into(),
         dense_mlp: args.step_bf16_dense_mlp.into(),

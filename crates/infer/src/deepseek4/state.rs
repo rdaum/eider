@@ -228,6 +228,58 @@ impl Deepseek4CompressionState {
             }))
     }
 
+    fn device_bytes_for(
+        ratio: usize,
+        compressed_width: usize,
+        overlapping: bool,
+        max_tokens: usize,
+    ) -> Result<usize> {
+        if ratio == 0 || compressed_width == 0 || max_tokens == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 compression state",
+                expected: "positive ratio, width, and token capacity".to_string(),
+                actual: format!("ratio={ratio} width={compressed_width} max_tokens={max_tokens}"),
+            });
+        }
+        let projected_width = if overlapping {
+            compressed_width.checked_mul(2)
+        } else {
+            Some(compressed_width)
+        }
+        .ok_or_else(|| state_overflow("compression projected width", compressed_width, 2))?;
+        let compressed = (max_tokens / ratio)
+            .max(1)
+            .checked_mul(compressed_width)
+            .ok_or_else(|| {
+                state_overflow("compressed cache", max_tokens / ratio, compressed_width)
+            })?;
+        let pending = ratio
+            .checked_mul(projected_width)
+            .and_then(|values| values.checked_mul(2))
+            .ok_or_else(|| state_overflow("compression pending buffers", ratio, projected_width))?;
+        let overlap = if overlapping {
+            ratio
+                .checked_mul(compressed_width)
+                .and_then(|values| values.checked_mul(2))
+                .ok_or_else(|| {
+                    state_overflow("compression overlap buffers", ratio, compressed_width)
+                })?
+        } else {
+            0
+        };
+        compressed
+            .checked_add(pending)
+            .and_then(|values| values.checked_add(overlap))
+            .and_then(|values| values.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| {
+                state_overflow(
+                    "compression state bytes",
+                    compressed,
+                    pending.saturating_add(overlap),
+                )
+            })
+    }
+
     fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
         if self.ratio != source.ratio
             || self.projected_width != source.projected_width
@@ -525,6 +577,64 @@ impl Deepseek4LayerSequenceState {
             }
     }
 
+    fn device_bytes_for(
+        config: &Deepseek4ModelConfig,
+        layer: usize,
+        max_tokens: usize,
+    ) -> Result<usize> {
+        let sliding_capacity =
+            config
+                .sliding_window
+                .checked_sub(1)
+                .ok_or_else(|| Error::Shape {
+                    label: "DeepSeek V4 sliding window",
+                    expected: "at least two tokens".to_string(),
+                    actual: config.sliding_window.to_string(),
+                })?;
+        let sliding = sliding_capacity
+            .checked_mul(config.head_dim)
+            .and_then(|values| values.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| {
+                state_overflow("sliding cache bytes", sliding_capacity, config.head_dim)
+            })?;
+        let compression = match config.attention_kind(layer)? {
+            Deepseek4AttentionKind::Sliding => 0,
+            Deepseek4AttentionKind::CompressedSparse => {
+                let ratio = config.compression_ratio(layer)?;
+                Deepseek4CompressionState::device_bytes_for(
+                    ratio,
+                    config.head_dim,
+                    true,
+                    max_tokens,
+                )?
+                .checked_add(Deepseek4CompressionState::device_bytes_for(
+                    ratio,
+                    config.index_head_dim,
+                    true,
+                    max_tokens,
+                )?)
+                .ok_or_else(|| {
+                    state_overflow(
+                        "compressed sparse state bytes",
+                        config.head_dim,
+                        config.index_head_dim,
+                    )
+                })?
+            }
+            Deepseek4AttentionKind::HeavilyCompressed => {
+                Deepseek4CompressionState::device_bytes_for(
+                    config.compression_ratio(layer)?,
+                    config.head_dim,
+                    false,
+                    max_tokens,
+                )?
+            }
+        };
+        sliding
+            .checked_add(compression)
+            .ok_or_else(|| state_overflow("layer sequence state bytes", sliding, compression))
+    }
+
     fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
         self.sliding.copy_from_on_stream(&source.sliding, stream)?;
         match (&mut self.compression, &source.compression) {
@@ -625,6 +735,23 @@ impl Deepseek4SequenceState {
 
     pub fn device_bytes(&self) -> usize {
         self.device_bytes
+    }
+
+    pub fn device_bytes_for(config: &Deepseek4ModelConfig, max_tokens: usize) -> Result<usize> {
+        if max_tokens == 0 || max_tokens > config.max_position_embeddings {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 sequence capacity",
+                expected: format!("1..={}", config.max_position_embeddings),
+                actual: max_tokens.to_string(),
+            });
+        }
+        (0..config.num_hidden_layers).try_fold(0usize, |total, layer| {
+            total
+                .checked_add(Deepseek4LayerSequenceState::device_bytes_for(
+                    config, layer, max_tokens,
+                )?)
+                .ok_or_else(|| state_overflow("sequence state bytes", total, layer))
+        })
     }
 
     pub(crate) fn checkpoint_on_stream(
@@ -739,6 +866,10 @@ mod tests {
     #[test]
     fn compression_state_sizes_pending_overlap_and_completed_entries() {
         let mut state = Deepseek4CompressionState::new(4, 8, true, 19).expect("compression state");
+        assert_eq!(
+            state.device_bytes(),
+            Deepseek4CompressionState::device_bytes_for(4, 8, true, 19).expect("estimated bytes")
+        );
         assert_eq!(state.compressed_capacity(), 4);
         assert_eq!(state.compressed().len(), 32);
         assert_eq!(state.pending_kv().len(), 64);
