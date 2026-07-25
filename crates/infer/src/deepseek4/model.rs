@@ -2789,18 +2789,28 @@ impl Deepseek4TextModel {
     ) -> Result<Self> {
         let weights = Deepseek4ModelWeights::load(model_dir)?;
         let manifest = Deepseek4Manifest::from(&weights.config);
+        let hot_source = hot_cache_dir
+            .map(|cache_dir| {
+                Deepseek4HotExpertCache::open(cache_dir, &manifest, hot_capacity_per_layer)
+            })
+            .transpose()?;
         let mut routed_experts = Vec::with_capacity(manifest.layers);
         let mut device_bytes = weights.device_bytes();
         for layer in 0..manifest.layers {
+            let layer_hot_capacity = match hot_source.as_ref() {
+                Some(source) => source.resident_capacity(layer)?,
+                None => hot_capacity_per_layer,
+            };
             let loaded = Deepseek4ExpertLayer::load(
                 expert_artifact_dir.as_ref(),
                 &manifest,
                 layer,
-                hot_capacity_per_layer,
+                layer_hot_capacity,
             )?;
             device_bytes = device_bytes.saturating_add(loaded.device_bytes());
             info!(
                 layer,
+                hot_expert_slots = layer_hot_capacity,
                 device_weights_gib = device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                 "loaded DeepSeek V4 routed expert layer"
             );
@@ -2810,17 +2820,15 @@ impl Deepseek4TextModel {
             weights,
             routed_experts,
         };
-        if let Some(hot_cache_dir) = hot_cache_dir {
-            let source =
-                Deepseek4HotExpertCache::open(hot_cache_dir, &manifest, hot_capacity_per_layer)?;
+        if let Some(source) = hot_source.as_ref() {
             let mut installed = 0usize;
             for layer in &mut model.routed_experts {
                 installed =
-                    installed.saturating_add(layer.install_cached_hotset(&source)?.installed);
+                    installed.saturating_add(layer.install_cached_hotset(source)?.installed);
             }
             info!(
                 installed,
-                cache_dir = %hot_cache_dir.display(),
+                cache_dir = %source.root.display(),
                 "installed DeepSeek V4 NVFP4 hot experts"
             );
         }
@@ -3244,10 +3252,17 @@ mod tests {
     use super::{
         Deepseek4AttentionRow, Deepseek4AttentionWeights, Deepseek4Bf16Linear,
         Deepseek4BlockFp8Linear, Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights,
-        Deepseek4ModelConfig, Deepseek4RmsNorm, Deepseek4UnweightedRmsNorm,
+        Deepseek4ModelConfig, Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4UnweightedRmsNorm,
+        load_bf16,
     };
-    use crate::deepseek4::Deepseek4SequenceState;
-    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, format};
+    use crate::deepseek4::{
+        Deepseek4ExpertLayer, Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4SequenceState,
+    };
+    use crate::nvfp4::{
+        CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, format,
+        repeat_hyper_streams_f32_into_on_stream,
+    };
 
     const CONFIG: &str = r#"{
         "architectures":["DeepseekV4ForCausalLM"],
@@ -3286,6 +3301,164 @@ mod tests {
         "hc_eps":1e-6,
         "num_nextn_predict_layers":0
     }"#;
+
+    #[test]
+    #[ignore = "requires EIDER_DEEPSEEK4_MODEL_DIR with a prepared real checkpoint"]
+    fn real_checkpoint_block_fp8_linear_matches_cpu_dequantization() {
+        const PREFIX: &str = "layers.0.attn.wq_a";
+        let model_dir =
+            std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
+        let checkpoint = ModelOptCheckpoint::open(model_dir).expect("checkpoint");
+        let host = checkpoint
+            .load_block_scaled_fp8_linear(PREFIX)
+            .expect("FP8 projection");
+        let input = (0..host.in_features)
+            .map(|index| ((index * 17 % 257) as f32 - 128.0) / 64.0)
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let linear = Deepseek4BlockFp8Linear::from_host(host.clone()).expect("linear");
+        let mut output = DeviceBuffer::zeroed(host.out_features).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        linear
+            .run_rows(&input_device, &mut output, 1, &stream)
+            .expect("run projection");
+        let actual = output.copy_to_host(&stream).expect("read output");
+        let scale_cols = host.in_features / 128;
+        for row in 0..host.out_features {
+            let expected = (0..host.in_features)
+                .map(|col| {
+                    let scale_code = host.weight_scale[(row / 128) * scale_cols + col / 128];
+                    let scale = if scale_code == u8::MAX {
+                        f32::NAN
+                    } else {
+                        2.0f32.powi(scale_code as i32 - 127)
+                    };
+                    input[col]
+                        * format::e4m3_value(host.weight[row * host.in_features + col])
+                        * scale
+                })
+                .sum::<f32>();
+            let allowed = 2.0e-3 + 2.0e-4 * expected.abs();
+            assert!(
+                (actual[row] - expected).abs() <= allowed,
+                "row {row}: actual={} expected={expected} allowed={allowed}",
+                actual[row]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires prepared DeepSeek V4 layer data and an independent reference"]
+    fn real_checkpoint_layer_zero_matches_reference() {
+        let model_dir =
+            std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
+        let artifact_dir = std::env::var_os("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
+            .expect("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR");
+        let hot_cache_dir = std::env::var_os("EIDER_DEEPSEEK4_HOT_CACHE_DIR")
+            .expect("EIDER_DEEPSEEK4_HOT_CACHE_DIR");
+        let reference_path = std::env::var_os("EIDER_DEEPSEEK4_LAYER0_REFERENCE")
+            .expect("EIDER_DEEPSEEK4_LAYER0_REFERENCE");
+        let config = Deepseek4ModelConfig::load(&model_dir).expect("config");
+        let manifest = Deepseek4Manifest::from(&config);
+        let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
+        let resident =
+            Deepseek4ResidentLayer::load(&checkpoint, &config, 0).expect("resident layer");
+        let hot_source =
+            Deepseek4HotExpertCache::open(&hot_cache_dir, &manifest, manifest.routed_experts)
+                .expect("hot cache");
+        let hot_capacity = hot_source.resident_capacity(0).expect("hot capacity");
+        let mut routed = Deepseek4ExpertLayer::load(&artifact_dir, &manifest, 0, hot_capacity)
+            .expect("routed experts");
+        routed
+            .install_cached_hotset(&hot_source)
+            .expect("install hot experts");
+
+        let token_ids = [
+            0u32, 128_803, 19_905, 418, 9_045, 28, 44_388, 128_804, 128_821,
+        ];
+        let token_count = token_ids.len();
+        let token_ids_device = DeviceBuffer::from_host(&token_ids).expect("token IDs");
+        let embedding = load_bf16(
+            &checkpoint,
+            "embed.weight",
+            &[config.vocab_size, config.hidden_size],
+        )
+        .expect("embedding");
+        let mut embedded =
+            DeviceBuffer::zeroed(token_count * config.hidden_size).expect("embedded rows");
+        let mut streams = DeviceBuffer::zeroed(token_count * config.hc_mult * config.hidden_size)
+            .expect("hyper streams");
+        let mut output = DeviceBuffer::zeroed(token_count * config.hc_mult * config.hidden_size)
+            .expect("layer output");
+        let rope = DeviceBuffer::from_host(&config.sliding_rope_inv_freq()).expect("RoPE");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+            config.vocab_size,
+            config.hidden_size,
+            &embedding,
+            &token_ids_device,
+            embedded.output(),
+            token_count,
+            &stream,
+        )
+        .expect("embed tokens");
+        repeat_hyper_streams_f32_into_on_stream(
+            &embedded,
+            streams.output(),
+            token_count,
+            config.hidden_size,
+            &stream,
+        )
+        .expect("repeat streams");
+        let mut state = Deepseek4SequenceState::new(&config, 16).expect("sequence state");
+        let mut workspace = resident
+            .allocate_layer_workspace(&config, token_count)
+            .expect("layer workspace");
+        let mut rows = [Deepseek4AttentionRow {
+            state: state.layer_mut(0).expect("layer state"),
+            rows: token_count,
+            position: 0,
+        }];
+        resident
+            .run_layer_rows(
+                &mut routed,
+                &mut workspace,
+                &mut rows,
+                &streams,
+                &token_ids_device,
+                &rope,
+                &mut output,
+                &config,
+                &stream,
+            )
+            .expect("run layer zero");
+        let actual = output.copy_to_host(&stream).expect("read layer output");
+        let bytes = std::fs::read(reference_path).expect("read layer reference");
+        let expected = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        let (error_sq, expected_sq, dot, actual_sq) = actual.iter().zip(&expected).fold(
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+            |(error_sq, expected_sq, dot, actual_sq), (&actual, &expected)| {
+                let actual = actual as f64;
+                let expected = expected as f64;
+                (
+                    error_sq + (actual - expected).powi(2),
+                    expected_sq + expected.powi(2),
+                    dot + actual * expected,
+                    actual_sq + actual.powi(2),
+                )
+            },
+        );
+        let relative_l2 = (error_sq / expected_sq).sqrt();
+        let cosine = dot / (actual_sq * expected_sq).sqrt();
+        assert!(
+            relative_l2 < 0.01 && cosine > 0.999,
+            "layer zero: relative_l2={relative_l2} cosine={cosine}"
+        );
+    }
 
     #[test]
     fn sliding_attention_matches_across_prefill_chunk_boundaries() {

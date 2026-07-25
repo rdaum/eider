@@ -297,6 +297,14 @@ impl Deepseek4HotExpertCache {
         }
         Ok(experts)
     }
+
+    /// Resident overlay slots needed for the cached experts in one layer.
+    ///
+    /// An empty layer retains one slot because the overlay kernels require a
+    /// positive capacity.
+    pub fn resident_capacity(&self, layer: usize) -> Result<usize> {
+        Ok(self.cached_experts(layer)?.len().max(1))
+    }
 }
 
 /// Mutable output storage for one routed-expert layer.
@@ -1654,6 +1662,112 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires prepared DeepSeek V4 model, Q2 artifacts, and hot cache"]
+    fn real_checkpoint_hot_nvfp4_expert_matches_cpu_dequantization() {
+        let model_dir =
+            std::env::var_os("EIDER_DEEPSEEK4_MODEL_DIR").expect("EIDER_DEEPSEEK4_MODEL_DIR");
+        let artifact_dir = std::env::var_os("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR")
+            .expect("EIDER_DEEPSEEK4_EXPERT_ARTIFACT_DIR");
+        let source_dir = std::env::var_os("EIDER_DEEPSEEK4_HOT_CACHE_DIR")
+            .expect("EIDER_DEEPSEEK4_HOT_CACHE_DIR");
+        let manifest = Deepseek4Manifest::load(model_dir).expect("manifest");
+        let source = Deepseek4HotExpertCache::open(source_dir, &manifest, manifest.routed_experts)
+            .expect("source hot cache");
+        let expert = source.cached_experts(0).expect("cached experts")[0];
+        let hot = source.load(0, expert).expect("hot expert");
+
+        let test_hot_dir = std::env::temp_dir().join(format!(
+            "eider-deepseek4-real-hot-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(hot_layer_dir(&test_hot_dir, 0)).expect("test hot directory");
+        write_hot_expert(
+            &hot_expert_path(&test_hot_dir, 0, expert),
+            &manifest,
+            0,
+            expert,
+            &hot,
+        )
+        .expect("write test hot expert");
+        let test_source =
+            Deepseek4HotExpertCache::open(&test_hot_dir, &manifest, 1).expect("test hot cache");
+        let mut layer =
+            Deepseek4ExpertLayer::load(artifact_dir, &manifest, 0, 1).expect("expert layer");
+        layer
+            .install_cached_hotset(&test_source)
+            .expect("install real hot expert");
+
+        let input = (0..manifest.hidden)
+            .map(|index| ((index * 29 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let indices = DeviceBuffer::from_host(&vec![expert as u32; manifest.experts_per_token])
+            .expect("indices");
+        let mut route_weights = vec![0.0f32; manifest.experts_per_token];
+        route_weights[0] = 1.0;
+        let route_weights = DeviceBuffer::from_host(&route_weights).expect("route weights");
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let mut workspace = Deepseek4ExpertWorkspace::new(&manifest).expect("workspace");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        layer
+            .run_one_token(
+                &mut workspace,
+                &indices,
+                &route_weights,
+                &input_device,
+                &stream,
+            )
+            .expect("run real hot expert");
+        let actual = workspace.output().copy_to_host(&stream).expect("output");
+
+        let matvec = |linear: &ModelOptNvfp4Linear, values: &[f32]| {
+            let weight = linear.dequantize_to_f32_col_major();
+            (0..linear.out_features)
+                .map(|row| {
+                    weight[row * linear.in_features..(row + 1) * linear.in_features]
+                        .iter()
+                        .zip(values)
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f32>()
+                        * linear.weight_scale_2
+                })
+                .collect::<Vec<_>>()
+        };
+        let gate = matvec(&hot.w1, &input);
+        let up = matvec(&hot.w3, &input);
+        let activated = gate
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| {
+                let gate = gate.min(manifest.swiglu_limit);
+                let up = up.clamp(-manifest.swiglu_limit, manifest.swiglu_limit);
+                gate / (1.0 + (-gate).exp()) * up
+            })
+            .collect::<Vec<_>>();
+        let expected = matvec(&hot.w2, &activated);
+        let (error_sq, expected_sq, dot, actual_sq) = actual.iter().zip(&expected).fold(
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+            |(error_sq, expected_sq, dot, actual_sq), (&actual, &expected)| {
+                let actual = actual as f64;
+                let expected = expected as f64;
+                (
+                    error_sq + (actual - expected).powi(2),
+                    expected_sq + expected.powi(2),
+                    dot + actual * expected,
+                    actual_sq + actual.powi(2),
+                )
+            },
+        );
+        let relative_l2 = (error_sq / expected_sq).sqrt();
+        let cosine = dot / (actual_sq * expected_sq).sqrt();
+        assert!(
+            relative_l2 < 0.01 && cosine > 0.999,
+            "expert {expert}: relative_l2={relative_l2} cosine={cosine}"
+        );
+        std::fs::remove_dir_all(test_hot_dir).expect("remove test hot directory");
+    }
+
+    #[test]
     fn prepared_q2_layer_runs_and_records_routes() {
         let manifest = Deepseek4Manifest {
             hidden: 64,
@@ -1751,6 +1865,7 @@ mod tests {
             1
         );
         assert_eq!(cache.cached_experts(0).expect("cached experts"), [2]);
+        assert_eq!(cache.resident_capacity(0).expect("resident capacity"), 1);
         let startup = layer
             .install_cached_hotset(&cache)
             .expect("install cached hotset");
