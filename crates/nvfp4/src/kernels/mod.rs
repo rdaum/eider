@@ -1,5 +1,6 @@
 //! CUDA-backed operation families used by the inference layers.
 
+pub(crate) mod deepseek4;
 pub(crate) mod gemma4_attention;
 pub(crate) mod marlin;
 pub(crate) mod non_gemm;

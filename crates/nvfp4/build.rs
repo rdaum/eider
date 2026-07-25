@@ -66,6 +66,7 @@ fn main() {
     let oracle_object = format!("{out_dir}/fp4_oracle.o");
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
+    let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
@@ -124,6 +125,27 @@ fn main() {
     ]);
     let nvcc_status = nvcc.status().expect("failed to run nvcc for CUDA kernels");
     assert!(nvcc_status.success(), "nvcc failed to build CUDA kernels");
+
+    let mut deepseek4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    deepseek4_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-arch=sm_121",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/deepseek4.cu",
+        "-o",
+        &deepseek4_object,
+    ]);
+    let deepseek4_status = deepseek4_nvcc
+        .status()
+        .expect("failed to run nvcc for DeepSeek V4 kernels");
+    assert!(
+        deepseek4_status.success(),
+        "nvcc failed to build DeepSeek V4 kernels"
+    );
 
     let mut qwen36_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
     qwen36_nvcc.args([
@@ -351,6 +373,7 @@ fn main() {
             &oracle_object,
             &gpu_counters_object,
             &non_gemm_object,
+            &deepseek4_object,
             &qwen36_gdn_object,
             &gemma4_attention_object,
             &sm12x_mma_object,
@@ -374,6 +397,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/fp4_oracle.cpp");
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
+    println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");

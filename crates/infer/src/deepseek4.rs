@@ -1,8 +1,19 @@
-//! DeepSeek V4 Flash expert artifact preparation.
+//! DeepSeek V4 Flash model support and expert artifact preparation.
 //!
 //! Routed experts are converted one at a time from the ModelOpt NVFP4
 //! checkpoint into resident Q2 tables. The original checkpoint remains the
 //! source for the bounded NVFP4 hot-expert overlay.
+
+mod config;
+mod model;
+pub use config::{Deepseek4AttentionKind, Deepseek4ModelConfig};
+pub use model::{
+    Deepseek4AttentionWeights, Deepseek4Bf16Linear, Deepseek4BlockFp8Linear,
+    Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights, Deepseek4HyperConnection,
+    Deepseek4HyperHead, Deepseek4HyperWorkspace, Deepseek4IndexerWeights, Deepseek4ModelWeights,
+    Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4Router, Deepseek4RouterWorkspace,
+    Deepseek4SharedExpertWeights,
+};
 
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Q2ExpertTable,
@@ -24,19 +35,6 @@ const HOT_EXPERT_MAGIC: &[u8; 8] = b"EIDDS4H1";
 const HOT_EXPERT_VERSION: u32 = 1;
 const HOT_EXPERT_HEADER_BYTES: u64 = 8 + 5 * 4 + 6 * 4;
 
-#[derive(Deserialize)]
-struct Deepseek4Config {
-    model_type: String,
-    hidden_size: usize,
-    num_hidden_layers: usize,
-    n_routed_experts: usize,
-    num_experts_per_tok: usize,
-    moe_intermediate_size: usize,
-    n_shared_experts: usize,
-    num_hash_layers: usize,
-    swiglu_limit: f32,
-}
-
 /// Model dimensions needed by the routed-expert storage path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Deepseek4Manifest {
@@ -53,47 +51,15 @@ pub struct Deepseek4Manifest {
 impl Deepseek4Manifest {
     /// Reads and validates the checkpoint's DeepSeek V4 configuration.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
-        let path = model_dir.as_ref().join("config.json");
-        let bytes = fs::read(&path).map_err(|error| Error::Format {
-            label: "DeepSeek V4 config",
-            detail: format!("failed to read {}: {error}", path.display()),
-        })?;
-        let config: Deepseek4Config =
-            serde_json::from_slice(&bytes).map_err(|error| Error::Format {
-                label: "DeepSeek V4 config",
-                detail: format!("invalid {}: {error}", path.display()),
-            })?;
-        if config.model_type != "deepseek_v4"
-            || config.hidden_size == 0
-            || config.num_hidden_layers == 0
-            || config.n_routed_experts == 0
-            || config.num_experts_per_tok == 0
-            || config.num_experts_per_tok > config.n_routed_experts
-            || config.moe_intermediate_size == 0
-            || !config.swiglu_limit.is_finite()
-            || config.swiglu_limit <= 0.0
-        {
-            return Err(Error::Format {
-                label: "DeepSeek V4 config",
-                detail: format!(
-                    "unsupported model_type={} hidden={} layers={} experts={} top_k={} intermediate={}",
-                    config.model_type,
-                    config.hidden_size,
-                    config.num_hidden_layers,
-                    config.n_routed_experts,
-                    config.num_experts_per_tok,
-                    config.moe_intermediate_size
-                ),
-            });
-        }
+        let config = Deepseek4ModelConfig::load(model_dir)?;
         Ok(Self {
             hidden: config.hidden_size,
             layers: config.num_hidden_layers,
-            routed_experts: config.n_routed_experts,
-            experts_per_token: config.num_experts_per_tok,
-            expert_intermediate: config.moe_intermediate_size,
-            shared_experts: config.n_shared_experts,
-            hash_layers: config.num_hash_layers,
+            routed_experts: config.routed_experts,
+            experts_per_token: config.experts_per_token,
+            expert_intermediate: config.expert_intermediate,
+            shared_experts: config.shared_experts,
+            hash_layers: config.hash_layers,
             swiglu_limit: config.swiglu_limit,
         })
     }

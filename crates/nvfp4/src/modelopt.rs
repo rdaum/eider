@@ -65,6 +65,25 @@ pub struct ModelOptFp8Linear {
     pub input_scale: Option<f32>,
 }
 
+/// Raw block-scaled FP8 linear used by DeepSeek V4 dense projections.
+///
+/// Weights are E4M3 in row-major `[out, in]` order. One unsigned E8M0 scale
+/// applies to each 128 by 128 weight block, with scales stored row-major as
+/// `[out / 128, in / 128]`.
+#[derive(Clone, Debug)]
+pub struct ModelOptBlockScaledFp8Linear {
+    /// Tensor name prefix, for example `layers.0.attn.wq_a`.
+    pub prefix: String,
+    /// Output feature count.
+    pub out_features: usize,
+    /// Input feature count.
+    pub in_features: usize,
+    /// E4M3 weight bytes from `<prefix>.weight`.
+    pub weight: Vec<u8>,
+    /// E8M0 block-scale bytes from `<prefix>.scale`.
+    pub weight_scale: Vec<u8>,
+}
+
 /// cuBLASLt-ready imported ModelOpt NVFP4 weight plus scalar scale metadata.
 ///
 /// This type deliberately keeps `weight_scale_2` and `input_scale` next to the
@@ -902,6 +921,28 @@ impl ModelOptCheckpoint {
         })
     }
 
+    /// Imports a 128 by 128 block-scaled E4M3 linear.
+    pub fn load_block_scaled_fp8_linear(
+        &self,
+        prefix: &str,
+    ) -> Result<ModelOptBlockScaledFp8Linear> {
+        let weight_name = format!("{prefix}.weight");
+        let scale_name = format!("{prefix}.scale");
+        let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+        let scale_shard = self.open_shard_for_tensor(&scale_name)?;
+        let weight_info = weight_shard.require_tensor(&weight_name)?;
+        let scale_info = scale_shard.require_tensor(&scale_name)?;
+        let (out_features, in_features) = validate_modelopt_fp8_weight(weight_info)?;
+        validate_block_scaled_fp8_scale(scale_info, out_features, in_features)?;
+        Ok(ModelOptBlockScaledFp8Linear {
+            prefix: prefix.to_string(),
+            out_features,
+            in_features,
+            weight: weight_shard.read_tensor_bytes(&weight_name)?,
+            weight_scale: scale_shard.read_tensor_bytes(&scale_name)?,
+        })
+    }
+
     fn load_compressed_tensors_nvfp4_linear(&self, prefix: &str) -> Result<ModelOptNvfp4Linear> {
         let weight_name = format!("{prefix}.weight_packed");
         let scale_name = format!("{prefix}.weight_scale");
@@ -1061,6 +1102,38 @@ fn validate_modelopt_fp8_weight(info: &SafeTensorInfo) -> Result<(usize, usize)>
     Ok((out_features, in_features))
 }
 
+fn validate_block_scaled_fp8_scale(
+    info: &SafeTensorInfo,
+    out_features: usize,
+    in_features: usize,
+) -> Result<()> {
+    if !out_features.is_multiple_of(128) || !in_features.is_multiple_of(128) {
+        return Err(Error::Shape {
+            label: "ModelOpt block-scaled FP8 dimensions",
+            expected: "out and in divisible by 128".to_string(),
+            actual: format!("out={out_features} in={in_features}"),
+        });
+    }
+    let expected_shape = [out_features / 128, in_features / 128];
+    let expected_bytes = expected_shape[0] * expected_shape[1];
+    if info.dtype != "F8_E8M0"
+        || info.shape != expected_shape
+        || info.byte_len() != expected_bytes as u64
+    {
+        return Err(Error::Shape {
+            label: "ModelOpt block-scaled FP8 scale",
+            expected: format!("dtype=F8_E8M0 shape={expected_shape:?} bytes={expected_bytes}"),
+            actual: format!(
+                "dtype={} shape={:?} bytes={}",
+                info.dtype,
+                info.shape,
+                info.byte_len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_modelopt_scale(
     info: &SafeTensorInfo,
     out_features: usize,
@@ -1139,6 +1212,37 @@ mod tests {
             };
             assert_eq!(format::e2m1_value(code), expected);
         }
+    }
+
+    #[test]
+    fn validates_deepseek_block_scaled_fp8_metadata() {
+        let weight = SafeTensorInfo {
+            dtype: "F8_E4M3".to_string(),
+            shape: vec![1024, 4096],
+            data_begin: 0,
+            data_end: 1024 * 4096,
+        };
+        let scale = SafeTensorInfo {
+            dtype: "F8_E8M0".to_string(),
+            shape: vec![8, 32],
+            data_begin: 0,
+            data_end: 8 * 32,
+        };
+        let (out, input) = validate_modelopt_fp8_weight(&weight).expect("weight metadata");
+        validate_block_scaled_fp8_scale(&scale, out, input).expect("scale metadata");
+    }
+
+    #[test]
+    fn rejects_deepseek_fp8_scale_with_wrong_block_grid() {
+        let scale = SafeTensorInfo {
+            dtype: "F8_E8M0".to_string(),
+            shape: vec![8, 31],
+            data_begin: 0,
+            data_end: 8 * 31,
+        };
+        let error =
+            validate_block_scaled_fp8_scale(&scale, 1024, 4096).expect_err("wrong scale grid");
+        assert!(error.to_string().contains("shape=[8, 31]"));
     }
 
     #[test]
