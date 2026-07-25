@@ -193,6 +193,14 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     deepseek_hot_expert_capacity: usize,
 
+    /// Prepared original-NVFP4 experts installed into DeepSeek V4 hot slots.
+    #[arg(long)]
+    deepseek_hot_expert_cache_dir: Option<PathBuf>,
+
+    /// Write cumulative DeepSeek V4 routing observations on graceful shutdown.
+    #[arg(long)]
+    deepseek_hotset_plan_output: Option<PathBuf>,
+
     /// Runtime storage for BF16 Step attention projections.
     #[arg(long, value_enum, default_value_t = StepBf16StorageArg::Nvfp4)]
     step_bf16_attention: StepBf16StorageArg,
@@ -314,6 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     actor_config.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
     actor_config.step_expert_capacity = step_expert_capacity;
     actor_config.deepseek_hot_expert_capacity = args.deepseek_hot_expert_capacity;
+    actor_config.deepseek_hot_expert_cache_dir = args.deepseek_hot_expert_cache_dir;
+    actor_config.deepseek_hotset_plan_output = args.deepseek_hotset_plan_output;
     actor_config.step_bf16_storage = Step37Bf16StorageConfig {
         attention: args.step_bf16_attention.into(),
         dense_mlp: args.step_bf16_dense_mlp.into(),

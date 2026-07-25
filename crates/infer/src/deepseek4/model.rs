@@ -1,6 +1,7 @@
 use super::{
     Deepseek4AttentionKind, Deepseek4CompressionState, Deepseek4ExpertLayer,
-    Deepseek4ExpertWorkspace, Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
+    Deepseek4ExpertWorkspace, Deepseek4HotExpertCache, Deepseek4HotsetPlan,
+    Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
     Deepseek4SequenceCheckpoint, Deepseek4SequenceState,
 };
 use crate::nvfp4::{
@@ -2776,6 +2777,16 @@ impl Deepseek4TextModel {
         expert_artifact_dir: impl AsRef<Path>,
         hot_capacity_per_layer: usize,
     ) -> Result<Self> {
+        Self::load_with_hot_cache(model_dir, expert_artifact_dir, hot_capacity_per_layer, None)
+    }
+
+    /// Loads the model and installs any prepared original-NVFP4 hot experts.
+    pub fn load_with_hot_cache(
+        model_dir: impl AsRef<Path>,
+        expert_artifact_dir: impl AsRef<Path>,
+        hot_capacity_per_layer: usize,
+        hot_cache_dir: Option<&Path>,
+    ) -> Result<Self> {
         let weights = Deepseek4ModelWeights::load(model_dir)?;
         let manifest = Deepseek4Manifest::from(&weights.config);
         let mut routed_experts = Vec::with_capacity(manifest.layers);
@@ -2795,10 +2806,25 @@ impl Deepseek4TextModel {
             );
             routed_experts.push(loaded);
         }
-        Ok(Self {
+        let mut model = Self {
             weights,
             routed_experts,
-        })
+        };
+        if let Some(hot_cache_dir) = hot_cache_dir {
+            let source =
+                Deepseek4HotExpertCache::open(hot_cache_dir, &manifest, hot_capacity_per_layer)?;
+            let mut installed = 0usize;
+            for layer in &mut model.routed_experts {
+                installed =
+                    installed.saturating_add(layer.install_cached_hotset(&source)?.installed);
+            }
+            info!(
+                installed,
+                cache_dir = %hot_cache_dir.display(),
+                "installed DeepSeek V4 NVFP4 hot experts"
+            );
+        }
+        Ok(model)
     }
 
     pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Deepseek4SequenceState> {
@@ -3032,6 +3058,22 @@ impl Deepseek4TextModel {
                 .map(Deepseek4ExpertLayer::device_bytes)
                 .sum::<usize>(),
         )
+    }
+
+    /// Snapshots cumulative per-layer routing for bounded hot-cache preparation.
+    pub fn hotset_plan(
+        &self,
+        capacity_per_layer: usize,
+        workspace: &Deepseek4BatchWorkspace,
+    ) -> Result<Deepseek4HotsetPlan> {
+        let mut plan = Deepseek4HotsetPlan::new();
+        for (layer, experts) in self.routed_experts.iter().enumerate() {
+            let selected = experts.selected_hotset(capacity_per_layer, &workspace.stream)?;
+            if !selected.is_empty() {
+                plan.insert(layer, selected);
+            }
+        }
+        Ok(plan)
     }
 }
 

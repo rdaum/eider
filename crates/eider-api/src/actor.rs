@@ -57,6 +57,8 @@ pub struct InferenceActorConfig {
     pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
     pub deepseek_hot_expert_capacity: usize,
+    pub deepseek_hot_expert_cache_dir: Option<PathBuf>,
+    pub deepseek_hotset_plan_output: Option<PathBuf>,
     pub step_bf16_storage: Step37Bf16StorageConfig,
     pub nemotron_storage: Nemotron3StorageConfig,
     pub event_capacity: usize,
@@ -74,6 +76,8 @@ impl InferenceActorConfig {
             qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
             deepseek_hot_expert_capacity: 1,
+            deepseek_hot_expert_cache_dir: None,
+            deepseek_hotset_plan_output: None,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
             nemotron_storage: Nemotron3StorageConfig::default(),
             event_capacity: 256,
@@ -243,6 +247,8 @@ fn actor_main(
         qwen_fp8_attention_storage,
         step_expert_capacity,
         deepseek_hot_expert_capacity,
+        deepseek_hot_expert_cache_dir,
+        deepseek_hotset_plan_output,
         step_bf16_storage,
         nemotron_storage,
         ..
@@ -458,13 +464,15 @@ fn actor_main(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
                 hot_expert_capacity = deepseek_hot_expert_capacity,
+                hot_expert_cache_dir = ?deepseek_hot_expert_cache_dir,
                 prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
                 "loading DeepSeek V4 model"
             );
-            let model = match Deepseek4TextModel::load(
+            let model = match Deepseek4TextModel::load_with_hot_cache(
                 &model_dir,
                 &artifact_dir,
                 deepseek_hot_expert_capacity,
+                deepseek_hot_expert_cache_dir.as_deref(),
             ) {
                 Ok(model) => model,
                 Err(error) => {
@@ -488,7 +496,11 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = DeepseekActorService::new(service);
+            let mut service = DeepseekActorService::new(
+                service,
+                deepseek_hotset_plan_output,
+                deepseek_hot_expert_capacity,
+            );
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
     }
@@ -657,6 +669,9 @@ trait ActorService {
     ) -> infer::nvfp4::Result<EngineTick>;
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
     fn active_sequence_count(&self) -> usize;
+    fn shutdown(&mut self) -> infer::nvfp4::Result<()> {
+        Ok(())
+    }
 }
 
 struct QwenActorService<'model, 'template> {
@@ -1192,13 +1207,21 @@ impl ActorService for LagunaActorService<'_, '_> {
 struct DeepseekActorService<'template> {
     inner: Deepseek4ChatService<'template>,
     ids: BTreeMap<u64, Deepseek4RequestId>,
+    hotset_plan_output: Option<PathBuf>,
+    hotset_capacity: usize,
 }
 
 impl<'template> DeepseekActorService<'template> {
-    fn new(inner: Deepseek4ChatService<'template>) -> Self {
+    fn new(
+        inner: Deepseek4ChatService<'template>,
+        hotset_plan_output: Option<PathBuf>,
+        hotset_capacity: usize,
+    ) -> Self {
         Self {
             inner,
             ids: BTreeMap::new(),
+            hotset_plan_output,
+            hotset_capacity,
         }
     }
 }
@@ -1295,6 +1318,20 @@ impl ActorService for DeepseekActorService<'_> {
     fn active_sequence_count(&self) -> usize {
         self.inner.active_sequence_count()
     }
+
+    fn shutdown(&mut self) -> infer::nvfp4::Result<()> {
+        let Some(path) = self.hotset_plan_output.as_ref() else {
+            return Ok(());
+        };
+        let experts = self.inner.write_hotset_plan(path, self.hotset_capacity)?;
+        info!(
+            path = %path.display(),
+            experts,
+            capacity_per_layer = self.hotset_capacity,
+            "wrote DeepSeek V4 hotset plan"
+        );
+        Ok(())
+    }
 }
 
 fn run_actor_loop(
@@ -1331,6 +1368,7 @@ fn run_actor_loop(
         while let Ok(command) = commands.try_recv() {
             if !handle_command(command, service, &mut active, &mut scheduler_by_external) {
                 cancel_all(service, &mut active, &mut scheduler_by_external);
+                shutdown_service(service);
                 return;
             }
         }
@@ -1526,6 +1564,13 @@ fn run_actor_loop(
         update_current_counts(service, &active);
     }
     cancel_all(service, &mut active, &mut scheduler_by_external);
+    shutdown_service(service);
+}
+
+fn shutdown_service(service: &mut dyn ActorService) {
+    if let Err(error) = service.shutdown() {
+        error!(error = %error, "failed to shut down inference service");
+    }
 }
 
 fn handle_command(

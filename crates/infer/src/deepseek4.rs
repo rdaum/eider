@@ -37,7 +37,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const ARTIFACT_FORMAT: &str = "deepseek4-q2-experts-v2";
+const ARTIFACT_FORMAT: &str = "deepseek4-q2-experts-v3";
 const HOT_EXPERT_MAGIC: &[u8; 8] = b"EIDDS4H1";
 const EXPERT_PREPARATION_BATCH: usize = 16;
 const HOT_EXPERT_VERSION: u32 = 1;
@@ -248,6 +248,24 @@ impl Deepseek4HotExpertCache {
     }
 
     pub fn inspect_layer(&self, layer: usize) -> Result<Deepseek4HotExpertCacheInfo> {
+        let experts = self.cached_experts(layer)?;
+        let file_bytes = experts.iter().try_fold(0u64, |total, &expert| {
+            let path = hot_expert_path(&self.root, layer, expert);
+            let bytes = path.metadata().map_err(hot_cache_io(&path))?.len();
+            total.checked_add(bytes).ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 hot-expert cache size",
+                expected: "layer bytes without overflow".to_string(),
+                actual: format!("total={total} next={bytes}"),
+            })
+        })?;
+        Ok(Deepseek4HotExpertCacheInfo {
+            experts: experts.len(),
+            file_bytes,
+        })
+    }
+
+    /// Validates and lists cached logical experts for one layer.
+    pub fn cached_experts(&self, layer: usize) -> Result<Vec<usize>> {
         if layer >= self.manifest.layers {
             return Err(Error::Shape {
                 label: "DeepSeek V4 hot-expert cache",
@@ -257,13 +275,9 @@ impl Deepseek4HotExpertCache {
         }
         let layer_dir = hot_layer_dir(&self.root, layer);
         if !layer_dir.is_dir() {
-            return Ok(Deepseek4HotExpertCacheInfo {
-                experts: 0,
-                file_bytes: 0,
-            });
+            return Ok(Vec::new());
         }
-        let mut experts = 0usize;
-        let mut file_bytes = 0u64;
+        let mut experts = Vec::new();
         for entry in fs::read_dir(&layer_dir).map_err(hot_cache_io(&layer_dir))? {
             let entry = entry.map_err(hot_cache_io(&layer_dir))?;
             let Some(expert) = hot_expert_index(&entry.path()) else {
@@ -271,20 +285,17 @@ impl Deepseek4HotExpertCache {
             };
             validate_layer_expert(&self.manifest, layer, expert)?;
             read_hot_expert(&entry.path(), &self.manifest, layer, expert)?;
-            experts += 1;
-            file_bytes += entry.metadata().map_err(hot_cache_io(&entry.path()))?.len();
+            experts.push(expert);
         }
-        if experts > self.capacity_per_layer {
+        experts.sort_unstable();
+        if experts.len() > self.capacity_per_layer {
             return Err(Error::Shape {
                 label: "DeepSeek V4 hot-expert cache",
                 expected: format!("at most {} experts", self.capacity_per_layer),
-                actual: experts.to_string(),
+                actual: experts.len().to_string(),
             });
         }
-        Ok(Deepseek4HotExpertCacheInfo {
-            experts,
-            file_bytes,
-        })
+        Ok(experts)
     }
 }
 
@@ -393,6 +404,9 @@ pub struct Deepseek4HotsetRefresh {
     /// Experts newly copied into hot slots.
     pub installed: usize,
 }
+
+/// Per-layer logical experts selected from cumulative routing observations.
+pub type Deepseek4HotsetPlan = BTreeMap<usize, Vec<usize>>;
 
 impl Deepseek4ExpertLayer {
     /// Loads one prepared layer and allocates `hot_capacity` NVFP4 slots.
@@ -515,54 +529,75 @@ impl Deepseek4ExpertLayer {
         source: &Deepseek4HotExpertCache,
         stream: &CudaStream,
     ) -> Result<Deepseek4HotsetRefresh> {
-        if source.manifest != self.manifest
-            || source.capacity_per_layer < self.gate_up.hot_capacity()
-        {
-            return Err(Error::Shape {
-                label: "DeepSeek V4 hot-expert source",
-                expected: format!(
-                    "matching manifest and capacity >= {}",
-                    self.gate_up.hot_capacity()
-                ),
-                actual: format!(
-                    "manifest_match={} capacity={}",
-                    source.manifest == self.manifest,
-                    source.capacity_per_layer
-                ),
-            });
-        }
+        self.validate_hot_source(source)?;
         if self.gate_up.resident_experts() != self.down.resident_experts() {
             self.clear_hot_overlays()?;
         }
-        let counts = self.usage.snapshot(stream)?;
+        let mut counts = self.usage.snapshot(stream)?;
+        let available = source.cached_experts(self.layer)?;
+        let mut cached = vec![false; counts.len()];
+        for &expert in &available {
+            cached[expert] = true;
+        }
+        for (expert, count) in counts.iter_mut().enumerate() {
+            if !cached[expert] {
+                *count = 0;
+            }
+        }
         let selected = select_top_experts(&counts, self.gate_up.hot_capacity())?;
+        self.reconcile_hotset(source, selected)
+    }
+
+    /// Installs every cached original expert that fits the allocated hot slots.
+    ///
+    /// This is intended for model startup, before any inference can observe
+    /// the overlay.
+    pub fn install_cached_hotset(
+        &mut self,
+        source: &Deepseek4HotExpertCache,
+    ) -> Result<Deepseek4HotsetRefresh> {
+        self.validate_hot_source(source)?;
+        let selected = source.cached_experts(self.layer)?;
+        if selected.len() > self.gate_up.hot_capacity() {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 cached hotset",
+                expected: format!("at most {} experts", self.gate_up.hot_capacity()),
+                actual: selected.len().to_string(),
+            });
+        }
+        self.reconcile_hotset(source, selected)
+    }
+
+    fn reconcile_hotset(
+        &mut self,
+        source: &Deepseek4HotExpertCache,
+        selected: Vec<usize>,
+    ) -> Result<Deepseek4HotsetRefresh> {
+        let mut resident = self
+            .gate_up
+            .resident_experts()
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        resident.sort_unstable();
+        let mut selected_set = selected.clone();
+        selected_set.sort_unstable();
+        if resident == selected_set {
+            return Ok(Deepseek4HotsetRefresh {
+                selected,
+                installed: 0,
+            });
+        }
+        self.clear_hot_overlays()?;
         let update = (|| {
-            let mut installed = 0;
-            for &expert in &selected {
-                if self.gate_up.resident_experts().contains(&Some(expert)) {
-                    continue;
-                }
-                let slot = self
-                    .gate_up
-                    .resident_experts()
-                    .iter()
-                    .position(Option::is_none)
-                    .or_else(|| {
-                        self.gate_up.resident_experts().iter().position(|resident| {
-                            resident.is_some_and(|resident| !selected.contains(&resident))
-                        })
-                    })
-                    .ok_or_else(|| Error::Format {
-                        label: "DeepSeek V4 expert hotset",
-                        detail: "no replaceable hot slot".to_string(),
-                    })?;
+            for (slot, &expert) in selected.iter().enumerate() {
                 let weights = source.load(self.layer, expert)?;
                 self.gate_up
                     .install_pair(slot, expert, &weights.w1, &weights.w3)?;
                 self.down.install(slot, expert, &weights.w2)?;
-                installed += 1;
             }
-            Ok(installed)
+            Ok(selected.len())
         })();
         let installed = match update {
             Ok(installed) => installed,
@@ -591,9 +626,34 @@ impl Deepseek4ExpertLayer {
         })
     }
 
+    fn validate_hot_source(&self, source: &Deepseek4HotExpertCache) -> Result<()> {
+        if source.manifest == self.manifest
+            && source.capacity_per_layer >= self.gate_up.hot_capacity()
+        {
+            return Ok(());
+        }
+        Err(Error::Shape {
+            label: "DeepSeek V4 hot-expert source",
+            expected: format!(
+                "matching manifest and capacity >= {}",
+                self.gate_up.hot_capacity()
+            ),
+            actual: format!(
+                "manifest_match={} capacity={}",
+                source.manifest == self.manifest,
+                source.capacity_per_layer
+            ),
+        })
+    }
+
     /// Cumulative routing counts, synchronized at the caller's boundary.
     pub fn usage(&self, stream: &CudaStream) -> Result<Vec<u64>> {
         self.usage.snapshot(stream)
+    }
+
+    /// Selects the most-used observed experts for an offline hot-cache plan.
+    pub fn selected_hotset(&self, capacity: usize, stream: &CudaStream) -> Result<Vec<usize>> {
+        select_top_experts(&self.usage.snapshot(stream)?, capacity)
     }
 
     /// Device bytes retained by Q2 weights, hot slots, and usage counts.
@@ -1690,6 +1750,12 @@ mod tests {
             cache.inspect_layer(0).expect("inspect hot cache").experts,
             1
         );
+        assert_eq!(cache.cached_experts(0).expect("cached experts"), [2]);
+        let startup = layer
+            .install_cached_hotset(&cache)
+            .expect("install cached hotset");
+        assert_eq!(startup.selected, [2]);
+        assert_eq!(startup.installed, 1);
 
         let hot_indices = DeviceBuffer::from_host(&[2u32, 2]).expect("hot indices");
         layer
@@ -1699,7 +1765,7 @@ mod tests {
             .refresh_hotset(&cache, &stream)
             .expect("refresh hotset");
         assert_eq!(refresh.selected, [2]);
-        assert_eq!(refresh.installed, 1);
+        assert_eq!(refresh.installed, 0);
         assert_eq!(
             layer
                 .refresh_hotset(&cache, &stream)

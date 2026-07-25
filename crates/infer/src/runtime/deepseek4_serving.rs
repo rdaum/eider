@@ -15,6 +15,8 @@ use crate::deepseek4::{
 };
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -259,6 +261,50 @@ impl<'template> Deepseek4ChatService<'template> {
             prompt_tokens,
             max_output_tokens,
         })
+    }
+
+    /// Atomically writes cumulative routing observations for hot-cache preparation.
+    pub fn write_hotset_plan(
+        &self,
+        path: impl AsRef<Path>,
+        capacity_per_layer: usize,
+    ) -> Result<usize> {
+        if self.active_sequences != 0 {
+            return Err(Error::Format {
+                label: "DeepSeek V4 hotset plan",
+                detail: "cannot snapshot routing while sequences are active".to_string(),
+            });
+        }
+        let path = path.as_ref();
+        let plan = self
+            .model
+            .hotset_plan(capacity_per_layer, &self.workspace)?;
+        let bytes = serde_json::to_vec_pretty(&plan).map_err(|error| Error::Format {
+            label: "DeepSeek V4 hotset plan",
+            detail: format!("failed to encode plan: {error}"),
+        })?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|error| Error::Format {
+                label: "DeepSeek V4 hotset plan",
+                detail: format!("failed to create {}: {error}", parent.display()),
+            })?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, bytes).map_err(|error| Error::Format {
+            label: "DeepSeek V4 hotset plan",
+            detail: format!("failed to write {}: {error}", temporary.display()),
+        })?;
+        fs::rename(&temporary, path).map_err(|error| Error::Format {
+            label: "DeepSeek V4 hotset plan",
+            detail: format!(
+                "failed to publish {} as {}: {error}",
+                temporary.display(),
+                path.display()
+            ),
+        })?;
+        Ok(plan.values().map(Vec::len).sum())
     }
 
     pub fn tick(&mut self) -> Result<Deepseek4Tick> {

@@ -14,10 +14,11 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const CACHE_MAGIC: &[u8; 8] = b"EIDQ2W01";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const TABLE_CACHE_MAGIC: &[u8; 8] = b"EIDQ2T01";
-const TABLE_CACHE_VERSION: u32 = 2;
+const TABLE_CACHE_VERSION: u32 = 3;
 const TABLE_CACHE_HEADER_BYTES: u64 = 8 + 4 + 3 * 8;
+const Q2_SCALE_REFINEMENT_STEPS: usize = 3;
 
 /// Number of consecutive input-channel weights sharing one Q2 scale.
 pub const Q2_BLOCK_SIZE: usize = 64;
@@ -410,22 +411,43 @@ fn quantize_q2_with(
         let row_begin = row * cols;
         for block_begin in (0..cols).step_by(Q2_BLOCK_SIZE) {
             let block_start = row_begin + block_begin;
-            let max_abs = (block_start..block_start + Q2_BLOCK_SIZE)
-                .map(&value_at)
-                .try_fold(0.0f32, |maximum, value| {
-                    value
-                        .is_finite()
-                        .then(|| maximum.max(value.abs()))
-                        .ok_or_else(|| Error::Format {
-                            label: "Q2 matrix",
-                            detail: "weights must be finite".to_string(),
-                        })
-                })?;
-            let scale_bits = format::f32_to_bf16(max_abs / 3.0);
+            let mut values = [0.0f32; Q2_BLOCK_SIZE];
+            let mut max_abs = 0.0f32;
+            for (offset, value) in values.iter_mut().enumerate() {
+                *value = value_at(block_start + offset);
+                if !value.is_finite() {
+                    return Err(Error::Format {
+                        label: "Q2 matrix",
+                        detail: "weights must be finite".to_string(),
+                    });
+                }
+                max_abs = max_abs.max(value.abs());
+            }
+
+            let mut fitted_scale = max_abs / 3.0;
+            if fitted_scale != 0.0 {
+                for _ in 0..Q2_SCALE_REFINEMENT_STEPS {
+                    let threshold = 2.0 * fitted_scale;
+                    let mut numerator = 0.0f64;
+                    let mut denominator = 0.0f64;
+                    for &value in &values {
+                        let magnitude = if value.abs() < threshold { 1.0 } else { 3.0 };
+                        let level = if value < 0.0 { -magnitude } else { magnitude };
+                        numerator += f64::from(value) * level;
+                        denominator += level * level;
+                    }
+                    let next_scale = (numerator / denominator) as f32;
+                    if !next_scale.is_finite() || next_scale <= 0.0 {
+                        break;
+                    }
+                    fitted_scale = next_scale;
+                }
+            }
+
+            let scale_bits = format::f32_to_bf16(fitted_scale);
             let scale = format::bf16_to_f32(scale_bits);
             scales.push(scale_bits);
-            for offset in 0..Q2_BLOCK_SIZE {
-                let value = value_at(block_start + offset);
+            for (offset, value) in values.into_iter().enumerate() {
                 let normalized = if scale == 0.0 { 0.0 } else { value / scale };
                 let code = if scale == 0.0 || normalized < -2.0 {
                     0
@@ -1681,6 +1703,54 @@ mod tests {
             );
             assert_eq!(quantized.storage_bytes(), 18);
         }
+    }
+
+    #[test]
+    fn q2_scale_fit_reduces_error_for_outlier_heavy_blocks() {
+        let mut values = [0.0f32; Q2_BLOCK_SIZE];
+        for (index, value) in values[..Q2_BLOCK_SIZE - 1].iter_mut().enumerate() {
+            let magnitude = 0.2 + (index % 7) as f32 * 0.025;
+            *value = if index.is_multiple_of(2) {
+                magnitude
+            } else {
+                -magnitude
+            };
+        }
+        values[Q2_BLOCK_SIZE - 1] = 4.0;
+
+        let quantized =
+            quantize_q2_row_major(1, Q2_BLOCK_SIZE, &values).expect("quantize fitted Q2");
+        let fitted =
+            dequantize_q2_row_major(1, Q2_BLOCK_SIZE, &quantized).expect("dequantize fitted Q2");
+
+        let legacy_scale = format::bf16_to_f32(format::f32_to_bf16(4.0 / 3.0));
+        let legacy = values.map(|value| {
+            let normalized = value / legacy_scale;
+            let level = if normalized < -2.0 {
+                -3.0
+            } else if normalized < 0.0 {
+                -1.0
+            } else if normalized < 2.0 {
+                1.0
+            } else {
+                3.0
+            };
+            level * legacy_scale
+        });
+        let squared_error = |actual: &[f32]| {
+            actual
+                .iter()
+                .zip(values)
+                .map(|(&actual, expected)| (actual - expected).powi(2))
+                .sum::<f32>()
+        };
+        let fitted_error = squared_error(&fitted);
+        let legacy_error = squared_error(&legacy);
+        assert!(
+            fitted_error < legacy_error * 0.5,
+            "fitted_error={fitted_error} legacy_error={legacy_error}"
+        );
+        assert_eq!(quantized.storage_bytes(), 18);
     }
 
     #[test]
