@@ -1,11 +1,15 @@
-use super::{Deepseek4AttentionKind, Deepseek4ModelConfig};
+use super::{
+    Deepseek4AttentionKind, Deepseek4ExpertLayer, Deepseek4ExpertWorkspace, Deepseek4Manifest,
+    Deepseek4ModelConfig,
+};
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, Result,
-    bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
-    block_fp8_linear_f32_batch_into_on_stream, hyper_apply_f32_batch_into_on_stream,
-    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-    rms_norm_f32_into_on_stream, router_hash_f32_batch_into_on_stream,
-    router_topk_f32_batch_into_on_stream,
+    add_f32_prefix_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
+    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
+    hyper_prepare_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
+    router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
+    swiglu_pair_clamped_f32_batch_into_on_stream,
 };
 use std::path::Path;
 use tracing::info;
@@ -170,6 +174,13 @@ pub struct Deepseek4RmsNorm {
     eps: f32,
 }
 
+/// Unweighted RMSNorm used independently within every query head.
+pub struct Deepseek4UnweightedRmsNorm {
+    unit_weight: DeviceBuffer<f32>,
+    width: usize,
+    eps: f32,
+}
+
 impl Deepseek4RmsNorm {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -204,6 +215,45 @@ impl Deepseek4RmsNorm {
 
     pub fn device_bytes(&self) -> usize {
         self.weight.device_bytes()
+    }
+}
+
+impl Deepseek4UnweightedRmsNorm {
+    pub fn new(width: usize, eps: f32) -> Result<Self> {
+        if width == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 unweighted RMSNorm",
+                expected: "positive width and finite positive epsilon".to_string(),
+                actual: format!("width={width} eps={eps}"),
+            });
+        }
+        Ok(Self {
+            unit_weight: DeviceBuffer::from_host(&vec![1.0; width])?,
+            width,
+            eps,
+        })
+    }
+
+    pub fn run_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        rms_norm_f32_into_on_stream(
+            batch_rows,
+            self.width,
+            input,
+            &self.unit_weight,
+            output.output(),
+            self.eps,
+            stream,
+        )
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.unit_weight.device_bytes()
     }
 }
 
@@ -402,6 +452,7 @@ pub struct Deepseek4AttentionWeights {
     pub o_a: Deepseek4BlockFp8Linear,
     pub o_b: Deepseek4BlockFp8Linear,
     pub q_norm: Deepseek4RmsNorm,
+    pub q_b_norm: Deepseek4UnweightedRmsNorm,
     pub kv_norm: Deepseek4RmsNorm,
     pub sink: DeviceBuffer<f32>,
 }
@@ -454,6 +505,7 @@ impl Deepseek4AttentionWeights {
                 config.q_lora_rank,
                 config.rms_norm_eps,
             )?,
+            q_b_norm: Deepseek4UnweightedRmsNorm::new(config.head_dim, config.rms_norm_eps)?,
             kv_norm: Deepseek4RmsNorm::load(
                 checkpoint,
                 &format!("{prefix}.kv_norm.weight"),
@@ -475,6 +527,7 @@ impl Deepseek4AttentionWeights {
             + self.o_a.device_bytes()
             + self.o_b.device_bytes()
             + self.q_norm.device_bytes()
+            + self.q_b_norm.device_bytes()
             + self.kv_norm.device_bytes()
             + self.sink.device_bytes()
     }
@@ -663,6 +716,17 @@ pub struct Deepseek4SharedExpertWeights {
     pub down: Deepseek4BlockFp8Linear,
 }
 
+/// Reusable contiguous intermediates for the shared expert.
+pub struct Deepseek4SharedExpertWorkspace {
+    gate: DeviceBuffer<f32>,
+    up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+    batch_capacity: usize,
+    intermediate: usize,
+    hidden: usize,
+}
+
 impl Deepseek4SharedExpertWeights {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -695,6 +759,92 @@ impl Deepseek4SharedExpertWeights {
 
     pub fn device_bytes(&self) -> usize {
         self.gate.device_bytes() + self.up.device_bytes() + self.down.device_bytes()
+    }
+
+    pub fn allocate_workspace(
+        &self,
+        batch_capacity: usize,
+    ) -> Result<Deepseek4SharedExpertWorkspace> {
+        if batch_capacity == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 shared-expert workspace",
+                expected: "positive batch capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let intermediate_values = batch_capacity.saturating_mul(self.gate.rows());
+        Ok(Deepseek4SharedExpertWorkspace {
+            gate: DeviceBuffer::zeroed(intermediate_values)?,
+            up: DeviceBuffer::zeroed(intermediate_values)?,
+            activated: DeviceBuffer::zeroed(intermediate_values)?,
+            output: DeviceBuffer::zeroed(batch_capacity.saturating_mul(self.down.rows()))?,
+            batch_capacity,
+            intermediate: self.gate.rows(),
+            hidden: self.down.rows(),
+        })
+    }
+
+    pub fn run_rows<'a>(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &'a mut Deepseek4SharedExpertWorkspace,
+        batch_rows: usize,
+        swiglu_limit: f32,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        workspace.validate(batch_rows, self)?;
+        self.gate
+            .run_rows(input, &mut workspace.gate, batch_rows, stream)?;
+        self.up
+            .run_rows(input, &mut workspace.up, batch_rows, stream)?;
+        swiglu_pair_clamped_f32_batch_into_on_stream(
+            &workspace.gate,
+            &workspace.up,
+            workspace.activated.output(),
+            batch_rows,
+            workspace.intermediate,
+            swiglu_limit,
+            stream,
+        )?;
+        self.down.run_rows(
+            &workspace.activated,
+            &mut workspace.output,
+            batch_rows,
+            stream,
+        )?;
+        Ok(&workspace.output)
+    }
+}
+
+impl Deepseek4SharedExpertWorkspace {
+    fn validate(&self, batch_rows: usize, weights: &Deepseek4SharedExpertWeights) -> Result<()> {
+        if batch_rows == 0
+            || batch_rows > self.batch_capacity
+            || self.intermediate != weights.gate.rows()
+            || self.hidden != weights.down.rows()
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 shared-expert workspace",
+                expected: format!(
+                    "batch in 1..={} intermediate={} hidden={}",
+                    self.batch_capacity,
+                    weights.gate.rows(),
+                    weights.down.rows()
+                ),
+                actual: format!(
+                    "batch={batch_rows} intermediate={} hidden={}",
+                    self.intermediate, self.hidden
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.gate.device_bytes()
+            + self.up.device_bytes()
+            + self.activated.device_bytes()
+            + self.output.device_bytes()
     }
 }
 
@@ -864,6 +1014,16 @@ pub struct Deepseek4ResidentLayer {
     pub shared_expert: Deepseek4SharedExpertWeights,
 }
 
+/// Reusable complete shared+routed MoE intermediates for one layer.
+pub struct Deepseek4FfnWorkspace {
+    router: Deepseek4RouterWorkspace,
+    routed: Deepseek4ExpertWorkspace,
+    shared: Deepseek4SharedExpertWorkspace,
+    output: DeviceBuffer<f32>,
+    batch_capacity: usize,
+    hidden: usize,
+}
+
 impl Deepseek4ResidentLayer {
     pub fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -913,6 +1073,98 @@ impl Deepseek4ResidentLayer {
             + self.ffn_hyper.device_bytes()
             + self.router.device_bytes()
             + self.shared_expert.device_bytes()
+    }
+
+    pub fn allocate_ffn_workspace(
+        &self,
+        config: &Deepseek4ModelConfig,
+        batch_capacity: usize,
+    ) -> Result<Deepseek4FfnWorkspace> {
+        let manifest = Deepseek4Manifest::from(config);
+        Ok(Deepseek4FfnWorkspace {
+            router: self.router.allocate_workspace(config, batch_capacity)?,
+            routed: Deepseek4ExpertWorkspace::new_for_rows(&manifest, batch_capacity)?,
+            shared: self.shared_expert.allocate_workspace(batch_capacity)?,
+            output: DeviceBuffer::zeroed(batch_capacity.saturating_mul(config.hidden_size))?,
+            batch_capacity,
+            hidden: config.hidden_size,
+        })
+    }
+
+    /// Runs the exact shared plus routed DeepSeek MoE branch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_ffn_rows<'a>(
+        &self,
+        routed_experts: &mut Deepseek4ExpertLayer,
+        workspace: &'a mut Deepseek4FfnWorkspace,
+        input: &DeviceBuffer<f32>,
+        token_ids: &DeviceBuffer<u32>,
+        batch_rows: usize,
+        config: &Deepseek4ModelConfig,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        workspace.validate(batch_rows, config.hidden_size)?;
+        let (indices, weights) = self.router.run_rows(
+            input,
+            token_ids,
+            &mut workspace.router,
+            batch_rows,
+            config.routed_scaling_factor,
+            stream,
+        )?;
+        let routed = routed_experts.run_rows(
+            &mut workspace.routed,
+            indices,
+            weights,
+            input,
+            batch_rows,
+            stream,
+        )?;
+        let shared = self.shared_expert.run_rows(
+            input,
+            &mut workspace.shared,
+            batch_rows,
+            config.swiglu_limit,
+            stream,
+        )?;
+        add_f32_prefix_into_on_stream(
+            routed,
+            shared,
+            workspace.output.output(),
+            batch_rows.saturating_mul(config.hidden_size),
+            stream,
+        )?;
+        Ok(&workspace.output)
+    }
+}
+
+impl Deepseek4FfnWorkspace {
+    fn validate(&self, batch_rows: usize, hidden: usize) -> Result<()> {
+        if batch_rows == 0
+            || batch_rows > self.batch_capacity
+            || hidden != self.hidden
+            || self.output.len() < batch_rows.saturating_mul(hidden)
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 FFN workspace",
+                expected: format!(
+                    "batch in 1..={} hidden={}",
+                    self.batch_capacity, self.hidden
+                ),
+                actual: format!(
+                    "batch={batch_rows} hidden={hidden} output={}",
+                    self.output.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.router.device_bytes()
+            + self.routed.device_bytes()
+            + self.shared.device_bytes()
+            + self.output.device_bytes()
     }
 }
 

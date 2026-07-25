@@ -1670,18 +1670,33 @@ pub fn remap_expert_indices_at_offset_into_on_stream(
 /// Accumulates routed expert usage without copying route IDs to the host.
 pub fn record_expert_indices_u64_on_stream(
     expert_indices: &DeviceBuffer<u32>,
+    counts: DeviceInOut<'_, u64>,
+    stream: &CudaStream,
+) -> Result<()> {
+    record_expert_indices_prefix_u64_on_stream(expert_indices, expert_indices.len(), counts, stream)
+}
+
+/// Accumulates a prefix of routed expert IDs without copying them to the host.
+pub fn record_expert_indices_prefix_u64_on_stream(
+    expert_indices: &DeviceBuffer<u32>,
+    len: usize,
     mut counts: DeviceInOut<'_, u64>,
     stream: &CudaStream,
 ) -> Result<()> {
-    if expert_indices.is_empty()
+    if len == 0
+        || len > expert_indices.len()
         || counts.is_empty()
-        || expert_indices.len() > u32::MAX as usize
+        || len > u32::MAX as usize
         || counts.len() > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "expert usage histogram",
-            expected: "non-empty route IDs and expert counts fitting u32".to_string(),
-            actual: format!("indices={} experts={}", expert_indices.len(), counts.len()),
+            expected: "non-empty route-ID prefix and expert counts fitting u32".to_string(),
+            actual: format!(
+                "indices={} prefix={len} experts={}",
+                expert_indices.len(),
+                counts.len()
+            ),
         });
     }
     let experts = counts.len();
@@ -1691,7 +1706,7 @@ pub fn record_expert_indices_u64_on_stream(
             ffi::infer_record_expert_indices_u64_on_stream(
                 expert_indices.ptr,
                 counts.buffer_mut().ptr,
-                expert_indices.len() as u32,
+                len as u32,
                 experts as u32,
                 stream.as_raw(),
             ),

@@ -744,6 +744,106 @@ pub fn compress_windows_f32_into_on_stream(
     }
 }
 
+/// Applies DeepSeek's separately projected, clamped SwiGLU activation.
+pub fn swiglu_pair_clamped_f32_batch_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    up: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    width: usize,
+    limit: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.saturating_mul(width);
+    if rows == 0
+        || width == 0
+        || rows > u32::MAX as usize
+        || width > u32::MAX as usize
+        || !limit.is_finite()
+        || limit <= 0.0
+        || gate.len() < values
+        || up.len() < values
+        || output.len() < values
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 clamped SwiGLU",
+            expected: format!("gate/up/output>={values} finite positive limit"),
+            actual: format!(
+                "rows={rows} width={width} limit={limit} gate={} up={} output={}",
+                gate.len(),
+                up.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_swiglu_pair_clamped_f32_on_stream",
+            ffi::infer_deepseek4_swiglu_pair_clamped_f32_on_stream(
+                gate.as_const_ptr().cast(),
+                up.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                width as u32,
+                limit,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Reduces contiguous route-major outputs with per-route router weights.
+pub fn routed_accumulate_f32_batch_into_on_stream(
+    route_output: &DeviceBuffer<f32>,
+    route_weights: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    routes_per_row: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = rows.saturating_mul(routes_per_row);
+    let route_values = routes.saturating_mul(width);
+    let output_values = rows.saturating_mul(width);
+    if rows == 0
+        || routes_per_row == 0
+        || width == 0
+        || [rows, routes_per_row, width]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || route_output.len() < route_values
+        || route_weights.len() < routes
+        || output.len() < output_values
+    {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 routed accumulation",
+            expected: format!(
+                "route_output>={route_values} weights>={routes} output>={output_values}"
+            ),
+            actual: format!(
+                "rows={rows} routes/row={routes_per_row} width={width} route_output={} weights={} output={}",
+                route_output.len(),
+                route_weights.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_deepseek4_routed_accumulate_f32_on_stream",
+            ffi::infer_deepseek4_routed_accumulate_f32_on_stream(
+                route_output.as_const_ptr().cast(),
+                route_weights.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                routes_per_row as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn validate_router_buffers(
     logits_len: usize,
     indices_len: usize,
@@ -790,7 +890,8 @@ mod tests {
         hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
         hyper_prepare_f32_batch_into_on_stream,
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
-        router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
+        routed_accumulate_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
+        router_topk_f32_batch_into_on_stream, swiglu_pair_clamped_f32_batch_into_on_stream,
     };
     use crate::{CudaStream, DeviceBuffer, format};
 
@@ -1327,6 +1428,66 @@ mod tests {
                 4.0e-5,
             );
         }
+    }
+
+    #[test]
+    fn clamped_swiglu_and_routed_accumulation_match_cpu() {
+        const ROWS: usize = 2;
+        const ROUTES: usize = 3;
+        const WIDTH: usize = 5;
+        const LIMIT: f32 = 1.25;
+        let gate = test_rows(ROWS * ROUTES, WIDTH, -0.8);
+        let up = test_rows(ROWS * ROUTES, WIDTH, 0.35);
+        let activated = gate
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| {
+                let gate = gate.min(LIMIT);
+                let up = up.clamp(-LIMIT, LIMIT);
+                gate * (1.0 / (1.0 + (-gate).exp())) * up
+            })
+            .collect::<Vec<_>>();
+        let weights = vec![0.2, 0.3, 0.5, 0.1, 0.6, 0.3];
+        let mut expected = vec![0.0; ROWS * WIDTH];
+        for row in 0..ROWS {
+            for route in 0..ROUTES {
+                for feature in 0..WIDTH {
+                    expected[row * WIDTH + feature] += weights[row * ROUTES + route]
+                        * activated[(row * ROUTES + route) * WIDTH + feature];
+                }
+            }
+        }
+        let gate = DeviceBuffer::from_host(&gate).expect("gate");
+        let up = DeviceBuffer::from_host(&up).expect("up");
+        let weights = DeviceBuffer::from_host(&weights).expect("weights");
+        let mut activated_device = DeviceBuffer::zeroed(ROWS * ROUTES * WIDTH).expect("activated");
+        let mut output = DeviceBuffer::zeroed(ROWS * WIDTH).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        swiglu_pair_clamped_f32_batch_into_on_stream(
+            &gate,
+            &up,
+            activated_device.output(),
+            ROWS * ROUTES,
+            WIDTH,
+            LIMIT,
+            &stream,
+        )
+        .expect("SwiGLU");
+        routed_accumulate_f32_batch_into_on_stream(
+            &activated_device,
+            &weights,
+            output.output(),
+            ROWS,
+            ROUTES,
+            WIDTH,
+            &stream,
+        )
+        .expect("accumulate");
+        assert_close(
+            &output.copy_to_host(&stream).expect("read output"),
+            &expected,
+            2.0e-6,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

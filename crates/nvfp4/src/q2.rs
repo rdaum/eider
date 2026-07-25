@@ -1195,6 +1195,37 @@ impl Q2Nvfp4ExpertOverlay {
         )
     }
 
+    /// Runs a contiguous routed batch without host-built pointer tables.
+    ///
+    /// `routes_per_input` is the top-k width for gate/up and one for the
+    /// independently materialized down-projection inputs.
+    pub fn run_routed_rows(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        input_rows: usize,
+        routes_per_input: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        q2_nvfp4_mixed_routed_matvec_f32_into_on_stream(
+            indices,
+            input,
+            self.cold.value_table(),
+            self.cold.scale_table(),
+            &self.expert_to_hot,
+            &self.hot_value_table,
+            &self.hot_scale_table,
+            &self.hot_scale_2_table,
+            output,
+            input_rows,
+            routes_per_input,
+            self.cold.rows,
+            self.cold.cols,
+            stream,
+        )
+    }
+
     /// Logical expert currently installed in each hot slot.
     pub fn resident_experts(&self) -> &[Option<usize>] {
         &self.slot_to_expert
@@ -1518,6 +1549,97 @@ pub fn q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream(
     }
 }
 
+/// Runs mixed Q2/NVFP4 routed matvecs into contiguous route-major output.
+#[allow(clippy::too_many_arguments)]
+pub fn q2_nvfp4_mixed_routed_matvec_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<f32>,
+    q2_packed_weight_table: &DeviceBuffer<*const u8>,
+    q2_weight_scale_table: &DeviceBuffer<*const u16>,
+    expert_to_hot: &DeviceBuffer<u32>,
+    hot_packed_weight_table: &DeviceBuffer<*const u8>,
+    hot_weight_scale_table: &DeviceBuffer<*const u8>,
+    hot_weight_scale_2_table: &DeviceBuffer<*const f32>,
+    output: &mut DeviceBuffer<f32>,
+    input_rows: usize,
+    routes_per_input: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = input_rows.saturating_mul(routes_per_input);
+    let experts = q2_packed_weight_table.len();
+    let hot_capacity = hot_packed_weight_table.len();
+    let input_values = input_rows.saturating_mul(in_features);
+    let output_values = routes.saturating_mul(out_features);
+    if routes == 0
+        || input_rows == 0
+        || routes_per_input == 0
+        || indices.len() < routes
+        || experts == 0
+        || q2_weight_scale_table.len() != experts
+        || expert_to_hot.len() != experts
+        || hot_capacity == 0
+        || hot_weight_scale_table.len() != hot_capacity
+        || hot_weight_scale_2_table.len() != hot_capacity
+        || input.len() < input_values
+        || output.len() < output_values
+        || out_features == 0
+        || !in_features.is_multiple_of(Q2_BLOCK_SIZE)
+        || [
+            input_rows,
+            routes_per_input,
+            experts,
+            hot_capacity,
+            out_features,
+            in_features,
+        ]
+        .into_iter()
+        .any(|value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "mixed Q2/NVFP4 routed matvec buffers",
+            expected: format!(
+                "routes divisible by routes/input, input>={input_values}, output>={output_values}, matching Q2/hot tables"
+            ),
+            actual: format!(
+                "routes={routes} input_rows={input_rows} routes/input={routes_per_input} input={} output={} q2={}/{} map={} hot={}/{}/{} out={out_features} in={in_features}",
+                input.len(),
+                output.len(),
+                experts,
+                q2_weight_scale_table.len(),
+                expert_to_hot.len(),
+                hot_capacity,
+                hot_weight_scale_table.len(),
+                hot_weight_scale_2_table.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_q2_nvfp4_mixed_routed_matvec_f32_on_stream",
+            ffi::infer_q2_nvfp4_mixed_routed_matvec_f32_on_stream(
+                indices.ptr,
+                input.ptr,
+                q2_packed_weight_table.ptr,
+                q2_weight_scale_table.ptr,
+                expert_to_hot.ptr,
+                hot_packed_weight_table.ptr,
+                hot_weight_scale_table.ptr,
+                hot_weight_scale_2_table.ptr,
+                output.as_mut_ptr().cast(),
+                experts as u32,
+                hot_capacity as u32,
+                routes as u32,
+                routes_per_input as u32,
+                out_features as u32,
+                in_features as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1762,9 +1884,19 @@ mod tests {
         overlay
             .run_grouped(&indices, &input, &output_table, &stream)
             .expect("mixed matvec");
+        let mut contiguous =
+            DeviceBuffer::<f32>::zeroed(EXPERTS * ROWS).expect("contiguous output");
+        overlay
+            .run_routed_rows(&indices, &input, &mut contiguous, 1, EXPERTS, &stream)
+            .expect("contiguous mixed matvec");
+        let contiguous = contiguous.copy_to_host(&stream).expect("contiguous output");
 
         for expert in 0..EXPERTS {
             let actual = outputs[expert].copy_to_host(&stream).expect("output");
+            assert_eq!(
+                actual.as_slice(),
+                &contiguous[expert * ROWS..(expert + 1) * ROWS]
+            );
             let quantized = if expert == 1 {
                 &modelopt[expert]
             } else {

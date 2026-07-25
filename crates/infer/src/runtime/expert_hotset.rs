@@ -2,7 +2,7 @@
 
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, Result, clear_expert_counts_u64_on_stream,
-    record_expert_indices_u64_on_stream,
+    record_expert_indices_prefix_u64_on_stream, record_expert_indices_u64_on_stream,
 };
 
 /// Cumulative device-resident routed-expert usage counts.
@@ -36,6 +36,16 @@ impl ExpertUsageTracker {
         stream: &CudaStream,
     ) -> Result<()> {
         record_expert_indices_u64_on_stream(expert_indices, self.counts.inout(), stream)
+    }
+
+    /// Enqueues one increment for a prefix of a reusable route buffer.
+    pub fn record_prefix(
+        &mut self,
+        expert_indices: &DeviceBuffer<u32>,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        record_expert_indices_prefix_u64_on_stream(expert_indices, len, self.counts.inout(), stream)
     }
 
     /// Copies cumulative counts to the host after prior stream work completes.

@@ -9,17 +9,18 @@ mod model;
 pub use config::{Deepseek4AttentionKind, Deepseek4ModelConfig};
 pub use model::{
     Deepseek4AttentionWeights, Deepseek4Bf16Linear, Deepseek4BlockFp8Linear,
-    Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights, Deepseek4HyperConnection,
-    Deepseek4HyperHead, Deepseek4HyperWorkspace, Deepseek4IndexerWeights, Deepseek4ModelWeights,
-    Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4Router, Deepseek4RouterWorkspace,
-    Deepseek4SharedExpertWeights,
+    Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights, Deepseek4FfnWorkspace,
+    Deepseek4HyperConnection, Deepseek4HyperHead, Deepseek4HyperWorkspace, Deepseek4IndexerWeights,
+    Deepseek4ModelWeights, Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4Router,
+    Deepseek4RouterWorkspace, Deepseek4SharedExpertWeights, Deepseek4SharedExpertWorkspace,
+    Deepseek4UnweightedRmsNorm,
 };
 
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Q2ExpertTable,
     Q2ExpertTableCacheInfo, Q2ExpertTableCacheWriter, Q2Nvfp4ExpertOverlay, QuantizedQ2, Result,
-    SafeTensorShard, fill_f32_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    silu_mul_halves_clamped_f32_into_on_stream,
+    SafeTensorShard, routed_accumulate_f32_batch_into_on_stream,
+    silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
 use serde::{Deserialize, Serialize};
@@ -52,16 +53,7 @@ impl Deepseek4Manifest {
     /// Reads and validates the checkpoint's DeepSeek V4 configuration.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
         let config = Deepseek4ModelConfig::load(model_dir)?;
-        Ok(Self {
-            hidden: config.hidden_size,
-            layers: config.num_hidden_layers,
-            routed_experts: config.routed_experts,
-            experts_per_token: config.experts_per_token,
-            expert_intermediate: config.expert_intermediate,
-            shared_experts: config.shared_experts,
-            hash_layers: config.hash_layers,
-            swiglu_limit: config.swiglu_limit,
-        })
+        Ok(Self::from(&config))
     }
 
     /// Q2 expert bytes retained across every layer, excluding tiny headers.
@@ -87,6 +79,21 @@ impl Deepseek4Manifest {
                 actual: format!("experts={} layers={}", self.routed_experts, self.layers),
             })?;
         Ok((weights as u64) * 9 / 32)
+    }
+}
+
+impl From<&Deepseek4ModelConfig> for Deepseek4Manifest {
+    fn from(config: &Deepseek4ModelConfig) -> Self {
+        Self {
+            hidden: config.hidden_size,
+            layers: config.num_hidden_layers,
+            routed_experts: config.routed_experts,
+            experts_per_token: config.experts_per_token,
+            expert_intermediate: config.expert_intermediate,
+            shared_experts: config.shared_experts,
+            hash_layers: config.hash_layers,
+            swiglu_limit: config.swiglu_limit,
+        }
     }
 }
 
@@ -276,41 +283,50 @@ impl Deepseek4HotExpertCache {
 
 /// Mutable output storage for one routed-expert layer.
 pub struct Deepseek4ExpertWorkspace {
-    gate_up: Vec<DeviceBuffer<f32>>,
-    gate_up_table: DeviceBuffer<*mut f32>,
-    activated: Vec<DeviceBuffer<f32>>,
-    activated_table: DeviceBuffer<*const f32>,
-    _down: Vec<DeviceBuffer<f32>>,
-    down_table: DeviceBuffer<*mut f32>,
-    down_const_table: DeviceBuffer<*const f32>,
+    gate_up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
+    batch_capacity: usize,
+    routes_per_row: usize,
+    intermediate: usize,
+    hidden: usize,
 }
 
 impl Deepseek4ExpertWorkspace {
     /// Allocates one output slot per routed expert selected for a token.
     pub fn new(manifest: &Deepseek4Manifest) -> Result<Self> {
-        let gate_up = (0..manifest.experts_per_token)
-            .map(|_| DeviceBuffer::<f32>::zeroed(manifest.expert_intermediate * 2))
-            .collect::<Result<Vec<_>>>()?;
-        let gate_up_table = mutable_pointer_table(&gate_up)?;
-        let activated = (0..manifest.experts_per_token)
-            .map(|_| DeviceBuffer::<f32>::zeroed(manifest.expert_intermediate))
-            .collect::<Result<Vec<_>>>()?;
-        let activated_table = const_pointer_table(&activated)?;
-        let down = (0..manifest.experts_per_token)
-            .map(|_| DeviceBuffer::<f32>::zeroed(manifest.hidden))
-            .collect::<Result<Vec<_>>>()?;
-        let down_table = mutable_pointer_table(&down)?;
-        let down_const_table = const_pointer_table(&down)?;
+        Self::new_for_rows(manifest, 1)
+    }
+
+    /// Allocates contiguous routed intermediates for a fixed row capacity.
+    pub fn new_for_rows(manifest: &Deepseek4Manifest, batch_capacity: usize) -> Result<Self> {
+        if batch_capacity == 0 {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 expert workspace",
+                expected: "positive batch capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let routes = batch_capacity
+            .checked_mul(manifest.experts_per_token)
+            .ok_or_else(|| Error::Shape {
+                label: "DeepSeek V4 expert workspace",
+                expected: "batch * routes without overflow".to_string(),
+                actual: format!(
+                    "batch={batch_capacity} routes={}",
+                    manifest.experts_per_token
+                ),
+            })?;
         Ok(Self {
-            gate_up,
-            gate_up_table,
-            activated,
-            activated_table,
-            _down: down,
-            down_table,
-            down_const_table,
-            output: DeviceBuffer::zeroed(manifest.hidden)?,
+            gate_up: DeviceBuffer::zeroed(routes.saturating_mul(2 * manifest.expert_intermediate))?,
+            activated: DeviceBuffer::zeroed(routes.saturating_mul(manifest.expert_intermediate))?,
+            down: DeviceBuffer::zeroed(routes.saturating_mul(manifest.hidden))?,
+            output: DeviceBuffer::zeroed(batch_capacity.saturating_mul(manifest.hidden))?,
+            batch_capacity,
+            routes_per_row: manifest.experts_per_token,
+            intermediate: manifest.expert_intermediate,
+            hidden: manifest.hidden,
         })
     }
 
@@ -321,17 +337,35 @@ impl Deepseek4ExpertWorkspace {
 
     /// Device bytes retained by the layer workspace.
     pub fn device_bytes(&self) -> usize {
-        self.gate_up
-            .iter()
-            .chain(&self.activated)
-            .chain(&self._down)
-            .map(DeviceBuffer::device_bytes)
-            .sum::<usize>()
-            + self.gate_up_table.device_bytes()
-            + self.activated_table.device_bytes()
-            + self.down_table.device_bytes()
-            + self.down_const_table.device_bytes()
+        self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.down.device_bytes()
             + self.output.device_bytes()
+    }
+
+    fn validate(&self, rows: usize, manifest: &Deepseek4Manifest) -> Result<()> {
+        if rows == 0
+            || rows > self.batch_capacity
+            || self.routes_per_row != manifest.experts_per_token
+            || self.intermediate != manifest.expert_intermediate
+            || self.hidden != manifest.hidden
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 expert workspace",
+                expected: format!(
+                    "rows in 1..={} routes={} intermediate={} hidden={}",
+                    self.batch_capacity,
+                    manifest.experts_per_token,
+                    manifest.expert_intermediate,
+                    manifest.hidden
+                ),
+                actual: format!(
+                    "rows={rows} routes={} intermediate={} hidden={}",
+                    self.routes_per_row, self.intermediate, self.hidden
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -341,7 +375,6 @@ pub struct Deepseek4ExpertLayer {
     manifest: Deepseek4Manifest,
     gate_up: Q2Nvfp4ExpertOverlay,
     down: Q2Nvfp4ExpertOverlay,
-    unity_alphas: DeviceBuffer<f32>,
     usage: ExpertUsageTracker,
 }
 
@@ -383,7 +416,6 @@ impl Deepseek4ExpertLayer {
             manifest: manifest.clone(),
             gate_up,
             down,
-            unity_alphas: DeviceBuffer::from_host(&vec![1.0; manifest.routed_experts])?,
             usage: ExpertUsageTracker::new(manifest.routed_experts)?,
         })
     }
@@ -397,17 +429,30 @@ impl Deepseek4ExpertLayer {
         input: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
-        if indices.len() != self.manifest.experts_per_token
-            || route_weights.len() != self.manifest.experts_per_token
-            || input.len() != self.manifest.hidden
+        self.run_rows(workspace, indices, route_weights, input, 1, stream)
+    }
+
+    /// Runs the complete routed-expert branch for contiguous token rows.
+    pub fn run_rows<'a>(
+        &mut self,
+        workspace: &'a mut Deepseek4ExpertWorkspace,
+        indices: &DeviceBuffer<u32>,
+        route_weights: &DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        workspace.validate(rows, &self.manifest)?;
+        let routes = rows.saturating_mul(self.manifest.experts_per_token);
+        if indices.len() < routes
+            || route_weights.len() < routes
+            || input.len() < rows.saturating_mul(self.manifest.hidden)
         {
             return Err(Error::Shape {
                 label: "DeepSeek V4 routed expert input",
                 expected: format!(
-                    "indices={} weights={} input={}",
-                    self.manifest.experts_per_token,
-                    self.manifest.experts_per_token,
-                    self.manifest.hidden
+                    "indices/weights>={routes} input>={}",
+                    rows.saturating_mul(self.manifest.hidden)
                 ),
                 actual: format!(
                     "indices={} weights={} input={}",
@@ -417,31 +462,38 @@ impl Deepseek4ExpertLayer {
                 ),
             });
         }
-        self.usage.record(indices, stream)?;
-        self.gate_up
-            .run_grouped(indices, input, &workspace.gate_up_table, stream)?;
-        for route in 0..self.manifest.experts_per_token {
-            silu_mul_halves_clamped_f32_into_on_stream(
-                &workspace.gate_up[route],
-                workspace.activated[route].output(),
-                self.manifest.expert_intermediate,
-                self.manifest.swiglu_limit,
-                stream,
-            )?;
-        }
-        self.down.run_grouped_inputs(
+        self.usage.record_prefix(indices, routes, stream)?;
+        self.gate_up.run_routed_rows(
             indices,
-            &workspace.activated_table,
-            &workspace.down_table,
+            input,
+            &mut workspace.gate_up,
+            rows,
+            self.manifest.experts_per_token,
             stream,
         )?;
-        fill_f32_into_on_stream(workspace.output.output(), 0.0, stream)?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        silu_mul_halves_clamped_f32_batch_into_on_stream(
+            &workspace.gate_up,
+            workspace.activated.output(),
+            routes,
+            self.manifest.expert_intermediate,
+            self.manifest.swiglu_limit,
+            stream,
+        )?;
+        self.down.run_routed_rows(
             indices,
+            &workspace.activated,
+            &mut workspace.down,
+            routes,
+            1,
+            stream,
+        )?;
+        routed_accumulate_f32_batch_into_on_stream(
+            &workspace.down,
             route_weights,
-            &workspace.down_const_table,
-            &self.unity_alphas,
-            workspace.output.inout(),
+            workspace.output.output(),
+            rows,
+            self.manifest.experts_per_token,
+            self.manifest.hidden,
             stream,
         )?;
         Ok(&workspace.output)
@@ -917,24 +969,6 @@ fn thin_checkpoint_io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ 
         label: "DeepSeek V4 thin checkpoint",
         detail: format!("{}: {error}", path.display()),
     }
-}
-
-fn mutable_pointer_table(values: &[DeviceBuffer<f32>]) -> Result<DeviceBuffer<*mut f32>> {
-    DeviceBuffer::from_host(
-        &values
-            .iter()
-            .map(|value| value.as_const_ptr().cast::<f32>().cast_mut())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn const_pointer_table(values: &[DeviceBuffer<f32>]) -> Result<DeviceBuffer<*const f32>> {
-    DeviceBuffer::from_host(
-        &values
-            .iter()
-            .map(|value| value.as_const_ptr().cast::<f32>())
-            .collect::<Vec<_>>(),
-    )
 }
 
 fn missing_artifact_bytes(artifact_dir: &Path, manifest: &Deepseek4Manifest) -> Result<u64> {
@@ -1651,6 +1685,49 @@ mod tests {
                 .installed,
             0
         );
+
+        let mut batch_workspace =
+            Deepseek4ExpertWorkspace::new_for_rows(&manifest, 2).expect("batch workspace");
+        let batch_input_host = vec![0.125f32; 2 * manifest.hidden];
+        let batch_input = DeviceBuffer::from_host(&batch_input_host).expect("batch input");
+        let batch_indices = DeviceBuffer::from_host(&[0u32, 1, 1, 0]).expect("batch indices");
+        let batch_weights =
+            DeviceBuffer::from_host(&[0.25f32, 0.75, 0.6, 0.4]).expect("batch weights");
+        layer
+            .run_rows(
+                &mut batch_workspace,
+                &batch_indices,
+                &batch_weights,
+                &batch_input,
+                2,
+                &stream,
+            )
+            .expect("run batch");
+        let batch_output = batch_workspace
+            .output()
+            .copy_to_host(&stream)
+            .expect("batch output");
+        for (row, (indices, weights)) in [([0u32, 1], [0.25f32, 0.75]), ([1u32, 0], [0.6f32, 0.4])]
+            .into_iter()
+            .enumerate()
+        {
+            let indices = DeviceBuffer::from_host(&indices).expect("single indices");
+            let weights = DeviceBuffer::from_host(&weights).expect("single weights");
+            layer
+                .run_one_token(&mut workspace, &indices, &weights, &input, &stream)
+                .expect("single reference");
+            let expected = workspace
+                .output()
+                .copy_to_host(&stream)
+                .expect("single output");
+            for (&actual, &expected) in batch_output
+                [row * manifest.hidden..(row + 1) * manifest.hidden]
+                .iter()
+                .zip(expected.iter())
+            {
+                assert!((actual - expected).abs() < 1e-4);
+            }
+        }
         std::fs::remove_dir_all(artifact_dir).expect("remove artifacts");
     }
 

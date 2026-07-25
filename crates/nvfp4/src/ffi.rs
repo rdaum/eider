@@ -212,6 +212,24 @@ unsafe extern "C" {
         has_prior: bool,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_swiglu_pair_clamped_f32_on_stream(
+        gate: *const f32,
+        up: *const f32,
+        output: *mut f32,
+        rows: u32,
+        width: u32,
+        limit: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_deepseek4_routed_accumulate_f32_on_stream(
+        route_output: *const f32,
+        route_weights: *const f32,
+        output: *mut f32,
+        rows: u32,
+        routes_per_row: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gemma4_local_attention_bf16_on_stream(
         query: *const u16,
         key: *const u16,
@@ -2485,6 +2503,24 @@ unsafe extern "C" {
         experts: u32,
         hot_capacity: u32,
         groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_q2_nvfp4_mixed_routed_matvec_f32_on_stream(
+        indices: *const u32,
+        input: *const f32,
+        q2_packed_weight_table: *const *const u8,
+        q2_weight_scale_table: *const *const u16,
+        expert_to_hot: *const u32,
+        hot_packed_weight_table: *const *const u8,
+        hot_weight_scale_table: *const *const u8,
+        hot_weight_scale_2_table: *const *const f32,
+        output: *mut f32,
+        experts: u32,
+        hot_capacity: u32,
+        routes: u32,
+        routes_per_input: u32,
         out_features: u32,
         in_features: u32,
         stream: cudaStream_t,
