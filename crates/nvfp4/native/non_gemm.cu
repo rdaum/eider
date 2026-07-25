@@ -2942,6 +2942,46 @@ extern "C" cudaError_t infer_remap_expert_indices_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_record_expert_indices_u64_kernel(
+    const std::uint32_t* expert_indices,
+    unsigned long long* counts,
+    std::uint32_t count,
+    std::uint32_t experts) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const std::uint32_t expert = expert_indices[index];
+    if (expert < experts) {
+        atomicAdd(counts + expert, 1ull);
+    }
+}
+
+extern "C" cudaError_t infer_record_expert_indices_u64_on_stream(
+    const std::uint32_t* expert_indices,
+    unsigned long long* counts,
+    std::uint32_t count,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (expert_indices == nullptr || counts == nullptr || count == 0 || experts == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 128;
+    infer_record_expert_indices_u64_kernel<<<
+        (count + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        expert_indices, counts, count, experts);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_clear_expert_counts_u64_on_stream(
+    unsigned long long* counts,
+    std::uint32_t experts,
+    cudaStream_t stream) {
+    if (counts == nullptr || experts == 0) {
+        return cudaErrorInvalidValue;
+    }
+    return cudaMemsetAsync(
+        counts, 0, static_cast<std::size_t>(experts) * sizeof(unsigned long long), stream);
+}
+
 __global__ void infer_gather_indexed_mul_f32_kernel(
     const float* values,
     const std::uint32_t* indices,
@@ -10680,6 +10720,398 @@ extern "C" cudaError_t infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
         dim3(grid_x, groups), kThreads, shared_bytes, stream>>>(
         indices, input_table, packed_weight_table, weight_scale_table,
         weight_scale_2_table, output_table, table_len, groups, out_features, in_features);
+    return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Experimental blockwise-Q2 matvec.
+//
+// Four signed levels {-3, -1, 1, 3} share one BF16 scale per 64 consecutive
+// input channels. The format is intentionally independent of external Q2
+// checkpoint conventions while the resident-expert design is evaluated.
+// ---------------------------------------------------------------------------
+
+__device__ inline float infer_q2_row_dot_warp(
+    const std::uint8_t* packed_row,
+    const std::uint16_t* row_scales,
+    const float* input_sh,
+    std::uint32_t cols) {
+    float acc = 0.0f;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    for (std::uint32_t col = lane * 4; col < cols; col += 32 * 4) {
+        const std::uint8_t packed = packed_row[col / 4];
+        const float scale = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(
+                row_scales + col / 64));
+#pragma unroll
+        for (std::uint32_t offset = 0; offset < 4; ++offset) {
+            const std::uint32_t code = (packed >> (offset * 2)) & 0x03u;
+            const float weight = static_cast<float>(
+                static_cast<std::int32_t>(code) * 2 - 3) * scale;
+            acc = __fmaf_rn(input_sh[col + offset], weight, acc);
+        }
+    }
+    acc += __shfl_xor_sync(0xffffffffu, acc, 16);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 8);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 4);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+    return acc;
+}
+
+__global__ void infer_q2_w2a16_grouped_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* __restrict__ input,
+    const std::uint8_t* const* __restrict__ packed_weight_table,
+    const std::uint16_t* const* __restrict__ weight_scale_table,
+    float* const* __restrict__ output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    extern __shared__ float input_sh[];
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t group = blockIdx.y;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (group >= groups || row >= out_features) {
+        return;
+    }
+    const std::uint32_t expert = indices[group];
+    if (expert >= table_len) {
+        return;
+    }
+    const std::uint32_t packed_row_bytes = in_features / 4;
+    const std::uint32_t scales_per_row = in_features / 64;
+    const float value = infer_q2_row_dot_warp(
+        packed_weight_table[expert] +
+            static_cast<std::size_t>(row) * packed_row_bytes,
+        weight_scale_table[expert] +
+            static_cast<std::size_t>(row) * scales_per_row,
+        input_sh,
+        in_features);
+    if (lane == 0) {
+        output_table[group][row] = value;
+    }
+}
+
+extern "C" cudaError_t infer_q2_w2a16_grouped_matvec_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint8_t* const* packed_weight_table,
+    const std::uint16_t* const* weight_scale_table,
+    float* const* output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (indices == nullptr || input == nullptr || packed_weight_table == nullptr ||
+        weight_scale_table == nullptr || output_table == nullptr ||
+        table_len == 0 || groups == 0 || out_features == 0 ||
+        in_features == 0 || (in_features % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const dim3 grid(
+        (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock,
+        groups);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_q2_w2a16_grouped_matvec_f32_kernel<<<
+        grid, kThreads, shared_bytes, stream>>>(
+        indices, input, packed_weight_table, weight_scale_table, output_table,
+        table_len, groups, out_features, in_features);
+    return cudaGetLastError();
+}
+
+__global__ void infer_q2_w2a16_grouped_inputs_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* const* __restrict__ input_table,
+    const std::uint8_t* const* __restrict__ packed_weight_table,
+    const std::uint16_t* const* __restrict__ weight_scale_table,
+    float* const* __restrict__ output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    extern __shared__ float input_sh[];
+    const std::uint32_t group = blockIdx.y;
+    if (group >= groups) {
+        return;
+    }
+    const float* input = input_table[group];
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= out_features) {
+        return;
+    }
+    const std::uint32_t expert = indices[group];
+    if (expert >= table_len) {
+        return;
+    }
+    const std::uint32_t packed_row_bytes = in_features / 4;
+    const std::uint32_t scales_per_row = in_features / 64;
+    const float value = infer_q2_row_dot_warp(
+        packed_weight_table[expert] +
+            static_cast<std::size_t>(row) * packed_row_bytes,
+        weight_scale_table[expert] +
+            static_cast<std::size_t>(row) * scales_per_row,
+        input_sh,
+        in_features);
+    if (lane == 0) {
+        output_table[group][row] = value;
+    }
+}
+
+extern "C" cudaError_t infer_q2_w2a16_grouped_inputs_matvec_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* const* input_table,
+    const std::uint8_t* const* packed_weight_table,
+    const std::uint16_t* const* weight_scale_table,
+    float* const* output_table,
+    std::uint32_t table_len,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (indices == nullptr || input_table == nullptr ||
+        packed_weight_table == nullptr || weight_scale_table == nullptr ||
+        output_table == nullptr || table_len == 0 || groups == 0 ||
+        out_features == 0 || in_features == 0 || (in_features % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const dim3 grid(
+        (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock,
+        groups);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_q2_w2a16_grouped_inputs_matvec_f32_kernel<<<
+        grid, kThreads, shared_bytes, stream>>>(
+        indices, input_table, packed_weight_table, weight_scale_table,
+        output_table, table_len, groups, out_features, in_features);
+    return cudaGetLastError();
+}
+
+__global__ void infer_q2_nvfp4_mixed_grouped_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* __restrict__ input,
+    const std::uint8_t* const* __restrict__ q2_packed_weight_table,
+    const std::uint16_t* const* __restrict__ q2_weight_scale_table,
+    const std::uint32_t* __restrict__ expert_to_hot,
+    const std::uint8_t* const* __restrict__ hot_packed_weight_table,
+    const std::uint8_t* const* __restrict__ hot_weight_scale_table,
+    const float* const* __restrict__ hot_weight_scale_2_table,
+    float* const* __restrict__ output_table,
+    std::uint32_t experts,
+    std::uint32_t hot_capacity,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    extern __shared__ float input_sh[];
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t group = blockIdx.y;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (group >= groups || row >= out_features) {
+        return;
+    }
+    const std::uint32_t expert = indices[group];
+    if (expert >= experts) {
+        return;
+    }
+
+    float value;
+    const std::uint32_t hot_slot = expert_to_hot[expert];
+    if (hot_slot < hot_capacity) {
+        const std::uint32_t row_byte_base = row * (in_features / 2);
+        const std::uint32_t row_scale_base = row * (in_features / 16);
+        value = infer_nvfp4_row_dot_warp(
+            hot_packed_weight_table[hot_slot] + row_byte_base,
+            hot_weight_scale_table[hot_slot] + row_scale_base,
+            input_sh,
+            in_features) * hot_weight_scale_2_table[hot_slot][row];
+    } else {
+        const std::uint32_t packed_row_bytes = in_features / 4;
+        const std::uint32_t scales_per_row = in_features / 64;
+        value = infer_q2_row_dot_warp(
+            q2_packed_weight_table[expert] +
+                static_cast<std::size_t>(row) * packed_row_bytes,
+            q2_weight_scale_table[expert] +
+                static_cast<std::size_t>(row) * scales_per_row,
+            input_sh,
+            in_features);
+    }
+    if (lane == 0) {
+        output_table[group][row] = value;
+    }
+}
+
+extern "C" cudaError_t infer_q2_nvfp4_mixed_grouped_matvec_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint8_t* const* q2_packed_weight_table,
+    const std::uint16_t* const* q2_weight_scale_table,
+    const std::uint32_t* expert_to_hot,
+    const std::uint8_t* const* hot_packed_weight_table,
+    const std::uint8_t* const* hot_weight_scale_table,
+    const float* const* hot_weight_scale_2_table,
+    float* const* output_table,
+    std::uint32_t experts,
+    std::uint32_t hot_capacity,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (indices == nullptr || input == nullptr ||
+        q2_packed_weight_table == nullptr || q2_weight_scale_table == nullptr ||
+        expert_to_hot == nullptr || hot_packed_weight_table == nullptr ||
+        hot_weight_scale_table == nullptr || hot_weight_scale_2_table == nullptr ||
+        output_table == nullptr || experts == 0 || hot_capacity == 0 ||
+        groups == 0 || out_features == 0 || in_features == 0 ||
+        (in_features % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const dim3 grid(
+        (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock,
+        groups);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_q2_nvfp4_mixed_grouped_matvec_f32_kernel<<<
+        grid, kThreads, shared_bytes, stream>>>(
+        indices, input, q2_packed_weight_table, q2_weight_scale_table,
+        expert_to_hot, hot_packed_weight_table, hot_weight_scale_table,
+        hot_weight_scale_2_table, output_table, experts, hot_capacity, groups,
+        out_features, in_features);
+    return cudaGetLastError();
+}
+
+__global__ void infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* const* __restrict__ input_table,
+    const std::uint8_t* const* __restrict__ q2_packed_weight_table,
+    const std::uint16_t* const* __restrict__ q2_weight_scale_table,
+    const std::uint32_t* __restrict__ expert_to_hot,
+    const std::uint8_t* const* __restrict__ hot_packed_weight_table,
+    const std::uint8_t* const* __restrict__ hot_weight_scale_table,
+    const float* const* __restrict__ hot_weight_scale_2_table,
+    float* const* __restrict__ output_table,
+    std::uint32_t experts,
+    std::uint32_t hot_capacity,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features) {
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    extern __shared__ float input_sh[];
+    const std::uint32_t group = blockIdx.y;
+    if (group >= groups) {
+        return;
+    }
+    const float* input = input_table[group];
+    for (std::uint32_t col = threadIdx.x; col < in_features; col += blockDim.x) {
+        input_sh[col] = input[col];
+    }
+    __syncthreads();
+
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= out_features) {
+        return;
+    }
+    const std::uint32_t expert = indices[group];
+    if (expert >= experts) {
+        return;
+    }
+
+    float value;
+    const std::uint32_t hot_slot = expert_to_hot[expert];
+    if (hot_slot < hot_capacity) {
+        const std::uint32_t row_byte_base = row * (in_features / 2);
+        const std::uint32_t row_scale_base = row * (in_features / 16);
+        value = infer_nvfp4_row_dot_warp(
+            hot_packed_weight_table[hot_slot] + row_byte_base,
+            hot_weight_scale_table[hot_slot] + row_scale_base,
+            input_sh,
+            in_features) * hot_weight_scale_2_table[hot_slot][row];
+    } else {
+        const std::uint32_t packed_row_bytes = in_features / 4;
+        const std::uint32_t scales_per_row = in_features / 64;
+        value = infer_q2_row_dot_warp(
+            q2_packed_weight_table[expert] +
+                static_cast<std::size_t>(row) * packed_row_bytes,
+            q2_weight_scale_table[expert] +
+                static_cast<std::size_t>(row) * scales_per_row,
+            input_sh,
+            in_features);
+    }
+    if (lane == 0) {
+        output_table[group][row] = value;
+    }
+}
+
+extern "C" cudaError_t infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* const* input_table,
+    const std::uint8_t* const* q2_packed_weight_table,
+    const std::uint16_t* const* q2_weight_scale_table,
+    const std::uint32_t* expert_to_hot,
+    const std::uint8_t* const* hot_packed_weight_table,
+    const std::uint8_t* const* hot_weight_scale_table,
+    const float* const* hot_weight_scale_2_table,
+    float* const* output_table,
+    std::uint32_t experts,
+    std::uint32_t hot_capacity,
+    std::uint32_t groups,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (indices == nullptr || input_table == nullptr ||
+        q2_packed_weight_table == nullptr || q2_weight_scale_table == nullptr ||
+        expert_to_hot == nullptr || hot_packed_weight_table == nullptr ||
+        hot_weight_scale_table == nullptr || hot_weight_scale_2_table == nullptr ||
+        output_table == nullptr || experts == 0 || hot_capacity == 0 ||
+        groups == 0 || out_features == 0 || in_features == 0 ||
+        (in_features % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kWarpsPerBlock = 16;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const dim3 grid(
+        (out_features + kWarpsPerBlock - 1) / kWarpsPerBlock,
+        groups);
+    const std::size_t shared_bytes =
+        static_cast<std::size_t>(in_features) * sizeof(float);
+    infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_kernel<<<
+        grid, kThreads, shared_bytes, stream>>>(
+        indices, input_table, q2_packed_weight_table, q2_weight_scale_table,
+        expert_to_hot, hot_packed_weight_table, hot_weight_scale_table,
+        hot_weight_scale_2_table, output_table, experts, hot_capacity, groups,
+        out_features, in_features);
     return cudaGetLastError();
 }
 

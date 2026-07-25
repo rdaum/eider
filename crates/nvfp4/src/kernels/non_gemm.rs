@@ -1667,6 +1667,63 @@ pub fn remap_expert_indices_at_offset_into_on_stream(
     }
 }
 
+/// Accumulates routed expert usage without copying route IDs to the host.
+pub fn record_expert_indices_u64_on_stream(
+    expert_indices: &DeviceBuffer<u32>,
+    mut counts: DeviceInOut<'_, u64>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if expert_indices.is_empty()
+        || counts.is_empty()
+        || expert_indices.len() > u32::MAX as usize
+        || counts.len() > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "expert usage histogram",
+            expected: "non-empty route IDs and expert counts fitting u32".to_string(),
+            actual: format!("indices={} experts={}", expert_indices.len(), counts.len()),
+        });
+    }
+    let experts = counts.len();
+    unsafe {
+        check_cuda(
+            "infer_record_expert_indices_u64_on_stream",
+            ffi::infer_record_expert_indices_u64_on_stream(
+                expert_indices.ptr,
+                counts.buffer_mut().ptr,
+                expert_indices.len() as u32,
+                experts as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Clears a device-resident expert usage histogram.
+pub fn clear_expert_counts_u64_on_stream(
+    mut counts: DeviceOutput<'_, u64>,
+    stream: &CudaStream,
+) -> Result<()> {
+    if counts.is_empty() || counts.len() > u32::MAX as usize {
+        return Err(Error::Shape {
+            label: "expert usage histogram",
+            expected: "non-empty expert counts fitting u32".to_string(),
+            actual: format!("experts={}", counts.len()),
+        });
+    }
+    let experts = counts.len();
+    unsafe {
+        check_cuda(
+            "infer_clear_expert_counts_u64_on_stream",
+            ffi::infer_clear_expert_counts_u64_on_stream(
+                counts.buffer_mut().ptr,
+                experts as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues independent softmax top-k routing for a row-major batch.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_topk_f32_batch_into_on_stream(
@@ -11790,6 +11847,26 @@ mod tests {
         assert_eq!(
             slots.copy_to_host(&stream).expect("readback"),
             [5, 7, 1, u32::MAX]
+        );
+    }
+
+    #[test]
+    fn expert_usage_histogram_accumulates_and_clears_on_device() {
+        let first = DeviceBuffer::from_host(&[3u32, 0, 3, 7, 1]).expect("first indices");
+        let second = DeviceBuffer::from_host(&[1u32, 3, 2]).expect("second indices");
+        let mut counts = DeviceBuffer::zeroed(4).expect("counts");
+        let stream = CudaStream::new_blocking().expect("stream");
+        record_expert_indices_u64_on_stream(&first, counts.inout(), &stream).expect("record first");
+        record_expert_indices_u64_on_stream(&second, counts.inout(), &stream)
+            .expect("record second");
+        assert_eq!(
+            counts.copy_to_host(&stream).expect("readback"),
+            [1, 2, 1, 3]
+        );
+        clear_expert_counts_u64_on_stream(counts.output(), &stream).expect("clear counts");
+        assert_eq!(
+            counts.copy_to_host(&stream).expect("cleared readback"),
+            [0, 0, 0, 0]
         );
     }
 

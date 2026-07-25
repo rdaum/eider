@@ -1073,6 +1073,18 @@ unsafe extern "C" {
         experts: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_record_expert_indices_u64_on_stream(
+        expert_indices: *const u32,
+        counts: *mut u64,
+        count: u32,
+        experts: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_clear_expert_counts_u64_on_stream(
+        counts: *mut u64,
+        experts: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gather_indexed_mul_f32_on_stream(
         values: *const f32,
         indices: *const u32,
@@ -2289,6 +2301,64 @@ unsafe extern "C" {
         weight_scale_2_table: *const f32,
         output_table: *const *mut f32,
         table_len: u32,
+        groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_q2_w2a16_grouped_matvec_f32_on_stream(
+        indices: *const u32,
+        input: *const f32,
+        packed_weight_table: *const *const u8,
+        weight_scale_table: *const *const u16,
+        output_table: *const *mut f32,
+        table_len: u32,
+        groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_q2_w2a16_grouped_inputs_matvec_f32_on_stream(
+        indices: *const u32,
+        input_table: *const *const f32,
+        packed_weight_table: *const *const u8,
+        weight_scale_table: *const *const u16,
+        output_table: *const *mut f32,
+        table_len: u32,
+        groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_q2_nvfp4_mixed_grouped_matvec_f32_on_stream(
+        indices: *const u32,
+        input: *const f32,
+        q2_packed_weight_table: *const *const u8,
+        q2_weight_scale_table: *const *const u16,
+        expert_to_hot: *const u32,
+        hot_packed_weight_table: *const *const u8,
+        hot_weight_scale_table: *const *const u8,
+        hot_weight_scale_2_table: *const *const f32,
+        output_table: *const *mut f32,
+        experts: u32,
+        hot_capacity: u32,
+        groups: u32,
+        out_features: u32,
+        in_features: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_on_stream(
+        indices: *const u32,
+        input_table: *const *const f32,
+        q2_packed_weight_table: *const *const u8,
+        q2_weight_scale_table: *const *const u16,
+        expert_to_hot: *const u32,
+        hot_packed_weight_table: *const *const u8,
+        hot_weight_scale_table: *const *const u8,
+        hot_weight_scale_2_table: *const *const f32,
+        output_table: *const *mut f32,
+        experts: u32,
+        hot_capacity: u32,
         groups: u32,
         out_features: u32,
         in_features: u32,

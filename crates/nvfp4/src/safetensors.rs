@@ -6,10 +6,10 @@
 //! explicitly requests it.
 
 use crate::error::{Error, Result};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Metadata for one tensor inside a safetensors shard.
@@ -100,6 +100,11 @@ impl SafeTensorShard {
     /// Returns the number of tensors described by this shard.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
+    }
+
+    /// Iterates tensor names in stable lexical order.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
     }
 
     /// Returns metadata for a named tensor.
@@ -227,6 +232,104 @@ impl SafeTensorShard {
             }),
         }
     }
+
+    /// Writes a new safetensors shard containing only `names`.
+    ///
+    /// Tensor payloads are copied in bounded chunks; this does not materialize
+    /// a complete tensor or shard in host memory.
+    pub fn copy_tensors_to(&self, output: impl AsRef<Path>, names: &[String]) -> Result<u64> {
+        let output = output.as_ref();
+        let mut ordered = names.to_vec();
+        ordered.sort();
+        ordered.dedup();
+        if ordered.len() != names.len() {
+            return Err(Error::Format {
+                label: "safetensors filtered copy",
+                detail: "tensor names must be unique".to_string(),
+            });
+        }
+        let mut header = Map::new();
+        let mut offset = 0u64;
+        for name in &ordered {
+            let info = self.require_tensor(name)?;
+            let end = offset
+                .checked_add(info.byte_len())
+                .ok_or_else(|| Error::Format {
+                    label: "safetensors filtered copy",
+                    detail: "tensor offsets overflowed u64".to_string(),
+                })?;
+            header.insert(
+                name.clone(),
+                json!({
+                    "dtype": info.dtype,
+                    "shape": info.shape,
+                    "data_offsets": [offset, end],
+                }),
+            );
+            offset = end;
+        }
+        let mut header_bytes =
+            serde_json::to_vec(&Value::Object(header)).map_err(|error| Error::Format {
+                label: "safetensors filtered copy",
+                detail: format!("failed to encode header: {error}"),
+            })?;
+        while !header_bytes.len().is_multiple_of(8) {
+            header_bytes.push(b' ');
+        }
+
+        let mut source = File::open(&self.path).map_err(|error| Error::Format {
+            label: "safetensors filtered copy",
+            detail: format!("failed to open {}: {error}", self.path.display()),
+        })?;
+        let output_file = File::create(output).map_err(|error| Error::Format {
+            label: "safetensors filtered copy",
+            detail: format!("failed to create {}: {error}", output.display()),
+        })?;
+        let mut writer = BufWriter::new(output_file);
+        writer
+            .write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .and_then(|()| writer.write_all(&header_bytes))
+            .map_err(|error| Error::Format {
+                label: "safetensors filtered copy",
+                detail: format!("failed to write {} header: {error}", output.display()),
+            })?;
+        let mut buffer = vec![0u8; 8 << 20];
+        for name in &ordered {
+            let info = self.require_tensor(name)?;
+            source
+                .seek(SeekFrom::Start(self.data_start + info.data_begin))
+                .map_err(|error| Error::Format {
+                    label: "safetensors filtered copy",
+                    detail: format!("failed to seek {}: {error}", self.path.display()),
+                })?;
+            let mut remaining = info.byte_len();
+            while remaining != 0 {
+                let chunk = usize::try_from(remaining.min(buffer.len() as u64))
+                    .expect("chunk is bounded by the buffer length");
+                source
+                    .read_exact(&mut buffer[..chunk])
+                    .and_then(|()| writer.write_all(&buffer[..chunk]))
+                    .map_err(|error| Error::Format {
+                        label: "safetensors filtered copy",
+                        detail: format!(
+                            "failed to copy {name} from {} to {}: {error}",
+                            self.path.display(),
+                            output.display()
+                        ),
+                    })?;
+                remaining -= chunk as u64;
+            }
+        }
+        writer.flush().map_err(|error| Error::Format {
+            label: "safetensors filtered copy",
+            detail: format!("failed to flush {}: {error}", output.display()),
+        })?;
+        writer.get_ref().sync_all().map_err(|error| Error::Format {
+            label: "safetensors filtered copy",
+            detail: format!("failed to sync {}: {error}", output.display()),
+        })?;
+        Ok(8 + header_bytes.len() as u64 + offset)
+    }
 }
 
 fn parse_tensor_info(name: &str, value: &Value) -> Result<SafeTensorInfo> {
@@ -293,4 +396,50 @@ fn parse_tensor_info(name: &str, value: &Value) -> Result<SafeTensorInfo> {
         data_begin,
         data_end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SafeTensorShard;
+    use serde_json::json;
+    use std::io::Write;
+
+    #[test]
+    fn filtered_copy_rewrites_offsets_without_materializing_the_shard() {
+        let root = std::env::temp_dir().join(format!(
+            "eider-safetensors-filter-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let source_path = root.join("source.safetensors");
+        let output_path = root.join("output.safetensors");
+        let mut header = serde_json::to_vec(&json!({
+            "large": {"dtype":"U8", "shape":[6], "data_offsets":[0,6]},
+            "keep": {"dtype":"U8", "shape":[4], "data_offsets":[6,10]}
+        }))
+        .expect("header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut source = std::fs::File::create(&source_path).expect("source");
+        source
+            .write_all(&(header.len() as u64).to_le_bytes())
+            .and_then(|()| source.write_all(&header))
+            .and_then(|()| source.write_all(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+            .expect("fixture");
+
+        let shard = SafeTensorShard::open(&source_path).expect("open source");
+        shard
+            .copy_tensors_to(&output_path, &["keep".to_string()])
+            .expect("copy tensor");
+        let output = SafeTensorShard::open(&output_path).expect("open output");
+        assert_eq!(output.tensor_names().collect::<Vec<_>>(), ["keep"]);
+        assert_eq!(
+            output.read_tensor_bytes("keep").expect("read output"),
+            [7, 8, 9, 10]
+        );
+        assert!(output.tensor("large").is_none());
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
 }

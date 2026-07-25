@@ -101,6 +101,14 @@ harness = false
 name = "nemotron3_dense_linear"
 harness = false
 
+[[bench]]
+name = "q2_expert_overlay"
+harness = false
+
+[[bench]]
+name = "q2_expert_layer"
+harness = false
+
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"

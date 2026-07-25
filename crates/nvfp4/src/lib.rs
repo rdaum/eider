@@ -21,6 +21,7 @@ mod ffi;
 mod kernels;
 mod matrix;
 mod modelopt;
+mod q2;
 mod safetensors;
 mod tensor;
 
@@ -53,9 +54,9 @@ pub use kernels::non_gemm::{
     bf16_matrix_to_f32_into_on_stream, bf16_to_f32_prefix_into_on_stream,
     cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     cached_gqa_attention_nvfp4_into_on_stream, causal_window_softmax_f32_in_place_on_stream,
-    causal_window_softmax_f32_to_bf16_on_stream, concat_f32_rows_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream,
+    causal_window_softmax_f32_to_bf16_on_stream, clear_expert_counts_u64_on_stream,
+    concat_f32_rows_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
     dual_rms_norm_add_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
@@ -116,11 +117,11 @@ pub use kernels::non_gemm::{
     qwen36_gdn_gate_paired_batch_bf16_into_on_stream, qwen36_gdn_gate_paired_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_bf16_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, qwen36_gdn_prep_into_on_stream,
-    ragged_gqa_attention_f32_into_on_stream, relu_squared_f32_into_on_stream,
-    remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
-    rms_norm_add_channel_row_scale_f32_into_on_stream, rms_norm_add_f32_into_on_stream,
-    rms_norm_add_then_rms_norm_quantize_nvfp4_f32_into_on_stream, rms_norm_f32_into_on_stream,
-    rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
+    ragged_gqa_attention_f32_into_on_stream, record_expert_indices_u64_on_stream,
+    relu_squared_f32_into_on_stream, remap_expert_indices_at_offset_into_on_stream,
+    remap_expert_indices_into_on_stream, rms_norm_add_channel_row_scale_f32_into_on_stream,
+    rms_norm_add_f32_into_on_stream, rms_norm_add_then_rms_norm_quantize_nvfp4_f32_into_on_stream,
+    rms_norm_f32_into_on_stream, rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     rms_norm_quantize_nvfp4_pair_col_major_f32_into_on_stream,
     rms_norm_rope_neox_f32_indexed_into_on_stream, rope_imrope_f32_indexed_into_on_stream,
     rope_imrope_f32_into_on_stream, rope_imrope_text_batch_f32_into_on_stream,
@@ -170,6 +171,14 @@ pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt::{
     ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Activation,
     ModelOptNvfp4Linear, modelopt_scales_to_cublaslt,
+};
+pub use q2::{
+    Q2_BLOCK_SIZE, Q2ExpertTable, Q2ExpertTableCacheInfo, Q2ExpertTableCacheWriter, Q2Matrix,
+    Q2Nvfp4ExpertOverlay, QuantizedQ2, dequantize_q2_row_major,
+    q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream,
+    q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream,
+    q2_w2a16_grouped_inputs_matvec_f32_into_on_stream, q2_w2a16_grouped_matvec_f32_into_on_stream,
+    quantize_q2_row_major,
 };
 pub use safetensors::{SafeTensorInfo, SafeTensorShard};
 pub use tensor::{Bf16Tensor2d, Nvfp4Tensor2d, Tensor2dLayout, Tensor2dView};

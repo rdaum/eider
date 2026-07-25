@@ -20,6 +20,9 @@ pub mod gemma4;
 /// Nemotron 3 hybrid Mamba/attention/MoE model support.
 pub mod nemotron3;
 
+/// DeepSeek V4 expert storage preparation and memory-bounded execution support.
+pub mod deepseek4;
+
 /// Poolside Laguna sparse-MoE model support.
 pub mod laguna;
 
