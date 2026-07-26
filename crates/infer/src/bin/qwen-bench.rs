@@ -16,6 +16,7 @@ use tokenizers::Tokenizer;
 
 struct BenchArgs {
     model_dir: PathBuf,
+    artifact_dir: Option<PathBuf>,
     prompt: String,
     decode_tokens: usize,
     warmup_repeats: usize,
@@ -153,6 +154,7 @@ fn main() -> Result<()> {
     let (free_before_load, total_memory) = device_memory_info()?;
     let mut model = BenchModel::load(
         &args.model_dir,
+        args.artifact_dir.as_deref(),
         args.expert_cache_capacity,
         args.bf16_storage,
         args.fp8_attention_storage,
@@ -162,6 +164,13 @@ fn main() -> Result<()> {
 
     println!("Qwen3 benchmark");
     println!("  model dir: {}", args.model_dir.display());
+    println!(
+        "  artifact dir: {}",
+        args.artifact_dir.as_deref().map_or_else(
+            || "<model-dir default>".to_string(),
+            |path| path.display().to_string()
+        )
+    );
     println!("  prompt tokens: {}", prompt_ids.len());
     println!("  decode tokens: {}", args.decode_tokens);
     println!("  warmup repeats: {}", args.warmup_repeats);
@@ -274,6 +283,7 @@ fn main() -> Result<()> {
 impl BenchModel {
     fn load(
         model_dir: &Path,
+        artifact_dir: Option<&Path>,
         expert_cache_capacity: Option<usize>,
         bf16_storage: Qwen36Bf16StorageConfig,
         fp8_attention_storage: Qwen36Fp8AttentionStorage,
@@ -282,8 +292,16 @@ impl BenchModel {
         match manifest.architecture {
             QwenArchitecture::Qwen3 => Qwen3Model::load(model_dir).map(Self::Qwen3),
             QwenArchitecture::Qwen35Moe => {
-                let checkpoint =
-                    Qwen36Model::open_with_storage(model_dir, bf16_storage, fp8_attention_storage)?;
+                let checkpoint = if let Some(artifact_dir) = artifact_dir {
+                    Qwen36Model::open_with_storage_and_artifact_dir(
+                        model_dir,
+                        artifact_dir,
+                        bf16_storage,
+                        fp8_attention_storage,
+                    )?
+                } else {
+                    Qwen36Model::open_with_storage(model_dir, bf16_storage, fp8_attention_storage)?
+                };
                 let model = if let Some(capacity) = expert_cache_capacity {
                     Qwen36TextModel::from_qwen36_model_with_expert_cache_capacity(
                         checkpoint, capacity,
@@ -546,6 +564,7 @@ impl BenchMetrics {
 impl BenchArgs {
     fn parse() -> Result<Self> {
         let mut model_dir = PathBuf::from(DEFAULT_MODEL_DIR);
+        let mut artifact_dir = None;
         let mut prompt = None;
         let mut decode_tokens = 200;
         let mut warmup_repeats = 0;
@@ -567,6 +586,13 @@ impl BenchArgs {
                         label: "--model",
                         detail: "expected model directory".to_string(),
                     })?);
+                }
+                "--artifact-dir" => {
+                    artifact_dir =
+                        Some(PathBuf::from(args.next().ok_or_else(|| Error::Format {
+                            label: "--artifact-dir",
+                            detail: "expected model artifact directory".to_string(),
+                        })?));
                 }
                 "--prompt" => {
                     prompt = Some(args.next().ok_or_else(|| Error::Format {
@@ -690,6 +716,7 @@ impl BenchArgs {
 
         Ok(Self {
             model_dir,
+            artifact_dir,
             prompt,
             decode_tokens,
             warmup_repeats,
@@ -708,7 +735,7 @@ impl BenchArgs {
 
 fn print_usage() {
     println!(
-        "usage: qwen-bench --model models/qwen3-8b-nvfp4 --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--expert-cache-capacity N] [--qwen-bf16-attention bf16|fp8|nvfp4] [--qwen-bf16-lm-head bf16|fp8|nvfp4] [--qwen-fp8-attention fp8|nvfp4] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
+        "usage: qwen-bench --model models/qwen3-8b-nvfp4 [--artifact-dir DIR] --prompt TEXT [--decode-tokens N] [--warmup-repeats N] [--repeats N] [--temperature 0] [--expert-cache-capacity N] [--qwen-bf16-attention bf16|fp8|nvfp4] [--qwen-bf16-lm-head bf16|fp8|nvfp4] [--qwen-fp8-attention fp8|nvfp4] [--profile-decode] [--gpu-counters] [--gpu-counter-stage qwen36-routed-gate-up|qwen36-full-attention|qwen36-linear-attention] [--metrics-prometheus]"
     );
 }
 

@@ -3,15 +3,17 @@ use micromeasure::{
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CublasLt, CudaEvent, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape,
-    ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs,
+    CublasLt, CudaEvent, CudaStream, DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, Fp8TnMatmulPlan,
+    GemmShape, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear, Nvfp4Matrix,
+    Nvfp4TnInputs, nvfp4_w4a16_matvec_f32_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream,
 };
 use std::time::Duration;
 
-const TOKENS: usize = 2_048;
+const PREFILL_TOKENS: usize = 2_048;
+const DECODE_TOKENS: usize = 1;
 const HIDDEN: usize = 2_048;
 const VALUE_DIM: usize = 4_096;
 const QKV_ROWS: usize = 8_192;
@@ -53,7 +55,7 @@ fn patterned_fp8_weight(prefix: &str, rows: usize, cols: usize) -> ModelOptFp8Li
     }
 }
 
-struct Fp8Projection {
+struct Fp8Projection<const TOKENS: usize> {
     plan: Fp8TnMatmulPlan,
     weight: DeviceBuffer<u8>,
     channel_scale: DeviceBuffer<f32>,
@@ -61,7 +63,7 @@ struct Fp8Projection {
     rows: usize,
 }
 
-impl Fp8Projection {
+impl<const TOKENS: usize> Fp8Projection<TOKENS> {
     fn new(lt: &CublasLt, host: &ModelOptFp8Linear) -> Self {
         Self {
             plan: Fp8TnMatmulPlan::new(
@@ -108,28 +110,73 @@ impl Fp8Projection {
     }
 }
 
-struct Nvfp4Projection {
+struct Nvfp4Projection<const TOKENS: usize> {
     plan: Fp4TnMatmulPlan,
     weight: ModelOptCublasLtWeight,
-    output: DeviceBuffer<f32>,
+    c: F32Matrix,
+    output: F32Matrix,
 }
 
-impl Nvfp4Projection {
+struct W4A16Projection<const TOKENS: usize> {
+    packed_weight: DeviceBuffer<u8>,
+    weight_scale: DeviceBuffer<u8>,
+    output: DeviceBuffer<f32>,
+    weight_scale_2: f32,
+    rows: usize,
+    cols: usize,
+}
+
+impl<const TOKENS: usize> W4A16Projection<TOKENS> {
+    fn new(host: &ModelOptFp8Linear) -> Self {
+        assert_eq!(TOKENS, 1, "W4A16 projection is decode-only");
+        let weight =
+            ModelOptNvfp4Linear::quantize_fp8(host).expect("requantize FP8 projection to NVFP4");
+        Self {
+            packed_weight: DeviceBuffer::from_host(&weight.packed_weight)
+                .expect("NVFP4 packed weight"),
+            weight_scale: DeviceBuffer::from_host(&weight.weight_scale)
+                .expect("NVFP4 weight scale"),
+            output: DeviceBuffer::zeroed(weight.out_features).expect("W4A16 output"),
+            weight_scale_2: weight.weight_scale_2,
+            rows: weight.out_features,
+            cols: weight.in_features,
+        }
+    }
+
+    fn enqueue(&mut self, input: &DeviceBuffer<f32>, stream: &CudaStream) {
+        nvfp4_w4a16_matvec_f32_into_on_stream(
+            input,
+            &self.packed_weight,
+            &self.weight_scale,
+            self.output.output(),
+            self.rows,
+            self.cols,
+            self.weight_scale_2,
+            stream,
+        )
+        .expect("W4A16 projection");
+    }
+}
+
+impl<const TOKENS: usize> Nvfp4Projection<TOKENS> {
     fn new(lt: &CublasLt, host: &ModelOptFp8Linear, activation: &Nvfp4Matrix) -> Self {
         let weight = ModelOptNvfp4Linear::quantize_fp8(host)
             .and_then(|weight| weight.as_cublaslt_weight())
             .expect("requantize FP8 projection to NVFP4");
-        let plan = Fp4TnMatmulPlan::new_f32_output_for_shape(
+        let c = F32Matrix::zeroed(host.out_features, TOKENS).expect("NVFP4 C matrix");
+        let plan = Fp4TnMatmulPlan::new_f32_output(
             lt,
             GemmShape::new(host.out_features, TOKENS, host.in_features),
             Nvfp4TnInputs::new(weight.matrix(), activation),
+            &c,
             WORKSPACE_LIMIT,
         )
         .expect("NVFP4 TN plan");
         Self {
             plan,
             weight,
-            output: DeviceBuffer::zeroed(host.out_features * TOKENS).expect("NVFP4 output"),
+            c,
+            output: F32Matrix::zeroed(host.out_features, TOKENS).expect("NVFP4 output"),
         }
     }
 
@@ -138,12 +185,24 @@ impl Nvfp4Projection {
             .run_with_alpha_beta_f32_inout_buffer_on_stream(
                 lt,
                 Nvfp4TnInputs::new(self.weight.matrix(), activation),
-                self.output.inout(),
+                self.output.data_mut().inout(),
                 self.weight.matmul_alpha(),
                 0.0,
                 stream,
             )
             .expect("NVFP4 TN projection");
+    }
+
+    fn enqueue_cutlass(&mut self, activation: &Nvfp4Matrix, stream: &CudaStream) {
+        self.plan
+            .run_cutlass_fp4_gemv_f32_on_stream(
+                Nvfp4TnInputs::new(self.weight.matrix(), activation),
+                &self.c,
+                &mut self.output,
+                self.weight.matmul_alpha(),
+                stream,
+            )
+            .expect("CUTLASS NVFP4 GEMV projection");
     }
 
     fn storage_bytes(&self) -> usize {
@@ -194,7 +253,7 @@ impl QualityAccumulator {
     }
 }
 
-struct Qwen36PrefillProjectionBench {
+struct Qwen36ProjectionBench<const TOKENS: usize> {
     lt: CublasLt,
     stream: CudaStream,
     start: CudaEvent,
@@ -207,27 +266,37 @@ struct Qwen36PrefillProjectionBench {
     value_fp8_scale: DeviceBuffer<f32>,
     hidden_nvfp4: Nvfp4Matrix,
     value_nvfp4: Nvfp4Matrix,
-    fp8_qkv: Fp8Projection,
-    fp8_z: Fp8Projection,
-    fp8_k: Fp8Projection,
-    fp8_v: Fp8Projection,
-    fp8_out: Fp8Projection,
-    nvfp4_qkv: Nvfp4Projection,
-    nvfp4_z: Nvfp4Projection,
-    nvfp4_k: Nvfp4Projection,
-    nvfp4_v: Nvfp4Projection,
-    nvfp4_out: Nvfp4Projection,
+    fp8_qkv: Fp8Projection<TOKENS>,
+    fp8_z: Fp8Projection<TOKENS>,
+    fp8_k: Fp8Projection<TOKENS>,
+    fp8_v: Fp8Projection<TOKENS>,
+    fp8_out: Fp8Projection<TOKENS>,
+    nvfp4_qkv: Nvfp4Projection<TOKENS>,
+    nvfp4_z: Nvfp4Projection<TOKENS>,
+    nvfp4_k: Nvfp4Projection<TOKENS>,
+    nvfp4_v: Nvfp4Projection<TOKENS>,
+    nvfp4_out: Nvfp4Projection<TOKENS>,
+    w4a16_qkv: Option<W4A16Projection<TOKENS>>,
+    w4a16_z: Option<W4A16Projection<TOKENS>>,
+    w4a16_k: Option<W4A16Projection<TOKENS>>,
+    w4a16_v: Option<W4A16Projection<TOKENS>>,
+    w4a16_out: Option<W4A16Projection<TOKENS>>,
     linear_quality: Quality,
     full_quality: Quality,
+    w4a16_linear_quality: Quality,
+    w4a16_full_quality: Quality,
+    cutlass_linear_quality: Quality,
 }
 
 #[derive(Clone, Copy)]
 enum ProjectionPath {
     Fp8,
     Nvfp4,
+    CutlassNvfp4,
+    W4A16,
 }
 
-impl Qwen36PrefillProjectionBench {
+impl<const TOKENS: usize> Qwen36ProjectionBench<TOKENS> {
     fn new() -> Self {
         let lt = CublasLt::new().expect("cuBLASLt");
         let hidden_nvfp4 = Nvfp4Matrix::zeroed_col_major(HIDDEN, TOKENS).expect("hidden NVFP4");
@@ -237,6 +306,11 @@ impl Qwen36PrefillProjectionBench {
         let k = patterned_fp8_weight("qwen36.k", KV_ROWS, HIDDEN);
         let v = patterned_fp8_weight("qwen36.v", KV_ROWS, HIDDEN);
         let out = patterned_fp8_weight("qwen36.out", HIDDEN, VALUE_DIM);
+        let w4a16_qkv = (TOKENS == DECODE_TOKENS).then(|| W4A16Projection::new(&qkv));
+        let w4a16_z = (TOKENS == DECODE_TOKENS).then(|| W4A16Projection::new(&z));
+        let w4a16_k = (TOKENS == DECODE_TOKENS).then(|| W4A16Projection::new(&k));
+        let w4a16_v = (TOKENS == DECODE_TOKENS).then(|| W4A16Projection::new(&v));
+        let w4a16_out = (TOKENS == DECODE_TOKENS).then(|| W4A16Projection::new(&out));
         Self {
             fp8_qkv: Fp8Projection::new(&lt, &qkv),
             fp8_z: Fp8Projection::new(&lt, &z),
@@ -248,6 +322,11 @@ impl Qwen36PrefillProjectionBench {
             nvfp4_k: Nvfp4Projection::new(&lt, &k, &hidden_nvfp4),
             nvfp4_v: Nvfp4Projection::new(&lt, &v, &hidden_nvfp4),
             nvfp4_out: Nvfp4Projection::new(&lt, &out, &value_nvfp4),
+            w4a16_qkv,
+            w4a16_z,
+            w4a16_k,
+            w4a16_v,
+            w4a16_out,
             lt,
             stream: CudaStream::new_non_blocking().expect("stream"),
             start: CudaEvent::new().expect("start"),
@@ -264,6 +343,9 @@ impl Qwen36PrefillProjectionBench {
             value_nvfp4,
             linear_quality: Quality::default(),
             full_quality: Quality::default(),
+            w4a16_linear_quality: Quality::default(),
+            w4a16_full_quality: Quality::default(),
+            cutlass_linear_quality: Quality::default(),
         }
     }
 
@@ -391,21 +473,86 @@ impl Qwen36PrefillProjectionBench {
             .enqueue(&self.lt, &self.value_nvfp4, &self.stream);
     }
 
+    fn enqueue_w4a16_linear_attention(&mut self) {
+        self.w4a16_qkv
+            .as_mut()
+            .expect("decode W4A16 qkv")
+            .enqueue(&self.hidden, &self.stream);
+        self.w4a16_z
+            .as_mut()
+            .expect("decode W4A16 z")
+            .enqueue(&self.hidden, &self.stream);
+        self.w4a16_out
+            .as_mut()
+            .expect("decode W4A16 out")
+            .enqueue(&self.value, &self.stream);
+    }
+
+    fn enqueue_w4a16_full_attention(&mut self) {
+        self.w4a16_qkv
+            .as_mut()
+            .expect("decode W4A16 q")
+            .enqueue(&self.hidden, &self.stream);
+        self.w4a16_k
+            .as_mut()
+            .expect("decode W4A16 k")
+            .enqueue(&self.hidden, &self.stream);
+        self.w4a16_v
+            .as_mut()
+            .expect("decode W4A16 v")
+            .enqueue(&self.hidden, &self.stream);
+        self.w4a16_out
+            .as_mut()
+            .expect("decode W4A16 out")
+            .enqueue(&self.value, &self.stream);
+    }
+
+    fn enqueue_cutlass_nvfp4_linear_attention(&mut self) {
+        self.enqueue_nvfp4_hidden_quantize();
+        self.nvfp4_qkv
+            .enqueue_cutlass(&self.hidden_nvfp4, &self.stream);
+        self.nvfp4_z
+            .enqueue_cutlass(&self.hidden_nvfp4, &self.stream);
+        self.enqueue_nvfp4_value_quantize();
+        self.nvfp4_out
+            .enqueue_cutlass(&self.value_nvfp4, &self.stream);
+    }
+
     fn projection_quality(
-        fp8: &Fp8Projection,
-        nvfp4: &Nvfp4Projection,
+        fp8: &Fp8Projection<TOKENS>,
+        nvfp4: &Nvfp4Projection<TOKENS>,
         stream: &CudaStream,
         quality: &mut QualityAccumulator,
     ) {
-        let len = fp8.rows * QUALITY_TOKENS;
+        let len = fp8.rows * QUALITY_TOKENS.min(TOKENS);
         let reference = fp8
             .output
             .copy_prefix_to_host(len, stream)
             .expect("download FP8 reference");
         let candidate = nvfp4
             .output
+            .data()
             .copy_prefix_to_host(len, stream)
             .expect("download NVFP4 candidate");
+        quality.extend(&reference, &candidate);
+    }
+
+    fn w4a16_projection_quality(
+        w4a16: &W4A16Projection<TOKENS>,
+        w4a4: &Nvfp4Projection<TOKENS>,
+        stream: &CudaStream,
+        quality: &mut QualityAccumulator,
+    ) {
+        let len = w4a16.rows * QUALITY_TOKENS.min(TOKENS);
+        let reference = w4a16
+            .output
+            .copy_prefix_to_host(len, stream)
+            .expect("download W4A16 reference");
+        let candidate = w4a4
+            .output
+            .data()
+            .copy_prefix_to_host(len, stream)
+            .expect("download W4A4 candidate");
         quality.extend(&reference, &candidate);
     }
 
@@ -427,10 +574,99 @@ impl Qwen36PrefillProjectionBench {
         Self::projection_quality(&self.fp8_out, &self.nvfp4_out, &self.stream, &mut full);
         self.full_quality = full.finish();
 
+        if TOKENS == DECODE_TOKENS {
+            self.enqueue_w4a16_linear_attention();
+            self.enqueue_nvfp4_linear_attention();
+            let mut linear = QualityAccumulator::default();
+            Self::w4a16_projection_quality(
+                self.w4a16_qkv.as_ref().expect("decode W4A16 qkv"),
+                &self.nvfp4_qkv,
+                &self.stream,
+                &mut linear,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_z.as_ref().expect("decode W4A16 z"),
+                &self.nvfp4_z,
+                &self.stream,
+                &mut linear,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_out.as_ref().expect("decode W4A16 out"),
+                &self.nvfp4_out,
+                &self.stream,
+                &mut linear,
+            );
+            self.w4a16_linear_quality = linear.finish();
+
+            self.enqueue_w4a16_full_attention();
+            self.enqueue_nvfp4_full_attention();
+            let mut full = QualityAccumulator::default();
+            Self::w4a16_projection_quality(
+                self.w4a16_qkv.as_ref().expect("decode W4A16 q"),
+                &self.nvfp4_qkv,
+                &self.stream,
+                &mut full,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_k.as_ref().expect("decode W4A16 k"),
+                &self.nvfp4_k,
+                &self.stream,
+                &mut full,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_v.as_ref().expect("decode W4A16 v"),
+                &self.nvfp4_v,
+                &self.stream,
+                &mut full,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_out.as_ref().expect("decode W4A16 out"),
+                &self.nvfp4_out,
+                &self.stream,
+                &mut full,
+            );
+            self.w4a16_full_quality = full.finish();
+
+            self.enqueue_w4a16_linear_attention();
+            self.enqueue_cutlass_nvfp4_linear_attention();
+            let mut linear = QualityAccumulator::default();
+            Self::w4a16_projection_quality(
+                self.w4a16_qkv.as_ref().expect("decode W4A16 qkv"),
+                &self.nvfp4_qkv,
+                &self.stream,
+                &mut linear,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_z.as_ref().expect("decode W4A16 z"),
+                &self.nvfp4_z,
+                &self.stream,
+                &mut linear,
+            );
+            Self::w4a16_projection_quality(
+                self.w4a16_out.as_ref().expect("decode W4A16 out"),
+                &self.nvfp4_out,
+                &self.stream,
+                &mut linear,
+            );
+            self.cutlass_linear_quality = linear.finish();
+        }
+
         for (label, quality) in [
             ("linear attention", self.linear_quality),
             ("full attention", self.full_quality),
+            (
+                "W4A16 versus W4A4 linear attention",
+                self.w4a16_linear_quality,
+            ),
+            ("W4A16 versus W4A4 full attention", self.w4a16_full_quality),
+            (
+                "W4A16 versus CUTLASS W4A4 linear attention",
+                self.cutlass_linear_quality,
+            ),
         ] {
+            if TOKENS != DECODE_TOKENS && label.starts_with("W4A16") {
+                continue;
+            }
             assert!(
                 quality.cosine >= 0.8 && quality.nrmse <= 0.6,
                 "{label} NVFP4 drift is catastrophic: {quality:?}"
@@ -481,8 +717,30 @@ impl Qwen36PrefillProjectionBench {
                 fp8_weight_bytes
             }
             ProjectionPath::Nvfp4 => {
-                black_box(self.nvfp4_qkv.output.as_const_ptr());
-                black_box(self.nvfp4_out.output.as_const_ptr());
+                black_box(self.nvfp4_qkv.output.data_ptr());
+                black_box(self.nvfp4_out.output.data_ptr());
+                nvfp4_weight_bytes
+            }
+            ProjectionPath::CutlassNvfp4 => {
+                black_box(self.nvfp4_qkv.output.data_ptr());
+                black_box(self.nvfp4_out.output.data_ptr());
+                nvfp4_weight_bytes
+            }
+            ProjectionPath::W4A16 => {
+                black_box(
+                    self.w4a16_qkv
+                        .as_ref()
+                        .expect("decode W4A16 qkv")
+                        .output
+                        .as_const_ptr(),
+                );
+                black_box(
+                    self.w4a16_out
+                        .as_ref()
+                        .expect("decode W4A16 out")
+                        .output
+                        .as_const_ptr(),
+                );
                 nvfp4_weight_bytes
             }
         };
@@ -525,7 +783,7 @@ impl Qwen36PrefillProjectionBench {
     }
 }
 
-impl BenchContext for Qwen36PrefillProjectionBench {
+impl<const TOKENS: usize> BenchContext for Qwen36ProjectionBench<TOKENS> {
     fn prepare(_num_chunks: usize) -> Self {
         let mut context = Self::new();
         context.validate();
@@ -537,8 +795,8 @@ impl BenchContext for Qwen36PrefillProjectionBench {
     }
 }
 
-fn fp8_linear_attention_sample(
-    context: &mut Qwen36PrefillProjectionBench,
+fn fp8_linear_attention_sample<const TOKENS: usize>(
+    context: &mut Qwen36ProjectionBench<TOKENS>,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -547,15 +805,15 @@ fn fp8_linear_attention_sample(
     let (fp8_weight_bytes, nvfp4_weight_bytes) = context.linear_weight_bytes();
     context.measure(
         ProjectionPath::Fp8,
-        Qwen36PrefillProjectionBench::enqueue_fp8_linear_attention,
+        Qwen36ProjectionBench::enqueue_fp8_linear_attention,
         quality,
         fp8_weight_bytes,
         nvfp4_weight_bytes,
     )
 }
 
-fn nvfp4_linear_attention_sample(
-    context: &mut Qwen36PrefillProjectionBench,
+fn nvfp4_linear_attention_sample<const TOKENS: usize>(
+    context: &mut Qwen36ProjectionBench<TOKENS>,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -564,15 +822,15 @@ fn nvfp4_linear_attention_sample(
     let (fp8_weight_bytes, nvfp4_weight_bytes) = context.linear_weight_bytes();
     context.measure(
         ProjectionPath::Nvfp4,
-        Qwen36PrefillProjectionBench::enqueue_nvfp4_linear_attention,
+        Qwen36ProjectionBench::enqueue_nvfp4_linear_attention,
         quality,
         fp8_weight_bytes,
         nvfp4_weight_bytes,
     )
 }
 
-fn fp8_full_attention_sample(
-    context: &mut Qwen36PrefillProjectionBench,
+fn fp8_full_attention_sample<const TOKENS: usize>(
+    context: &mut Qwen36ProjectionBench<TOKENS>,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -581,15 +839,15 @@ fn fp8_full_attention_sample(
     let (fp8_weight_bytes, nvfp4_weight_bytes) = context.full_weight_bytes();
     context.measure(
         ProjectionPath::Fp8,
-        Qwen36PrefillProjectionBench::enqueue_fp8_full_attention,
+        Qwen36ProjectionBench::enqueue_fp8_full_attention,
         quality,
         fp8_weight_bytes,
         nvfp4_weight_bytes,
     )
 }
 
-fn nvfp4_full_attention_sample(
-    context: &mut Qwen36PrefillProjectionBench,
+fn nvfp4_full_attention_sample<const TOKENS: usize>(
+    context: &mut Qwen36ProjectionBench<TOKENS>,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
@@ -598,7 +856,58 @@ fn nvfp4_full_attention_sample(
     let (fp8_weight_bytes, nvfp4_weight_bytes) = context.full_weight_bytes();
     context.measure(
         ProjectionPath::Nvfp4,
-        Qwen36PrefillProjectionBench::enqueue_nvfp4_full_attention,
+        Qwen36ProjectionBench::enqueue_nvfp4_full_attention,
+        quality,
+        fp8_weight_bytes,
+        nvfp4_weight_bytes,
+    )
+}
+
+fn w4a16_linear_attention_decode_sample(
+    context: &mut Qwen36ProjectionBench<DECODE_TOKENS>,
+    chunk_size: usize,
+    _: usize,
+) -> BenchSampleResult {
+    assert_eq!(chunk_size, 1);
+    let quality = context.w4a16_linear_quality;
+    let (fp8_weight_bytes, nvfp4_weight_bytes) = context.linear_weight_bytes();
+    context.measure(
+        ProjectionPath::W4A16,
+        Qwen36ProjectionBench::enqueue_w4a16_linear_attention,
+        quality,
+        fp8_weight_bytes,
+        nvfp4_weight_bytes,
+    )
+}
+
+fn w4a4_linear_attention_decode_sample(
+    context: &mut Qwen36ProjectionBench<DECODE_TOKENS>,
+    chunk_size: usize,
+    _: usize,
+) -> BenchSampleResult {
+    assert_eq!(chunk_size, 1);
+    let quality = context.w4a16_linear_quality;
+    let (fp8_weight_bytes, nvfp4_weight_bytes) = context.linear_weight_bytes();
+    context.measure(
+        ProjectionPath::Nvfp4,
+        Qwen36ProjectionBench::enqueue_nvfp4_linear_attention,
+        quality,
+        fp8_weight_bytes,
+        nvfp4_weight_bytes,
+    )
+}
+
+fn cutlass_w4a4_linear_attention_decode_sample(
+    context: &mut Qwen36ProjectionBench<DECODE_TOKENS>,
+    chunk_size: usize,
+    _: usize,
+) -> BenchSampleResult {
+    assert_eq!(chunk_size, 1);
+    let quality = context.cutlass_linear_quality;
+    let (fp8_weight_bytes, nvfp4_weight_bytes) = context.linear_weight_bytes();
+    context.measure(
+        ProjectionPath::CutlassNvfp4,
+        Qwen36ProjectionBench::enqueue_cutlass_nvfp4_linear_attention,
         quality,
         fp8_weight_bytes,
         nvfp4_weight_bytes,
@@ -606,7 +915,7 @@ fn nvfp4_full_attention_sample(
 }
 
 fn run_abenchting_profile(profile: &str) {
-    let mut context = Qwen36PrefillProjectionBench::new();
+    let mut context = Qwen36ProjectionBench::<PREFILL_TOKENS>::new();
     match profile {
         "fp8-linear" => context.enqueue_fp8_linear_attention(),
         "fp8-full" => context.enqueue_fp8_full_attention(),
@@ -621,8 +930,8 @@ fn run_abenchting_profile(profile: &str) {
             black_box(context.fp8_out.output.as_const_ptr());
         }
         "nvfp4-linear" | "nvfp4-full" => {
-            black_box(context.nvfp4_qkv.output.as_const_ptr());
-            black_box(context.nvfp4_out.output.as_const_ptr());
+            black_box(context.nvfp4_qkv.output.data_ptr());
+            black_box(context.nvfp4_out.output.data_ptr());
         }
         _ => unreachable!(),
     }
@@ -652,7 +961,7 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
-            runner.group::<Qwen36PrefillProjectionBench>(
+            runner.group::<Qwen36ProjectionBench<PREFILL_TOKENS>>(
                 "Qwen3.6 dynamic FP8 prefill projections 2K",
                 |group| {
                     let group = group
@@ -662,7 +971,7 @@ fn main() {
                     group.bench_sample("full_attention_pipeline", fp8_full_attention_sample);
                 },
             );
-            runner.group::<Qwen36PrefillProjectionBench>(
+            runner.group::<Qwen36ProjectionBench<PREFILL_TOKENS>>(
                 "Qwen3.6 shared-activation NVFP4 prefill projections 2K",
                 |group| {
                     let group = group
@@ -670,6 +979,59 @@ fn main() {
                         .measurement_domain(MeasurementDomain::Gpu);
                     group.bench_sample("linear_attention_pipeline", nvfp4_linear_attention_sample);
                     group.bench_sample("full_attention_pipeline", nvfp4_full_attention_sample);
+                },
+            );
+            runner.group::<Qwen36ProjectionBench<DECODE_TOKENS>>(
+                "Qwen3.6 dynamic FP8 decode projections",
+                |group| {
+                    let group = group
+                        .throughput(Throughput::per_operation(1, "tokens"))
+                        .measurement_domain(MeasurementDomain::Gpu);
+                    group.bench_sample(
+                        "linear_attention_decode_pipeline",
+                        fp8_linear_attention_sample,
+                    );
+                    group.bench_sample("full_attention_decode_pipeline", fp8_full_attention_sample);
+                },
+            );
+            runner.group::<Qwen36ProjectionBench<DECODE_TOKENS>>(
+                "Qwen3.6 shared-activation NVFP4 decode projections",
+                |group| {
+                    let group = group
+                        .throughput(Throughput::per_operation(1, "tokens"))
+                        .measurement_domain(MeasurementDomain::Gpu);
+                    group.bench_sample(
+                        "linear_attention_decode_pipeline",
+                        w4a4_linear_attention_decode_sample,
+                    );
+                    group.bench_sample(
+                        "full_attention_decode_pipeline",
+                        nvfp4_full_attention_sample,
+                    );
+                },
+            );
+            runner.group::<Qwen36ProjectionBench<DECODE_TOKENS>>(
+                "Qwen3.6 W4A16 decode projections",
+                |group| {
+                    let group = group
+                        .throughput(Throughput::per_operation(1, "tokens"))
+                        .measurement_domain(MeasurementDomain::Gpu);
+                    group.bench_sample(
+                        "linear_attention_decode_w4a16_pipeline",
+                        w4a16_linear_attention_decode_sample,
+                    );
+                },
+            );
+            runner.group::<Qwen36ProjectionBench<DECODE_TOKENS>>(
+                "Qwen3.6 shared-activation CUTLASS W4A4 decode projections",
+                |group| {
+                    let group = group
+                        .throughput(Throughput::per_operation(1, "tokens"))
+                        .measurement_domain(MeasurementDomain::Gpu);
+                    group.bench_sample(
+                        "linear_attention_decode_cutlass_w4a4_pipeline",
+                        cutlass_w4a4_linear_attention_decode_sample,
+                    );
                 },
             );
         },

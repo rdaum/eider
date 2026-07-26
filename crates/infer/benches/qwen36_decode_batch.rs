@@ -1,7 +1,7 @@
 use infer::nvfp4::GpuSamplingRow;
 use infer::qwen3::qwen36::{
-    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState, Qwen36SequenceState,
-    Qwen36TextModel,
+    Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState,
+    Qwen36Fp8AttentionStorage, Qwen36SequenceState, Qwen36TextModel,
 };
 use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
@@ -378,6 +378,10 @@ fn model_dir() -> PathBuf {
         })
 }
 
+fn artifact_dir() -> Option<PathBuf> {
+    std::env::var_os("QWEN36_ARTIFACT_DIR").map(PathBuf::from)
+}
+
 fn max_context_tokens() -> usize {
     std::env::var("QWEN36_BATCH_CONTEXT")
         .ok()
@@ -415,8 +419,25 @@ fn main() {
         "batch starting position needs headroom for benchmark samples"
     );
     let path = model_dir();
-    info!(model_dir = %path.display(), "loading Qwen3.6 model");
-    let model = Rc::new(Qwen36TextModel::open(path).expect("load Qwen3.6 model"));
+    let artifact_dir = artifact_dir();
+    info!(
+        model_dir = %path.display(),
+        artifact_dir = artifact_dir.as_ref().map(|path| path.display().to_string()),
+        "loading Qwen3.6 model"
+    );
+    let model = Rc::new(
+        if let Some(artifact_dir) = artifact_dir {
+            Qwen36TextModel::open_with_storage_and_artifact_dir(
+                path,
+                artifact_dir,
+                Qwen36Bf16StorageConfig::default(),
+                Qwen36Fp8AttentionStorage::default(),
+            )
+        } else {
+            Qwen36TextModel::open(path)
+        }
+        .expect("load Qwen3.6 model"),
+    );
     for batch in BATCH_SIZES {
         validate_batch(&model, batch, batch, max_context_tokens);
     }
