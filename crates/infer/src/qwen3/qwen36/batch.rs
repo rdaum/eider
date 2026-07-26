@@ -1,3 +1,4 @@
+use super::super::infer::GroupedGemvWorkspace;
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36AttentionState, Qwen36DownStorage,
     Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36Linear,
@@ -13,14 +14,14 @@ use crate::nvfp4::{
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
     Nvfp4TnInputs, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
-    Sm121W4A16GateUpBatchWorkspace, add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
+    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
     causal_window_softmax_f32_to_bf16_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_topk_f32_batch_into_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
@@ -1241,7 +1242,8 @@ struct BatchMoeWorkspace {
     router_plan: BatchBf16LinearPlan,
     route_indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
-    w4a16: Sm121W4A16GateUpBatchWorkspace,
+    single_gate_up_input: Nvfp4Matrix,
+    single_gate_up: GroupedGemvWorkspace,
     sm12x_down: Sm12xGateUpWorkspace,
     shared_gate_up: DeviceBuffer<f32>,
     shared_activated: DeviceBuffer<f32>,
@@ -1250,7 +1252,7 @@ struct BatchMoeWorkspace {
     shared_gate_plan: BatchBf16LinearPlan,
     shared_gate_up_plan: BatchNvfp4LinearPlan,
     shared_down_plan: BatchNvfp4LinearPlan,
-    grouped: Option<BatchGroupedMoeWorkspace>,
+    grouped: BatchGroupedMoeWorkspace,
     output: DeviceBuffer<f32>,
 }
 
@@ -1408,24 +1410,19 @@ impl Qwen36PrefillBatchWorkspace {
 }
 
 impl BatchMoeWorkspace {
-    fn new(
-        model: &Qwen36TextModel,
-        weights: &Qwen36MoeWeights,
-        capacity: usize,
-        grouped_prefill: bool,
-    ) -> Result<Self> {
-        let w4a16 = match &weights.gate_up_storage {
-            Qwen36GateUpStorage::Sm121W4A16(w4a16) => w4a16.new_batch_workspace(capacity)?,
-            Qwen36GateUpStorage::Grouped { .. }
-            | Qwen36GateUpStorage::Paged
-            | Qwen36GateUpStorage::Fp8 => {
-                return Err(crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 batched routed gate/up",
-                    detail: "the current model does not use the SM121 W4A16 NVFP4 route"
-                        .to_string(),
-                });
-            }
-        };
+    fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, capacity: usize) -> Result<Self> {
+        if !matches!(weights.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
+            return Err(crate::nvfp4::Error::Format {
+                label: "Qwen3.6 batched routed gate/up",
+                detail: "the current model does not use resident CUTLASS W4A4 experts".to_string(),
+            });
+        }
+        if weights.grouped.is_none() {
+            return Err(crate::nvfp4::Error::Format {
+                label: "Qwen3.6 batched routed gate/up",
+                detail: "grouped W4A4 expert weights are unavailable".to_string(),
+            });
+        }
         if weights.storage_plan.down != Qwen36DownStorage::Sm12x {
             return Err(crate::nvfp4::Error::Format {
                 label: "Qwen3.6 batched routed down",
@@ -1440,17 +1437,22 @@ impl BatchMoeWorkspace {
                 detail: "the current model does not use NVFP4 shared experts".to_string(),
             });
         };
-        let grouped = if grouped_prefill && weights.grouped_prefill.is_some() {
-            Some(BatchGroupedMoeWorkspace::new(model, weights, capacity)?)
-        } else {
-            None
-        };
+        let grouped = BatchGroupedMoeWorkspace::new(model, weights, capacity)?;
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(capacity * weights.num_experts)?,
             router_plan: BatchBf16LinearPlan::new(model, &weights.router, capacity)?,
             route_indices: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
-            w4a16,
+            single_gate_up_input: Nvfp4Matrix::zeroed_col_major(model.manifest.hidden, 1)?,
+            single_gate_up: GroupedGemvWorkspace::new(
+                gate_up_width,
+                model.manifest.hidden,
+                weights.experts_per_token,
+            )?
+            .ok_or_else(|| crate::nvfp4::Error::Format {
+                label: "Qwen3.6 batched routed gate/up",
+                detail: "indexed CUTLASS W4A4 workspace is unavailable".to_string(),
+            })?,
             sm12x_down: Sm12xGateUpWorkspace::new(
                 model.manifest.hidden,
                 weights.expert_intermediate,
@@ -1474,7 +1476,8 @@ impl BatchMoeWorkspace {
             + self.router_plan.device_bytes()
             + self.route_indices.device_bytes()
             + self.route_weights.device_bytes()
-            + self.w4a16.device_bytes()
+            + self.single_gate_up_input.device_bytes()
+            + self.single_gate_up.device_bytes()
             + self.sm12x_down.device_bytes()
             + self.shared_gate_up.device_bytes()
             + self.shared_activated.device_bytes()
@@ -1495,10 +1498,7 @@ impl BatchMoeWorkspace {
                 .map(Fp4TnMatmulPlan::workspace_bytes)
                 .sum::<usize>()
             + self.shared_down_plan.activation.device_bytes()
-            + self
-                .grouped
-                .as_ref()
-                .map_or(0, BatchGroupedMoeWorkspace::device_bytes)
+            + self.grouped.device_bytes()
             + self.output.device_bytes()
     }
 }
@@ -1685,7 +1685,7 @@ impl Qwen36TextModel {
                 token_capacity,
                 max_context_tokens,
             )?,
-            moe: BatchMoeWorkspace::new(self, first_moe, token_capacity, true)?,
+            moe: BatchMoeWorkspace::new(self, first_moe, token_capacity)?,
         })
     }
 
@@ -1988,7 +1988,7 @@ impl Qwen36TextModel {
                 false,
             )?,
             full: BatchFullAttentionWorkspace::new(self, first_full, capacity, max_context_tokens)?,
-            moe: BatchMoeWorkspace::new(self, first_moe, capacity, false)?,
+            moe: BatchMoeWorkspace::new(self, first_moe, capacity)?,
             lm_head_plan,
             lm_head_quantized: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
             lm_head_scale: DeviceBuffer::zeroed(capacity)?,
@@ -3120,9 +3120,83 @@ impl Qwen36MoeWeights {
             self.norm_topk_prob,
             stream,
         )?;
-        let ran_grouped_prefill = if let (Some(weights), Some(grouped)) =
-            (&self.grouped_prefill, &mut workspace.grouped)
+        if capacity == 1 {
+            quantize_nvfp4_col_major_f32_device_into_on_stream(
+                model.manifest.hidden,
+                1,
+                ffn_norm,
+                &mut workspace.single_gate_up_input,
+                1.0,
+                stream,
+            )?;
+            if !workspace.single_gate_up.run_indexed_gate_up_indices(
+                &workspace.route_indices,
+                &self.expert_ptrs,
+                &workspace.single_gate_up_input,
+                stream,
+            )? {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 batched routed gate/up",
+                    detail: "indexed W4A4 workspace route count mismatch".to_string(),
+                });
+            }
+            moe_silu_quantize_slots_on_stream(
+                &workspace.route_indices,
+                &workspace.single_gate_up.c,
+                &mut workspace.sm12x_down.b_tiles,
+                &mut workspace.sm12x_down.b_scales,
+                &self.expert_ptrs.down_input_scales,
+                &self.gate_up_unity_alphas,
+                self.expert_intermediate,
+                self.experts_per_token,
+                stream,
+            )?;
+            indexed_grouped_gemv_on_stream(
+                &workspace.route_indices,
+                self.sm12x_down_tiles
+                    .as_ref()
+                    .expect("SM12x routed down tiles"),
+                self.sm12x_down_scales
+                    .as_ref()
+                    .expect("SM12x routed down scales"),
+                self.num_experts,
+                &workspace.sm12x_down.b_tiles,
+                &workspace.sm12x_down.b_scales,
+                &workspace.sm12x_down.d,
+                self.sm12x_down_m_tiles,
+                self.sm12x_down_k_tiles,
+                self.experts_per_token,
+                stream,
+            )?;
+            if let Some(parallel_moe) = parallel_moe {
+                parallel_moe
+                    .join
+                    .record_on_stream(parallel_moe.shared_stream)?;
+                stream.wait_event(parallel_moe.join)?;
+            } else {
+                self.enqueue_shared_batch(model, workspace, ffn_norm, capacity, stream)?;
+            }
+            return qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
+                &workspace.route_indices,
+                &workspace.route_weights,
+                &workspace.sm12x_down.c,
+                &self.expert_ptrs.down_alphas,
+                &workspace.shared_gate,
+                &workspace.shared_output,
+                residual,
+                workspace.output.output(),
+                capacity,
+                model.manifest.hidden,
+                self.experts_per_token,
+                stream,
+            );
+        }
+        let weights = self
+            .grouped
+            .as_ref()
+            .expect("batch workspace construction requires grouped W4A4 weights");
         {
+            let grouped = &mut workspace.grouped;
             grouped.set_rows(capacity)?;
             grouped
                 .sorted_routes
@@ -3183,75 +3257,7 @@ impl Qwen36MoeWeights {
                 model.manifest.hidden,
                 stream,
             )?;
-            true
-        } else {
-            false
-        };
-        if ran_grouped_prefill {
-            if let Some(parallel_moe) = parallel_moe {
-                parallel_moe
-                    .join
-                    .record_on_stream(parallel_moe.shared_stream)?;
-                stream.wait_event(parallel_moe.join)?;
-            } else {
-                self.enqueue_shared_batch(model, workspace, ffn_norm, capacity, stream)?;
-            }
-            let grouped = workspace
-                .grouped
-                .as_ref()
-                .expect("grouped prefill workspace exists");
-            return qwen36_ffn_finalize_batch_f32_into_on_stream(
-                &grouped.routed_output,
-                &workspace.shared_gate,
-                &workspace.shared_output,
-                residual,
-                workspace.output.output(),
-                capacity,
-                model.manifest.hidden,
-                stream,
-            );
         }
-        let Qwen36GateUpStorage::Sm121W4A16(w4a16) = &self.gate_up_storage else {
-            return Err(crate::nvfp4::Error::Format {
-                label: "Qwen3.6 batched routed gate/up",
-                detail: "workspace and layer storage disagree".to_string(),
-            });
-        };
-        w4a16.run_batch_bf16_prefix_on_stream(
-            &workspace.w4a16,
-            &workspace.route_indices,
-            ffn_norm,
-            capacity,
-            stream,
-        )?;
-        moe_silu_quantize_bf16_slots_on_stream(
-            &workspace.route_indices,
-            workspace.w4a16.output_bf16(),
-            &mut workspace.sm12x_down.b_tiles,
-            &mut workspace.sm12x_down.b_scales,
-            &self.expert_ptrs.down_input_scales,
-            &self.gate_up_w4a16_unity_alphas,
-            self.expert_intermediate,
-            capacity * self.experts_per_token,
-            stream,
-        )?;
-        indexed_grouped_gemv_on_stream(
-            &workspace.route_indices,
-            self.sm12x_down_tiles
-                .as_ref()
-                .expect("SM12x routed down tiles"),
-            self.sm12x_down_scales
-                .as_ref()
-                .expect("SM12x routed down scales"),
-            self.num_experts,
-            &workspace.sm12x_down.b_tiles,
-            &workspace.sm12x_down.b_scales,
-            &workspace.sm12x_down.d,
-            self.sm12x_down_m_tiles,
-            self.sm12x_down_k_tiles,
-            capacity * self.experts_per_token,
-            stream,
-        )?;
         if let Some(parallel_moe) = parallel_moe {
             parallel_moe
                 .join
@@ -3260,18 +3266,14 @@ impl Qwen36MoeWeights {
         } else {
             self.enqueue_shared_batch(model, workspace, ffn_norm, capacity, stream)?;
         }
-        qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
-            &workspace.route_indices,
-            &workspace.route_weights,
-            &workspace.sm12x_down.c,
-            &self.expert_ptrs.down_alphas,
+        qwen36_ffn_finalize_batch_f32_into_on_stream(
+            &workspace.grouped.routed_output,
             &workspace.shared_gate,
             &workspace.shared_output,
             residual,
             workspace.output.output(),
             capacity,
             model.manifest.hidden,
-            self.experts_per_token,
             stream,
         )
     }

@@ -30,15 +30,16 @@ runtime. Keep cancellation, tool history, sampling, usage, and finish-reason
 semantics aligned across both adapters. Pi launchers default to Responses; set
 `PI_EIDER_PROVIDER=eider-chat` to exercise Chat Completions.
 
-The Qwen3.6 fast MoE path is enabled by default: Eider SM121 W4A16 gate/up, SM12x
-down, grouped workspace allocation, segmented decode graph capture, and the
-shared radix prompt-prefix cache. Compatibility flags from older experiments
-are not required for normal runs.
+The Qwen3.6 fast MoE path is enabled by default: indexed CUTLASS W4A4 gate/up
+for single-row decode, grouped W4A4 for larger batches, SM12x down, segmented
+decode graph capture, and the shared radix prompt-prefix cache. Compatibility
+flags from older experiments are not required for normal runs.
 
 ## Microbenchmarks
 
 ```sh
 cargo bench -p nvfp4 --bench sm121_w4a16_routed_gate_up
+cargo bench -p nvfp4 --bench qwen36_routed_moe_decode
 cargo bench -p infer --bench qwen36_prefill
 cargo bench -p infer --bench step37_prefill
 cargo bench -p infer --bench laguna_prefill

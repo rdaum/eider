@@ -38,6 +38,10 @@ name = "sm121_w4a16_routed_gate_up"
 harness = false
 
 [[bench]]
+name = "qwen36_routed_moe_decode"
+harness = false
+
+[[bench]]
 name = "laguna_routed_gate_up"
 harness = false
 

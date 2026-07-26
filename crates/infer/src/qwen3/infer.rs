@@ -1252,6 +1252,7 @@ pub struct GroupedGemvWorkspace {
     pub c: DeviceBuffer<*const f32>,
     pub d: DeviceBuffer<*mut f32>,
     pub outputs: Vec<F32Matrix>,
+    zero: F32Matrix,
 }
 
 struct LinearDecodeOp {
@@ -2928,7 +2929,57 @@ impl GroupedGemvWorkspace {
             c: DeviceBuffer::from_host(&c_ptrs)?,
             d: DeviceBuffer::from_host(&d_ptrs)?,
             outputs,
+            zero: F32Matrix::zeroed(out_features, 1)?,
         }))
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.a_values.device_bytes()
+            + self.a_scales.device_bytes()
+            + self.b_values.device_bytes()
+            + self.b_scales.device_bytes()
+            + self.c.device_bytes()
+            + self.d.device_bytes()
+            + self
+                .outputs
+                .iter()
+                .map(F32Matrix::device_bytes)
+                .sum::<usize>()
+            + self.zero.device_bytes()
+    }
+
+    pub fn run_indexed_gate_up_device_route(
+        &self,
+        route: &MoeRouteWorkspace,
+        expert_ptrs: &MoeExpertPointerTables,
+        gate_up_input: &Nvfp4Matrix,
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        self.run_indexed_gate_up_indices(&route.indices, expert_ptrs, gate_up_input, stream)
+    }
+
+    pub fn run_indexed_gate_up_indices(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        expert_ptrs: &MoeExpertPointerTables,
+        gate_up_input: &Nvfp4Matrix,
+        stream: &CudaStream,
+    ) -> Result<bool> {
+        let groups = self.outputs.len();
+        if indices.len() != groups {
+            return Ok(false);
+        }
+        self.plan.run_indexed_a_tiled_scales_on_stream(
+            indices,
+            &expert_ptrs.gate_up_grouped_values,
+            &expert_ptrs.gate_up_grouped_scales,
+            &expert_ptrs.gate_up_alphas,
+            gate_up_input,
+            &self.zero,
+            &self.d,
+            stream,
+        )?;
+        Ok(true)
     }
 
     pub fn run_gate_up_device_route(

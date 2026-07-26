@@ -25,12 +25,11 @@ use crate::nvfp4::{
     fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
     gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_fp8_slots_f32_into_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
     nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
-    quantize_nvfp4_vector_simple_scales_f32_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
+    quantize_nvfp4_col_major_f32_device_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
     qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
@@ -2227,17 +2226,16 @@ fn apply_rope_indexed(
 ///
 /// Every Qwen3.6 text layer carries a BF16 router over 256 routed experts
 /// (top-8), a quantized shared expert, and a BF16 scalar shared-expert gate.
-/// NVFP4 layers use SM121 W4A16/SM12x; mixed-precision layers keep channel-scaled
-/// FP8 expert tables device-resident for device-routed W8A8 execution.
+/// Resident NVFP4 layers use native W4A4 gate/up and SM12x down execution;
+/// mixed-precision layers keep channel-scaled FP8 expert tables device-resident.
 pub struct Qwen36MoeWeights {
     router: Bf16Linear,
     experts: Vec<LazyQwen36Expert>,
     expert_ptrs: super::infer::MoeExpertPointerTables,
-    gate_up_w4a16_weight_scale_2: DeviceBuffer<f32>,
-    gate_up_w4a16_unity_alphas: DeviceBuffer<f32>,
+    gate_up_unity_alphas: DeviceBuffer<f32>,
     storage_plan: Qwen36MoeStoragePlan,
     gate_up_storage: Qwen36GateUpStorage,
-    grouped_prefill: Option<Qwen36GroupedPrefillWeights>,
+    grouped: Option<Qwen36GroupedMoeWeights>,
     fp8_experts: Option<Qwen36Fp8Experts>,
     shared: Qwen36SharedExpertStorage,
     shared_gate: Bf16Linear,
@@ -2362,8 +2360,7 @@ impl Qwen36ExpertStaging {
 }
 
 enum Qwen36GateUpStorage {
-    Sm121W4A16(Sm121W4A16GateUp),
-    Grouped { _weights: Vec<Nvfp4DeviceLinear> },
+    CutlassW4A4,
     Paged,
     Fp8,
 }
@@ -2423,7 +2420,7 @@ enum Qwen36SharedExpertStorage {
     Fp8 { gate_up: Fp8Linear, down: Fp8Linear },
 }
 
-struct Qwen36GroupedPrefillWeights {
+struct Qwen36GroupedMoeWeights {
     _gate_up: Vec<ModelOptCublasLtWeight>,
     _down: Vec<ModelOptCublasLtWeight>,
     gate_up_values: DeviceBuffer<*const u8>,
@@ -2436,7 +2433,7 @@ struct Qwen36GroupedPrefillWeights {
     down_alpha_table: DeviceBuffer<*mut f32>,
 }
 
-impl Qwen36GroupedPrefillWeights {
+impl Qwen36GroupedMoeWeights {
     fn new(
         gate_up: Vec<ModelOptCublasLtWeight>,
         down: Vec<ModelOptCublasLtWeight>,
@@ -2995,10 +2992,6 @@ impl Qwen36MoeWeights {
             });
         }
 
-        // Compressed-tensors checkpoints use W4A4 for the shared expert and
-        // provide the scale metadata needed by the grouped routed fallback.
-        let compressed_tensors =
-            checkpoint.contains_tensor(&format!("{prefix}.experts.0.gate_proj.weight_packed"));
         let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
             && (0..experts).all(|expert_idx| down_path(&sm12x_cache_dir, expert_idx).is_file());
@@ -3017,13 +3010,9 @@ impl Qwen36MoeWeights {
         let mut down_grouped_scale_ptrs = vec![std::ptr::null(); experts];
         let mut down_input_scales = Vec::with_capacity(experts);
         let mut down_alphas = Vec::with_capacity(experts);
-        let mut shared_gate_up_input_scale: Option<f32> = None;
         let mut gate_up_alphas = Vec::with_capacity(experts);
-        let mut gate_up_w4a16_weight_scale_2 = Vec::with_capacity(experts);
-        let mut w4a16_gate_up_weights = Vec::with_capacity(experts);
-        let mut grouped_prefill_gate_up = Vec::with_capacity(experts);
-        let mut grouped_prefill_down = Vec::with_capacity(experts);
-        let mut grouped_gate_up_weights = Vec::with_capacity(experts);
+        let mut grouped_gate_up = Vec::with_capacity(experts);
+        let mut grouped_down = Vec::with_capacity(experts);
         let mut sm12x_down = Vec::with_capacity(experts);
         let mut sm12x_down_tile_ptrs = Vec::with_capacity(experts);
         let mut sm12x_down_scale_ptrs = Vec::with_capacity(experts);
@@ -3037,17 +3026,8 @@ impl Qwen36MoeWeights {
                 &gate,
                 &up,
             )?;
-            if compressed_tensors {
-                match shared_gate_up_input_scale {
-                    None => shared_gate_up_input_scale = Some(weight.input_scale),
-                    Some(first) if first.to_bits() == weight.input_scale.to_bits() => {}
-                    Some(_) => shared_gate_up_input_scale = Some(f32::NAN),
-                }
-                gate_up_alphas.push(weight.weight_scale_2 * weight.input_scale);
-            }
-            gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
-            grouped_prefill_gate_up.push(weight.as_cublaslt_weight()?);
-            w4a16_gate_up_weights.push(weight);
+            gate_up_alphas.push(weight.weight_scale_2);
+            grouped_gate_up.push(weight.as_cublaslt_weight()?);
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
@@ -3063,7 +3043,7 @@ impl Qwen36MoeWeights {
                         checkpoint.load_nvfp4_linear(&format!("{}.down_proj", expert.prefix))?;
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
-                    grouped_prefill_down.push(weight.as_cublaslt_weight()?);
+                    grouped_down.push(weight.as_cublaslt_weight()?);
                 }
                 Qwen36DownStorage::Fp8 => {
                     unreachable!("NVFP4 loader cannot select FP8 down storage")
@@ -3081,41 +3061,16 @@ impl Qwen36MoeWeights {
             }
         }
 
-        // The SM121 W4A16 tensor-core path is substantially faster than the SIMT
-        // grouped W4A4 kernel for this batch-one top-8 shape. Keep grouped W4A4
-        // as the device-support fallback without retaining both weight layouts.
-        let gate_up_storage = match Sm121W4A16GateUp::new(&w4a16_gate_up_weights) {
-            Ok(w4a16) => Qwen36GateUpStorage::Sm121W4A16(w4a16),
-            Err(_error) if compressed_tensors => {
-                if shared_gate_up_input_scale.is_none_or(f32::is_nan) {
-                    return Err(Error::Format {
-                        label: "Qwen3.6 grouped gate/up",
-                        detail: "expert gate/up input scales are not shared".to_string(),
-                    });
-                }
-                for (expert_idx, weight) in w4a16_gate_up_weights.iter().enumerate() {
-                    let device = Nvfp4DeviceLinear::from_host(weight)?;
-                    gate_up_grouped_value_ptrs[expert_idx] =
-                        device.packed_weight.as_const_ptr().cast();
-                    gate_up_grouped_scale_ptrs[expert_idx] =
-                        device.weight_scale.as_const_ptr().cast();
-                    grouped_gate_up_weights.push(device);
-                }
-                Qwen36GateUpStorage::Grouped {
-                    _weights: grouped_gate_up_weights,
-                }
-            }
-            Err(error) => return Err(error),
+        for (expert_idx, weight) in grouped_gate_up.iter().enumerate() {
+            gate_up_grouped_value_ptrs[expert_idx] = weight.matrix().values_ptr();
+            gate_up_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_ptr();
+        }
+        let gate_up_storage = Qwen36GateUpStorage::CutlassW4A4;
+        let grouped = if grouped_gate_up.len() == experts && grouped_down.len() == experts {
+            Some(Qwen36GroupedMoeWeights::new(grouped_gate_up, grouped_down)?)
+        } else {
+            None
         };
-        let grouped_prefill =
-            if grouped_prefill_gate_up.len() == experts && grouped_prefill_down.len() == experts {
-                Some(Qwen36GroupedPrefillWeights::new(
-                    grouped_prefill_gate_up,
-                    grouped_prefill_down,
-                )?)
-            } else {
-                None
-            };
         let expert_ptrs = MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&gate_up_ptrs)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scale_ptrs)?,
@@ -3127,7 +3082,7 @@ impl Qwen36MoeWeights {
             down_grouped_scales: DeviceBuffer::from_host(&down_grouped_scale_ptrs)?,
             down_input_scales: DeviceBuffer::from_host(&down_input_scales)?,
             down_alphas: DeviceBuffer::from_host(&down_alphas)?,
-            shared_gate_up_input_scale: shared_gate_up_input_scale.filter(|v| !v.is_nan()),
+            shared_gate_up_input_scale: None,
             gate_up_alphas: DeviceBuffer::from_host(&gate_up_alphas)?,
         };
 
@@ -3175,11 +3130,10 @@ impl Qwen36MoeWeights {
             router,
             experts: lazy_experts,
             expert_ptrs,
-            gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&gate_up_w4a16_weight_scale_2)?,
-            gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan,
             gate_up_storage,
-            grouped_prefill,
+            grouped,
             fp8_experts: None,
             shared,
             shared_gate,
@@ -3316,13 +3270,12 @@ impl Qwen36MoeWeights {
             router,
             experts: Vec::new(),
             expert_ptrs,
-            gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&vec![1.0; experts])?,
-            gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan: Qwen36MoeStoragePlan {
                 down: Qwen36DownStorage::Sm12x,
             },
             gate_up_storage: Qwen36GateUpStorage::Paged,
-            grouped_prefill: None,
+            grouped: None,
             fp8_experts: None,
             shared,
             shared_gate,
@@ -3411,13 +3364,12 @@ impl Qwen36MoeWeights {
             router,
             experts: Vec::new(),
             expert_ptrs,
-            gate_up_w4a16_weight_scale_2: DeviceBuffer::from_host(&vec![1.0; experts])?,
-            gate_up_w4a16_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&vec![1.0; experts])?,
             storage_plan: Qwen36MoeStoragePlan {
                 down: Qwen36DownStorage::Fp8,
             },
             gate_up_storage: Qwen36GateUpStorage::Fp8,
-            grouped_prefill: None,
+            grouped: None,
             fp8_experts: Some(fp8_experts),
             shared,
             shared_gate,
@@ -3476,17 +3428,13 @@ impl Qwen36MoeWeights {
         workspace
             .route
             .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
-        if matches!(self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. }) {
-            let input_scale = self
-                .expert_ptrs
-                .shared_gate_up_input_scale
-                .expect("grouped W4A4 storage requires a shared input scale");
-            quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
+        if matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
+            quantize_nvfp4_col_major_f32_device_into_on_stream(
                 manifest.hidden,
+                1,
                 ffn_norm,
                 &mut workspace.gate_up_input,
-                &mut workspace.gate_up_input_simple_scales,
-                input_scale,
+                1.0,
                 stream,
             )?;
         }
@@ -3501,13 +3449,7 @@ impl Qwen36MoeWeights {
         stream: &CudaStream,
     ) -> Result<()> {
         match &self.gate_up_storage {
-            Qwen36GateUpStorage::Grouped { .. } => self.run_grouped_gate_up_only(workspace, stream),
-            Qwen36GateUpStorage::Sm121W4A16(w4a16) => w4a16.run_on_stream(
-                &workspace.route.indices,
-                ffn_norm,
-                workspace.w4a16_gate_up_output.output(),
-                stream,
-            ),
+            Qwen36GateUpStorage::CutlassW4A4 => self.run_grouped_gate_up_only(workspace, stream),
             Qwen36GateUpStorage::Paged => Err(Error::Format {
                 label: "Qwen3.6 paged routed gate/up",
                 detail: "resolve resident expert slots before routed execution".to_string(),
@@ -3549,24 +3491,17 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        let input_scale =
-            self.expert_ptrs
-                .shared_gate_up_input_scale
-                .ok_or_else(|| Error::Format {
-                    label: "Qwen3.6 grouped gate/up",
-                    detail: "expert gate/up input scales are not shared".to_string(),
-                })?;
         self.router
             .run_into(ffn_norm, &mut workspace.router_logits, stream)?;
         workspace
             .route
             .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
-        quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
             manifest.hidden,
+            1,
             ffn_norm,
             &mut workspace.gate_up_input,
-            &mut workspace.gate_up_input_simple_scales,
-            input_scale,
+            1.0,
             stream,
         )
     }
@@ -3584,41 +3519,13 @@ impl Qwen36MoeWeights {
                 label: "Qwen3.6 grouped gate/up",
                 detail: "grouped gate/up workspace is unavailable".to_string(),
             })?;
-        grouped_gate_up.run_gate_up_device_route(
+        grouped_gate_up.run_indexed_gate_up_device_route(
             &workspace.route,
             &self.expert_ptrs,
             &workspace.gate_up_input,
-            workspace.gate_up_input_simple_scales.as_const_ptr().cast(),
             stream,
         )?;
         Ok(())
-    }
-
-    /// Runs only device-routed grouped W4A16 gate/up using raw ModelOpt weights.
-    pub fn run_grouped_w4a16_gate_up_only(
-        &self,
-        workspace: &mut Qwen36MoeWorkspace,
-        ffn_norm: &DeviceBuffer<f32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let grouped_gate_up = workspace
-            .grouped_gate_up
-            .as_ref()
-            .ok_or_else(|| Error::Format {
-                label: "Qwen3.6 grouped W4A16 gate/up",
-                detail: "grouped gate/up workspace is unavailable".to_string(),
-            })?;
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
-            &workspace.route.indices,
-            ffn_norm,
-            &self.expert_ptrs.gate_up_grouped_values,
-            &self.expert_ptrs.gate_up_grouped_scales,
-            &self.gate_up_w4a16_weight_scale_2,
-            &grouped_gate_up.d,
-            self.expert_intermediate * 2,
-            ffn_norm.len(),
-            stream,
-        )
     }
 
     /// Runs only the router and top-k stage.
@@ -3664,7 +3571,7 @@ impl Qwen36MoeWeights {
         stream: &CudaStream,
     ) -> Result<()> {
         let gate_up_table = match &self.gate_up_storage {
-            Qwen36GateUpStorage::Grouped { .. } => {
+            Qwen36GateUpStorage::CutlassW4A4 => {
                 &workspace
                     .grouped_gate_up
                     .as_ref()
@@ -3674,9 +3581,7 @@ impl Qwen36MoeWeights {
                     })?
                     .c
             }
-            Qwen36GateUpStorage::Sm121W4A16(_) | Qwen36GateUpStorage::Fp8 => {
-                &workspace.w4a16_gate_up_table
-            }
+            Qwen36GateUpStorage::Fp8 => &workspace.w4a16_gate_up_table,
             Qwen36GateUpStorage::Paged => {
                 return Err(Error::Format {
                     label: "Qwen3.6 paged grouped down",
@@ -3693,12 +3598,7 @@ impl Qwen36MoeWeights {
             })?;
         let enable_sm12x = self.storage_plan.down == Qwen36DownStorage::Sm12x;
         if enable_sm12x && self.sm12x_down_tiles.is_some() && self.sm12x_down_scales.is_some() {
-            let gate_up_alpha_table =
-                if matches!(&self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. }) {
-                    &self.expert_ptrs.gate_up_alphas
-                } else {
-                    &self.gate_up_w4a16_unity_alphas
-                };
+            let gate_up_alpha_table = &self.gate_up_unity_alphas;
             return moe_silu_quantize_slots_on_stream(
                 &workspace.route.indices,
                 gate_up_table,
@@ -4364,127 +4264,68 @@ impl Qwen36MoeWeights {
                     .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
             }
 
-            let use_grouped_w4a4 =
-                matches!(self.gate_up_storage, Qwen36GateUpStorage::Grouped { .. });
-            if use_grouped_w4a4 {
-                let input_scale = self
-                    .expert_ptrs
-                    .shared_gate_up_input_scale
-                    .expect("grouped W4A4 storage requires a shared input scale");
-                quantize_nvfp4_vector_simple_scales_f32_into_on_stream(
-                    manifest.hidden,
-                    ffn_norm,
-                    &mut workspace.gate_up_input,
-                    &mut workspace.gate_up_input_simple_scales,
-                    input_scale,
+            if !matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
+                return Err(Error::Format {
+                    label: "Qwen3.6 resident routed gate/up",
+                    detail: "device-routed NVFP4 execution requires CUTLASS W4A4 storage"
+                        .to_string(),
+                });
+            }
+            quantize_nvfp4_col_major_f32_device_into_on_stream(
+                manifest.hidden,
+                1,
+                ffn_norm,
+                &mut workspace.gate_up_input,
+                1.0,
+                stream,
+            )?;
+            let grouped_gate_up = workspace
+                .grouped_gate_up
+                .as_mut()
+                .expect("device route requires grouped gate/up workspace");
+            let run_grouped = || {
+                grouped_gate_up.run_indexed_gate_up_device_route(
+                    &workspace.route,
+                    &self.expert_ptrs,
+                    &workspace.gate_up_input,
                     stream,
                 )?;
-                let grouped_gate_up = workspace
-                    .grouped_gate_up
-                    .as_mut()
-                    .expect("device route requires grouped gate/up workspace");
-                let mut run_grouped = || {
-                    grouped_gate_up.run_gate_up_device_route(
-                        &workspace.route,
-                        &self.expert_ptrs,
-                        &workspace.gate_up_input,
-                        workspace.gate_up_input_simple_scales.as_const_ptr().cast(),
-                        stream,
-                    )?;
-                    Ok(())
-                };
-                if gpu_probe
-                    .as_ref()
-                    .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::RoutedGateUp))
-                {
-                    gpu_probe
-                        .as_deref_mut()
-                        .expect("probe present")
-                        .capture(run_grouped)?;
-                } else if let Some(profile) = profile.as_deref_mut() {
-                    let (_, ms) = timed_cuda(stream, run_grouped)?;
-                    profile.qwen36_routed_gate_up_ms += ms;
-                } else {
-                    run_grouped()?;
-                }
+                Ok(())
+            };
+            if gpu_probe
+                .as_ref()
+                .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::RoutedGateUp))
+            {
+                gpu_probe
+                    .as_deref_mut()
+                    .expect("probe present")
+                    .capture(run_grouped)?;
+            } else if let Some(profile) = profile.as_deref_mut() {
+                let (_, ms) = timed_cuda(stream, run_grouped)?;
+                profile.qwen36_routed_gate_up_ms += ms;
             } else {
-                let mut run_w4a16 = || {
-                    let Qwen36GateUpStorage::Sm121W4A16(w4a16) = &self.gate_up_storage else {
-                        unreachable!("checked SM121 W4A16 gate/up storage")
-                    };
-                    if use_sm12x_down {
-                        w4a16
-                            .run_bf16_on_stream(&workspace.route.indices, ffn_norm, stream)
-                            .map(|_| ())
-                    } else {
-                        w4a16.run_on_stream(
-                            &workspace.route.indices,
-                            ffn_norm,
-                            workspace.w4a16_gate_up_output.output(),
-                            stream,
-                        )
-                    }
-                };
-                if gpu_probe
-                    .as_ref()
-                    .is_some_and(|probe| probe.should_capture(Qwen36GpuCounterStage::RoutedGateUp))
-                {
-                    gpu_probe
-                        .as_deref_mut()
-                        .expect("probe present")
-                        .capture(run_w4a16)?;
-                } else if let Some(profile) = profile.as_deref_mut() {
-                    let (_, ms) = timed_cuda(stream, run_w4a16)?;
-                    profile.qwen36_routed_gate_up_ms += ms;
-                } else {
-                    run_w4a16()?;
-                }
+                run_grouped()?;
             }
-            let gate_up_table = if use_grouped_w4a4 {
-                &workspace
-                    .grouped_gate_up
-                    .as_ref()
-                    .expect("grouped W4A4 workspace")
-                    .c
-            } else {
-                &workspace.w4a16_gate_up_table
-            };
-            let gate_up_alpha_table = if use_grouped_w4a4 {
-                &self.expert_ptrs.gate_up_alphas
-            } else {
-                &self.gate_up_w4a16_unity_alphas
-            };
+            let gate_up_table = &workspace
+                .grouped_gate_up
+                .as_ref()
+                .expect("grouped W4A4 workspace")
+                .c;
+            let gate_up_alpha_table = &self.gate_up_unity_alphas;
             if use_sm12x_down {
                 let sm12x_down = &mut workspace.sm12x_down;
                 let mut run_silu_quantize = || {
-                    if use_grouped_w4a4 {
-                        moe_silu_quantize_slots_on_stream(
-                            &workspace.route.indices,
-                            gate_up_table,
-                            &mut sm12x_down.b_tiles,
-                            &mut sm12x_down.b_scales,
-                            &self.expert_ptrs.down_input_scales,
-                            gate_up_alpha_table,
-                            grouped_down.inputs[0].rows,
-                            sm12x_down.groups,
-                            stream,
-                        )
-                    } else {
-                        let Qwen36GateUpStorage::Sm121W4A16(w4a16) = &self.gate_up_storage else {
-                            unreachable!("checked SM121 W4A16 gate/up storage")
-                        };
-                        moe_silu_quantize_bf16_slots_on_stream(
-                            &workspace.route.indices,
-                            w4a16.output_bf16(),
-                            &mut sm12x_down.b_tiles,
-                            &mut sm12x_down.b_scales,
-                            &self.expert_ptrs.down_input_scales,
-                            gate_up_alpha_table,
-                            grouped_down.inputs[0].rows,
-                            sm12x_down.groups,
-                            stream,
-                        )
-                    }
+                    moe_silu_quantize_slots_on_stream(
+                        &workspace.route.indices,
+                        gate_up_table,
+                        &mut sm12x_down.b_tiles,
+                        &mut sm12x_down.b_scales,
+                        &self.expert_ptrs.down_input_scales,
+                        gate_up_alpha_table,
+                        grouped_down.inputs[0].rows,
+                        sm12x_down.groups,
+                        stream,
+                    )
                 };
                 if let Some(profile) = profile.as_deref_mut() {
                     let (_, ms) = timed_cuda(stream, run_silu_quantize)?;

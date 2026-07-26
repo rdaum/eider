@@ -328,8 +328,8 @@ The workspace has three crates:
   DogStatsD metrics.
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust crate
-by its build script. CUTLASS is optional; the normal Qwen3.6 serving path uses
-SM121 W4A16, SM12x kernels, and cuBLASLt without a CUTLASS checkout.
+by its build script. Normal Qwen3.6 serving uses CUTLASS W4A4 routed gate/up,
+SM12x routed down, and cuBLASLt.
 
 ### Build and test
 
@@ -414,7 +414,7 @@ flowchart TD
     J --> K
     K -->|Main stream| L[BF16 router + top-k]
     K -->|Shared stream| M[NVFP4 shared expert + BF16 gate]
-    L --> N[Eider SM121 W4A16 routed gate/up]
+    L --> N[Indexed CUTLASS W4A4 routed gate/up]
     N --> O[SiLU + indexed SM12x routed down]
     O --> P[Fused routed/shared combine + residual]
     M --> P
@@ -468,15 +468,11 @@ same execution path but submits its layer work eagerly.
 
 ### CUTLASS setup
 
-CUTLASS is needed when using the dense Qwen GEMV backend or running the
-CUTLASS-specific low-level tests and benchmarks.
+CUTLASS is needed for the normal Qwen3.6 routed gate/up path, the dense Qwen
+GEMV backend, and CUTLASS-specific low-level tests and benchmarks.
 
-You do not need CUTLASS for the normal Qwen3.6 path. Its SM121 W4A16 gate/up and
-SM12x down kernels build and run without a CUTLASS checkout.
-
-If you need it though, the build looks for it under `.deps/cutlass`
-and uses `.deps/cutlass-build-sm121` by default. Configure it
-explicitly with:
+The build looks for it under `.deps/cutlass` and uses
+`.deps/cutlass-build-sm121` by default. Configure it with:
 
 ```sh
 scripts/setup-cutlass-sm12x.sh
@@ -507,6 +503,7 @@ cargo bench -p nvfp4 --bench fp4_cublaslt
 cargo bench -p nvfp4 --bench fp4_quantization
 cargo bench -p nvfp4 --bench moe_topk
 cargo bench -p nvfp4 --bench gated_delta_net
+cargo bench -p nvfp4 --bench qwen36_routed_moe_decode
 cargo bench -p infer --bench qwen36_routed_gate_up
 cargo bench -p infer --bench qwen36_decode_batch
 cargo bench -p infer --bench qwen36_prefill
@@ -537,8 +534,8 @@ model, prompt, token count, repeat count, and endpoint.
 ### The CUDA build cannot target `sm_121`
 
 Use CUDA 13.x and confirm that `nvcc`, the CUDA headers, and cuBLASLt come from
-the same installation. `scripts/probe-cutlass-sm12x.sh` checks the optional
-CUTLASS toolchain; CUTLASS is not required for normal Qwen3.6 serving.
+the same installation. `scripts/probe-cutlass-sm12x.sh` checks the CUTLASS
+toolchain used by normal Qwen3.6 serving.
 
 ### A catalogue model will not start offline
 
