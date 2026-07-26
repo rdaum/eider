@@ -19,6 +19,7 @@ use crate::nvfp4::{
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
+    gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream,
@@ -466,6 +467,26 @@ fn run_nvfp4_batch(
     stream: &CudaStream,
 ) -> Result<()> {
     plan.activation.cols = rows;
+    quantize_nvfp4_col_major_f32_device_into_on_stream(
+        linear.in_features,
+        rows,
+        input,
+        &mut plan.activation,
+        linear.input_scale,
+        stream,
+    )?;
+    run_nvfp4_batch_quantized(model, linear, plan, output, rows, stream)
+}
+
+fn run_nvfp4_batch_quantized(
+    model: &Qwen36TextModel,
+    linear: &super::Nvfp4DeviceLinear,
+    plan: &mut BatchNvfp4LinearPlan,
+    output: &mut DeviceBuffer<f32>,
+    rows: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    plan.activation.cols = rows;
     if !plan.plans.contains_key(&rows) {
         plan.plans.insert(
             rows,
@@ -477,14 +498,6 @@ fn run_nvfp4_batch(
             )?,
         );
     }
-    quantize_nvfp4_col_major_f32_device_into_on_stream(
-        linear.in_features,
-        rows,
-        input,
-        &mut plan.activation,
-        linear.input_scale,
-        stream,
-    )?;
     plan.plans[&rows].run_with_alpha_beta_f32_inout_buffer_on_stream(
         &model.lt,
         Nvfp4TnInputs::new(linear.cublaslt_weight.matrix(), &plan.activation),
@@ -2613,6 +2626,31 @@ impl Qwen36LinearAttentionWeights {
             linear.value_heads,
             stream,
         )?;
+        if let (Qwen36Linear::Nvfp4(out), Some(BatchLinearPlan::Nvfp4(plan))) =
+            (&self.out, workspace.out_plan.as_mut())
+        {
+            plan.activation.cols = capacity;
+            gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+                capacity,
+                linear.value_heads,
+                linear.value_head_dim,
+                &workspace.gdn_output,
+                &workspace.z_output,
+                &self.norm_weight,
+                &mut plan.activation,
+                model.manifest.rms_eps,
+                out.input_scale,
+                stream,
+            )?;
+            return run_nvfp4_batch_quantized(
+                model,
+                out,
+                plan,
+                &mut workspace.output,
+                capacity,
+                stream,
+            );
+        }
         gated_rms_norm_f32_into_on_stream(
             &workspace.gdn_output,
             &workspace.z_output,

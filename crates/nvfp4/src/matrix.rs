@@ -1,6 +1,6 @@
 //! Matrix owner types for the current cuBLASLt FP4 path.
 
-use crate::cuda::{DeviceBuffer, DeviceInput, DeviceOutput};
+use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, HostRead};
 use crate::error::{Error, Result};
 use crate::format;
 
@@ -271,6 +271,16 @@ impl Nvfp4Matrix {
     /// Returns the UE4M3 scale metadata pointer.
     pub fn scales_ptr(&self) -> *const u8 {
         self.scales.as_const_ptr().cast()
+    }
+
+    /// Synchronizes `stream` and copies the packed E2M1 payload to host memory.
+    pub fn copy_values_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, u8>> {
+        self.values.copy_to_host(stream)
+    }
+
+    /// Synchronizes `stream` and copies the UE4M3 scale metadata to host memory.
+    pub fn copy_scales_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, u8>> {
+        self.scales.copy_to_host(stream)
     }
 
     /// Returns the packed E2M1 payload output pointer.

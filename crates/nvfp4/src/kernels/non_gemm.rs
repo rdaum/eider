@@ -10238,6 +10238,81 @@ pub fn gated_rms_norm_f32_into_on_stream(
     }
 }
 
+/// Fuses per-head gated RMSNorm with column-major NVFP4 activation quantization.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    input: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    output: &mut Nvfp4Matrix,
+    eps: f32,
+    input_scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let cols = heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "gated RMSNorm NVFP4 quantization",
+        expected: "heads * head_dim without overflow".to_string(),
+        actual: format!("heads={heads} head_dim={head_dim}"),
+    })?;
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "gated RMSNorm NVFP4 quantization",
+        expected: "rows * heads * head_dim without overflow".to_string(),
+        actual: format!("rows={rows} heads={heads} head_dim={head_dim}"),
+    })?;
+    if rows == 0
+        || heads == 0
+        || head_dim != 128
+        || rows > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || input.len() < len
+        || gate.len() < len
+        || weight.len() != head_dim
+        || output.rows != cols
+        || output.cols < rows
+        || !eps.is_finite()
+        || eps < 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "gated RMSNorm NVFP4 quantization buffers",
+            expected: format!(
+                "input/gate={len} weight={head_dim} output={cols}x{rows} with valid dimensions"
+            ),
+            actual: format!(
+                "input={} gate={} weight={} output={}x{} eps={eps} input_scale={input_scale}",
+                input.len(),
+                gate.len(),
+                weight.len(),
+                output.rows,
+                output.cols
+            ),
+        });
+    }
+    let mut output = output.output();
+    unsafe {
+        check_cuda(
+            "infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream",
+            ffi::infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+                input.ptr,
+                gate.ptr,
+                weight.ptr,
+                output.values_mut_ptr().cast(),
+                output.scales_mut_ptr().cast(),
+                rows as u32,
+                heads as u32,
+                head_dim as u32,
+                eps,
+                input_scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Advances the one-token causal depthwise convolution in a Nemotron 3 Mamba layer.
 #[allow(clippy::too_many_arguments)]
 pub fn nemotron3_mamba_conv_update_f32_into_on_stream(

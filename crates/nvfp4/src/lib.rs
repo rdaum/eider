@@ -88,6 +88,7 @@ pub use kernels::non_gemm::{
     fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
+    gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_group_row_f32_into_on_stream,
     gather_indexed_mul_f32_into_on_stream, gather_indexed_mul_f32_prefix_into_on_stream,
     gather_nvfp4_grouped_gemv_ptr_tables_on_stream, gather_nvfp4_grouped_gemv_ptrs_on_stream,

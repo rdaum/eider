@@ -2725,6 +2725,19 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+        input: *const f32,
+        gate: *const f32,
+        weight: *const f32,
+        packed: *mut u8,
+        scales: *mut u8,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        eps: f32,
+        input_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_relu_squared_f32_on_stream(
         input: *const f32,
         output: *mut f32,

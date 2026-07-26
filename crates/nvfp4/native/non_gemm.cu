@@ -7399,37 +7399,39 @@ __global__ void infer_gated_delta_net_128_f32_kernel(const float* q,
     const float k_value = k[head_base + row];
     const float old_state = state[state_base + row];
 
-    __shared__ float partial[128];
-    partial[row] = old_state * k_value;
-    __syncthreads();
-
-    for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-        if (row < stride) {
-            partial[row] += partial[row + stride];
-        }
-        __syncthreads();
+    const std::uint32_t lane = row & 31U;
+    const std::uint32_t warp = row >> 5;
+    __shared__ float warp_sums[4];
+    __shared__ float reduced;
+    float state_dot_k = infer_warp_reduce_sum(old_state * k_value);
+    if (lane == 0) {
+        warp_sums[warp] = state_dot_k;
     }
+    __syncthreads();
+    if (warp == 0) {
+        state_dot_k = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) {
+            reduced = state_dot_k;
+        }
+    }
+    __syncthreads();
 
     const float decay = expf(gate[head]);
-    const float state_dot_k = partial[0];
-    // All lanes must consume the first reduction before lane 0 reuses partial[0].
-    __syncthreads();
-    const float delta = (v[head_base + col] - decay * state_dot_k) * beta[head];
+    const float delta = (v[head_base + col] - decay * reduced) * beta[head];
     const float new_state = decay * old_state + k_value * delta;
     state[state_base + row] = new_state;
 
-    partial[row] = new_state * q_value;
-    __syncthreads();
-
-    for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-        if (row < stride) {
-            partial[row] += partial[row + stride];
-        }
-        __syncthreads();
+    float output_value = infer_warp_reduce_sum(new_state * q_value);
+    if (lane == 0) {
+        warp_sums[warp] = output_value;
     }
-
-    if (row == 0) {
-        output[head_base + col] = partial[0] * 0.08838834764831845f; // 1 / sqrt(128)
+    __syncthreads();
+    if (warp == 0) {
+        output_value = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) {
+            output[head_base + col] =
+                output_value * 0.08838834764831845f; // 1 / sqrt(128)
+        }
     }
 }
 
@@ -7479,30 +7481,39 @@ __global__ void infer_gated_delta_net_128_f32_batch_kernel(
     const float k_value = k[vector_base + row];
     const float old_state = state[state_base + row];
 
-    __shared__ float partial[128];
-    partial[row] = old_state * k_value;
-    __syncthreads();
-    for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-        if (row < stride) partial[row] += partial[row + stride];
-        __syncthreads();
+    const std::uint32_t lane = row & 31U;
+    const std::uint32_t warp = row >> 5;
+    __shared__ float warp_sums[4];
+    __shared__ float reduced;
+    float state_dot_k = infer_warp_reduce_sum(old_state * k_value);
+    if (lane == 0) {
+        warp_sums[warp] = state_dot_k;
     }
+    __syncthreads();
+    if (warp == 0) {
+        state_dot_k = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) {
+            reduced = state_dot_k;
+        }
+    }
+    __syncthreads();
 
     const float decay = expf(gate[batch * heads + head]);
-    const float state_dot_k = partial[0];
-    __syncthreads();
     const float delta =
-        (v[vector_base + col] - decay * state_dot_k) * beta[batch * heads + head];
+        (v[vector_base + col] - decay * reduced) * beta[batch * heads + head];
     const float new_state = decay * old_state + k_value * delta;
     state[state_base + row] = new_state;
 
-    partial[row] = new_state * q_value;
-    __syncthreads();
-    for (std::uint32_t stride = kState / 2; stride > 0; stride >>= 1) {
-        if (row < stride) partial[row] += partial[row + stride];
-        __syncthreads();
+    float output_value = infer_warp_reduce_sum(new_state * q_value);
+    if (lane == 0) {
+        warp_sums[warp] = output_value;
     }
-    if (row == 0) {
-        output[vector_base + col] = partial[0] * 0.08838834764831845f;
+    __syncthreads();
+    if (warp == 0) {
+        output_value = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) {
+            output[vector_base + col] = output_value * 0.08838834764831845f;
+        }
     }
 }
 
@@ -9439,6 +9450,101 @@ extern "C" cudaError_t infer_gated_rms_norm_f32_on_stream(const float* input,
     constexpr int kThreads = 256;
     infer_gated_rms_norm_f32_kernel<<<rows, kThreads, kThreads * sizeof(float), stream>>>(
         input, gate, weight, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_gated_rms_norm_quantize_nvfp4_col_major_f32_kernel(
+    const float* input,
+    const float* gate,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t heads,
+    float eps,
+    float input_scale) {
+    constexpr std::uint32_t kHeadDim = 128;
+    const std::uint32_t row = blockIdx.x / heads;
+    const std::uint32_t head = blockIdx.x % heads;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t cols = heads * kHeadDim;
+    const std::uint32_t head_offset = row * cols + head * kHeadDim;
+    const float* head_input = input + head_offset;
+    const float* head_gate = gate + head_offset;
+
+    const float input_value = head_input[threadIdx.x];
+    const float square_sum = infer_block_reduce_sum(input_value * input_value);
+    __shared__ float inverse_rms;
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(square_sum / static_cast<float>(kHeadDim) + eps);
+    }
+    __syncthreads();
+
+    const std::uint32_t feature_pair = warp;
+    const std::uint32_t half = lane >> 4;
+    const std::uint32_t half_lane = lane & 15U;
+    const std::uint32_t head_feature = feature_pair * 32 + lane;
+    const std::uint32_t feature = head * kHeadDim + head_feature;
+    const std::uint32_t feature_block = feature_pair * 2 + half;
+    const float gate_value = head_gate[head_feature];
+    const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+    const float value =
+        input_value * inverse_rms * weight[head_feature] * silu_gate / input_scale;
+    const std::uint32_t mask = half == 0 ? 0x0000ffffU : 0xffff0000U;
+    float max_abs = fabsf(value);
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_down_sync(mask, max_abs, offset, 16));
+    }
+    std::uint32_t scale_word = 0;
+    if (half_lane == 0) {
+        scale_word = max_abs == 0.0f ? 0 : static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp8(max_abs / 6.0f, __NV_SATFINITE, __NV_E4M3));
+        const std::uint32_t global_block = head * 8 + feature_block;
+        scales[infer_ue4m3_tiled_scale_offset(row, global_block, cols)] =
+            static_cast<std::uint8_t>(scale_word);
+    }
+    scale_word = __shfl_sync(mask, scale_word, 0, 16);
+    const float scale = infer_e4m3_value(static_cast<std::uint8_t>(scale_word));
+    const std::uint32_t pair_lane = (half_lane & 7U) * 2;
+    const float lo_value = __shfl_sync(mask, value, pair_lane, 16);
+    const float hi_value = __shfl_sync(mask, value, pair_lane + 1, 16);
+    if (half_lane < 8) {
+        const std::uint32_t lo_feature =
+            head * kHeadDim + feature_block * 16 + half_lane * 2;
+        const std::uint8_t lo = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp4(
+                scale == 0.0f ? 0.0f : lo_value / scale,
+                __NV_E2M1, cudaRoundNearest) & 0x0f);
+        const std::uint8_t hi = static_cast<std::uint8_t>(
+            __nv_cvt_float_to_fp4(
+                scale == 0.0f ? 0.0f : hi_value / scale,
+                __NV_E2M1, cudaRoundNearest) & 0x0f);
+        packed[(row * cols + lo_feature) / 2] = lo | (hi << 4);
+    }
+}
+
+extern "C" cudaError_t
+infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
+    const float* input,
+    const float* gate,
+    const float* weight,
+    std::uint8_t* packed,
+    std::uint8_t* scales,
+    std::uint32_t rows,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    float eps,
+    float input_scale,
+    cudaStream_t stream) {
+    if (input == nullptr || gate == nullptr || weight == nullptr || packed == nullptr ||
+        scales == nullptr || rows == 0 || heads == 0 || head_dim != 128 ||
+        input_scale <= 0.0f || !isfinite(input_scale)) {
+        return cudaErrorInvalidValue;
+    }
+    infer_gated_rms_norm_quantize_nvfp4_col_major_f32_kernel<<<
+        rows * heads, 128, 0, stream>>>(
+        input, gate, weight, packed, scales, heads, eps, input_scale);
     return cudaGetLastError();
 }
 
