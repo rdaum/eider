@@ -39,6 +39,10 @@ name = "qwen36_decode_batch"
 harness = false
 
 [[bench]]
+name = "qwen36_capacity_parity"
+harness = false
+
+[[bench]]
 name = "qwen36_prefill"
 harness = false
 

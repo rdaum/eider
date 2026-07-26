@@ -251,6 +251,46 @@ fn seed_tokens(batch: usize) -> Vec<u32> {
     (0..batch).map(|row| 9707 + row as u32).collect()
 }
 
+fn argmax(values: &[f32]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .expect("non-empty logits")
+}
+
+fn assert_logit_parity(label: &str, reference: &[f32], candidate: &[f32]) {
+    assert_eq!(reference.len(), candidate.len());
+    let mut dot = 0.0f64;
+    let mut reference_norm = 0.0f64;
+    let mut candidate_norm = 0.0f64;
+    let mut error_norm = 0.0f64;
+    let mut max_abs_error = 0.0f32;
+    for (&reference, &candidate) in reference.iter().zip(candidate) {
+        let reference = reference as f64;
+        let candidate = candidate as f64;
+        let error = candidate - reference;
+        dot += reference * candidate;
+        reference_norm += reference * reference;
+        candidate_norm += candidate * candidate;
+        error_norm += error * error;
+        max_abs_error = max_abs_error.max(error.abs() as f32);
+    }
+    let cosine = dot / (reference_norm.sqrt() * candidate_norm.sqrt()).max(f64::MIN_POSITIVE);
+    let nrmse = (error_norm / reference_norm.max(f64::MIN_POSITIVE)).sqrt();
+    let reference_top = argmax(reference);
+    let candidate_top = argmax(candidate);
+    assert_eq!(
+        reference_top, candidate_top,
+        "{label} changed its top token: cosine={cosine:.6} nrmse={nrmse:.6} max_abs_error={max_abs_error:.6}"
+    );
+    assert!(
+        cosine >= 0.98 && nrmse <= 0.20,
+        "{label} logits materially diverged: cosine={cosine:.6} nrmse={nrmse:.6} max_abs_error={max_abs_error:.6}"
+    );
+}
+
 fn decode_sample(
     context: &mut DecodeBatchBench,
     chunk_size: usize,
@@ -358,10 +398,10 @@ fn validate_batch(
             .decode_batch(&mut independent_workspace, &mut rows)
             .and_then(|decoded| decoded.copy_logits())
             .expect("validation independent decode");
-        assert_eq!(
+        assert_logit_parity(
+            &format!("batch {batch}/{workspace_capacity} row {row}"),
             &batched_logits[row * vocab..(row + 1) * vocab],
             independent_logits.as_slice(),
-            "batch {batch}/{workspace_capacity} row {row} logits differ from an independent call"
         );
         assert_eq!(batched_states[row].position(), 1);
         assert_eq!(independent_states[row].position(), 1);

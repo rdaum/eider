@@ -3,8 +3,8 @@
 mod batch;
 
 pub use batch::{
-    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace,
-    Qwen36PrefillRow,
+    Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow,
+    Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
 };
 
 use crate::metrics::ExpertPagingMetricHandle;
@@ -2583,18 +2583,6 @@ impl Sm12xGateUpWorkspace {
             d: DeviceBuffer::from_host(&d_ptrs)?,
             groups,
         })
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.b_tiles.device_bytes()
-            + self.b_scales.device_bytes()
-            + self
-                ._outputs
-                .iter()
-                .map(F32Matrix::device_bytes)
-                .sum::<usize>()
-            + self.c.device_bytes()
-            + self.d.device_bytes()
     }
 }
 

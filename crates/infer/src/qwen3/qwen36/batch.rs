@@ -1,10 +1,9 @@
-use super::super::infer::GroupedGemvWorkspace;
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36AttentionState, Qwen36DownStorage,
     Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36Linear,
     Qwen36LinearAttentionState, Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights,
     Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage,
-    Qwen36TextModel, Sm12xGateUpWorkspace, maybe_round_device_f32_to_bf16,
+    Qwen36TextModel, maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -20,15 +19,12 @@ use crate::nvfp4::{
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
-    gather_f32_pointer_rows_into_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_topk_f32_batch_into_on_stream,
+    gather_f32_pointer_rows_into_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
-    qwen36_ffn_finalize_batch_f32_into_on_stream,
-    qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
-    qwen36_full_attn_prep_f32_batch_into_on_stream,
+    qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
     qwen36_gdn_gate_paired_batch_bf16_into_on_stream, qwen36_gdn_gate_paired_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_bf16_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, rms_norm_f32_into_on_stream,
@@ -68,6 +64,42 @@ pub struct Qwen36DecodedBatch<'a> {
     workspace: &'a mut Qwen36DecodeBatchWorkspace,
     rows: usize,
     vocab: usize,
+}
+
+/// Host-side layer outputs captured by a diagnostic decode.
+pub struct Qwen36DecodeBatchTrace {
+    /// Active row-major logits after the final normalization and LM head.
+    pub logits: Vec<f32>,
+    /// Post-FFN hidden rows after each transformer layer.
+    pub layers: Vec<Qwen36DecodeLayerTrace>,
+}
+
+/// Host-side post-layer hidden rows captured by a diagnostic decode.
+pub struct Qwen36DecodeLayerTrace {
+    /// Zero-based checkpoint layer index.
+    pub layer_index: usize,
+    /// Input-normalized active rows consumed by the attention block.
+    pub input_norm: Vec<f32>,
+    /// Active rows produced by the attention block before the residual update.
+    pub attention: Vec<f32>,
+    /// Active rows after the attention residual update.
+    pub attention_residual: Vec<f32>,
+    /// Post-attention-normalized active rows consumed by the MoE block.
+    pub ffn_norm: Vec<f32>,
+    /// Router logits for each active row.
+    pub router_logits: Vec<f32>,
+    /// Top-k expert indices for each active row.
+    pub route_indices: Vec<u32>,
+    /// Normalized top-k expert weights for each active row.
+    pub route_weights: Vec<f32>,
+    /// Accumulated routed-expert rows before shared-expert combination.
+    pub routed_moe: Vec<f32>,
+    /// Shared-expert rows before gating and residual combination.
+    pub shared_moe: Vec<f32>,
+    /// Scalar shared-expert gate for each active row.
+    pub shared_gate: Vec<f32>,
+    /// Active row-major hidden values after the layer residual update.
+    pub hidden: Vec<f32>,
 }
 
 impl Qwen36DecodedBatch<'_> {
@@ -1242,9 +1274,6 @@ struct BatchMoeWorkspace {
     router_plan: BatchBf16LinearPlan,
     route_indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
-    single_gate_up_input: Nvfp4Matrix,
-    single_gate_up: GroupedGemvWorkspace,
-    sm12x_down: Sm12xGateUpWorkspace,
     shared_gate_up: DeviceBuffer<f32>,
     shared_activated: DeviceBuffer<f32>,
     shared_output: DeviceBuffer<f32>,
@@ -1443,22 +1472,6 @@ impl BatchMoeWorkspace {
             router_plan: BatchBf16LinearPlan::new(model, &weights.router, capacity)?,
             route_indices: DeviceBuffer::zeroed(routes)?,
             route_weights: DeviceBuffer::zeroed(routes)?,
-            single_gate_up_input: Nvfp4Matrix::zeroed_col_major(model.manifest.hidden, 1)?,
-            single_gate_up: GroupedGemvWorkspace::new(
-                gate_up_width,
-                model.manifest.hidden,
-                weights.experts_per_token,
-            )?
-            .ok_or_else(|| crate::nvfp4::Error::Format {
-                label: "Qwen3.6 batched routed gate/up",
-                detail: "indexed CUTLASS W4A4 workspace is unavailable".to_string(),
-            })?,
-            sm12x_down: Sm12xGateUpWorkspace::new(
-                model.manifest.hidden,
-                weights.expert_intermediate,
-                routes,
-                routes,
-            )?,
             shared_gate_up: DeviceBuffer::zeroed(capacity * gate_up_width)?,
             shared_activated: DeviceBuffer::zeroed(capacity * weights.expert_intermediate)?,
             shared_output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
@@ -1476,9 +1489,6 @@ impl BatchMoeWorkspace {
             + self.router_plan.device_bytes()
             + self.route_indices.device_bytes()
             + self.route_weights.device_bytes()
-            + self.single_gate_up_input.device_bytes()
-            + self.single_gate_up.device_bytes()
-            + self.sm12x_down.device_bytes()
             + self.shared_gate_up.device_bytes()
             + self.shared_activated.device_bytes()
             + self.shared_output.device_bytes()
@@ -1580,6 +1590,7 @@ impl Qwen36LayerBlock {
         attn_residual: &mut DeviceBuffer<f32>,
         ffn_norm: &mut DeviceBuffer<f32>,
         capacity: usize,
+        stabilise_router_logits: bool,
         stream: &CudaStream,
         parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
@@ -1605,6 +1616,7 @@ impl Qwen36LayerBlock {
             ffn_norm,
             attn_residual,
             capacity,
+            stabilise_router_logits,
             stream,
             parallel_moe,
         )
@@ -1901,6 +1913,7 @@ impl Qwen36TextModel {
                 &mut workspace.attn_residual,
                 &mut workspace.ffn_norm,
                 total_tokens,
+                false,
                 stream,
                 Some(Qwen36ParallelMoe {
                     shared_stream: &workspace.shared_moe_stream,
@@ -2060,6 +2073,7 @@ impl Qwen36TextModel {
                             attn_residual,
                             ffn_norm,
                             *capacity,
+                            true,
                             stream,
                             Some(parallel_moe()),
                         )
@@ -2096,6 +2110,7 @@ impl Qwen36TextModel {
                             attn_residual,
                             ffn_norm,
                             *capacity,
+                            true,
                             stream,
                             Some(parallel_moe()),
                         )
@@ -2115,6 +2130,72 @@ impl Qwen36TextModel {
         Ok(graphs)
     }
 
+    fn capture_decode_layer_trace(
+        &self,
+        workspace: &Qwen36DecodeBatchWorkspace,
+        block: &Qwen36LayerBlock,
+        layer_index: usize,
+        active_rows: usize,
+    ) -> Result<Qwen36DecodeLayerTrace> {
+        let values = active_rows * self.manifest.hidden;
+        let stream = &workspace.stream;
+        let attention = match &block.attention {
+            Qwen36Attention::LinearAttention(_) => &workspace.linear.output,
+            Qwen36Attention::FullAttention(_) => &workspace.full.output,
+        };
+        Ok(Qwen36DecodeLayerTrace {
+            layer_index,
+            input_norm: workspace
+                .normed_hidden
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+            attention: attention.copy_prefix_to_host(values, stream)?.into_vec(),
+            attention_residual: workspace
+                .attn_residual
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+            ffn_norm: workspace
+                .ffn_norm
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+            router_logits: workspace
+                .moe
+                .router_logits
+                .copy_prefix_to_host(active_rows * block.moe.num_experts, stream)?
+                .into_vec(),
+            route_indices: workspace
+                .moe
+                .route_indices
+                .copy_prefix_to_host(active_rows * block.moe.experts_per_token, stream)?
+                .into_vec(),
+            route_weights: workspace
+                .moe
+                .route_weights
+                .copy_prefix_to_host(active_rows * block.moe.experts_per_token, stream)?
+                .into_vec(),
+            routed_moe: workspace
+                .moe
+                .grouped
+                .routed_output
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+            shared_moe: workspace
+                .moe
+                .shared_output
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+            shared_gate: workspace
+                .moe
+                .shared_gate
+                .copy_prefix_to_host(active_rows, stream)?
+                .into_vec(),
+            hidden: workspace
+                .hidden
+                .copy_prefix_to_host(values, stream)?
+                .into_vec(),
+        })
+    }
+
     /// Decodes one scheduler tick for arbitrary persistent sequence rows.
     ///
     /// Rows may be reordered between calls and may have different positions and
@@ -2124,6 +2205,29 @@ impl Qwen36TextModel {
         &self,
         workspace: &'w mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
+    ) -> Result<Qwen36DecodedBatch<'w>> {
+        self.decode_batch_impl(workspace, rows, None)
+    }
+
+    /// Runs one diagnostic decode and copies each post-layer hidden row to the host.
+    pub fn trace_decode_batch(
+        &self,
+        workspace: &mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+    ) -> Result<Qwen36DecodeBatchTrace> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let decoded = self.decode_batch_impl(workspace, rows, Some(&mut layers))?;
+        Ok(Qwen36DecodeBatchTrace {
+            logits: decoded.copy_logits()?,
+            layers,
+        })
+    }
+
+    fn decode_batch_impl<'w>(
+        &self,
+        workspace: &'w mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+        mut trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
     ) -> Result<Qwen36DecodedBatch<'w>> {
         if workspace.model_id != self.model_id {
             return Err(crate::nvfp4::Error::Format {
@@ -2242,6 +2346,14 @@ impl Qwen36TextModel {
                     }
                 }
                 std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.push(self.capture_decode_layer_trace(
+                        workspace,
+                        block,
+                        layer_idx,
+                        active_rows,
+                    )?);
+                }
                 continue;
             }
             rms_norm_f32_into_on_stream(
@@ -2301,6 +2413,7 @@ impl Qwen36TextModel {
                 &mut workspace.attn_residual,
                 &mut workspace.ffn_norm,
                 workspace.capacity,
+                true,
                 stream,
                 Some(Qwen36ParallelMoe {
                     shared_stream: &workspace.shared_moe_stream,
@@ -2309,6 +2422,14 @@ impl Qwen36TextModel {
                 }),
             )?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.push(self.capture_decode_layer_trace(
+                    workspace,
+                    block,
+                    layer_idx,
+                    active_rows,
+                )?);
+            }
         }
 
         rms_norm_f32_into_on_stream(
@@ -3086,6 +3207,7 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         residual: &DeviceBuffer<f32>,
         capacity: usize,
+        stabilise_router_logits: bool,
         stream: &CudaStream,
         parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
@@ -3110,6 +3232,9 @@ impl Qwen36MoeWeights {
             capacity,
             stream,
         )?;
+        if stabilise_router_logits {
+            round_f32_to_bf16_in_place_on_stream(workspace.router_logits.inout(), stream)?;
+        }
         moe_topk_f32_batch_into_on_stream(
             &workspace.router_logits,
             workspace.route_indices.output(),
@@ -3120,77 +3245,6 @@ impl Qwen36MoeWeights {
             self.norm_topk_prob,
             stream,
         )?;
-        if capacity == 1 {
-            quantize_nvfp4_col_major_f32_device_into_on_stream(
-                model.manifest.hidden,
-                1,
-                ffn_norm,
-                &mut workspace.single_gate_up_input,
-                1.0,
-                stream,
-            )?;
-            if !workspace.single_gate_up.run_indexed_gate_up_indices(
-                &workspace.route_indices,
-                &self.expert_ptrs,
-                &workspace.single_gate_up_input,
-                stream,
-            )? {
-                return Err(crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 batched routed gate/up",
-                    detail: "indexed W4A4 workspace route count mismatch".to_string(),
-                });
-            }
-            moe_silu_quantize_slots_on_stream(
-                &workspace.route_indices,
-                &workspace.single_gate_up.c,
-                &mut workspace.sm12x_down.b_tiles,
-                &mut workspace.sm12x_down.b_scales,
-                &self.expert_ptrs.down_input_scales,
-                &self.gate_up_unity_alphas,
-                self.expert_intermediate,
-                self.experts_per_token,
-                stream,
-            )?;
-            indexed_grouped_gemv_on_stream(
-                &workspace.route_indices,
-                self.sm12x_down_tiles
-                    .as_ref()
-                    .expect("SM12x routed down tiles"),
-                self.sm12x_down_scales
-                    .as_ref()
-                    .expect("SM12x routed down scales"),
-                self.num_experts,
-                &workspace.sm12x_down.b_tiles,
-                &workspace.sm12x_down.b_scales,
-                &workspace.sm12x_down.d,
-                self.sm12x_down_m_tiles,
-                self.sm12x_down_k_tiles,
-                self.experts_per_token,
-                stream,
-            )?;
-            if let Some(parallel_moe) = parallel_moe {
-                parallel_moe
-                    .join
-                    .record_on_stream(parallel_moe.shared_stream)?;
-                stream.wait_event(parallel_moe.join)?;
-            } else {
-                self.enqueue_shared_batch(model, workspace, ffn_norm, capacity, stream)?;
-            }
-            return qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
-                &workspace.route_indices,
-                &workspace.route_weights,
-                &workspace.sm12x_down.c,
-                &self.expert_ptrs.down_alphas,
-                &workspace.shared_gate,
-                &workspace.shared_output,
-                residual,
-                workspace.output.output(),
-                capacity,
-                model.manifest.hidden,
-                self.experts_per_token,
-                stream,
-            );
-        }
         let weights = self
             .grouped
             .as_ref()
@@ -3275,6 +3329,7 @@ impl Qwen36MoeWeights {
             capacity,
             model.manifest.hidden,
             stream,
-        )
+        )?;
+        Ok(())
     }
 }
