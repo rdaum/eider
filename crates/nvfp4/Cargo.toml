@@ -34,7 +34,7 @@ name = "nvfp4_routed_moe_shape"
 harness = false
 
 [[bench]]
-name = "marlin_routed_gate_up"
+name = "sm121_w4a16_routed_gate_up"
 harness = false
 
 [[bench]]
@@ -54,7 +54,7 @@ name = "lm_head_top1"
 harness = false
 
 [[bench]]
-name = "marlin_shared_expert"
+name = "sm121_w4a16_shared_expert"
 harness = false
 
 [[bench]]

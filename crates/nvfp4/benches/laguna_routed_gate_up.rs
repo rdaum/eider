@@ -4,9 +4,9 @@ use micromeasure::{
 };
 use nvfp4::{
     CublasLt, CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan,
-    DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, GemmShape, MarlinNvfp4GateUp,
-    MarlinNvfp4GateUpBatchWorkspace, ModelOptCublasLtWeight, ModelOptNvfp4Linear,
-    MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, Result, format,
+    DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, GemmShape, ModelOptCublasLtWeight,
+    ModelOptNvfp4Linear, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, Result,
+    Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, format,
     moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_silu_quantize_bf16_sorted_slots_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
@@ -29,8 +29,8 @@ struct LagunaRoutedGateUpBench {
     input: DeviceBuffer<f32>,
     indices: DeviceBuffer<u32>,
     sorted_routes: MoeSortedRoutes,
-    marlin: MarlinNvfp4GateUp,
-    marlin_workspace: MarlinNvfp4GateUpBatchWorkspace,
+    w4a16: Sm121W4A16GateUp,
+    w4a16_workspace: Sm121W4A16GateUpBatchWorkspace,
     grouped_weights: Vec<ModelOptCublasLtWeight>,
     grouped_weight_values: DeviceBuffer<*const u8>,
     grouped_weight_scales: DeviceBuffer<*const u8>,
@@ -59,6 +59,8 @@ struct LagunaRoutedGateUpBench {
     decode_cutlass_validation_max_abs_error: f32,
     decode_indexed_cutlass_validation_nrmse: f64,
     decode_indexed_cutlass_validation_max_abs_error: f32,
+    w4a16_reference_nrmse: f64,
+    w4a16_reference_max_abs_error: f32,
 }
 
 impl BenchContext for LagunaRoutedGateUpBench {
@@ -74,8 +76,8 @@ impl BenchContext for LagunaRoutedGateUpBench {
 impl LagunaRoutedGateUpBench {
     fn new() -> Result<Self> {
         let weights = synthetic_weights();
-        let marlin = MarlinNvfp4GateUp::new_with_top_k(&weights, TOP_K)?;
-        let marlin_workspace = marlin.new_batch_workspace(ROWS)?;
+        let w4a16 = Sm121W4A16GateUp::new_with_top_k(&weights, TOP_K)?;
+        let w4a16_workspace = w4a16.new_batch_workspace(ROWS)?;
         let grouped_weights = weights
             .iter()
             .map(ModelOptNvfp4Linear::as_cublaslt_weight)
@@ -158,8 +160,8 @@ impl LagunaRoutedGateUpBench {
             input,
             indices,
             sorted_routes: MoeSortedRoutes::new(ROUTES, EXPERTS)?,
-            marlin,
-            marlin_workspace,
+            w4a16,
+            w4a16_workspace,
             grouped_weights,
             grouped_weight_values,
             grouped_weight_scales,
@@ -188,14 +190,16 @@ impl LagunaRoutedGateUpBench {
             decode_cutlass_validation_max_abs_error: 0.0,
             decode_indexed_cutlass_validation_nrmse: 0.0,
             decode_indexed_cutlass_validation_max_abs_error: 0.0,
+            w4a16_reference_nrmse: 0.0,
+            w4a16_reference_max_abs_error: 0.0,
         };
         bench.validate()?;
         Ok(bench)
     }
 
-    fn enqueue_marlin_pipeline(&mut self) -> Result<()> {
-        self.marlin.run_batch_bf16_on_stream(
-            &self.marlin_workspace,
+    fn enqueue_w4a16_pipeline(&mut self) -> Result<()> {
+        self.w4a16.run_batch_bf16_on_stream(
+            &self.w4a16_workspace,
             &self.indices,
             &self.input,
             &self.stream,
@@ -239,8 +243,8 @@ impl LagunaRoutedGateUpBench {
         self.enqueue_grouped_gemm()
     }
 
-    fn enqueue_marlin_decode(&mut self) -> Result<()> {
-        self.marlin
+    fn enqueue_w4a16_decode(&mut self) -> Result<()> {
+        self.w4a16
             .run_bf16_on_stream(&self.decode_indices, &self.decode_input, &self.stream)
             .map(|_| ())
     }
@@ -327,9 +331,9 @@ impl LagunaRoutedGateUpBench {
     }
 
     fn validate(&mut self) -> Result<()> {
-        self.enqueue_marlin_pipeline()?;
-        let marlin = self
-            .marlin_workspace
+        self.enqueue_w4a16_pipeline()?;
+        let w4a16 = self
+            .w4a16_workspace
             .output_bf16()
             .copy_to_host(&self.stream)?
             .into_vec();
@@ -358,7 +362,7 @@ impl LagunaRoutedGateUpBench {
         for (sorted, &original) in sorted_routes.iter().enumerate() {
             let original = original as usize;
             for feature in 0..GATE_UP {
-                let reference = format::bf16_to_f32(marlin[original * GATE_UP + feature]) as f64;
+                let reference = format::bf16_to_f32(w4a16[original * GATE_UP + feature]) as f64;
                 let actual = format::bf16_to_f32(grouped[sorted * GATE_UP + feature]) as f64;
                 let error = actual - reference;
                 squared_error += error * error;
@@ -376,13 +380,13 @@ impl LagunaRoutedGateUpBench {
         self.validation_nrmse = nrmse;
         self.validation_max_abs_error = max_error;
 
-        let mut marlin_sorted = vec![0u16; ROUTES * GATE_UP];
+        let mut w4a16_sorted = vec![0u16; ROUTES * GATE_UP];
         for (sorted, &original) in sorted_routes.iter().enumerate() {
             let original = original as usize;
-            marlin_sorted[sorted * GATE_UP..(sorted + 1) * GATE_UP]
-                .copy_from_slice(&marlin[original * GATE_UP..(original + 1) * GATE_UP]);
+            w4a16_sorted[sorted * GATE_UP..(sorted + 1) * GATE_UP]
+                .copy_from_slice(&w4a16[original * GATE_UP..(original + 1) * GATE_UP]);
         }
-        let marlin_sorted = DeviceBuffer::from_host(&marlin_sorted)?;
+        let w4a16_sorted = DeviceBuffer::from_host(&w4a16_sorted)?;
         let input_scales = DeviceBuffer::from_host(&vec![1.0; EXPERTS])?;
         let gate_up_alphas = DeviceBuffer::from_host(&vec![1.0; EXPERTS])?;
         let tile_len = ROUTES * (INTERMEDIATE / 64) * 512;
@@ -394,7 +398,7 @@ impl LagunaRoutedGateUpBench {
         moe_silu_quantize_bf16_sorted_slots_on_stream(
             &self.sorted_routes,
             &self.indices,
-            self.marlin_workspace.output_bf16(),
+            self.w4a16_workspace.output_bf16(),
             &mut gathered_tiles,
             &mut gathered_scales,
             &input_scales,
@@ -405,7 +409,7 @@ impl LagunaRoutedGateUpBench {
         )?;
         moe_silu_quantize_bf16_expert_sorted_slots_on_stream(
             self.sorted_routes.sorted_experts(),
-            &marlin_sorted,
+            &w4a16_sorted,
             &mut sorted_tiles,
             &mut sorted_scales,
             &input_scales,
@@ -425,12 +429,43 @@ impl LagunaRoutedGateUpBench {
             });
         }
 
-        self.enqueue_marlin_decode()?;
-        let marlin = self
-            .marlin
+        self.enqueue_w4a16_decode()?;
+        let w4a16 = self
+            .w4a16
             .output_bf16()
             .copy_to_host(&self.stream)?
             .into_vec();
+        let expected = (0..HIDDEN)
+            .map(|index| ((index * 17 % 257) as f32 + 1.0) / 512.0)
+            .map(format::f32_to_bf16)
+            .map(format::bf16_to_f32)
+            .sum::<f32>()
+            / HIDDEN as f32;
+        let expected = format::bf16_to_f32(format::f32_to_bf16(expected));
+        let mut squared_error = 0.0f64;
+        let mut reference_norm = 0.0f64;
+        let mut max_error = 0.0f32;
+        for &actual in &w4a16 {
+            let reference = expected as f64;
+            let actual = format::bf16_to_f32(actual) as f64;
+            let error = actual - reference;
+            squared_error += error * error;
+            reference_norm += reference * reference;
+            max_error = max_error.max(error.abs() as f32);
+        }
+        let nrmse = (squared_error / reference_norm.max(f64::MIN_POSITIVE)).sqrt();
+        if !nrmse.is_finite() || nrmse > 0.005 {
+            return Err(nvfp4::Error::Format {
+                label: "SM121 W4A16 decode gate/up correctness",
+                detail: format!(
+                    "native versus analytic reference nrmse={nrmse:.6} \
+                     max_abs_error={max_error:.6}"
+                ),
+            });
+        }
+        self.w4a16_reference_nrmse = nrmse;
+        self.w4a16_reference_max_abs_error = max_error;
+
         self.enqueue_grouped_decode()?;
         let grouped = self
             .decode_outputs
@@ -447,7 +482,7 @@ impl LagunaRoutedGateUpBench {
         let mut max_error = 0.0f32;
         for route in 0..TOP_K {
             for feature in 0..GATE_UP {
-                let reference = format::bf16_to_f32(marlin[route * GATE_UP + feature]) as f64;
+                let reference = format::bf16_to_f32(w4a16[route * GATE_UP + feature]) as f64;
                 let actual = grouped[route][feature] as f64;
                 let error = actual - reference;
                 squared_error += error * error;
@@ -481,7 +516,7 @@ impl LagunaRoutedGateUpBench {
         let mut max_error = 0.0f32;
         for route in 0..TOP_K {
             for feature in 0..GATE_UP {
-                let reference = format::bf16_to_f32(marlin[route * GATE_UP + feature]) as f64;
+                let reference = format::bf16_to_f32(w4a16[route * GATE_UP + feature]) as f64;
                 let actual = cutlass[route][feature] as f64;
                 let error = actual - reference;
                 squared_error += error * error;
@@ -515,7 +550,7 @@ impl LagunaRoutedGateUpBench {
         let mut max_error = 0.0f32;
         for route in 0..TOP_K {
             for feature in 0..GATE_UP {
-                let reference = format::bf16_to_f32(marlin[route * GATE_UP + feature]) as f64;
+                let reference = format::bf16_to_f32(w4a16[route * GATE_UP + feature]) as f64;
                 let actual = indexed_cutlass[route][feature] as f64;
                 let error = actual - reference;
                 squared_error += error * error;
@@ -548,7 +583,8 @@ impl LagunaRoutedGateUpBench {
             .record_on_stream(&self.stream)
             .expect("record stop event");
         self.stop.synchronize().expect("synchronize stop event");
-        black_box(self.marlin_workspace.output_bf16().as_const_ptr());
+        black_box(self.w4a16_workspace.output_bf16().as_const_ptr());
+        black_box(self.w4a16.output_bf16().as_const_ptr());
         black_box(self.grouped_output.as_const_ptr());
         black_box(self.decode_output_table.as_const_ptr());
         black_box(self.decode_cutlass_outputs[0].data().as_const_ptr());
@@ -603,6 +639,16 @@ impl LagunaRoutedGateUpBench {
                 self.decode_indexed_cutlass_validation_max_abs_error as f64,
                 "value",
             ))
+            .push_metric(MetricValue::new(
+                "w4a16_reference_nrmse",
+                self.w4a16_reference_nrmse,
+                "ratio",
+            ))
+            .push_metric(MetricValue::new(
+                "w4a16_reference_max_abs_error",
+                self.w4a16_reference_max_abs_error as f64,
+                "value",
+            ))
     }
 }
 
@@ -629,16 +675,13 @@ fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*
     )
 }
 
-fn marlin_pipeline_sample(
+fn w4a16_pipeline_sample(
     context: &mut LagunaRoutedGateUpBench,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
     assert_eq!(chunk_size, 1);
-    context.measure(
-        ROWS as u64,
-        LagunaRoutedGateUpBench::enqueue_marlin_pipeline,
-    )
+    context.measure(ROWS as u64, LagunaRoutedGateUpBench::enqueue_w4a16_pipeline)
 }
 
 fn grouped_prepare_sample(
@@ -674,13 +717,13 @@ fn grouped_pipeline_sample(
     )
 }
 
-fn marlin_decode_sample(
+fn w4a16_decode_sample(
     context: &mut LagunaRoutedGateUpBench,
     chunk_size: usize,
     _: usize,
 ) -> BenchSampleResult {
     assert_eq!(chunk_size, 1);
-    context.measure(1, LagunaRoutedGateUpBench::enqueue_marlin_decode)
+    context.measure(1, LagunaRoutedGateUpBench::enqueue_w4a16_decode)
 }
 
 fn grouped_decode_sample(
@@ -768,7 +811,7 @@ fn main() {
                 let group = group
                     .throughput(Throughput::per_operation(1, "tokens"))
                     .measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("marlin_w4a16_pipeline", marlin_pipeline_sample);
+                group.bench_sample("sm121_w4a16_pipeline", w4a16_pipeline_sample);
                 group.bench_sample("grouped_w4a4_pipeline", grouped_pipeline_sample);
                 group.bench_sample("grouped_w4a4_prepare", grouped_prepare_sample);
                 group.bench_sample("grouped_w4a4_gemm", grouped_gemm_sample);
@@ -777,7 +820,7 @@ fn main() {
                 let group = group
                     .throughput(Throughput::per_operation(1, "tokens"))
                     .measurement_domain(MeasurementDomain::Gpu);
-                group.bench_sample("marlin_w4a16_decode", marlin_decode_sample);
+                group.bench_sample("sm121_w4a16_decode", w4a16_decode_sample);
                 group.bench_sample("grouped_w4a4_decode", grouped_decode_sample);
                 group.bench_sample(
                     "grouped_w4a4_decode_quantize",

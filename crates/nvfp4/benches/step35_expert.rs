@@ -3,8 +3,8 @@ use micromeasure::{
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, MarlinNvfp4GateUp,
-    ModelOptCheckpoint, ModelOptNvfp4Linear, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, ModelOptCheckpoint,
+    ModelOptNvfp4Linear, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
     indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,
 };
@@ -27,7 +27,7 @@ struct Step35ExpertBench {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
-    gate_up: MarlinNvfp4GateUp,
+    gate_up: Sm121W4A16GateUp,
     down_weights: Vec<Sm12xFp4DeviceGemmWeight>,
     down_tiles: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
@@ -78,10 +78,10 @@ impl Step35ExpertBench {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let gate_up = MarlinNvfp4GateUp::new(&gate_up_weights)?;
+        let gate_up = Sm121W4A16GateUp::new(&gate_up_weights)?;
         if gate_up.shape() != (GATE_UP, HIDDEN) {
             return Err(nvfp4::Error::Shape {
-                label: "Step-3.5 Marlin gate/up plan",
+                label: "Step-3.5 SM121 W4A16 gate/up plan",
                 expected: format!("out={GATE_UP} in={HIDDEN}"),
                 actual: format!("out={} in={}", gate_up.shape().0, gate_up.shape().1),
             });
@@ -218,7 +218,7 @@ impl Step35ExpertBench {
             .map(nvfp4::format::bf16_to_f32)
             .collect::<Vec<_>>();
         require_similarity(
-            "Step-3.5 layer-3 expert-0 Marlin gate/up",
+            "Step-3.5 layer-3 expert-0 SM121 W4A16 gate/up",
             &gate_up_actual,
             &first_gate_up,
             0.998,
@@ -411,7 +411,10 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<Step35ExpertBench>("Step-3.5 layer-3 routed experts", |group| {
-            group.bench_sample("top8_marlin_gate_up_swiglu_sm12x_down", expert_chain_sample);
+            group.bench_sample(
+                "top8_sm121_w4a16_gate_up_swiglu_sm12x_down",
+                expert_chain_sample,
+            );
         });
     });
 }

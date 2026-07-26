@@ -234,7 +234,7 @@ fn run_moe(
         .copy_to_host(stream)?
         .into_vec();
     require_similarity(
-        &format!("layer {layer} first routed Marlin gate/up"),
+        &format!("layer {layer} first routed SM121 W4A16 gate/up"),
         &actual_gate_up[..expected_gate_up.len()],
         &expected_gate_up,
         0.90,

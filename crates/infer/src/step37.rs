@@ -7,8 +7,8 @@ use crate::runtime::expert_cache::{
 use fs2::FileExt as Fs2FileExt;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear,
-    PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    ModelOptCheckpoint, ModelOptNvfp4Linear, PinnedHostBuffer, Result, Sm12xFp4TileSet,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm121W4A16GateUp, Sm121W4A16HostWeight,
     add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
@@ -73,9 +73,9 @@ pub struct Step37Bf16StorageConfig {
     pub lm_head: Step37Bf16Storage,
 }
 
-const CACHE_DIR: &str = ".eider-cache/step37-experts-v1";
-const MAGIC: &[u8; 8] = b"EIDST371";
-const VERSION: u32 = 1;
+const CACHE_DIR: &str = ".eider-cache/step37-experts-v2";
+const MAGIC: &[u8; 8] = b"EIDST372";
+const VERSION: u32 = 2;
 const HEADER_BYTES: usize = 4096;
 const GATE_WEIGHT_BYTES: usize = GATE_UP * HIDDEN / 2;
 const GATE_SCALE_BYTES: usize = GATE_UP * HIDDEN / 16;
@@ -237,7 +237,7 @@ impl ExpertRecordSource for Step37ExpertRecordSource {
 /// Bounded routed-expert slots for one Step-3.7 MoE layer.
 pub struct Step37PagedExperts {
     source: Step37ExpertRecordSource,
-    gate_up: MarlinNvfp4GateUp,
+    gate_up: Sm121W4A16GateUp,
     down: Vec<Step37DownSlot>,
     down_values: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
@@ -1294,7 +1294,7 @@ impl Step37PagedExperts {
     /// Allocates `capacity` routed-expert slots for `layer`.
     pub fn load(model_dir: impl AsRef<Path>, layer: usize, capacity: usize) -> Result<Self> {
         let source = Step37ExpertRecordSource::open_at(model_dir, layer)?;
-        let gate_up = MarlinNvfp4GateUp::new_empty_slots(capacity, GATE_UP, HIDDEN)?;
+        let gate_up = Sm121W4A16GateUp::new_empty_slots(capacity, GATE_UP, HIDDEN)?;
         let mut down = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             down.push(Step37DownSlot {
@@ -2369,7 +2369,7 @@ pub struct Step37ResidentExperts {
 }
 
 struct ResidentLayer {
-    _gate_weights: DeviceBuffer<u32>,
+    _gate_weights: DeviceBuffer<u8>,
     _gate_scales: DeviceBuffer<u8>,
     _gate_global_scales: DeviceBuffer<f32>,
     _down_tiles: DeviceBuffer<u8>,
@@ -2429,7 +2429,7 @@ impl ResidentLayer {
             });
         }
 
-        let mut gate_weights = DeviceBuffer::<u32>::zeroed(EXPERTS * GATE_WEIGHT_BYTES / 4)?;
+        let mut gate_weights = DeviceBuffer::<u8>::zeroed(EXPERTS * GATE_WEIGHT_BYTES)?;
         let mut gate_scales = DeviceBuffer::<u8>::zeroed(EXPERTS * GATE_SCALE_BYTES)?;
         let mut down_tiles = DeviceBuffer::<u8>::zeroed(EXPERTS * DOWN_TILE_BYTES)?;
         let mut down_row_scales = DeviceBuffer::<u32>::zeroed(EXPERTS * DOWN_SCALE_BYTES / 4)?;
@@ -2649,17 +2649,15 @@ fn prepare_expert(
         &gate,
         &up,
     )?;
-    let marlin = MarlinNvfp4HostWeight::from_modelopt(&gate_up)?;
+    let w4a16 = Sm121W4A16HostWeight::from_modelopt(&gate_up)?;
     let down_tiles =
         Sm12xFp4TileSet::from_packed_row_major_mxk(HIDDEN, INTERMEDIATE, &down.packed_weight)?
             .to_bytes();
     let down_row_scales =
         modelopt_m16_k64_row_scale_words(HIDDEN, INTERMEDIATE, &down.weight_scale)?;
     let mut record = Vec::with_capacity(EXPERT_RECORD_BYTES);
-    for value in &marlin.packed_weight {
-        record.extend_from_slice(&value.to_le_bytes());
-    }
-    record.extend_from_slice(&marlin.weight_scale);
+    record.extend_from_slice(&w4a16.packed_weight);
+    record.extend_from_slice(&w4a16.weight_scale);
     record.extend_from_slice(&down_tiles);
     for scale in down_row_scales {
         record.extend_from_slice(&scale.to_le_bytes());
@@ -2674,7 +2672,7 @@ fn prepare_expert(
     Ok((
         record,
         ExpertMetadata {
-            gate_global_scale: marlin.global_scale,
+            gate_global_scale: w4a16.global_scale,
             down_input_scale: down.input_scale,
             down_alpha: down.weight_scale_2 * down.input_scale,
         },

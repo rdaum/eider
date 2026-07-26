@@ -11,10 +11,10 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    MarlinNvfp4GateUp, MarlinNvfp4HostWeight, MarlinNvfp4Linear, ModelOptCheckpoint,
-    ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers,
-    MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result, SafeTensorInfo, Sm12xFp4DeviceGemmWeight,
-    Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear,
+    MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
+    SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm121W4A16GateUp, Sm121W4A16HostWeight,
     add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     device_weight_gemv_on_stream, fill_f32_into_on_stream,
@@ -2227,7 +2227,7 @@ fn apply_rope_indexed(
 ///
 /// Every Qwen3.6 text layer carries a BF16 router over 256 routed experts
 /// (top-8), a quantized shared expert, and a BF16 scalar shared-expert gate.
-/// NVFP4 layers use Marlin/SM12x; mixed-precision layers keep channel-scaled
+/// NVFP4 layers use SM121 W4A16/SM12x; mixed-precision layers keep channel-scaled
 /// FP8 expert tables device-resident for device-routed W8A8 execution.
 pub struct Qwen36MoeWeights {
     router: Bf16Linear,
@@ -2280,7 +2280,7 @@ pub struct Qwen36PagingStats {
 /// Bounded expert cache for the Qwen3.6 NVFP4 MoE path.
 pub struct Qwen36ExpertPager {
     cache_dir: PathBuf,
-    gate_up: MarlinNvfp4GateUp,
+    gate_up: Sm121W4A16GateUp,
     down: Vec<Sm12xFp4DeviceGemmWeight>,
     down_tiles: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
@@ -2301,7 +2301,7 @@ pub struct Qwen36ExpertPager {
 
 struct Qwen36ExpertStaging {
     slot: usize,
-    gate_weight: PinnedHostBuffer<u32>,
+    gate_weight: PinnedHostBuffer<u8>,
     gate_scale: PinnedHostBuffer<u8>,
     gate_global_scale: PinnedHostBuffer<f32>,
     down_tiles: PinnedHostBuffer<u8>,
@@ -2311,7 +2311,7 @@ struct Qwen36ExpertStaging {
 }
 
 struct Qwen36PreparedExpertRecord {
-    gate: MarlinNvfp4HostWeight,
+    gate: Sm121W4A16HostWeight,
     down: Sm12xFp4GemmWeight,
     bytes: usize,
 }
@@ -2326,7 +2326,7 @@ impl ExpertRecordSource for Qwen36ExpertRecordSource<'_> {
     fn read_record(&self, expert: usize) -> Result<Self::Record> {
         let gate_path = gate_up_path(self.cache_dir, expert);
         let down_path = down_path(self.cache_dir, expert);
-        let gate = MarlinNvfp4HostWeight::read_cache_file(&gate_path)?;
+        let gate = Sm121W4A16HostWeight::read_cache_file(&gate_path)?;
         let down = Sm12xFp4GemmWeight::read_cache_file(&down_path)?;
         let bytes = std::fs::metadata(&gate_path)
             .map_err(|error| Error::Format {
@@ -2350,7 +2350,7 @@ impl Qwen36ExpertStaging {
         let down_scales = (hidden / 16) * (intermediate / 64);
         Ok(Self {
             slot: 0,
-            gate_weight: PinnedHostBuffer::zeroed(gate_up * hidden / 8)?,
+            gate_weight: PinnedHostBuffer::zeroed(gate_up * hidden / 2)?,
             gate_scale: PinnedHostBuffer::zeroed(gate_up * hidden / 16)?,
             gate_global_scale: PinnedHostBuffer::zeroed(1)?,
             down_tiles: PinnedHostBuffer::zeroed(down_tiles)?,
@@ -2362,7 +2362,7 @@ impl Qwen36ExpertStaging {
 }
 
 enum Qwen36GateUpStorage {
-    Marlin(MarlinNvfp4GateUp),
+    Sm121W4A16(Sm121W4A16GateUp),
     Grouped { _weights: Vec<Nvfp4DeviceLinear> },
     Paged,
     Fp8,
@@ -2403,8 +2403,6 @@ struct LazyQwen36Expert {
 struct Qwen36SharedExpert {
     gate_up: Nvfp4DeviceLinear,
     down: Nvfp4DeviceLinear,
-    marlin_gate_up: MarlinNvfp4Linear,
-    marlin_down: MarlinNvfp4Linear,
 }
 
 struct Qwen36Fp8ExpertTable {
@@ -2525,8 +2523,8 @@ pub struct Qwen36MoeWorkspace {
     pub gate_up_input: Nvfp4Matrix,
     pub gate_up_input_simple_scales: DeviceBuffer<u8>,
     pub grouped_gate_up: Option<GroupedGemvWorkspace>,
-    marlin_gate_up_output: DeviceBuffer<f32>,
-    marlin_gate_up_table: DeviceBuffer<*const f32>,
+    w4a16_gate_up_output: DeviceBuffer<f32>,
+    w4a16_gate_up_table: DeviceBuffer<*const f32>,
     fp8_hidden_input: DeviceBuffer<u8>,
     fp8_hidden_input_scale: DeviceBuffer<f32>,
     fp8_down_input: DeviceBuffer<u8>,
@@ -2686,7 +2684,7 @@ impl Qwen36ExpertPager {
         }
 
         let gate_up =
-            MarlinNvfp4GateUp::new_empty_slots(capacity, intermediate * 2, manifest.hidden)?;
+            Sm121W4A16GateUp::new_empty_slots(capacity, intermediate * 2, manifest.hidden)?;
         let mut down = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             down.push(Sm12xFp4DeviceGemmWeight::zeroed(
@@ -2872,12 +2870,12 @@ impl Qwen36ExpertPager {
         self.gate_up.run_on_stream(
             slot_indices,
             ffn_norm,
-            workspace.marlin_gate_up_output.output(),
+            workspace.w4a16_gate_up_output.output(),
             stream,
         )?;
         moe_silu_quantize_slots_on_stream(
             slot_indices,
-            &workspace.marlin_gate_up_table,
+            &workspace.w4a16_gate_up_table,
             &mut workspace.sm12x_down.b_tiles,
             &mut workspace.sm12x_down.b_scales,
             &self.down_input_scales,
@@ -3022,7 +3020,7 @@ impl Qwen36MoeWeights {
         let mut shared_gate_up_input_scale: Option<f32> = None;
         let mut gate_up_alphas = Vec::with_capacity(experts);
         let mut gate_up_w4a16_weight_scale_2 = Vec::with_capacity(experts);
-        let mut marlin_gate_up_weights = Vec::with_capacity(experts);
+        let mut w4a16_gate_up_weights = Vec::with_capacity(experts);
         let mut grouped_prefill_gate_up = Vec::with_capacity(experts);
         let mut grouped_prefill_down = Vec::with_capacity(experts);
         let mut grouped_gate_up_weights = Vec::with_capacity(experts);
@@ -3049,7 +3047,7 @@ impl Qwen36MoeWeights {
             }
             gate_up_w4a16_weight_scale_2.push(weight.weight_scale_2);
             grouped_prefill_gate_up.push(weight.as_cublaslt_weight()?);
-            marlin_gate_up_weights.push(weight);
+            w4a16_gate_up_weights.push(weight);
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
@@ -3083,11 +3081,11 @@ impl Qwen36MoeWeights {
             }
         }
 
-        // The Marlin tensor-core path is substantially faster than the SIMT
+        // The SM121 W4A16 tensor-core path is substantially faster than the SIMT
         // grouped W4A4 kernel for this batch-one top-8 shape. Keep grouped W4A4
         // as the device-support fallback without retaining both weight layouts.
-        let gate_up_storage = match MarlinNvfp4GateUp::new(&marlin_gate_up_weights) {
-            Ok(marlin) => Qwen36GateUpStorage::Marlin(marlin),
+        let gate_up_storage = match Sm121W4A16GateUp::new(&w4a16_gate_up_weights) {
+            Ok(w4a16) => Qwen36GateUpStorage::Sm121W4A16(w4a16),
             Err(_error) if compressed_tensors => {
                 if shared_gate_up_input_scale.is_none_or(f32::is_nan) {
                     return Err(Error::Format {
@@ -3095,7 +3093,7 @@ impl Qwen36MoeWeights {
                         detail: "expert gate/up input scales are not shared".to_string(),
                     });
                 }
-                for (expert_idx, weight) in marlin_gate_up_weights.iter().enumerate() {
+                for (expert_idx, weight) in w4a16_gate_up_weights.iter().enumerate() {
                     let device = Nvfp4DeviceLinear::from_host(weight)?;
                     gate_up_grouped_value_ptrs[expert_idx] =
                         device.packed_weight.as_const_ptr().cast();
@@ -3162,8 +3160,6 @@ impl Qwen36MoeWeights {
             });
         }
         let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
-            marlin_gate_up: MarlinNvfp4Linear::new(&shared_gate_up)?,
-            marlin_down: MarlinNvfp4Linear::new(&shared_down)?,
             gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
             down: Nvfp4DeviceLinear::from_host(&shared_down)?,
         });
@@ -3290,8 +3286,6 @@ impl Qwen36MoeWeights {
             });
         }
         let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
-            marlin_gate_up: MarlinNvfp4Linear::new(&shared_gate_up)?,
-            marlin_down: MarlinNvfp4Linear::new(&shared_down)?,
             gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
             down: Nvfp4DeviceLinear::from_host(&shared_down)?,
         });
@@ -3508,10 +3502,10 @@ impl Qwen36MoeWeights {
     ) -> Result<()> {
         match &self.gate_up_storage {
             Qwen36GateUpStorage::Grouped { .. } => self.run_grouped_gate_up_only(workspace, stream),
-            Qwen36GateUpStorage::Marlin(marlin) => marlin.run_on_stream(
+            Qwen36GateUpStorage::Sm121W4A16(w4a16) => w4a16.run_on_stream(
                 &workspace.route.indices,
                 ffn_norm,
-                workspace.marlin_gate_up_output.output(),
+                workspace.w4a16_gate_up_output.output(),
                 stream,
             ),
             Qwen36GateUpStorage::Paged => Err(Error::Format {
@@ -3537,7 +3531,7 @@ impl Qwen36MoeWeights {
                     &fp8.gate.scales,
                     &fp8.up.weights,
                     &fp8.up.scales,
-                    workspace.marlin_gate_up_output.output(),
+                    workspace.w4a16_gate_up_output.output(),
                     self.expert_intermediate,
                     ffn_norm.len(),
                     self.experts_per_token,
@@ -3680,8 +3674,8 @@ impl Qwen36MoeWeights {
                     })?
                     .c
             }
-            Qwen36GateUpStorage::Marlin(_) | Qwen36GateUpStorage::Fp8 => {
-                &workspace.marlin_gate_up_table
+            Qwen36GateUpStorage::Sm121W4A16(_) | Qwen36GateUpStorage::Fp8 => {
+                &workspace.w4a16_gate_up_table
             }
             Qwen36GateUpStorage::Paged => {
                 return Err(Error::Format {
@@ -4267,7 +4261,7 @@ impl Qwen36MoeWeights {
                     &fp8.gate.scales,
                     &fp8.up.weights,
                     &fp8.up.scales,
-                    workspace.marlin_gate_up_output.output(),
+                    workspace.w4a16_gate_up_output.output(),
                     self.expert_intermediate,
                     manifest.hidden,
                     self.experts_per_token,
@@ -4282,7 +4276,7 @@ impl Qwen36MoeWeights {
             }
             let mut run_silu_quantize = || {
                 moe_silu_quantize_fp8_slots_f32_into_on_stream(
-                    &workspace.marlin_gate_up_output,
+                    &workspace.w4a16_gate_up_output,
                     &mut workspace.fp8_down_input,
                     &mut workspace.fp8_down_input_scales,
                     self.expert_intermediate,
@@ -4414,19 +4408,19 @@ impl Qwen36MoeWeights {
                     run_grouped()?;
                 }
             } else {
-                let mut run_marlin = || {
-                    let Qwen36GateUpStorage::Marlin(marlin) = &self.gate_up_storage else {
-                        unreachable!("checked Marlin gate/up storage")
+                let mut run_w4a16 = || {
+                    let Qwen36GateUpStorage::Sm121W4A16(w4a16) = &self.gate_up_storage else {
+                        unreachable!("checked SM121 W4A16 gate/up storage")
                     };
                     if use_sm12x_down {
-                        marlin
+                        w4a16
                             .run_bf16_on_stream(&workspace.route.indices, ffn_norm, stream)
                             .map(|_| ())
                     } else {
-                        marlin.run_on_stream(
+                        w4a16.run_on_stream(
                             &workspace.route.indices,
                             ffn_norm,
-                            workspace.marlin_gate_up_output.output(),
+                            workspace.w4a16_gate_up_output.output(),
                             stream,
                         )
                     }
@@ -4438,12 +4432,12 @@ impl Qwen36MoeWeights {
                     gpu_probe
                         .as_deref_mut()
                         .expect("probe present")
-                        .capture(run_marlin)?;
+                        .capture(run_w4a16)?;
                 } else if let Some(profile) = profile.as_deref_mut() {
-                    let (_, ms) = timed_cuda(stream, run_marlin)?;
+                    let (_, ms) = timed_cuda(stream, run_w4a16)?;
                     profile.qwen36_routed_gate_up_ms += ms;
                 } else {
-                    run_marlin()?;
+                    run_w4a16()?;
                 }
             }
             let gate_up_table = if use_grouped_w4a4 {
@@ -4453,7 +4447,7 @@ impl Qwen36MoeWeights {
                     .expect("grouped W4A4 workspace")
                     .c
             } else {
-                &workspace.marlin_gate_up_table
+                &workspace.w4a16_gate_up_table
             };
             let gate_up_alpha_table = if use_grouped_w4a4 {
                 &self.expert_ptrs.gate_up_alphas
@@ -4476,12 +4470,12 @@ impl Qwen36MoeWeights {
                             stream,
                         )
                     } else {
-                        let Qwen36GateUpStorage::Marlin(marlin) = &self.gate_up_storage else {
-                            unreachable!("checked Marlin gate/up storage")
+                        let Qwen36GateUpStorage::Sm121W4A16(w4a16) = &self.gate_up_storage else {
+                            unreachable!("checked SM121 W4A16 gate/up storage")
                         };
                         moe_silu_quantize_bf16_slots_on_stream(
                             &workspace.route.indices,
-                            marlin.output_bf16(),
+                            w4a16.output_bf16(),
                             &mut sm12x_down.b_tiles,
                             &mut sm12x_down.b_scales,
                             &self.expert_ptrs.down_input_scales,
@@ -5151,10 +5145,10 @@ impl Qwen36MoeWorkspace {
         } else {
             None
         };
-        let marlin_gate_up_output = DeviceBuffer::zeroed(experts_per_token * gate_up_out_features)?;
-        let marlin_base = marlin_gate_up_output.as_const_ptr().cast::<f32>();
-        let marlin_gate_up_ptrs = (0..experts_per_token)
-            .map(|slot| unsafe { marlin_base.add(slot * gate_up_out_features) })
+        let w4a16_gate_up_output = DeviceBuffer::zeroed(experts_per_token * gate_up_out_features)?;
+        let w4a16_base = w4a16_gate_up_output.as_const_ptr().cast::<f32>();
+        let w4a16_gate_up_ptrs = (0..experts_per_token)
+            .map(|slot| unsafe { w4a16_base.add(slot * gate_up_out_features) })
             .collect::<Vec<_>>();
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(experts)?,
@@ -5162,8 +5156,8 @@ impl Qwen36MoeWorkspace {
             gate_up_input: Nvfp4Matrix::zeroed_col_major(hidden, 1)?,
             gate_up_input_simple_scales: DeviceBuffer::zeroed(hidden.div_ceil(16))?,
             grouped_gate_up,
-            marlin_gate_up_output,
-            marlin_gate_up_table: DeviceBuffer::from_host(&marlin_gate_up_ptrs)?,
+            w4a16_gate_up_output,
+            w4a16_gate_up_table: DeviceBuffer::from_host(&w4a16_gate_up_ptrs)?,
             fp8_hidden_input: DeviceBuffer::zeroed(hidden)?,
             fp8_hidden_input_scale: DeviceBuffer::zeroed(1)?,
             fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,

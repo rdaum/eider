@@ -329,7 +329,7 @@ The workspace has three crates:
 
 CUDA kernels live in `crates/nvfp4/native/` and are linked into the Rust crate
 by its build script. CUTLASS is optional; the normal Qwen3.6 serving path uses
-Marlin, SM12x kernels, and cuBLASLt without a CUTLASS checkout.
+SM121 W4A16, SM12x kernels, and cuBLASLt without a CUTLASS checkout.
 
 ### Build and test
 
@@ -396,7 +396,7 @@ comparison, not the fast default.
 ### Runtime shape
 
 The steady-state Qwen3.6 path is a device-resident decode loop. Rust owns the
-layer orchestration and state transitions; CUDA, cuBLASLt, Marlin, and SM12x
+layer orchestration and state transitions; CUDA, cuBLASLt, and SM12x
 implement the measured kernels underneath it.
 
 ```mermaid
@@ -414,7 +414,7 @@ flowchart TD
     J --> K
     K -->|Main stream| L[BF16 router + top-k]
     K -->|Shared stream| M[NVFP4 shared expert + BF16 gate]
-    L --> N[Marlin W4A16 routed gate/up]
+    L --> N[Eider SM121 W4A16 routed gate/up]
     N --> O[SiLU + indexed SM12x routed down]
     O --> P[Fused routed/shared combine + residual]
     M --> P
@@ -471,7 +471,7 @@ same execution path but submits its layer work eagerly.
 CUTLASS is needed when using the dense Qwen GEMV backend or running the
 CUTLASS-specific low-level tests and benchmarks.
 
-You do not need CUTLASS for the normal Qwen3.6 path. Its Marlin gate/up and
+You do not need CUTLASS for the normal Qwen3.6 path. Its SM121 W4A16 gate/up and
 SM12x down kernels build and run without a CUTLASS checkout.
 
 If you need it though, the build looks for it under `.deps/cutlass`
@@ -496,8 +496,8 @@ Benchmarks use my [`micromeasure`](https://github.com/rdaum/micromeasure) crate.
 Useful current targets include:
 
 ```sh
-cargo bench -p nvfp4 --bench marlin_routed_gate_up
-cargo bench -p nvfp4 --bench marlin_shared_expert
+cargo bench -p nvfp4 --bench sm121_w4a16_routed_gate_up
+cargo bench -p nvfp4 --bench sm121_w4a16_shared_expert
 cargo bench -p nvfp4 --bench lm_head_top1
 cargo bench -p nvfp4 --bench sm12x_indexed_gemv
 cargo bench -p nvfp4 --bench nvfp4_kv_attention

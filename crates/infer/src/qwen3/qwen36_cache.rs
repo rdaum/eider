@@ -2,15 +2,15 @@ use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
 use fs2::FileExt;
 use nvfp4::{
-    Error, MarlinNvfp4HostWeight, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    Sm12xFp4GemmWeight,
+    Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result, Sm12xFp4GemmWeight,
+    Sm121W4A16HostWeight,
 };
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
-const CACHE_MARKER_VERSION: &str = "eider-qwen36-experts-v1";
+const CACHE_MARKER_VERSION: &str = "eider-qwen36-experts-v2";
 
 pub(crate) fn ensure_model_cache(
     checkpoint: &ModelOptCheckpoint,
@@ -121,7 +121,7 @@ fn build_layer_cache(
     let missing = (0..experts)
         .filter(|&expert| {
             rebuild_all
-                || !MarlinNvfp4HostWeight::cache_file_matches(
+                || !Sm121W4A16HostWeight::cache_file_matches(
                     gate_up_path(&layer_dir, expert),
                     intermediate * 2,
                     manifest.hidden,
@@ -186,7 +186,7 @@ fn build_expert_cache(
         manifest.tensor_prefix
     );
     let gate_path = gate_up_path(layer_dir, expert);
-    if !MarlinNvfp4HostWeight::cache_file_matches(&gate_path, intermediate * 2, manifest.hidden) {
+    if !Sm121W4A16HostWeight::cache_file_matches(&gate_path, intermediate * 2, manifest.hidden) {
         let gate = checkpoint.load_nvfp4_linear(&gate_prefix)?;
         let up = checkpoint.load_nvfp4_linear(&up_prefix)?;
         let gate_up = ModelOptNvfp4Linear::concat_out_features(
@@ -197,7 +197,7 @@ fn build_expert_cache(
             &gate,
             &up,
         )?;
-        MarlinNvfp4HostWeight::from_modelopt(&gate_up)?.write_cache_file(&gate_path)?;
+        Sm121W4A16HostWeight::from_modelopt(&gate_up)?.write_cache_file(&gate_path)?;
     }
 
     let prefix = format!(
@@ -238,7 +238,7 @@ fn layer_cache_complete(
         return false;
     };
     (0..experts).all(|expert| {
-        MarlinNvfp4HostWeight::cache_file_matches(
+        Sm121W4A16HostWeight::cache_file_matches(
             gate_up_path(&layer_dir, expert),
             intermediate * 2,
             manifest.hidden,
@@ -348,7 +348,7 @@ pub(crate) fn down_path(layer_dir: &Path, expert: usize) -> PathBuf {
 }
 
 pub(crate) fn gate_up_path(layer_dir: &Path, expert: usize) -> PathBuf {
-    layer_dir.join(format!("expert-{expert:03}.gate-up.marlin"))
+    layer_dir.join(format!("expert-{expert:03}.gate-up.sm121-w4a16"))
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {

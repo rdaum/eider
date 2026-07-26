@@ -70,7 +70,7 @@ fn main() {
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
-    let marlin_moe_object = format!("{out_dir}/marlin_moe.o");
+    let sm121_w4a16_object = format!("{out_dir}/sm121_w4a16.o");
     let cutlass_gemv_object = format!("{out_dir}/cutlass_gemv.o");
     let cutlass_grouped_gemm_object = format!("{out_dir}/cutlass_grouped_gemm.o");
     let archive = format!("{out_dir}/libfp4_oracle.a");
@@ -212,28 +212,25 @@ fn main() {
         "nvcc failed to build SM12x MMA kernels"
     );
 
-    let mut marlin_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
-    marlin_nvcc.args([
+    let mut sm121_w4a16_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    sm121_w4a16_nvcc.args([
         "-std=c++17",
         "-O3",
         "--use_fast_math",
-        "--expt-relaxed-constexpr",
-        "--generate-code=arch=compute_121,code=sm_121",
+        "--generate-code=arch=compute_121a,code=sm_121a",
         "-I",
         &cuda_include,
-        "-I",
-        "native/marlin",
         "-c",
-        "native/marlin_moe.cu",
+        "native/sm121_w4a16.cu",
         "-o",
-        &marlin_moe_object,
+        &sm121_w4a16_object,
     ]);
-    let marlin_status = marlin_nvcc
+    let sm121_w4a16_status = sm121_w4a16_nvcc
         .status()
-        .expect("failed to run nvcc for Marlin MoE kernel");
+        .expect("failed to run nvcc for SM121 W4A16 kernels");
     assert!(
-        marlin_status.success(),
-        "nvcc failed to build Marlin MoE kernel"
+        sm121_w4a16_status.success(),
+        "nvcc failed to build SM121 W4A16 kernels"
     );
 
     if cutlass_available {
@@ -377,7 +374,7 @@ fn main() {
             &qwen36_gdn_object,
             &gemma4_attention_object,
             &sm12x_mma_object,
-            &marlin_moe_object,
+            &sm121_w4a16_object,
             &cutlass_gemv_object,
             &cutlass_grouped_gemm_object,
         ])
@@ -401,8 +398,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");
-    println!("cargo:rerun-if-changed=native/marlin_moe.cu");
-    println!("cargo:rerun-if-changed=native/marlin");
+    println!("cargo:rerun-if-changed=native/sm121_w4a16.cu");
     println!("cargo:rerun-if-changed=native/cutlass_gemv.cu");
     println!("cargo:rerun-if-changed=native/cutlass_gemv_stub.cpp");
     println!("cargo:rerun-if-changed=native/cutlass_grouped_gemm.cu");

@@ -3,8 +3,8 @@ use micromeasure::{
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, MarlinNvfp4GateUp, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, nvfp4_w4a16_matvec_f32_into_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, ModelOptCheckpoint, ModelOptNvfp4Linear,
+    Result, Sm121W4A16GateUp, nvfp4_w4a16_matvec_f32_into_on_stream,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,11 +15,11 @@ const TOP_K: usize = 8;
 const EXPERTS: usize = 8;
 const ROUTES: [u32; TOP_K] = [7, 2, 7, 0, 5, 1, 6, 3];
 
-struct MarlinRoutedGateUpBench {
+struct Sm121W4A16RoutedGateUpBench {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
-    plan: MarlinNvfp4GateUp,
+    plan: Sm121W4A16GateUp,
     weights: Vec<ModelOptNvfp4Linear>,
     indices: DeviceBuffer<u32>,
     input: DeviceBuffer<f32>,
@@ -27,9 +27,9 @@ struct MarlinRoutedGateUpBench {
     graph: CudaGraphExec,
 }
 
-impl BenchContext for MarlinRoutedGateUpBench {
+impl BenchContext for Sm121W4A16RoutedGateUpBench {
     fn prepare(_num_chunks: usize) -> Self {
-        Self::new().expect("prepare Marlin routed gate/up benchmark")
+        Self::new().expect("prepare SM121 W4A16 routed gate/up benchmark")
     }
 
     fn chunk_size() -> Option<usize> {
@@ -37,10 +37,10 @@ impl BenchContext for MarlinRoutedGateUpBench {
     }
 }
 
-impl MarlinRoutedGateUpBench {
+impl Sm121W4A16RoutedGateUpBench {
     fn new() -> Result<Self> {
         let weights = load_weights()?;
-        let plan = MarlinNvfp4GateUp::new(&weights)?;
+        let plan = Sm121W4A16GateUp::new(&weights)?;
         let stream = CudaStream::new_blocking()?;
         let input = DeviceBuffer::from_host(
             &(0..HIDDEN)
@@ -85,7 +85,7 @@ impl MarlinRoutedGateUpBench {
             .collect::<Vec<_>>();
         if actual.as_ref() != bf16_expanded.as_slice() {
             return Err(nvfp4::Error::Format {
-                label: "Marlin BF16 routed gate/up",
+                label: "SM121 W4A16 BF16 routed gate/up",
                 detail: "BF16-only output differs from the expanded F32 path".to_string(),
             });
         }
@@ -101,7 +101,7 @@ impl MarlinRoutedGateUpBench {
                 })
                 .expect("different outputs have a mismatch");
             return Err(nvfp4::Error::Format {
-                label: "Marlin routed gate/up graph replay",
+                label: "SM121 W4A16 routed gate/up graph replay",
                 detail: format!(
                     "index={index} direct={direct} replay={replay} error={}",
                     (direct - replay).abs()
@@ -148,7 +148,7 @@ impl MarlinRoutedGateUpBench {
                 })
                 .map(|(slot, values)| (slot, ROUTES[slot], values[worst.4]));
             return Err(nvfp4::Error::Format {
-                label: "Marlin routed gate/up versus W4A16",
+                label: "SM121 W4A16 routed gate/up versus W4A16",
                 detail: format!(
                     "slot={} expert={} row={} actual={} expected={} error={} allowed={allowed} nearest={nearest:?}",
                     worst.3, ROUTES[worst.3], worst.4, worst.1, worst.2, worst.0
@@ -184,8 +184,8 @@ fn model_dir() -> PathBuf {
         })
 }
 
-fn marlin_sample(
-    ctx: &mut MarlinRoutedGateUpBench,
+fn sm121_w4a16_sample(
+    ctx: &mut Sm121W4A16RoutedGateUpBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -195,7 +195,7 @@ fn marlin_sample(
     for _ in 0..chunk_size {
         ctx.plan
             .run_on_stream(&ctx.indices, &ctx.input, ctx.output.output(), &ctx.stream)
-            .expect("Marlin routed gate/up");
+            .expect("SM121 W4A16 routed gate/up");
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
@@ -211,7 +211,7 @@ fn marlin_sample(
 }
 
 fn graph_sample(
-    ctx: &mut MarlinRoutedGateUpBench,
+    ctx: &mut Sm121W4A16RoutedGateUpBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -219,7 +219,9 @@ fn graph_sample(
         .record_on_stream(&ctx.stream)
         .expect("start event");
     for _ in 0..chunk_size {
-        ctx.graph.launch(&ctx.stream).expect("Marlin graph replay");
+        ctx.graph
+            .launch(&ctx.stream)
+            .expect("SM121 W4A16 graph replay");
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
@@ -234,8 +236,8 @@ fn graph_sample(
         .push_metric(MetricValue::integer("slots", TOP_K as i64, "slots"))
 }
 
-fn marlin_bf16_sample(
-    ctx: &mut MarlinRoutedGateUpBench,
+fn sm121_w4a16_bf16_sample(
+    ctx: &mut Sm121W4A16RoutedGateUpBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -245,7 +247,7 @@ fn marlin_bf16_sample(
     for _ in 0..chunk_size {
         ctx.plan
             .run_bf16_on_stream(&ctx.indices, &ctx.input, &ctx.stream)
-            .expect("Marlin BF16 routed gate/up");
+            .expect("SM121 W4A16 BF16 routed gate/up");
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
@@ -262,7 +264,7 @@ fn marlin_bf16_sample(
 
 fn main() {
     let options = BenchmarkMainOptions {
-        suite: Some("nvfp4-marlin-routed-gate-up".to_string()),
+        suite: Some("nvfp4-w4a16-routed-gate-up".to_string()),
         comparison_policy: ComparisonPolicy::None,
         save_results: false,
         runtime: BenchmarkRuntimeOptions {
@@ -274,11 +276,11 @@ fn main() {
         ..BenchmarkMainOptions::default()
     };
     run_benchmark_main(options, |runner| {
-        runner.group::<MarlinRoutedGateUpBench>("NVFP4 Marlin routed gate/up", |group| {
-            group.bench_sample("qwen36_layer0_top8_m1024_k2048", marlin_sample);
+        runner.group::<Sm121W4A16RoutedGateUpBench>("NVFP4 SM121 W4A16 routed gate/up", |group| {
+            group.bench_sample("qwen36_layer0_top8_m1024_k2048", sm121_w4a16_sample);
             group.bench_sample(
                 "qwen36_layer0_top8_m1024_k2048_bf16_output",
-                marlin_bf16_sample,
+                sm121_w4a16_bf16_sample,
             );
             group.bench_sample("qwen36_layer0_top8_m1024_k2048_graph", graph_sample);
         });

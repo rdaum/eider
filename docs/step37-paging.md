@@ -3,11 +3,12 @@
 Eider can load the complete Step-3.7-Flash NVFP4 checkpoint on one GB10 while
 keeping only a bounded set of routed experts resident. Dense layers and shared
 experts remain resident and are converted to NVFP4 by default. Routed gate/up
-weights use Marlin; routed down weights use the SM12x FP4 tensor-core path.
+weights use Eider's SM121 W4A16 kernel; routed down weights use the SM12x FP4
+tensor-core path.
 
 The official checkpoint stores each routed projection as one stacked
 all-expert tensor. Preparation reads one expert slice at a time and writes
-fixed-size records containing Marlin gate/up weights and native SM12x down
+fixed-size records containing SM121 W4A16 gate/up weights and native SM12x down
 tiles. The checkpoint's BF16 attention projections, first three dense FFNs,
 shared experts, and LM head are quantized to native NVFP4 storage at load time.
 The compact SM12x KV cache supports both the 64-head full attention and the

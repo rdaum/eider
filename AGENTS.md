@@ -30,7 +30,7 @@ runtime. Keep cancellation, tool history, sampling, usage, and finish-reason
 semantics aligned across both adapters. Pi launchers default to Responses; set
 `PI_EIDER_PROVIDER=eider-chat` to exercise Chat Completions.
 
-The Qwen3.6 fast MoE path is enabled by default: Marlin W4A16 gate/up, SM12x
+The Qwen3.6 fast MoE path is enabled by default: Eider SM121 W4A16 gate/up, SM12x
 down, grouped workspace allocation, segmented decode graph capture, and the
 shared radix prompt-prefix cache. Compatibility flags from older experiments
 are not required for normal runs.
@@ -38,7 +38,7 @@ are not required for normal runs.
 ## Microbenchmarks
 
 ```sh
-cargo bench -p nvfp4 --bench marlin_routed_gate_up
+cargo bench -p nvfp4 --bench sm121_w4a16_routed_gate_up
 cargo bench -p infer --bench qwen36_prefill
 cargo bench -p infer --bench step37_prefill
 cargo bench -p infer --bench laguna_prefill
@@ -65,6 +65,63 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
 `.deps/cutlass-build-sm121`; those paths are used automatically when present.
 `scripts/probe-cutlass-sm12x.sh` checks CUTLASS SM12x compile support.
 
+## TLDR SM121
+
+For CUDA and CUTLASS work on GB10, keep these
+[SM12x NVFP4 notes](https://research.colfax-intl.com/cutlass-tutorial-nvfp4-blockscaled-gemm-on-nvidia-rtx-pro-blackwell-gpus-sm12x/)
+in view:
+
+- SM121 is Blackwell, but it is not the SM100/B200 programming model. Its tensor
+  cores use synchronous, warp-collective `mma.sync` with operand and accumulator
+  fragments in registers; it has no `tcgen05` or TMEM. SM100 GEMM kernels are
+  incompatible. SM8x mainloop, scheduling, and pipelining ideas are the more
+  useful starting point, with SM12x additions such as TMA.
+- Build SM121 architecture-specific MMA translation units with
+  `compute_121a,code=sm_121a`, as `crates/nvfp4/build.rs` does. Do not silently
+  compile them under a conservative generic target. Conversely, do not assume
+  an SM120a/f-only feature such as warpgroup register reallocation exists on
+  GB10; confirm support with the installed CUDA/CUTLASS toolchain and a device
+  probe.
+- The hardware NVFP4 atom is fixed:
+  `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3`.
+  It consumes E2M1 A `16x64`, E2M1 B `64x8`, UE4M3 SFA `16x4`, UE4M3 SFB
+  `4x8`, and FP32 accumulators. The `m16n8k64` shape, `4X` scale vector, and
+  UE4M3 scale type are not tuning choices.
+- NVFP4 means packed E2M1 values with one UE4M3 scale per 16 values along K.
+  E2M1 has only `0`, `±0.5`, `±1`, `±1.5`, `±2`, `±3`, `±4`, and `±6`; it has
+  no NaN or infinity encoding, and UE4M3 scales are nonnegative.
+  Logically, A `[M,K]` has SFA `[M,K/16]` and B `[K,N]` has SFB `[K/16,N]`.
+  One MMA K atom therefore consumes four scales. An unguarded MMA mainloop still
+  needs K in 64-element atoms; handle or pad tails rather than treating
+  divisibility by 16 as sufficient.
+- Keep logical, checkpoint, cuBLASLt, CUTLASS, shared-memory, and native MMA
+  scale layouts distinct. The hardware fixes the register fragment layout, not
+  the global- or shared-memory layout. ModelOpt row-major scales are not
+  cuBLASLt `VEC16_UE4M3` scales and neither can be reinterpreted as a native MMA
+  layout. Convert once while preparing/caching weights, not in the decode hot
+  path.
+- Scale register ownership is quad-based. With CUTLASS's selector convention,
+  lanes 0 and 1 of each four-lane quad supply SFA while lane 0 supplies SFB.
+  CUTLASS layouts consequently replicate SFA registers 2x and SFB registers 4x;
+  that apparent duplication is part of feeding the instruction correctly.
+  Preserve the `byte-id`/`thread-id` selectors and validate lane-to-scale
+  mapping when writing inline PTX.
+- Pipeline A, B, SFA, and SFB together. A/B commonly use TMA to shared memory
+  and `ldmatrix` into registers, while scale factors use the SM12x scale-factor
+  TV layouts and a universal copy. In CuTe code, use the SM120 scale-layout
+  helpers and remove broadcast coordinates (for example with `filter_zeros`)
+  rather than hand-deriving a superficially contiguous copy.
+- `mma.sync` is a warp collective: every participating lane must execute it
+  consistently. Keep divergent bounds and routing decisions outside the MMA,
+  and make register pressure, shared-memory staging, pipeline depth, and the
+  number of MMA warps explicit tuning dimensions.
+- Do not transfer published RTX Pro 6000 tile choices or throughput numbers to
+  DGX Spark. CTA-wave quantization depends on the device's SM count and problem
+  shape, and published GEMM figures may exclude quantization and layout
+  conversion. Count waves for GB10, include preparation costs when they occur at
+  runtime, and gate changes on both a correctness-first micromeasure and the
+  real prefill/decode path.
+
 ## Layout
 
 - `crates/eider-api/src/` — catalogue deployment, inference actor, HTTP APIs,
@@ -75,11 +132,11 @@ The build defaults are CUDA 13.0, `.deps/cutlass`, and
   family-specific model loading and execution.
 - `crates/infer/benches/` — model-runtime and prefill micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.
-- `crates/nvfp4/src/kernels/` — Marlin, non-GEMM, and SM12x operations.
+- `crates/nvfp4/src/kernels/` — Eider SM121 W4A16, non-GEMM, and SM12x operations.
 - `crates/nvfp4/src/diagnostics/` — smoke checks and GPU-counter helpers.
 - `crates/nvfp4/src/` — storage, checkpoint, CUDA, and FFI support.
 - `crates/nvfp4/native/` — CUDA kernels and native FFI implementations.
-- `crates/nvfp4/benches/` — focused NVFP4, Marlin, attention, and GEMV
+- `crates/nvfp4/benches/` — focused NVFP4, SM121 W4A16, attention, and GEMV
   micromeasures.
 - `pi/agent/models.json` — repository-local Pi providers for Responses and Chat
   Completions.

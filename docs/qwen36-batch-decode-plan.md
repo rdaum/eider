@@ -71,7 +71,7 @@ selects for the current tick:
 - row-major hidden, residual, normalization, projection, and LM-head buffers;
 - FP8 and NVFP4 activation scratch;
 - GDN state-pointer tables assembled from the selected sequence rows;
-- routed-MoE route, Marlin gate/up, SM12x down, and shared-expert storage; and
+- routed-MoE route, SM121 W4A16 gate/up, SM12x down, and shared-expert storage; and
 - one compact-attention scratch workspace reused serially across active rows.
 
 Workspace creation performs all recurring host and device allocation. The
@@ -88,7 +88,7 @@ One call executes the model in layer order:
    full-attention projections followed by per-sequence compact-cache append and
    attention;
 4. row-wise residual and FFN normalization;
-5. batched router top-k, Marlin routed gate/up, SM12x routed down, shared
+5. batched router top-k, SM121 W4A16 routed gate/up, SM12x routed down, shared
    expert, and fused FFN finalization;
 6. final RMSNorm and the batched LM head; and
 7. either device logits, host logits for sampling, or GPU top-1 results.
@@ -172,7 +172,7 @@ The batch implementation is currently eager. Recovering production-path graph
 and launch efficiency is a later optimization because the scheduler contract
 deliberately permits changing row membership, order, and positions.
 
-The current workspace constructor supports the normal Marlin NVFP4 routed
+The current workspace constructor supports the normal SM121 W4A16 routed
 gate/up, SM12x routed down, and NVFP4 shared-expert plan. Add true batched paths
 for grouped or FP8 experts before moving mixed-storage Unsloth checkpoints off
 the single-row decoder; do not implement that support as a host loop over

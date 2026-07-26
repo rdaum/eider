@@ -56,10 +56,6 @@ pub use kernels::deepseek4::{
     swiglu_pair_f32_batch_into_on_stream,
 };
 pub use kernels::gemma4_attention::Gemma4LocalPrefillAttention;
-pub use kernels::marlin::{
-    MarlinNvfp4GateUp, MarlinNvfp4GateUpBatchWorkspace, MarlinNvfp4HostWeight, MarlinNvfp4Linear,
-    MarlinNvfp4LinearBatchWorkspace,
-};
 pub use kernels::non_gemm::{
     ArgmaxResult, GPU_SAMPLING_MAX_TOP_K, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     GroupedGemvPointerBuffers, GroupedGemvPointerTableBuffers, MoeSiluQuantizeSlotBuffers,
@@ -185,6 +181,10 @@ pub use kernels::sm12x_mma::{
     moe_silu_quantize_slots_reference_on_stream, moe_silu_quantize_slots_residual_on_stream,
     quantize_dynamic_vector_on_stream, quantize_dynamic_vectors_residual2_on_stream,
     quantize_fixed_scale_vector_on_stream,
+};
+pub use kernels::sm121_w4a16::{
+    Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, Sm121W4A16HostWeight, Sm121W4A16Linear,
+    Sm121W4A16LinearBatchWorkspace,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt::{

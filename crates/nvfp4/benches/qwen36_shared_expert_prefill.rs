@@ -3,8 +3,8 @@ use micromeasure::{
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CudaEvent, CudaStream, DeviceBuffer, MarlinNvfp4Linear, MarlinNvfp4LinearBatchWorkspace,
-    ModelOptFp8Linear, ModelOptNvfp4Linear, format, silu_mul_halves_f32_batch_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear, Sm121W4A16Linear,
+    Sm121W4A16LinearBatchWorkspace, format, silu_mul_halves_f32_batch_into_on_stream,
 };
 use std::time::Duration;
 
@@ -33,8 +33,8 @@ fn bf16_round(value: f32) -> f32 {
 }
 
 struct SharedExpertLayer {
-    gate_up: MarlinNvfp4Linear,
-    down: MarlinNvfp4Linear,
+    gate_up: Sm121W4A16Linear,
+    down: Sm121W4A16Linear,
 }
 
 struct Qwen36SharedExpertPrefillBench {
@@ -43,7 +43,7 @@ struct Qwen36SharedExpertPrefillBench {
     stop: CudaEvent,
     layers: Vec<SharedExpertLayer>,
     next_layer: usize,
-    workspace: MarlinNvfp4LinearBatchWorkspace,
+    workspace: Sm121W4A16LinearBatchWorkspace,
     hidden: DeviceBuffer<f32>,
     gate_up: DeviceBuffer<f32>,
     activated: DeviceBuffer<f32>,
@@ -62,8 +62,8 @@ impl Qwen36SharedExpertPrefillBench {
         let expected = bf16_round(INTERMEDIATE as f32 * bf16_round(activated) * down_value);
         let layers = (0..LAYERS)
             .map(|_| SharedExpertLayer {
-                gate_up: MarlinNvfp4Linear::new(&gate_up_weight).expect("gate/up Marlin plan"),
-                down: MarlinNvfp4Linear::new(&down_weight).expect("down Marlin plan"),
+                gate_up: Sm121W4A16Linear::new(&gate_up_weight).expect("gate/up SM121 W4A16 plan"),
+                down: Sm121W4A16Linear::new(&down_weight).expect("down SM121 W4A16 plan"),
             })
             .collect();
         Self {
@@ -72,7 +72,7 @@ impl Qwen36SharedExpertPrefillBench {
             stop: CudaEvent::new().expect("stop"),
             layers,
             next_layer: 0,
-            workspace: MarlinNvfp4LinearBatchWorkspace::new(TOKENS, HIDDEN)
+            workspace: Sm121W4A16LinearBatchWorkspace::new(TOKENS, HIDDEN)
                 .expect("shared-expert workspace"),
             hidden: DeviceBuffer::from_host(&vec![INPUT_VALUE; TOKENS * HIDDEN])
                 .expect("hidden input"),

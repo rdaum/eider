@@ -11,7 +11,7 @@ entrypoints called by those wrappers.
 | --- | --- |
 | `non_gemm.cu` | Elementwise, quantization, RoPE, attention, MoE routing, lm-head, FP8, GDN, and W4A16 kernels. |
 | `sm12x_mma.cu` | Experimental and production SM12x NVFP4 MMA/GEMV kernels. |
-| `marlin_moe.cu` | Marlin W4A16 routed gate/up kernels. |
+| `sm121_w4a16.cu` | Eider-owned SM121 W4A16 routed and dense tensor-core kernels. |
 | `cutlass_gemv.cu` | Optional CUTLASS SM12x GEMV implementation. |
 | `cutlass_gemv_stub.cpp` | Fallback symbols when CUTLASS is unavailable. |
 | `fp4_oracle.cpp` | Host/CUDA conversion oracle used by format checks. |

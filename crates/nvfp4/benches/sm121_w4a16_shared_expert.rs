@@ -3,8 +3,8 @@ use micromeasure::{
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
 };
 use nvfp4::{
-    CudaEvent, CudaStream, DeviceBuffer, MarlinNvfp4Linear, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, nvfp4_w4a16_matvec_block_per_row_f32_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
+    Sm121W4A16Linear, nvfp4_w4a16_matvec_block_per_row_f32_into_on_stream,
     nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
 };
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ const INTERMEDIATE: usize = 512;
 const GATE_UP: usize = INTERMEDIATE * 2;
 
 struct SharedProjection {
-    gate_up_plan: MarlinNvfp4Linear,
-    down_plan: MarlinNvfp4Linear,
+    gate_up_plan: Sm121W4A16Linear,
+    down_plan: Sm121W4A16Linear,
     gate_up_weight: DeviceBuffer<u8>,
     gate_up_scale: DeviceBuffer<u8>,
     gate_up_scale_2: f32,
@@ -26,7 +26,7 @@ struct SharedProjection {
     down_scale_2: f32,
 }
 
-struct MarlinSharedExpertBench {
+struct Sm121W4A16SharedExpertBench {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
@@ -37,9 +37,9 @@ struct MarlinSharedExpertBench {
     projections: Vec<SharedProjection>,
 }
 
-impl BenchContext for MarlinSharedExpertBench {
+impl BenchContext for Sm121W4A16SharedExpertBench {
     fn prepare(_num_chunks: usize) -> Self {
-        Self::new().expect("prepare Marlin shared-expert benchmark")
+        Self::new().expect("prepare SM121 W4A16 shared-expert benchmark")
     }
 
     fn chunk_size() -> Option<usize> {
@@ -47,7 +47,7 @@ impl BenchContext for MarlinSharedExpertBench {
     }
 }
 
-impl MarlinSharedExpertBench {
+impl Sm121W4A16SharedExpertBench {
     fn new() -> Result<Self> {
         let checkpoint = ModelOptCheckpoint::open(model_dir())?;
         let mut projections = Vec::with_capacity(LAYERS);
@@ -62,8 +62,8 @@ impl MarlinSharedExpertBench {
             )?;
             let down = checkpoint.load_nvfp4_linear(&format!("{prefix}.down_proj"))?;
             projections.push(SharedProjection {
-                gate_up_plan: MarlinNvfp4Linear::new(&gate_up)?,
-                down_plan: MarlinNvfp4Linear::new(&down)?,
+                gate_up_plan: Sm121W4A16Linear::new(&gate_up)?,
+                down_plan: Sm121W4A16Linear::new(&down)?,
                 gate_up_weight: DeviceBuffer::from_host(&gate_up.packed_weight)?,
                 gate_up_scale: DeviceBuffer::from_host(&gate_up.weight_scale)?,
                 gate_up_scale_2: gate_up.weight_scale_2,
@@ -194,7 +194,7 @@ fn model_dir() -> PathBuf {
 }
 
 fn scalar_sample(
-    ctx: &mut MarlinSharedExpertBench,
+    ctx: &mut Sm121W4A16SharedExpertBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -228,8 +228,8 @@ fn scalar_sample(
     finish_sample(ctx, chunk_size)
 }
 
-fn marlin_sample(
-    ctx: &mut MarlinSharedExpertBench,
+fn sm121_w4a16_sample(
+    ctx: &mut Sm121W4A16SharedExpertBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -239,7 +239,7 @@ fn marlin_sample(
             projection
                 .gate_up_plan
                 .run_on_stream(&ctx.hidden_input, ctx.gate_up_output.output(), &ctx.stream)
-                .expect("Marlin shared gate/up");
+                .expect("SM121 W4A16 shared gate/up");
             projection
                 .down_plan
                 .run_on_stream(
@@ -247,14 +247,14 @@ fn marlin_sample(
                     ctx.down_output.output(),
                     &ctx.stream,
                 )
-                .expect("Marlin shared down");
+                .expect("SM121 W4A16 shared down");
         }
     }
     finish_sample(ctx, chunk_size)
 }
 
 fn warp_rows_sample<const WARPS: usize>(
-    ctx: &mut MarlinSharedExpertBench,
+    ctx: &mut Sm121W4A16SharedExpertBench,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -290,7 +290,7 @@ fn warp_rows_sample<const WARPS: usize>(
     finish_sample(ctx, chunk_size)
 }
 
-fn finish_sample(ctx: &mut MarlinSharedExpertBench, chunk_size: usize) -> BenchSampleResult {
+fn finish_sample(ctx: &mut Sm121W4A16SharedExpertBench, chunk_size: usize) -> BenchSampleResult {
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
@@ -303,7 +303,7 @@ fn finish_sample(ctx: &mut MarlinSharedExpertBench, chunk_size: usize) -> BenchS
 
 fn main() {
     let options = BenchmarkMainOptions {
-        suite: Some("nvfp4-marlin-shared-expert".to_string()),
+        suite: Some("nvfp4-w4a16-shared-expert".to_string()),
         comparison_policy: ComparisonPolicy::None,
         save_results: false,
         runtime: BenchmarkRuntimeOptions {
@@ -315,13 +315,13 @@ fn main() {
         ..BenchmarkMainOptions::default()
     };
     run_benchmark_main(options, |runner| {
-        runner.group::<MarlinSharedExpertBench>("NVFP4 shared expert", |group| {
+        runner.group::<Sm121W4A16SharedExpertBench>("NVFP4 shared expert", |group| {
             group.bench_sample("qwen36_40_layers_scalar", scalar_sample);
             group.bench_sample("qwen36_40_layers_warp_rows_4", warp_rows_sample::<4>);
             group.bench_sample("qwen36_40_layers_warp_rows_8", warp_rows_sample::<8>);
             group.bench_sample("qwen36_40_layers_warp_rows_16", warp_rows_sample::<16>);
             group.bench_sample("qwen36_40_layers_warp_rows_32", warp_rows_sample::<32>);
-            group.bench_sample("qwen36_40_layers_marlin", marlin_sample);
+            group.bench_sample("qwen36_40_layers_sm121_w4a16", sm121_w4a16_sample);
         });
     });
 }
