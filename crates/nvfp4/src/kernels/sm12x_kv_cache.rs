@@ -10,6 +10,16 @@ const MMA_K: usize = 64;
 const MMA_N: usize = 8;
 const COMPACT_TILE_BYTES: usize = MMA_N * MMA_K / 2;
 const SCALE_BYTES_PER_TILE: usize = MMA_K / 16;
+const PV_SPLIT_CAPACITY: usize = 32;
+const PV_SPLIT_MIN_TOKENS: usize = 1_024;
+
+fn pv_split_count(tokens: usize) -> usize {
+    if tokens < PV_SPLIT_MIN_TOKENS {
+        1
+    } else {
+        PV_SPLIT_CAPACITY
+    }
+}
 
 /// Persistent compact FP4 K/V storage for one attention layer.
 ///
@@ -63,6 +73,7 @@ pub struct Sm12xKvAttentionWorkspace {
     scores: DeviceBuffer<f32>,
     probability_tiles: DeviceBuffer<u8>,
     probability_scales: DeviceBuffer<u32>,
+    pv_partials: DeviceBuffer<f32>,
     max_tokens: usize,
     q_heads: usize,
     kv_heads: usize,
@@ -884,6 +895,10 @@ impl Sm12xKvAttentionWorkspace {
                 "SM12x KV probability scale words",
                 &[probability_tile_count, MMA_N],
             )?)?,
+            pv_partials: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV PV partials",
+                &[PV_SPLIT_CAPACITY, q_heads, head_dim],
+            )?)?,
             max_tokens,
             q_heads,
             kv_heads,
@@ -899,6 +914,62 @@ impl Sm12xKvAttentionWorkspace {
             + self.scores.device_bytes()
             + self.probability_tiles.device_bytes()
             + self.probability_scales.device_bytes()
+            + self.pv_partials.device_bytes()
+    }
+
+    /// Enqueues Q-to-FP4 and compact-cache QK into the internal score workspace.
+    pub fn qk_scores_into_workspace_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0
+            || cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV QK cache",
+                expected: format!(
+                    "non-empty cache with max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "len={} max_tokens={} kv_heads={} head_dim={}",
+                    cache.len, cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let query_values = self.q_heads * self.head_dim;
+        if query.len() != query_values {
+            return Err(Error::Shape {
+                label: "SM12x KV QK query",
+                expected: format!("{query_values} values"),
+                actual: format!("{} values", query.len()),
+            });
+        }
+
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_qk_on_stream",
+                crate::ffi::infer_sm12x_kv_qk_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    cache.max_tokens as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Enqueues Q-to-FP4, QK, f32 online softmax, P-to-FP4, and PV.
@@ -941,6 +1012,7 @@ impl Sm12xKvAttentionWorkspace {
             });
         }
 
+        let pv_splits = pv_split_count(cache.len);
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_on_stream",
@@ -957,12 +1029,14 @@ impl Sm12xKvAttentionWorkspace {
                     self.scores.as_mut_ptr().cast(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache.len as u32,
                     cache.max_tokens as u32,
                     self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
+                    pv_splits as u32,
                     stream.as_raw(),
                 ),
             )
@@ -1010,6 +1084,7 @@ impl Sm12xKvAttentionWorkspace {
             });
         }
 
+        let pv_splits = pv_split_count(cache.len - window_start);
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_window_on_stream",
@@ -1026,6 +1101,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.scores.as_mut_ptr().cast(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache.len as u32,
                     window_start as u32,
@@ -1033,6 +1109,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
+                    pv_splits as u32,
                     stream.as_raw(),
                 ),
             )
@@ -1203,6 +1280,7 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
+        let pv_splits = pv_split_count(cache.len);
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_on_stream",
@@ -1219,12 +1297,14 @@ impl Sm12xKvAttentionWorkspace {
                     self.scores.as_mut_ptr().cast(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast::<f32>().add(output_offset),
                     cache.len as u32,
                     cache.max_tokens as u32,
                     self.q_heads as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
+                    pv_splits as u32,
                     stream.as_raw(),
                 ),
             )
@@ -1285,11 +1365,13 @@ impl Sm12xKvAttentionWorkspace {
                     self.scores.as_mut_ptr().cast(),
                     self.probability_tiles.as_mut_ptr().cast(),
                     self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast(),
                     cache_len.as_const_ptr().cast(),
                     cache.max_tokens as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
+                    PV_SPLIT_CAPACITY as u32,
                     stream.as_raw(),
                 ),
             )
@@ -1356,6 +1438,74 @@ impl Sm12xKvAttentionWorkspace {
         }
     }
 
+    /// Enqueues P-to-FP4 and context-split PV from caller-provided probabilities.
+    pub fn pv_from_probabilities_split_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        probabilities: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        pv_splits: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len == 0
+            || cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x split KV PV cache",
+                expected: format!(
+                    "non-empty cache with max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "len={} max_tokens={} kv_heads={} head_dim={}",
+                    cache.len, cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let probability_values = self.kv_heads * MMA_N * self.max_tokens;
+        let output_values = self.kv_heads * MMA_N * self.head_dim;
+        if probabilities.len() != probability_values
+            || output.len() != output_values
+            || !(2..=PV_SPLIT_CAPACITY).contains(&pv_splits)
+        {
+            return Err(Error::Shape {
+                label: "SM12x split KV PV probabilities/output",
+                expected: format!(
+                    "{probability_values} probabilities, {output_values} outputs, and 2..={PV_SPLIT_CAPACITY} splits"
+                ),
+                actual: format!(
+                    "probabilities={} output={} pv_splits={pv_splits}",
+                    probabilities.len(),
+                    output.len()
+                ),
+            });
+        }
+
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_pv_from_probabilities_split_on_stream",
+                crate::ffi::infer_sm12x_kv_pv_from_probabilities_split_on_stream(
+                    probabilities.as_const_ptr().cast(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    cache.max_tokens as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    pv_splits as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Returns the f32 score/probability scratch for validation.
     pub fn scores(&self) -> &DeviceBuffer<f32> {
         &self.scores
@@ -1410,6 +1560,17 @@ mod tests {
             crate::format::ue4m3_code(max_abs / 6.0)
         };
         (code, crate::format::e4m3_value(code))
+    }
+
+    #[test]
+    fn pv_split_policy_uses_measured_crossover() {
+        assert_eq!(pv_split_count(1), 1);
+        assert_eq!(pv_split_count(64), 1);
+        assert_eq!(pv_split_count(1_023), 1);
+        assert_eq!(pv_split_count(1_024), PV_SPLIT_CAPACITY);
+        assert_eq!(pv_split_count(4_096), PV_SPLIT_CAPACITY);
+        assert_eq!(pv_split_count(32_768), 32);
+        assert_eq!(pv_split_count(131_072), PV_SPLIT_CAPACITY);
     }
 
     #[test]

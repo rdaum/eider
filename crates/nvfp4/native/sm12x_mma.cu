@@ -1997,9 +1997,12 @@ __global__ void infer_sm12x_kv_pv_kernel(
     std::uint32_t head_dim,
     std::uint32_t causal_start_position,
     std::uint32_t window_tokens,
-    std::uint32_t output_row_offset)
+    std::uint32_t output_row_offset,
+    float* __restrict__ partial_output,
+    std::uint32_t pv_splits)
 {
-    const std::uint32_t batch_row = blockIdx.z;
+    const std::uint32_t batch_row = blockIdx.z / pv_splits;
+    const std::uint32_t split = blockIdx.z % pv_splits;
     if (cache_len_device != nullptr) cache_len = *cache_len_device;
     if (causal_start_position != 0xffffffffu) {
         cache_len = causal_start_position + batch_row + 1;
@@ -2020,7 +2023,9 @@ __global__ void infer_sm12x_kv_pv_kernel(
     const std::uint32_t max_context_tiles = (max_tokens + 63) / 64;
     probability_tiles += batch_row * query_groups * max_context_tiles * 512;
     probability_scales += batch_row * query_groups * max_context_tiles * 8;
-    output += (output_row_offset + batch_row) * q_heads * head_dim;
+    float* destination = pv_splits == 1
+        ? output + (output_row_offset + batch_row) * q_heads * head_dim
+        : partial_output + (batch_row * pv_splits + split) * q_heads * head_dim;
     const std::uint32_t full_tokens = cache_len / 16 * 16;
     const std::uint32_t tail_len = cache_len & 15u;
     const std::uint32_t width = kv_heads * head_dim;
@@ -2031,7 +2036,13 @@ __global__ void infer_sm12x_kv_pv_kernel(
     float d2 = 0.0f;
     float d3 = 0.0f;
 
-    for (std::uint32_t kt = window_start / 64; kt < context_tiles; ++kt) {
+    const std::uint32_t first_context_tile = window_start / 64;
+    const std::uint32_t active_context_tiles = context_tiles - first_context_tile;
+    const std::uint32_t context_tile_begin =
+        first_context_tile + active_context_tiles * split / pv_splits;
+    const std::uint32_t context_tile_end =
+        first_context_tile + active_context_tiles * (split + 1) / pv_splits;
+    for (std::uint32_t kt = context_tile_begin; kt < context_tile_end; ++kt) {
         const std::uint8_t* a_tile = probability_tiles + (group * max_context_tiles + kt) * 512;
         const std::uint32_t value_tile_index =
             (kv_head * (head_dim / 8) + dim_tile) * max_context_tiles + kt;
@@ -2098,9 +2109,30 @@ __global__ void infer_sm12x_kv_pv_kernel(
     const int col = (threadIdx.x & 3) * 2;
     const std::uint32_t q_head = query_base + row;
     if (q_head < (kv_head + 1) * queries_per_kv) {
-        output[q_head * head_dim + dim_tile * 8 + col] = d0 / probability_correction;
-        output[q_head * head_dim + dim_tile * 8 + col + 1] = d1 / probability_correction;
+        destination[q_head * head_dim + dim_tile * 8 + col] =
+            d0 / probability_correction;
+        destination[q_head * head_dim + dim_tile * 8 + col + 1] =
+            d1 / probability_correction;
     }
+}
+
+__global__ void infer_sm12x_kv_pv_reduce_kernel(
+    const float* __restrict__ partial_output,
+    float* __restrict__ output,
+    std::uint32_t pv_splits,
+    std::uint32_t q_heads,
+    std::uint32_t head_dim,
+    std::uint32_t output_row_offset)
+{
+    const std::uint32_t batch_row = blockIdx.y;
+    const std::uint32_t width = q_heads * head_dim;
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= width) return;
+    float sum = 0.0f;
+    for (std::uint32_t split = 0; split < pv_splits; ++split) {
+        sum += partial_output[(batch_row * pv_splits + split) * width + index];
+    }
+    output[(output_row_offset + batch_row) * width + index] = sum;
 }
 
 static cudaError_t infer_sm12x_kv_attention_impl(
@@ -2116,6 +2148,7 @@ static cudaError_t infer_sm12x_kv_attention_impl(
     float* scores,
     std::uint8_t* probability_tiles,
     std::uint32_t* probability_scales,
+    float* partial_output,
     float* output,
     std::uint32_t cache_len,
     std::uint32_t window_start,
@@ -2123,6 +2156,7 @@ static cudaError_t infer_sm12x_kv_attention_impl(
     std::uint32_t q_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
+    std::uint32_t pv_splits,
     cudaStream_t stream)
 {
     if (query == nullptr || key_values == nullptr || key_scales == nullptr || key_tail == nullptr ||
@@ -2131,7 +2165,9 @@ static cudaError_t infer_sm12x_kv_attention_impl(
         probability_tiles == nullptr || probability_scales == nullptr || output == nullptr ||
         cache_len == 0 || cache_len > max_tokens || window_start >= cache_len ||
         q_heads == 0 || kv_heads == 0 ||
-        (q_heads % kv_heads) != 0 || head_dim == 0 || (head_dim % 64) != 0) {
+        (q_heads % kv_heads) != 0 || head_dim == 0 || (head_dim % 64) != 0 ||
+        pv_splits == 0 || pv_splits > 32 ||
+        (pv_splits > 1 && partial_output == nullptr)) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t head_k_tiles = head_dim / 64;
@@ -2157,10 +2193,54 @@ static cudaError_t infer_sm12x_kv_attention_impl(
         q_heads, kv_heads, 0xffffffffu, 0);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, 1), 32, 0, stream>>>(
+    infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, pv_splits), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
         output, cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim,
-        0xffffffffu, 0, 0);
+        0xffffffffu, 0, 0, partial_output, pv_splits);
+    status = cudaGetLastError();
+    if (status != cudaSuccess || pv_splits == 1) return status;
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t output_values = q_heads * head_dim;
+    infer_sm12x_kv_pv_reduce_kernel<<<
+        dim3((output_values + kThreads - 1) / kThreads, 1, 1), kThreads, 0, stream>>>(
+        partial_output, output, pv_splits, q_heads, head_dim, 0);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_kv_qk_on_stream(
+    const float* query,
+    const std::uint8_t* key_values,
+    const std::uint8_t* key_scales,
+    const float* key_tail,
+    std::uint8_t* query_tiles,
+    std::uint32_t* query_scales,
+    float* scores,
+    std::uint32_t cache_len,
+    std::uint32_t max_tokens,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream)
+{
+    if (query == nullptr || key_values == nullptr || key_scales == nullptr ||
+        key_tail == nullptr || query_tiles == nullptr || query_scales == nullptr ||
+        scores == nullptr || cache_len == 0 || cache_len > max_tokens ||
+        q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0 ||
+        head_dim == 0 || (head_dim % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t head_k_tiles = head_dim / 64;
+    const std::uint32_t token_tiles = (cache_len + 7) / 8;
+    const std::uint32_t query_groups = kv_heads * ((q_heads / kv_heads + 7) / 8);
+    infer_sm12x_kv_quantize_query_kernel<<<
+        dim3(query_groups, head_k_tiles, 1), 128, 0, stream>>>(
+        query, query_tiles, query_scales, q_heads, kv_heads, head_dim, 0);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_sm12x_kv_qk_kernel<<<dim3(query_groups, token_tiles, 1), 32, 0, stream>>>(
+        query_tiles, query_scales, key_values, key_scales, key_tail, scores,
+        cache_len, nullptr, 0, max_tokens, q_heads, kv_heads, head_dim,
+        0xffffffffu, 0);
     return cudaGetLastError();
 }
 
@@ -2169,13 +2249,16 @@ extern "C" cudaError_t infer_sm12x_kv_attention_on_stream(
     const float* key_tail, const std::uint8_t* value_values,
     const std::uint8_t* value_scales, const float* value_tail,
     std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
-    std::uint8_t* probability_tiles, std::uint32_t* probability_scales, float* output,
+    std::uint8_t* probability_tiles, std::uint32_t* probability_scales,
+    float* partial_output, float* output,
     std::uint32_t cache_len, std::uint32_t max_tokens, std::uint32_t q_heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim, cudaStream_t stream) {
+    std::uint32_t kv_heads, std::uint32_t head_dim, std::uint32_t pv_splits,
+    cudaStream_t stream) {
     return infer_sm12x_kv_attention_impl(
         query, key_values, key_scales, key_tail, value_values, value_scales, value_tail,
-        query_tiles, query_scales, scores, probability_tiles, probability_scales, output,
-        cache_len, 0, max_tokens, q_heads, kv_heads, head_dim, stream);
+        query_tiles, query_scales, scores, probability_tiles, probability_scales,
+        partial_output, output, cache_len, 0, max_tokens, q_heads, kv_heads, head_dim,
+        pv_splits, stream);
 }
 
 extern "C" cudaError_t infer_sm12x_kv_attention_window_on_stream(
@@ -2183,14 +2266,16 @@ extern "C" cudaError_t infer_sm12x_kv_attention_window_on_stream(
     const float* key_tail, const std::uint8_t* value_values,
     const std::uint8_t* value_scales, const float* value_tail,
     std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
-    std::uint8_t* probability_tiles, std::uint32_t* probability_scales, float* output,
+    std::uint8_t* probability_tiles, std::uint32_t* probability_scales,
+    float* partial_output, float* output,
     std::uint32_t cache_len, std::uint32_t window_start, std::uint32_t max_tokens,
     std::uint32_t q_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
-    cudaStream_t stream) {
+    std::uint32_t pv_splits, cudaStream_t stream) {
     return infer_sm12x_kv_attention_impl(
         query, key_values, key_scales, key_tail, value_values, value_scales, value_tail,
-        query_tiles, query_scales, scores, probability_tiles, probability_scales, output,
-        cache_len, window_start, max_tokens, q_heads, kv_heads, head_dim, stream);
+        query_tiles, query_scales, scores, probability_tiles, probability_scales,
+        partial_output, output, cache_len, window_start, max_tokens, q_heads, kv_heads,
+        head_dim, pv_splits, stream);
 }
 
 extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
@@ -2283,7 +2368,7 @@ extern "C" cudaError_t infer_sm12x_kv_append_causal_attention_rows_on_stream(
             dim3(query_groups, head_dim / 8, batch_rows), 32, 0, stream>>>(
             probability_tiles, probability_scales, value_values, value_scales, value_tail,
             output, 0, nullptr, 0, max_tokens, q_heads, kv_heads, head_dim,
-            position, window_tokens, input_row);
+            position, window_tokens, input_row, nullptr, 1);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
         processed += batch_rows;
@@ -2304,19 +2389,22 @@ extern "C" cudaError_t infer_sm12x_kv_attention_indexed_on_stream(
     float* scores,
     std::uint8_t* probability_tiles,
     std::uint32_t* probability_scales,
+    float* partial_output,
     float* output,
     const std::uint32_t* cache_len,
     std::uint32_t max_tokens,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
+    std::uint32_t pv_splits,
     cudaStream_t stream)
 {
     if (query == nullptr || key_values == nullptr || key_scales == nullptr || key_tail == nullptr ||
         value_values == nullptr || value_scales == nullptr || value_tail == nullptr ||
         query_tiles == nullptr || query_scales == nullptr || scores == nullptr ||
-        probability_tiles == nullptr || probability_scales == nullptr || output == nullptr ||
+        probability_tiles == nullptr || probability_scales == nullptr ||
+        partial_output == nullptr || output == nullptr ||
         cache_len == nullptr || max_tokens == 0 || kv_heads == 0 || head_dim == 0 ||
-        (head_dim % 64) != 0) {
+        (head_dim % 64) != 0 || pv_splits < 2 || pv_splits > 32) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t head_k_tiles = head_dim / 64;
@@ -2341,10 +2429,18 @@ extern "C" cudaError_t infer_sm12x_kv_attention_indexed_on_stream(
         kv_heads * 8, kv_heads, 0xffffffffu, 0);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
+    infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, pv_splits), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
         output, 0, cache_len, 0, max_tokens, kv_heads * 8, kv_heads, head_dim,
-        0xffffffffu, 0, 0);
+        0xffffffffu, 0, 0, partial_output, pv_splits);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t q_heads = kv_heads * 8;
+    const std::uint32_t output_values = q_heads * head_dim;
+    infer_sm12x_kv_pv_reduce_kernel<<<
+        dim3((output_values + kThreads - 1) / kThreads, 1, 1), kThreads, 0, stream>>>(
+        partial_output, output, pv_splits, q_heads, head_dim, 0);
     return cudaGetLastError();
 }
 
@@ -2378,7 +2474,53 @@ extern "C" cudaError_t infer_sm12x_kv_pv_from_probabilities_on_stream(
     infer_sm12x_kv_pv_kernel<<<dim3(kv_heads, head_dim / 8, 1), 32, 0, stream>>>(
         probability_tiles, probability_scales, value_values, value_scales, value_tail,
         output, cache_len, nullptr, 0, max_tokens, kv_heads * 8, kv_heads, head_dim,
-        0xffffffffu, 0, 0);
+        0xffffffffu, 0, 0, nullptr, 1);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_sm12x_kv_pv_from_probabilities_split_on_stream(
+    const float* probabilities,
+    const std::uint8_t* value_values,
+    const std::uint8_t* value_scales,
+    const float* value_tail,
+    std::uint8_t* probability_tiles,
+    std::uint32_t* probability_scales,
+    float* partial_output,
+    float* output,
+    std::uint32_t cache_len,
+    std::uint32_t max_tokens,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    std::uint32_t pv_splits,
+    cudaStream_t stream)
+{
+    if (probabilities == nullptr || value_values == nullptr || value_scales == nullptr ||
+        value_tail == nullptr || probability_tiles == nullptr ||
+        probability_scales == nullptr || partial_output == nullptr || output == nullptr ||
+        cache_len == 0 || cache_len > max_tokens || kv_heads == 0 ||
+        head_dim == 0 || (head_dim % 64) != 0 || pv_splits < 2 || pv_splits > 32) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t q_heads = kv_heads * 8;
+    const std::uint32_t context_tiles = (cache_len + 63) / 64;
+    infer_sm12x_kv_quantize_probability_kernel<<<
+        dim3(kv_heads, context_tiles, 1), 128, 0, stream>>>(
+        probabilities, probability_tiles, probability_scales, cache_len, nullptr,
+        0, max_tokens, q_heads, kv_heads, 0xffffffffu, 0);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_sm12x_kv_pv_kernel<<<
+        dim3(kv_heads, head_dim / 8, pv_splits), 32, 0, stream>>>(
+        probability_tiles, probability_scales, value_values, value_scales, value_tail,
+        output, cache_len, nullptr, 0, max_tokens, q_heads, kv_heads, head_dim,
+        0xffffffffu, 0, 0, partial_output, pv_splits);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t output_values = q_heads * head_dim;
+    infer_sm12x_kv_pv_reduce_kernel<<<
+        dim3((output_values + kThreads - 1) / kThreads, 1, 1), kThreads, 0, stream>>>(
+        partial_output, output, pv_splits, q_heads, head_dim, 0);
     return cudaGetLastError();
 }
 

@@ -205,6 +205,294 @@ fn nvfp4_sample<const CACHE_LEN: usize>(
     ))
 }
 
+/// The compact-cache decode pipeline used by Qwen3.6 serving.
+///
+/// Unlike `KvAttentionBench`, this exercises the persistent SM12x K/V layouts
+/// and the complete Q-to-FP4, QK, softmax, P-to-FP4, and PV launch sequence.
+struct CompactKvAttentionBench<const CACHE_LEN: usize> {
+    stream: CudaStream,
+    start: CudaEvent,
+    stop: CudaEvent,
+    query: DeviceBuffer<f32>,
+    cache: Sm12xKvCache,
+    cache_len: DeviceBuffer<u32>,
+    workspace: Sm12xKvAttentionWorkspace,
+    output: DeviceBuffer<f32>,
+    probabilities: DeviceBuffer<f32>,
+}
+
+impl<const CACHE_LEN: usize> CompactKvAttentionBench<CACHE_LEN> {
+    fn new() -> Self {
+        let cache_values = CACHE_LEN * KV_HEADS * HEAD_DIM;
+        let values = |factor| {
+            (0..cache_values)
+                .map(|index| ((index * factor % 509) as f32 - 254.0) / 256.0)
+                .collect::<Vec<_>>()
+        };
+        let query_values = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 17 % 251) as f32 - 125.0) / 128.0)
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let query = DeviceBuffer::from_host(&query_values).expect("query");
+        let key = DeviceBuffer::from_host(&values(29)).expect("key cache");
+        let value = DeviceBuffer::from_host(&values(43)).expect("value cache");
+        let mut cache = Sm12xKvCache::new(CACHE_LEN, KV_HEADS, HEAD_DIM).expect("compact cache");
+        cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, CACHE_LEN, &stream)
+            .expect("pack compact cache");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(CACHE_LEN, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("compact attention workspace");
+        let mut output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("compact attention output");
+        let mut reference = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("f32 attention output");
+        cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key,
+            &value,
+            reference.output(),
+            CACHE_LEN,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("f32 attention");
+        workspace
+            .attention_into_on_stream(&cache, &query, output.output(), &stream)
+            .expect("compact attention");
+        stream.synchronize().expect("attention sync");
+        let reference = reference.copy_to_host(&stream).expect("copy f32 attention");
+        let actual = output
+            .copy_to_host(&stream)
+            .expect("copy compact attention");
+        let max_abs = reference
+            .iter()
+            .zip(actual.iter())
+            .map(|(reference, actual)| (reference - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.20,
+            "SM12x compact KV attention error too large at {CACHE_LEN} tokens: max_abs={max_abs}"
+        );
+        let cache_len = DeviceBuffer::from_host(&[CACHE_LEN as u32]).expect("device cache length");
+        workspace
+            .attention_indexed_into_on_stream(&cache, &query, &cache_len, output.output(), &stream)
+            .expect("indexed compact attention");
+        stream.synchronize().expect("indexed attention sync");
+        let indexed = output
+            .copy_to_host(&stream)
+            .expect("copy indexed compact attention");
+        let max_abs = reference
+            .iter()
+            .zip(indexed.iter())
+            .map(|(reference, actual)| (reference - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.20,
+            "SM12x indexed compact KV attention error too large at {CACHE_LEN} tokens: max_abs={max_abs}"
+        );
+
+        let probabilities =
+            DeviceBuffer::from_host(&vec![1.0 / CACHE_LEN as f32; Q_HEADS * CACHE_LEN])
+                .expect("probabilities");
+        let mut bench = Self {
+            stream,
+            start: CudaEvent::new().expect("start"),
+            stop: CudaEvent::new().expect("stop"),
+            query,
+            cache,
+            cache_len,
+            workspace,
+            output,
+            probabilities,
+        };
+        bench.assert_split_pv_correctness();
+        bench
+    }
+
+    fn run_attention(&mut self) {
+        self.workspace
+            .attention_into_on_stream(&self.cache, &self.query, self.output.output(), &self.stream)
+            .expect("compact attention");
+    }
+
+    fn run_qk(&mut self) {
+        self.workspace
+            .qk_scores_into_workspace_on_stream(&self.cache, &self.query, &self.stream)
+            .expect("compact QK");
+    }
+
+    fn run_indexed_attention(&mut self) {
+        self.workspace
+            .attention_indexed_into_on_stream(
+                &self.cache,
+                &self.query,
+                &self.cache_len,
+                self.output.output(),
+                &self.stream,
+            )
+            .expect("indexed compact attention");
+    }
+
+    fn run_probability_quantize_pv(&mut self) {
+        self.workspace
+            .pv_from_probabilities_into_on_stream(
+                &self.cache,
+                &self.probabilities,
+                self.output.output(),
+                &self.stream,
+            )
+            .expect("compact probability quantize and PV");
+    }
+
+    fn run_probability_quantize_pv_split(&mut self, pv_splits: usize) {
+        self.workspace
+            .pv_from_probabilities_split_into_on_stream(
+                &self.cache,
+                &self.probabilities,
+                self.output.output(),
+                pv_splits,
+                &self.stream,
+            )
+            .expect("split compact probability quantize and PV");
+    }
+
+    fn assert_split_pv_correctness(&mut self) {
+        self.run_probability_quantize_pv();
+        self.stream.synchronize().expect("unsplit PV sync");
+        let reference = self
+            .output
+            .copy_to_host(&self.stream)
+            .expect("copy unsplit PV")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for pv_splits in [2, 4, 8, 16, 32] {
+            self.run_probability_quantize_pv_split(pv_splits);
+            self.stream.synchronize().expect("split PV sync");
+            let actual = self
+                .output
+                .copy_to_host(&self.stream)
+                .expect("copy split PV");
+            let max_abs = reference
+                .iter()
+                .zip(actual.iter())
+                .map(|(reference, actual)| (reference - actual).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1.0e-4,
+                "split compact PV differs at {CACHE_LEN} tokens with {pv_splits} splits: max_abs={max_abs}"
+            );
+        }
+    }
+}
+
+impl<const CACHE_LEN: usize> BenchContext for CompactKvAttentionBench<CACHE_LEN> {
+    fn prepare(_num_chunks: usize) -> Self {
+        Self::new()
+    }
+
+    fn chunk_size() -> Option<usize> {
+        Some(1)
+    }
+}
+
+fn compact_attention_sample<const CACHE_LEN: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_attention();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.output.as_const_ptr());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
+fn compact_qk_sample<const CACHE_LEN: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_qk();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.workspace.scores().as_const_ptr());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
+fn compact_indexed_attention_sample<const CACHE_LEN: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_indexed_attention();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.output.as_const_ptr());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
+fn compact_pv_sample<const CACHE_LEN: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_probability_quantize_pv();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.output.as_const_ptr());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
+fn compact_pv_split_sample<const CACHE_LEN: usize, const PV_SPLITS: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_probability_quantize_pv_split(PV_SPLITS);
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.output.as_const_ptr());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
 /// Persistent native-tile K cache times an already quantized decode query.
 ///
 /// This is deliberately QK-only: it establishes the useful CUDA-MMA shape
@@ -614,11 +902,37 @@ fn causal_prefill_batched_sample(
 }
 
 fn main() {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("--abenchting-profile") {
+        match args.get(2).map(String::as_str) {
+            Some("4k") => {
+                let mut context = CompactKvAttentionBench::<4_096>::new();
+                context.run_attention();
+                context.stream.synchronize().expect("profile synchronize");
+                black_box(context.output.as_const_ptr());
+            }
+            Some("32k") => {
+                let mut context = CompactKvAttentionBench::<32_768>::new();
+                context.run_attention();
+                context.stream.synchronize().expect("profile synchronize");
+                black_box(context.output.as_const_ptr());
+            }
+            Some("128k") => {
+                let mut context = CompactKvAttentionBench::<131_072>::new();
+                context.run_attention();
+                context.stream.synchronize().expect("profile synchronize");
+                black_box(context.output.as_const_ptr());
+            }
+            profile => panic!("unknown compact KV profile {profile:?}"),
+        }
+        return;
+    }
+
     run_benchmark_main(
         BenchmarkMainOptions {
             suite: Some("nvfp4-kv-attention".to_string()),
             comparison_policy: ComparisonPolicy::None,
-            save_results: false,
+            save_results: true,
             runtime: BenchmarkRuntimeOptions {
                 warm_up_duration: Duration::from_millis(50),
                 benchmark_duration: Duration::from_millis(250),
@@ -644,6 +958,123 @@ fn main() {
                 group.bench_sample("f32_cache", f32_sample::<131_072>);
                 group.bench_sample("nvfp4_cache_fused_decode", nvfp4_sample::<131_072>);
             });
+            runner.group::<CompactKvAttentionBench<64>>("Qwen3.6 SM12x compact GQA 64", |group| {
+                group.bench_sample("sm12x_probability_quantize_pv_64", compact_pv_sample::<64>);
+                group.bench_sample(
+                    "sm12x_probability_quantize_pv_split32_64",
+                    compact_pv_split_sample::<64, 32>,
+                );
+            });
+            runner.group::<CompactKvAttentionBench<128>>(
+                "Qwen3.6 SM12x compact GQA 128",
+                |group| {
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_128",
+                        compact_pv_sample::<128>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split32_128",
+                        compact_pv_split_sample::<128, 32>,
+                    );
+                },
+            );
+            runner.group::<CompactKvAttentionBench<1_024>>(
+                "Qwen3.6 SM12x compact GQA 1K",
+                |group| {
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_1k",
+                        compact_pv_sample::<1_024>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split32_1k",
+                        compact_pv_split_sample::<1_024, 32>,
+                    );
+                },
+            );
+            runner.group::<CompactKvAttentionBench<4_096>>(
+                "Qwen3.6 SM12x compact GQA 4K",
+                |group| {
+                    group
+                        .bench_sample("sm12x_compact_decode_4k", compact_attention_sample::<4_096>);
+                    group.bench_sample(
+                        "sm12x_compact_indexed_decode_4k",
+                        compact_indexed_attention_sample::<4_096>,
+                    );
+                    group.bench_sample("sm12x_qk_4k", compact_qk_sample::<4_096>);
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_4k",
+                        compact_pv_sample::<4_096>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split4_4k",
+                        compact_pv_split_sample::<4_096, 4>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split32_4k",
+                        compact_pv_split_sample::<4_096, 32>,
+                    );
+                },
+            );
+            runner.group::<CompactKvAttentionBench<32_768>>(
+                "Qwen3.6 SM12x compact GQA 32K",
+                |group| {
+                    group.bench_sample(
+                        "sm12x_compact_decode_32k",
+                        compact_attention_sample::<32_768>,
+                    );
+                    group.bench_sample(
+                        "sm12x_compact_indexed_decode_32k",
+                        compact_indexed_attention_sample::<32_768>,
+                    );
+                    group.bench_sample("sm12x_qk_32k", compact_qk_sample::<32_768>);
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_32k",
+                        compact_pv_sample::<32_768>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split2_32k",
+                        compact_pv_split_sample::<32_768, 2>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split4_32k",
+                        compact_pv_split_sample::<32_768, 4>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split8_32k",
+                        compact_pv_split_sample::<32_768, 8>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split16_32k",
+                        compact_pv_split_sample::<32_768, 16>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split32_32k",
+                        compact_pv_split_sample::<32_768, 32>,
+                    );
+                },
+            );
+            runner.group::<CompactKvAttentionBench<131_072>>(
+                "Qwen3.6 SM12x compact GQA 128K",
+                |group| {
+                    group.bench_sample(
+                        "sm12x_compact_decode_128k",
+                        compact_attention_sample::<131_072>,
+                    );
+                    group.bench_sample(
+                        "sm12x_compact_indexed_decode_128k",
+                        compact_indexed_attention_sample::<131_072>,
+                    );
+                    group.bench_sample("sm12x_qk_128k", compact_qk_sample::<131_072>);
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_128k",
+                        compact_pv_sample::<131_072>,
+                    );
+                    group.bench_sample(
+                        "sm12x_probability_quantize_pv_split32_128k",
+                        compact_pv_split_sample::<131_072, 32>,
+                    );
+                },
+            );
             runner.group::<TileQkBench<4_096>>("SM12x FP4 QK tile 4K", |group| {
                 group.bench_sample("m16n8k64_cuda_mma", tile_qk_sample::<4_096>);
             });

@@ -1,7 +1,7 @@
 use infer::nvfp4::GpuSamplingRow;
 use infer::qwen3::qwen36::{
-    Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36DecodeState,
-    Qwen36Fp8AttentionStorage, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
+    Qwen36Fp8AttentionStorage, Qwen36PrefillRow, Qwen36SequenceState, Qwen36TextModel,
 };
 use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
@@ -52,7 +52,8 @@ struct DecodeBatchBench {
 
 struct ProductionDecodeCase {
     model: Rc<Qwen36TextModel>,
-    state: Qwen36DecodeState,
+    workspace: Qwen36DecodeBatchWorkspace,
+    state: Qwen36SequenceState,
     token: u32,
     start_position: usize,
 }
@@ -84,25 +85,57 @@ impl BenchContext for ProductionDecodeBench {
 impl ProductionDecodeCase {
     fn new(model: Rc<Qwen36TextModel>, max_context_tokens: usize, start_position: usize) -> Self {
         let state = model
-            .new_decode_state(max_context_tokens)
-            .expect("production decode state");
+            .new_sequence_state(max_context_tokens)
+            .expect("production sequence state");
+        let workspace = model
+            .new_decode_batch_workspace(1, max_context_tokens)
+            .expect("production decode workspace");
         let mut case = Self {
             model,
+            workspace,
             state,
             token: seed_tokens(1)[0],
             start_position,
         };
-        for _ in 0..start_position {
-            case.tick();
-        }
+        case.prefill_to_start();
         case
     }
 
+    fn prefill_to_start(&mut self) {
+        const PREFILL_CHUNK_TOKENS: usize = 2_048;
+        if self.start_position == 0 {
+            return;
+        }
+        let token_capacity = self.start_position.min(PREFILL_CHUNK_TOKENS);
+        let mut workspace = self
+            .model
+            .new_prefill_batch_workspace(1, token_capacity, self.state.max_tokens())
+            .expect("production prefill workspace");
+        let tokens = vec![self.token; token_capacity];
+        let mut consumed = 0;
+        while consumed < self.start_position {
+            let chunk_tokens = (self.start_position - consumed).min(token_capacity);
+            let mut rows = [Qwen36PrefillRow {
+                token_ids: &tokens[..chunk_tokens],
+                state: &mut self.state,
+            }];
+            self.model
+                .prefill_batch(&mut workspace, &mut rows)
+                .expect("production prefill");
+            consumed += chunk_tokens;
+        }
+    }
+
     fn tick(&mut self) {
+        let mut rows = [Qwen36DecodeRow {
+            token_id: self.token,
+            state: &mut self.state,
+        }];
         self.token = self
             .model
-            .decode_one_token(&mut self.state, self.token)
-            .expect("production decode tick")
+            .decode_batch(&mut self.workspace, &mut rows)
+            .and_then(|mut decoded| decoded.top1())
+            .expect("production decode tick")[0]
             .id;
         black_box(self.token);
     }
@@ -444,6 +477,11 @@ fn start_position() -> usize {
         .unwrap_or(DEFAULT_START_POSITION)
 }
 
+fn production_only() -> bool {
+    std::env::var("QWEN36_PRODUCTION_ONLY")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 fn main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -478,16 +516,19 @@ fn main() {
         }
         .expect("load Qwen3.6 model"),
     );
-    for batch in BATCH_SIZES {
-        validate_batch(&model, batch, batch, max_context_tokens);
+    let production_only = production_only();
+    if !production_only {
+        for batch in BATCH_SIZES {
+            validate_batch(&model, batch, batch, max_context_tokens);
+        }
+        validate_batch(&model, 3, 4, max_context_tokens);
+        validate_batch(&model, 5, 8, max_context_tokens);
     }
-    validate_batch(&model, 3, 4, max_context_tokens);
-    validate_batch(&model, 5, 8, max_context_tokens);
 
     let options = BenchmarkMainOptions {
         suite: Some("infer-qwen36-decode-batch".to_string()),
         comparison_policy: ComparisonPolicy::None,
-        save_results: false,
+        save_results: true,
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(1),
             benchmark_duration: Duration::from_millis(250),
@@ -514,6 +555,9 @@ fn main() {
                 .bench_sample("decode_one_token_1", production_decode_sample);
         });
 
+        if production_only {
+            return;
+        }
         runner.group::<DecodeBatchBench>("Qwen3.6 decode batching", |group| {
             for batch in BATCH_SIZES {
                 let batched_case = Rc::new(RefCell::new(DecodeBatchCase::new(
