@@ -6,6 +6,7 @@
 //! per-row symmetric INT8 quantization and the CUDA kernel accumulates exact
 //! integer dot products with `dp4a` before applying both scales.
 
+use crate::cublaslt::{CublasLt, Int8TnMatmulPlan};
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -232,6 +233,7 @@ pub struct BitNetMatrix {
     rows: usize,
     cols: usize,
     packed_weight: DeviceBuffer<u8>,
+    expanded_weight: DeviceBuffer<i8>,
     row_scales: DeviceBuffer<f32>,
 }
 
@@ -239,10 +241,19 @@ impl BitNetMatrix {
     /// Uploads an imported BitNet linear.
     pub fn from_packed(linear: &BitNetPackedLinear) -> Result<Self> {
         validate_shape(linear.out_features, linear.in_features)?;
+        let mut expanded_weight = Vec::with_capacity(linear.out_features * linear.in_features);
+        for row in 0..linear.out_features {
+            for col in 0..linear.in_features {
+                let byte = linear.packed_weight[row * (linear.in_features / 4) + col / 4];
+                let code = (byte >> ((col % 4) * 2)) & 0x03;
+                expanded_weight.push(i32::from(code) as i8 - 1);
+            }
+        }
         Ok(Self {
             rows: linear.out_features,
             cols: linear.in_features,
             packed_weight: DeviceBuffer::from_host(&linear.packed_weight)?,
+            expanded_weight: DeviceBuffer::from_host(&expanded_weight)?,
             row_scales: DeviceBuffer::from_host(&linear.row_scales)?,
         })
     }
@@ -259,7 +270,9 @@ impl BitNetMatrix {
 
     /// Device bytes occupied by weights and scales.
     pub fn device_bytes(&self) -> usize {
-        self.packed_weight.device_bytes() + self.row_scales.device_bytes()
+        self.packed_weight.device_bytes()
+            + self.expanded_weight.device_bytes()
+            + self.row_scales.device_bytes()
     }
 
     /// Quantizes `input` into `workspace` and computes the W2A8 batch linear.
@@ -316,6 +329,77 @@ impl BitNetMatrix {
                     batch_rows,
                     rows,
                     cols,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Quantizes activations and runs the batch through an INT8 tensor-core plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_f32_batch_int8_into_on_stream(
+        &self,
+        lt: &CublasLt,
+        plan: &Int8TnMatmulPlan,
+        input: DeviceInput<'_, f32>,
+        mut accumulator: DeviceOutput<'_, i32>,
+        mut output: DeviceOutput<'_, f32>,
+        batch_rows: usize,
+        workspace: &mut BitNetActivationWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if batch_rows == 0
+            || input.len() != batch_rows * self.cols
+            || accumulator.len() != batch_rows * self.rows
+            || output.len() != batch_rows * self.rows
+        {
+            return Err(Error::Shape {
+                label: "BitNet INT8 batch linear",
+                expected: format!(
+                    "input={} accumulator={} output={}",
+                    batch_rows * self.cols,
+                    batch_rows * self.rows,
+                    batch_rows * self.rows,
+                ),
+                actual: format!(
+                    "input={} accumulator={} output={}",
+                    input.len(),
+                    accumulator.len(),
+                    output.len(),
+                ),
+            });
+        }
+        workspace.validate(batch_rows, self.cols)?;
+        unsafe {
+            check_cuda(
+                "infer_bitnet_quantize_i8_f32_on_stream",
+                ffi::infer_bitnet_quantize_i8_f32_on_stream(
+                    input.as_const_ptr().cast(),
+                    workspace.quantized.ptr,
+                    workspace.dequant_scales.ptr,
+                    batch_rows as u32,
+                    self.cols as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        plan.run_on_stream(
+            lt,
+            &self.expanded_weight,
+            &workspace.quantized,
+            accumulator.buffer_mut().output(),
+            stream,
+        )?;
+        unsafe {
+            check_cuda(
+                "infer_bitnet_scale_i32_f32_on_stream",
+                ffi::infer_bitnet_scale_i32_f32_on_stream(
+                    accumulator.buffer().ptr,
+                    workspace.dequant_scales.ptr,
+                    self.row_scales.ptr,
+                    output.as_mut_ptr().cast(),
+                    batch_rows as u32,
+                    self.rows as u32,
                     stream.as_raw(),
                 ),
             )
@@ -435,6 +519,7 @@ fn dimension_overflow(label: &'static str) -> impl Fn(std::num::TryFromIntError)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GemmShape;
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -497,6 +582,111 @@ mod tests {
                 .map(|col| weights[row * 8 + col] as i32 * quantized[col])
                 .sum::<i32>();
             assert!((output[row] - sum as f32 * scale * 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn tiled_batch_gpu_matches_integer_reference() {
+        const ROWS: usize = 12;
+        const COLS: usize = 64;
+        const BATCH: usize = 9;
+        let weights = (0..ROWS * COLS)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<i8>>();
+        let packed = BitNetPackedLinear::from_hf_packed(
+            "test",
+            ROWS,
+            COLS,
+            &hf_pack(&weights, ROWS, COLS),
+            0.375,
+        )
+        .expect("pack weights");
+        let input = (0..BATCH * COLS)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect::<Vec<_>>();
+        let expected = packed.reference_f32(&input, BATCH).expect("reference");
+        let matrix = BitNetMatrix::from_packed(&packed).expect("upload weights");
+        let input = DeviceBuffer::from_host(&input).expect("upload input");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("allocate output");
+        let mut workspace =
+            BitNetActivationWorkspace::new(BATCH, COLS).expect("allocate activation workspace");
+        let stream = CudaStream::new_non_blocking().expect("create stream");
+        matrix
+            .run_f32_batch_into_on_stream(
+                input.input(),
+                output.output(),
+                BATCH,
+                &mut workspace,
+                &stream,
+            )
+            .expect("run tiled batch");
+        let actual = output.copy_to_host(&stream).expect("read output");
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = expected.abs().max(1.0) * 1.0e-5;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "output {index}: actual={actual} expected={expected} tolerance={tolerance}",
+            );
+        }
+    }
+
+    #[test]
+    fn int8_tensor_core_batch_matches_integer_reference() {
+        const ROWS: usize = 16;
+        const COLS: usize = 64;
+        const BATCH: usize = 16;
+        let weights = (0..ROWS * COLS)
+            .map(|index| match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<i8>>();
+        let packed = BitNetPackedLinear::from_hf_packed(
+            "test",
+            ROWS,
+            COLS,
+            &hf_pack(&weights, ROWS, COLS),
+            0.375,
+        )
+        .expect("pack weights");
+        let input = (0..BATCH * COLS)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 17.0)
+            .collect::<Vec<_>>();
+        let expected = packed.reference_f32(&input, BATCH).expect("reference");
+        let matrix = BitNetMatrix::from_packed(&packed).expect("upload weights");
+        let input = DeviceBuffer::from_host(&input).expect("upload input");
+        let mut accumulator = DeviceBuffer::zeroed(BATCH * ROWS).expect("allocate accumulator");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("allocate output");
+        let mut workspace =
+            BitNetActivationWorkspace::new(BATCH, COLS).expect("allocate activation workspace");
+        let lt = CublasLt::new().expect("create cuBLASLt handle");
+        let plan = Int8TnMatmulPlan::new(&lt, GemmShape::new(ROWS, BATCH, COLS), 1 << 20)
+            .expect("create INT8 plan");
+        let stream = CudaStream::new_non_blocking().expect("create stream");
+        matrix
+            .run_f32_batch_int8_into_on_stream(
+                &lt,
+                &plan,
+                input.input(),
+                accumulator.output(),
+                output.output(),
+                BATCH,
+                &mut workspace,
+                &stream,
+            )
+            .expect("run INT8 batch");
+        let actual = output.copy_to_host(&stream).expect("read output");
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = expected.abs().max(1.0) * 1.0e-5;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "output {index}: actual={actual} expected={expected} tolerance={tolerance}",
+            );
         }
     }
 

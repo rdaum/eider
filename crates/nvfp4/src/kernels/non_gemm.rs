@@ -1325,6 +1325,70 @@ pub fn split_qkv_f32_into_on_stream(
     }
 }
 
+/// Splits row-major fused Q/K/V rows into three row-major batches on `stream`.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    batch_rows: usize,
+    q_width: usize,
+    kv_width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_rows
+        .checked_mul(q_width + 2 * kv_width)
+        .ok_or_else(|| Error::Shape {
+            label: "split QKV batch",
+            expected: "batch_rows * fused_width without overflow".to_string(),
+            actual: format!("batch_rows={batch_rows} q_width={q_width} kv_width={kv_width}"),
+        })?;
+    if batch_rows == 0
+        || q_width == 0
+        || kv_width == 0
+        || input.len() != input_len
+        || q.len() != batch_rows * q_width
+        || k.len() != batch_rows * kv_width
+        || v.len() != batch_rows * kv_width
+        || batch_rows > u32::MAX as usize
+        || q_width > u32::MAX as usize
+        || kv_width > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "split QKV batch",
+            expected: format!(
+                "input={input_len} q={} k={} v={}",
+                batch_rows * q_width,
+                batch_rows * kv_width,
+                batch_rows * kv_width,
+            ),
+            actual: format!(
+                "input={} q={} k={} v={} batch_rows={batch_rows}",
+                input.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_split_qkv_f32_batch_on_stream",
+            ffi::infer_split_qkv_f32_batch_on_stream(
+                input.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                batch_rows as u32,
+                q_width as u32,
+                kv_width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues MoE softmax top-k routing into fixed device output buffers.
 ///
 /// `out_indices` and `out_weights` must both have length `k`. Weights match
@@ -5836,6 +5900,56 @@ pub fn prefill_gqa_attention_f32_into(
     }
 }
 
+/// Enqueues causal grouped-query prefill attention on `stream`.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gqa_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<f32>,
+    value_cache: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    tokens: usize,
+    start_position: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_len = prefill_gqa_attention_len(
+        query,
+        key_cache,
+        value_cache,
+        tokens,
+        start_position,
+        q_heads,
+        kv_heads,
+        head_dim,
+    )?;
+    if output.len() != query_len {
+        return Err(Error::Shape {
+            label: "prefill GQA output",
+            expected: format!("{query_len} values"),
+            actual: format!("{} values", output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_prefill_gqa_attention_f32_on_stream",
+            ffi::infer_prefill_gqa_attention_f32_on_stream(
+                query.ptr,
+                key_cache.ptr,
+                value_cache.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                start_position as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Appends flattened ragged K/V rows into per-sequence cache pointer tables.
 #[allow(clippy::too_many_arguments)]
 pub fn append_ragged_kv_f32_into_on_stream(
@@ -7069,6 +7183,45 @@ pub fn pack_token_heads_bf16_at_offset_into_on_stream(
                 heads as u32,
                 head_dim as u32,
                 input_row_offset as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Packs `[tokens, heads, head_dim]` f32 values as BF16 `[heads, head_dim, tokens]`.
+pub fn pack_value_heads_bf16_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u16>,
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = checked_attention_product("packed value heads", &[tokens, heads, head_dim])?;
+    if len == 0
+        || len > u32::MAX as usize
+        || input.len() < len
+        || output.len() < len
+        || tokens > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "packed value heads",
+            expected: format!("input and output >= {len} values"),
+            actual: format!("input={} output={}", input.len(), output.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_pack_value_heads_bf16_on_stream",
+            ffi::infer_pack_value_heads_bf16_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
                 stream.as_raw(),
             ),
         )

@@ -90,6 +90,58 @@ __global__ void bitnet_w2a8_linear_f32_kernel(const std::int8_t* input,
     }
 }
 
+template <std::uint32_t kBatchTile>
+__global__ void bitnet_w2a8_linear_f32_batch_tiled_kernel(
+    const std::int8_t* input,
+    const float* input_scales,
+    const std::uint8_t* weight,
+    const float* weight_scales,
+    float* output,
+    std::uint32_t batch_rows,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    constexpr std::uint32_t kWarpsPerBlock = 8;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    if (row >= rows) {
+        return;
+    }
+    const std::uint32_t batch_start = blockIdx.y * kBatchTile;
+    const auto* row_weight = weight + static_cast<std::size_t>(row) * (cols / 4);
+
+    int sums[kBatchTile] = {};
+    for (std::uint32_t packed_col = lane; packed_col < cols / 4; packed_col += 32) {
+        const int packed_weight = static_cast<int>(unpack_ternary(row_weight[packed_col]));
+#pragma unroll
+        for (std::uint32_t index = 0; index < kBatchTile; ++index) {
+            const std::uint32_t batch = batch_start + index;
+            if (batch < batch_rows) {
+                const auto* input4 = reinterpret_cast<const int*>(
+                    input + static_cast<std::size_t>(batch) * cols);
+                sums[index] = __dp4a(packed_weight, input4[packed_col], sums[index]);
+            }
+        }
+    }
+#pragma unroll
+    for (std::uint32_t index = 0; index < kBatchTile; ++index) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sums[index] += __shfl_down_sync(0xffffffffu, sums[index], offset);
+        }
+    }
+    if (lane == 0) {
+        const float weight_scale = weight_scales[row];
+#pragma unroll
+        for (std::uint32_t index = 0; index < kBatchTile; ++index) {
+            const std::uint32_t batch = batch_start + index;
+            if (batch < batch_rows) {
+                output[static_cast<std::size_t>(batch) * rows + row] =
+                    static_cast<float>(sums[index]) * input_scales[batch] * weight_scale;
+            }
+        }
+    }
+}
+
 __global__ void bitnet_relu_squared_mul_halves_f32_kernel(
     const float* input,
     float* output,
@@ -105,6 +157,23 @@ __global__ void bitnet_relu_squared_mul_halves_f32_kernel(
     const std::size_t base = static_cast<std::size_t>(row) * cols * 2;
     const float gate = fmaxf(input[base + col], 0.0f);
     output[index] = gate * gate * input[base + cols + col];
+}
+
+__global__ void bitnet_scale_i32_f32_kernel(const std::int32_t* input,
+                                             const float* input_scales,
+                                             const float* weight_scales,
+                                             float* output,
+                                             std::uint32_t batch_rows,
+                                             std::uint32_t rows) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = batch_rows * rows;
+    if (index >= total) {
+        return;
+    }
+    const std::uint32_t batch = index / rows;
+    const std::uint32_t row = index - batch * rows;
+    output[index] = static_cast<float>(input[index]) *
+                    input_scales[batch] * weight_scales[row];
 }
 
 }  // namespace
@@ -143,9 +212,18 @@ extern "C" cudaError_t infer_bitnet_w2a8_linear_f32_on_stream(
     }
     constexpr std::uint32_t kWarpsPerBlock = 8;
     constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
-    const dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock, batch_rows);
-    bitnet_w2a8_linear_f32_kernel<<<grid, kThreads, 0, stream>>>(
-        input, input_scales, weight, weight_scales, output, rows, cols);
+    if (batch_rows == 1) {
+        const dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock, 1);
+        bitnet_w2a8_linear_f32_kernel<<<grid, kThreads, 0, stream>>>(
+            input, input_scales, weight, weight_scales, output, rows, cols);
+    } else {
+        constexpr std::uint32_t kBatchTile = 8;
+        const dim3 grid((rows + kWarpsPerBlock - 1) / kWarpsPerBlock,
+                        (batch_rows + kBatchTile - 1) / kBatchTile);
+        bitnet_w2a8_linear_f32_batch_tiled_kernel<kBatchTile><<<grid, kThreads, 0, stream>>>(
+            input, input_scales, weight, weight_scales, output,
+            batch_rows, rows, cols);
+    }
     return cudaGetLastError();
 }
 
@@ -163,5 +241,25 @@ extern "C" cudaError_t infer_bitnet_relu_squared_mul_halves_f32_on_stream(
     const std::uint32_t blocks = (total + kThreads - 1) / kThreads;
     bitnet_relu_squared_mul_halves_f32_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, batch_rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_bitnet_scale_i32_f32_on_stream(
+    const std::int32_t* input,
+    const float* input_scales,
+    const float* weight_scales,
+    float* output,
+    std::uint32_t batch_rows,
+    std::uint32_t rows,
+    cudaStream_t stream) {
+    if (input == nullptr || input_scales == nullptr || weight_scales == nullptr ||
+        output == nullptr || batch_rows == 0 || rows == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t total = batch_rows * rows;
+    const std::uint32_t blocks = (total + kThreads - 1) / kThreads;
+    bitnet_scale_i32_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, input_scales, weight_scales, output, batch_rows, rows);
     return cudaGetLastError();
 }

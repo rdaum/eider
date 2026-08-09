@@ -52,10 +52,13 @@ pub(crate) const CUBLAS_OP_T: i32 = 1;
 pub(crate) const CUDA_R_16F: cudaDataType_t = 2;
 pub(crate) const CUDA_R_16BF: cudaDataType_t = 14;
 pub(crate) const CUDA_R_32F: cudaDataType_t = 0;
+pub(crate) const CUDA_R_8I: cudaDataType_t = 3;
+pub(crate) const CUDA_R_32I: cudaDataType_t = 10;
 #[allow(dead_code)]
 pub(crate) const CUDA_R_8F_E4M3: cudaDataType_t = 28;
 pub(crate) const CUDA_R_4F_E2M1: cudaDataType_t = 33;
 pub(crate) const CUBLAS_COMPUTE_32F: cublasComputeType_t = 68;
+pub(crate) const CUBLAS_COMPUTE_32I: cublasComputeType_t = 72;
 
 pub(crate) const CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3: i32 = 1;
 
@@ -112,6 +115,15 @@ unsafe extern "C" {
         output: *mut f32,
         batch_rows: u32,
         cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_bitnet_scale_i32_f32_on_stream(
+        input: *const i32,
+        input_scales: *const f32,
+        weight_scales: *const f32,
+        output: *mut f32,
+        batch_rows: u32,
+        rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_block_fp8_linear_f32_on_stream(
@@ -1202,6 +1214,16 @@ unsafe extern "C" {
         kv_len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_split_qkv_f32_batch_on_stream(
+        input: *const f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        batch_rows: u32,
+        q_width: u32,
+        kv_width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_moe_topk_f32_on_stream(
         logits: *const f32,
         out_indices: *mut u32,
@@ -1947,6 +1969,18 @@ unsafe extern "C" {
         kv_heads: u32,
         head_dim: u32,
     ) -> cudaError_t;
+    pub(crate) fn infer_prefill_gqa_attention_f32_on_stream(
+        query: *const f32,
+        key_cache: *const f32,
+        value_cache: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        start_position: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_append_ragged_kv_f32_on_stream(
         key: *const f32,
         value: *const f32,
@@ -2089,6 +2123,14 @@ unsafe extern "C" {
         heads: u32,
         head_dim: u32,
         input_row_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_pack_value_heads_bf16_on_stream(
+        input: *const f32,
+        output: *mut u16,
+        tokens: u32,
+        heads: u32,
+        head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_causal_window_softmax_f32_on_stream(

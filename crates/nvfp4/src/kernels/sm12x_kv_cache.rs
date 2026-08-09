@@ -2198,6 +2198,66 @@ mod tests {
     }
 
     #[test]
+    fn compact_mma_attention_tracks_f32_gqa_at_bitnet_shape_and_context() {
+        const TOKENS: usize = 4_016;
+        const KV_HEADS: usize = 5;
+        const HEAD_DIM: usize = 128;
+        const Q_HEADS: usize = 20;
+        let width = KV_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * width)
+            .map(|index| ((index * 31 % 509) as f32 - 254.0) / 768.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * width)
+            .map(|index| ((index * 43 % 503) as f32 - 251.0) / 640.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 17 % 251) as f32 - 125.0) / 576.0)
+            .collect::<Vec<_>>();
+
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let key = DeviceBuffer::from_host(&key_host).expect("K cache");
+        let value = DeviceBuffer::from_host(&value_host).expect("V cache");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let mut cache =
+            Sm12xKvCache::new(TOKENS, KV_HEADS, HEAD_DIM).expect("BitNet compact cache");
+        cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, TOKENS, &stream)
+            .expect("append BitNet cache");
+
+        let mut expected = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("f32 output");
+        crate::cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key,
+            &value,
+            expected.output(),
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("f32 attention");
+        let mut actual = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("FP4 output");
+        let mut workspace = Sm12xKvAttentionWorkspace::new_gqa(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+            .expect("workspace");
+        workspace
+            .attention_into_on_stream(&cache, &query, actual.output(), &stream)
+            .expect("compact attention");
+
+        let expected = expected.copy_to_host(&stream).expect("f32 copy");
+        let actual = actual.copy_to_host(&stream).expect("FP4 copy");
+        let max_abs = expected
+            .iter()
+            .zip(actual.iter())
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.25,
+            "BitNet-shape compact FP4 attention error too large: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
     fn dense_row_offsets_match_independent_cache_and_attention() {
         const MAX_TOKENS: usize = 4;
         const KV_HEADS: usize = 1;

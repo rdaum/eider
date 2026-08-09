@@ -35,7 +35,7 @@ pub use bitnet::{
 pub use cublaslt::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan,
     Fp4TnMatmul, Fp4TnMatmulPlan, Fp4TnPlanMetadata, Fp8TnMatmulPlan, GemmShape, InferenceGemm,
-    Nvfp4TnInputs,
+    Int8TnMatmulPlan, Nvfp4TnInputs,
 };
 pub use cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
@@ -122,7 +122,8 @@ pub use kernels::non_gemm::{
     nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
     nvfp4_w4a16_top1_configured_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream, pack_token_heads_bf16_into_on_stream,
-    prefill_gqa_attention_f32_into, prepend_u32_rows_into_on_stream,
+    pack_value_heads_bf16_into_on_stream, prefill_gqa_attention_f32_into,
+    prefill_gqa_attention_f32_into_on_stream, prepend_u32_rows_into_on_stream,
     quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
@@ -166,9 +167,10 @@ pub use kernels::non_gemm::{
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, softmax_f32_in_place_on_stream,
     softplus_scale_heads_f32_into_on_stream, softplus_scale_heads_f32_prefix_into_on_stream,
     speculative_accept_argmax_f32_into_on_stream, split_q_gate_f32_into_on_stream,
-    split_qkv_f32_into_on_stream, step37_sigmoid_top8_f32_batch_into_on_stream,
-    step37_sigmoid_top8_f32_into_on_stream, store_u32_column_into_on_stream,
-    unpack_heads_f32_at_offset_into_on_stream, unpack_heads_f32_into_on_stream,
+    split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
+    step37_sigmoid_top8_f32_batch_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
+    store_u32_column_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,
+    unpack_heads_f32_into_on_stream,
     unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream,
     unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream,
 };

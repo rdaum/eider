@@ -1,12 +1,16 @@
 //! BitNet b1.58 dense decoder using checkpoint-exact ternary GPU linears.
 
-use crate::kv_cache::KvCache;
 use nvfp4::{
-    BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CudaStream, DeviceBuffer, Error,
-    ModelOptCheckpoint, Result, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    Bf16TnMatmulPlan, BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt,
+    CudaStream, DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, ModelOptCheckpoint, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, pack_token_heads_bf16_into_on_stream,
     relu_squared_mul_halves_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_f32_indexed_into_on_stream, split_qkv_f32_into_on_stream,
+    rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
+    unpack_heads_f32_at_offset_into_on_stream,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -147,12 +151,13 @@ struct BitNetLayer {
 
 /// Mutable state for one BitNet sequence.
 pub struct BitNetDecodeState {
-    kv_cache: KvCache,
+    kv_cache: Vec<Sm12xKvCache>,
     position: usize,
     token: DeviceBuffer<u32>,
     position_device: DeviceBuffer<u32>,
     stream: CudaStream,
     workspace: BitNetDecodeWorkspace,
+    prefill_workspace: Option<BitNetPrefillWorkspace>,
 }
 
 struct BitNetDecodeWorkspace {
@@ -181,6 +186,53 @@ struct BitNetDecodeWorkspace {
     output_activation: BitNetActivationWorkspace,
     gate_up_activation: BitNetActivationWorkspace,
     down_activation: BitNetActivationWorkspace,
+    compact_attention: Sm12xKvAttentionWorkspace,
+}
+
+struct BitNetPrefillWorkspace {
+    rows: usize,
+    cache_tokens: usize,
+    lt: CublasLt,
+    qkv_plan: Int8TnMatmulPlan,
+    output_plan: Int8TnMatmulPlan,
+    gate_up_plan: Int8TnMatmulPlan,
+    down_plan: Int8TnMatmulPlan,
+    qk_plan: Bf16TnMatmulPlan,
+    pv_plan: Bf16TnMatmulPlan,
+    token_ids: DeviceBuffer<u32>,
+    hidden: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    qkv: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+    k: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    q_rope: DeviceBuffer<f32>,
+    k_rope: DeviceBuffer<f32>,
+    attention: DeviceBuffer<f32>,
+    packed_query: DeviceBuffer<u16>,
+    packed_key: DeviceBuffer<u16>,
+    packed_value: DeviceBuffer<u16>,
+    attention_scores: DeviceBuffer<f32>,
+    packed_probabilities: DeviceBuffer<u16>,
+    packed_attention: DeviceBuffer<f32>,
+    attention_normed: DeviceBuffer<f32>,
+    projected: DeviceBuffer<f32>,
+    residual: DeviceBuffer<f32>,
+    ffn_normed: DeviceBuffer<f32>,
+    gate_up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    activated_normed: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
+    final_hidden: DeviceBuffer<f32>,
+    qkv_accumulator: DeviceBuffer<i32>,
+    output_accumulator: DeviceBuffer<i32>,
+    gate_up_accumulator: DeviceBuffer<i32>,
+    down_accumulator: DeviceBuffer<i32>,
+    qkv_activation: BitNetActivationWorkspace,
+    output_activation: BitNetActivationWorkspace,
+    gate_up_activation: BitNetActivationWorkspace,
+    down_activation: BitNetActivationWorkspace,
+    compact_attention: Sm12xKvAttentionWorkspace,
 }
 
 impl BitNetModel {
@@ -224,7 +276,11 @@ impl BitNetModel {
         BitNetDecodeState::new(self.config, max_tokens)
     }
 
-    /// Runs one token through the model and leaves full logits in `state`.
+    /// Runs one token through the transformer and leaves final hidden state ready.
+    ///
+    /// The vocabulary projection is deferred until the caller selects greedy
+    /// top-1 or sampled logits. This avoids scanning the tied BF16 embedding
+    /// table for intermediate prompt tokens.
     pub fn forward_one(&self, state: &mut BitNetDecodeState, token_id: u32) -> Result<()> {
         if token_id as usize >= self.config.vocab || state.position >= self.config.max_context {
             return Err(Error::Shape {
@@ -248,12 +304,11 @@ impl BitNetModel {
             state.workspace.hidden.output(),
             &state.stream,
         )?;
-        for (layer_index, layer) in self.layers.iter().enumerate() {
+        for (layer, kv_cache) in self.layers.iter().zip(&mut state.kv_cache) {
             state.workspace.run_layer(
                 self.config,
-                layer_index,
                 layer,
-                &mut state.kv_cache,
+                kv_cache,
                 &state.position_device,
                 &state.stream,
             )?;
@@ -267,20 +322,12 @@ impl BitNetModel {
             self.config.rms_eps,
             &state.stream,
         )?;
-        bf16_linear_logits_f32_into_on_stream(
-            &state.workspace.final_hidden,
-            &self.embeddings,
-            state.workspace.logits.output(),
-            self.config.vocab,
-            self.config.hidden,
-            &state.stream,
-        )?;
         state.stream.synchronize()?;
         state.position += 1;
         Ok(())
     }
 
-    /// Sequentially prefills a prompt, preserving exact decode semantics.
+    /// Prefills a contiguous prompt chunk through the batched GPU path.
     pub fn prefill(&self, state: &mut BitNetDecodeState, token_ids: &[u32]) -> Result<()> {
         if token_ids.is_empty() {
             return Err(Error::Shape {
@@ -289,20 +336,90 @@ impl BitNetModel {
                 actual: "zero tokens".to_string(),
             });
         }
-        for &token in token_ids {
-            self.forward_one(state, token)?;
+        if token_ids
+            .iter()
+            .any(|&token| token as usize >= self.config.vocab)
+            || state.position + token_ids.len() > self.config.max_context
+        {
+            return Err(Error::Shape {
+                label: "BitNet prefill",
+                expected: format!(
+                    "tokens < {} and final position <= {}",
+                    self.config.vocab, self.config.max_context
+                ),
+                actual: format!(
+                    "start={} tokens={} max_token={:?}",
+                    state.position,
+                    token_ids.len(),
+                    token_ids.iter().max()
+                ),
+            });
         }
+        let rows = token_ids.len();
+        let start_position = state.position;
+        let cache_tokens = start_position + rows;
+        let mut workspace = match state.prefill_workspace.take() {
+            Some(workspace) if workspace.rows == rows && workspace.cache_tokens == cache_tokens => {
+                workspace
+            }
+            _ => BitNetPrefillWorkspace::new(
+                self.config,
+                rows,
+                cache_tokens,
+                state.kv_cache[0].max_tokens(),
+            )?,
+        };
+        workspace.token_ids.copy_from_host(token_ids)?;
+        copy_bf16_rows_to_f32_indexed_into_on_stream(
+            self.config.vocab,
+            self.config.hidden,
+            &self.embeddings,
+            &workspace.token_ids,
+            workspace.hidden.output(),
+            &state.stream,
+        )?;
+        for (layer, kv_cache) in self.layers.iter().zip(&mut state.kv_cache) {
+            workspace.run_layer(self.config, layer, kv_cache, start_position, &state.stream)?;
+        }
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.config.hidden,
+            &workspace.hidden,
+            &self.final_norm,
+            workspace.final_hidden.output(),
+            self.config.rms_eps,
+            &state.stream,
+        )?;
+        copy_row_f32_into_on_stream(
+            rows,
+            self.config.hidden,
+            rows - 1,
+            &workspace.final_hidden,
+            state.workspace.final_hidden.output(),
+            &state.stream,
+        )?;
+        state.stream.synchronize()?;
+        state.position += rows;
+        state.prefill_workspace = Some(workspace);
         Ok(())
     }
 
     /// Copies the most recent full vocabulary logits to the host.
-    pub fn logits_to_host(&self, state: &BitNetDecodeState) -> Result<Vec<f32>> {
+    pub fn logits_to_host(&self, state: &mut BitNetDecodeState) -> Result<Vec<f32>> {
         if state.position == 0 {
             return Err(Error::Format {
                 label: "BitNet logits",
                 detail: "no token has been evaluated".to_string(),
             });
         }
+        bf16_linear_logits_f32_into_on_stream(
+            &state.workspace.final_hidden,
+            &self.embeddings,
+            state.workspace.logits.output(),
+            self.config.vocab,
+            self.config.hidden,
+            &state.stream,
+        )?;
         Ok(state
             .workspace
             .logits
@@ -312,6 +429,14 @@ impl BitNetModel {
 
     /// Returns the argmax token and logit without copying the vocabulary.
     pub fn argmax_with_logit(&self, state: &mut BitNetDecodeState) -> Result<(u32, f32)> {
+        bf16_linear_logits_f32_into_on_stream(
+            &state.workspace.final_hidden,
+            &self.embeddings,
+            state.workspace.logits.output(),
+            self.config.vocab,
+            self.config.hidden,
+            &state.stream,
+        )?;
         argmax_f32_into_on_stream(
             &state.workspace.logits,
             state.workspace.argmax_index.output(),
@@ -326,13 +451,17 @@ impl BitNetModel {
 
 impl BitNetDecodeState {
     fn new(config: BitNetConfig, max_tokens: usize) -> Result<Self> {
+        let kv_cache = (0..config.layers)
+            .map(|_| Sm12xKvCache::new(max_tokens, config.kv_heads, config.head_dim))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            kv_cache: KvCache::new(config.layers, max_tokens, config.kv_heads, config.head_dim)?,
+            kv_cache,
             position: 0,
             token: DeviceBuffer::from_host(&[0])?,
             position_device: DeviceBuffer::from_host(&[0])?,
             stream: CudaStream::new_non_blocking()?,
-            workspace: BitNetDecodeWorkspace::new(config)?,
+            workspace: BitNetDecodeWorkspace::new(config, max_tokens)?,
+            prefill_workspace: None,
         })
     }
 
@@ -348,15 +477,17 @@ impl BitNetDecodeState {
 
     /// Device bytes owned by sequence-specific state and workspace.
     pub fn device_bytes(&self) -> usize {
-        let cache = (0..self.kv_cache.n_layers())
-            .map(|index| {
-                self.kv_cache
-                    .layer(index)
-                    .expect("existing BitNet KV layer")
-                    .device_bytes()
-            })
+        let cache = self
+            .kv_cache
+            .iter()
+            .map(Sm12xKvCache::device_bytes)
             .sum::<usize>();
-        cache + self.workspace.device_bytes()
+        cache
+            + self.workspace.device_bytes()
+            + self
+                .prefill_workspace
+                .as_ref()
+                .map_or(0, BitNetPrefillWorkspace::device_bytes)
     }
 }
 
@@ -437,7 +568,7 @@ impl BitNetLayer {
 }
 
 impl BitNetDecodeWorkspace {
-    fn new(config: BitNetConfig) -> Result<Self> {
+    fn new(config: BitNetConfig, max_tokens: usize) -> Result<Self> {
         let q_width = config.q_width();
         let kv_width = config.kv_width();
         Ok(Self {
@@ -466,15 +597,20 @@ impl BitNetDecodeWorkspace {
             output_activation: BitNetActivationWorkspace::new(1, q_width)?,
             gate_up_activation: BitNetActivationWorkspace::new(1, config.hidden)?,
             down_activation: BitNetActivationWorkspace::new(1, config.intermediate)?,
+            compact_attention: Sm12xKvAttentionWorkspace::new_gqa(
+                max_tokens,
+                config.q_heads,
+                config.kv_heads,
+                config.head_dim,
+            )?,
         })
     }
 
     fn run_layer(
         &mut self,
         config: BitNetConfig,
-        layer_index: usize,
         weights: &BitNetLayer,
-        kv_cache: &mut KvCache,
+        kv_cache: &mut Sm12xKvCache,
         position_device: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -519,17 +655,13 @@ impl BitNetDecodeWorkspace {
             config.rope_theta,
             stream,
         )?;
-        kv_cache
-            .layer_mut(layer_index)?
-            .append_on_stream(&self.k_rope, &self.v, stream)?;
-        kv_cache
-            .layer(layer_index)?
-            .decode_attention_into_on_stream(
-                &self.q_rope,
-                self.attention.output(),
-                config.q_heads,
-                stream,
-            )?;
+        kv_cache.append_on_stream(&self.k_rope, &self.v, stream)?;
+        self.compact_attention.attention_into_on_stream(
+            kv_cache,
+            &self.q_rope,
+            self.attention.output(),
+            stream,
+        )?;
         rms_norm_f32_into_on_stream(
             1,
             config.q_width(),
@@ -620,6 +752,378 @@ impl BitNetDecodeWorkspace {
             + self.output_activation.device_bytes()
             + self.gate_up_activation.device_bytes()
             + self.down_activation.device_bytes()
+            + self.compact_attention.device_bytes()
+    }
+}
+
+impl BitNetPrefillWorkspace {
+    fn new(
+        config: BitNetConfig,
+        rows: usize,
+        cache_tokens: usize,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let q_width = config.q_width();
+        let kv_width = config.kv_width();
+        let lt = CublasLt::new()?;
+        const WORKSPACE_LIMIT: u64 = 32 * 1024 * 1024;
+        let qkv_plan = Int8TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(q_width + 2 * kv_width, rows, config.hidden),
+            WORKSPACE_LIMIT,
+        )?;
+        let output_plan = Int8TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(config.hidden, rows, q_width),
+            WORKSPACE_LIMIT,
+        )?;
+        let gate_up_plan = Int8TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(config.intermediate * 2, rows, config.hidden),
+            WORKSPACE_LIMIT,
+        )?;
+        let down_plan = Int8TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(config.hidden, rows, config.intermediate),
+            WORKSPACE_LIMIT,
+        )?;
+        let queries_per_kv = config.q_heads / config.kv_heads;
+        let qk_plan = Bf16TnMatmulPlan::new_strided_batch(
+            &lt,
+            GemmShape::new(cache_tokens, rows * queries_per_kv, config.head_dim),
+            config.kv_heads,
+            cache_tokens * config.head_dim,
+            queries_per_kv * rows * config.head_dim,
+            queries_per_kv * rows * cache_tokens,
+            4 * 1024 * 1024,
+        )?;
+        let pv_plan = Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
+            &lt,
+            GemmShape::new(config.head_dim, rows * queries_per_kv, cache_tokens),
+            cache_tokens,
+            config.kv_heads,
+            config.head_dim * cache_tokens,
+            queries_per_kv * rows * cache_tokens,
+            queries_per_kv * rows * config.head_dim,
+            4 * 1024 * 1024,
+        )?;
+        Ok(Self {
+            rows,
+            cache_tokens,
+            lt,
+            qkv_plan,
+            output_plan,
+            gate_up_plan,
+            down_plan,
+            qk_plan,
+            pv_plan,
+            token_ids: DeviceBuffer::zeroed(rows)?,
+            hidden: DeviceBuffer::zeroed(rows * config.hidden)?,
+            normed: DeviceBuffer::zeroed(rows * config.hidden)?,
+            qkv: DeviceBuffer::zeroed(rows * (q_width + 2 * kv_width))?,
+            q: DeviceBuffer::zeroed(rows * q_width)?,
+            k: DeviceBuffer::zeroed(rows * kv_width)?,
+            v: DeviceBuffer::zeroed(rows * kv_width)?,
+            q_rope: DeviceBuffer::zeroed(rows * q_width)?,
+            k_rope: DeviceBuffer::zeroed(rows * kv_width)?,
+            attention: DeviceBuffer::zeroed(rows * q_width)?,
+            packed_query: DeviceBuffer::zeroed(rows * q_width)?,
+            packed_key: DeviceBuffer::zeroed(cache_tokens * kv_width)?,
+            packed_value: DeviceBuffer::zeroed(cache_tokens * kv_width)?,
+            attention_scores: DeviceBuffer::zeroed(rows * config.q_heads * cache_tokens)?,
+            packed_probabilities: DeviceBuffer::zeroed(rows * config.q_heads * cache_tokens)?,
+            packed_attention: DeviceBuffer::zeroed(rows * q_width)?,
+            attention_normed: DeviceBuffer::zeroed(rows * q_width)?,
+            projected: DeviceBuffer::zeroed(rows * config.hidden)?,
+            residual: DeviceBuffer::zeroed(rows * config.hidden)?,
+            ffn_normed: DeviceBuffer::zeroed(rows * config.hidden)?,
+            gate_up: DeviceBuffer::zeroed(rows * config.intermediate * 2)?,
+            activated: DeviceBuffer::zeroed(rows * config.intermediate)?,
+            activated_normed: DeviceBuffer::zeroed(rows * config.intermediate)?,
+            down: DeviceBuffer::zeroed(rows * config.hidden)?,
+            final_hidden: DeviceBuffer::zeroed(rows * config.hidden)?,
+            qkv_accumulator: DeviceBuffer::zeroed(rows * (q_width + 2 * kv_width))?,
+            output_accumulator: DeviceBuffer::zeroed(rows * config.hidden)?,
+            gate_up_accumulator: DeviceBuffer::zeroed(rows * config.intermediate * 2)?,
+            down_accumulator: DeviceBuffer::zeroed(rows * config.hidden)?,
+            qkv_activation: BitNetActivationWorkspace::new(rows, config.hidden)?,
+            output_activation: BitNetActivationWorkspace::new(rows, q_width)?,
+            gate_up_activation: BitNetActivationWorkspace::new(rows, config.hidden)?,
+            down_activation: BitNetActivationWorkspace::new(rows, config.intermediate)?,
+            compact_attention: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_tokens,
+                config.q_heads,
+                config.kv_heads,
+                config.head_dim,
+                16,
+            )?,
+        })
+    }
+
+    fn run_layer(
+        &mut self,
+        config: BitNetConfig,
+        weights: &BitNetLayer,
+        kv_cache: &mut Sm12xKvCache,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        rms_norm_f32_into_on_stream(
+            self.rows,
+            config.hidden,
+            &self.hidden,
+            &weights.input_norm,
+            self.normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.qkv.run_f32_batch_int8_into_on_stream(
+            &self.lt,
+            &self.qkv_plan,
+            self.normed.input(),
+            self.qkv_accumulator.output(),
+            self.qkv.output(),
+            self.rows,
+            &mut self.qkv_activation,
+            stream,
+        )?;
+        split_qkv_f32_batch_into_on_stream(
+            &self.qkv,
+            self.q.output(),
+            self.k.output(),
+            self.v.output(),
+            self.rows,
+            config.q_width(),
+            config.kv_width(),
+            stream,
+        )?;
+        rope_neox_sequence_f32_into_on_stream(
+            self.rows,
+            config.q_heads,
+            config.head_dim,
+            &self.q,
+            self.q_rope.output(),
+            start_position,
+            config.rope_theta,
+            stream,
+        )?;
+        rope_neox_sequence_f32_into_on_stream(
+            self.rows,
+            config.kv_heads,
+            config.head_dim,
+            &self.k,
+            self.k_rope.output(),
+            start_position,
+            config.rope_theta,
+            stream,
+        )?;
+        if self.rows < 64 {
+            let mut row_offset = 0;
+            while row_offset < self.rows {
+                let rows_until_tail_wrap = 16 - kv_cache.len() % 16;
+                let rows = (self.rows - row_offset).min(rows_until_tail_wrap);
+                self.compact_attention
+                    .append_causal_rows_at_offset_into_on_stream(
+                        kv_cache,
+                        &self.q_rope,
+                        &self.k_rope,
+                        &self.v,
+                        row_offset,
+                        rows,
+                        None,
+                        self.attention.output(),
+                        stream,
+                    )?;
+                row_offset += rows;
+            }
+        } else {
+            pack_token_heads_bf16_into_on_stream(
+                &self.q_rope,
+                self.packed_query.output(),
+                self.rows,
+                config.q_heads,
+                config.head_dim,
+                stream,
+            )?;
+            if start_position == 0 {
+                kv_cache.append_initial_rows_and_stage_bf16_on_stream(
+                    &self.k_rope,
+                    &self.v,
+                    0,
+                    self.rows,
+                    self.packed_key.output(),
+                    self.packed_value.output(),
+                    stream,
+                )?;
+            } else {
+                kv_cache.append_rows_at_offset_on_stream(
+                    &self.k_rope,
+                    &self.v,
+                    0,
+                    self.rows,
+                    stream,
+                )?;
+                kv_cache.unpack_bf16_on_stream(
+                    self.packed_key.output(),
+                    self.packed_value.output(),
+                    stream,
+                )?;
+            }
+            self.qk_plan.run_offsets_on_stream(
+                &self.lt,
+                &self.packed_key,
+                0,
+                &self.packed_query,
+                0,
+                self.attention_scores.output(),
+                0,
+                stream,
+            )?;
+            causal_window_softmax_f32_to_bf16_on_stream(
+                &self.attention_scores,
+                self.packed_probabilities.output(),
+                self.rows,
+                self.cache_tokens,
+                start_position,
+                config.q_heads,
+                config.head_dim,
+                None,
+                stream,
+            )?;
+            self.pv_plan.run_offsets_on_stream(
+                &self.lt,
+                &self.packed_value,
+                0,
+                &self.packed_probabilities,
+                0,
+                self.packed_attention.output(),
+                0,
+                stream,
+            )?;
+            unpack_heads_f32_at_offset_into_on_stream(
+                &self.packed_attention,
+                self.attention.output(),
+                self.rows,
+                config.q_heads,
+                config.head_dim,
+                0,
+                stream,
+            )?;
+        }
+        rms_norm_f32_into_on_stream(
+            self.rows,
+            config.q_width(),
+            &self.attention,
+            &weights.attention_sub_norm,
+            self.attention_normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.output.run_f32_batch_int8_into_on_stream(
+            &self.lt,
+            &self.output_plan,
+            self.attention_normed.input(),
+            self.output_accumulator.output(),
+            self.projected.output(),
+            self.rows,
+            &mut self.output_activation,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            &self.hidden,
+            &self.projected,
+            self.residual.output(),
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            self.rows,
+            config.hidden,
+            &self.residual,
+            &weights.post_attention_norm,
+            self.ffn_normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.gate_up.run_f32_batch_int8_into_on_stream(
+            &self.lt,
+            &self.gate_up_plan,
+            self.ffn_normed.input(),
+            self.gate_up_accumulator.output(),
+            self.gate_up.output(),
+            self.rows,
+            &mut self.gate_up_activation,
+            stream,
+        )?;
+        relu_squared_mul_halves_f32_batch_into_on_stream(
+            self.gate_up.input(),
+            self.activated.output(),
+            self.rows,
+            config.intermediate,
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            self.rows,
+            config.intermediate,
+            &self.activated,
+            &weights.ffn_sub_norm,
+            self.activated_normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.down.run_f32_batch_int8_into_on_stream(
+            &self.lt,
+            &self.down_plan,
+            self.activated_normed.input(),
+            self.down_accumulator.output(),
+            self.down.output(),
+            self.rows,
+            &mut self.down_activation,
+            stream,
+        )?;
+        add_f32_into_on_stream(&self.residual, &self.down, self.hidden.output(), stream)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.qkv_plan.workspace_bytes()
+            + self.output_plan.workspace_bytes()
+            + self.gate_up_plan.workspace_bytes()
+            + self.down_plan.workspace_bytes()
+            + self.qk_plan.workspace_bytes()
+            + self.pv_plan.workspace_bytes()
+            + self.token_ids.device_bytes()
+            + self.hidden.device_bytes()
+            + self.normed.device_bytes()
+            + self.qkv.device_bytes()
+            + self.q.device_bytes()
+            + self.k.device_bytes()
+            + self.v.device_bytes()
+            + self.q_rope.device_bytes()
+            + self.k_rope.device_bytes()
+            + self.attention.device_bytes()
+            + self.packed_query.device_bytes()
+            + self.packed_key.device_bytes()
+            + self.packed_value.device_bytes()
+            + self.attention_scores.device_bytes()
+            + self.packed_probabilities.device_bytes()
+            + self.packed_attention.device_bytes()
+            + self.attention_normed.device_bytes()
+            + self.projected.device_bytes()
+            + self.residual.device_bytes()
+            + self.ffn_normed.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.activated_normed.device_bytes()
+            + self.down.device_bytes()
+            + self.final_hidden.device_bytes()
+            + self.qkv_accumulator.device_bytes()
+            + self.output_accumulator.device_bytes()
+            + self.gate_up_accumulator.device_bytes()
+            + self.down_accumulator.device_bytes()
+            + self.qkv_activation.device_bytes()
+            + self.output_activation.device_bytes()
+            + self.gate_up_activation.device_bytes()
+            + self.down_activation.device_bytes()
+            + self.compact_attention.device_bytes()
     }
 }
 

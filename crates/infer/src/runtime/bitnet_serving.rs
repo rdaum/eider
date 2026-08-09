@@ -10,6 +10,7 @@ use crate::bitnet::{BitNetDecodeState, BitNetModel};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
+use tracing::info;
 
 /// Stable identity assigned to a BitNet request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -142,6 +143,15 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
                 actual: format!("{} tokens", config.max_context_tokens),
             });
         }
+        let warmup_started = Instant::now();
+        let warmup_rows = config.prefill_token_capacity.min(config.max_context_tokens);
+        let mut warmup_state = model.new_decode_state(warmup_rows)?;
+        model.prefill(&mut warmup_state, &vec![0; warmup_rows])?;
+        info!(
+            tokens = warmup_rows,
+            elapsed_ms = warmup_started.elapsed().as_secs_f64() * 1000.0,
+            "warmed BitNet prefill path"
+        );
         Ok(Self {
             model,
             template,

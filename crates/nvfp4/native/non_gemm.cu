@@ -1650,6 +1650,49 @@ extern "C" cudaError_t infer_split_qkv_f32_on_stream(const float* input,
     return cudaGetLastError();
 }
 
+__global__ void infer_split_qkv_f32_batch_kernel(const float* input,
+                                                  float* q,
+                                                  float* k,
+                                                  float* v,
+                                                  std::uint32_t q_width,
+                                                  std::uint32_t kv_width) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint32_t width = q_width + 2 * kv_width;
+    const std::uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= width) {
+        return;
+    }
+    const float value = input[static_cast<std::size_t>(row) * width + col];
+    if (col < q_width) {
+        q[static_cast<std::size_t>(row) * q_width + col] = value;
+    } else if (col < q_width + kv_width) {
+        k[static_cast<std::size_t>(row) * kv_width + col - q_width] = value;
+    } else {
+        v[static_cast<std::size_t>(row) * kv_width + col - q_width - kv_width] = value;
+    }
+}
+
+extern "C" cudaError_t infer_split_qkv_f32_batch_on_stream(
+    const float* input,
+    float* q,
+    float* k,
+    float* v,
+    std::uint32_t batch_rows,
+    std::uint32_t q_width,
+    std::uint32_t kv_width,
+    cudaStream_t stream) {
+    if (input == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+        batch_rows == 0 || q_width == 0 || kv_width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t width = q_width + 2 * kv_width;
+    const dim3 blocks((width + kThreads - 1) / kThreads, batch_rows);
+    infer_split_qkv_f32_batch_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, q, k, v, q_width, kv_width);
+    return cudaGetLastError();
+}
+
 __global__ void infer_qwen36_full_attn_prep_f32_kernel(
     const float* q_full,
     const float* k_raw,
@@ -5618,7 +5661,9 @@ __global__ void infer_prefill_gqa_attention_f32_kernel(const float* query,
                                                              std::uint32_t q_heads,
                                                              std::uint32_t kv_heads,
                                                              std::uint32_t head_dim) {
-    extern __shared__ float partial[];
+    extern __shared__ float shmem[];
+    float* q_sh = shmem;
+    float* partial = shmem + head_dim;
     const std::uint32_t token = blockIdx.x;
     const std::uint32_t q_head = blockIdx.y;
     if (token >= tokens || q_head >= q_heads) {
@@ -5631,66 +5676,61 @@ __global__ void infer_prefill_gqa_attention_f32_kernel(const float* query,
     const std::uint32_t hidden = q_heads * head_dim;
     const std::uint32_t cache_len = start_position + token + 1;
     const float scale = rsqrtf(static_cast<float>(head_dim));
-    const float* q = query + token * hidden + q_head * head_dim;
-
-    float max_score = -INFINITY;
-    for (std::uint32_t row = 0; row < cache_len; ++row) {
-        const float* k = key_cache + row * kv_width + kv_head * head_dim;
-        float dot = 0.0f;
-        for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
-            dot += q[dim] * k[dim];
-        }
-        partial[threadIdx.x] = dot;
-        __syncthreads();
-        for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                partial[threadIdx.x] += partial[threadIdx.x + stride];
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            max_score = fmaxf(max_score, partial[0] * scale);
-        }
-        __syncthreads();
+    const float* q = query + static_cast<std::size_t>(token) * hidden + q_head * head_dim;
+    for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+        q_sh[dim] = q[dim];
     }
+    __syncthreads();
 
+    float maximum = -INFINITY;
+    float sum = 0.0f;
     float accum = 0.0f;
-    float total_weight = 0.0f;
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t lane = tid & 31u;
+    const std::uint32_t warp = tid >> 5u;
+    const std::uint32_t warps = blockDim.x >> 5u;
     for (std::uint32_t row = 0; row < cache_len; ++row) {
-        const float* k = key_cache + row * kv_width + kv_head * head_dim;
-        float dot = 0.0f;
-        for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
-            dot += q[dim] * k[dim];
+        const std::size_t base = static_cast<std::size_t>(row) * kv_width + kv_head * head_dim;
+        const float* k = key_cache + base;
+        const float* v = value_cache + base;
+        float dot = tid < head_dim ? q_sh[tid] * k[tid] : 0.0f;
+        dot += __shfl_xor_sync(0xffffffffu, dot, 16);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 8);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+        if (lane == 0) {
+            partial[warp] = dot;
         }
-        partial[threadIdx.x] = dot;
         __syncthreads();
-        for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                partial[threadIdx.x] += partial[threadIdx.x + stride];
+        if (warp == 0 && lane == 0) {
+            dot = 0.0f;
+            for (std::uint32_t index = 0; index < warps; ++index) {
+                dot += partial[index];
             }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            const float weight = expf(partial[0] * scale - max_score);
-            partial[0] = weight;
-            total_weight += weight;
+            const float score = dot * scale;
+            const float rescale = score > maximum ? expf(maximum - score) : 1.0f;
+            const float weight = score > maximum ? 1.0f : expf(score - maximum);
+            maximum = fmaxf(maximum, score);
+            sum = sum * rescale + weight;
+            partial[0] = rescale;
+            partial[1] = weight;
         }
         __syncthreads();
-        const float weight = partial[0];
-        for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
-            const float* v = value_cache + row * kv_width + kv_head * head_dim;
-            accum += weight * v[dim];
+        if (tid < head_dim) {
+            accum = __fmaf_rn(partial[1], v[tid], accum * partial[0]);
         }
         __syncthreads();
     }
 
-    if (threadIdx.x == 0) {
-        partial[0] = total_weight;
+    if (tid == 0) {
+        partial[0] = sum;
     }
     __syncthreads();
     const float inv_total = 1.0f / partial[0];
-    for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
-        output[token * hidden + q_head * head_dim + dim] = accum * inv_total;
+    if (tid < head_dim) {
+        output[static_cast<std::size_t>(token) * hidden + q_head * head_dim + tid] =
+            accum * inv_total;
     }
 }
 
@@ -5892,7 +5932,7 @@ extern "C" cudaError_t infer_ragged_gqa_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t infer_prefill_gqa_attention_f32(const float* query,
+extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* query,
                                                              const float* key_cache,
                                                              const float* value_cache,
                                                              float* output,
@@ -5900,7 +5940,8 @@ extern "C" cudaError_t infer_prefill_gqa_attention_f32(const float* query,
                                                              std::uint32_t start_position,
                                                              std::uint32_t q_heads,
                                                              std::uint32_t kv_heads,
-                                                             std::uint32_t head_dim) {
+                                                             std::uint32_t head_dim,
+                                                             cudaStream_t stream) {
     constexpr int kThreads = 256;
     if (query == nullptr || key_cache == nullptr || value_cache == nullptr || output == nullptr ||
         tokens == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 || head_dim > kThreads ||
@@ -5909,9 +5950,24 @@ extern "C" cudaError_t infer_prefill_gqa_attention_f32(const float* query,
     }
 
     const dim3 blocks(tokens, q_heads);
-    infer_prefill_gqa_attention_f32_kernel<<<blocks, kThreads, kThreads * sizeof(float)>>>(
+    infer_prefill_gqa_attention_f32_kernel<<<
+        blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
         query, key_cache, value_cache, output, tokens, start_position, q_heads, kv_heads, head_dim);
     return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_prefill_gqa_attention_f32(const float* query,
+                                                         const float* key_cache,
+                                                         const float* value_cache,
+                                                         float* output,
+                                                         std::uint32_t tokens,
+                                                         std::uint32_t start_position,
+                                                         std::uint32_t q_heads,
+                                                         std::uint32_t kv_heads,
+                                                         std::uint32_t head_dim) {
+    return infer_prefill_gqa_attention_f32_on_stream(
+        query, key_cache, value_cache, output, tokens, start_position,
+        q_heads, kv_heads, head_dim, nullptr);
 }
 
 // lm-head reductions, BF16 conversion, and output preparation.
@@ -7026,6 +7082,42 @@ extern "C" cudaError_t infer_pack_token_heads_bf16_on_stream(
     const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
     infer_pack_token_heads_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
         input, output, tokens, heads, head_dim, input_row_offset);
+    return cudaGetLastError();
+}
+
+__global__ void infer_pack_value_heads_bf16_kernel(
+    const float* input,
+    std::uint16_t* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t total = tokens * heads * head_dim;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % heads;
+    const std::uint32_t token = index / (heads * head_dim);
+    const std::uint32_t destination = (head * head_dim + dim) * tokens + token;
+    const __nv_bfloat16 value = __float2bfloat16_rn(input[index]);
+    output[destination] = *reinterpret_cast<const std::uint16_t*>(&value);
+}
+
+extern "C" cudaError_t infer_pack_value_heads_bf16_on_stream(
+    const float* input,
+    std::uint16_t* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || tokens == 0 || heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t total = static_cast<std::uint64_t>(tokens) * heads * head_dim;
+    if (total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_pack_value_heads_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, tokens, heads, head_dim);
     return cudaGetLastError();
 }
 
