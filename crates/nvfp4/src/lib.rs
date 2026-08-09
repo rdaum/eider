@@ -13,6 +13,7 @@
 
 pub mod format;
 
+mod bitnet;
 mod cublaslt;
 mod cuda;
 mod diagnostics;
@@ -27,6 +28,10 @@ mod q3;
 mod safetensors;
 mod tensor;
 
+pub use bitnet::{
+    BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear,
+    relu_squared_mul_halves_f32_batch_into_on_stream,
+};
 pub use cublaslt::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan,
     Fp4TnMatmul, Fp4TnMatmulPlan, Fp4TnPlanMetadata, Fp8TnMatmulPlan, GemmShape, InferenceGemm,
@@ -34,7 +39,7 @@ pub use cublaslt::{
 };
 pub use cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
-    HostRead, PinnedHostBuffer, device_memory_info, synchronize_device,
+    HostRead, PinnedHostBuffer, device_memory_info, set_cuda_device, synchronize_device,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};

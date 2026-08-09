@@ -117,6 +117,10 @@ harness = false
 name = "q2_expert_layer"
 harness = false
 
+[[bench]]
+name = "bitnet_w2a8"
+harness = false
+
 [[bin]]
 name = "nvfp4-smoke"
 path = "src/bin/nvfp4-smoke.rs"

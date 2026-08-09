@@ -361,6 +361,11 @@ pub fn device_memory_info() -> Result<(usize, usize)> {
     Ok((free, total))
 }
 
+/// Selects and initializes the CUDA device for the calling thread.
+pub fn set_cuda_device(device: i32) -> Result<()> {
+    unsafe { check_cuda("cudaSetDevice", ffi::cudaSetDevice(device)) }
+}
+
 /// Non-blocking CUDA stream suitable for graph capture and replay.
 pub struct CudaStream {
     stream: ffi::cudaStream_t,

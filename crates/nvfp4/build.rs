@@ -66,6 +66,7 @@ fn main() {
     let oracle_object = format!("{out_dir}/fp4_oracle.o");
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
+    let bitnet_object = format!("{out_dir}/bitnet.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
@@ -125,6 +126,27 @@ fn main() {
     ]);
     let nvcc_status = nvcc.status().expect("failed to run nvcc for CUDA kernels");
     assert!(nvcc_status.success(), "nvcc failed to build CUDA kernels");
+
+    let mut bitnet_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    bitnet_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "--generate-code=arch=compute_121a,code=sm_121a",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/bitnet.cu",
+        "-o",
+        &bitnet_object,
+    ]);
+    let bitnet_status = bitnet_nvcc
+        .status()
+        .expect("failed to run nvcc for BitNet kernels");
+    assert!(
+        bitnet_status.success(),
+        "nvcc failed to build BitNet kernels"
+    );
 
     let mut deepseek4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
     deepseek4_nvcc.args([
@@ -370,6 +392,7 @@ fn main() {
             &oracle_object,
             &gpu_counters_object,
             &non_gemm_object,
+            &bitnet_object,
             &deepseek4_object,
             &qwen36_gdn_object,
             &gemma4_attention_object,
@@ -394,6 +417,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/fp4_oracle.cpp");
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
+    println!("cargo:rerun-if-changed=native/bitnet.cu");
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");

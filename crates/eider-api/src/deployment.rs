@@ -45,6 +45,20 @@ pub struct ServingDefaults {
 
 const CATALOGUE: &[ModelSpec] = &[
     ModelSpec {
+        id: "bitnet-b1.58-2b-4t",
+        repository: "microsoft/bitnet-b1.58-2B-4T",
+        revision: "04c3b9ad9361b824064a1f25ea60a8be9599b127",
+        model_type: "bitnet",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-bitnet-b1.58-2b",
+            max_context_tokens: 4_096,
+            prefill_token_capacity: 256,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "qwen3.6-35b-a3b",
         repository: "nvidia/Qwen3.6-35B-A3B-NVFP4",
         revision: "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
@@ -201,7 +215,9 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
     let artifact_dir = artifact_dir(spec.repository, spec.revision, spec.artifact_kind)?;
     let metadata_root = fetch_metadata_root(&repository, spec, offline).await?;
     validate_checkpoint(&metadata_root, spec.model_type)?;
-    validate_weight_index(&metadata_root)?;
+    if spec.model_type != "bitnet" {
+        validate_weight_index(&metadata_root)?;
+    }
     if !offline {
         preflight_download(&repository, spec, &artifact_dir).await?;
     }
@@ -274,19 +290,21 @@ async fn fetch_metadata_root(
                 spec.repository, spec.revision
             )
         })?;
-    repository
-        .download_file()
-        .filename("model.safetensors.index.json")
-        .revision(spec.revision)
-        .local_files_only(offline)
-        .send()
-        .await
-        .map_err(|error| {
-            format!(
-                "fetch safetensors index for {} at {}: {error}",
-                spec.repository, spec.revision
-            )
-        })?;
+    if spec.model_type != "bitnet" {
+        repository
+            .download_file()
+            .filename("model.safetensors.index.json")
+            .revision(spec.revision)
+            .local_files_only(offline)
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "fetch safetensors index for {} at {}: {error}",
+                    spec.repository, spec.revision
+                )
+            })?;
+    }
     config.parent().map(Path::to_path_buf).ok_or_else(|| {
         format!(
             "Hugging Face returned config path without a snapshot root: {}",
@@ -458,7 +476,8 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     let model_type = checkpoint_model_type(&checkpoint_dir)?;
     if !matches!(
         model_type.as_str(),
-        "qwen3_5_moe"
+        "bitnet"
+            | "qwen3_5_moe"
             | "step3p7"
             | "nemotron_h"
             | "nemotron_h_puzzle"
@@ -479,7 +498,11 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
         identity: format!("local-{model_type}"),
         defaults: ServingDefaults {
             served_model_name: "eider-local",
-            max_context_tokens: 32_768,
+            max_context_tokens: if model_type == "bitnet" {
+                4_096
+            } else {
+                32_768
+            },
             prefill_token_capacity: 2_048,
             step_expert_capacity: 240,
         },
@@ -515,6 +538,16 @@ fn checkpoint_model_type(checkpoint_dir: &Path) -> Result<String, String> {
 
 fn validate_weight_index(checkpoint_dir: &Path) -> Result<(), String> {
     let path = checkpoint_dir.join("model.safetensors.index.json");
+    if !path.is_file() {
+        let single = checkpoint_dir.join("model.safetensors");
+        return single.is_file().then_some(()).ok_or_else(|| {
+            format!(
+                "required checkpoint weights are missing: expected {} or {}",
+                path.display(),
+                single.display()
+            )
+        });
+    }
     let contents = std::fs::read_to_string(&path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let index: serde_json::Value = serde_json::from_str(&contents)
@@ -542,13 +575,7 @@ fn validate_weight_index(checkpoint_dir: &Path) -> Result<(), String> {
 }
 
 fn validate_runtime_files(checkpoint_dir: &Path) -> Result<(), String> {
-    for filename in [
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "chat_template.jinja",
-        "model.safetensors.index.json",
-    ] {
+    for filename in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
         let path = checkpoint_dir.join(filename);
         if !path.is_file() {
             return Err(format!(
@@ -557,8 +584,30 @@ fn validate_runtime_files(checkpoint_dir: &Path) -> Result<(), String> {
             ));
         }
     }
+    let standalone_template = checkpoint_dir.join("chat_template.jinja");
+    if !standalone_template.is_file() {
+        let tokenizer_config_path = checkpoint_dir.join("tokenizer_config.json");
+        let tokenizer_config = std::fs::read_to_string(&tokenizer_config_path)
+            .map_err(|error| format!("read {}: {error}", tokenizer_config_path.display()))?;
+        let tokenizer_config: serde_json::Value = serde_json::from_str(&tokenizer_config)
+            .map_err(|error| format!("parse {}: {error}", tokenizer_config_path.display()))?;
+        if tokenizer_config
+            .get("chat_template")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(format!(
+                "required chat template is missing: {} and tokenizer_config.json has no string chat_template",
+                standalone_template.display()
+            ));
+        }
+    }
     validate_weight_index(checkpoint_dir)?;
-    let index = std::fs::read_to_string(checkpoint_dir.join("model.safetensors.index.json"))
+    let index_path = checkpoint_dir.join("model.safetensors.index.json");
+    if !index_path.is_file() {
+        return Ok(());
+    }
+    let index = std::fs::read_to_string(&index_path)
         .map_err(|error| format!("read weight index in {}: {error}", checkpoint_dir.display()))?;
     let index: serde_json::Value = serde_json::from_str(&index).map_err(|error| {
         format!(
@@ -646,6 +695,23 @@ mod tests {
             catalogue_model("gemma-4-26b-a4b-it").unwrap().model_type,
             "gemma4"
         );
+    }
+
+    #[test]
+    fn catalogue_pins_official_bitnet_checkpoint() {
+        let model = catalogue_model("bitnet-b1.58-2b-4t").unwrap();
+        assert_eq!(model.model_type, "bitnet");
+        assert_eq!(model.repository, "microsoft/bitnet-b1.58-2B-4T");
+        assert_eq!(model.revision, "04c3b9ad9361b824064a1f25ea60a8be9599b127");
+        assert_eq!(model.defaults.max_context_tokens, 4_096);
+    }
+
+    #[test]
+    fn local_checkpoint_validation_accepts_single_safetensors_and_inline_template() {
+        let fixture = CheckpointFixture::new_single("bitnet");
+        let resolved = resolve_local_model(fixture.path()).expect("resolve BitNet fixture");
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(resolved.defaults.max_context_tokens, 4_096);
     }
 
     #[test]
@@ -758,6 +824,26 @@ mod tests {
                 std::fs::write(root.join("model-00001-of-00001.safetensors"), [])
                     .expect("write shard");
             }
+            Self { root }
+        }
+
+        fn new_single(model_type: &str) -> Self {
+            let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("eider-deployment-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create fixture root");
+            std::fs::write(
+                root.join("config.json"),
+                format!(r#"{{"model_type":"{model_type}"}}"#),
+            )
+            .expect("write config");
+            std::fs::write(root.join("tokenizer.json"), "{}").expect("write tokenizer");
+            std::fs::write(
+                root.join("tokenizer_config.json"),
+                r#"{"chat_template":"{{ messages }}"}"#,
+            )
+            .expect("write tokenizer config");
+            std::fs::write(root.join("model.safetensors"), []).expect("write single weights");
             Self { root }
         }
 

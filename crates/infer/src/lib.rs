@@ -11,6 +11,9 @@ pub use nvfp4;
 pub mod runtime;
 pub use runtime::kv_cache;
 
+/// BitNet b1.58 ternary text-model loading and inference.
+pub mod bitnet;
+
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 

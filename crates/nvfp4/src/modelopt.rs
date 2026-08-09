@@ -659,6 +659,22 @@ impl ModelOptCheckpoint {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index_path = root.join("model.safetensors.index.json");
+        if !index_path.is_file() {
+            let shard_name = "model.safetensors";
+            let shard_path = root.join(shard_name);
+            let shard = Arc::new(SafeTensorShard::open(&shard_path)?);
+            let weight_map = shard
+                .tensor_names()
+                .map(|tensor| (tensor.to_string(), shard_name.to_string()))
+                .collect::<BTreeMap<_, _>>();
+            let mut shards = BTreeMap::new();
+            shards.insert(shard_name.to_string(), shard);
+            return Ok(Self {
+                root,
+                weight_map: Arc::new(weight_map),
+                shards: Arc::new(Mutex::new(shards)),
+            });
+        }
         let index = fs::read_to_string(&index_path).map_err(|err| Error::Format {
             label: "safetensors index",
             detail: format!("{}: {err}", index_path.display()),
