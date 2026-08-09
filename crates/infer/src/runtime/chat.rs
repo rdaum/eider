@@ -219,8 +219,22 @@ impl CheckpointChatTemplate {
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let (source, template_path) = load_template_source(model_dir)?;
+        Self::from_source_and_tokenizer_files(
+            source,
+            template_path,
+            model_dir.join("tokenizer.json"),
+            model_dir.join("tokenizer_config.json"),
+        )
+    }
+
+    /// Builds a checkpoint template from an explicitly supplied source and tokenizer files.
+    pub fn from_source_and_tokenizer_files(
+        source: String,
+        template_path: PathBuf,
+        tokenizer_path: PathBuf,
+        tokenizer_config_path: PathBuf,
+    ) -> Result<Self> {
         let environment = build_environment(source)?;
-        let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|error| Error::Format {
                 label: "tokenizer.json",
@@ -232,7 +246,6 @@ impl CheckpointChatTemplate {
                 label: "tokenizer.json truncation",
                 detail: error.to_string(),
             })?;
-        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
         let tokenizer_config = std::fs::read_to_string(&tokenizer_config_path)
             .ok()
             .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())

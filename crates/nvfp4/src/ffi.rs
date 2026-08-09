@@ -126,6 +126,35 @@ unsafe extern "C" {
         rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ternary_g64_quantize_i8_f32_on_stream(
+        input: *const f32,
+        output: *mut i8,
+        dequant_scales: *mut f32,
+        batch_rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ternary_g64_w2a8_linear_f32_on_stream(
+        input: *const i8,
+        input_scales: *const f32,
+        weight: *const u8,
+        weight_scales: *const f32,
+        output: *mut f32,
+        batch_rows: u32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ternary_g64_lookup_rows_f32_on_stream(
+        weight: *const u8,
+        weight_scales: *const f32,
+        row_indices: *const u32,
+        output: *mut f32,
+        batch_rows: u32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_block_fp8_linear_f32_on_stream(
         input: *const f32,
         weight: *const u8,

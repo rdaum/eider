@@ -254,7 +254,7 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
             }
         })?;
     validate_checkpoint(&checkpoint_dir, spec.model_type)?;
-    validate_runtime_files(&checkpoint_dir)?;
+    validate_runtime_files(&checkpoint_dir, spec.model_type)?;
     info!(
         model = spec.id,
         repository = spec.repository,
@@ -477,6 +477,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "bitnet"
+            | "bonsai"
             | "qwen3_5_moe"
             | "step3p7"
             | "nemotron_h"
@@ -490,7 +491,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             checkpoint_dir.join("config.json").display()
         ));
     }
-    validate_runtime_files(&checkpoint_dir)?;
+    validate_runtime_files(&checkpoint_dir, &model_type)?;
     let artifact_dir = local_artifact_dir(&checkpoint_dir, &model_type)?;
     Ok(ResolvedModel {
         checkpoint_dir,
@@ -498,12 +499,12 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
         identity: format!("local-{model_type}"),
         defaults: ServingDefaults {
             served_model_name: "eider-local",
-            max_context_tokens: if model_type == "bitnet" {
-                4_096
-            } else {
-                32_768
+            max_context_tokens: match model_type.as_str() {
+                "bitnet" => 4_096,
+                "bonsai" => 65_536,
+                _ => 32_768,
             },
-            prefill_token_capacity: 2_048,
+            prefill_token_capacity: if model_type == "bonsai" { 256 } else { 2_048 },
             step_expert_capacity: 240,
         },
         preparation: match model_type.as_str() {
@@ -574,7 +575,7 @@ fn validate_weight_index(checkpoint_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_runtime_files(checkpoint_dir: &Path) -> Result<(), String> {
+fn validate_runtime_files(checkpoint_dir: &Path, model_type: &str) -> Result<(), String> {
     for filename in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
         let path = checkpoint_dir.join(filename);
         if !path.is_file() {
@@ -585,7 +586,7 @@ fn validate_runtime_files(checkpoint_dir: &Path) -> Result<(), String> {
         }
     }
     let standalone_template = checkpoint_dir.join("chat_template.jinja");
-    if !standalone_template.is_file() {
+    if model_type != "bonsai" && !standalone_template.is_file() {
         let tokenizer_config_path = checkpoint_dir.join("tokenizer_config.json");
         let tokenizer_config = std::fs::read_to_string(&tokenizer_config_path)
             .map_err(|error| format!("read {}: {error}", tokenizer_config_path.display()))?;
@@ -601,6 +602,16 @@ fn validate_runtime_files(checkpoint_dir: &Path) -> Result<(), String> {
                 standalone_template.display()
             ));
         }
+    }
+    if model_type == "bonsai" {
+        let gguf = checkpoint_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf");
+        if !gguf.is_file() {
+            return Err(format!(
+                "required Bonsai GGUF is missing: {}",
+                gguf.display()
+            ));
+        }
+        return Ok(());
     }
     validate_weight_index(checkpoint_dir)?;
     let index_path = checkpoint_dir.join("model.safetensors.index.json");
@@ -712,6 +723,15 @@ mod tests {
         let resolved = resolve_local_model(fixture.path()).expect("resolve BitNet fixture");
         assert_eq!(resolved.preparation, ArtifactKind::None);
         assert_eq!(resolved.defaults.max_context_tokens, 4_096);
+    }
+
+    #[test]
+    fn local_checkpoint_validation_accepts_bonsai_gguf_without_standalone_template() {
+        let fixture = CheckpointFixture::new_bonsai();
+        let resolved = resolve_local_model(fixture.path()).expect("resolve Bonsai fixture");
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(resolved.defaults.max_context_tokens, 65_536);
+        assert_eq!(resolved.defaults.prefill_token_capacity, 256);
     }
 
     #[test]
@@ -844,6 +864,20 @@ mod tests {
             )
             .expect("write tokenizer config");
             std::fs::write(root.join("model.safetensors"), []).expect("write single weights");
+            Self { root }
+        }
+
+        fn new_bonsai() -> Self {
+            let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("eider-deployment-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create fixture root");
+            std::fs::write(root.join("config.json"), r#"{"model_type":"bonsai"}"#)
+                .expect("write config");
+            std::fs::write(root.join("tokenizer.json"), "{}").expect("write tokenizer");
+            std::fs::write(root.join("tokenizer_config.json"), "{}")
+                .expect("write tokenizer config");
+            std::fs::write(root.join("Ternary-Bonsai-8B-Q2_0_g64.gguf"), []).expect("write GGUF");
             Self { root }
         }
 

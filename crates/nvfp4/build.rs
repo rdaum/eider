@@ -67,6 +67,7 @@ fn main() {
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
     let bitnet_object = format!("{out_dir}/bitnet.o");
+    let ternary_g64_object = format!("{out_dir}/ternary_g64.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
@@ -146,6 +147,26 @@ fn main() {
     assert!(
         bitnet_status.success(),
         "nvcc failed to build BitNet kernels"
+    );
+
+    let mut ternary_g64_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    ternary_g64_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--generate-code=arch=compute_121a,code=sm_121a",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/ternary_g64.cu",
+        "-o",
+        &ternary_g64_object,
+    ]);
+    let ternary_g64_status = ternary_g64_nvcc
+        .status()
+        .expect("failed to run nvcc for group-scaled ternary kernels");
+    assert!(
+        ternary_g64_status.success(),
+        "nvcc failed to build group-scaled ternary kernels"
     );
 
     let mut deepseek4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
@@ -393,6 +414,7 @@ fn main() {
             &gpu_counters_object,
             &non_gemm_object,
             &bitnet_object,
+            &ternary_g64_object,
             &deepseek4_object,
             &qwen36_gdn_object,
             &gemma4_attention_object,
@@ -418,6 +440,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/gpu_counters.cpp");
     println!("cargo:rerun-if-changed=native/non_gemm.cu");
     println!("cargo:rerun-if-changed=native/bitnet.cu");
+    println!("cargo:rerun-if-changed=native/ternary_g64.cu");
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");

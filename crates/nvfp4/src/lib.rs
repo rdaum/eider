@@ -27,6 +27,7 @@ mod q2;
 mod q3;
 mod safetensors;
 mod tensor;
+mod ternary_g64;
 
 pub use bitnet::{
     BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear,
@@ -214,3 +215,6 @@ pub use q3::{
 };
 pub use safetensors::{SafeTensorInfo, SafeTensorShard};
 pub use tensor::{Bf16Tensor2d, Nvfp4Tensor2d, Tensor2dLayout, Tensor2dView};
+pub use ternary_g64::{
+    TERNARY_G64_GROUP_SIZE, TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
+};

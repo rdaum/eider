@@ -14,6 +14,12 @@ pub use runtime::kv_cache;
 /// BitNet b1.58 ternary text-model loading and inference.
 pub mod bitnet;
 
+/// Ternary Bonsai dense Qwen3 model loading and inference.
+pub mod bonsai;
+
+/// Minimal GGUF v3 checkpoint indexing.
+pub mod gguf;
+
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 

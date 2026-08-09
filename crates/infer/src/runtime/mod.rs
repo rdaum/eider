@@ -1,6 +1,7 @@
 //! Runtime state and execution support shared by model frontends.
 
 pub mod bitnet_serving;
+pub mod bonsai_serving;
 pub mod chat;
 pub mod chat_output;
 pub mod deepseek4_serving;
