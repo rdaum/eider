@@ -6,9 +6,11 @@
 //! activations use a matching symmetric INT8 scale per 64-value group so the
 //! CUDA projection can accumulate exact integer dot products with `dp4a`.
 
+use crate::cublaslt::{Bf16TnMatmulPlan, CublasLt, GemmShape};
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+use crate::kernels::non_gemm::f32_to_bf16_into_on_stream;
 
 /// Number of input values represented by one GGUF scale block.
 pub const TERNARY_G64_GROUP_SIZE: usize = 64;
@@ -223,11 +225,21 @@ pub struct TernaryG64Matrix {
     cols: usize,
     packed_weight: DeviceBuffer<u8>,
     group_scales: DeviceBuffer<f32>,
+    bf16_prefill_weight: Option<DeviceBuffer<u16>>,
 }
 
 impl TernaryG64Matrix {
     /// Uploads one imported group-scaled ternary linear.
     pub fn from_packed(linear: &TernaryG64PackedLinear) -> Result<Self> {
+        Self::from_packed_impl(linear, false)
+    }
+
+    /// Uploads packed decode weights and materializes a BF16 tensor-core prefill copy.
+    pub fn from_packed_with_bf16_prefill(linear: &TernaryG64PackedLinear) -> Result<Self> {
+        Self::from_packed_impl(linear, true)
+    }
+
+    fn from_packed_impl(linear: &TernaryG64PackedLinear, bf16_prefill: bool) -> Result<Self> {
         validate_shape(linear.out_features, linear.in_features)?;
         let groups = linear.out_features * (linear.in_features / TERNARY_G64_GROUP_SIZE);
         if linear.packed_weight.len() != linear.out_features * linear.in_features / 4
@@ -246,12 +258,35 @@ impl TernaryG64Matrix {
                 ),
             });
         }
-        Ok(Self {
+        let mut matrix = Self {
             rows: linear.out_features,
             cols: linear.in_features,
             packed_weight: DeviceBuffer::from_host(&linear.packed_weight)?,
             group_scales: DeviceBuffer::from_host(&linear.group_scales)?,
-        })
+            bf16_prefill_weight: None,
+        };
+        if bf16_prefill {
+            let weight = DeviceBuffer::zeroed(matrix.rows * matrix.cols)?;
+            let stream = CudaStream::new_non_blocking()?;
+            let rows = u32::try_from(matrix.rows).map_err(dimension_overflow("rows"))?;
+            let cols = u32::try_from(matrix.cols).map_err(dimension_overflow("columns"))?;
+            unsafe {
+                check_cuda(
+                    "infer_ternary_g64_expand_bf16_on_stream",
+                    ffi::infer_ternary_g64_expand_bf16_on_stream(
+                        matrix.packed_weight.ptr,
+                        matrix.group_scales.ptr,
+                        weight.ptr,
+                        rows,
+                        cols,
+                        stream.as_raw(),
+                    ),
+                )?;
+            }
+            stream.synchronize()?;
+            matrix.bf16_prefill_weight = Some(weight);
+        }
+        Ok(matrix)
     }
 
     /// Number of output rows.
@@ -266,7 +301,58 @@ impl TernaryG64Matrix {
 
     /// Device bytes occupied by packed weights and group scales.
     pub fn device_bytes(&self) -> usize {
-        self.packed_weight.device_bytes() + self.group_scales.device_bytes()
+        self.packed_weight.device_bytes()
+            + self.group_scales.device_bytes()
+            + self
+                .bf16_prefill_weight
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
+    }
+
+    /// Converts activations to BF16 and enqueues the tensor-core prefill projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_f32_batch_bf16_into_on_stream(
+        &self,
+        lt: &CublasLt,
+        plan: &Bf16TnMatmulPlan,
+        input: DeviceInput<'_, f32>,
+        input_bf16: &mut DeviceBuffer<u16>,
+        output: DeviceOutput<'_, f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let expected_shape = GemmShape::new(self.rows, batch_rows, self.cols);
+        if batch_rows == 0
+            || input.len() != batch_rows * self.cols
+            || input_bf16.len() < input.len()
+            || output.len() != batch_rows * self.rows
+            || plan.gemm_shape() != expected_shape
+        {
+            return Err(Error::Shape {
+                label: "ternary g64 BF16 prefill linear",
+                expected: format!(
+                    "shape={expected_shape:?}, input={} values, BF16 input >= {}, output={} values",
+                    batch_rows * self.cols,
+                    batch_rows * self.cols,
+                    batch_rows * self.rows
+                ),
+                actual: format!(
+                    "shape={:?} input={} BF16 input={} output={}",
+                    plan.gemm_shape(),
+                    input.len(),
+                    input_bf16.len(),
+                    output.len()
+                ),
+            });
+        }
+        let Some(weight) = self.bf16_prefill_weight.as_ref() else {
+            return Err(Error::Format {
+                label: "ternary g64 BF16 prefill linear",
+                detail: "matrix has no BF16 prefill weights".to_string(),
+            });
+        };
+        f32_to_bf16_into_on_stream(input.buffer(), input_bf16.output(), stream)?;
+        plan.run_on_stream(lt, weight, input_bf16, output, stream)
     }
 
     /// Quantizes `input` per group and enqueues the direct W2A8 projection.
@@ -634,5 +720,128 @@ mod tests {
             relative_rmse <= 2.0e-5,
             "Bonsai g64 W2A8 max_abs={max_abs} relative_rmse={relative_rmse} scale={scale}"
         );
+    }
+
+    #[test]
+    fn tiled_gpu_projection_matches_reference_with_batch_and_row_tails() {
+        const ROWS: usize = 37;
+        const COLS: usize = 192;
+        const BATCH: usize = 11;
+        let packed = TernaryG64PackedLinear::from_gguf_q2_0_g64(
+            "tiled.tails",
+            ROWS,
+            COLS,
+            &synthetic_gguf(ROWS, COLS),
+        )
+        .expect("import");
+        let input_host = (0..BATCH * COLS)
+            .map(|index| ((index * 53 % 613) as f32 - 306.0) / 91.0)
+            .collect::<Vec<_>>();
+        let expected = packed
+            .reference_w2a8(&input_host, BATCH)
+            .expect("reference");
+        let matrix = TernaryG64Matrix::from_packed(&packed).expect("upload");
+        let input = DeviceBuffer::from_host(&input_host).expect("input");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("output");
+        let mut workspace = TernaryG64ActivationWorkspace::new(BATCH, COLS).expect("workspace");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        matrix
+            .run_f32_batch_into_on_stream(
+                input.input(),
+                output.output(),
+                BATCH,
+                &mut workspace,
+                &stream,
+            )
+            .expect("projection");
+        let actual = output.copy_to_host(&stream).expect("download");
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let rmse = (actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(actual, expected)| (actual - expected).powi(2) as f64)
+            .sum::<f64>()
+            / actual.len() as f64)
+            .sqrt();
+        let scale = (expected
+            .iter()
+            .map(|value| value.powi(2) as f64)
+            .sum::<f64>()
+            / expected.len() as f64)
+            .sqrt();
+        let relative_rmse = rmse / scale.max(f64::EPSILON);
+        assert!(
+            relative_rmse <= 2.0e-5,
+            "tiled g64 W2A8 max_abs={max_abs} relative_rmse={relative_rmse} scale={scale}"
+        );
+    }
+
+    #[test]
+    fn bf16_tensor_prefill_matches_rounded_dense_reference() {
+        const ROWS: usize = 96;
+        const COLS: usize = 128;
+        const BATCH: usize = 7;
+        let packed = TernaryG64PackedLinear::from_gguf_q2_0_g64(
+            "bf16.prefill",
+            ROWS,
+            COLS,
+            &synthetic_gguf(ROWS, COLS),
+        )
+        .expect("import");
+        let input_host = (0..BATCH * COLS)
+            .map(|index| ((index * 43 % 557) as f32 - 278.0) / 83.0)
+            .collect::<Vec<_>>();
+        let expected = (0..BATCH)
+            .flat_map(|batch| {
+                let packed = &packed;
+                let input_host = &input_host;
+                (0..ROWS).map(move |row| {
+                    (0..COLS)
+                        .map(|col| {
+                            let input = crate::format::bf16_to_f32(crate::format::f32_to_bf16(
+                                input_host[batch * COLS + col],
+                            ));
+                            let weight = crate::format::bf16_to_f32(crate::format::f32_to_bf16(
+                                packed.weight(row, col).unwrap(),
+                            ));
+                            input * weight
+                        })
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let matrix = TernaryG64Matrix::from_packed_with_bf16_prefill(&packed).expect("upload");
+        let lt = CublasLt::new().expect("cuBLASLt");
+        let plan = Bf16TnMatmulPlan::new(&lt, GemmShape::new(ROWS, BATCH, COLS), 8 * 1024 * 1024)
+            .expect("plan");
+        let input = DeviceBuffer::from_host(&input_host).expect("input");
+        let mut input_bf16 = DeviceBuffer::zeroed(BATCH * COLS).expect("BF16 input");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        matrix
+            .run_f32_batch_bf16_into_on_stream(
+                &lt,
+                &plan,
+                input.input(),
+                &mut input_bf16,
+                output.output(),
+                BATCH,
+                &stream,
+            )
+            .expect("projection");
+        let actual = output.copy_to_host(&stream).expect("download");
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = 0.002 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "BF16 prefill value {index}: actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+        let packed_bytes = ROWS * COLS / 4 + ROWS * (COLS / 64) * std::mem::size_of::<f32>();
+        assert_eq!(matrix.device_bytes(), packed_bytes + ROWS * COLS * 2);
     }
 }

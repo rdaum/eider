@@ -33,6 +33,11 @@ enum Bf16TnOutput {
 }
 
 impl Bf16TnMatmulPlan {
+    /// Returns the logical GEMM shape owned by this plan.
+    pub const fn gemm_shape(&self) -> GemmShape {
+        self.shape
+    }
+
     /// Creates a plan with BF16 A/B inputs and f32 output.
     pub fn new(lt: &CublasLt, shape: GemmShape, workspace_limit: u64) -> Result<Self> {
         Self::new_with_a_leading_dimension(lt, shape, shape.k, workspace_limit)

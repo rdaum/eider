@@ -2,12 +2,14 @@
 
 use crate::gguf::{GgufIndex, GgufValue};
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
-    TERNARY_G64_GROUP_SIZE, TernaryG64ActivationWorkspace, TernaryG64Matrix,
-    TernaryG64PackedLinear, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    copy_row_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmShape, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, TERNARY_G64_GROUP_SIZE, TernaryG64ActivationWorkspace,
+    TernaryG64Matrix, TernaryG64PackedLinear, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    causal_window_softmax_f32_to_bf16_on_stream, copy_row_f32_into_on_stream,
+    pack_token_heads_bf16_at_offset_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
+    unpack_heads_f32_at_offset_into_on_stream,
 };
 use std::f32::consts::PI;
 use std::path::Path;
@@ -178,6 +180,32 @@ struct BonsaiWorkspace {
     down_activation: TernaryG64ActivationWorkspace,
     logits_activation: TernaryG64ActivationWorkspace,
     compact_attention: Sm12xKvAttentionWorkspace,
+    tensor_prefill: Option<BonsaiTensorPrefillWorkspace>,
+}
+
+struct BonsaiTensorPrefillWorkspace {
+    lt: CublasLt,
+    qkv_plan: Bf16TnMatmulPlan,
+    output_plan: Bf16TnMatmulPlan,
+    gate_up_plan: Bf16TnMatmulPlan,
+    down_plan: Bf16TnMatmulPlan,
+    hidden_input: DeviceBuffer<u16>,
+    intermediate_input: DeviceBuffer<u16>,
+    attention: Option<BonsaiTensorAttentionWorkspace>,
+}
+
+struct BonsaiTensorAttentionWorkspace {
+    cache_tokens: usize,
+    chunk_rows: usize,
+    qk_plan: Bf16TnMatmulPlan,
+    pv_plan: Bf16TnMatmulPlan,
+    tail_plans: Option<(Bf16TnMatmulPlan, Bf16TnMatmulPlan)>,
+    packed_query: DeviceBuffer<u16>,
+    packed_key: DeviceBuffer<u16>,
+    packed_value: DeviceBuffer<u16>,
+    attention_scores: DeviceBuffer<f32>,
+    packed_probabilities: DeviceBuffer<u16>,
+    packed_attention: DeviceBuffer<f32>,
 }
 
 impl BonsaiModel {
@@ -464,15 +492,15 @@ impl BonsaiLayer {
         let gate_up =
             TernaryG64PackedLinear::concat_rows(format!("{prefix}.ffn_gate_up"), &[gate, up])?;
         Ok(Self {
-            qkv: TernaryG64Matrix::from_packed(&qkv)?,
-            output: load_q2_matrix(
+            qkv: TernaryG64Matrix::from_packed_with_bf16_prefill(&qkv)?,
+            output: load_q2_prefill_matrix(
                 index,
                 &format!("{prefix}.attn_output.weight"),
                 config.hidden,
                 config.q_width(),
             )?,
-            gate_up: TernaryG64Matrix::from_packed(&gate_up)?,
-            down: load_q2_matrix(
+            gate_up: TernaryG64Matrix::from_packed_with_bf16_prefill(&gate_up)?,
+            down: load_q2_prefill_matrix(
                 index,
                 &format!("{prefix}.ffn_down.weight"),
                 config.hidden,
@@ -518,6 +546,15 @@ impl BonsaiWorkspace {
         }
         let q_width = config.q_width();
         let kv_width = config.kv_width();
+        let tensor_prefill = if rows >= 4 {
+            Some(BonsaiTensorPrefillWorkspace::new(
+                config,
+                rows,
+                cache_tokens,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             rows,
             cache_tokens,
@@ -553,9 +590,9 @@ impl BonsaiWorkspace {
                 config.head_dim,
                 16,
             )?,
+            tensor_prefill,
         })
     }
-
     #[allow(clippy::too_many_arguments)]
     fn run_layer(
         &mut self,
@@ -576,13 +613,25 @@ impl BonsaiWorkspace {
             config.rms_eps,
             stream,
         )?;
-        weights.qkv.run_f32_batch_into_on_stream(
-            self.normed.input(),
-            self.qkv.output(),
-            self.rows,
-            &mut self.qkv_activation,
-            stream,
-        )?;
+        if let Some(prefill) = &mut self.tensor_prefill {
+            weights.qkv.run_f32_batch_bf16_into_on_stream(
+                &prefill.lt,
+                &prefill.qkv_plan,
+                self.normed.input(),
+                &mut prefill.hidden_input,
+                self.qkv.output(),
+                self.rows,
+                stream,
+            )?;
+        } else {
+            weights.qkv.run_f32_batch_into_on_stream(
+                self.normed.input(),
+                self.qkv.output(),
+                self.rows,
+                &mut self.qkv_activation,
+                stream,
+            )?;
+        }
         split_qkv_f32_batch_into_on_stream(
             &self.qkv,
             self.q.output(),
@@ -635,31 +684,66 @@ impl BonsaiWorkspace {
             rope_attention_scale,
             stream,
         )?;
-        let mut row_offset = 0;
-        while row_offset < self.rows {
-            let rows_until_tail_wrap = 16 - cache.len() % 16;
-            let rows = (self.rows - row_offset).min(rows_until_tail_wrap);
-            self.compact_attention
-                .append_causal_rows_at_offset_into_on_stream(
+        let tensor_attention = if let Some(prefill) = &mut self.tensor_prefill {
+            if let Some(attention) = &mut prefill.attention {
+                attention.run(
+                    &prefill.lt,
+                    config,
                     cache,
                     &self.q,
                     &self.k,
                     &self.v,
-                    row_offset,
-                    rows,
-                    None,
-                    self.attention.output(),
+                    &mut self.attention,
+                    self.rows,
+                    start_position,
                     stream,
                 )?;
-            row_offset += rows;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !tensor_attention {
+            let mut row_offset = 0;
+            while row_offset < self.rows {
+                let rows_until_tail_wrap = 16 - cache.len() % 16;
+                let rows = (self.rows - row_offset).min(rows_until_tail_wrap);
+                self.compact_attention
+                    .append_causal_rows_at_offset_into_on_stream(
+                        cache,
+                        &self.q,
+                        &self.k,
+                        &self.v,
+                        row_offset,
+                        rows,
+                        None,
+                        self.attention.output(),
+                        stream,
+                    )?;
+                row_offset += rows;
+            }
         }
-        weights.output.run_f32_batch_into_on_stream(
-            self.attention.input(),
-            self.projected.output(),
-            self.rows,
-            &mut self.output_activation,
-            stream,
-        )?;
+        if let Some(prefill) = &mut self.tensor_prefill {
+            weights.output.run_f32_batch_bf16_into_on_stream(
+                &prefill.lt,
+                &prefill.output_plan,
+                self.attention.input(),
+                &mut prefill.hidden_input,
+                self.projected.output(),
+                self.rows,
+                stream,
+            )?;
+        } else {
+            weights.output.run_f32_batch_into_on_stream(
+                self.attention.input(),
+                self.projected.output(),
+                self.rows,
+                &mut self.output_activation,
+                stream,
+            )?;
+        }
         add_f32_into_on_stream(
             &self.hidden,
             &self.projected,
@@ -675,13 +759,25 @@ impl BonsaiWorkspace {
             config.rms_eps,
             stream,
         )?;
-        weights.gate_up.run_f32_batch_into_on_stream(
-            self.ffn_normed.input(),
-            self.gate_up.output(),
-            self.rows,
-            &mut self.gate_up_activation,
-            stream,
-        )?;
+        if let Some(prefill) = &mut self.tensor_prefill {
+            weights.gate_up.run_f32_batch_bf16_into_on_stream(
+                &prefill.lt,
+                &prefill.gate_up_plan,
+                self.ffn_normed.input(),
+                &mut prefill.hidden_input,
+                self.gate_up.output(),
+                self.rows,
+                stream,
+            )?;
+        } else {
+            weights.gate_up.run_f32_batch_into_on_stream(
+                self.ffn_normed.input(),
+                self.gate_up.output(),
+                self.rows,
+                &mut self.gate_up_activation,
+                stream,
+            )?;
+        }
         silu_mul_halves_f32_batch_into_on_stream(
             &self.gate_up,
             self.activated.output(),
@@ -689,13 +785,25 @@ impl BonsaiWorkspace {
             config.intermediate,
             stream,
         )?;
-        weights.down.run_f32_batch_into_on_stream(
-            self.activated.input(),
-            self.down.output(),
-            self.rows,
-            &mut self.down_activation,
-            stream,
-        )?;
+        if let Some(prefill) = &mut self.tensor_prefill {
+            weights.down.run_f32_batch_bf16_into_on_stream(
+                &prefill.lt,
+                &prefill.down_plan,
+                self.activated.input(),
+                &mut prefill.intermediate_input,
+                self.down.output(),
+                self.rows,
+                stream,
+            )?;
+        } else {
+            weights.down.run_f32_batch_into_on_stream(
+                self.activated.input(),
+                self.down.output(),
+                self.rows,
+                &mut self.down_activation,
+                stream,
+            )?;
+        }
         add_f32_into_on_stream(&self.residual, &self.down, self.hidden.output(), stream)
     }
 
@@ -726,6 +834,241 @@ impl BonsaiWorkspace {
             + self.down_activation.device_bytes()
             + self.logits_activation.device_bytes()
             + self.compact_attention.device_bytes()
+            + self
+                .tensor_prefill
+                .as_ref()
+                .map_or(0, BonsaiTensorPrefillWorkspace::device_bytes)
+    }
+}
+
+impl BonsaiTensorPrefillWorkspace {
+    fn new(config: BonsaiConfig, rows: usize, cache_tokens: usize) -> Result<Self> {
+        let q_width = config.q_width();
+        let kv_width = config.kv_width();
+        let lt = CublasLt::new()?;
+        const WORKSPACE_LIMIT: u64 = 32 * 1024 * 1024;
+        Ok(Self {
+            qkv_plan: Bf16TnMatmulPlan::new(
+                &lt,
+                GemmShape::new(q_width + 2 * kv_width, rows, config.hidden),
+                WORKSPACE_LIMIT,
+            )?,
+            output_plan: Bf16TnMatmulPlan::new(
+                &lt,
+                GemmShape::new(config.hidden, rows, q_width),
+                WORKSPACE_LIMIT,
+            )?,
+            gate_up_plan: Bf16TnMatmulPlan::new(
+                &lt,
+                GemmShape::new(config.intermediate * 2, rows, config.hidden),
+                WORKSPACE_LIMIT,
+            )?,
+            down_plan: Bf16TnMatmulPlan::new(
+                &lt,
+                GemmShape::new(config.hidden, rows, config.intermediate),
+                WORKSPACE_LIMIT,
+            )?,
+            hidden_input: DeviceBuffer::zeroed(rows * config.hidden.max(q_width))?,
+            intermediate_input: DeviceBuffer::zeroed(rows * config.intermediate)?,
+            attention: if rows >= 64 {
+                Some(BonsaiTensorAttentionWorkspace::new(
+                    &lt,
+                    config,
+                    rows,
+                    cache_tokens,
+                )?)
+            } else {
+                None
+            },
+            lt,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.hidden_input.device_bytes()
+            + self.intermediate_input.device_bytes()
+            + self.qkv_plan.workspace_bytes()
+            + self.output_plan.workspace_bytes()
+            + self.gate_up_plan.workspace_bytes()
+            + self.down_plan.workspace_bytes()
+            + self
+                .attention
+                .as_ref()
+                .map_or(0, BonsaiTensorAttentionWorkspace::device_bytes)
+    }
+}
+
+impl BonsaiTensorAttentionWorkspace {
+    const CHUNK_ROWS: usize = 256;
+    const WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
+
+    fn new(lt: &CublasLt, config: BonsaiConfig, rows: usize, cache_tokens: usize) -> Result<Self> {
+        let chunk_rows = rows.min(Self::CHUNK_ROWS);
+        let (qk_plan, pv_plan) = Self::plans(lt, config, chunk_rows, cache_tokens)?;
+        let tail_rows = rows % chunk_rows;
+        let tail_plans = if tail_rows == 0 {
+            None
+        } else {
+            Some(Self::plans(lt, config, tail_rows, cache_tokens)?)
+        };
+        Ok(Self {
+            cache_tokens,
+            chunk_rows,
+            qk_plan,
+            pv_plan,
+            tail_plans,
+            packed_query: DeviceBuffer::zeroed(chunk_rows * config.q_width())?,
+            packed_key: DeviceBuffer::zeroed(cache_tokens * config.kv_width())?,
+            packed_value: DeviceBuffer::zeroed(cache_tokens * config.kv_width())?,
+            attention_scores: DeviceBuffer::zeroed(chunk_rows * config.q_heads * cache_tokens)?,
+            packed_probabilities: DeviceBuffer::zeroed(chunk_rows * config.q_heads * cache_tokens)?,
+            packed_attention: DeviceBuffer::zeroed(chunk_rows * config.q_width())?,
+        })
+    }
+
+    fn plans(
+        lt: &CublasLt,
+        config: BonsaiConfig,
+        query_rows: usize,
+        cache_tokens: usize,
+    ) -> Result<(Bf16TnMatmulPlan, Bf16TnMatmulPlan)> {
+        let queries_per_kv = config.q_heads / config.kv_heads;
+        let qk_plan = Bf16TnMatmulPlan::new_strided_batch(
+            lt,
+            GemmShape::new(cache_tokens, query_rows * queries_per_kv, config.head_dim),
+            config.kv_heads,
+            cache_tokens * config.head_dim,
+            queries_per_kv * query_rows * config.head_dim,
+            queries_per_kv * query_rows * cache_tokens,
+            Self::WORKSPACE_LIMIT,
+        )?;
+        let pv_plan = Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
+            lt,
+            GemmShape::new(config.head_dim, query_rows * queries_per_kv, cache_tokens),
+            cache_tokens,
+            config.kv_heads,
+            config.head_dim * cache_tokens,
+            queries_per_kv * query_rows * cache_tokens,
+            queries_per_kv * query_rows * config.head_dim,
+            Self::WORKSPACE_LIMIT,
+        )?;
+        Ok((qk_plan, pv_plan))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        lt: &CublasLt,
+        config: BonsaiConfig,
+        cache: &mut Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if start_position == 0 {
+            cache.append_initial_rows_and_stage_bf16_on_stream(
+                key,
+                value,
+                0,
+                rows,
+                self.packed_key.output(),
+                self.packed_value.output(),
+                stream,
+            )?;
+        } else {
+            cache.append_rows_at_offset_on_stream(key, value, 0, rows, stream)?;
+            cache.unpack_bf16_on_stream(
+                self.packed_key.output(),
+                self.packed_value.output(),
+                stream,
+            )?;
+        }
+
+        let mut row_offset = 0;
+        while row_offset < rows {
+            let query_rows = (rows - row_offset).min(self.chunk_rows);
+            pack_token_heads_bf16_at_offset_into_on_stream(
+                query,
+                self.packed_query.output(),
+                query_rows,
+                config.q_heads,
+                config.head_dim,
+                row_offset,
+                stream,
+            )?;
+            let (qk_plan, pv_plan) = if query_rows == self.chunk_rows {
+                (&self.qk_plan, &self.pv_plan)
+            } else {
+                let Some((qk_plan, pv_plan)) = self.tail_plans.as_ref() else {
+                    return Err(Error::Format {
+                        label: "Bonsai tensor prefill attention",
+                        detail: format!("missing plans for {query_rows}-row tail"),
+                    });
+                };
+                (qk_plan, pv_plan)
+            };
+            qk_plan.run_offsets_on_stream(
+                lt,
+                &self.packed_key,
+                0,
+                &self.packed_query,
+                0,
+                self.attention_scores.output(),
+                0,
+                stream,
+            )?;
+            causal_window_softmax_f32_to_bf16_on_stream(
+                &self.attention_scores,
+                self.packed_probabilities.output(),
+                query_rows,
+                self.cache_tokens,
+                start_position + row_offset,
+                config.q_heads,
+                config.head_dim,
+                None,
+                stream,
+            )?;
+            pv_plan.run_offsets_on_stream(
+                lt,
+                &self.packed_value,
+                0,
+                &self.packed_probabilities,
+                0,
+                self.packed_attention.output(),
+                0,
+                stream,
+            )?;
+            unpack_heads_f32_at_offset_into_on_stream(
+                &self.packed_attention,
+                output.output(),
+                query_rows,
+                config.q_heads,
+                config.head_dim,
+                row_offset,
+                stream,
+            )?;
+            row_offset += query_rows;
+        }
+        Ok(())
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.qk_plan.workspace_bytes()
+            + self.pv_plan.workspace_bytes()
+            + self
+                .tail_plans
+                .as_ref()
+                .map_or(0, |(qk, pv)| qk.workspace_bytes() + pv.workspace_bytes())
+            + self.packed_query.device_bytes()
+            + self.packed_key.device_bytes()
+            + self.packed_value.device_bytes()
+            + self.attention_scores.device_bytes()
+            + self.packed_probabilities.device_bytes()
+            + self.packed_attention.device_bytes()
     }
 }
 
@@ -736,6 +1079,15 @@ fn load_q2_matrix(
     cols: usize,
 ) -> Result<TernaryG64Matrix> {
     TernaryG64Matrix::from_packed(&load_q2_packed(index, name, rows, cols)?)
+}
+
+fn load_q2_prefill_matrix(
+    index: &GgufIndex,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<TernaryG64Matrix> {
+    TernaryG64Matrix::from_packed_with_bf16_prefill(&load_q2_packed(index, name, rows, cols)?)
 }
 
 fn load_q2_packed(
@@ -880,6 +1232,10 @@ fn yarn_inverse_frequencies(config: BonsaiConfig) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    fn round_bf16(value: f32) -> f32 {
+        nvfp4::format::bf16_to_f32(nvfp4::format::f32_to_bf16(value))
+    }
+
     #[test]
     fn bonsai_yarn_frequency_endpoints_match_reference_formula() {
         let config = BonsaiConfig {
@@ -901,6 +1257,146 @@ mod tests {
         assert!((frequencies[0] - 1.0).abs() < 1.0e-7);
         let unscaled_last = config.rope_theta.powf(-126.0 / config.head_dim as f32);
         assert!((frequencies[63] - unscaled_last / 4.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn chunked_bf16_attention_matches_causal_gqa_reference() {
+        const ROWS: usize = 257;
+        const Q_HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        let config = BonsaiConfig {
+            hidden: Q_HEADS * HEAD_DIM,
+            intermediate: Q_HEADS * HEAD_DIM,
+            layers: 1,
+            q_heads: Q_HEADS,
+            kv_heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            vocab: 32,
+            max_context: ROWS,
+            rms_eps: 1.0e-6,
+            rope_theta: 1_000_000.0,
+            rope_factor: 1.0,
+            rope_original_context: ROWS,
+        };
+        let query = (0..ROWS * Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 17 % 97) as f32 - 48.0) / 64.0)
+            .collect::<Vec<_>>();
+        let key = (0..ROWS * KV_HEADS * HEAD_DIM)
+            .map(|index| ((index * 23 % 89) as f32 - 44.0) / 64.0)
+            .collect::<Vec<_>>();
+        let value = (0..ROWS * KV_HEADS * HEAD_DIM)
+            .map(|index| ((index * 29 % 83) as f32 - 41.0) / 53.0)
+            .collect::<Vec<_>>();
+
+        let query_reference = query.clone();
+        let lt = CublasLt::new().expect("cuBLASLt");
+        let mut workspace =
+            BonsaiTensorAttentionWorkspace::new(&lt, config, ROWS, ROWS).expect("workspace");
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let key = DeviceBuffer::from_host(&key).expect("key");
+        let value = DeviceBuffer::from_host(&value).expect("value");
+        let mut output = DeviceBuffer::zeroed(ROWS * Q_HEADS * HEAD_DIM).expect("output");
+        let mut cache = Sm12xKvCache::new(ROWS, KV_HEADS, HEAD_DIM).expect("cache");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        workspace
+            .run(
+                &lt,
+                config,
+                &mut cache,
+                &query,
+                &key,
+                &value,
+                &mut output,
+                ROWS,
+                0,
+                &stream,
+            )
+            .expect("attention");
+        let actual = output.copy_to_host(&stream).expect("download");
+        let staged_key = workspace
+            .packed_key
+            .copy_to_host(&stream)
+            .expect("staged key");
+        let staged_value = workspace
+            .packed_value
+            .copy_to_host(&stream)
+            .expect("staged value");
+        let queries_per_kv = Q_HEADS / KV_HEADS;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut expected = vec![0.0f32; ROWS * Q_HEADS * HEAD_DIM];
+        for token in 0..ROWS {
+            for q_head in 0..Q_HEADS {
+                let kv_head = q_head / queries_per_kv;
+                let mut scores = Vec::with_capacity(token + 1);
+                for key_token in 0..=token {
+                    let score = (0..HEAD_DIM)
+                        .map(|dim| {
+                            round_bf16(query_reference[(token * Q_HEADS + q_head) * HEAD_DIM + dim])
+                                * nvfp4::format::bf16_to_f32(
+                                    staged_key[(kv_head * ROWS + key_token) * HEAD_DIM + dim],
+                                )
+                        })
+                        .sum::<f32>()
+                        * scale;
+                    scores.push(score);
+                }
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let denominator = scores
+                    .iter()
+                    .map(|score| (*score - maximum).exp())
+                    .sum::<f32>();
+                for dim in 0..HEAD_DIM {
+                    expected[(token * Q_HEADS + q_head) * HEAD_DIM + dim] = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(key_token, score)| {
+                            let probability = round_bf16((*score - maximum).exp() / denominator);
+                            probability
+                                * nvfp4::format::bf16_to_f32(
+                                    staged_value[(kv_head * HEAD_DIM + dim) * ROWS + key_token],
+                                )
+                        })
+                        .sum::<f32>();
+                }
+            }
+        }
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let (worst_index, worst_actual, worst_expected) = actual
+            .iter()
+            .zip(&expected)
+            .enumerate()
+            .max_by(
+                |(_, (left_actual, left_expected)), (_, (right_actual, right_expected))| {
+                    (*left_actual - *left_expected)
+                        .abs()
+                        .total_cmp(&(*right_actual - *right_expected).abs())
+                },
+            )
+            .map(|(index, (&actual, &expected))| (index, actual, expected))
+            .expect("non-empty attention output");
+        let rmse = (actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).powi(2) as f64)
+            .sum::<f64>()
+            / actual.len() as f64)
+            .sqrt();
+        let reference_scale = (expected
+            .iter()
+            .map(|value| value.powi(2) as f64)
+            .sum::<f64>()
+            / expected.len() as f64)
+            .sqrt();
+        let relative_rmse = rmse / reference_scale.max(f64::EPSILON);
+        assert!(
+            relative_rmse <= 3.0e-3,
+            "chunked BF16 attention max_abs={max_abs} relative_rmse={relative_rmse} scale={reference_scale} worst_index={worst_index} actual={worst_actual} expected={worst_expected}"
+        );
     }
 
     #[test]

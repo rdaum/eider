@@ -155,6 +155,14 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ternary_g64_expand_bf16_on_stream(
+        weight: *const u8,
+        weight_scales: *const f32,
+        output: *mut u16,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_block_fp8_linear_f32_on_stream(
         input: *const f32,
         weight: *const u8,
