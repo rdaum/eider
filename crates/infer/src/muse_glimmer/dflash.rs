@@ -182,6 +182,16 @@ pub(super) struct DFlashSequenceState {
     argmax_values: DeviceBuffer<f32>,
 }
 
+pub(super) struct DFlashSequenceCheckpoint {
+    caches: Vec<Sm12xKvCache>,
+}
+
+impl DFlashSequenceCheckpoint {
+    pub(super) fn device_bytes(&self) -> usize {
+        self.caches.iter().map(Sm12xKvCache::device_bytes).sum()
+    }
+}
+
 impl DFlashSequenceState {
     pub(super) fn device_bytes(&self) -> usize {
         self.linear.device_bytes()
@@ -453,6 +463,90 @@ impl DFlashModel {
             argmax_indices: DeviceBuffer::zeroed(rows)?,
             argmax_values: DeviceBuffer::zeroed(rows)?,
         })
+    }
+
+    pub(super) fn checkpoint_sequence_device_bytes(
+        &self,
+        state: &DFlashSequenceState,
+        prefix_tokens: usize,
+    ) -> Result<usize> {
+        if prefix_tokens == 0
+            || !prefix_tokens.is_multiple_of(128)
+            || state.caches.len() != self.layers.len()
+            || state.caches.iter().any(|cache| cache.len() < prefix_tokens)
+        {
+            return Err(Error::Shape {
+                label: "DFlash sequence checkpoint byte estimate",
+                expected: format!(
+                    "a nonzero 128-token-aligned prefix retained by {} layer caches",
+                    self.layers.len()
+                ),
+                actual: format!(
+                    "prefix_tokens={prefix_tokens} layer_caches={} minimum_len={}",
+                    state.caches.len(),
+                    state
+                        .caches
+                        .iter()
+                        .map(Sm12xKvCache::len)
+                        .min()
+                        .unwrap_or(0)
+                ),
+            });
+        }
+        state.caches.iter().try_fold(0usize, |total, cache| {
+            let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
+            total.checked_add(bytes).ok_or_else(|| Error::Shape {
+                label: "DFlash checkpoint byte estimate",
+                expected: "device-byte total without overflow".to_string(),
+                actual: prefix_tokens.to_string(),
+            })
+        })
+    }
+
+    pub(super) fn checkpoint_sequence(
+        &self,
+        state: &DFlashSequenceState,
+        prefix_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<DFlashSequenceCheckpoint> {
+        self.checkpoint_sequence_device_bytes(state, prefix_tokens)?;
+        let mut caches = (0..self.layers.len())
+            .map(|_| {
+                Sm12xKvCache::new(
+                    prefix_tokens,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (destination, source) in caches.iter_mut().zip(&state.caches) {
+            destination.copy_aligned_prefix_from_on_stream(source, prefix_tokens, stream)?;
+        }
+        Ok(DFlashSequenceCheckpoint { caches })
+    }
+
+    pub(super) fn restore_sequence_checkpoint(
+        &self,
+        checkpoint: &DFlashSequenceCheckpoint,
+        state: &mut DFlashSequenceState,
+        prefix_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if checkpoint.caches.len() != self.layers.len() || state.caches.len() != self.layers.len() {
+            return Err(Error::Shape {
+                label: "DFlash sequence checkpoint restore",
+                expected: format!("{} source and destination layer caches", self.layers.len()),
+                actual: format!(
+                    "source={} destination={}",
+                    checkpoint.caches.len(),
+                    state.caches.len()
+                ),
+            });
+        }
+        for (destination, source) in state.caches.iter_mut().zip(&checkpoint.caches) {
+            destination.copy_aligned_prefix_from_on_stream(source, prefix_tokens, stream)?;
+        }
+        Ok(())
     }
 
     pub(super) fn inject_features(

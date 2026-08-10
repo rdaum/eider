@@ -334,7 +334,11 @@ fn actor_main(
                 let _ = ready.send(Err(error.to_string()));
                 return;
             }
-            info!(model_dir = %model_dir.display(), "loading Muse Glimmer model");
+            info!(
+                model_dir = %model_dir.display(),
+                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                "loading Muse Glimmer model"
+            );
             let model_result = match dflash_gguf {
                 Some(path) => MuseGlimmerModel::load_with_dflash(&model_dir, path),
                 None => MuseGlimmerModel::load(&model_dir),
@@ -356,7 +360,12 @@ fn actor_main(
                     .min(model.config().max_position_embeddings),
                 ..scheduler
             };
-            let service = match MuseGlimmerChatService::new(&model, &template, muse_scheduler) {
+            let service = match MuseGlimmerChatService::new_with_prefix_cache(
+                &model,
+                &template,
+                muse_scheduler,
+                prefix_cache,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -719,8 +728,8 @@ fn muse_admission_progress(progress: MuseGlimmerAdmissionProgress) -> EngineAdmi
         request_id: progress.request_id.get(),
         sequence_device_bytes: progress.sequence_device_bytes,
         cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: Duration::ZERO,
-        checkpoint_copy_duration: Duration::ZERO,
+        allocation_duration: progress.allocation_duration,
+        checkpoint_copy_duration: progress.checkpoint_copy_duration,
         admitted_after_tick_start: progress.admitted_after_tick_start,
     }
 }

@@ -2,14 +2,20 @@
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::prefix_cache::{
+    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
+};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::muse_glimmer::{MuseGlimmerDecodeState, MuseGlimmerModel};
+use crate::muse_glimmer::{
+    MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceCheckpoint,
+};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// Stable identity assigned to a Muse Glimmer request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -39,8 +45,12 @@ pub struct MuseGlimmerAdmissionProgress {
     pub request_id: MuseGlimmerRequestId,
     /// Sequence-specific device bytes.
     pub sequence_device_bytes: usize,
-    /// Prefix-cache hits; currently always zero for Muse Glimmer.
+    /// Prompt tokens restored from a retained prefix checkpoint.
     pub cached_prompt_tokens: usize,
+    /// Time spent allocating a fresh or restored active sequence.
+    pub allocation_duration: Duration,
+    /// Time spent copying a retained prefix into the active sequence.
+    pub checkpoint_copy_duration: Duration,
     /// Elapsed scheduler-tick time at admission.
     pub admitted_after_tick_start: Duration,
 }
@@ -104,6 +114,9 @@ pub enum MuseGlimmerCancelOutcome {
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
+    prefix_cache_key: Option<PrefixCacheKey>,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
@@ -127,6 +140,7 @@ pub struct MuseGlimmerChatService<'model, 'template> {
     waiting: VecDeque<MuseGlimmerRequestId>,
     requests: BTreeMap<MuseGlimmerRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
+    prefix_cache: Option<PrefixCache<MuseGlimmerSequenceCheckpoint>>,
 }
 
 impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
@@ -135,6 +149,16 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         model: &'model MuseGlimmerModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
+    ) -> Result<Self> {
+        Self::new_with_prefix_cache(model, template, config, PrefixCacheConfig::default())
+    }
+
+    /// Creates a service with explicit scheduling and prompt-prefix limits.
+    pub fn new_with_prefix_cache(
+        model: &'model MuseGlimmerModel,
+        template: &'template CheckpointChatTemplate,
+        config: SchedulerConfig,
+        prefix_cache: PrefixCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         if config.max_context_tokens > model.config().max_position_embeddings {
@@ -152,6 +176,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
+            prefix_cache: (prefix_cache.max_device_bytes != 0)
+                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
         })
     }
 
@@ -202,6 +228,15 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         })?;
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
+        let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_cache_key = if prefix_cache_target == 0 {
+            None
+        } else {
+            self.prefix_cache
+                .as_mut()
+                .map(|cache| cache.prompt_key(&prompt.token_ids, prefix_cache_target))
+                .transpose()?
+        };
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
         let dflash_enabled = self.model.has_dflash()
@@ -214,6 +249,9 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             ActiveRequest {
                 prompt: prompt.token_ids.clone(),
                 prompt_position: 0,
+                prefix_cache_key,
+                prefix_cache_target,
+                prefix_cache_checkpointed: false,
                 generation: request.generation.clone(),
                 generated_tokens: 0,
                 last_token: None,
@@ -253,6 +291,13 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         let started = Instant::now();
         let mut tick = MuseGlimmerTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
+        for admission in &tick.admitted {
+            self.requests
+                .get_mut(&admission.request_id)
+                .expect("admitted Muse Glimmer request is retained")
+                .usage
+                .cached_prompt_tokens = admission.cached_prompt_tokens;
+        }
         let mut terminal = BTreeMap::new();
         let decode_ids = self
             .requests
@@ -331,11 +376,39 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             let capacity = request.prompt.len()
                 + request.generation.max_new_tokens
                 + usize::from(request.dflash_enabled) * 15;
-            let state = self.model.new_decode_state(capacity.max(1))?;
+            let mut allocation_duration = Duration::ZERO;
+            let mut checkpoint_copy_duration = Duration::ZERO;
+            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
+                (Some(cache), Some(key)) => {
+                    cache.restore(key, MuseGlimmerSequenceCheckpoint::position, |checkpoint| {
+                        let restore_started = Instant::now();
+                        let state = self
+                            .model
+                            .restore_sequence_checkpoint(checkpoint, capacity.max(1))?;
+                        checkpoint_copy_duration = restore_started.elapsed();
+                        Ok(state)
+                    })?
+                }
+                _ => None,
+            };
+            let cached_prompt_tokens = restored.as_ref().map_or(0, MuseGlimmerDecodeState::len);
+            let state = if let Some(restored) = restored {
+                restored
+            } else {
+                let allocation_started = Instant::now();
+                let state = self.model.new_decode_state(capacity.max(1))?;
+                allocation_duration = allocation_started.elapsed();
+                state
+            };
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_cache_checkpointed =
+                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             let progress = MuseGlimmerAdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: state.device_bytes(),
-                cached_prompt_tokens: 0,
+                cached_prompt_tokens,
+                allocation_duration,
+                checkpoint_copy_duration,
                 admitted_after_tick_start: started.elapsed(),
             };
             request.state = Some(state);
@@ -390,12 +463,62 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             }
             request.prompt_position = end;
             request.prompt_logits_ready = end == request.prompt.len();
+            if checkpoint_ready(
+                request.prompt_position,
+                request.prefix_cache_target,
+                request.prefix_cache_checkpointed,
+            ) {
+                Self::retain_request_checkpoint(self.model, &mut self.prefix_cache, request);
+            }
             tick.prefilled.push(MuseGlimmerPrefillProgress {
                 request_id: id,
                 prompt_position: end,
             });
         }
         Ok(())
+    }
+
+    fn retain_request_checkpoint(
+        model: &MuseGlimmerModel,
+        prefix_cache: &mut Option<PrefixCache<MuseGlimmerSequenceCheckpoint>>,
+        request: &mut ActiveRequest<'template>,
+    ) {
+        if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
+            return;
+        }
+        let (Some(cache), Some(key), Some(state)) = (
+            prefix_cache.as_mut(),
+            request.prefix_cache_key.as_ref(),
+            request.state.as_ref(),
+        ) else {
+            request.prefix_cache_checkpointed = true;
+            return;
+        };
+        if state.len() < request.prefix_cache_target {
+            return;
+        }
+        if !cache.contains(key) {
+            let Ok(estimated_bytes) =
+                model.checkpoint_sequence_device_bytes(state, request.prefix_cache_target)
+            else {
+                request.prefix_cache_checkpointed = true;
+                return;
+            };
+            if cache.prepare_insert(estimated_bytes) {
+                let started = Instant::now();
+                match model.checkpoint_sequence(state, request.prefix_cache_target) {
+                    Ok(checkpoint) => {
+                        cache.record_checkpoint(started);
+                        let bytes = checkpoint.device_bytes();
+                        if let Err(error) = cache.insert(key.clone(), checkpoint, bytes) {
+                            warn!(%error, "failed to retain Muse Glimmer prompt prefix checkpoint");
+                        }
+                    }
+                    Err(error) => warn!(%error, "failed to checkpoint Muse Glimmer prompt prefix"),
+                }
+            }
+        }
+        request.prefix_cache_checkpointed = true;
     }
 
     fn generate_one(
@@ -535,6 +658,14 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     }
 }
 
+fn checkpoint_ready(
+    prompt_position: usize,
+    prefix_cache_target: usize,
+    prefix_cache_checkpointed: bool,
+) -> bool {
+    !prefix_cache_checkpointed && prefix_cache_target != 0 && prompt_position >= prefix_cache_target
+}
+
 struct ResponseFilter {
     stop: StopBuffer,
     saw_tool_calls: bool,
@@ -592,5 +723,23 @@ impl ResponseFilter {
                 event: ChatOutputEvent::Text(text),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_ready;
+
+    #[test]
+    fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
+        assert!(checkpoint_ready(4_736, 4_736, false));
+        assert!(checkpoint_ready(4_800, 4_736, false));
+        assert!(!checkpoint_ready(4_672, 4_736, false));
+    }
+
+    #[test]
+    fn disabled_or_completed_checkpoint_is_not_ready() {
+        assert!(!checkpoint_ready(4_736, 0, false));
+        assert!(!checkpoint_ready(4_736, 4_736, true));
     }
 }

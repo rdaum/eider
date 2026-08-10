@@ -1071,6 +1071,7 @@ pub struct MuseGlimmerSequenceCheckpoint {
     model_id: u64,
     position: usize,
     kv_caches: Vec<Sm12xKvCache>,
+    dflash: Option<dflash::DFlashSequenceCheckpoint>,
 }
 
 /// One greedy next-token result.
@@ -1438,14 +1439,38 @@ impl MuseGlimmerModel {
                 actual: prefix_tokens.to_string(),
             });
         }
-        state.kv_caches.iter().try_fold(0usize, |total, cache| {
+        let target_bytes = state.kv_caches.iter().try_fold(0usize, |total, cache| {
             let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
             total.checked_add(bytes).ok_or_else(|| Error::Shape {
                 label: "Muse Glimmer checkpoint byte estimate",
                 expected: "device-byte total without overflow".to_string(),
                 actual: prefix_tokens.to_string(),
             })
-        })
+        })?;
+        let dflash_bytes = match (&self.dflash, &state.dflash_state) {
+            (Some(model), Some(state)) => {
+                model.checkpoint_sequence_device_bytes(state, prefix_tokens)?
+            }
+            (None, None) => 0,
+            _ => {
+                return Err(Error::Shape {
+                    label: "Muse Glimmer DFlash checkpoint state",
+                    expected: "model and sequence DFlash state to match".to_string(),
+                    actual: format!(
+                        "model={} sequence={}",
+                        self.dflash.is_some(),
+                        state.dflash_state.is_some()
+                    ),
+                });
+            }
+        };
+        target_bytes
+            .checked_add(dflash_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Muse Glimmer checkpoint byte estimate",
+                expected: "target and DFlash device-byte total without overflow".to_string(),
+                actual: prefix_tokens.to_string(),
+            })
     }
 
     /// Copies an aligned K/V prefix into immutable compact storage.
@@ -1463,11 +1488,29 @@ impl MuseGlimmerModel {
         for (destination, source) in kv_caches.iter_mut().zip(&state.kv_caches) {
             destination.copy_aligned_prefix_from_on_stream(source, prefix_tokens, &self.stream)?;
         }
+        let dflash = match (&self.dflash, &state.dflash_state) {
+            (Some(model), Some(state)) => {
+                Some(model.checkpoint_sequence(state, prefix_tokens, &self.stream)?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(Error::Shape {
+                    label: "Muse Glimmer DFlash checkpoint state",
+                    expected: "model and sequence DFlash state to match".to_string(),
+                    actual: format!(
+                        "model={} sequence={}",
+                        self.dflash.is_some(),
+                        state.dflash_state.is_some()
+                    ),
+                });
+            }
+        };
         self.stream.synchronize()?;
         Ok(MuseGlimmerSequenceCheckpoint {
             model_id: self.model_id,
             position: prefix_tokens,
             kv_caches,
+            dflash,
         })
     }
 
@@ -1480,17 +1523,19 @@ impl MuseGlimmerModel {
         if checkpoint.model_id != self.model_id
             || checkpoint.position > max_tokens
             || checkpoint.kv_caches.len() != self.layers.len()
+            || checkpoint.dflash.is_some() != self.dflash.is_some()
         {
             return Err(Error::Shape {
                 label: "Muse Glimmer sequence checkpoint restore",
                 expected: format!(
-                    "matching model, capacity >= {}, and {} layer caches",
+                    "matching model, capacity >= {}, {} layer caches, and matching DFlash state",
                     checkpoint.position,
                     self.layers.len()
                 ),
                 actual: format!(
-                    "capacity={max_tokens} layer_caches={}",
-                    checkpoint.kv_caches.len()
+                    "capacity={max_tokens} layer_caches={} dflash={}",
+                    checkpoint.kv_caches.len(),
+                    checkpoint.dflash.is_some()
                 ),
             });
         }
@@ -1498,6 +1543,18 @@ impl MuseGlimmerModel {
         for (destination, source) in state.kv_caches.iter_mut().zip(&checkpoint.kv_caches) {
             destination.copy_aligned_prefix_from_on_stream(
                 source,
+                checkpoint.position,
+                &self.stream,
+            )?;
+        }
+        if let (Some(model), Some(dflash_checkpoint), Some(dflash_state)) = (
+            &self.dflash,
+            &checkpoint.dflash,
+            state.dflash_state.as_mut(),
+        ) {
+            model.restore_sequence_checkpoint(
+                dflash_checkpoint,
+                dflash_state,
                 checkpoint.position,
                 &self.stream,
             )?;
@@ -1577,7 +1634,14 @@ impl MuseGlimmerSequenceCheckpoint {
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.kv_caches.iter().map(Sm12xKvCache::device_bytes).sum()
+        self.kv_caches
+            .iter()
+            .map(Sm12xKvCache::device_bytes)
+            .sum::<usize>()
+            + self
+                .dflash
+                .as_ref()
+                .map_or(0, dflash::DFlashSequenceCheckpoint::device_bytes)
     }
 }
 
@@ -1645,5 +1709,64 @@ mod tests {
             generated.push(token);
         }
         assert_eq!(generated, [24, 372, 1_045, 10_016, 328, 2_885, 262, 5_091]);
+    }
+
+    #[test]
+    #[ignore = "requires the local Muse Glimmer NVFP4 and DFlash checkpoints and an SM121 GPU"]
+    fn dflash_checkpoint_restore_preserves_the_next_speculative_cycle() {
+        let model_dir = std::env::var_os("MUSE_GLIMMER_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/muse-glimmer-30b-nvfp4")
+            });
+        let dflash = std::env::var_os("MUSE_GLIMMER_DFLASH")
+            .map(std::path::PathBuf::from)
+            .expect("set MUSE_GLIMMER_DFLASH to Meta's dflash-kquant.gguf");
+        let model =
+            MuseGlimmerModel::load_with_dflash(model_dir, dflash).expect("load Muse with DFlash");
+        let prefix = (0..128).map(|token| token as u32 + 1).collect::<Vec<_>>();
+        let suffix = [129, 130, 131];
+        let mut direct = model.new_decode_state(160).expect("direct state");
+        for chunk in prefix.chunks(16) {
+            model
+                .dflash_prefill_chunk(&mut direct, chunk, false)
+                .expect("prefill checkpoint prefix");
+        }
+        let estimated = model
+            .checkpoint_sequence_device_bytes(&direct, prefix.len())
+            .expect("estimate checkpoint bytes");
+        let checkpoint = model
+            .checkpoint_sequence(&direct, prefix.len())
+            .expect("checkpoint target and DFlash caches");
+        assert_eq!(checkpoint.device_bytes(), estimated);
+        let mut restored = model
+            .restore_sequence_checkpoint(&checkpoint, 160)
+            .expect("restore target and DFlash caches");
+        assert_eq!(restored.len(), prefix.len());
+
+        model
+            .dflash_prefill_chunk(&mut direct, &suffix, true)
+            .expect("continue direct state");
+        model
+            .dflash_prefill_chunk(&mut restored, &suffix, true)
+            .expect("continue restored state");
+        let direct_anchor = model
+            .argmax_with_logit(&mut direct)
+            .expect("direct anchor")
+            .0;
+        let restored_anchor = model
+            .argmax_with_logit(&mut restored)
+            .expect("restored anchor")
+            .0;
+        assert_eq!(restored_anchor, direct_anchor);
+        let direct_cycle = model
+            .dflash_cycle(&mut direct, direct_anchor)
+            .expect("direct DFlash cycle");
+        let restored_cycle = model
+            .dflash_cycle(&mut restored, restored_anchor)
+            .expect("restored DFlash cycle");
+        assert_eq!(restored_cycle, direct_cycle);
     }
 }
