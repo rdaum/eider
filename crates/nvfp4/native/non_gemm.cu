@@ -10821,6 +10821,13 @@ extern "C" cudaError_t infer_nvfp4_w4a16_matvec_f32_warp_rows_on_stream(
     const std::uint32_t threads = warps_per_block * 32;
     const std::uint32_t grid = (out_features + warps_per_block - 1) / warps_per_block;
     const std::size_t shmem_bytes = static_cast<std::size_t>(in_features) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_nvfp4_w4a16_matvec_f32_warp_rows_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shmem_bytes));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
     infer_nvfp4_w4a16_matvec_f32_warp_rows_kernel<<<
         grid, threads, shmem_bytes, stream>>>(
         input, packed_weight, weight_scale, output,
@@ -10856,6 +10863,13 @@ extern "C" cudaError_t infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream(
         return cudaGetLastError();
     }
     const std::size_t shmem_bytes = static_cast<std::size_t>(in_features) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shmem_bytes));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
     infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_kernel<<<
         dim3(grid_x, batch_size), threads, shmem_bytes, stream>>>(
         input, packed_weight, weight_scale, output,

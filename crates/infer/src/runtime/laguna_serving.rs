@@ -42,6 +42,7 @@ fn reasoning_token_budget(
         ChatReasoningEffort::Low => 1,
         ChatReasoningEffort::Medium => 2,
         ChatReasoningEffort::High => 3,
+        ChatReasoningEffort::XHigh => 4,
     };
     if max_output_tokens < 2 {
         return None;

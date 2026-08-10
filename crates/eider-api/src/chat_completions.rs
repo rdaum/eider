@@ -311,9 +311,10 @@ fn parse_reasoning_effort(value: &str) -> Result<ChatReasoningEffort, ApiError> 
         "low" => Ok(ChatReasoningEffort::Low),
         "medium" => Ok(ChatReasoningEffort::Medium),
         "high" => Ok(ChatReasoningEffort::High),
+        "xhigh" => Ok(ChatReasoningEffort::XHigh),
         _ => Err(ApiError::invalid(
             "reasoning_effort",
-            "reasoning effort must be low, medium, or high",
+            "reasoning effort must be low, medium, high, or xhigh",
         )),
     }
 }

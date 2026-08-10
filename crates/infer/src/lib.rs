@@ -26,6 +26,9 @@ pub mod qwen3;
 /// Gemma 4 text-model loading and inference.
 pub mod gemma4;
 
+/// Muse Glimmer dense text-model loading and inference.
+pub mod muse_glimmer;
+
 /// Nemotron 3 hybrid Mamba/attention/MoE model support.
 pub mod nemotron3;
 

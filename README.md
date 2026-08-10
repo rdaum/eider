@@ -14,7 +14,8 @@ not use llama.cpp or vLLM.
 
 It is capable of running Qwen3.6, the Qwen3.5-MoE fine-tune Agents-A1,
 StepFun's Step-3.7-Flash, Poolside's Laguna-S-2.1, Gemma 4 26B-A4B, and
-NVIDIA's Nemotron 3 Puzzle hybrid model and DeepSeek V4 Flash.
+NVIDIA's Nemotron 3 Puzzle hybrid model, DeepSeek V4 Flash, and Meta's
+Muse Glimmer 30B text model.
 
 It includes an OpenAI-compatible Responses and Chat Completions server
 with continuous multi-session scheduling and a compact FP4 KV cache
@@ -94,6 +95,7 @@ throughput run has not been completed.
 | [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | 20.4 | — | 240 of 288 routed experts resident per layer |
 | [Laguna-S-2.1](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | 16.2 | — | Resident NVFP4 experts; compact FP4 KV cache |
 | [Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | 30.1 | 29.6 | Same ModelOpt NVFP4 weights; compact FP4 KV in Eider, FP8 E4M3 KV in vLLM |
+| [Muse Glimmer 30B](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | 5.5 | — | ModelOpt NVFP4 weights through the initial W4A16 decode path; compact FP4 KV |
 | [Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | — | — | Throughput comparison pending |
 
 Gemma prefills a fresh roughly 2,700-token Pi/API prompt at about 6,740 prompt
@@ -101,7 +103,9 @@ tokens/sec, compared with about 7,060 in vLLM. Prefix reuse brought a typical
 follow-up to 235 ms TTFT. An Agents-A1 Pi session sustained 58-60 decode
 tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
 Laguna prefills a fresh roughly 3,300-token API prompt at about 135 prompt
-tokens/sec.
+tokens/sec. Muse Glimmer's initial sequential path measured 5.9 prompt
+tokens/sec and 5.5 decode tokens/sec on a 50-token API prompt; batched prefill
+and a tensor-core decode path remain future optimization work.
 
 Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
 its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5
@@ -130,6 +134,7 @@ corresponding served model name.
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agentic fine-tune; 262K-token limit |
 | [`step-3.7-flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | `eider-step3.7` | 198B MoE with disk-backed expert paging |
 | [`laguna-s-2.1`](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | `eider-laguna-s-2.1` | 256-expert MoE; compact FP4 KV cache |
+| [`muse-glimmer-30b-nvfp4`](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | `eider-muse-glimmer-30b` | Dense agentic text model; ATEM tools and compact FP4 KV cache |
 | [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |
 | [`gemma-4-26b-a4b-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | `eider-gemma4-26b` | Upstream BF16 source served by the same text runtime |
 | [`nemotron-3-puzzle-75b-a9b`](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | `eider-nemotron3-puzzle` | Mamba-2, latent-MoE, and attention hybrid |

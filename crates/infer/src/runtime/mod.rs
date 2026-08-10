@@ -11,6 +11,7 @@ pub mod gemma4_serving;
 pub mod generation;
 pub mod kv_cache;
 pub mod laguna_serving;
+pub mod muse_glimmer_serving;
 pub mod nemotron3_serving;
 pub mod prefix_cache;
 pub mod sampling;

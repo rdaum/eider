@@ -22,6 +22,12 @@ const DSML_INVOKE_OPEN: &str = "<｜DSML｜invoke";
 const DSML_INVOKE_CLOSE: &str = "</｜DSML｜invoke>";
 const DSML_PARAMETER_OPEN: &str = "<｜DSML｜parameter";
 const DSML_PARAMETER_CLOSE: &str = "</｜DSML｜parameter>";
+const ATEM_TOOL_CALLS_OPEN: &str = "<atem:function_calls>";
+const ATEM_TOOL_CALLS_CLOSE: &str = "</atem:function_calls>";
+const ATEM_INVOKE_OPEN: &str = "<atem:invoke";
+const ATEM_INVOKE_CLOSE: &str = "</atem:invoke>";
+const ATEM_PARAMETER_OPEN: &str = "<atem:parameter";
+const ATEM_PARAMETER_CLOSE: &str = "</atem:parameter>";
 const GEMMA_THINK_OPEN: &str = "<|channel>thought\n";
 const GEMMA_THINK_CLOSE: &str = "<channel|>";
 const THINK_CLOSE: &str = "</think>";
@@ -61,6 +67,7 @@ enum ToolCallProtocol {
     Standard,
     Gemma,
     Dsml,
+    Atem,
 }
 
 impl ToolCallProtocol {
@@ -69,6 +76,7 @@ impl ToolCallProtocol {
             Self::Standard => TOOL_CALL_CLOSE,
             Self::Gemma => GEMMA_TOOL_CALL_CLOSE,
             Self::Dsml => DSML_TOOL_CALLS_CLOSE,
+            Self::Atem => ATEM_TOOL_CALLS_CLOSE,
         }
     }
 }
@@ -78,6 +86,8 @@ pub struct ChatOutputCodec<'tokenizer> {
     decode_stream: TokenizerDecodeStream<'tokenizer>,
     parser: ChatOutputParser,
     gemma_special_tokens: Option<GemmaSpecialTokens>,
+    muse_special_tokens: Option<MuseSpecialTokens>,
+    muse_header: Option<String>,
     finished: bool,
 }
 
@@ -86,6 +96,13 @@ struct GemmaSpecialTokens {
     channel_close: u32,
     tool_call_open: u32,
     tool_call_close: u32,
+}
+
+struct MuseSpecialTokens {
+    start: u32,
+    message: u32,
+    end_message: u32,
+    end_turn: u32,
 }
 
 impl<'tokenizer> ChatOutputCodec<'tokenizer> {
@@ -117,10 +134,31 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
             }),
             _ => None,
         };
+        let muse_special_tokens = match (
+            tokenizer.token_to_id("<|start|>"),
+            tokenizer.token_to_id("<|message|>"),
+            tokenizer.token_to_id("<|eom|>"),
+            tokenizer.token_to_id("<|eot|>"),
+        ) {
+            (Some(start), Some(message), Some(end_message), Some(end_turn)) => {
+                Some(MuseSpecialTokens {
+                    start,
+                    message,
+                    end_message,
+                    end_turn,
+                })
+            }
+            _ => None,
+        };
+        let muse_header = muse_special_tokens
+            .as_ref()
+            .map(|_| "assistant".to_string());
         Ok(Self {
             decode_stream: tokenizer.decode_stream(true),
             parser: ChatOutputParser::new(tools, starts_in_reasoning)?,
             gemma_special_tokens,
+            muse_special_tokens,
+            muse_header,
             finished: false,
         })
     }
@@ -132,6 +170,25 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
                 label: "chat output stream",
                 detail: "cannot push a token after finish".to_string(),
             });
+        }
+        if let Some(tokens) = &self.muse_special_tokens {
+            if token_id == tokens.start {
+                self.muse_header = Some(String::new());
+                return Ok(Vec::new());
+            }
+            if token_id == tokens.message {
+                let header = self.muse_header.take().ok_or_else(|| Error::Format {
+                    label: "Muse Glimmer output",
+                    detail: "message marker appeared outside a recipient header".to_string(),
+                })?;
+                self.parser.begin_muse_segment(&header)?;
+                return Ok(Vec::new());
+            }
+            if token_id == tokens.end_message || token_id == tokens.end_turn {
+                let events = self.parser.end_muse_segment()?;
+                self.muse_header = Some(String::new());
+                return Ok(events);
+            }
         }
         if let Some(tokens) = &self.gemma_special_tokens {
             let marker = if token_id == tokens.channel_open {
@@ -159,6 +216,10 @@ impl<'tokenizer> ChatOutputCodec<'tokenizer> {
         else {
             return Ok(Vec::new());
         };
+        if let Some(header) = &mut self.muse_header {
+            header.push_str(&text);
+            return Ok(Vec::new());
+        }
         self.parser.push_text(&text)
     }
 
@@ -308,6 +369,54 @@ impl ChatOutputParser {
         Ok(events)
     }
 
+    fn begin_muse_segment(&mut self, header: &str) -> Result<()> {
+        let header = header.trim();
+        let recipient = header
+            .strip_prefix("assistant")
+            .map(str::trim)
+            .and_then(|tail| tail.strip_prefix("to="))
+            .map(str::trim)
+            .ok_or_else(|| Error::Format {
+                label: "Muse Glimmer output",
+                detail: format!("invalid recipient header {header:?}"),
+            })?;
+        if recipient.is_empty() {
+            return Err(Error::Format {
+                label: "Muse Glimmer output",
+                detail: "recipient header has an empty recipient".to_string(),
+            });
+        }
+        self.mode = if recipient == "self" {
+            OutputMode::Reasoning
+        } else {
+            OutputMode::Text
+        };
+        self.trim_after_thinking = false;
+        self.trim_after_tool_call = false;
+        Ok(())
+    }
+
+    fn end_muse_segment(&mut self) -> Result<Vec<ChatOutputEvent>> {
+        let events = match self.mode {
+            OutputMode::Reasoning => take_event(&mut self.pending, ChatOutputEvent::Reasoning),
+            OutputMode::Text => take_event(&mut self.pending, ChatOutputEvent::Text),
+            OutputMode::ToolCall => {
+                return Err(Error::Format {
+                    label: "Muse Glimmer tool call",
+                    detail: format!("message ended before {}", self.tool_call_protocol.close()),
+                });
+            }
+            OutputMode::DirectToolCall => {
+                return Err(Error::Format {
+                    label: "Muse Glimmer tool call",
+                    detail: "message ended inside a direct tool call".to_string(),
+                });
+            }
+        };
+        self.mode = OutputMode::Text;
+        Ok(events)
+    }
+
     fn finish(&mut self) -> Result<Vec<ChatOutputEvent>> {
         self.finish_with_truncation(false)
     }
@@ -397,6 +506,7 @@ impl ChatOutputParser {
             (TOOL_CALL_OPEN, ToolCallProtocol::Standard),
             (GEMMA_TOOL_CALL_OPEN, ToolCallProtocol::Gemma),
             (DSML_TOOL_CALLS_OPEN, ToolCallProtocol::Dsml),
+            (ATEM_TOOL_CALLS_OPEN, ToolCallProtocol::Atem),
         ]
         .into_iter()
         .filter_map(|(open, protocol)| self.pending.find(open).map(|index| (index, open, protocol)))
@@ -426,9 +536,14 @@ impl ChatOutputParser {
         }
         flush_safe_prefix_with_markers(
             &mut self.pending,
-            [TOOL_CALL_OPEN, GEMMA_TOOL_CALL_OPEN, DSML_TOOL_CALLS_OPEN]
-                .into_iter()
-                .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
+            [
+                TOOL_CALL_OPEN,
+                GEMMA_TOOL_CALL_OPEN,
+                DSML_TOOL_CALLS_OPEN,
+                ATEM_TOOL_CALLS_OPEN,
+            ]
+            .into_iter()
+            .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
             events,
             ChatOutputEvent::Text,
         )
@@ -457,6 +572,9 @@ impl ChatOutputParser {
                 &self.tool_parameters,
             )?],
             ToolCallProtocol::Dsml => parse_dsml_function_calls(&body, &self.tool_parameters)?,
+            ToolCallProtocol::Atem => {
+                parse_atem_function_calls(&body, &self.string_arguments, &self.tool_parameters)?
+            }
         };
         for function in functions {
             let id = next_tool_call_id()?;
@@ -543,6 +661,89 @@ fn push_nonempty(events: &mut Vec<ChatOutputEvent>, event: ChatOutputEvent) {
     if !empty {
         events.push(event);
     }
+}
+
+fn parse_atem_function_calls(
+    body: &str,
+    string_arguments: &BTreeMap<String, BTreeSet<String>>,
+    tool_parameters: &BTreeMap<String, ToolParameters>,
+) -> Result<Vec<ChatFunctionCall>> {
+    let mut remaining = body;
+    let mut functions = Vec::new();
+    loop {
+        remaining = trim_protocol_whitespace_start(remaining);
+        if remaining.is_empty() {
+            break;
+        }
+        let (mut attributes, invoke_body) =
+            parse_dsml_open_tag(remaining, ATEM_INVOKE_OPEN, "ATEM invoke")?;
+        let name = take_dsml_attribute(&mut attributes, "name", "ATEM invoke")?;
+        reject_dsml_attributes(&attributes, "ATEM invoke")?;
+        validate_protocol_name("function", &name)?;
+        if !tool_parameters.contains_key(&name) {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("unknown function {name:?} in ATEM invocation"),
+            });
+        }
+        let close = invoke_body
+            .find(ATEM_INVOKE_CLOSE)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("missing {ATEM_INVOKE_CLOSE} for {name:?}"),
+            })?;
+        let arguments =
+            parse_atem_parameters(&name, &invoke_body[..close], string_arguments.get(&name))?;
+        functions.push(ChatFunctionCall { name, arguments });
+        remaining = &invoke_body[close + ATEM_INVOKE_CLOSE.len()..];
+    }
+    if functions.is_empty() {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: "ATEM function_calls block does not contain an invocation".to_string(),
+        });
+    }
+    Ok(functions)
+}
+
+fn parse_atem_parameters(
+    function: &str,
+    body: &str,
+    string_arguments: Option<&BTreeSet<String>>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut remaining = body;
+    let mut arguments = BTreeMap::new();
+    loop {
+        remaining = trim_protocol_whitespace_start(remaining);
+        if remaining.is_empty() {
+            break;
+        }
+        let (mut attributes, parameter_body) =
+            parse_dsml_open_tag(remaining, ATEM_PARAMETER_OPEN, "ATEM parameter")?;
+        let name = take_dsml_attribute(&mut attributes, "name", "ATEM parameter")?;
+        reject_dsml_attributes(&attributes, "ATEM parameter")?;
+        validate_protocol_name("parameter", &name)?;
+        let close = parameter_body
+            .find(ATEM_PARAMETER_CLOSE)
+            .ok_or_else(|| Error::Format {
+                label: "chat tool call",
+                detail: format!("missing {ATEM_PARAMETER_CLOSE} for {name:?}"),
+            })?;
+        let raw_value = &parameter_body[..close];
+        let value = if string_arguments.is_some_and(|names| names.contains(&name)) {
+            Value::String(raw_value.to_string())
+        } else {
+            serde_json::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_string()))
+        };
+        if arguments.insert(name.clone(), value).is_some() {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!("duplicate parameter {name:?} in ATEM invocation {function:?}"),
+            });
+        }
+        remaining = &parameter_body[close + ATEM_PARAMETER_CLOSE.len()..];
+    }
+    Ok(arguments)
 }
 
 fn parse_dsml_function_calls(
@@ -1154,7 +1355,7 @@ fn validate_protocol_name(kind: &str, name: &str) -> Result<()> {
     if !name.is_empty()
         && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Ok(());
     }
@@ -1404,6 +1605,58 @@ mod tests {
             events.extend(parser.push_text(&text[split..]).unwrap());
             events.extend(parser.finish().unwrap());
             assert_eq!(normalized(events), dsml_expected(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn muse_recipient_segments_separate_reasoning_and_answer_text() {
+        let mut parser = ChatOutputParser::new(&[], false).unwrap();
+        parser.begin_muse_segment("assistant to=self").unwrap();
+        assert_eq!(
+            parser.push_text("check the result").unwrap(),
+            [ChatOutputEvent::Reasoning("check the result".to_string())]
+        );
+        assert!(parser.end_muse_segment().unwrap().is_empty());
+        parser.begin_muse_segment("assistant to=user").unwrap();
+        assert_eq!(
+            parser.push_text("The result is four.").unwrap(),
+            [ChatOutputEvent::Text("The result is four.".to_string())]
+        );
+        assert!(parser.end_muse_segment().unwrap().is_empty());
+    }
+
+    #[test]
+    fn atem_tool_protocol_survives_every_character_boundary() {
+        let text = concat!(
+            "<atem:function_calls>\n",
+            "<atem:invoke name=\"write_file\">\n",
+            "<atem:parameter name=\"path\">src/main.rs</atem:parameter>\n",
+            "<atem:parameter name=\"contents\">fn main() {}</atem:parameter>\n",
+            "<atem:parameter name=\"executable\">false</atem:parameter>\n",
+            "</atem:invoke>\n",
+            "</atem:function_calls>"
+        );
+        let expected = vec![ChatOutputEvent::ToolCall(ChatToolCall {
+            id: "call_ID".to_string(),
+            function: ChatFunctionCall {
+                name: "write_file".to_string(),
+                arguments: BTreeMap::from([
+                    ("contents".to_string(), json!("fn main() {}")),
+                    ("executable".to_string(), json!(false)),
+                    ("path".to_string(), json!("src/main.rs")),
+                ]),
+            },
+        })];
+        for split in text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+        {
+            let mut parser = ChatOutputParser::new(&tools(), false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(normalized(events), expected, "split {split}");
         }
     }
 

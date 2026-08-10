@@ -59,6 +59,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "muse-glimmer-30b-nvfp4",
+        repository: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4",
+        revision: "d35cb79050f419c457611b1cee5c5d15b176f285",
+        model_type: "muse_glimmer",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-muse-glimmer-30b",
+            max_context_tokens: 131_072,
+            prefill_token_capacity: 64,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "qwen3.6-35b-a3b",
         repository: "nvidia/Qwen3.6-35B-A3B-NVFP4",
         revision: "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
@@ -477,6 +491,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "bitnet"
+            | "muse_glimmer"
             | "bonsai"
             | "qwen3_5_moe"
             | "step3p7"
@@ -715,6 +730,15 @@ mod tests {
         assert_eq!(model.repository, "microsoft/bitnet-b1.58-2B-4T");
         assert_eq!(model.revision, "04c3b9ad9361b824064a1f25ea60a8be9599b127");
         assert_eq!(model.defaults.max_context_tokens, 4_096);
+    }
+
+    #[test]
+    fn catalogue_pins_muse_glimmer_nvfp4_checkpoint() {
+        let model = catalogue_model("muse-glimmer-30b-nvfp4").unwrap();
+        assert_eq!(model.model_type, "muse_glimmer");
+        assert_eq!(model.repository, "Inferact/Muse-Glimmer-30B-NVFP4-W4A4");
+        assert_eq!(model.revision, "d35cb79050f419c457611b1cee5c5d15b176f285");
+        assert_eq!(model.defaults.max_context_tokens, 131_072);
     }
 
     #[test]

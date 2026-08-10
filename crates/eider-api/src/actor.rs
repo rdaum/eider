@@ -8,6 +8,7 @@ use infer::deepseek4::Deepseek4TextModel;
 use infer::gemma4::Gemma4Model;
 use infer::laguna::LagunaModel;
 use infer::metrics::metrics as infer_metrics;
+use infer::muse_glimmer::MuseGlimmerModel;
 use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
 use infer::runtime::bitnet_serving::{
@@ -27,6 +28,10 @@ use infer::runtime::gemma4_serving::{
 use infer::runtime::generation::GenerationConfig;
 use infer::runtime::laguna_serving::{
     LagunaAdmissionProgress, LagunaCancelOutcome, LagunaChatService, LagunaRequestId,
+};
+use infer::runtime::muse_glimmer_serving::{
+    MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
+    MuseGlimmerRequestId,
 };
 use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
@@ -319,6 +324,41 @@ fn actor_main(
             let mut service = BitNetActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
+        CheckpointArchitecture::MuseGlimmer => {
+            let mut defaults = defaults;
+            defaults.sampling.temperature = 0.0;
+            if let Err(error) = infer::nvfp4::set_cuda_device(0) {
+                let _ = ready.send(Err(error.to_string()));
+                return;
+            }
+            info!(model_dir = %model_dir.display(), "loading Muse Glimmer model");
+            let model = match MuseGlimmerModel::load(&model_dir) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            info!(
+                device_weights_gib = model.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                "loaded Muse Glimmer text model"
+            );
+            let muse_scheduler = SchedulerConfig {
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().max_position_embeddings),
+                ..scheduler
+            };
+            let service = match MuseGlimmerChatService::new(&model, &template, muse_scheduler) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut service = MuseGlimmerActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
+        }
         CheckpointArchitecture::Bonsai => {
             if let Err(error) = infer::nvfp4::set_cuda_device(0) {
                 let _ = ready.send(Err(error.to_string()));
@@ -566,6 +606,7 @@ fn actor_main(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckpointArchitecture {
     BitNet,
+    MuseGlimmer,
     Bonsai,
     Qwen36,
     Step37,
@@ -588,6 +629,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
     match config.model_type.as_str() {
         "bitnet" => Ok(CheckpointArchitecture::BitNet),
+        "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
         "bonsai" => Ok(CheckpointArchitecture::Bonsai),
         "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
         "step3p7" => Ok(CheckpointArchitecture::Step37),
@@ -655,6 +697,17 @@ fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmission
 }
 
 fn bitnet_admission_progress(progress: BitNetAdmissionProgress) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: Duration::ZERO,
+        checkpoint_copy_duration: Duration::ZERO,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
+fn muse_admission_progress(progress: MuseGlimmerAdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
         sequence_device_bytes: progress.sequence_device_bytes,
@@ -1303,6 +1356,112 @@ impl ActorService for BitNetActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             BitNetCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+struct MuseGlimmerActorService<'model, 'template> {
+    inner: MuseGlimmerChatService<'model, 'template>,
+    ids: BTreeMap<u64, MuseGlimmerRequestId>,
+}
+
+impl<'model, 'template> MuseGlimmerActorService<'model, 'template> {
+    fn new(inner: MuseGlimmerChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for MuseGlimmerActorService<'_, '_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer = |event: RequestLifecycleEvent<
+            MuseGlimmerRequestId,
+            MuseGlimmerAdmissionProgress,
+        >| match event {
+            RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
+                EngineLifecycleEvent::Admitted(muse_admission_progress(progress)),
+            ),
+            RequestLifecycleEvent::PrefillStarted(id) => {
+                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+            }
+        };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(MuseGlimmerRequestId::get)
+                .collect(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            MuseGlimmerCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            MuseGlimmerCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
@@ -2367,6 +2526,15 @@ mod tests {
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::BitNet
+        );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"muse_glimmer"}"#,
+        )
+        .expect("write Muse Glimmer config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::MuseGlimmer
         );
         fs::write(directory.join("config.json"), r#"{"model_type":"bonsai"}"#)
             .expect("write Bonsai config");

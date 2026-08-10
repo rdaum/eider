@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "bitnet_decode"
 harness = false
+
+[[bench]]
+name = "muse_glimmer_decode"
+harness = false

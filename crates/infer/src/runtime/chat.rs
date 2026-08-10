@@ -34,6 +34,7 @@ pub enum ChatReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl ChatReasoningEffort {
@@ -42,6 +43,7 @@ impl ChatReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 }
@@ -364,7 +366,7 @@ fn validate_name(label: &'static str, name: &str) -> Result<()> {
     if name.is_empty()
         || !name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(Error::Format {
             label,
@@ -438,6 +440,12 @@ fn normalise_generation_blocks(mut source: String) -> String {
     ] {
         source = source.replace(annotation, ordinary);
     }
+    // Minijinja requires a conditional expression used as a keyword argument
+    // to be parenthesized; Hugging Face Jinja accepts the unparenthesized form.
+    source = source.replace(
+        "namespace(name=tcid if tcid else '')",
+        "namespace(name=(tcid if tcid else ''))",
+    );
     source
 }
 
@@ -581,6 +589,7 @@ fn render_with_environment(
             thinking_mode => if options.enable_thinking { "thinking" } else { "chat" },
             drop_thinking => !options.preserve_thinking,
             reasoning_effort => reasoning_effort,
+            reasoning_strength => reasoning_effort,
             add_vision_id => false,
             bos_token => bos_token,
             eos_token => eos_token,
@@ -597,9 +606,13 @@ fn special_token_content(value: &Value) -> String {
 }
 
 fn template_error(error: TemplateError) -> Error {
+    let range = error
+        .range()
+        .map(|range| format!(" at bytes {}..{}", range.start, range.end))
+        .unwrap_or_default();
     Error::Format {
         label: "chat template",
-        detail: error.to_string(),
+        detail: format!("{error}{range}"),
     }
 }
 
@@ -965,6 +978,57 @@ mod tests {
                 .text
                 .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         );
+        assert!(!prompt.token_ids.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the local Muse Glimmer checkpoint"]
+    fn local_muse_template_renders_atem_history_and_recipient_prefix() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("models/muse-glimmer-30b-nvfp4");
+        let template = CheckpointChatTemplate::from_model_dir(model_dir).unwrap();
+        let call = ChatToolCall {
+            id: "call_1".to_string(),
+            function: ChatFunctionCall {
+                name: "functions.read_file".to_string(),
+                arguments: BTreeMap::from([("path".to_string(), json!("src/main.rs"))]),
+            },
+        };
+        let mut tool = tool_definition();
+        tool.function.name = "functions.read_file".to_string();
+        let prompt = template
+            .render_and_tokenize(
+                &[
+                    ChatMessage::system("Be precise."),
+                    ChatMessage::user("Inspect the entry point."),
+                    ChatMessage::assistant_tool_calls(
+                        None,
+                        Some("I should inspect the file.".to_string()),
+                        vec![call],
+                    ),
+                    ChatMessage::tool("call_1", "fn main() {}"),
+                ],
+                &[tool],
+                ChatTemplateOptions {
+                    reasoning_effort: Some(ChatReasoningEffort::XHigh),
+                    ..ChatTemplateOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(prompt.text.contains("Reasoning strength: xhigh."));
+        assert!(
+            prompt
+                .text
+                .contains("<atem:invoke name=\"functions.read_file\">")
+        );
+        assert!(
+            prompt
+                .text
+                .contains("<tool_output name=\"functions.read_file\">")
+        );
+        assert!(prompt.text.ends_with("<|start|>assistant"));
         assert!(!prompt.token_ids.is_empty());
     }
 }

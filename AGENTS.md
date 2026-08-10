@@ -5,6 +5,8 @@ Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
 multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
 families currently include Qwen3.5/3.6 MoE, Step-3.7, Laguna-S-2.1, Gemma 4,
 Nemotron 3, and DeepSeek V4 Flash.
+Muse Glimmer 30B is supported through the Inferact ModelOpt NVFP4 checkpoint's
+text path; its image and video towers are not served.
 
 ## Build / run
 
@@ -129,7 +131,7 @@ in view:
   streaming protocol adapters, and server telemetry.
 - `crates/infer/src/runtime/` — shared scheduling, prefix/KV caches, sampling,
   chat rendering, output parsing, and serving state.
-- `crates/infer/src/{qwen3,step37,laguna,gemma4,nemotron3,deepseek4}/` —
+- `crates/infer/src/{qwen3,step37,laguna,gemma4,muse_glimmer,nemotron3,deepseek4}/` —
   family-specific model loading and execution.
 - `crates/infer/benches/` — model-runtime and prefill micromeasures.
 - `crates/nvfp4/src/cublaslt/` — cuBLASLt descriptors and matmul plans.
@@ -205,6 +207,9 @@ Before handing work back:
 - Gemma 4 uses heterogeneous local/global attention. Preserve the checkpoint's
   per-layer attention pattern and validate both prefill and decode when changing
   its shared kernels.
+- Muse Glimmer repeats three local RoPE layers followed by one global NoPE
+  layer. Preserve its weightless Q/K normalization, learned attention gate,
+  centred residual norms, separate LM head, and ATEM recipient framing.
 - Nemotron 3 combines attention, Mamba recurrent state, latent MoE, and an
   optional MTP block. Do not treat its sequence state as a conventional KV-only
   cache.

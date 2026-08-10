@@ -56,6 +56,7 @@ catalogue:
 eider-serve agents-a1
 eider-serve step-3.7-flash --step-expert-capacity 192
 eider-serve gemma-4-26b-a4b-nvfp4
+eider-serve muse-glimmer-30b-nvfp4
 ```
 
 The catalogue supplies the served model name and model-specific runtime
@@ -109,11 +110,17 @@ Each Eider release contains a small, reviewed catalogue. A model entry includes:
 - Default served model name, context limit, and paging settings.
 
 The current catalogue includes Qwen3.6 35B-A3B, Agents-A1, Step-3.7-Flash,
-Nemotron 3 Puzzle 75B-A9B, and both supported Gemma 4 26B-A4B weight formats:
+Muse Glimmer 30B, Nemotron 3 Puzzle 75B-A9B, and both supported Gemma 4
+26B-A4B weight formats:
 the NVIDIA ModelOpt NVFP4 checkpoint (`gemma-4-26b-a4b-nvfp4`) and Google's
 upstream BF16 instruction-tuned checkpoint (`gemma-4-26b-a4b-it`). Both Gemma
 entries use the Gemma 4 text runtime; image, video, and audio inputs remain
 outside Eider's text-serving interface.
+
+Muse Glimmer uses the pinned Inferact ModelOpt NVFP4 checkpoint and Eider's
+text-only runtime. Its recipient-framed reasoning and ATEM function calls are
+translated into the same Responses and Chat Completions events as other model
+families; image and video inputs are not exposed.
 
 Conceptually:
 
