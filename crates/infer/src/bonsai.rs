@@ -2,12 +2,12 @@
 
 use crate::gguf::{GgufIndex, GgufValue};
 use nvfp4::{
-    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmShape, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, TERNARY_G64_GROUP_SIZE, TernaryG64ActivationWorkspace,
-    TernaryG64Matrix, TernaryG64PackedLinear, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    causal_window_softmax_f32_to_bf16_on_stream, copy_row_f32_into_on_stream,
-    pack_token_heads_bf16_at_offset_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape,
+    Nvfp4Matrix, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, TERNARY_G64_GROUP_SIZE,
+    TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
+    copy_row_f32_into_on_stream, pack_token_heads_bf16_at_offset_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
     unpack_heads_f32_at_offset_into_on_stream,
 };
@@ -122,12 +122,22 @@ impl BonsaiConfig {
 /// Fully resident GPU Ternary Bonsai model.
 pub struct BonsaiModel {
     config: BonsaiConfig,
+    prefill_mode: BonsaiPrefillMode,
     embeddings: TernaryG64Matrix,
     layers: Vec<BonsaiLayer>,
     final_norm: DeviceBuffer<f32>,
     lm_head: TernaryG64Matrix,
     rope_inv_freq: DeviceBuffer<f32>,
     rope_attention_scale: f32,
+}
+
+/// Tensor-core weight representation used for multi-token prefill.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BonsaiPrefillMode {
+    /// Expand the exact ternary weights to BF16.
+    Bf16,
+    /// Quantize the ternary weights and activations to NVFP4.
+    Nvfp4,
 }
 
 struct BonsaiLayer {
@@ -185,13 +195,29 @@ struct BonsaiWorkspace {
 
 struct BonsaiTensorPrefillWorkspace {
     lt: CublasLt,
-    qkv_plan: Bf16TnMatmulPlan,
-    output_plan: Bf16TnMatmulPlan,
-    gate_up_plan: Bf16TnMatmulPlan,
-    down_plan: Bf16TnMatmulPlan,
-    hidden_input: DeviceBuffer<u16>,
-    intermediate_input: DeviceBuffer<u16>,
+    projections: BonsaiProjectionPrefillWorkspace,
     attention: Option<BonsaiTensorAttentionWorkspace>,
+}
+
+enum BonsaiProjectionPrefillWorkspace {
+    Bf16 {
+        qkv_plan: Bf16TnMatmulPlan,
+        output_plan: Bf16TnMatmulPlan,
+        gate_up_plan: Bf16TnMatmulPlan,
+        down_plan: Bf16TnMatmulPlan,
+        hidden_input: DeviceBuffer<u16>,
+        attention_input: DeviceBuffer<u16>,
+        intermediate_input: DeviceBuffer<u16>,
+    },
+    Nvfp4 {
+        qkv_plan: Fp4TnMatmulPlan,
+        output_plan: Fp4TnMatmulPlan,
+        gate_up_plan: Fp4TnMatmulPlan,
+        down_plan: Fp4TnMatmulPlan,
+        hidden_input: Nvfp4Matrix,
+        attention_input: Nvfp4Matrix,
+        intermediate_input: Nvfp4Matrix,
+    },
 }
 
 struct BonsaiTensorAttentionWorkspace {
@@ -211,6 +237,14 @@ struct BonsaiTensorAttentionWorkspace {
 impl BonsaiModel {
     /// Loads the mainline group-64 Bonsai GGUF directly into packed GPU storage.
     pub fn load(gguf_path: &Path) -> Result<Self> {
+        Self::load_with_prefill_mode(gguf_path, BonsaiPrefillMode::Bf16)
+    }
+
+    /// Loads Bonsai with an explicit tensor-core prefill representation.
+    pub fn load_with_prefill_mode(
+        gguf_path: &Path,
+        prefill_mode: BonsaiPrefillMode,
+    ) -> Result<Self> {
         let index = GgufIndex::open(gguf_path)?;
         let config = BonsaiConfig::from_index(&index)?;
         let embeddings = load_q2_matrix(&index, "token_embd.weight", config.vocab, config.hidden)?;
@@ -218,7 +252,7 @@ impl BonsaiModel {
         let final_norm = load_f32_vector(&index, "output_norm.weight", config.hidden)?;
         let mut layers = Vec::with_capacity(config.layers);
         for layer in 0..config.layers {
-            layers.push(BonsaiLayer::load(&index, config, layer)?);
+            layers.push(BonsaiLayer::load(&index, config, layer, prefill_mode)?);
             tracing::info!(
                 layer = layer + 1,
                 layers = config.layers,
@@ -229,6 +263,7 @@ impl BonsaiModel {
         let rope_attention_scale = 1.0 + 0.1 * config.rope_factor.ln();
         Ok(Self {
             config,
+            prefill_mode,
             embeddings,
             layers,
             final_norm,
@@ -252,7 +287,7 @@ impl BonsaiModel {
                 actual: max_tokens.to_string(),
             });
         }
-        BonsaiDecodeState::new(self.config, max_tokens)
+        BonsaiDecodeState::new(self, max_tokens)
     }
 
     /// Evaluates one token and leaves its final hidden state on the device.
@@ -301,6 +336,8 @@ impl BonsaiModel {
             }
             _ => BonsaiWorkspace::new(
                 self.config,
+                &self.layers[0],
+                self.prefill_mode,
                 rows,
                 cache_tokens,
                 state.kv_cache[0].max_tokens(),
@@ -417,7 +454,8 @@ impl BonsaiModel {
 }
 
 impl BonsaiDecodeState {
-    fn new(config: BonsaiConfig, max_tokens: usize) -> Result<Self> {
+    fn new(model: &BonsaiModel, max_tokens: usize) -> Result<Self> {
+        let config = model.config;
         let kv_cache = (0..config.layers)
             .map(|_| Sm12xKvCache::new(max_tokens, config.kv_heads, config.head_dim))
             .collect::<Result<Vec<_>>>()?;
@@ -426,7 +464,14 @@ impl BonsaiDecodeState {
             position: 0,
             token: DeviceBuffer::from_host(&[0])?,
             stream: CudaStream::new_non_blocking()?,
-            workspace: BonsaiWorkspace::new(config, 1, 1, max_tokens)?,
+            workspace: BonsaiWorkspace::new(
+                config,
+                &model.layers[0],
+                model.prefill_mode,
+                1,
+                1,
+                max_tokens,
+            )?,
             prefill_workspace: None,
         })
     }
@@ -456,7 +501,12 @@ impl BonsaiDecodeState {
 }
 
 impl BonsaiLayer {
-    fn load(index: &GgufIndex, config: BonsaiConfig, layer: usize) -> Result<Self> {
+    fn load(
+        index: &GgufIndex,
+        config: BonsaiConfig,
+        layer: usize,
+        prefill_mode: BonsaiPrefillMode,
+    ) -> Result<Self> {
         let prefix = format!("blk.{layer}");
         let q = load_q2_packed(
             index,
@@ -492,19 +542,21 @@ impl BonsaiLayer {
         let gate_up =
             TernaryG64PackedLinear::concat_rows(format!("{prefix}.ffn_gate_up"), &[gate, up])?;
         Ok(Self {
-            qkv: TernaryG64Matrix::from_packed_with_bf16_prefill(&qkv)?,
+            qkv: matrix_with_prefill(&qkv, prefill_mode)?,
             output: load_q2_prefill_matrix(
                 index,
                 &format!("{prefix}.attn_output.weight"),
                 config.hidden,
                 config.q_width(),
+                prefill_mode,
             )?,
-            gate_up: TernaryG64Matrix::from_packed_with_bf16_prefill(&gate_up)?,
+            gate_up: matrix_with_prefill(&gate_up, prefill_mode)?,
             down: load_q2_prefill_matrix(
                 index,
                 &format!("{prefix}.ffn_down.weight"),
                 config.hidden,
                 config.intermediate,
+                prefill_mode,
             )?,
             input_norm: load_f32_vector(
                 index,
@@ -533,6 +585,8 @@ impl BonsaiLayer {
 impl BonsaiWorkspace {
     fn new(
         config: BonsaiConfig,
+        plan_layer: &BonsaiLayer,
+        prefill_mode: BonsaiPrefillMode,
         rows: usize,
         cache_tokens: usize,
         max_tokens: usize,
@@ -549,6 +603,8 @@ impl BonsaiWorkspace {
         let tensor_prefill = if rows >= 4 {
             Some(BonsaiTensorPrefillWorkspace::new(
                 config,
+                plan_layer,
+                prefill_mode,
                 rows,
                 cache_tokens,
             )?)
@@ -614,15 +670,34 @@ impl BonsaiWorkspace {
             stream,
         )?;
         if let Some(prefill) = &mut self.tensor_prefill {
-            weights.qkv.run_f32_batch_bf16_into_on_stream(
-                &prefill.lt,
-                &prefill.qkv_plan,
-                self.normed.input(),
-                &mut prefill.hidden_input,
-                self.qkv.output(),
-                self.rows,
-                stream,
-            )?;
+            match &mut prefill.projections {
+                BonsaiProjectionPrefillWorkspace::Bf16 {
+                    qkv_plan,
+                    hidden_input,
+                    ..
+                } => weights.qkv.run_f32_batch_bf16_into_on_stream(
+                    &prefill.lt,
+                    qkv_plan,
+                    self.normed.input(),
+                    hidden_input,
+                    self.qkv.output(),
+                    self.rows,
+                    stream,
+                )?,
+                BonsaiProjectionPrefillWorkspace::Nvfp4 {
+                    qkv_plan,
+                    hidden_input,
+                    ..
+                } => weights.qkv.run_f32_batch_nvfp4_into_on_stream(
+                    &prefill.lt,
+                    qkv_plan,
+                    self.normed.input(),
+                    hidden_input,
+                    self.qkv.inout(),
+                    self.rows,
+                    stream,
+                )?,
+            }
         } else {
             weights.qkv.run_f32_batch_into_on_stream(
                 self.normed.input(),
@@ -726,15 +801,34 @@ impl BonsaiWorkspace {
             }
         }
         if let Some(prefill) = &mut self.tensor_prefill {
-            weights.output.run_f32_batch_bf16_into_on_stream(
-                &prefill.lt,
-                &prefill.output_plan,
-                self.attention.input(),
-                &mut prefill.hidden_input,
-                self.projected.output(),
-                self.rows,
-                stream,
-            )?;
+            match &mut prefill.projections {
+                BonsaiProjectionPrefillWorkspace::Bf16 {
+                    output_plan,
+                    attention_input,
+                    ..
+                } => weights.output.run_f32_batch_bf16_into_on_stream(
+                    &prefill.lt,
+                    output_plan,
+                    self.attention.input(),
+                    attention_input,
+                    self.projected.output(),
+                    self.rows,
+                    stream,
+                )?,
+                BonsaiProjectionPrefillWorkspace::Nvfp4 {
+                    output_plan,
+                    attention_input,
+                    ..
+                } => weights.output.run_f32_batch_nvfp4_into_on_stream(
+                    &prefill.lt,
+                    output_plan,
+                    self.attention.input(),
+                    attention_input,
+                    self.projected.inout(),
+                    self.rows,
+                    stream,
+                )?,
+            }
         } else {
             weights.output.run_f32_batch_into_on_stream(
                 self.attention.input(),
@@ -760,15 +854,34 @@ impl BonsaiWorkspace {
             stream,
         )?;
         if let Some(prefill) = &mut self.tensor_prefill {
-            weights.gate_up.run_f32_batch_bf16_into_on_stream(
-                &prefill.lt,
-                &prefill.gate_up_plan,
-                self.ffn_normed.input(),
-                &mut prefill.hidden_input,
-                self.gate_up.output(),
-                self.rows,
-                stream,
-            )?;
+            match &mut prefill.projections {
+                BonsaiProjectionPrefillWorkspace::Bf16 {
+                    gate_up_plan,
+                    hidden_input,
+                    ..
+                } => weights.gate_up.run_f32_batch_bf16_into_on_stream(
+                    &prefill.lt,
+                    gate_up_plan,
+                    self.ffn_normed.input(),
+                    hidden_input,
+                    self.gate_up.output(),
+                    self.rows,
+                    stream,
+                )?,
+                BonsaiProjectionPrefillWorkspace::Nvfp4 {
+                    gate_up_plan,
+                    hidden_input,
+                    ..
+                } => weights.gate_up.run_f32_batch_nvfp4_into_on_stream(
+                    &prefill.lt,
+                    gate_up_plan,
+                    self.ffn_normed.input(),
+                    hidden_input,
+                    self.gate_up.inout(),
+                    self.rows,
+                    stream,
+                )?,
+            }
         } else {
             weights.gate_up.run_f32_batch_into_on_stream(
                 self.ffn_normed.input(),
@@ -786,15 +899,34 @@ impl BonsaiWorkspace {
             stream,
         )?;
         if let Some(prefill) = &mut self.tensor_prefill {
-            weights.down.run_f32_batch_bf16_into_on_stream(
-                &prefill.lt,
-                &prefill.down_plan,
-                self.activated.input(),
-                &mut prefill.intermediate_input,
-                self.down.output(),
-                self.rows,
-                stream,
-            )?;
+            match &mut prefill.projections {
+                BonsaiProjectionPrefillWorkspace::Bf16 {
+                    down_plan,
+                    intermediate_input,
+                    ..
+                } => weights.down.run_f32_batch_bf16_into_on_stream(
+                    &prefill.lt,
+                    down_plan,
+                    self.activated.input(),
+                    intermediate_input,
+                    self.down.output(),
+                    self.rows,
+                    stream,
+                )?,
+                BonsaiProjectionPrefillWorkspace::Nvfp4 {
+                    down_plan,
+                    intermediate_input,
+                    ..
+                } => weights.down.run_f32_batch_nvfp4_into_on_stream(
+                    &prefill.lt,
+                    down_plan,
+                    self.activated.input(),
+                    intermediate_input,
+                    self.down.inout(),
+                    self.rows,
+                    stream,
+                )?,
+            }
         } else {
             weights.down.run_f32_batch_into_on_stream(
                 self.activated.input(),
@@ -842,34 +974,79 @@ impl BonsaiWorkspace {
 }
 
 impl BonsaiTensorPrefillWorkspace {
-    fn new(config: BonsaiConfig, rows: usize, cache_tokens: usize) -> Result<Self> {
+    fn new(
+        config: BonsaiConfig,
+        plan_layer: &BonsaiLayer,
+        prefill_mode: BonsaiPrefillMode,
+        rows: usize,
+        cache_tokens: usize,
+    ) -> Result<Self> {
         let q_width = config.q_width();
-        let kv_width = config.kv_width();
         let lt = CublasLt::new()?;
         const WORKSPACE_LIMIT: u64 = 32 * 1024 * 1024;
+        let projections = match prefill_mode {
+            BonsaiPrefillMode::Bf16 => BonsaiProjectionPrefillWorkspace::Bf16 {
+                qkv_plan: Bf16TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(plan_layer.qkv.rows(), rows, plan_layer.qkv.cols()),
+                    WORKSPACE_LIMIT,
+                )?,
+                output_plan: Bf16TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(plan_layer.output.rows(), rows, plan_layer.output.cols()),
+                    WORKSPACE_LIMIT,
+                )?,
+                gate_up_plan: Bf16TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(plan_layer.gate_up.rows(), rows, plan_layer.gate_up.cols()),
+                    WORKSPACE_LIMIT,
+                )?,
+                down_plan: Bf16TnMatmulPlan::new(
+                    &lt,
+                    GemmShape::new(plan_layer.down.rows(), rows, plan_layer.down.cols()),
+                    WORKSPACE_LIMIT,
+                )?,
+                hidden_input: DeviceBuffer::zeroed(rows * config.hidden)?,
+                attention_input: DeviceBuffer::zeroed(rows * q_width)?,
+                intermediate_input: DeviceBuffer::zeroed(rows * config.intermediate)?,
+            },
+            BonsaiPrefillMode::Nvfp4 => {
+                let hidden_input = Nvfp4Matrix::zeroed_col_major(config.hidden, rows)?;
+                let attention_input = Nvfp4Matrix::zeroed_col_major(q_width, rows)?;
+                let intermediate_input = Nvfp4Matrix::zeroed_col_major(config.intermediate, rows)?;
+                BonsaiProjectionPrefillWorkspace::Nvfp4 {
+                    qkv_plan: plan_layer.qkv.new_f32_batch_nvfp4_plan(
+                        &lt,
+                        &hidden_input,
+                        rows,
+                        WORKSPACE_LIMIT,
+                    )?,
+                    output_plan: plan_layer.output.new_f32_batch_nvfp4_plan(
+                        &lt,
+                        &attention_input,
+                        rows,
+                        WORKSPACE_LIMIT,
+                    )?,
+                    gate_up_plan: plan_layer.gate_up.new_f32_batch_nvfp4_plan(
+                        &lt,
+                        &hidden_input,
+                        rows,
+                        WORKSPACE_LIMIT,
+                    )?,
+                    down_plan: plan_layer.down.new_f32_batch_nvfp4_plan(
+                        &lt,
+                        &intermediate_input,
+                        rows,
+                        WORKSPACE_LIMIT,
+                    )?,
+                    hidden_input,
+                    attention_input,
+                    intermediate_input,
+                }
+            }
+        };
         Ok(Self {
-            qkv_plan: Bf16TnMatmulPlan::new(
-                &lt,
-                GemmShape::new(q_width + 2 * kv_width, rows, config.hidden),
-                WORKSPACE_LIMIT,
-            )?,
-            output_plan: Bf16TnMatmulPlan::new(
-                &lt,
-                GemmShape::new(config.hidden, rows, q_width),
-                WORKSPACE_LIMIT,
-            )?,
-            gate_up_plan: Bf16TnMatmulPlan::new(
-                &lt,
-                GemmShape::new(config.intermediate * 2, rows, config.hidden),
-                WORKSPACE_LIMIT,
-            )?,
-            down_plan: Bf16TnMatmulPlan::new(
-                &lt,
-                GemmShape::new(config.hidden, rows, config.intermediate),
-                WORKSPACE_LIMIT,
-            )?,
-            hidden_input: DeviceBuffer::zeroed(rows * config.hidden.max(q_width))?,
-            intermediate_input: DeviceBuffer::zeroed(rows * config.intermediate)?,
+            projections,
             attention: if rows >= 64 {
                 Some(BonsaiTensorAttentionWorkspace::new(
                     &lt,
@@ -885,16 +1062,52 @@ impl BonsaiTensorPrefillWorkspace {
     }
 
     fn device_bytes(&self) -> usize {
-        self.hidden_input.device_bytes()
-            + self.intermediate_input.device_bytes()
-            + self.qkv_plan.workspace_bytes()
-            + self.output_plan.workspace_bytes()
-            + self.gate_up_plan.workspace_bytes()
-            + self.down_plan.workspace_bytes()
+        self.projections.device_bytes()
             + self
                 .attention
                 .as_ref()
                 .map_or(0, BonsaiTensorAttentionWorkspace::device_bytes)
+    }
+}
+
+impl BonsaiProjectionPrefillWorkspace {
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Bf16 {
+                qkv_plan,
+                output_plan,
+                gate_up_plan,
+                down_plan,
+                hidden_input,
+                attention_input,
+                intermediate_input,
+            } => {
+                hidden_input.device_bytes()
+                    + attention_input.device_bytes()
+                    + intermediate_input.device_bytes()
+                    + qkv_plan.workspace_bytes()
+                    + output_plan.workspace_bytes()
+                    + gate_up_plan.workspace_bytes()
+                    + down_plan.workspace_bytes()
+            }
+            Self::Nvfp4 {
+                qkv_plan,
+                output_plan,
+                gate_up_plan,
+                down_plan,
+                hidden_input,
+                attention_input,
+                intermediate_input,
+            } => {
+                hidden_input.device_bytes()
+                    + attention_input.device_bytes()
+                    + intermediate_input.device_bytes()
+                    + qkv_plan.workspace_bytes()
+                    + output_plan.workspace_bytes()
+                    + gate_up_plan.workspace_bytes()
+                    + down_plan.workspace_bytes()
+            }
+        }
     }
 }
 
@@ -1086,8 +1299,19 @@ fn load_q2_prefill_matrix(
     name: &str,
     rows: usize,
     cols: usize,
+    prefill_mode: BonsaiPrefillMode,
 ) -> Result<TernaryG64Matrix> {
-    TernaryG64Matrix::from_packed_with_bf16_prefill(&load_q2_packed(index, name, rows, cols)?)
+    matrix_with_prefill(&load_q2_packed(index, name, rows, cols)?, prefill_mode)
+}
+
+fn matrix_with_prefill(
+    packed: &TernaryG64PackedLinear,
+    prefill_mode: BonsaiPrefillMode,
+) -> Result<TernaryG64Matrix> {
+    match prefill_mode {
+        BonsaiPrefillMode::Bf16 => TernaryG64Matrix::from_packed_with_bf16_prefill(packed),
+        BonsaiPrefillMode::Nvfp4 => TernaryG64Matrix::from_packed_with_nvfp4_prefill(packed),
+    }
 }
 
 fn load_q2_packed(

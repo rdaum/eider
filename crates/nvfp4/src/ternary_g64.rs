@@ -6,11 +6,13 @@
 //! activations use a matching symmetric INT8 scale per 64-value group so the
 //! CUDA projection can accumulate exact integer dot products with `dp4a`.
 
-use crate::cublaslt::{Bf16TnMatmulPlan, CublasLt, GemmShape};
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, check_cuda};
+use crate::cublaslt::{Bf16TnMatmulPlan, CublasLt, Fp4TnMatmulPlan, GemmShape, Nvfp4TnInputs};
+use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::kernels::non_gemm::f32_to_bf16_into_on_stream;
+use crate::matrix::Nvfp4Matrix;
+use crate::modelopt::{ModelOptCublasLtWeight, ModelOptNvfp4Linear};
 
 /// Number of input values represented by one GGUF scale block.
 pub const TERNARY_G64_GROUP_SIZE: usize = 64;
@@ -153,11 +155,28 @@ impl TernaryG64PackedLinear {
                 actual: format!("row={row} col={col}"),
             });
         }
+        Ok(self.weight_unchecked(row, col))
+    }
+
+    fn weight_unchecked(&self, row: usize, col: usize) -> f32 {
         let groups_per_row = self.in_features / TERNARY_G64_GROUP_SIZE;
         let group = row * groups_per_row + col / TERNARY_G64_GROUP_SIZE;
         let row_byte = row * (self.in_features / 4) + col / 4;
         let code = (self.packed_weight[row_byte] >> ((col % 4) * 2)) & 0x03;
-        Ok((i32::from(code) - 1) as f32 * self.group_scales[group])
+        (i32::from(code) - 1) as f32 * self.group_scales[group]
+    }
+
+    fn quantize_nvfp4(&self) -> Result<ModelOptNvfp4Linear> {
+        ModelOptNvfp4Linear::quantize_values(
+            format!("{}.nvfp4_prefill", self.name),
+            self.out_features,
+            self.in_features,
+            |index| {
+                let row = index / self.in_features;
+                let col = index % self.in_features;
+                self.weight_unchecked(row, col)
+            },
+        )
     }
 
     /// Computes the same per-group W2A8 operation as the CUDA path.
@@ -226,20 +245,30 @@ pub struct TernaryG64Matrix {
     packed_weight: DeviceBuffer<u8>,
     group_scales: DeviceBuffer<f32>,
     bf16_prefill_weight: Option<DeviceBuffer<u16>>,
+    nvfp4_prefill_weight: Option<ModelOptCublasLtWeight>,
 }
 
 impl TernaryG64Matrix {
     /// Uploads one imported group-scaled ternary linear.
     pub fn from_packed(linear: &TernaryG64PackedLinear) -> Result<Self> {
-        Self::from_packed_impl(linear, false)
+        Self::from_packed_impl(linear, false, false)
     }
 
     /// Uploads packed decode weights and materializes a BF16 tensor-core prefill copy.
     pub fn from_packed_with_bf16_prefill(linear: &TernaryG64PackedLinear) -> Result<Self> {
-        Self::from_packed_impl(linear, true)
+        Self::from_packed_impl(linear, true, false)
     }
 
-    fn from_packed_impl(linear: &TernaryG64PackedLinear, bf16_prefill: bool) -> Result<Self> {
+    /// Uploads packed decode weights and materializes an NVFP4 tensor-core prefill copy.
+    pub fn from_packed_with_nvfp4_prefill(linear: &TernaryG64PackedLinear) -> Result<Self> {
+        Self::from_packed_impl(linear, false, true)
+    }
+
+    fn from_packed_impl(
+        linear: &TernaryG64PackedLinear,
+        bf16_prefill: bool,
+        nvfp4_prefill: bool,
+    ) -> Result<Self> {
         validate_shape(linear.out_features, linear.in_features)?;
         let groups = linear.out_features * (linear.in_features / TERNARY_G64_GROUP_SIZE);
         if linear.packed_weight.len() != linear.out_features * linear.in_features / 4
@@ -264,6 +293,7 @@ impl TernaryG64Matrix {
             packed_weight: DeviceBuffer::from_host(&linear.packed_weight)?,
             group_scales: DeviceBuffer::from_host(&linear.group_scales)?,
             bf16_prefill_weight: None,
+            nvfp4_prefill_weight: None,
         };
         if bf16_prefill {
             let weight = DeviceBuffer::zeroed(matrix.rows * matrix.cols)?;
@@ -286,6 +316,9 @@ impl TernaryG64Matrix {
             stream.synchronize()?;
             matrix.bf16_prefill_weight = Some(weight);
         }
+        if nvfp4_prefill {
+            matrix.nvfp4_prefill_weight = Some(linear.quantize_nvfp4()?.as_cublaslt_weight()?);
+        }
         Ok(matrix)
     }
 
@@ -307,6 +340,93 @@ impl TernaryG64Matrix {
                 .bf16_prefill_weight
                 .as_ref()
                 .map_or(0, DeviceBuffer::device_bytes)
+            + self
+                .nvfp4_prefill_weight
+                .as_ref()
+                .map_or(0, ModelOptCublasLtWeight::device_bytes)
+    }
+
+    /// Creates a reusable F32-output W4A4 prefill plan for this matrix.
+    pub fn new_f32_batch_nvfp4_plan(
+        &self,
+        lt: &CublasLt,
+        activation: &Nvfp4Matrix,
+        batch_rows: usize,
+        workspace_limit: u64,
+    ) -> Result<Fp4TnMatmulPlan> {
+        let Some(weight) = self.nvfp4_prefill_weight.as_ref() else {
+            return Err(Error::Format {
+                label: "ternary g64 NVFP4 prefill linear",
+                detail: "matrix has no NVFP4 prefill weights".to_string(),
+            });
+        };
+        Fp4TnMatmulPlan::new_f32_output_for_shape(
+            lt,
+            GemmShape::new(self.rows, batch_rows, self.cols),
+            Nvfp4TnInputs::new(weight.matrix(), activation),
+            workspace_limit,
+        )
+    }
+
+    /// Quantizes activations and enqueues the tensor-core W4A4 prefill projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_f32_batch_nvfp4_into_on_stream(
+        &self,
+        lt: &CublasLt,
+        plan: &Fp4TnMatmulPlan,
+        input: DeviceInput<'_, f32>,
+        activation: &mut Nvfp4Matrix,
+        output: DeviceInOut<'_, f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let expected_shape = GemmShape::new(self.rows, batch_rows, self.cols);
+        if batch_rows == 0
+            || input.len() != batch_rows * self.cols
+            || activation.shape().rows != self.cols
+            || activation.shape().cols != batch_rows
+            || output.len() < batch_rows * self.rows
+            || plan.shape() != expected_shape
+        {
+            return Err(Error::Shape {
+                label: "ternary g64 NVFP4 prefill linear",
+                expected: format!(
+                    "shape={expected_shape:?}, input={} values, activation={}x{}, output >= {} values",
+                    batch_rows * self.cols,
+                    self.cols,
+                    batch_rows,
+                    batch_rows * self.rows
+                ),
+                actual: format!(
+                    "shape={:?} input={} activation={:?} output={}",
+                    plan.shape(),
+                    input.len(),
+                    activation.shape(),
+                    output.len()
+                ),
+            });
+        }
+        let Some(weight) = self.nvfp4_prefill_weight.as_ref() else {
+            return Err(Error::Format {
+                label: "ternary g64 NVFP4 prefill linear",
+                detail: "matrix has no NVFP4 prefill weights".to_string(),
+            });
+        };
+        weight.quantize_activation_device_col_major_f32_into_on_stream(
+            self.cols,
+            batch_rows,
+            input.buffer(),
+            activation,
+            stream,
+        )?;
+        plan.run_with_alpha_beta_f32_inout_buffer_on_stream(
+            lt,
+            Nvfp4TnInputs::new(weight.matrix(), activation),
+            output,
+            weight.matmul_alpha(),
+            0.0,
+            stream,
+        )
     }
 
     /// Converts activations to BF16 and enqueues the tensor-core prefill projection.
@@ -843,5 +963,76 @@ mod tests {
         }
         let packed_bytes = ROWS * COLS / 4 + ROWS * (COLS / 64) * std::mem::size_of::<f32>();
         assert_eq!(matrix.device_bytes(), packed_bytes + ROWS * COLS * 2);
+    }
+
+    #[test]
+    fn nvfp4_tensor_prefill_tracks_ternary_dense_reference_for_unaligned_batch() {
+        const ROWS: usize = 128;
+        const COLS: usize = 128;
+        const BATCH: usize = 7;
+        let packed = TernaryG64PackedLinear::from_gguf_q2_0_g64(
+            "nvfp4.prefill",
+            ROWS,
+            COLS,
+            &synthetic_gguf(ROWS, COLS),
+        )
+        .expect("import");
+        let input_host = (0..BATCH * COLS)
+            .map(|index| ((index * 43 % 557) as f32 - 278.0) / 83.0)
+            .collect::<Vec<_>>();
+        let expected = (0..BATCH)
+            .flat_map(|batch| {
+                let packed = &packed;
+                let input_host = &input_host;
+                (0..ROWS).map(move |row| {
+                    (0..COLS)
+                        .map(|col| {
+                            input_host[batch * COLS + col] * packed.weight(row, col).unwrap()
+                        })
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let matrix = TernaryG64Matrix::from_packed_with_nvfp4_prefill(&packed).expect("upload");
+        let lt = CublasLt::new().expect("cuBLASLt");
+        let mut activation = Nvfp4Matrix::zeroed_col_major(COLS, BATCH).expect("NVFP4 activation");
+        let plan = matrix
+            .new_f32_batch_nvfp4_plan(&lt, &activation, BATCH, 8 * 1024 * 1024)
+            .expect("plan");
+        let input = DeviceBuffer::from_host(&input_host).expect("input");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        matrix
+            .run_f32_batch_nvfp4_into_on_stream(
+                &lt,
+                &plan,
+                input.input(),
+                &mut activation,
+                output.inout(),
+                BATCH,
+                &stream,
+            )
+            .expect("projection");
+        let actual = output.copy_to_host(&stream).expect("download");
+        let (mut dot, mut expected_squared, mut actual_squared, mut error_squared) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&actual, &expected) in actual.iter().zip(&expected) {
+            let actual = f64::from(actual);
+            let expected = f64::from(expected);
+            dot += actual * expected;
+            expected_squared += expected * expected;
+            actual_squared += actual * actual;
+            error_squared += (actual - expected).powi(2);
+        }
+        let cosine = dot / (expected_squared.sqrt() * actual_squared.sqrt());
+        let nrmse = (error_squared / expected_squared).sqrt();
+        assert!(
+            cosine >= 0.97 && nrmse <= 0.35,
+            "NVFP4 prefill cosine={cosine} nrmse={nrmse}"
+        );
+
+        let packed_bytes = ROWS * COLS / 4 + ROWS * (COLS / 64) * size_of::<f32>();
+        let nvfp4_bytes = ROWS * COLS / 2 + ROWS * (COLS / 16);
+        assert_eq!(matrix.device_bytes(), packed_bytes + nvfp4_bytes);
     }
 }

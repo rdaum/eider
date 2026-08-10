@@ -374,7 +374,7 @@ impl ModelOptNvfp4Linear {
         )
     }
 
-    fn quantize_values(
+    pub(crate) fn quantize_values(
         prefix: impl Into<String>,
         out_features: usize,
         in_features: usize,
