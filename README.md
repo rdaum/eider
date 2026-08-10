@@ -95,7 +95,7 @@ throughput run has not been completed.
 | [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | 20.4 | — | 240 of 288 routed experts resident per layer |
 | [Laguna-S-2.1](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | 16.2 | — | Resident NVFP4 experts; compact FP4 KV cache |
 | [Gemma 4 26B-A4B](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | 30.1 | 29.6 | Same ModelOpt NVFP4 weights; compact FP4 KV in Eider, FP8 E4M3 KV in vLLM |
-| [Muse Glimmer 30B](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | 5.5 | — | ModelOpt NVFP4 weights through the initial W4A16 decode path; compact FP4 KV |
+| [Muse Glimmer 30B](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | 11.8 | — | ModelOpt W4A4 decode; import-quantized gates and LM head; compact FP4 KV |
 | [Nemotron Labs 3 Puzzle 75B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4) | — | — | Throughput comparison pending |
 
 Gemma prefills a fresh roughly 2,700-token Pi/API prompt at about 6,740 prompt
@@ -103,9 +103,10 @@ tokens/sec, compared with about 7,060 in vLLM. Prefix reuse brought a typical
 follow-up to 235 ms TTFT. An Agents-A1 Pi session sustained 58-60 decode
 tokens/sec through 4,200-token turns and 44.5 at 17,748 tokens.
 Laguna prefills a fresh roughly 3,300-token API prompt at about 135 prompt
-tokens/sec. Muse Glimmer's initial sequential path measured 5.9 prompt
-tokens/sec and 5.5 decode tokens/sec on a 50-token API prompt; batched prefill
-and a tensor-core decode path remain future optimization work.
+tokens/sec. Muse Glimmer measured 12.3 prompt tokens/sec and 11.8 decode
+tokens/sec on a fresh 57-token API prompt. It uses checkpoint-calibrated W4A4
+for the released NVFP4 projections and converts the BF16 attention gates and
+language head to NVFP4 during loading. Batched prefill remains future work.
 
 Step-3.7 is a 198B checkpoint served with disk-backed expert paging. Converting
 its remaining BF16 weights to NVFP4 reduces resident device weights from 95.5

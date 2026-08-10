@@ -1,14 +1,14 @@
 //! Muse Glimmer dense text-model loading and inference.
 //!
-//! The initial runtime is text-only. It consumes the released ModelOpt NVFP4
-//! language projections while retaining the checkpoint's attention gates,
-//! embeddings, normalization vectors, and language head in BF16.
+//! The text-only runtime consumes the released ModelOpt NVFP4 projections and
+//! converts the checkpoint's BF16 attention gates and language head to NVFP4
+//! during loading. Embeddings and normalization vectors remain BF16.
 
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
+    ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, sigmoid_mul_f32_into_on_stream,
     silu_mul_f32_into_on_stream,
@@ -199,8 +199,28 @@ impl MuseGlimmerCheckpoint {
         MuseNvfp4Linear::from_modelopt(prefix, self.checkpoint.load_nvfp4_linear(prefix)?)
     }
 
-    fn load_bf16_linear(&self, prefix: &str) -> Result<MuseBf16Linear> {
-        MuseBf16Linear::load(&self.checkpoint, prefix)
+    fn load_bf16_nvfp4_linear(&self, prefix: &str) -> Result<MuseNvfp4Linear> {
+        let tensor = format!("{prefix}.weight");
+        let info = self.checkpoint.tensor_info(&tensor)?;
+        if info.dtype != "BF16" || info.shape.len() != 2 {
+            return Err(Error::Shape {
+                label: "Muse Glimmer BF16-to-NVFP4 linear",
+                expected: "BF16 [rows, cols]".to_string(),
+                actual: format!("{} {:?} for {tensor}", info.dtype, info.shape),
+            });
+        }
+        let bytes = self
+            .checkpoint
+            .open_shard_for_tensor(&tensor)?
+            .read_tensor_bytes(&tensor)?;
+        let values = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        MuseNvfp4Linear::from_modelopt(
+            prefix,
+            ModelOptNvfp4Linear::quantize_bf16(prefix, info.shape[0], info.shape[1], &values)?,
+        )
     }
 
     fn load_bf16_vector(&self, tensor: &str, width: usize) -> Result<Vec<f32>> {
@@ -249,9 +269,23 @@ impl MuseGlimmerCheckpoint {
 struct MuseNvfp4Linear {
     name: String,
     weight: ModelOptCublasLtWeight,
-    weight_scale: DeviceBuffer<u8>,
     out_features: usize,
     in_features: usize,
+}
+
+struct MuseNvfp4LinearWorkspace {
+    activation: Nvfp4Matrix,
+    output: DeviceBuffer<f32>,
+}
+
+impl MuseNvfp4LinearWorkspace {
+    fn output(&self) -> &DeviceBuffer<f32> {
+        &self.output
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.activation.device_bytes() + self.output.device_bytes()
+    }
 }
 
 impl MuseNvfp4Linear {
@@ -267,13 +301,11 @@ impl MuseNvfp4Linear {
                 ),
             });
         }
-        let weight_scale = DeviceBuffer::from_host(&weight.weight_scale)?;
         let out_features = weight.out_features;
         let in_features = weight.in_features;
         Ok(Self {
             name: name.to_string(),
             weight: weight.as_cublaslt_weight()?,
-            weight_scale,
             out_features,
             in_features,
         })
@@ -283,116 +315,53 @@ impl MuseNvfp4Linear {
         (self.out_features, self.in_features)
     }
 
+    fn new_workspace(&self) -> Result<MuseNvfp4LinearWorkspace> {
+        Ok(MuseNvfp4LinearWorkspace {
+            activation: Nvfp4Matrix::zeroed_col_major(self.in_features, 1)?,
+            output: DeviceBuffer::zeroed(self.out_features)?,
+        })
+    }
+
     fn run_into(
         &self,
+        lt: &CublasLt,
+        plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
+        workspace: &mut MuseNvfp4LinearWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        if input.len() != self.in_features || output.len() != self.out_features {
+        if input.len() != self.in_features || workspace.output().len() != self.out_features {
             return Err(Error::Shape {
                 label: "Muse Glimmer NVFP4 linear buffers",
                 expected: format!("input={} output={}", self.in_features, self.out_features),
-                actual: format!("input={} output={}", input.len(), output.len()),
+                actual: format!("input={} output={}", input.len(), workspace.output().len()),
             });
         }
-        nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream(
-            input,
-            self.weight.matrix(),
-            &self.weight_scale,
-            output.output(),
-            1,
-            self.out_features,
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
             self.in_features,
-            self.weight.weight_scale_2(),
-            stream,
-        )
-        .map_err(|error| Error::Format {
-            label: "Muse Glimmer NVFP4 linear execution",
-            detail: format!(
-                "{} [{}x{}]: {error}",
-                self.name, self.out_features, self.in_features
-            ),
-        })
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.weight.device_bytes() + self.weight_scale.device_bytes()
-    }
-}
-
-struct MuseBf16Linear {
-    name: String,
-    weight: DeviceBuffer<u16>,
-    rows: usize,
-    cols: usize,
-}
-
-impl MuseBf16Linear {
-    fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
-        let name = format!("{prefix}.weight");
-        let info = checkpoint.tensor_info(&name)?;
-        if info.dtype != "BF16" || info.shape.len() != 2 {
-            return Err(Error::Shape {
-                label: "Muse Glimmer BF16 linear",
-                expected: "BF16 [rows, cols]".to_string(),
-                actual: format!("{} {:?} for {name}", info.dtype, info.shape),
-            });
-        }
-        let rows = info.shape[0];
-        let cols = info.shape[1];
-        let bytes = checkpoint
-            .open_shard_for_tensor(&name)?
-            .read_tensor_bytes(&name)?;
-        let values = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>();
-        Ok(Self {
-            name: prefix.to_string(),
-            weight: DeviceBuffer::from_host(&values)?,
-            rows,
-            cols,
-        })
-    }
-
-    fn require_shape(&self, rows: usize, cols: usize, label: &'static str) -> Result<()> {
-        if self.rows != rows || self.cols != cols {
-            return Err(Error::Shape {
-                label,
-                expected: format!("[{rows}, {cols}]"),
-                actual: format!("[{}, {}]", self.rows, self.cols),
-            });
-        }
-        Ok(())
-    }
-
-    fn run_into(
-        &self,
-        input: &DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if input.len() != self.cols || output.len() != self.rows {
-            return Err(Error::Shape {
-                label: "Muse Glimmer BF16 linear buffers",
-                expected: format!("input={} output={}", self.cols, self.rows),
-                actual: format!("input={} output={}", input.len(), output.len()),
-            });
-        }
-        bf16_linear_logits_f32_into_on_stream(
+            1,
             input,
-            &self.weight,
-            output.output(),
-            self.rows,
-            self.cols,
+            &mut workspace.activation,
+            self.weight.input_scale(),
             stream,
-        )
-        .map_err(|error| Error::Format {
-            label: "Muse Glimmer BF16 linear execution",
-            detail: format!("{} [{}, {}]: {error}", self.name, self.rows, self.cols),
-        })?;
-        round_f32_to_bf16_in_place_on_stream(output.inout(), stream)
+        )?;
+        plans
+            .for_linear(self)?
+            .run_with_alpha_beta_f32_inout_buffer_on_stream(
+                lt,
+                Nvfp4TnInputs::new(self.weight.matrix(), &workspace.activation),
+                workspace.output.inout(),
+                self.weight.matmul_alpha(),
+                0.0,
+                stream,
+            )
+            .map_err(|error| Error::Format {
+                label: "Muse Glimmer NVFP4 linear execution",
+                detail: format!(
+                    "{} [{}x{}]: {error}",
+                    self.name, self.out_features, self.in_features
+                ),
+            })
     }
 
     fn device_bytes(&self) -> usize {
@@ -480,10 +449,16 @@ struct MuseMlp {
 }
 
 struct MuseMlpWorkspace {
-    gate: DeviceBuffer<f32>,
-    up: DeviceBuffer<f32>,
+    gate: MuseNvfp4LinearWorkspace,
+    up: MuseNvfp4LinearWorkspace,
     activated: DeviceBuffer<f32>,
-    output: DeviceBuffer<f32>,
+    down: MuseNvfp4LinearWorkspace,
+}
+
+impl MuseMlpWorkspace {
+    fn output(&self) -> &DeviceBuffer<f32> {
+        self.down.output()
+    }
 }
 
 impl MuseMlp {
@@ -524,29 +499,33 @@ impl MuseMlp {
 
     fn new_workspace(&self) -> Result<MuseMlpWorkspace> {
         Ok(MuseMlpWorkspace {
-            gate: DeviceBuffer::zeroed(self.intermediate_size)?,
-            up: DeviceBuffer::zeroed(self.intermediate_size)?,
+            gate: self.gate.new_workspace()?,
+            up: self.up.new_workspace()?,
             activated: DeviceBuffer::zeroed(self.intermediate_size)?,
-            output: DeviceBuffer::zeroed(self.down.shape().0)?,
+            down: self.down.new_workspace()?,
         })
     }
 
     fn run_into(
         &self,
+        lt: &CublasLt,
+        plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
         workspace: &mut MuseMlpWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.gate.run_into(input, &mut workspace.gate, stream)?;
-        self.up.run_into(input, &mut workspace.up, stream)?;
+        self.gate
+            .run_into(lt, plans, input, &mut workspace.gate, stream)?;
+        self.up
+            .run_into(lt, plans, input, &mut workspace.up, stream)?;
         silu_mul_f32_into_on_stream(
-            &workspace.gate,
-            &workspace.up,
+            workspace.gate.output(),
+            workspace.up.output(),
             workspace.activated.output(),
             stream,
         )?;
         self.down
-            .run_into(&workspace.activated, &mut workspace.output, stream)
+            .run_into(lt, plans, &workspace.activated, &mut workspace.down, stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -558,7 +537,7 @@ struct MuseAttention {
     q: MuseNvfp4Linear,
     k: MuseNvfp4Linear,
     v: MuseNvfp4Linear,
-    gate: MuseBf16Linear,
+    gate: MuseNvfp4Linear,
     output: MuseNvfp4Linear,
     q_norm: MuseRmsNorm,
     k_norm: MuseRmsNorm,
@@ -570,17 +549,23 @@ struct MuseAttention {
 }
 
 struct MuseAttentionWorkspace {
-    q: DeviceBuffer<f32>,
-    k: DeviceBuffer<f32>,
-    v: DeviceBuffer<f32>,
-    gate: DeviceBuffer<f32>,
+    q: MuseNvfp4LinearWorkspace,
+    k: MuseNvfp4LinearWorkspace,
+    v: MuseNvfp4LinearWorkspace,
+    gate: MuseNvfp4LinearWorkspace,
     q_normed: DeviceBuffer<f32>,
     k_normed: DeviceBuffer<f32>,
     q_positioned: DeviceBuffer<f32>,
     k_positioned: DeviceBuffer<f32>,
     attended: DeviceBuffer<f32>,
     gated: DeviceBuffer<f32>,
-    output: DeviceBuffer<f32>,
+    output: MuseNvfp4LinearWorkspace,
+}
+
+impl MuseAttentionWorkspace {
+    fn output(&self) -> &DeviceBuffer<f32> {
+        self.output.output()
+    }
 }
 
 impl MuseAttention {
@@ -590,7 +575,7 @@ impl MuseAttention {
         let q = checkpoint.load_nvfp4_linear(&format!("{prefix}.q_proj"))?;
         let k = checkpoint.load_nvfp4_linear(&format!("{prefix}.k_proj"))?;
         let v = checkpoint.load_nvfp4_linear(&format!("{prefix}.v_proj"))?;
-        let gate = checkpoint.load_bf16_linear(&format!("{prefix}.gate_proj"))?;
+        let gate = checkpoint.load_bf16_nvfp4_linear(&format!("{prefix}.gate_proj"))?;
         let output = checkpoint.load_nvfp4_linear(&format!("{prefix}.o_proj"))?;
         let q_width = config.num_attention_heads * config.head_dim;
         let kv_width = config.num_key_value_heads * config.head_dim;
@@ -614,7 +599,13 @@ impl MuseAttention {
                 ),
             });
         }
-        gate.require_shape(q_width, config.hidden_size, "Muse Glimmer attention gate")?;
+        if gate.shape() != (q_width, config.hidden_size) {
+            return Err(Error::Shape {
+                label: "Muse Glimmer attention gate",
+                expected: format!("[{q_width}, {}]", config.hidden_size),
+                actual: format!("{:?}", gate.shape()),
+            });
+        }
         let local = config.is_local_layer(layer)?;
         let theta = config.layer_rope_theta[layer];
         Ok(Self {
@@ -641,17 +632,17 @@ impl MuseAttention {
         let q_width = self.q_heads * self.head_dim;
         let kv_width = self.kv_heads * self.head_dim;
         Ok(MuseAttentionWorkspace {
-            q: DeviceBuffer::zeroed(q_width)?,
-            k: DeviceBuffer::zeroed(kv_width)?,
-            v: DeviceBuffer::zeroed(kv_width)?,
-            gate: DeviceBuffer::zeroed(q_width)?,
+            q: self.q.new_workspace()?,
+            k: self.k.new_workspace()?,
+            v: self.v.new_workspace()?,
+            gate: self.gate.new_workspace()?,
             q_normed: DeviceBuffer::zeroed(q_width)?,
             k_normed: DeviceBuffer::zeroed(kv_width)?,
             q_positioned: DeviceBuffer::zeroed(q_width)?,
             k_positioned: DeviceBuffer::zeroed(kv_width)?,
             attended: DeviceBuffer::zeroed(q_width)?,
             gated: DeviceBuffer::zeroed(q_width)?,
-            output: DeviceBuffer::zeroed(self.output.shape().0)?,
+            output: self.output.new_workspace()?,
         })
     }
 
@@ -669,6 +660,8 @@ impl MuseAttention {
     #[allow(clippy::too_many_arguments)]
     fn run_into(
         &self,
+        lt: &CublasLt,
+        plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
         workspace: &mut MuseAttentionWorkspace,
         cache: &mut Sm12xKvCache,
@@ -683,21 +676,26 @@ impl MuseAttention {
                 actual: cache.len().to_string(),
             });
         }
-        self.q.run_into(input, &mut workspace.q, stream)?;
-        self.k.run_into(input, &mut workspace.k, stream)?;
-        self.v.run_into(input, &mut workspace.v, stream)?;
-        self.gate.run_into(input, &mut workspace.gate, stream)?;
+        self.q
+            .run_into(lt, plans, input, &mut workspace.q, stream)?;
+        self.k
+            .run_into(lt, plans, input, &mut workspace.k, stream)?;
+        self.v
+            .run_into(lt, plans, input, &mut workspace.v, stream)?;
+        self.gate
+            .run_into(lt, plans, input, &mut workspace.gate, stream)?;
+        round_f32_to_bf16_in_place_on_stream(workspace.gate.output.inout(), stream)?;
         self.q_norm.run_into(
             self.q_heads,
             self.head_dim,
-            &workspace.q,
+            workspace.q.output(),
             &mut workspace.q_normed,
             stream,
         )?;
         self.k_norm.run_into(
             self.kv_heads,
             self.head_dim,
-            &workspace.k,
+            workspace.k.output(),
             &mut workspace.k_normed,
             stream,
         )?;
@@ -732,7 +730,12 @@ impl MuseAttention {
                 stream,
             )?;
         }
-        cache.append_at_on_stream(&workspace.k_positioned, &workspace.v, position, stream)?;
+        cache.append_at_on_stream(
+            &workspace.k_positioned,
+            workspace.v.output(),
+            position,
+            stream,
+        )?;
         if let Some(window) = self.window {
             compact_attention.attention_window_into_on_stream(
                 cache,
@@ -750,13 +753,13 @@ impl MuseAttention {
             )?;
         }
         sigmoid_mul_f32_into_on_stream(
-            &workspace.gate,
+            workspace.gate.output(),
             &workspace.attended,
             workspace.gated.output(),
             stream,
         )?;
         self.output
-            .run_into(&workspace.gated, &mut workspace.output, stream)
+            .run_into(lt, plans, &workspace.gated, &mut workspace.output, stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -839,6 +842,8 @@ impl MuseDecoderLayer {
     #[allow(clippy::too_many_arguments)]
     fn run_into(
         &self,
+        lt: &CublasLt,
+        plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
         workspace: &mut MuseDecoderLayerWorkspace,
         cache: &mut Sm12xKvCache,
@@ -850,6 +855,8 @@ impl MuseDecoderLayer {
         self.input_norm
             .run_into(1, hidden, input, &mut workspace.normalized, stream)?;
         self.attention.run_into(
+            lt,
+            plans,
             &workspace.normalized,
             &mut workspace.attention,
             cache,
@@ -860,7 +867,7 @@ impl MuseDecoderLayer {
         self.post_attention_norm.run_into(
             1,
             hidden,
-            &workspace.attention.output,
+            workspace.attention.output(),
             &mut workspace.normalized,
             stream,
         )?;
@@ -877,12 +884,17 @@ impl MuseDecoderLayer {
             &mut workspace.feedforward_input,
             stream,
         )?;
-        self.mlp
-            .run_into(&workspace.feedforward_input, &mut workspace.mlp, stream)?;
+        self.mlp.run_into(
+            lt,
+            plans,
+            &workspace.feedforward_input,
+            &mut workspace.mlp,
+            stream,
+        )?;
         self.post_feedforward_norm.run_into(
             1,
             hidden,
-            &workspace.mlp.output,
+            workspace.mlp.output(),
             &mut workspace.feedforward_output,
             stream,
         )?;
@@ -950,6 +962,70 @@ impl MuseCompactAttentionWorkspaces {
     }
 }
 
+struct MuseLinearPlan {
+    out_features: usize,
+    in_features: usize,
+    plan: Fp4TnMatmulPlan,
+}
+
+struct MuseLinearPlans {
+    plans: Vec<MuseLinearPlan>,
+}
+
+impl MuseLinearPlans {
+    fn new(lt: &CublasLt, layers: &[MuseDecoderLayer], lm_head: &MuseNvfp4Linear) -> Result<Self> {
+        let first = layers.first().ok_or_else(|| Error::Format {
+            label: "Muse Glimmer linear plans",
+            detail: "model has no decoder layers".to_string(),
+        })?;
+        let representatives = [
+            &first.attention.q,
+            &first.attention.k,
+            &first.attention.output,
+            &first.mlp.gate,
+            &first.mlp.down,
+            lm_head,
+        ];
+        let mut plans = Vec::with_capacity(representatives.len());
+        for linear in representatives {
+            let activation = Nvfp4Matrix::zeroed_col_major(linear.in_features, 1)?;
+            let shape = GemmShape::new(linear.out_features, 1, linear.in_features);
+            plans.push(MuseLinearPlan {
+                out_features: linear.out_features,
+                in_features: linear.in_features,
+                plan: Fp4TnMatmulPlan::new_f32_output_for_shape(
+                    lt,
+                    shape,
+                    Nvfp4TnInputs::new(linear.weight.matrix(), &activation),
+                    8 << 20,
+                )?,
+            });
+        }
+        Ok(Self { plans })
+    }
+
+    fn for_linear(&self, linear: &MuseNvfp4Linear) -> Result<&Fp4TnMatmulPlan> {
+        self.plans
+            .iter()
+            .find(|plan| {
+                (plan.out_features, plan.in_features) == (linear.out_features, linear.in_features)
+            })
+            .map(|plan| &plan.plan)
+            .ok_or_else(|| Error::Shape {
+                label: "Muse Glimmer linear plan",
+                expected: "one of the model's dense projection shapes".to_string(),
+                actual: format!("{}x{}", linear.out_features, linear.in_features),
+            })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.plans
+            .iter()
+            .map(|plan| plan.plan.workspace_bytes())
+            .sum()
+    }
+}
+
 /// Complete resident Muse Glimmer text model.
 pub struct MuseGlimmerModel {
     model_id: u64,
@@ -957,8 +1033,10 @@ pub struct MuseGlimmerModel {
     embedding: DeviceBuffer<u16>,
     embedding_norm: MuseRmsNorm,
     layers: Vec<MuseDecoderLayer>,
+    lt: CublasLt,
+    linear_plans: MuseLinearPlans,
     final_norm: MuseRmsNorm,
-    lm_head: MuseBf16Linear,
+    lm_head: MuseNvfp4Linear,
     stream: CudaStream,
 }
 
@@ -971,7 +1049,7 @@ pub struct MuseGlimmerDecodeState {
     kv_caches: Vec<Sm12xKvCache>,
     compact_attention: MuseCompactAttentionWorkspaces,
     final_hidden: DeviceBuffer<f32>,
-    logits: DeviceBuffer<f32>,
+    lm_head: MuseNvfp4LinearWorkspace,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
     position: usize,
@@ -997,6 +1075,7 @@ impl MuseGlimmerModel {
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
         let checkpoint = MuseGlimmerCheckpoint::open(model_dir)?;
         let config = checkpoint.config.clone();
+        let lt = CublasLt::new()?;
         let embedding = checkpoint.load_bf16_matrix(
             "model.language_model.embed_tokens.weight",
             config.vocab_size,
@@ -1024,18 +1103,23 @@ impl MuseGlimmerModel {
             config.hidden_size,
             config.rms_norm_eps,
         )?;
-        let lm_head = checkpoint.load_bf16_linear("lm_head")?;
-        lm_head.require_shape(
-            config.vocab_size,
-            config.hidden_size,
-            "Muse Glimmer language head",
-        )?;
+        let lm_head = checkpoint.load_bf16_nvfp4_linear("lm_head")?;
+        if lm_head.shape() != (config.vocab_size, config.hidden_size) {
+            return Err(Error::Shape {
+                label: "Muse Glimmer language head",
+                expected: format!("[{}, {}]", config.vocab_size, config.hidden_size),
+                actual: format!("{:?}", lm_head.shape()),
+            });
+        }
+        let linear_plans = MuseLinearPlans::new(&lt, &layers, &lm_head)?;
         Ok(Self {
             model_id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             config,
             embedding,
             embedding_norm,
             layers,
+            lt,
+            linear_plans,
             final_norm,
             lm_head,
             stream: CudaStream::new_non_blocking()?,
@@ -1056,6 +1140,7 @@ impl MuseGlimmerModel {
                 .iter()
                 .map(MuseDecoderLayer::device_bytes)
                 .sum::<usize>()
+            + self.linear_plans.device_bytes()
             + self.final_norm.device_bytes()
             + self.lm_head.device_bytes()
     }
@@ -1090,7 +1175,7 @@ impl MuseGlimmerModel {
                 .collect::<Result<Vec<_>>>()?,
             compact_attention: MuseCompactAttentionWorkspaces::new(&self.layers, max_tokens)?,
             final_hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
-            logits: DeviceBuffer::zeroed(self.config.vocab_size)?,
+            lm_head: self.lm_head.new_workspace()?,
             next_index: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
             position: 0,
@@ -1128,7 +1213,11 @@ impl MuseGlimmerModel {
                 detail: "no token has been evaluated".to_string(),
             });
         }
-        let mut logits = state.logits.copy_to_host(&self.stream)?.into_vec();
+        let mut logits = state
+            .lm_head
+            .output()
+            .copy_to_host(&self.stream)?
+            .into_vec();
         for logit in &mut logits {
             *logit = self.transform_logit(*logit);
         }
@@ -1144,7 +1233,7 @@ impl MuseGlimmerModel {
             });
         }
         argmax_f32_into_on_stream(
-            &state.logits,
+            state.lm_head.output(),
             state.next_index.output(),
             state.next_value.output(),
             &self.stream,
@@ -1195,6 +1284,8 @@ impl MuseGlimmerModel {
                 &previous[layer_index - 1].output
             };
             self.layers[layer_index].run_into(
+                &self.lt,
+                &self.linear_plans,
                 input,
                 &mut current[0],
                 &mut state.kv_caches[layer_index],
@@ -1225,8 +1316,14 @@ impl MuseGlimmerModel {
             &mut state.final_hidden,
             &self.stream,
         )?;
-        self.lm_head
-            .run_into(&state.final_hidden, &mut state.logits, &self.stream)
+        self.lm_head.run_into(
+            &self.lt,
+            &self.linear_plans,
+            &state.final_hidden,
+            &mut state.lm_head,
+            &self.stream,
+        )?;
+        round_f32_to_bf16_in_place_on_stream(state.lm_head.output.inout(), &self.stream)
     }
 
     fn transform_logit(&self, logit: f32) -> f32 {
@@ -1357,7 +1454,7 @@ impl MuseGlimmerDecodeState {
                         + layer.mlp.gate.device_bytes()
                         + layer.mlp.up.device_bytes()
                         + layer.mlp.activated.device_bytes()
-                        + layer.mlp.output.device_bytes()
+                        + layer.mlp.down.device_bytes()
                         + layer.normalized.device_bytes()
                         + layer.residual.device_bytes()
                         + layer.feedforward_input.device_bytes()
@@ -1372,7 +1469,7 @@ impl MuseGlimmerDecodeState {
                 .sum::<usize>()
             + self.compact_attention.device_bytes()
             + self.final_hidden.device_bytes()
-            + self.logits.device_bytes()
+            + self.lm_head.device_bytes()
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()
     }

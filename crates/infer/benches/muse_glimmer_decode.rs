@@ -88,8 +88,8 @@ fn main() {
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(250),
             benchmark_duration: Duration::from_secs(2),
-            min_samples: 3,
-            max_samples: 5,
+            min_samples: 10,
+            max_samples: 20,
         },
         ..BenchmarkMainOptions::default()
     };
