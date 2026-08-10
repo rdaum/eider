@@ -7,8 +7,9 @@
 use nvfp4::{
     CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
     ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_into_on_stream,
+    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    copy_f32_rows_into_columns_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, sigmoid_mul_f32_into_on_stream,
     silu_mul_f32_into_on_stream,
@@ -18,6 +19,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
+
+mod batch;
+mod dflash;
+
+pub use dflash::{DFlashConfig, DFlashModel, MuseGlimmerDFlashCycle};
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1037,6 +1043,7 @@ pub struct MuseGlimmerModel {
     linear_plans: MuseLinearPlans,
     final_norm: MuseRmsNorm,
     lm_head: MuseNvfp4Linear,
+    dflash: Option<DFlashModel>,
     stream: CudaStream,
 }
 
@@ -1052,6 +1059,9 @@ pub struct MuseGlimmerDecodeState {
     lm_head: MuseNvfp4LinearWorkspace,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
+    verification: Option<Box<batch::MuseTargetBatchWorkspace>>,
+    dflash_state: Option<Box<dflash::DFlashSequenceState>>,
+    batch_logits_row: Option<usize>,
     position: usize,
     max_tokens: usize,
 }
@@ -1122,8 +1132,19 @@ impl MuseGlimmerModel {
             linear_plans,
             final_norm,
             lm_head,
+            dflash: None,
             stream: CudaStream::new_non_blocking()?,
         })
+    }
+
+    /// Loads Muse Glimmer together with Meta's official DFlash companion.
+    pub fn load_with_dflash(
+        model_dir: impl AsRef<Path>,
+        dflash_gguf: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let mut model = Self::load(model_dir)?;
+        model.dflash = Some(DFlashModel::load(dflash_gguf, &model.config)?);
+        Ok(model)
     }
 
     /// Returns the validated checkpoint configuration.
@@ -1143,6 +1164,7 @@ impl MuseGlimmerModel {
             + self.linear_plans.device_bytes()
             + self.final_norm.device_bytes()
             + self.lm_head.device_bytes()
+            + self.dflash.as_ref().map_or(0, DFlashModel::device_bytes)
     }
 
     /// Waits for work submitted by this model instance.
@@ -1159,6 +1181,20 @@ impl MuseGlimmerModel {
                 actual: max_tokens.to_string(),
             });
         }
+        let verification = self
+            .dflash
+            .as_ref()
+            .map(|_| batch::MuseTargetBatchWorkspace::new(self, max_tokens).map(Box::new))
+            .transpose()?;
+        let dflash_state = self
+            .dflash
+            .as_ref()
+            .map(|dflash| {
+                dflash
+                    .new_sequence_state(max_tokens, self.config.vocab_size)
+                    .map(Box::new)
+            })
+            .transpose()?;
         Ok(MuseGlimmerDecodeState {
             model_id: self.model_id,
             hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
@@ -1178,6 +1214,9 @@ impl MuseGlimmerModel {
             lm_head: self.lm_head.new_workspace()?,
             next_index: DeviceBuffer::zeroed(1)?,
             next_value: DeviceBuffer::zeroed(1)?,
+            verification,
+            dflash_state,
+            batch_logits_row: None,
             position: 0,
             max_tokens,
         })
@@ -1232,6 +1271,15 @@ impl MuseGlimmerModel {
                 detail: "no token has been evaluated".to_string(),
             });
         }
+        if let Some(row) = state.batch_logits_row.take() {
+            let verification = state
+                .verification
+                .as_ref()
+                .expect("DFlash verification workspace");
+            let tokens = verification.argmax_indices.copy_to_host(&self.stream)?;
+            let values = verification.argmax_values.copy_to_host(&self.stream)?;
+            return Ok((tokens[row], self.transform_logit(values[row])));
+        }
         argmax_f32_into_on_stream(
             state.lm_head.output(),
             state.next_index.output(),
@@ -1244,6 +1292,7 @@ impl MuseGlimmerModel {
     }
 
     fn forward_hidden(&self, state: &mut MuseGlimmerDecodeState, token: u32) -> Result<()> {
+        state.batch_logits_row = None;
         if state.model_id != self.model_id {
             return Err(Error::Format {
                 label: "Muse Glimmer decode state",
@@ -1283,6 +1332,28 @@ impl MuseGlimmerModel {
             } else {
                 &previous[layer_index - 1].output
             };
+            if let Some(dflash) = &self.dflash
+                && let Some(extract_index) = dflash
+                    .config
+                    .target_layers
+                    .iter()
+                    .position(|&extract| extract == layer_index)
+            {
+                copy_f32_rows_into_columns_on_stream(
+                    1,
+                    self.config.hidden_size,
+                    dflash.config.target_layers.len() * self.config.hidden_size,
+                    extract_index * self.config.hidden_size,
+                    input,
+                    state
+                        .verification
+                        .as_mut()
+                        .expect("DFlash verification workspace")
+                        .features
+                        .output(),
+                    &self.stream,
+                )?;
+            }
             self.layers[layer_index].run_into(
                 &self.lt,
                 &self.linear_plans,
@@ -1290,6 +1361,23 @@ impl MuseGlimmerModel {
                 &mut current[0],
                 &mut state.kv_caches[layer_index],
                 state.compact_attention.for_layer_mut(local)?,
+                state.position,
+                &self.stream,
+            )?;
+        }
+        if let Some(dflash) = &self.dflash {
+            let MuseGlimmerDecodeState {
+                verification,
+                dflash_state,
+                ..
+            } = state;
+            dflash.inject_features(
+                &verification
+                    .as_ref()
+                    .expect("DFlash verification workspace")
+                    .features,
+                dflash_state.as_mut().expect("DFlash sequence state"),
+                1,
                 state.position,
                 &self.stream,
             )?;
@@ -1472,6 +1560,14 @@ impl MuseGlimmerDecodeState {
             + self.lm_head.device_bytes()
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()
+            + self
+                .verification
+                .as_ref()
+                .map_or(0, |workspace| workspace.device_bytes())
+            + self
+                .dflash_state
+                .as_ref()
+                .map_or(0, |state| state.device_bytes())
     }
 }
 

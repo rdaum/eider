@@ -3836,10 +3836,10 @@ pub fn rope_neox_sequence_f32_into_on_stream(
             expected: "tokens * heads * head_dim without overflow".to_string(),
             actual: format!("tokens={tokens} heads={heads} head_dim={head_dim}"),
         })?;
-    if input.len() != len || output.len() != len {
+    if input.len() < len || output.len() < len {
         return Err(Error::Shape {
             label: "sequence RoPE buffers",
-            expected: format!("{len} values"),
+            expected: format!("at least {len} values"),
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
@@ -4169,6 +4169,59 @@ pub fn concat_f32_rows_into_on_stream(
                 output.buffer_mut().ptr,
                 rows as u32,
                 cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Copies a row-major matrix into a contiguous column range of a wider
+/// row-major matrix on `stream`.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_f32_rows_into_columns_on_stream(
+    rows: usize,
+    input_cols: usize,
+    output_cols: usize,
+    output_col_offset: usize,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows.saturating_mul(input_cols);
+    let output_len = rows.saturating_mul(output_cols);
+    if rows == 0
+        || input_cols == 0
+        || output_cols == 0
+        || rows > u32::MAX as usize
+        || input_cols > u32::MAX as usize
+        || output_cols > u32::MAX as usize
+        || output_col_offset > output_cols
+        || input_cols > output_cols - output_col_offset
+        || input.len() < input_len
+        || output.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "copy f32 rows into columns",
+            expected: format!(
+                "input at least {input_len}, output at least {output_len}, and columns within output"
+            ),
+            actual: format!(
+                "input={} output={} rows={rows} input_cols={input_cols} output_cols={output_cols} offset={output_col_offset}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_copy_f32_rows_into_columns_on_stream",
+            ffi::infer_copy_f32_rows_into_columns_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                input_cols as u32,
+                output_cols as u32,
+                output_col_offset as u32,
                 stream.as_raw(),
             ),
         )
@@ -11146,6 +11199,22 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn copies_active_rows_into_interleaved_feature_columns() {
+        let input = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("input");
+        let mut output = DeviceBuffer::from_host(&[-1.0f32; 18]).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        copy_f32_rows_into_columns_on_stream(2, 3, 9, 3, &input, output.output(), &stream)
+            .expect("column copy");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output").as_slice(),
+            [
+                -1.0, -1.0, -1.0, 1.0, 2.0, 3.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 4.0, 5.0, 6.0,
+                -1.0, -1.0, -1.0,
+            ]
+        );
+    }
 
     #[test]
     fn active_prefix_elementwise_ops_preserve_padding() {

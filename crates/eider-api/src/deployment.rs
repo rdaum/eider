@@ -14,6 +14,10 @@ use tracing::{info, warn};
 
 use crate::metrics::metrics as server_metrics;
 
+const MUSE_DFLASH_REPOSITORY: &str = "meta-models/Muse-Glimmer-30B-GGUF";
+const MUSE_DFLASH_REVISION: &str = "93769bc7ab5ad1e9cd22d857e3138cf5d977ae81";
+const MUSE_DFLASH_FILE: &str = "dflash-kquant.gguf";
+
 /// A reviewed model available through the `eider-serve` catalogue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelSpec {
@@ -193,6 +197,7 @@ const CATALOGUE: &[ModelSpec] = &[
 pub struct ResolvedModel {
     pub checkpoint_dir: PathBuf,
     pub artifact_dir: PathBuf,
+    pub dflash_gguf: Option<PathBuf>,
     pub identity: String,
     pub defaults: ServingDefaults,
     pub preparation: ArtifactKind,
@@ -269,6 +274,11 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
         })?;
     validate_checkpoint(&checkpoint_dir, spec.model_type)?;
     validate_runtime_files(&checkpoint_dir, spec.model_type)?;
+    let dflash_gguf = if spec.model_type == "muse_glimmer" {
+        Some(resolve_muse_dflash(offline).await?)
+    } else {
+        None
+    };
     info!(
         model = spec.id,
         repository = spec.repository,
@@ -280,10 +290,45 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
     Ok(ResolvedModel {
         checkpoint_dir,
         artifact_dir,
+        dflash_gguf,
         identity: format!("{}@{}", spec.id, spec.revision),
         defaults: spec.defaults,
         preparation: spec.artifact_kind,
     })
+}
+
+async fn resolve_muse_dflash(offline: bool) -> Result<PathBuf, String> {
+    let (owner, name) = split_id(MUSE_DFLASH_REPOSITORY);
+    let client =
+        HFClient::new().map_err(|error| format!("configure Hugging Face client: {error}"))?;
+    let repository = client.model(owner, name);
+    let path = repository
+        .download_file()
+        .filename(MUSE_DFLASH_FILE)
+        .revision(MUSE_DFLASH_REVISION)
+        .local_files_only(offline)
+        .send()
+        .await
+        .map_err(|error| {
+            if offline {
+                format!(
+                    "offline DFlash companion {} at {} is incomplete: {error}",
+                    MUSE_DFLASH_REPOSITORY, MUSE_DFLASH_REVISION
+                )
+            } else {
+                format!(
+                    "resolve DFlash companion {} at {}: {error}",
+                    MUSE_DFLASH_REPOSITORY, MUSE_DFLASH_REVISION
+                )
+            }
+        })?;
+    info!(
+        repository = MUSE_DFLASH_REPOSITORY,
+        revision = MUSE_DFLASH_REVISION,
+        gguf = %path.display(),
+        "resolved Muse Glimmer DFlash companion"
+    );
+    Ok(path)
 }
 
 async fn fetch_metadata_root(
@@ -511,6 +556,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     Ok(ResolvedModel {
         checkpoint_dir,
         artifact_dir,
+        dflash_gguf: None,
         identity: format!("local-{model_type}"),
         defaults: ServingDefaults {
             served_model_name: "eider-local",

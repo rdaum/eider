@@ -1,8 +1,9 @@
 //! Minimal GGUF v3 index reader for packed model checkpoints.
 //!
-//! Eider only needs scalar metadata and tensor locations. Large metadata
-//! arrays, including embedded tokenizer vocabularies, are skipped in place so
-//! opening a checkpoint does not duplicate them in host memory.
+//! Eider only needs scalar metadata, small architecture arrays, and tensor
+//! locations. Large metadata arrays, including embedded tokenizer
+//! vocabularies, are skipped in place so opening a checkpoint does not
+//! duplicate them in host memory.
 
 use nvfp4::{Error, Result};
 use std::collections::BTreeMap;
@@ -15,6 +16,7 @@ const GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSIONS: u32 = 8;
+const MAX_RETAINED_ARRAY_VALUES: u64 = 1024;
 
 const TYPE_UINT8: u32 = 0;
 const TYPE_INT8: u32 = 1;
@@ -30,7 +32,7 @@ const TYPE_UINT64: u32 = 10;
 const TYPE_INT64: u32 = 11;
 const TYPE_FLOAT64: u32 = 12;
 
-/// Scalar GGUF metadata retained by the index reader.
+/// GGUF metadata retained by the index reader.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GgufValue {
     /// Unsigned integer metadata.
@@ -43,6 +45,14 @@ pub enum GgufValue {
     Bool(bool),
     /// UTF-8 string metadata.
     String(String),
+    /// Small unsigned integer array metadata.
+    UnsignedArray(Vec<u64>),
+    /// Small signed integer array metadata.
+    SignedArray(Vec<i64>),
+    /// Small floating-point array metadata.
+    FloatArray(Vec<f64>),
+    /// Small boolean array metadata.
+    BoolArray(Vec<bool>),
 }
 
 impl GgufValue {
@@ -69,6 +79,30 @@ impl GgufValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns this metadata as an unsigned integer array.
+    pub fn as_u64_slice(&self) -> Option<&[u64]> {
+        match self {
+            Self::UnsignedArray(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Returns this metadata as a signed integer array.
+    pub fn as_i64_slice(&self) -> Option<&[i64]> {
+        match self {
+            Self::SignedArray(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Returns this metadata as a boolean array.
+    pub fn as_bool_slice(&self) -> Option<&[bool]> {
+        match self {
+            Self::BoolArray(values) => Some(values),
             _ => None,
         }
     }
@@ -253,7 +287,7 @@ impl GgufIndex {
         self.data_offset
     }
 
-    /// Retained scalar metadata.
+    /// Retained scalar and small-array metadata.
     pub fn metadata(&self) -> &BTreeMap<String, GgufValue> {
         &self.metadata
     }
@@ -312,8 +346,12 @@ fn read_metadata_value(
         TYPE_ARRAY => {
             let element_kind = read_u32(reader, path)?;
             let count = read_u64(reader, path)?;
-            skip_array(reader, path, element_kind, count)?;
-            None
+            if count > MAX_RETAINED_ARRAY_VALUES || element_kind == TYPE_STRING {
+                skip_array(reader, path, element_kind, count)?;
+                None
+            } else {
+                Some(read_small_array(reader, path, element_kind, count)?)
+            }
         }
         TYPE_UINT64 => Some(GgufValue::Unsigned(read_u64(reader, path)?)),
         TYPE_INT64 => Some(GgufValue::Signed(read_i64(reader, path)?)),
@@ -322,6 +360,95 @@ fn read_metadata_value(
             return Err(Error::Format {
                 label: "GGUF metadata",
                 detail: format!("unsupported value type {kind}"),
+            });
+        }
+    })
+}
+
+fn read_small_array(
+    reader: &mut BufReader<File>,
+    path: &Path,
+    element_kind: u32,
+    count: u64,
+) -> Result<GgufValue> {
+    let count = usize::try_from(count).map_err(|_| Error::Format {
+        label: "GGUF metadata array",
+        detail: "element count exceeds usize".to_string(),
+    })?;
+    Ok(match element_kind {
+        TYPE_UINT8 => GgufValue::UnsignedArray(
+            (0..count)
+                .map(|_| read_u8(reader, path).map(u64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_UINT16 => GgufValue::UnsignedArray(
+            (0..count)
+                .map(|_| read_u16(reader, path).map(u64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_UINT32 => GgufValue::UnsignedArray(
+            (0..count)
+                .map(|_| read_u32(reader, path).map(u64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_UINT64 => GgufValue::UnsignedArray(
+            (0..count)
+                .map(|_| read_u64(reader, path))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_INT8 => GgufValue::SignedArray(
+            (0..count)
+                .map(|_| read_i8(reader, path).map(i64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_INT16 => GgufValue::SignedArray(
+            (0..count)
+                .map(|_| read_i16(reader, path).map(i64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_INT32 => GgufValue::SignedArray(
+            (0..count)
+                .map(|_| read_i32(reader, path).map(i64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_INT64 => GgufValue::SignedArray(
+            (0..count)
+                .map(|_| read_i64(reader, path))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_FLOAT32 => GgufValue::FloatArray(
+            (0..count)
+                .map(|_| read_f32(reader, path).map(f64::from))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_FLOAT64 => GgufValue::FloatArray(
+            (0..count)
+                .map(|_| read_f64(reader, path))
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_BOOL => GgufValue::BoolArray(
+            (0..count)
+                .map(|_| match read_u8(reader, path)? {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    value => Err(Error::Format {
+                        label: "GGUF boolean",
+                        detail: format!("invalid value {value}"),
+                    }),
+                })
+                .collect::<Result<_>>()?,
+        ),
+        TYPE_ARRAY => {
+            return Err(Error::Format {
+                label: "GGUF metadata array",
+                detail: "nested arrays are invalid".to_string(),
+            });
+        }
+        TYPE_STRING => unreachable!("string arrays are skipped"),
+        _ => {
+            return Err(Error::Format {
+                label: "GGUF metadata array",
+                detail: format!("unsupported element type {element_kind}"),
             });
         }
     })
@@ -468,7 +595,7 @@ mod tests {
         bytes.extend_from_slice(&GGUF_MAGIC);
         push_u32(&mut bytes, GGUF_VERSION);
         push_u64(&mut bytes, 1);
-        push_u64(&mut bytes, 3);
+        push_u64(&mut bytes, 5);
 
         push_string(&mut bytes, "general.architecture");
         push_u32(&mut bytes, TYPE_STRING);
@@ -482,6 +609,18 @@ mod tests {
         push_u64(&mut bytes, 2);
         push_string(&mut bytes, "zero");
         push_string(&mut bytes, "one");
+        push_string(&mut bytes, "dflash.target_layers");
+        push_u32(&mut bytes, TYPE_ARRAY);
+        push_u32(&mut bytes, TYPE_UINT32);
+        push_u64(&mut bytes, 5);
+        for layer in [2, 14, 26, 38, 50] {
+            push_u32(&mut bytes, layer);
+        }
+        push_string(&mut bytes, "dflash.sliding_pattern");
+        push_u32(&mut bytes, TYPE_ARRAY);
+        push_u32(&mut bytes, TYPE_BOOL);
+        push_u64(&mut bytes, 5);
+        bytes.extend_from_slice(&[1, 1, 0, 1, 0]);
 
         push_string(&mut bytes, "blk.0.attn_q.weight");
         push_u32(&mut bytes, 2);
@@ -507,6 +646,20 @@ mod tests {
             Some("qwen3")
         );
         assert!(!index.metadata().contains_key("tokenizer.ggml.tokens"));
+        assert_eq!(
+            index
+                .metadata()
+                .get("dflash.target_layers")
+                .and_then(GgufValue::as_u64_slice),
+            Some([2, 14, 26, 38, 50].as_slice())
+        );
+        assert_eq!(
+            index
+                .metadata()
+                .get("dflash.sliding_pattern")
+                .and_then(GgufValue::as_bool_slice),
+            Some([true, true, false, true, false].as_slice())
+        );
         let tensor = index.tensor("blk.0.attn_q.weight").expect("tensor");
         assert_eq!(tensor.dimensions, [4096, 4096]);
         assert_eq!(tensor.kind, 42);

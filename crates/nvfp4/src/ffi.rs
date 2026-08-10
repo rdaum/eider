@@ -812,6 +812,32 @@ unsafe extern "C" {
         workspace_rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_attention_rows_window_on_stream(
+        query: *const f32,
+        key_values: *const u8,
+        key_scales: *const u8,
+        key_tail: *const f32,
+        value_values: *const u8,
+        value_scales: *const u8,
+        value_tail: *const f32,
+        query_tiles: *mut u8,
+        query_scales: *mut u32,
+        scores: *mut f32,
+        probability_tiles: *mut u8,
+        probability_scales: *mut u32,
+        output: *mut f32,
+        input_row_offset: u32,
+        output_row_offset: u32,
+        rows: u32,
+        cache_len: u32,
+        window_start: u32,
+        max_tokens: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        workspace_rows: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_attention_indexed_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -1759,6 +1785,15 @@ unsafe extern "C" {
         output: *mut f32,
         rows: u32,
         cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_copy_f32_rows_into_columns_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        input_cols: u32,
+        output_cols: u32,
+        output_col_offset: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_increment_u32_on_stream(

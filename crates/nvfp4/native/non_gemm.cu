@@ -4593,6 +4593,42 @@ extern "C" cudaError_t infer_concat_f32_rows_on_stream(const float* left,
     return cudaGetLastError();
 }
 
+__global__ void infer_copy_f32_rows_into_columns_kernel(const float* input,
+                                                         float* output,
+                                                         std::uint32_t rows,
+                                                         std::uint32_t input_cols,
+                                                         std::uint32_t output_cols,
+                                                         std::uint32_t output_col_offset) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t count = rows * input_cols;
+    if (index >= count) return;
+    const std::uint32_t row = index / input_cols;
+    const std::uint32_t col = index % input_cols;
+    output[row * output_cols + output_col_offset + col] = input[index];
+}
+
+extern "C" cudaError_t infer_copy_f32_rows_into_columns_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t input_cols,
+    std::uint32_t output_cols,
+    std::uint32_t output_col_offset,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || rows == 0 || input_cols == 0 ||
+        output_cols == 0 || output_col_offset > output_cols ||
+        input_cols > output_cols - output_col_offset) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint64_t count = static_cast<std::uint64_t>(rows) * input_cols;
+    if (count > UINT32_MAX) return cudaErrorInvalidValue;
+    constexpr std::uint32_t threads = 256;
+    infer_copy_f32_rows_into_columns_kernel<<<
+        (static_cast<std::uint32_t>(count) + threads - 1) / threads, threads, 0, stream>>>(
+        input, output, rows, input_cols, output_cols, output_col_offset);
+    return cudaGetLastError();
+}
+
 __global__ void infer_increment_u32_kernel(std::uint32_t* values,
                                            std::uint32_t len,
                                            std::uint32_t increment) {

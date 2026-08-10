@@ -77,8 +77,8 @@ pub use kernels::non_gemm::{
     causal_window_softmax_f32_to_bf16_on_stream, clear_expert_counts_u64_on_stream,
     concat_f32_rows_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
-    dual_rms_norm_add_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_f32_rows_into_columns_on_stream,
+    copy_row_f32_into_on_stream, dual_rms_norm_add_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
     dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
     f32_to_bf16_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
@@ -176,7 +176,7 @@ pub use kernels::non_gemm::{
     unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream,
 };
 pub use kernels::qwen36_gdn::Qwen36ChunkedGdn;
-pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache};
+pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvTailSnapshot};
 pub use kernels::sm12x_mma::{
     Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xFp4Tile, Sm12xFp4TileSet, Sm12xRequantizedVector, Sm12xRequantizedWeight,

@@ -37,6 +37,47 @@ pub struct Sm12xKvCache {
     head_dim: usize,
 }
 
+/// Device-resident copy of the f32 staging rows needed to roll back a
+/// speculative append that wraps the cache's 16-row tail.
+pub struct Sm12xKvTailSnapshot {
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+impl Sm12xKvTailSnapshot {
+    /// Allocates one snapshot for a compact cache shape.
+    pub fn new(kv_heads: usize, head_dim: usize) -> Result<Self> {
+        if kv_heads == 0 || head_dim == 0 {
+            return Err(Error::Shape {
+                label: "SM12x KV tail snapshot",
+                expected: "non-zero head dimensions".to_string(),
+                actual: format!("kv_heads={kv_heads} head_dim={head_dim}"),
+            });
+        }
+        let values = V_TOKEN_BLOCK
+            .checked_mul(kv_heads)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x KV tail snapshot",
+                expected: "shape without overflow".to_string(),
+                actual: format!("kv_heads={kv_heads} head_dim={head_dim}"),
+            })?;
+        Ok(Self {
+            key: DeviceBuffer::zeroed(values)?,
+            value: DeviceBuffer::zeroed(values)?,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Returns the resident bytes used by this snapshot.
+    pub fn device_bytes(&self) -> usize {
+        self.key.device_bytes() + self.value.device_bytes()
+    }
+}
+
 struct Sm12xKvCacheLayout {
     key_values: usize,
     key_scales: usize,
@@ -820,6 +861,96 @@ impl Sm12xKvCache {
         self.len = len;
         Ok(())
     }
+
+    /// Captures the complete circular f32 tail before a speculative append.
+    pub fn snapshot_tail_on_stream(
+        &self,
+        snapshot: &mut Sm12xKvTailSnapshot,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.validate_tail_snapshot(snapshot)?;
+        let bytes = V_TOKEN_BLOCK * self.kv_heads * self.head_dim * size_of::<f32>();
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D KV key tail snapshot)",
+                crate::ffi::cudaMemcpyAsync(
+                    snapshot.key.ptr.cast(),
+                    self.key_tail_ptr().cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )?;
+            check_cuda(
+                "cudaMemcpyAsync(D2D KV value tail snapshot)",
+                crate::ffi::cudaMemcpyAsync(
+                    snapshot.value.ptr.cast(),
+                    self.value_tail_ptr().cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Restores old rows at the start of the circular tail after speculative
+    /// rows were discarded within the same 16-token value block.
+    pub fn restore_tail_prefix_on_stream(
+        &mut self,
+        snapshot: &Sm12xKvTailSnapshot,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.validate_tail_snapshot(snapshot)?;
+        if rows > V_TOKEN_BLOCK {
+            return Err(Error::Shape {
+                label: "SM12x KV tail restore",
+                expected: format!("at most {V_TOKEN_BLOCK} rows"),
+                actual: format!("{rows} rows"),
+            });
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let bytes = rows * self.kv_heads * self.head_dim * size_of::<f32>();
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D KV key tail restore)",
+                crate::ffi::cudaMemcpyAsync(
+                    self.key_tail_mut_ptr().cast(),
+                    snapshot.key.ptr.cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )?;
+            check_cuda(
+                "cudaMemcpyAsync(D2D KV value tail restore)",
+                crate::ffi::cudaMemcpyAsync(
+                    self.value_tail_mut_ptr().cast(),
+                    snapshot.value.ptr.cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    fn validate_tail_snapshot(&self, snapshot: &Sm12xKvTailSnapshot) -> Result<()> {
+        if snapshot.kv_heads != self.kv_heads || snapshot.head_dim != self.head_dim {
+            return Err(Error::Shape {
+                label: "SM12x KV tail snapshot shape",
+                expected: format!("kv_heads={} head_dim={}", self.kv_heads, self.head_dim),
+                actual: format!(
+                    "kv_heads={} head_dim={}",
+                    snapshot.kv_heads, snapshot.head_dim
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Sm12xKvAttentionWorkspace {
@@ -1233,6 +1364,91 @@ impl Sm12xKvAttentionWorkspace {
         }
         cache.len = cache_end;
         Ok(())
+    }
+
+    /// Computes non-causal attention for several query rows over one fixed
+    /// compact-cache window. The caller must append the block's K/V rows first
+    /// so every query can attend the complete block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_rows_window_at_offset_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        window_start: usize,
+        mut output: DeviceOutput<'_, f32>,
+        output_row_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let q_width = self.q_heads * self.head_dim;
+        let input_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(q_width))
+            .unwrap_or(usize::MAX);
+        let output_end = output_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(q_width))
+            .unwrap_or(usize::MAX);
+        if cache.len == 0
+            || cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+            || rows == 0
+            || rows > self.causal_row_capacity
+            || window_start >= cache.len
+            || input_end > query.len()
+            || output_end > output.len()
+            || input_row_offset > u32::MAX as usize
+            || output_row_offset > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "SM12x non-causal row attention",
+                expected: format!(
+                    "1..={} rows over cache len {} with matching q/output buffers",
+                    self.causal_row_capacity, cache.len
+                ),
+                actual: format!(
+                    "rows={rows} window_start={window_start} query={} output={} cache_len={} cache_max={} workspace_max={}",
+                    query.len(),
+                    output.len(),
+                    cache.len,
+                    cache.max_tokens,
+                    self.max_tokens
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_rows_window_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_rows_window_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    input_row_offset as u32,
+                    output_row_offset as u32,
+                    rows as u32,
+                    cache.len as u32,
+                    window_start as u32,
+                    cache.max_tokens as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    self.causal_row_capacity as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Enqueues attention from and into row offsets in larger dense buffers.
@@ -1808,6 +2024,186 @@ mod tests {
                 &value_rows[source_token]
             );
         }
+    }
+
+    #[test]
+    fn speculative_tail_snapshot_restores_rows_overwritten_by_wraparound() {
+        const MAX_TOKENS: usize = 32;
+        const PREFIX: usize = 3;
+        const SPECULATIVE: usize = 16;
+        const REPLACEMENT: usize = 13;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 64;
+        let width = KV_HEADS * HEAD_DIM;
+        let rows = |count: usize, seed: usize| {
+            DeviceBuffer::from_host(
+                &(0..count * width)
+                    .map(|index| ((index * 19 + seed) % 251) as f32 / 96.0 - 1.25)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("rows")
+        };
+        let prefix_key = rows(PREFIX, 3);
+        let prefix_value = rows(PREFIX, 7);
+        let speculative_key = rows(SPECULATIVE, 11);
+        let speculative_value = rows(SPECULATIVE, 13);
+        let replacement_key = rows(REPLACEMENT, 17);
+        let replacement_value = rows(REPLACEMENT, 23);
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut rolled = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("rolled cache");
+        rolled
+            .append_rows_at_offset_on_stream(&prefix_key, &prefix_value, 0, PREFIX, &stream)
+            .expect("prefix append");
+        let mut snapshot = Sm12xKvTailSnapshot::new(KV_HEADS, HEAD_DIM).expect("snapshot");
+        rolled
+            .snapshot_tail_on_stream(&mut snapshot, &stream)
+            .expect("snapshot tail");
+        rolled
+            .append_rows_at_offset_on_stream(
+                &speculative_key,
+                &speculative_value,
+                0,
+                SPECULATIVE,
+                &stream,
+            )
+            .expect("speculative append");
+        rolled
+            .restore_tail_prefix_on_stream(&snapshot, PREFIX, &stream)
+            .expect("restore prefix");
+        rolled.truncate(PREFIX).expect("truncate");
+        rolled
+            .append_rows_at_offset_on_stream(
+                &replacement_key,
+                &replacement_value,
+                0,
+                REPLACEMENT,
+                &stream,
+            )
+            .expect("replacement append");
+
+        let mut reference =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("reference cache");
+        reference
+            .append_rows_at_offset_on_stream(&prefix_key, &prefix_value, 0, PREFIX, &stream)
+            .expect("reference prefix");
+        reference
+            .append_rows_at_offset_on_stream(
+                &replacement_key,
+                &replacement_value,
+                0,
+                REPLACEMENT,
+                &stream,
+            )
+            .expect("reference replacement");
+        stream.synchronize().expect("sync");
+
+        assert_eq!(rolled.len(), reference.len());
+        assert_eq!(
+            rolled.key_values_to_host(&stream).expect("rolled K"),
+            reference.key_values_to_host(&stream).expect("reference K")
+        );
+        assert_eq!(
+            rolled.key_scales_to_host(&stream).expect("rolled K scales"),
+            reference
+                .key_scales_to_host(&stream)
+                .expect("reference K scales")
+        );
+        assert_eq!(
+            rolled.value_values_to_host(&stream).expect("rolled V"),
+            reference
+                .value_values_to_host(&stream)
+                .expect("reference V")
+        );
+        assert_eq!(
+            rolled
+                .value_scales_to_host(&stream)
+                .expect("rolled V scales"),
+            reference
+                .value_scales_to_host(&stream)
+                .expect("reference V scales")
+        );
+    }
+
+    #[test]
+    fn fixed_window_row_attention_tracks_independent_full_cache_attention() {
+        const TOKENS: usize = 6;
+        const ROWS: usize = 4;
+        const KV_HEADS: usize = 1;
+        const Q_HEADS: usize = 8;
+        const HEAD_DIM: usize = 64;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * kv_width)
+            .map(|index| ((index * 19 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * kv_width)
+            .map(|index| ((index * 31 % 257) as f32 - 128.0) / 320.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..ROWS * q_width)
+            .map(|index| ((index * 17 % 263) as f32 - 131.0) / 288.0)
+            .collect::<Vec<_>>();
+        let key = DeviceBuffer::from_host(&key_host).expect("key");
+        let value = DeviceBuffer::from_host(&value_host).expect("value");
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut cache = Sm12xKvCache::new(TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, TOKENS, &stream)
+            .expect("cache append");
+
+        let mut actual = DeviceBuffer::zeroed(ROWS * q_width).expect("actual");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa_batched(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM, ROWS)
+                .expect("workspace");
+        workspace
+            .attention_rows_window_at_offset_into_on_stream(
+                &cache,
+                &query,
+                0,
+                ROWS,
+                0,
+                actual.output(),
+                0,
+                &stream,
+            )
+            .expect("fixed-window attention");
+
+        let key = DeviceBuffer::from_host(&key_host).expect("reference key");
+        let value = DeviceBuffer::from_host(&value_host).expect("reference value");
+        let mut expected_host = Vec::with_capacity(ROWS * q_width);
+        for row in 0..ROWS {
+            let row_query =
+                DeviceBuffer::from_host(&query_host[row * q_width..(row + 1) * q_width])
+                    .expect("row query");
+            let mut row_output = DeviceBuffer::zeroed(q_width).expect("row output");
+            crate::cached_gqa_attention_f32_into_on_stream(
+                &row_query,
+                &key,
+                &value,
+                row_output.output(),
+                TOKENS,
+                Q_HEADS,
+                KV_HEADS,
+                HEAD_DIM,
+                &stream,
+            )
+            .expect("reference attention");
+            expected_host.extend(
+                row_output
+                    .copy_to_host(&stream)
+                    .expect("reference read")
+                    .iter()
+                    .copied(),
+            );
+        }
+        let actual = actual.copy_to_host(&stream).expect("actual read");
+        let max_abs = actual
+            .iter()
+            .zip(&expected_host)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 0.25, "fixed-window max_abs={max_abs}");
     }
 
     #[test]

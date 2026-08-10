@@ -137,6 +137,10 @@ struct Args {
     #[arg(long, requires = "model_dir")]
     artifact_dir: Option<PathBuf>,
 
+    /// Official DFlash GGUF companion for a local Muse Glimmer checkpoint.
+    #[arg(long, value_name = "FILE")]
+    dflash_gguf: Option<PathBuf>,
+
     /// Prohibit network access while resolving a catalogue model.
     #[arg(long)]
     offline: bool,
@@ -276,6 +280,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(artifact_dir) = args.artifact_dir {
         resolved.artifact_dir = artifact_dir;
     }
+    if let Some(dflash_gguf) = args.dflash_gguf {
+        resolved.dflash_gguf = Some(dflash_gguf);
+    }
     if resolved.preparation == ArtifactKind::Step37Experts {
         server_metrics().model_preparations.inc();
         info!(artifact_dir = %resolved.artifact_dir.display(), "preparing Step-3.7 expert artifacts");
@@ -296,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(defaults.step_expert_capacity);
     let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
     actor_config.artifact_dir = resolved.artifact_dir.clone();
+    actor_config.dflash_gguf = resolved.dflash_gguf.clone();
     actor_config.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,

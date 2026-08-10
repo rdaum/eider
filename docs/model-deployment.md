@@ -75,6 +75,8 @@ Development and checkpoint-conversion work retains an explicit local path:
 
 ```sh
 eider-serve --model-dir ./models/agents-a1-nvfp4
+eider-serve --model-dir ./models/muse-glimmer-30b-nvfp4 \
+  --dflash-gguf ./dflash-kquant.gguf
 ```
 
 `--model-dir` is mutually exclusive with the catalogue ID. Local checkpoints
@@ -117,10 +119,14 @@ upstream BF16 instruction-tuned checkpoint (`gemma-4-26b-a4b-it`). Both Gemma
 entries use the Gemma 4 text runtime; image, video, and audio inputs remain
 outside Eider's text-serving interface.
 
-Muse Glimmer uses the pinned Inferact ModelOpt NVFP4 checkpoint and Eider's
-text-only runtime. Its recipient-framed reasoning and ATEM function calls are
-translated into the same Responses and Chat Completions events as other model
-families; image and video inputs are not exposed.
+Muse Glimmer uses the pinned Inferact ModelOpt NVFP4 target and the pinned
+`dflash-kquant.gguf` companion from Meta's official GGUF repository. Catalogue
+resolution fetches both immutable revisions; `--dflash-gguf` supplies the
+companion for a local development checkpoint. Greedy requests use DFlash while
+sampled requests retain target-only decoding. Recipient-framed reasoning and
+ATEM function calls are translated into the same Responses and Chat
+Completions events as other model families; image and video inputs are not
+exposed.
 
 Conceptually:
 

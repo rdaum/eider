@@ -107,6 +107,8 @@ struct ActiveRequest<'tokenizer> {
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
+    dflash_enabled: bool,
+    pending_dflash_token: Option<u32>,
     prompt_logits_ready: bool,
     state: Option<MuseGlimmerDecodeState>,
     sampler: Sampler,
@@ -202,6 +204,11 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
+        let dflash_enabled = self.model.has_dflash()
+            && request.generation.sampling.uses_fast_argmax()
+            && total
+                .checked_add(15)
+                .is_some_and(|capacity| capacity <= self.model.config().max_position_embeddings);
         self.requests.insert(
             id,
             ActiveRequest {
@@ -210,6 +217,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 generation: request.generation.clone(),
                 generated_tokens: 0,
                 last_token: None,
+                dflash_enabled,
+                pending_dflash_token: None,
                 prompt_logits_ready: false,
                 state: None,
                 sampler: Sampler::new(request.generation.sampling)?,
@@ -319,7 +328,9 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 break;
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
-            let capacity = request.prompt.len() + request.generation.max_new_tokens;
+            let capacity = request.prompt.len()
+                + request.generation.max_new_tokens
+                + usize::from(request.dflash_enabled) * 15;
             let state = self.model.new_decode_state(capacity.max(1))?;
             let progress = MuseGlimmerAdmissionProgress {
                 request_id: id,
@@ -357,11 +368,24 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             let end = start + chunk;
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             let state = request.state.as_mut().expect("request is admitted");
-            for (offset, &token) in request.prompt[start..end].iter().enumerate() {
-                if start + offset + 1 == request.prompt.len() {
-                    self.model.forward_one(state, token)?;
-                } else {
-                    self.model.consume_one(state, token)?;
+            if request.dflash_enabled {
+                let mut chunk_start = start;
+                while chunk_start < end {
+                    let chunk_end = (chunk_start + 16).min(end);
+                    self.model.dflash_prefill_chunk(
+                        state,
+                        &request.prompt[chunk_start..chunk_end],
+                        chunk_end == request.prompt.len(),
+                    )?;
+                    chunk_start = chunk_end;
+                }
+            } else {
+                for (offset, &token) in request.prompt[start..end].iter().enumerate() {
+                    if start + offset + 1 == request.prompt.len() {
+                        self.model.forward_one(state, token)?;
+                    } else {
+                        self.model.consume_one(state, token)?;
+                    }
                 }
             }
             request.prompt_position = end;
@@ -380,6 +404,9 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         tick: &mut MuseGlimmerTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
+        if request.dflash_enabled {
+            return Self::generate_dflash(self.model, id, request, tick);
+        }
         let state = request.state.as_mut().expect("decode request is admitted");
         if request.prompt_logits_ready {
             request.prompt_logits_ready = false;
@@ -420,6 +447,52 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         }
         if request.generated_tokens == request.generation.max_new_tokens {
             return Ok(Some(ChatFinishReason::Length));
+        }
+        Ok(None)
+    }
+
+    fn generate_dflash(
+        model: &MuseGlimmerModel,
+        id: MuseGlimmerRequestId,
+        request: &mut ActiveRequest<'template>,
+        tick: &mut MuseGlimmerTick,
+    ) -> Result<Option<ChatFinishReason>> {
+        let anchor = if let Some(token) = request.pending_dflash_token.take() {
+            token
+        } else {
+            if !request.prompt_logits_ready {
+                return Err(Error::Format {
+                    label: "Muse Glimmer DFlash serving",
+                    detail: "missing prompt logits or pending target token".to_string(),
+                });
+            }
+            request.prompt_logits_ready = false;
+            model
+                .argmax_with_logit(request.state.as_mut().expect("request is admitted"))?
+                .0
+        };
+        let cycle =
+            model.dflash_cycle(request.state.as_mut().expect("request is admitted"), anchor)?;
+        request.pending_dflash_token = Some(cycle.next_token);
+        for token in cycle.tokens {
+            request.generated_tokens += 1;
+            request.last_token = Some(token);
+            request.history.push(token);
+            request.usage.completion_tokens += 1;
+            if request.output.is_reasoning() {
+                request.usage.reasoning_tokens += 1;
+            }
+            tick.generated.push(id);
+            let events = request.output.push_token(token)?;
+            if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
+                return Ok(Some(reason));
+            }
+            if request.generation.eos_token_ids.contains(&token) {
+                return Ok(Some(ChatFinishReason::Eos));
+            }
+            if request.generated_tokens == request.generation.max_new_tokens {
+                return Ok(Some(ChatFinishReason::Length));
+            }
         }
         Ok(None)
     }

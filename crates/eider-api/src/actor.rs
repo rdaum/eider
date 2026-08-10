@@ -64,6 +64,7 @@ const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub artifact_dir: PathBuf,
+    pub dflash_gguf: Option<PathBuf>,
     pub scheduler: SchedulerConfig,
     pub prefix_cache: PrefixCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
@@ -80,6 +81,7 @@ impl InferenceActorConfig {
         let model_dir = model_dir.into();
         Self {
             artifact_dir: model_dir.join(".eider-cache"),
+            dflash_gguf: None,
             model_dir,
             scheduler: SchedulerConfig::default(),
             prefix_cache: PrefixCacheConfig::default(),
@@ -250,6 +252,7 @@ fn actor_main(
     let InferenceActorConfig {
         model_dir,
         artifact_dir,
+        dflash_gguf,
         scheduler,
         prefix_cache,
         qwen_bf16_storage,
@@ -332,7 +335,11 @@ fn actor_main(
                 return;
             }
             info!(model_dir = %model_dir.display(), "loading Muse Glimmer model");
-            let model = match MuseGlimmerModel::load(&model_dir) {
+            let model_result = match dflash_gguf {
+                Some(path) => MuseGlimmerModel::load_with_dflash(&model_dir, path),
+                None => MuseGlimmerModel::load(&model_dir),
+            };
+            let model = match model_result {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

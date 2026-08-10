@@ -20,6 +20,9 @@ pub mod bonsai;
 /// Minimal GGUF v3 checkpoint indexing.
 pub mod gguf;
 
+/// CPU import support for GGML K-quantized tensors.
+pub mod gguf_quant;
+
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
