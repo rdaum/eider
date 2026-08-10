@@ -97,6 +97,25 @@
           }
         },
         {
+          "id": "eider-muse-glimmer-30b",
+          "name": "Muse Glimmer 30B NVFP4 with DFlash",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-laguna-s-2.1",
           "name": "Laguna-S-2.1 NVFP4",
           "reasoning": true,
@@ -234,6 +253,25 @@
         {
           "id": "eider-gemma4-26b",
           "name": "Gemma 4 26B-A4B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-muse-glimmer-30b",
+          "name": "Muse Glimmer 30B NVFP4 with DFlash",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
