@@ -31,7 +31,7 @@ use infer::runtime::laguna_serving::{
 };
 use infer::runtime::muse_glimmer_serving::{
     MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
-    MuseGlimmerRequestId,
+    MuseGlimmerDFlashProgress, MuseGlimmerDFlashStats, MuseGlimmerRequestId,
 };
 use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
@@ -152,6 +152,7 @@ struct SessionMetrics {
     last_report_at: Option<Instant>,
     last_report_tokens: usize,
     generated_tokens: usize,
+    dflash: Option<DFlashSessionMetrics>,
 }
 
 struct PrefillMetricsSnapshot {
@@ -165,6 +166,17 @@ struct SessionMetricsSnapshot {
     output_tokens: usize,
     interval_tokens_per_second: f64,
     decode_tokens_per_second: f64,
+}
+
+struct DFlashSessionMetrics {
+    cumulative: MuseGlimmerDFlashStats,
+    last_report_at: Instant,
+    last_report: MuseGlimmerDFlashStats,
+}
+
+struct DFlashMetricsSnapshot {
+    interval: MuseGlimmerDFlashStats,
+    cumulative: MuseGlimmerDFlashStats,
 }
 
 impl InferenceActor {
@@ -734,6 +746,13 @@ fn muse_admission_progress(progress: MuseGlimmerAdmissionProgress) -> EngineAdmi
     }
 }
 
+fn muse_dflash_progress(progress: MuseGlimmerDFlashProgress) -> EngineDFlashProgress {
+    EngineDFlashProgress {
+        request_id: progress.request_id.get(),
+        stats: progress.stats,
+    }
+}
+
 fn bonsai_admission_progress(progress: BonsaiAdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
@@ -822,10 +841,16 @@ struct EngineFinished {
     released_sequence_device_bytes: usize,
 }
 
+struct EngineDFlashProgress {
+    request_id: u64,
+    stats: MuseGlimmerDFlashStats,
+}
+
 #[derive(Default)]
 struct EngineTick {
     prefilled: Vec<EnginePrefillProgress>,
     generated: Vec<u64>,
+    dflash: Vec<EngineDFlashProgress>,
     output: Vec<EngineDelta>,
     finished: Vec<EngineFinished>,
     active_sequences: usize,
@@ -913,6 +938,7 @@ impl ActorService for QwenActorService<'_, '_> {
                 .into_iter()
                 .map(Qwen36RequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1018,6 +1044,7 @@ impl ActorService for StepActorService<'_> {
                 .into_iter()
                 .map(Step37RequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1125,6 +1152,7 @@ impl ActorService for NemotronActorService<'_, '_> {
                 .into_iter()
                 .map(Nemotron3RequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1231,6 +1259,7 @@ impl ActorService for GemmaActorService<'_, '_> {
                 .into_iter()
                 .map(Gemma4RequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1335,6 +1364,7 @@ impl ActorService for BitNetActorService<'_, '_> {
                 .into_iter()
                 .map(BitNetRequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1441,6 +1471,7 @@ impl ActorService for MuseGlimmerActorService<'_, '_> {
                 .into_iter()
                 .map(MuseGlimmerRequestId::get)
                 .collect(),
+            dflash: tick.dflash.into_iter().map(muse_dflash_progress).collect(),
             output: tick
                 .output
                 .into_iter()
@@ -1545,6 +1576,7 @@ impl ActorService for BonsaiActorService<'_, '_> {
                 .into_iter()
                 .map(BonsaiRequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1651,6 +1683,7 @@ impl ActorService for LagunaActorService<'_, '_> {
                 .into_iter()
                 .map(LagunaRequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1759,6 +1792,7 @@ impl ActorService for DeepseekActorService<'_> {
                 .into_iter()
                 .map(Deepseek4RequestId::get)
                 .collect(),
+            dflash: Vec::new(),
             output: tick
                 .output
                 .into_iter()
@@ -1987,6 +2021,13 @@ fn run_actor_loop(
                 }
             }
         }
+        for progress in &tick.dflash {
+            if let Some(request) = active.get_mut(&progress.request_id)
+                && let Some(snapshot) = request.metrics.record_dflash(now, progress.stats)
+            {
+                snapshot.log(request.external_id);
+            }
+        }
         let mut disconnected = Vec::new();
         for delta in tick.output {
             if let Some(request) = active.get(&delta.request_id)
@@ -2194,6 +2235,7 @@ impl SessionMetrics {
             last_report_at: None,
             last_report_tokens: 0,
             generated_tokens: 0,
+            dflash: None,
         }
     }
 
@@ -2271,6 +2313,32 @@ impl SessionMetrics {
         Some(snapshot)
     }
 
+    fn record_dflash(
+        &mut self,
+        now: Instant,
+        stats: MuseGlimmerDFlashStats,
+    ) -> Option<DFlashMetricsSnapshot> {
+        let Some(dflash) = &mut self.dflash else {
+            self.dflash = Some(DFlashSessionMetrics {
+                cumulative: stats,
+                last_report_at: now,
+                last_report: MuseGlimmerDFlashStats::default(),
+            });
+            return None;
+        };
+        dflash.cumulative = stats;
+        if now.duration_since(dflash.last_report_at) < SESSION_METRICS_INTERVAL {
+            return None;
+        }
+        let snapshot = DFlashMetricsSnapshot {
+            interval: dflash_stats_delta(stats, dflash.last_report),
+            cumulative: stats,
+        };
+        dflash.last_report_at = now;
+        dflash.last_report = stats;
+        Some(snapshot)
+    }
+
     fn log_finished(
         &self,
         id: ActorRequestId,
@@ -2311,6 +2379,9 @@ impl SessionMetrics {
             active_sequences,
             "session complete"
         );
+        if let Some(dflash) = &self.dflash {
+            log_dflash_summary(id, dflash.cumulative);
+        }
     }
 
     fn log_cancelled(
@@ -2399,6 +2470,93 @@ impl SessionMetrics {
     }
 }
 
+impl DFlashMetricsSnapshot {
+    fn log(&self, id: ActorRequestId) {
+        info!(
+            session = id.0,
+            interval_cycles = self.interval.cycles,
+            interval_drafted_tokens = self.interval.drafted_tokens,
+            interval_accepted_drafts = self.interval.accepted_drafts,
+            interval_acceptance_pct =
+                percentage(self.interval.accepted_drafts, self.interval.drafted_tokens),
+            interval_emitted_tokens = self.interval.emitted_tokens,
+            interval_tokens_per_cycle = ratio(self.interval.emitted_tokens, self.interval.cycles),
+            interval_cycle_ms =
+                average_duration_ms(self.interval.cycle_duration, self.interval.cycles),
+            cycles = self.cumulative.cycles,
+            drafted_tokens = self.cumulative.drafted_tokens,
+            accepted_drafts = self.cumulative.accepted_drafts,
+            acceptance_pct = percentage(
+                self.cumulative.accepted_drafts,
+                self.cumulative.drafted_tokens
+            ),
+            emitted_tokens = self.cumulative.emitted_tokens,
+            tokens_per_cycle = ratio(self.cumulative.emitted_tokens, self.cumulative.cycles),
+            cycle_ms = average_duration_ms(self.cumulative.cycle_duration, self.cumulative.cycles),
+            target_position = self.cumulative.target_position,
+            dflash_position = self.cumulative.dflash_position,
+            "DFlash progress"
+        );
+    }
+}
+
+fn log_dflash_summary(id: ActorRequestId, stats: MuseGlimmerDFlashStats) {
+    info!(
+        session = id.0,
+        cycles = stats.cycles,
+        drafted_tokens = stats.drafted_tokens,
+        accepted_drafts = stats.accepted_drafts,
+        acceptance_pct = percentage(stats.accepted_drafts, stats.drafted_tokens),
+        emitted_tokens = stats.emitted_tokens,
+        tokens_per_cycle = ratio(stats.emitted_tokens, stats.cycles),
+        cycle_ms = average_duration_ms(stats.cycle_duration, stats.cycles),
+        target_position = stats.target_position,
+        dflash_position = stats.dflash_position,
+        "DFlash session complete"
+    );
+}
+
+fn dflash_stats_delta(
+    current: MuseGlimmerDFlashStats,
+    previous: MuseGlimmerDFlashStats,
+) -> MuseGlimmerDFlashStats {
+    MuseGlimmerDFlashStats {
+        cycles: current.cycles.saturating_sub(previous.cycles),
+        drafted_tokens: current
+            .drafted_tokens
+            .saturating_sub(previous.drafted_tokens),
+        accepted_drafts: current
+            .accepted_drafts
+            .saturating_sub(previous.accepted_drafts),
+        emitted_tokens: current
+            .emitted_tokens
+            .saturating_sub(previous.emitted_tokens),
+        cycle_duration: current
+            .cycle_duration
+            .saturating_sub(previous.cycle_duration),
+        target_position: current.target_position,
+        dflash_position: current.dflash_position,
+    }
+}
+
+fn percentage(numerator: usize, denominator: usize) -> f64 {
+    ratio(numerator, denominator) * 100.0
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    numerator as f64 / denominator as f64
+}
+
+fn average_duration_ms(duration: Duration, count: usize) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    duration.as_secs_f64() * 1000.0 / count as f64
+}
+
 fn rate(tokens: usize, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
@@ -2443,6 +2601,53 @@ mod tests {
         assert_eq!(snapshot.output_tokens, 11);
         assert_eq!(snapshot.interval_tokens_per_second, 1.0);
         assert_eq!(snapshot.decode_tokens_per_second, 1.0);
+    }
+
+    #[test]
+    fn dflash_metrics_report_interval_and_cumulative_acceptance() {
+        let started = Instant::now();
+        let mut metrics = SessionMetrics::new(started, 1_000);
+        assert!(
+            metrics
+                .record_dflash(
+                    started,
+                    MuseGlimmerDFlashStats {
+                        cycles: 1,
+                        drafted_tokens: 15,
+                        accepted_drafts: 3,
+                        emitted_tokens: 4,
+                        cycle_duration: Duration::from_millis(30),
+                        target_position: 1_004,
+                        dflash_position: 1_004,
+                    },
+                )
+                .is_none()
+        );
+        let snapshot = metrics
+            .record_dflash(
+                started + SESSION_METRICS_INTERVAL,
+                MuseGlimmerDFlashStats {
+                    cycles: 4,
+                    drafted_tokens: 60,
+                    accepted_drafts: 15,
+                    emitted_tokens: 19,
+                    cycle_duration: Duration::from_millis(120),
+                    target_position: 1_019,
+                    dflash_position: 1_019,
+                },
+            )
+            .expect("ten-second DFlash report interval elapsed");
+
+        assert_eq!(snapshot.interval.cycles, 4);
+        assert_eq!(snapshot.interval.drafted_tokens, 60);
+        assert_eq!(snapshot.interval.accepted_drafts, 15);
+        assert_eq!(snapshot.interval.emitted_tokens, 19);
+        assert_eq!(snapshot.interval.cycle_duration, Duration::from_millis(120));
+        assert_eq!(snapshot.cumulative.target_position, 1_019);
+        assert_eq!(snapshot.cumulative.dflash_position, 1_019);
+        assert_eq!(percentage(15, 60), 25.0);
+        assert_eq!(ratio(19, 4), 4.75);
+        assert_eq!(average_duration_ms(Duration::from_millis(120), 4), 30.0);
     }
 
     #[test]

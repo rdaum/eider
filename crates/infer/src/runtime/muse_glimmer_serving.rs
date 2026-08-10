@@ -10,7 +10,7 @@ use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::muse_glimmer::{
-    MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceCheckpoint,
+    MuseGlimmerDFlashCycle, MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceCheckpoint,
 };
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
@@ -71,6 +71,51 @@ pub struct MuseGlimmerChatDelta {
     pub event: ChatOutputEvent,
 }
 
+/// Cumulative DFlash work retained for one request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MuseGlimmerDFlashStats {
+    /// Completed draft-and-verify cycles.
+    pub cycles: usize,
+    /// DFlash predictions proposed across all cycles.
+    pub drafted_tokens: usize,
+    /// DFlash predictions accepted by the target.
+    pub accepted_drafts: usize,
+    /// Target-approved tokens emitted to the request.
+    pub emitted_tokens: usize,
+    /// Time spent inside draft-and-verify cycles.
+    pub cycle_duration: Duration,
+    /// Latest retained target-model position.
+    pub target_position: usize,
+    /// Latest retained DFlash position.
+    pub dflash_position: usize,
+}
+
+/// Updated cumulative DFlash statistics produced by one service tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MuseGlimmerDFlashProgress {
+    /// Request owning the speculative state.
+    pub request_id: MuseGlimmerRequestId,
+    /// Cumulative statistics after the latest cycle.
+    pub stats: MuseGlimmerDFlashStats,
+}
+
+impl MuseGlimmerDFlashStats {
+    fn record_cycle(
+        &mut self,
+        cycle: &MuseGlimmerDFlashCycle,
+        emitted_tokens: usize,
+        cycle_duration: Duration,
+    ) {
+        self.cycles += 1;
+        self.drafted_tokens += cycle.drafted_tokens;
+        self.accepted_drafts += cycle.accepted_drafts;
+        self.emitted_tokens += emitted_tokens;
+        self.cycle_duration += cycle_duration;
+        self.target_position = cycle.target_position;
+        self.dflash_position = cycle.dflash_position;
+    }
+}
+
 /// Terminal request metadata.
 pub struct MuseGlimmerFinished {
     /// Finished request.
@@ -92,6 +137,8 @@ pub struct MuseGlimmerTick {
     pub prefilled: Vec<MuseGlimmerPrefillProgress>,
     /// Requests producing a token during this tick.
     pub generated: Vec<MuseGlimmerRequestId>,
+    /// Requests completing a DFlash draft-and-verify cycle.
+    pub dflash: Vec<MuseGlimmerDFlashProgress>,
     /// Structured streaming deltas.
     pub output: Vec<MuseGlimmerChatDelta>,
     /// Requests completing during this tick.
@@ -122,6 +169,7 @@ struct ActiveRequest<'tokenizer> {
     last_token: Option<u32>,
     dflash_enabled: bool,
     pending_dflash_token: Option<u32>,
+    dflash_stats: MuseGlimmerDFlashStats,
     prompt_logits_ready: bool,
     state: Option<MuseGlimmerDecodeState>,
     sampler: Sampler,
@@ -257,6 +305,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 last_token: None,
                 dflash_enabled,
                 pending_dflash_token: None,
+                dflash_stats: MuseGlimmerDFlashStats::default(),
                 prompt_logits_ready: false,
                 state: None,
                 sampler: Sampler::new(request.generation.sampling)?,
@@ -594,11 +643,16 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 .argmax_with_logit(request.state.as_mut().expect("request is admitted"))?
                 .0
         };
+        let cycle_started = Instant::now();
         let cycle =
             model.dflash_cycle(request.state.as_mut().expect("request is admitted"), anchor)?;
+        let cycle_duration = cycle_started.elapsed();
         request.pending_dflash_token = Some(cycle.next_token);
-        for token in cycle.tokens {
+        let mut emitted_tokens = 0;
+        let mut terminal = None;
+        for &token in &cycle.tokens {
             request.generated_tokens += 1;
+            emitted_tokens += 1;
             request.last_token = Some(token);
             request.history.push(token);
             request.usage.completion_tokens += 1;
@@ -608,16 +662,26 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             tick.generated.push(id);
             let events = request.output.push_token(token)?;
             if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
-                return Ok(Some(reason));
+                terminal = Some(reason);
+                break;
             }
             if request.generation.eos_token_ids.contains(&token) {
-                return Ok(Some(ChatFinishReason::Eos));
+                terminal = Some(ChatFinishReason::Eos);
+                break;
             }
             if request.generated_tokens == request.generation.max_new_tokens {
-                return Ok(Some(ChatFinishReason::Length));
+                terminal = Some(ChatFinishReason::Length);
+                break;
             }
         }
-        Ok(None)
+        request
+            .dflash_stats
+            .record_cycle(&cycle, emitted_tokens, cycle_duration);
+        tick.dflash.push(MuseGlimmerDFlashProgress {
+            request_id: id,
+            stats: request.dflash_stats,
+        });
+        Ok(terminal)
     }
 
     fn finish_request(
@@ -728,7 +792,9 @@ impl ResponseFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint_ready;
+    use super::{MuseGlimmerDFlashStats, checkpoint_ready};
+    use crate::muse_glimmer::MuseGlimmerDFlashCycle;
+    use std::time::Duration;
 
     #[test]
     fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
@@ -741,5 +807,42 @@ mod tests {
     fn disabled_or_completed_checkpoint_is_not_ready() {
         assert!(!checkpoint_ready(4_736, 0, false));
         assert!(!checkpoint_ready(4_736, 4_736, true));
+    }
+
+    #[test]
+    fn dflash_stats_accumulate_acceptance_emissions_latency_and_positions() {
+        let mut stats = MuseGlimmerDFlashStats::default();
+        stats.record_cycle(
+            &MuseGlimmerDFlashCycle {
+                tokens: vec![10, 11, 12],
+                next_token: 13,
+                accepted_drafts: 2,
+                drafted_tokens: 15,
+                target_position: 4_739,
+                dflash_position: 4_739,
+            },
+            2,
+            Duration::from_millis(30),
+        );
+        stats.record_cycle(
+            &MuseGlimmerDFlashCycle {
+                tokens: vec![13],
+                next_token: 14,
+                accepted_drafts: 0,
+                drafted_tokens: 15,
+                target_position: 4_740,
+                dflash_position: 4_740,
+            },
+            1,
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(stats.cycles, 2);
+        assert_eq!(stats.drafted_tokens, 30);
+        assert_eq!(stats.accepted_drafts, 2);
+        assert_eq!(stats.emitted_tokens, 3);
+        assert_eq!(stats.cycle_duration, Duration::from_millis(50));
+        assert_eq!(stats.target_position, 4_740);
+        assert_eq!(stats.dflash_position, 4_740);
     }
 }

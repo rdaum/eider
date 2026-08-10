@@ -249,6 +249,29 @@ impl DFlashSequenceState {
         Ok(())
     }
 
+    fn position(&self) -> Result<usize> {
+        let Some(position) = self.caches.first().map(Sm12xKvCache::len) else {
+            return Err(Error::Format {
+                label: "DFlash sequence position",
+                detail: "sequence has no layer caches".to_string(),
+            });
+        };
+        if self.caches.iter().any(|cache| cache.len() != position) {
+            return Err(Error::Shape {
+                label: "DFlash sequence position",
+                expected: format!("all layer caches at position {position}"),
+                actual: self
+                    .caches
+                    .iter()
+                    .map(Sm12xKvCache::len)
+                    .map(|position| position.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            });
+        }
+        Ok(position)
+    }
+
     fn snapshot_tails(&mut self, stream: &CudaStream) -> Result<()> {
         for (cache, snapshot) in self.caches.iter().zip(&mut self.tail_snapshots) {
             cache.snapshot_tail_on_stream(snapshot, stream)?;
@@ -275,6 +298,10 @@ pub struct MuseGlimmerDFlashCycle {
     pub accepted_drafts: usize,
     /// Number of DFlash predictions proposed in this cycle.
     pub drafted_tokens: usize,
+    /// Target-model position retained after verification.
+    pub target_position: usize,
+    /// DFlash position retained after verification.
+    pub dflash_position: usize,
 }
 
 impl DFlashModel {
@@ -908,6 +935,11 @@ impl MuseGlimmerModel {
             .expect("DFlash sequence state")
             .truncate(retained_position)?;
         state.position = retained_position;
+        let dflash_position = state
+            .dflash_state
+            .as_ref()
+            .expect("DFlash sequence state")
+            .position()?;
         let mut tokens = Vec::with_capacity(1 + accepted);
         tokens.push(anchor);
         tokens.extend_from_slice(&drafts[..accepted]);
@@ -916,6 +948,8 @@ impl MuseGlimmerModel {
             next_token: target[accepted],
             accepted_drafts: accepted,
             drafted_tokens: drafts.len(),
+            target_position: state.position,
+            dflash_position,
         })
     }
 }
