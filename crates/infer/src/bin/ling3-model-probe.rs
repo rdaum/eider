@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     let mut state = model.new_state(tokens.len())?;
     let mut workspace = model.new_workspace()?;
     let stream = CudaStream::new_non_blocking()?;
+    model.prepare_decode_graphs(&mut state, &mut workspace, &stream)?;
     println!(
         "loaded {:.3} GiB; decoding {} reference tokens",
         model.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),

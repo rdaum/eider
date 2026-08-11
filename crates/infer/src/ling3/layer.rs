@@ -306,6 +306,20 @@ impl Ling3Linear {
         }
     }
 
+    pub(super) fn nvfp4_parts(&self) -> Result<(&DeviceBuffer<u8>, &DeviceBuffer<u8>, f32)> {
+        let Self::Nvfp4(linear) = self else {
+            return Err(Error::Format {
+                label: "Ling 3 routed expert storage",
+                detail: "expected resident NVFP4 weights".to_string(),
+            });
+        };
+        Ok((
+            &linear.packed_weight,
+            &linear.weight_scale,
+            linear.weight_scale_2,
+        ))
+    }
+
     pub(super) fn device_bytes(&self) -> usize {
         match self {
             Self::Bf16(linear) => linear.device_bytes(),

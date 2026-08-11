@@ -4,9 +4,9 @@ use super::mla::{Ling3MlaAttention, Ling3MlaState, Ling3MlaWorkspace};
 use super::moe::{Ling3Moe, Ling3MoeWorkspace};
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
 use nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
+    add_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
 use std::path::Path;
 
@@ -134,12 +134,12 @@ impl AttentionWorkspace {
 
 enum Ffn {
     Dense(DenseMlp),
-    Moe(Ling3Moe),
+    Moe(Box<Ling3Moe>),
 }
 
 enum FfnWorkspace {
     Dense(DenseMlpWorkspace),
-    Moe(Ling3MoeWorkspace),
+    Moe(Box<Ling3MoeWorkspace>),
 }
 
 impl FfnWorkspace {
@@ -198,7 +198,7 @@ impl DecoderLayer {
         };
         let ffn = match manifest.ffn_kind(layer)? {
             Ling3FfnKind::Dense => Ffn::Dense(DenseMlp::load(checkpoint, manifest, layer)?),
-            Ling3FfnKind::Moe => Ffn::Moe(Ling3Moe::load(checkpoint, manifest, layer)?),
+            Ling3FfnKind::Moe => Ffn::Moe(Box::new(Ling3Moe::load(checkpoint, manifest, layer)?)),
         };
         Ok(Self {
             hidden,
@@ -232,7 +232,7 @@ impl DecoderLayer {
         };
         let ffn = match &self.ffn {
             Ffn::Dense(ffn) => FfnWorkspace::Dense(ffn.new_workspace()?),
-            Ffn::Moe(ffn) => FfnWorkspace::Moe(ffn.new_workspace()?),
+            Ffn::Moe(ffn) => FfnWorkspace::Moe(Box::new(ffn.new_workspace()?)),
         };
         Ok(DecoderLayerWorkspace {
             normed: DeviceBuffer::zeroed(self.hidden)?,
@@ -346,6 +346,7 @@ pub struct Ling3ModelState {
 pub struct Ling3ModelWorkspace {
     current: DeviceBuffer<f32>,
     layer: Vec<DecoderLayerWorkspace>,
+    layer_graphs: Vec<Option<CudaGraphExec>>,
     final_normed: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
 }
@@ -406,9 +407,36 @@ impl Ling3Model {
                 .iter()
                 .map(DecoderLayer::new_workspace)
                 .collect::<Result<Vec<_>>>()?,
+            layer_graphs: (0..self.layers.len()).map(|_| None).collect(),
             final_normed: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
         })
+    }
+
+    pub fn prepare_decode_graphs(
+        &self,
+        state: &mut Ling3ModelState,
+        workspace: &mut Ling3ModelWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        {
+            return Ok(());
+        }
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            if !matches!(layer.attention, Attention::Kda(_))
+                || workspace.layer_graphs[layer_index].is_some()
+            {
+                continue;
+            }
+            let layer_workspace = &mut workspace.layer[layer_index];
+            let layer_state = &mut state.layers[layer_index];
+            workspace.layer_graphs[layer_index] = Some(stream.capture(|stream| {
+                layer.run(&workspace.current, layer_workspace, layer_state, stream)
+            })?);
+        }
+        Ok(())
     }
 
     pub fn decode_token(
@@ -436,15 +464,19 @@ impl Ling3Model {
             workspace.current.output(),
             stream,
         )?;
-        for ((layer, layer_workspace), layer_state) in self
-            .layers
-            .iter()
-            .zip(&mut workspace.layer)
-            .zip(&mut state.layers)
-        {
-            layer.run(&workspace.current, layer_workspace, layer_state, stream)?;
+        for layer_index in 0..self.layers.len() {
+            if let Some(graph) = &workspace.layer_graphs[layer_index] {
+                graph.launch(stream)?;
+            } else {
+                self.layers[layer_index].run(
+                    &workspace.current,
+                    &mut workspace.layer[layer_index],
+                    &mut state.layers[layer_index],
+                    stream,
+                )?;
+            }
             workspace.current.copy_prefix_from_device_on_stream(
-                &layer_workspace.output,
+                &workspace.layer[layer_index].output,
                 self.manifest.hidden_size,
                 stream,
             )?;

@@ -304,10 +304,11 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let sequence = Ling3Sequence {
-                state: self.model.new_state(capacity.max(1))?,
-                workspace: self.model.new_workspace()?,
-            };
+            let mut state = self.model.new_state(capacity.max(1))?;
+            let mut workspace = self.model.new_workspace()?;
+            self.model
+                .prepare_decode_graphs(&mut state, &mut workspace, &self.stream)?;
+            let sequence = Ling3Sequence { state, workspace };
             let progress = Ling3AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: sequence.device_bytes(),

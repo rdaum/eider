@@ -79,6 +79,19 @@ fn compare(
             actual: actual.len().to_string(),
         });
     }
+    if !actual.iter().all(|value| value.is_finite()) {
+        let index = actual
+            .iter()
+            .position(|value| !value.is_finite())
+            .expect("non-finite value exists");
+        return Err(Error::Format {
+            label: "Ling MoE parity",
+            detail: format!(
+                "{label}: non-finite value {} at index {index}",
+                actual[index]
+            ),
+        });
+    }
     let dot = actual
         .iter()
         .zip(expected)
