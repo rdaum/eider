@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+exec cargo run --release \
+  --manifest-path "$repo_dir/Cargo.toml" \
+  -p eider-api \
+  --bin eider-serve \
+  -- ling-3.0-tiny-nvfp4 \
+  --decode-capacity "${LING3_DECODE_CAPACITY:-1}" \
+  --prefill-sequence-capacity "${LING3_PREFILL_SEQUENCE_CAPACITY:-1}" \
+  --max-active-sequences "${LING3_MAX_ACTIVE_SEQUENCES:-1}" \
+  "$@"

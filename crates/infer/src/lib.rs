@@ -38,6 +38,9 @@ pub mod nemotron3;
 /// DeepSeek V4 expert storage preparation and memory-bounded execution support.
 pub mod deepseek4;
 
+/// InclusionAI Ling 3 hybrid KDA/MLA sparse-MoE model support.
+pub mod ling3;
+
 /// Poolside Laguna sparse-MoE model support.
 pub mod laguna;
 

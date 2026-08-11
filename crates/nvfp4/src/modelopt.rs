@@ -80,7 +80,7 @@ pub struct ModelOptBlockScaledFp8Linear {
     pub in_features: usize,
     /// E4M3 weight bytes from `<prefix>.weight`.
     pub weight: Vec<u8>,
-    /// E8M0 block-scale bytes from `<prefix>.scale`.
+    /// E8M0 block-scale bytes from the checkpoint's scale tensor.
     pub weight_scale: Vec<u8>,
 }
 
@@ -370,6 +370,74 @@ impl ModelOptNvfp4Linear {
                     .as_ref()
                     .map_or(weight.weight_scale, |scales| scales[row]);
                 format::e4m3_value(weight.weight[index]) * scale
+            },
+        )
+    }
+
+    /// Requantizes a 128 by 128 block-scaled FP8 weight to NVFP4 storage.
+    ///
+    /// The checkpoint's E8M0 scale is applied to each E4M3 value before every
+    /// output-row K16 block is independently quantized to E2M1 and UE4M3.
+    pub fn quantize_block_scaled_fp8(weight: &ModelOptBlockScaledFp8Linear) -> Result<Self> {
+        let expected_values = weight
+            .out_features
+            .checked_mul(weight.in_features)
+            .ok_or_else(|| Error::Shape {
+                label: "block-FP8-to-NVFP4 weight",
+                expected: "out_features * in_features without overflow".to_string(),
+                actual: format!(
+                    "out_features={} in_features={}",
+                    weight.out_features, weight.in_features
+                ),
+            })?;
+        let expected_scales = (weight.out_features / 128)
+            .checked_mul(weight.in_features / 128)
+            .ok_or_else(|| Error::Shape {
+                label: "block-FP8-to-NVFP4 scales",
+                expected: "block rows * block columns without overflow".to_string(),
+                actual: format!(
+                    "out_features={} in_features={}",
+                    weight.out_features, weight.in_features
+                ),
+            })?;
+        if weight.out_features == 0
+            || weight.in_features == 0
+            || !weight.out_features.is_multiple_of(128)
+            || !weight.in_features.is_multiple_of(128)
+            || weight.weight.len() != expected_values
+            || weight.weight_scale.len() != expected_scales
+        {
+            return Err(Error::Shape {
+                label: "block-FP8-to-NVFP4 weight",
+                expected: format!(
+                    "non-zero 128-aligned dimensions, {expected_values} values, {expected_scales} scales"
+                ),
+                actual: format!(
+                    "out_features={} in_features={} values={} scales={}",
+                    weight.out_features,
+                    weight.in_features,
+                    weight.weight.len(),
+                    weight.weight_scale.len()
+                ),
+            });
+        }
+        if weight.weight_scale.contains(&u8::MAX) {
+            return Err(Error::Format {
+                label: "block-FP8-to-NVFP4 scale",
+                detail: "E8M0 scale tensor contains a NaN code".to_string(),
+            });
+        }
+
+        let scale_cols = weight.in_features / 128;
+        Self::quantize_values(
+            weight.prefix.clone(),
+            weight.out_features,
+            weight.in_features,
+            |index| {
+                let row = index / weight.in_features;
+                let col = index % weight.in_features;
+                let scale_code = weight.weight_scale[(row / 128) * scale_cols + col / 128];
+                format::e4m3_value(weight.weight[index]) * format::e8m0_value(scale_code)
             },
         )
     }
@@ -942,14 +1010,35 @@ impl ModelOptCheckpoint {
         &self,
         prefix: &str,
     ) -> Result<ModelOptBlockScaledFp8Linear> {
+        self.load_block_scaled_fp8_linear_with_scale(prefix, "scale", &["F8_E8M0"])
+    }
+
+    /// Imports a 128 by 128 E4M3 linear whose inverse scales use UE8M0FNU.
+    pub fn load_weight_scale_inv_block_fp8_linear(
+        &self,
+        prefix: &str,
+    ) -> Result<ModelOptBlockScaledFp8Linear> {
+        self.load_block_scaled_fp8_linear_with_scale(
+            prefix,
+            "weight_scale_inv",
+            &["F8_E8M0FNU", "F8_E8M0"],
+        )
+    }
+
+    fn load_block_scaled_fp8_linear_with_scale(
+        &self,
+        prefix: &str,
+        scale_suffix: &str,
+        scale_dtypes: &[&str],
+    ) -> Result<ModelOptBlockScaledFp8Linear> {
         let weight_name = format!("{prefix}.weight");
-        let scale_name = format!("{prefix}.scale");
+        let scale_name = format!("{prefix}.{scale_suffix}");
         let weight_shard = self.open_shard_for_tensor(&weight_name)?;
         let scale_shard = self.open_shard_for_tensor(&scale_name)?;
         let weight_info = weight_shard.require_tensor(&weight_name)?;
         let scale_info = scale_shard.require_tensor(&scale_name)?;
         let (out_features, in_features) = validate_modelopt_fp8_weight(weight_info)?;
-        validate_block_scaled_fp8_scale(scale_info, out_features, in_features)?;
+        validate_block_scaled_fp8_scale(scale_info, out_features, in_features, scale_dtypes)?;
         Ok(ModelOptBlockScaledFp8Linear {
             prefix: prefix.to_string(),
             out_features,
@@ -1122,6 +1211,7 @@ fn validate_block_scaled_fp8_scale(
     info: &SafeTensorInfo,
     out_features: usize,
     in_features: usize,
+    accepted_dtypes: &[&str],
 ) -> Result<()> {
     if !out_features.is_multiple_of(128) || !in_features.is_multiple_of(128) {
         return Err(Error::Shape {
@@ -1132,13 +1222,15 @@ fn validate_block_scaled_fp8_scale(
     }
     let expected_shape = [out_features / 128, in_features / 128];
     let expected_bytes = expected_shape[0] * expected_shape[1];
-    if info.dtype != "F8_E8M0"
+    if !accepted_dtypes.contains(&info.dtype.as_str())
         || info.shape != expected_shape
         || info.byte_len() != expected_bytes as u64
     {
         return Err(Error::Shape {
             label: "ModelOpt block-scaled FP8 scale",
-            expected: format!("dtype=F8_E8M0 shape={expected_shape:?} bytes={expected_bytes}"),
+            expected: format!(
+                "dtype in {accepted_dtypes:?} shape={expected_shape:?} bytes={expected_bytes}"
+            ),
             actual: format!(
                 "dtype={} shape={:?} bytes={}",
                 info.dtype,
@@ -1245,7 +1337,14 @@ mod tests {
             data_end: 8 * 32,
         };
         let (out, input) = validate_modelopt_fp8_weight(&weight).expect("weight metadata");
-        validate_block_scaled_fp8_scale(&scale, out, input).expect("scale metadata");
+        validate_block_scaled_fp8_scale(&scale, out, input, &["F8_E8M0"]).expect("scale metadata");
+
+        let ling_scale = SafeTensorInfo {
+            dtype: "F8_E8M0FNU".to_string(),
+            ..scale
+        };
+        validate_block_scaled_fp8_scale(&ling_scale, out, input, &["F8_E8M0FNU"])
+            .expect("Ling scale metadata");
     }
 
     #[test]
@@ -1256,8 +1355,8 @@ mod tests {
             data_begin: 0,
             data_end: 8 * 31,
         };
-        let error =
-            validate_block_scaled_fp8_scale(&scale, 1024, 4096).expect_err("wrong scale grid");
+        let error = validate_block_scaled_fp8_scale(&scale, 1024, 4096, &["F8_E8M0"])
+            .expect_err("wrong scale grid");
         assert!(error.to_string().contains("shape=[8, 31]"));
     }
 
@@ -1286,6 +1385,32 @@ mod tests {
         assert_eq!(format::e4m3_value(quantized.weight_scale[1]), 0.25);
         let expected = [vec![6.0; 16], vec![1.5; 16]].concat();
         assert_eq!(quantized.dequantize_to_f32_col_major(), expected);
+    }
+
+    #[test]
+    fn block_fp8_weight_quantization_applies_e8m0_scales() {
+        let weight = ModelOptBlockScaledFp8Linear {
+            prefix: "test".to_string(),
+            out_features: 128,
+            in_features: 128,
+            weight: vec![format::ue4m3_code(3.0); 128 * 128],
+            weight_scale: vec![128],
+        };
+        let quantized = ModelOptNvfp4Linear::quantize_block_scaled_fp8(&weight).expect("quantize");
+
+        assert_eq!(quantized.weight_scale.len(), 128 * 8);
+        assert!(
+            quantized
+                .weight_scale
+                .iter()
+                .all(|&scale| format::e4m3_value(scale) == 1.0)
+        );
+        assert!(
+            quantized
+                .dequantize_to_f32_col_major()
+                .into_iter()
+                .all(|value| value == 6.0)
+        );
     }
 
     #[test]

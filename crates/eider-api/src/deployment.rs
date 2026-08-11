@@ -77,6 +77,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "ling-3.0-tiny-nvfp4",
+        repository: "inclusionAI/Ling-3.0-tiny-fp8",
+        revision: "83a95ed0f8923357bf91a5351ad9d5c9d6e7f40e",
+        model_type: "bailing_hybrid",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-ling-3.0-tiny",
+            max_context_tokens: 4_096,
+            prefill_token_capacity: 4,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "qwen3.6-35b-a3b",
         repository: "nvidia/Qwen3.6-35B-A3B-NVFP4",
         revision: "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
@@ -536,6 +550,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
     if !matches!(
         model_type.as_str(),
         "bitnet"
+            | "bailing_hybrid"
             | "muse_glimmer"
             | "bonsai"
             | "qwen3_5_moe"
@@ -562,10 +577,15 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             served_model_name: "eider-local",
             max_context_tokens: match model_type.as_str() {
                 "bitnet" => 4_096,
+                "bailing_hybrid" => 4_096,
                 "bonsai" => 65_536,
                 _ => 32_768,
             },
-            prefill_token_capacity: if model_type == "bonsai" { 256 } else { 2_048 },
+            prefill_token_capacity: match model_type.as_str() {
+                "bailing_hybrid" => 4,
+                "bonsai" => 256,
+                _ => 2_048,
+            },
             step_expert_capacity: 240,
         },
         preparation: match model_type.as_str() {
@@ -785,6 +805,25 @@ mod tests {
         assert_eq!(model.repository, "Inferact/Muse-Glimmer-30B-NVFP4-W4A4");
         assert_eq!(model.revision, "d35cb79050f419c457611b1cee5c5d15b176f285");
         assert_eq!(model.defaults.max_context_tokens, 131_072);
+    }
+
+    #[test]
+    fn catalogue_pins_ling3_tiny_nvfp4_source_checkpoint() {
+        let model = catalogue_model("ling-3.0-tiny-nvfp4").unwrap();
+        assert_eq!(model.model_type, "bailing_hybrid");
+        assert_eq!(model.repository, "inclusionAI/Ling-3.0-tiny-fp8");
+        assert_eq!(model.revision, "83a95ed0f8923357bf91a5351ad9d5c9d6e7f40e");
+        assert_eq!(model.defaults.max_context_tokens, 4_096);
+        assert_eq!(model.defaults.prefill_token_capacity, 4);
+    }
+
+    #[test]
+    fn local_checkpoint_validation_accepts_ling3() {
+        let fixture = CheckpointFixture::new("bailing_hybrid", true);
+        let resolved = resolve_local_model(fixture.path()).expect("resolve Ling fixture");
+        assert_eq!(resolved.preparation, ArtifactKind::None);
+        assert_eq!(resolved.defaults.max_context_tokens, 4_096);
+        assert_eq!(resolved.defaults.prefill_token_capacity, 4);
     }
 
     #[test]

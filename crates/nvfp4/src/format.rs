@@ -132,6 +132,18 @@ pub fn e4m3_value(code: u8) -> f32 {
     }
 }
 
+/// Decodes an unsigned E8M0 byte to f32.
+///
+/// E8M0 represents powers of two with exponent bias 127. The all-ones code is
+/// reserved for NaN by the E8M0 and E8M0FNU checkpoint formats.
+pub fn e8m0_value(code: u8) -> f32 {
+    if code == u8::MAX {
+        f32::NAN
+    } else {
+        2.0f32.powi(i32::from(code) - 127)
+    }
+}
+
 /// Encodes a positive finite scale as E4M3, using nearest representable value.
 ///
 /// Values outside E4M3's finite range saturate. Non-positive or non-finite
@@ -424,6 +436,14 @@ mod tests {
     fn packs_e2m1_low_nibble_first() {
         assert_eq!(pack_e2m1(&[1.0, -1.0]), vec![0xa2]);
         assert_eq!(pack_e2m1(&[1.0, 0.0, -1.0]), vec![0x02, 0x0a]);
+    }
+
+    #[test]
+    fn decodes_e8m0_powers_of_two_and_nan() {
+        assert_eq!(e8m0_value(126), 0.5);
+        assert_eq!(e8m0_value(127), 1.0);
+        assert_eq!(e8m0_value(128), 2.0);
+        assert!(e8m0_value(u8::MAX).is_nan());
     }
 
     #[test]

@@ -9764,6 +9764,72 @@ pub fn qwen36_gdn_prep_into_on_stream(
     }
 }
 
+/// Applies Ling 3's causal depthwise convolution and exact Q/K L2 normalization.
+///
+/// Q, K, and V projections and convolution weights are concatenated in that
+/// order. The persistent convolution state stores the previous three raw
+/// projection values for every channel.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_prep_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    mut conv_state: DeviceInOut<'_, f32>,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let projection = heads.checked_mul(128).ok_or_else(|| Error::Shape {
+        label: "Ling 3 KDA preparation",
+        expected: "heads * 128 without overflow".to_string(),
+        actual: format!("heads={heads}"),
+    })?;
+    let conv_dim = projection.saturating_mul(3);
+    if heads == 0
+        || heads > u32::MAX as usize
+        || qkv.len() != conv_dim
+        || conv_weight_bf16.len() != conv_dim * 4
+        || q.len() != projection
+        || k.len() != projection
+        || v.len() != projection
+        || conv_state.len() != conv_dim * 3
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 KDA preparation buffers",
+            expected: format!(
+                "qkv={conv_dim} conv_weight={} q/k/v={projection} conv_state={}",
+                conv_dim * 4,
+                conv_dim * 3,
+            ),
+            actual: format!(
+                "qkv={} conv_weight={} q={} k={} v={} conv_state={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_prep_on_stream",
+            ffi::infer_ling3_kda_prep_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state.buffer_mut().ptr,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Applies Qwen3.6 convolution/GDN preparation to a changing sequence batch.
 /// `state_table_offset` selects the first row from a larger state-pointer table.
 #[allow(clippy::too_many_arguments)]
@@ -10137,6 +10203,310 @@ pub fn qwen36_gdn_gate_into_on_stream(
                 gate.buffer_mut().ptr,
                 beta.buffer_mut().ptr,
                 heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Computes Ling 3's bounded diagonal KDA gate and sigmoid beta.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_gate_f32_into_on_stream(
+    raw_gate: &DeviceBuffer<f32>,
+    beta_input: &DeviceBuffer<f32>,
+    a_log: &DeviceBuffer<f32>,
+    dt_bias: &DeviceBuffer<f32>,
+    mut gate: DeviceOutput<'_, f32>,
+    mut beta: DeviceOutput<'_, f32>,
+    heads: usize,
+    lower_bound: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let vector_len = heads.saturating_mul(128);
+    if heads == 0
+        || heads > u32::MAX as usize
+        || raw_gate.len() != vector_len
+        || beta_input.len() != heads
+        || a_log.len() != heads
+        || dt_bias.len() != vector_len
+        || gate.len() != vector_len
+        || beta.len() != heads
+        || !lower_bound.is_finite()
+        || lower_bound >= 0.0
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 KDA gate buffers",
+            expected: format!("gate/dt={vector_len} beta/A={heads}, lower_bound<0"),
+            actual: format!(
+                "raw_gate={} beta_input={} A={} dt={} gate={} beta={} lower_bound={lower_bound}",
+                raw_gate.len(),
+                beta_input.len(),
+                a_log.len(),
+                dt_bias.len(),
+                gate.len(),
+                beta.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_gate_f32_on_stream",
+            ffi::infer_ling3_kda_gate_f32_on_stream(
+                raw_gate.ptr,
+                beta_input.ptr,
+                a_log.ptr,
+                dt_bias.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                heads as u32,
+                lower_bound,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Advances one Ling 3 KDA token with `[head,key,value]` FP32 state.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_128_f32_into_on_stream(
+    q: &DeviceBuffer<f32>,
+    k: &DeviceBuffer<f32>,
+    v: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    beta: &DeviceBuffer<f32>,
+    mut state: DeviceInOut<'_, f32>,
+    mut output: DeviceOutput<'_, f32>,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let vector_len = heads.saturating_mul(128);
+    let state_len = vector_len.saturating_mul(128);
+    if heads == 0
+        || heads > u32::MAX as usize
+        || q.len() != vector_len
+        || k.len() != vector_len
+        || v.len() != vector_len
+        || gate.len() != vector_len
+        || beta.len() != heads
+        || state.len() != state_len
+        || output.len() != vector_len
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 KDA buffers",
+            expected: format!("q/k/v/g/output={vector_len} beta={heads} state={state_len}"),
+            actual: format!(
+                "q={} k={} v={} gate={} beta={} state={} output={}",
+                q.len(),
+                k.len(),
+                v.len(),
+                gate.len(),
+                beta.len(),
+                state.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_128_f32_on_stream",
+            ffi::infer_ling3_kda_128_f32_on_stream(
+                q.ptr,
+                k.ptr,
+                v.ptr,
+                gate.ptr,
+                beta.ptr,
+                state.buffer_mut().ptr,
+                output.buffer_mut().ptr,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies per-row RMSNorm and Ling's sigmoid output gate.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = rows.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() != len
+        || gate.len() != len
+        || weight.len() != cols
+        || output.len() != len
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 sigmoid-gated RMSNorm buffers",
+            expected: format!("input/gate/output={len} weight={cols}"),
+            actual: format!(
+                "input={} gate={} weight={} output={} rows={rows} cols={cols} eps={eps}",
+                input.len(),
+                gate.len(),
+                weight.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_sigmoid_gated_rms_norm_f32_on_stream",
+            ffi::infer_ling3_sigmoid_gated_rms_norm_f32_on_stream(
+                input.ptr,
+                gate.ptr,
+                weight.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                eps,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Packs Ling MLA projections into per-head query, key, and value rows.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_mla_pack_f32_into_on_stream(
+    query_projection: &DeviceBuffer<f32>,
+    kv_projection: &DeviceBuffer<f32>,
+    shared_rope_key: &DeviceBuffer<f32>,
+    mut query: DeviceOutput<'_, f32>,
+    mut key: DeviceOutput<'_, f32>,
+    mut value: DeviceOutput<'_, f32>,
+    heads: usize,
+    qk_nope_dim: usize,
+    rope_dim: usize,
+    value_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let qk_dim = qk_nope_dim.saturating_add(rope_dim);
+    let qk_len = heads.saturating_mul(qk_dim);
+    let value_len = heads.saturating_mul(value_dim);
+    let kv_len = heads.saturating_mul(qk_nope_dim.saturating_add(value_dim));
+    if heads == 0
+        || qk_nope_dim == 0
+        || rope_dim == 0
+        || value_dim == 0
+        || [heads, qk_nope_dim, rope_dim, value_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query_projection.len() != qk_len
+        || kv_projection.len() != kv_len
+        || shared_rope_key.len() != rope_dim
+        || query.len() != qk_len
+        || key.len() != qk_len
+        || value.len() != value_len
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 MLA projection packing",
+            expected: format!(
+                "query={qk_len} kv={kv_len} rope={rope_dim} key={qk_len} value={value_len}"
+            ),
+            actual: format!(
+                "query_projection={} kv_projection={} rope={} query={} key={} value={} heads={heads}",
+                query_projection.len(),
+                kv_projection.len(),
+                shared_rope_key.len(),
+                query.len(),
+                key.len(),
+                value.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_pack_f32_on_stream",
+            ffi::infer_ling3_mla_pack_f32_on_stream(
+                query_projection.ptr,
+                kv_projection.ptr,
+                shared_rope_key.ptr,
+                query.buffer_mut().ptr,
+                key.buffer_mut().ptr,
+                value.buffer_mut().ptr,
+                heads as u32,
+                qk_nope_dim as u32,
+                rope_dim as u32,
+                value_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Computes one-token Ling MLA attention over a contiguous causal KV cache.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_mla_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_cache: &DeviceBuffer<f32>,
+    value_cache: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    cache_len: usize,
+    heads: usize,
+    qk_dim: usize,
+    value_dim: usize,
+    scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_len = heads.saturating_mul(qk_dim);
+    let output_len = heads.saturating_mul(value_dim);
+    let required_keys = cache_len.saturating_mul(query_len);
+    let required_values = cache_len.saturating_mul(output_len);
+    if cache_len == 0
+        || heads == 0
+        || qk_dim == 0
+        || qk_dim > 512
+        || value_dim == 0
+        || value_dim > 256
+        || [cache_len, heads, qk_dim, value_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query.len() != query_len
+        || key_cache.len() < required_keys
+        || value_cache.len() < required_values
+        || output.len() != output_len
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 MLA attention",
+            expected: format!(
+                "query={query_len} keys>={required_keys} values>={required_values} output={output_len}"
+            ),
+            actual: format!(
+                "query={} keys={} values={} output={} cache={cache_len} heads={heads} qk={qk_dim} value={value_dim} scale={scale}",
+                query.len(),
+                key_cache.len(),
+                value_cache.len(),
+                output.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_attention_f32_on_stream",
+            ffi::infer_ling3_mla_attention_f32_on_stream(
+                query.ptr,
+                key_cache.ptr,
+                value_cache.ptr,
+                output.buffer_mut().ptr,
+                cache_len as u32,
+                heads as u32,
+                qk_dim as u32,
+                value_dim as u32,
+                scale,
                 stream.as_raw(),
             ),
         )
@@ -12370,40 +12740,48 @@ mod tests {
     #[test]
     fn rms_norm_f32_matches_cpu_reference() {
         let rows = 3;
-        let cols = 128;
         let eps = 1.0e-6;
-        let input = (0..rows * cols)
-            .map(|idx| ((idx % 19) as f32 - 9.0) * 0.125)
-            .collect::<Vec<_>>();
-        let weight = (0..cols)
-            .map(|idx| 0.5 + (idx % 7) as f32 * 0.03125)
-            .collect::<Vec<_>>();
+        for cols in [128, 1536] {
+            let input = (0..rows * cols)
+                .map(|idx| {
+                    if cols == 1536 {
+                        ((idx % 97) as f32 - 48.0) / 96.0
+                    } else {
+                        ((idx % 19) as f32 - 9.0) * 0.125
+                    }
+                })
+                .collect::<Vec<_>>();
+            let weight = (0..cols)
+                .map(|idx| 0.5 + (idx % 7) as f32 * 0.03125)
+                .collect::<Vec<_>>();
 
-        let input_device = DeviceBuffer::from_host(&input).expect("input upload");
-        let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
-        let mut output_device = DeviceBuffer::zeroed(rows * cols).expect("RMSNorm output alloc");
-        let stream = CudaStream::new_non_blocking().expect("stream");
-        rms_norm_f32_into_on_stream(
-            rows,
-            cols,
-            &input_device,
-            &weight_device,
-            output_device.output(),
-            eps,
-            &stream,
-        )
-        .expect("RMSNorm launch");
-        let output = output_device
-            .copy_to_host(&stream)
-            .expect("RMSNorm download");
+            let input_device = DeviceBuffer::from_host(&input).expect("input upload");
+            let weight_device = DeviceBuffer::from_host(&weight).expect("weight upload");
+            let mut output_device =
+                DeviceBuffer::zeroed(rows * cols).expect("RMSNorm output alloc");
+            let stream = CudaStream::new_non_blocking().expect("stream");
+            rms_norm_f32_into_on_stream(
+                rows,
+                cols,
+                &input_device,
+                &weight_device,
+                output_device.output(),
+                eps,
+                &stream,
+            )
+            .expect("RMSNorm launch");
+            let output = output_device
+                .copy_to_host(&stream)
+                .expect("RMSNorm download");
 
-        let expected = cpu_rms_norm(rows, cols, &input, &weight, eps);
-        for (idx, (actual, expected)) in output.iter().zip(expected.iter()).enumerate() {
-            let error = (actual - expected).abs();
-            assert!(
-                error <= 1.0e-5,
-                "RMSNorm mismatch at {idx}: actual={actual} expected={expected} error={error}"
-            );
+            let expected = cpu_rms_norm(rows, cols, &input, &weight, eps);
+            for (idx, (actual, expected)) in output.iter().zip(expected.iter()).enumerate() {
+                let error = (actual - expected).abs();
+                assert!(
+                    error <= 1.0e-5,
+                    "RMSNorm {cols} mismatch at {idx}: actual={actual} expected={expected} error={error}"
+                );
+            }
         }
     }
 
@@ -15851,6 +16229,282 @@ mod tests {
     }
 
     #[test]
+    fn ling3_kda_primitives_match_cpu_reference() {
+        let heads = 2usize;
+        let len = heads * 128;
+        let state_len = heads * 128 * 128;
+        let mut q = (0..len)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.0075)
+            .collect::<Vec<_>>();
+        let mut k = (0..len)
+            .map(|idx| ((idx * 13 % 103) as f32 - 51.0) * 0.00625)
+            .collect::<Vec<_>>();
+        normalize_ling3_heads_128(&mut q, heads);
+        normalize_ling3_heads_128(&mut k, heads);
+        let v = (0..len)
+            .map(|idx| ((idx * 19 % 107) as f32 - 53.0) * 0.01)
+            .collect::<Vec<_>>();
+        let raw_gate = (0..len)
+            .map(|idx| ((idx * 23 % 109) as f32 - 54.0) * 0.0125)
+            .collect::<Vec<_>>();
+        let beta_input = vec![-0.75f32, 1.25];
+        let a_log = vec![-0.5f32, 0.35];
+        let dt_bias = (0..len)
+            .map(|idx| ((idx * 29 % 113) as f32 - 56.0) * 0.005)
+            .collect::<Vec<_>>();
+        let state = (0..state_len)
+            .map(|idx| ((idx * 31 % 127) as f32 - 63.0) * 0.0005)
+            .collect::<Vec<_>>();
+        let lower_bound = -5.0f32;
+        let (expected_gate, expected_beta) =
+            cpu_ling3_kda_gate(&raw_gate, &beta_input, &a_log, &dt_bias, heads, lower_bound);
+        let mut expected_state = state.clone();
+        let expected_output = cpu_ling3_kda_128(
+            &q,
+            &k,
+            &v,
+            &expected_gate,
+            &expected_beta,
+            &mut expected_state,
+            heads,
+        );
+
+        let q = DeviceBuffer::from_host(&q).expect("q upload");
+        let k = DeviceBuffer::from_host(&k).expect("k upload");
+        let v = DeviceBuffer::from_host(&v).expect("v upload");
+        let raw_gate = DeviceBuffer::from_host(&raw_gate).expect("raw gate upload");
+        let beta_input = DeviceBuffer::from_host(&beta_input).expect("beta input upload");
+        let a_log = DeviceBuffer::from_host(&a_log).expect("A log upload");
+        let dt_bias = DeviceBuffer::from_host(&dt_bias).expect("dt bias upload");
+        let mut gate = DeviceBuffer::zeroed(len).expect("gate allocation");
+        let mut beta = DeviceBuffer::zeroed(heads).expect("beta allocation");
+        let mut state = DeviceBuffer::from_host(&state).expect("state upload");
+        let mut output = DeviceBuffer::zeroed(len).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        ling3_kda_gate_f32_into_on_stream(
+            &raw_gate,
+            &beta_input,
+            &a_log,
+            &dt_bias,
+            gate.output(),
+            beta.output(),
+            heads,
+            lower_bound,
+            &stream,
+        )
+        .expect("Ling KDA gate");
+        ling3_kda_128_f32_into_on_stream(
+            &q,
+            &k,
+            &v,
+            &gate,
+            &beta,
+            state.inout(),
+            output.output(),
+            heads,
+            &stream,
+        )
+        .expect("Ling KDA recurrence");
+
+        assert_close(
+            &gate.copy_to_host(&stream).expect("gate download"),
+            &expected_gate,
+            2.0e-6,
+            "Ling KDA gate",
+        );
+        assert_close(
+            &beta.copy_to_host(&stream).expect("beta download"),
+            &expected_beta,
+            2.0e-6,
+            "Ling KDA beta",
+        );
+        assert_close(
+            &output.copy_to_host(&stream).expect("output download"),
+            &expected_output,
+            4.0e-6,
+            "Ling KDA output",
+        );
+        assert_close(
+            &state.copy_to_host(&stream).expect("state download"),
+            &expected_state,
+            4.0e-6,
+            "Ling KDA state",
+        );
+    }
+
+    #[test]
+    fn ling3_kda_prep_matches_causal_convolution_reference() {
+        let heads = 2usize;
+        let projection = heads * 128;
+        let conv_dim = projection * 3;
+        let qkv = (0..conv_dim)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.00625)
+            .collect::<Vec<_>>();
+        let conv_weight = (0..conv_dim * 4)
+            .map(|idx| f32_to_bf16(((idx * 13 % 97) as f32 - 48.0) * 0.01))
+            .collect::<Vec<_>>();
+        let conv_state = (0..conv_dim * 3)
+            .map(|idx| ((idx * 19 % 103) as f32 - 51.0) * 0.0025)
+            .collect::<Vec<_>>();
+        let (expected_q, expected_k, expected_v, expected_state) =
+            cpu_ling3_kda_prep(&qkv, &conv_weight, &conv_state, heads);
+
+        let qkv = DeviceBuffer::from_host(&qkv).expect("QKV upload");
+        let conv_weight = DeviceBuffer::from_host(&conv_weight).expect("conv weight upload");
+        let mut conv_state = DeviceBuffer::from_host(&conv_state).expect("conv state upload");
+        let mut q = DeviceBuffer::zeroed(projection).expect("Q allocation");
+        let mut k = DeviceBuffer::zeroed(projection).expect("K allocation");
+        let mut v = DeviceBuffer::zeroed(projection).expect("V allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        ling3_kda_prep_into_on_stream(
+            &qkv,
+            &conv_weight,
+            q.output(),
+            k.output(),
+            v.output(),
+            conv_state.inout(),
+            heads,
+            &stream,
+        )
+        .expect("Ling KDA preparation");
+
+        assert_close(
+            &q.copy_to_host(&stream).expect("Q download"),
+            &expected_q,
+            2.0e-6,
+            "Ling normalized Q",
+        );
+        assert_close(
+            &k.copy_to_host(&stream).expect("K download"),
+            &expected_k,
+            2.0e-6,
+            "Ling normalized K",
+        );
+        assert_close(
+            &v.copy_to_host(&stream).expect("V download"),
+            &expected_v,
+            2.0e-6,
+            "Ling convolved V",
+        );
+        assert_close(
+            &conv_state
+                .copy_to_host(&stream)
+                .expect("conv state download"),
+            &expected_state,
+            0.0,
+            "Ling convolution state",
+        );
+    }
+
+    #[test]
+    fn ling3_mla_pack_and_attention_match_cpu_reference() {
+        let heads = 2usize;
+        let qk_nope = 3usize;
+        let rope = 2usize;
+        let qk_dim = qk_nope + rope;
+        let value_dim = 4usize;
+        let query_projection = (0..heads * qk_dim)
+            .map(|index| index as f32 * 0.1 - 0.4)
+            .collect::<Vec<_>>();
+        let kv_projection = (0..heads * (qk_nope + value_dim))
+            .map(|index| index as f32 * 0.05 - 0.25)
+            .collect::<Vec<_>>();
+        let shared_rope = vec![0.75f32, -0.5];
+        let expected_query = query_projection.clone();
+        let mut expected_key = vec![0.0f32; heads * qk_dim];
+        let mut expected_value = vec![0.0f32; heads * value_dim];
+        for head in 0..heads {
+            expected_key[head * qk_dim..head * qk_dim + qk_nope].copy_from_slice(
+                &kv_projection
+                    [head * (qk_nope + value_dim)..head * (qk_nope + value_dim) + qk_nope],
+            );
+            expected_key[head * qk_dim + qk_nope..(head + 1) * qk_dim]
+                .copy_from_slice(&shared_rope);
+            expected_value[head * value_dim..(head + 1) * value_dim].copy_from_slice(
+                &kv_projection
+                    [head * (qk_nope + value_dim) + qk_nope..(head + 1) * (qk_nope + value_dim)],
+            );
+        }
+
+        let query_projection =
+            DeviceBuffer::from_host(&query_projection).expect("query projection");
+        let kv_projection = DeviceBuffer::from_host(&kv_projection).expect("KV projection");
+        let shared_rope = DeviceBuffer::from_host(&shared_rope).expect("shared rope");
+        let mut query = DeviceBuffer::zeroed(heads * qk_dim).expect("query");
+        let mut key = DeviceBuffer::zeroed(heads * qk_dim).expect("key");
+        let mut value = DeviceBuffer::zeroed(heads * value_dim).expect("value");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        ling3_mla_pack_f32_into_on_stream(
+            &query_projection,
+            &kv_projection,
+            &shared_rope,
+            query.output(),
+            key.output(),
+            value.output(),
+            heads,
+            qk_nope,
+            rope,
+            value_dim,
+            &stream,
+        )
+        .expect("MLA pack");
+        assert_eq!(
+            query.copy_to_host(&stream).expect("query download"),
+            expected_query
+        );
+        assert_eq!(
+            key.copy_to_host(&stream).expect("key download"),
+            expected_key
+        );
+        assert_eq!(
+            value.copy_to_host(&stream).expect("value download"),
+            expected_value
+        );
+
+        let cache_len = 3usize;
+        let key_cache = (0..cache_len * heads * qk_dim)
+            .map(|index| ((index * 7 % 31) as f32 - 15.0) * 0.04)
+            .collect::<Vec<_>>();
+        let value_cache = (0..cache_len * heads * value_dim)
+            .map(|index| ((index * 11 % 29) as f32 - 14.0) * 0.03)
+            .collect::<Vec<_>>();
+        let scale = (qk_dim as f32).sqrt().recip();
+        let expected = cpu_ling3_mla_attention(
+            &expected_query,
+            &key_cache,
+            &value_cache,
+            cache_len,
+            heads,
+            qk_dim,
+            value_dim,
+            scale,
+        );
+        let key_cache = DeviceBuffer::from_host(&key_cache).expect("key cache");
+        let value_cache = DeviceBuffer::from_host(&value_cache).expect("value cache");
+        let mut output = DeviceBuffer::zeroed(heads * value_dim).expect("attention output");
+        ling3_mla_attention_f32_into_on_stream(
+            &query,
+            &key_cache,
+            &value_cache,
+            output.output(),
+            cache_len,
+            heads,
+            qk_dim,
+            value_dim,
+            scale,
+            &stream,
+        )
+        .expect("MLA attention");
+        assert_close(
+            &output.copy_to_host(&stream).expect("attention download"),
+            &expected,
+            2.0e-6,
+            "Ling MLA attention",
+        );
+    }
+
+    #[test]
     fn qwen36_paired_batch_gates_match_separate_inputs() {
         let rows = 3usize;
         let heads = 4usize;
@@ -17788,6 +18442,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ling3_sigmoid_gated_rms_norm_matches_cpu_reference() {
+        let rows = 3usize;
+        let cols = 128usize;
+        let input = (0..rows * cols)
+            .map(|idx| ((idx * 17 % 97) as f32 - 48.0) * 0.0125)
+            .collect::<Vec<_>>();
+        let gate = (0..rows * cols)
+            .map(|idx| ((idx * 19 % 101) as f32 - 50.0) * 0.025)
+            .collect::<Vec<_>>();
+        let weight = (0..cols)
+            .map(|idx| 0.75 + (idx % 11) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let eps = 1.0e-6;
+        let expected = cpu_ling3_sigmoid_gated_rms_norm(&input, &gate, &weight, rows, cols, eps);
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let gate = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let mut output = DeviceBuffer::zeroed(rows * cols).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
+            &input,
+            &gate,
+            &weight,
+            output.output(),
+            rows,
+            cols,
+            eps,
+            &stream,
+        )
+        .expect("Ling sigmoid-gated RMSNorm");
+        assert_close(
+            &output.copy_to_host(&stream).expect("output download"),
+            &expected,
+            2.0e-6,
+            "Ling sigmoid-gated RMSNorm",
+        );
+    }
+
     fn cpu_rms_norm(rows: usize, cols: usize, input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         let mut output = vec![0.0; input.len()];
         for row in 0..rows {
@@ -18018,6 +18712,148 @@ mod tests {
         output
     }
 
+    fn normalize_ling3_heads_128(values: &mut [f32], heads: usize) {
+        for head in 0..heads {
+            let row = &mut values[head * 128..(head + 1) * 128];
+            let norm = (row.iter().map(|value| value * value).sum::<f32>() + 1.0e-6).sqrt();
+            for value in row {
+                *value /= norm;
+            }
+        }
+    }
+
+    fn cpu_ling3_kda_prep(
+        qkv: &[f32],
+        conv_weight: &[u16],
+        conv_state: &[f32],
+        heads: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let projection = heads * 128;
+        let conv_dim = projection * 3;
+        let mut mixed = vec![0.0f32; conv_dim];
+        let mut next_state = conv_state.to_vec();
+        for index in 0..conv_dim {
+            let mut value = qkv[index] * bf16_to_f32(conv_weight[index * 4 + 3]);
+            for offset in 0..3 {
+                value +=
+                    conv_state[index * 3 + offset] * bf16_to_f32(conv_weight[index * 4 + offset]);
+            }
+            mixed[index] = value / (1.0 + (-value).exp());
+            next_state[index * 3] = conv_state[index * 3 + 1];
+            next_state[index * 3 + 1] = conv_state[index * 3 + 2];
+            next_state[index * 3 + 2] = qkv[index];
+        }
+        let mut q = mixed[..projection].to_vec();
+        let mut k = mixed[projection..projection * 2].to_vec();
+        let v = mixed[projection * 2..].to_vec();
+        normalize_ling3_heads_128(&mut q, heads);
+        normalize_ling3_heads_128(&mut k, heads);
+        (q, k, v, next_state)
+    }
+
+    fn cpu_ling3_kda_gate(
+        raw_gate: &[f32],
+        beta_input: &[f32],
+        a_log: &[f32],
+        dt_bias: &[f32],
+        heads: usize,
+        lower_bound: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut gate = vec![0.0f32; heads * 128];
+        let mut beta = vec![0.0f32; heads];
+        for (head, beta) in beta.iter_mut().enumerate() {
+            let a = a_log[head].exp();
+            *beta = 1.0 / (1.0 + (-beta_input[head]).exp());
+            for key in 0..128 {
+                let index = head * 128 + key;
+                let activated = a * (raw_gate[index] + dt_bias[index]);
+                gate[index] = lower_bound / (1.0 + (-activated).exp());
+            }
+        }
+        (gate, beta)
+    }
+
+    fn cpu_ling3_kda_128(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        gate: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        heads: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; heads * 128];
+        let scale = 128.0f32.sqrt().recip();
+        for (head, &beta) in beta.iter().take(heads).enumerate() {
+            let vector_offset = head * 128;
+            let state_offset = head * 128 * 128;
+            for key in 0..128 {
+                let decay = gate[vector_offset + key].exp();
+                for value in 0..128 {
+                    state[state_offset + key * 128 + value] *= decay;
+                }
+            }
+            for value in 0..128 {
+                let prediction = (0..128)
+                    .map(|key| state[state_offset + key * 128 + value] * k[vector_offset + key])
+                    .sum::<f32>();
+                let delta = (v[vector_offset + value] - prediction) * beta;
+                for key in 0..128 {
+                    state[state_offset + key * 128 + value] += k[vector_offset + key] * delta;
+                }
+                output[vector_offset + value] = (0..128)
+                    .map(|key| state[state_offset + key * 128 + value] * q[vector_offset + key])
+                    .sum::<f32>()
+                    * scale;
+            }
+        }
+        output
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_ling3_mla_attention(
+        query: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        cache_len: usize,
+        heads: usize,
+        qk_dim: usize,
+        value_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; heads * value_dim];
+        for head in 0..heads {
+            let q = &query[head * qk_dim..(head + 1) * qk_dim];
+            let scores = (0..cache_len)
+                .map(|token| {
+                    let offset = (token * heads + head) * qk_dim;
+                    q.iter()
+                        .zip(&key_cache[offset..offset + qk_dim])
+                        .map(|(query, key)| query * key)
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator = scores
+                .iter()
+                .map(|score| (score - maximum).exp())
+                .sum::<f32>();
+            for value_feature in 0..value_dim {
+                output[head * value_dim + value_feature] = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(token, score)| {
+                        let offset = (token * heads + head) * value_dim;
+                        (score - maximum).exp() * value_cache[offset + value_feature]
+                    })
+                    .sum::<f32>()
+                    / denominator;
+            }
+        }
+        output
+    }
+
     fn normalize_heads_128(values: &mut [f32], heads: usize) {
         for head in 0..heads {
             let row = &mut values[head * 128..(head + 1) * 128];
@@ -18178,6 +19014,32 @@ mod tests {
                 let gate_value = gate[start + col];
                 let silu_gate = gate_value / (1.0 + (-gate_value).exp());
                 output[start + col] = input[start + col] * inv_rms * weight[col] * silu_gate;
+            }
+        }
+        output
+    }
+
+    fn cpu_ling3_sigmoid_gated_rms_norm(
+        input: &[f32],
+        gate: &[f32],
+        weight: &[f32],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; input.len()];
+        for row in 0..rows {
+            let start = row * cols;
+            let mean_square = input[start..start + cols]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                / cols as f32;
+            let inv_rms = (mean_square + eps).sqrt().recip();
+            for (col, &weight) in weight.iter().take(cols).enumerate() {
+                let index = start + col;
+                let sigmoid_gate = 1.0 / (1.0 + (-gate[index]).exp());
+                output[index] = input[index] * inv_rms * weight * sigmoid_gate;
             }
         }
         output

@@ -7584,6 +7584,77 @@ extern "C" cudaError_t infer_gated_delta_net_128_f32_on_stream(
     return cudaGetLastError();
 }
 
+// Ling 3 KDA keeps a distinct log-decay for every key coordinate. State is
+// stored in the reference layout [head, key, value].
+__global__ void infer_ling3_kda_128_f32_kernel(const float* q,
+                                                const float* k,
+                                                const float* v,
+                                                const float* gate,
+                                                const float* beta,
+                                                float* state,
+                                                float* output,
+                                                std::uint32_t heads) {
+    constexpr std::uint32_t kState = 128;
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t value = blockIdx.y;
+    const std::uint32_t key = threadIdx.x;
+    if (head >= heads || value >= kState || key >= kState) return;
+
+    const std::uint32_t vector_base = head * kState;
+    const std::uint32_t state_index =
+        head * kState * kState + key * kState + value;
+    const float decayed = expf(gate[vector_base + key]) * state[state_index];
+    const float k_value = k[vector_base + key];
+
+    const std::uint32_t lane = key & 31U;
+    const std::uint32_t warp = key >> 5;
+    __shared__ float warp_sums[4];
+    __shared__ float prediction;
+    float sum = infer_warp_reduce_sum(decayed * k_value);
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) prediction = sum;
+    }
+    __syncthreads();
+
+    const float delta =
+        (v[vector_base + value] - prediction) * beta[head];
+    const float updated = decayed + k_value * delta;
+    state[state_index] = updated;
+
+    sum = infer_warp_reduce_sum(updated * q[vector_base + key]);
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+        if (lane == 0) {
+            output[vector_base + value] =
+                sum * 0.08838834764831845f; // 1 / sqrt(128)
+        }
+    }
+}
+
+extern "C" cudaError_t infer_ling3_kda_128_f32_on_stream(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* gate,
+    const float* beta,
+    float* state,
+    float* output,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (q == nullptr || k == nullptr || v == nullptr || gate == nullptr ||
+        beta == nullptr || state == nullptr || output == nullptr || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_ling3_kda_128_f32_kernel<<<dim3(heads, 128), 128, 0, stream>>>(
+        q, k, v, gate, beta, state, output, heads);
+    return cudaGetLastError();
+}
+
 __global__ void infer_gated_delta_net_128_f32_batch_kernel(
     const float* q,
     const float* k,
@@ -8902,6 +8973,24 @@ __global__ void infer_l2_norm_heads_128_kernel(float* values, std::uint32_t head
     row[lane] = value / fmaxf(sqrtf(partial[0]), 1.0e-6f);
 }
 
+__global__ void infer_ling3_l2_norm_heads_128_kernel(float* values,
+                                                      std::uint32_t heads) {
+    constexpr std::uint32_t kDim = 128;
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x;
+    if (head >= heads || lane >= kDim) return;
+    float* row = values + head * kDim;
+    __shared__ float partial[kDim];
+    const float value = row[lane];
+    partial[lane] = value * value;
+    __syncthreads();
+    for (std::uint32_t stride = kDim / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        __syncthreads();
+    }
+    row[lane] = value * rsqrtf(partial[0] + 1.0e-6f);
+}
+
 extern "C" cudaError_t infer_qwen36_gdn_prep_on_stream(
     const float* qkv,
     const std::uint16_t* conv_weight_bf16,
@@ -8934,6 +9023,35 @@ extern "C" cudaError_t infer_qwen36_gdn_prep_on_stream(
         return status;
     }
     infer_l2_norm_heads_128_kernel<<<value_heads, 128, 0, stream>>>(k, value_heads);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_ling3_kda_prep_on_stream(
+    const float* qkv,
+    const std::uint16_t* conv_weight_bf16,
+    float* q,
+    float* k,
+    float* v,
+    float* conv_state,
+    std::uint32_t heads,
+    cudaStream_t stream) {
+    if (qkv == nullptr || conv_weight_bf16 == nullptr || q == nullptr ||
+        k == nullptr || v == nullptr || conv_state == nullptr || heads == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kHeadDim = 128;
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t projection = heads * kHeadDim;
+    const std::uint32_t conv_dim = projection * 3;
+    infer_qwen36_gdn_prep_kernel<<<
+        (conv_dim + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        qkv, conv_weight_bf16, q, k, v, conv_state, heads, heads, kHeadDim);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_ling3_l2_norm_heads_128_kernel<<<heads, 128, 0, stream>>>(q, heads);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    infer_ling3_l2_norm_heads_128_kernel<<<heads, 128, 0, stream>>>(k, heads);
     return cudaGetLastError();
 }
 
@@ -9324,6 +9442,49 @@ __global__ void infer_qwen36_gdn_gate_kernel(const float* alpha,
     beta[idx] = 1.0f / (1.0f + expf(-beta_input[idx]));
 }
 
+__global__ void infer_ling3_kda_gate_f32_kernel(const float* raw_gate,
+                                                 const float* beta_input,
+                                                 const float* a_log,
+                                                 const float* dt_bias,
+                                                 float* gate,
+                                                 float* beta,
+                                                 std::uint32_t heads,
+                                                 float lower_bound) {
+    constexpr std::uint32_t kDim = 128;
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = heads * kDim;
+    if (idx >= len) return;
+    const std::uint32_t head = idx / kDim;
+    const float activated = expf(a_log[head]) * (raw_gate[idx] + dt_bias[idx]);
+    gate[idx] = lower_bound / (1.0f + expf(-activated));
+    if ((idx % kDim) == 0) {
+        beta[head] = 1.0f / (1.0f + expf(-beta_input[head]));
+    }
+}
+
+extern "C" cudaError_t infer_ling3_kda_gate_f32_on_stream(
+    const float* raw_gate,
+    const float* beta_input,
+    const float* a_log,
+    const float* dt_bias,
+    float* gate,
+    float* beta,
+    std::uint32_t heads,
+    float lower_bound,
+    cudaStream_t stream) {
+    if (raw_gate == nullptr || beta_input == nullptr || a_log == nullptr ||
+        dt_bias == nullptr || gate == nullptr || beta == nullptr || heads == 0 ||
+        !isfinite(lower_bound) || lower_bound >= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t len = heads * 128;
+    infer_ling3_kda_gate_f32_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        raw_gate, beta_input, a_log, dt_bias, gate, beta, heads, lower_bound);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_qwen36_gdn_gate_on_stream(
     const float* alpha,
     const float* beta_input,
@@ -9578,6 +9739,203 @@ extern "C" cudaError_t infer_gated_rms_norm_f32_on_stream(const float* input,
     constexpr int kThreads = 256;
     infer_gated_rms_norm_f32_kernel<<<rows, kThreads, kThreads * sizeof(float), stream>>>(
         input, gate, weight, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_ling3_sigmoid_gated_rms_norm_f32_kernel(
+    const float* input,
+    const float* gate,
+    const float* weight,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps) {
+    extern __shared__ float partial[];
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float* row_input = input + row * cols;
+    const float* row_gate = gate + row * cols;
+    float* row_output = output + row * cols;
+    float sum = 0.0f;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = row_input[col];
+        sum += value * value;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(partial[0] / static_cast<float>(cols) + eps);
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float sigmoid_gate = 1.0f / (1.0f + expf(-row_gate[col]));
+        row_output[col] = row_input[col] * inv_rms * weight[col] * sigmoid_gate;
+    }
+}
+
+extern "C" cudaError_t infer_ling3_sigmoid_gated_rms_norm_f32_on_stream(
+    const float* input,
+    const float* gate,
+    const float* weight,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    float eps,
+    cudaStream_t stream) {
+    if (input == nullptr || gate == nullptr || weight == nullptr || output == nullptr ||
+        rows == 0 || cols == 0 || !isfinite(eps) || eps < 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_ling3_sigmoid_gated_rms_norm_f32_kernel<<<
+        rows, kThreads, kThreads * sizeof(float), stream>>>(
+        input, gate, weight, output, rows, cols, eps);
+    return cudaGetLastError();
+}
+
+__global__ void infer_ling3_mla_pack_f32_kernel(
+    const float* query_projection,
+    const float* kv_projection,
+    const float* shared_rope_key,
+    float* query,
+    float* key,
+    float* value,
+    std::uint32_t heads,
+    std::uint32_t qk_nope_dim,
+    std::uint32_t rope_dim,
+    std::uint32_t value_dim) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t qk_dim = qk_nope_dim + rope_dim;
+    const std::uint32_t qk_len = heads * qk_dim;
+    const std::uint32_t value_len = heads * value_dim;
+    if (index < qk_len) {
+        const std::uint32_t head = index / qk_dim;
+        const std::uint32_t feature = index % qk_dim;
+        query[index] = query_projection[index];
+        key[index] = feature < qk_nope_dim
+            ? kv_projection[head * (qk_nope_dim + value_dim) + feature]
+            : shared_rope_key[feature - qk_nope_dim];
+    }
+    if (index < value_len) {
+        const std::uint32_t head = index / value_dim;
+        const std::uint32_t feature = index % value_dim;
+        value[index] = kv_projection[
+            head * (qk_nope_dim + value_dim) + qk_nope_dim + feature];
+    }
+}
+
+extern "C" cudaError_t infer_ling3_mla_pack_f32_on_stream(
+    const float* query_projection,
+    const float* kv_projection,
+    const float* shared_rope_key,
+    float* query,
+    float* key,
+    float* value,
+    std::uint32_t heads,
+    std::uint32_t qk_nope_dim,
+    std::uint32_t rope_dim,
+    std::uint32_t value_dim,
+    cudaStream_t stream) {
+    if (query_projection == nullptr || kv_projection == nullptr ||
+        shared_rope_key == nullptr || query == nullptr || key == nullptr ||
+        value == nullptr || heads == 0 || qk_nope_dim == 0 || rope_dim == 0 ||
+        value_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t qk_len = heads * (qk_nope_dim + rope_dim);
+    const std::uint32_t value_len = heads * value_dim;
+    const std::uint32_t len = qk_len > value_len ? qk_len : value_len;
+    infer_ling3_mla_pack_f32_kernel<<<
+        (len + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        query_projection, kv_projection, shared_rope_key, query, key, value,
+        heads, qk_nope_dim, rope_dim, value_dim);
+    return cudaGetLastError();
+}
+
+__global__ void infer_ling3_mla_attention_f32_kernel(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    float* output,
+    std::uint32_t cache_len,
+    std::uint32_t heads,
+    std::uint32_t qk_dim,
+    std::uint32_t value_dim,
+    float scale) {
+    const std::uint32_t head = blockIdx.x;
+    if (head >= heads) return;
+    const float* q = query + head * qk_dim;
+    __shared__ float score;
+    __shared__ float maximum;
+    __shared__ float denominator;
+    if (threadIdx.x == 0) maximum = -INFINITY;
+    __syncthreads();
+    for (std::uint32_t token = 0; token < cache_len; ++token) {
+        const float* k = key_cache
+            + (static_cast<std::size_t>(token) * heads + head) * qk_dim;
+        float dot = 0.0f;
+        for (std::uint32_t feature = threadIdx.x; feature < qk_dim;
+             feature += blockDim.x) {
+            dot = fmaf(q[feature], k[feature], dot);
+        }
+        dot = infer_block_reduce_sum(dot);
+        if (threadIdx.x == 0) {
+            score = dot * scale;
+            maximum = fmaxf(maximum, score);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denominator = 0.0f;
+    float accumulator = 0.0f;
+    __syncthreads();
+    for (std::uint32_t token = 0; token < cache_len; ++token) {
+        const float* k = key_cache
+            + (static_cast<std::size_t>(token) * heads + head) * qk_dim;
+        float dot = 0.0f;
+        for (std::uint32_t feature = threadIdx.x; feature < qk_dim;
+             feature += blockDim.x) {
+            dot = fmaf(q[feature], k[feature], dot);
+        }
+        dot = infer_block_reduce_sum(dot);
+        if (threadIdx.x == 0) {
+            score = expf(dot * scale - maximum);
+            denominator += score;
+        }
+        __syncthreads();
+        if (threadIdx.x < value_dim) {
+            const float* v = value_cache
+                + (static_cast<std::size_t>(token) * heads + head) * value_dim;
+            accumulator = fmaf(score, v[threadIdx.x], accumulator);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < value_dim) {
+        output[head * value_dim + threadIdx.x] = accumulator / denominator;
+    }
+}
+
+extern "C" cudaError_t infer_ling3_mla_attention_f32_on_stream(
+    const float* query,
+    const float* key_cache,
+    const float* value_cache,
+    float* output,
+    std::uint32_t cache_len,
+    std::uint32_t heads,
+    std::uint32_t qk_dim,
+    std::uint32_t value_dim,
+    float scale,
+    cudaStream_t stream) {
+    if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+        output == nullptr || cache_len == 0 || heads == 0 || qk_dim == 0 ||
+        qk_dim > 512 || value_dim == 0 || value_dim > 256 ||
+        !isfinite(scale) || scale <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    infer_ling3_mla_attention_f32_kernel<<<heads, 256, 0, stream>>>(
+        query, key_cache, value_cache, output, cache_len, heads, qk_dim,
+        value_dim, scale);
     return cudaGetLastError();
 }
 

@@ -2796,6 +2796,73 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_gate_f32_on_stream(
+        raw_gate: *const f32,
+        beta_input: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        gate: *mut f32,
+        beta: *mut f32,
+        heads: u32,
+        lower_bound: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_prep_on_stream(
+        qkv: *const f32,
+        conv_weight_bf16: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        conv_state: *mut f32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_128_f32_on_stream(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        output: *mut f32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_sigmoid_gated_rms_norm_f32_on_stream(
+        input: *const f32,
+        gate: *const f32,
+        weight: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_pack_f32_on_stream(
+        query_projection: *const f32,
+        kv_projection: *const f32,
+        shared_rope_key: *const f32,
+        query: *mut f32,
+        key: *mut f32,
+        value: *mut f32,
+        heads: u32,
+        qk_nope_dim: u32,
+        rope_dim: u32,
+        value_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_attention_f32_on_stream(
+        query: *const f32,
+        key_cache: *const f32,
+        value_cache: *const f32,
+        output: *mut f32,
+        cache_len: u32,
+        heads: u32,
+        qk_dim: u32,
+        value_dim: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_qwen36_gdn_prep_batch_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
