@@ -1571,6 +1571,7 @@ impl Qwen36TextModel {
             cache
                 .commit_append(
                     reservation,
+                    tokens,
                     &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,
@@ -2176,6 +2177,7 @@ impl Qwen36TextModel {
             cache
                 .commit_append(
                     reservation,
+                    1,
                     &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,

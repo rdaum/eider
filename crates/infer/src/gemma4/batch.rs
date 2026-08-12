@@ -587,6 +587,7 @@ impl Gemma4Model {
             cache
                 .commit_append(
                     reservation,
+                    tokens,
                     &mut Sm12xCacheContext {
                         stream,
                         page_table: &mut row.sequence.page_table,

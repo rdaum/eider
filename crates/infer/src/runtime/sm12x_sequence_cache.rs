@@ -305,14 +305,30 @@ impl PageBackend for Sm12xPageBackend {
 
     fn commit_append(
         &mut self,
+        committed_pages: &[&Self::Page],
         sealed_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
         new_position: usize,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in sealed_pages {
+        for page in committed_pages
+            .iter()
+            .chain(sealed_pages)
+            .chain(released_pages)
+        {
             self.validate_page(**page)?;
         }
-        context.page_table.position = new_position;
+        context
+            .page_table
+            .update(committed_pages, new_position, context.stream)?;
+        if !released_pages.is_empty() {
+            context.stream.synchronize()?;
+            for page in released_pages {
+                let slot = page.slot();
+                self.used_slots[slot] = false;
+                self.free_slots.push(slot as u32);
+            }
+        }
         Ok(())
     }
 
@@ -424,7 +440,7 @@ mod tests {
                 .expect("reserve first page");
             let first_page = reservation.segments()[0].page();
             cache
-                .commit_append(reservation, &mut context)
+                .commit_append(reservation, SM12X_KV_PAGE_TOKENS, &mut context)
                 .expect("commit first page");
             cache.page(first_page).expect("first physical page").slot()
         };
@@ -477,6 +493,7 @@ mod tests {
         cache
             .commit_append(
                 tail,
+                3,
                 &mut Sm12xCacheContext {
                     stream: &stream,
                     page_table: &mut source_table,

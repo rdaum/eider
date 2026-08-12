@@ -185,15 +185,21 @@ impl PageBackend for FakeBackend {
 
     fn commit_append(
         &mut self,
+        committed_pages: &[&Self::Page],
         sealed_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
         new_position: usize,
         context: &mut Self::Context<'_>,
     ) -> Result<(), Self::Error> {
         self.take_failure(Operation::Commit)?;
+        context.table = committed_pages.iter().map(|page| page.id).collect();
         context.position = new_position;
         for page in sealed_pages {
             page.sealed.set(true);
         }
+        self.rollbacks += released_pages.len();
+        self.recycled_pages
+            .extend(released_pages.iter().map(|page| (*page).clone()));
         Ok(())
     }
 
@@ -320,7 +326,7 @@ fn append(
         })
         .expect("write append rows");
     cache
-        .commit_append(reservation, context)
+        .commit_append(reservation, rows.len(), context)
         .expect("commit append");
 }
 
@@ -408,7 +414,7 @@ fn exact_append_reservations_cover_single_and_multi_page_shapes() {
             })
             .expect("write exact span");
         cache
-            .commit_append(reservation, &mut context)
+            .commit_append(reservation, rows, &mut context)
             .expect("commit exact span");
         let page_table = cache.page_table(sequence).expect("page table");
         assert_eq!(page_table.position(), start + rows);
@@ -421,6 +427,84 @@ fn exact_append_reservations_cover_single_and_multi_page_shapes() {
         assert_eq!(context.position, start + rows);
         cache.validate().expect("valid exact span");
     }
+}
+
+#[test]
+fn partial_commit_keeps_the_prefix_and_releases_unused_pages() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 16, &mut context);
+    append(&mut cache, sequence, &[1, 2], &mut context);
+    let reservation = cache
+        .reserve_append(sequence, 10, &mut context)
+        .expect("reserve across three pages");
+    cache
+        .with_append_pages(&reservation, |_backend, pages| {
+            for page in pages.iter() {
+                let segment = page.segment();
+                page.page()
+                    .rows
+                    .borrow_mut()
+                    .resize(segment.page_offset() + segment.rows(), 9);
+            }
+            Ok(())
+        })
+        .expect("write speculative span");
+    let rollbacks = cache.backend().rollbacks;
+    cache
+        .commit_append(reservation, 5, &mut context)
+        .expect("commit speculative prefix");
+
+    let table = cache.page_table(sequence).expect("committed table");
+    assert_eq!(table.position(), 7);
+    assert_eq!(table.pages().len(), 2);
+    assert_eq!(context.position, 7);
+    assert_eq!(context.table.len(), 2);
+    assert!(
+        cache
+            .page(table.pages()[0])
+            .expect("full page")
+            .sealed
+            .get()
+    );
+    assert!(
+        !cache
+            .page(table.pages()[1])
+            .expect("tail page")
+            .sealed
+            .get()
+    );
+    assert_eq!(cache.backend().rollbacks, rollbacks + 1);
+    assert_eq!(cache.stats().resident_pages, 2);
+    assert_eq!(cache.stats().reserved_pages, 2);
+    cache.validate().expect("valid partial commit");
+}
+
+#[test]
+fn partial_commit_row_count_must_be_a_nonempty_reserved_prefix() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 12, &mut context);
+    let reservation = cache
+        .reserve_append(sequence, 8, &mut context)
+        .expect("reserve speculative span");
+    let reserved = cache.stats();
+
+    let error = cache
+        .commit_append(reservation.clone(), 0, &mut context)
+        .expect_err("zero-row commit");
+    assert!(matches!(error, CacheError::InvalidPosition));
+    let error = cache
+        .commit_append(reservation.clone(), 9, &mut context)
+        .expect_err("commit beyond reservation");
+    assert!(matches!(error, CacheError::InvalidPosition));
+    assert_eq!(cache.stats(), reserved);
+    cache
+        .abort_append(reservation, &mut context)
+        .expect("abort after invalid commit attempts");
+    cache
+        .validate()
+        .expect("valid after invalid partial commit");
 }
 
 #[test]
@@ -572,7 +656,7 @@ fn stale_multi_page_reservation_cannot_commit_over_a_new_one() {
         .reserve_append(sequence, 8, &mut context)
         .expect("second reservation");
     let error = cache
-        .commit_append(stale, &mut context)
+        .commit_append(stale, 8, &mut context)
         .expect_err("stale commit");
     assert!(matches!(error, CacheError::AppendReservationMismatch));
     cache
@@ -990,7 +1074,7 @@ fn backend_failures_leave_accounting_valid() {
         .expect("write row");
     cache.with_backend(|backend| backend.fail(Operation::Commit));
     let error = cache
-        .commit_append(reservation.clone(), &mut context)
+        .commit_append(reservation.clone(), 1, &mut context)
         .expect_err("commit failure");
     assert!(matches!(
         error,

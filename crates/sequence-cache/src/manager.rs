@@ -207,7 +207,7 @@ impl AppendSegment {
     }
 }
 
-/// Capability for one exact, possibly multi-page append.
+/// Capability for one exact, possibly multi-page append reservation.
 ///
 /// Obtained from [`SequenceCache::reserve_append`] and consumed by exactly one
 /// [`SequenceCache::commit_append`] or [`SequenceCache::abort_append`]. The
@@ -233,7 +233,8 @@ impl AppendReservation {
         self.start_position
     }
 
-    /// Exact number of rows reserved and required at commit.
+    /// Exact number of writable rows reserved. Commit may retain a nonempty
+    /// prefix and releases the unused suffix.
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -861,31 +862,57 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         })
     }
 
-    /// Commit the complete span described by a reservation.
+    /// Commit a nonempty prefix of the span described by a reservation.
     ///
-    /// Exact reservations do not support partial commit. A backend failure
-    /// leaves the prior logical position intact and the reservation pending.
+    /// Pages used only by the uncommitted suffix are returned to the backend
+    /// and restored to the sequence's admission reservation. Rows beyond the
+    /// committed prefix in its final kept page remain invalid and writable.
+    /// A backend failure leaves the prior logical position intact and the
+    /// reservation pending.
     pub fn commit_append(
         &mut self,
         reservation: AppendReservation,
+        committed_rows: usize,
         context: &mut B::Context<'_>,
     ) -> Result<(), B::Error> {
         self.validate_reservation(&reservation)?;
-        let new_pages = {
+        if committed_rows == 0 || committed_rows > reservation.rows {
+            return Err(CacheError::InvalidPosition);
+        }
+        let (old_pages, new_pages) = {
             let sequence = self.sequence_record(reservation.sequence)?;
             let pending = sequence
                 .pending
                 .as_ref()
                 .ok_or(CacheError::NoAppendPending)?;
-            pending.new_pages.to_vec()
+            (sequence.pages.clone(), pending.new_pages.to_vec())
         };
         let new_position = reservation
             .start_position
-            .checked_add(reservation.rows)
+            .checked_add(committed_rows)
             .ok_or(CacheError::ArithmeticOverflow)?;
-        let mut sealed_ids = Vec::new();
-        for segment in reservation
+        let committed_page_count = div_ceil(new_position, self.config.page_tokens)?;
+        let kept_new_page_count =
+            committed_page_count
+                .checked_sub(old_pages.len())
+                .ok_or(CacheError::Invariant(
+                    "partial commit page count moved backwards",
+                ))?;
+        let (kept_new_pages, released_pages) = new_pages.split_at(kept_new_page_count);
+        let mut committed_pages = old_pages;
+        committed_pages.extend_from_slice(kept_new_pages);
+        let committed_segments = reservation
             .segments
+            .iter()
+            .copied()
+            .take_while(|segment| segment.input_offset < committed_rows)
+            .map(|mut segment| {
+                segment.rows = segment.rows.min(committed_rows - segment.input_offset);
+                segment
+            })
+            .collect::<Vec<_>>();
+        let mut sealed_ids = Vec::new();
+        for segment in committed_segments
             .iter()
             .filter(|segment| segment.page_offset + segment.rows == self.config.page_tokens)
         {
@@ -895,20 +922,35 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         }
         {
             let (backend, slots) = (&mut self.backend, &self.pages);
+            let committed = physical_refs_from::<B>(slots, &committed_pages)?;
             let sealed = physical_refs_from::<B>(slots, &sealed_ids)?;
-            if let Err(error) = backend.commit_append(&sealed, new_position, context) {
+            let released = physical_refs_from::<B>(slots, released_pages)?;
+            if let Err(error) =
+                backend.commit_append(&committed, &sealed, &released, new_position, context)
+            {
                 self.metrics.backend_failures.inc();
                 return Err(CacheError::Backend(error));
             }
         }
         let page_tokens = self.config.page_tokens;
-        for segment in reservation.segments.iter().copied() {
+        for segment in committed_segments {
             let record = self.page_record_mut(segment.page)?;
             record.valid_tokens = segment.page_offset + segment.rows;
             record.sealed = record.valid_tokens == page_tokens;
         }
+        for page in released_pages {
+            self.page_record_mut(*page)?
+                .physical
+                .take()
+                .ok_or(CacheError::StalePage)?;
+            self.remove_page(*page)?;
+        }
         let sequence = self.sequence_record_mut(reservation.sequence)?;
-        sequence.pages.extend_from_slice(&new_pages);
+        sequence.pages.extend_from_slice(kept_new_pages);
+        sequence.reserved_pages = sequence
+            .reserved_pages
+            .checked_add(released_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
         sequence.position = new_position;
         sequence.pending = None;
         self.metrics
@@ -2121,7 +2163,9 @@ mod tests {
 
         fn commit_append(
             &mut self,
+            _committed_pages: &[&Self::Page],
             _sealed_pages: &[&Self::Page],
+            _released_pages: &[&Self::Page],
             _new_position: usize,
             _context: &mut Self::Context<'_>,
         ) -> core::result::Result<(), Self::Error> {

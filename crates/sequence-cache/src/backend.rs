@@ -104,15 +104,19 @@ pub trait PageBackend {
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<PageAllocation<Self::Page>, Self::Error>;
 
-    /// Commit a logical append spanning one or more physical pages.
+    /// Commit a prefix of a logical append spanning one or more physical pages.
     ///
     /// The complete logical page table was already published by reservation.
-    /// `sealed_pages` is the ordered subset which became full in this append.
-    /// Publishing `new_position` and sealing those pages must be atomic: on
-    /// error the reservation remains writable and may be retried or aborted.
+    /// `committed_pages` is the complete table after commit, `sealed_pages` is
+    /// its ordered subset which became full, and `released_pages` is the
+    /// uncommitted suffix to reclaim. Publishing the shorter table and
+    /// `new_position`, sealing pages, and reclaiming the suffix must be atomic:
+    /// on error the reservation remains writable and may be retried or aborted.
     fn commit_append(
         &mut self,
+        committed_pages: &[&Self::Page],
         sealed_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
         new_position: usize,
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<(), Self::Error>;

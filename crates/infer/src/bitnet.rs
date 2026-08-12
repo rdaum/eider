@@ -379,6 +379,7 @@ impl BitNetModel {
         cache
             .commit_append(
                 reservation,
+                1,
                 &mut Sm12xCacheContext {
                     stream: &state.stream,
                     page_table: &mut sequence.page_table,
@@ -499,6 +500,7 @@ impl BitNetModel {
         cache
             .commit_append(
                 reservation,
+                rows,
                 &mut Sm12xCacheContext {
                     stream: &sequence.state.stream,
                     page_table: &mut sequence.page_table,
