@@ -113,7 +113,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
     model: &Gemma4Model,
     sequence_capacity: usize,
     max_context_tokens: usize,
-    max_managed_bytes: Option<usize>,
+    retained_budget_bytes: Option<usize>,
 ) -> Result<Gemma4SequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {
@@ -154,17 +154,22 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
             expected: "managed byte count without overflow".to_string(),
             actual: format!("page_bytes={page_bytes} page_slots={eager_page_slots}"),
         })?;
-    let managed_bytes = max_managed_bytes.unwrap_or(eager_managed_bytes);
-    let page_slots = managed_bytes.saturating_sub(fixed_bytes) / page_bytes;
-    if page_slots == 0 {
-        return Err(Error::Shape {
-            label: "Gemma 4 sequence cache capacity",
-            expected: format!(
-                "budget greater than fixed active capacity {fixed_bytes} and one {page_bytes}-byte page"
-            ),
-            actual: managed_bytes.to_string(),
-        });
-    }
+    let retained_bytes = retained_budget_bytes.unwrap_or(0);
+    let managed_bytes = eager_managed_bytes
+        .checked_add(retained_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Gemma 4 sequence cache budget",
+            expected: "active and retained budgets without overflow".to_string(),
+            actual: format!("active={eager_managed_bytes} retained={retained_bytes}"),
+        })?;
+    let retained_pages = retained_bytes / page_bytes;
+    let page_slots = eager_page_slots
+        .checked_add(retained_pages)
+        .ok_or_else(|| Error::Shape {
+            label: "Gemma 4 sequence cache pages",
+            expected: "active and retained page counts without overflow".to_string(),
+            actual: format!("active={eager_page_slots} retained={retained_pages}"),
+        })?;
     let backend =
         Sm12xPageBackend::new_heterogeneous(model.sequence_layer_geometries(), page_slots)?;
     Gemma4SequenceCache::new(
@@ -172,7 +177,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
             page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
-            max_prefix_entries: max_managed_bytes.is_none().then_some(0),
+            max_prefix_entries: retained_budget_bytes.is_none().then_some(0),
             emergency_bytes: 0,
         },
         backend,

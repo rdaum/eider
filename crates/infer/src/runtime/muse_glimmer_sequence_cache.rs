@@ -118,7 +118,7 @@ pub(crate) fn new_muse_glimmer_sequence_cache_with_budget(
     model: &MuseGlimmerModel,
     sequence_capacity: usize,
     max_context_tokens: usize,
-    max_managed_bytes: Option<usize>,
+    retained_budget_bytes: Option<usize>,
 ) -> Result<MuseGlimmerSequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {
@@ -162,25 +162,27 @@ pub(crate) fn new_muse_glimmer_sequence_cache_with_budget(
             expected: "managed byte count without overflow".to_string(),
             actual: format!("page_bytes={page_bytes} pages={eager_pages}"),
         })?;
-    let managed_bytes = max_managed_bytes.unwrap_or(eager_bytes);
-    let snapshot_bytes = if max_managed_bytes.is_some() && model.has_dflash() {
-        managed_bytes / 4
+    let retained_bytes = retained_budget_bytes.unwrap_or(0);
+    let managed_bytes = eager_bytes
+        .checked_add(retained_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Muse Glimmer sequence cache budget",
+            expected: "active and retained budgets without overflow".to_string(),
+            actual: format!("active={eager_bytes} retained={retained_bytes}"),
+        })?;
+    let snapshot_bytes = if retained_budget_bytes.is_some() && model.has_dflash() {
+        retained_bytes / 4
     } else {
         0
     };
-    let page_slots = managed_bytes
-        .saturating_sub(fixed_bytes)
-        .saturating_sub(snapshot_bytes)
-        / page_bytes;
-    if page_slots == 0 {
-        return Err(Error::Shape {
-            label: "Muse Glimmer sequence cache capacity",
-            expected: format!(
-                "budget greater than fixed capacity {fixed_bytes}, snapshot reserve {snapshot_bytes}, and one {page_bytes}-byte page"
-            ),
-            actual: managed_bytes.to_string(),
-        });
-    }
+    let retained_pages = retained_bytes.saturating_sub(snapshot_bytes) / page_bytes;
+    let page_slots = eager_pages
+        .checked_add(retained_pages)
+        .ok_or_else(|| Error::Shape {
+            label: "Muse Glimmer sequence cache pages",
+            expected: "active and retained page counts without overflow".to_string(),
+            actual: format!("active={eager_pages} retained={retained_pages}"),
+        })?;
     let backend = Sm12xPageBackend::new(
         std::iter::repeat_n(true, config.num_hidden_layers),
         page_slots,
@@ -192,7 +194,7 @@ pub(crate) fn new_muse_glimmer_sequence_cache_with_budget(
             page_tokens: SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: snapshot_bytes,
-            max_prefix_entries: max_managed_bytes.is_none().then_some(0),
+            max_prefix_entries: retained_budget_bytes.is_none().then_some(0),
             emergency_bytes: 0,
         },
         backend,
