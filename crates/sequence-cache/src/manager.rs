@@ -257,6 +257,32 @@ pub struct AppendPages<'a, P> {
     slots: &'a [Slot<PageRecord<P>>],
 }
 
+/// Allocation-free ordered views for a batch of append reservations.
+pub struct AppendReservations<'a, P> {
+    reservations: &'a [AppendReservation],
+    slots: &'a [Slot<PageRecord<P>>],
+}
+
+impl<'a, P> AppendReservations<'a, P> {
+    /// Number of independently reserved sequence spans in this batch.
+    pub fn len(&self) -> usize {
+        self.reservations.len()
+    }
+
+    /// Whether this batch contains no reservations.
+    pub fn is_empty(&self) -> bool {
+        self.reservations.is_empty()
+    }
+
+    /// Iterates over reservations in caller order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = AppendPages<'_, P>> + '_ {
+        self.reservations.iter().map(|reservation| AppendPages {
+            segments: &reservation.segments,
+            slots: self.slots,
+        })
+    }
+}
+
 impl<'a, P> AppendPages<'a, P> {
     /// Number of writable physical segments in this reservation.
     pub fn len(&self) -> usize {
@@ -854,6 +880,32 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         let (backend, slots) = (&mut self.backend, &self.pages);
         let pages = AppendPages {
             segments: &reservation.segments,
+            slots,
+        };
+        operation(backend, pages).map_err(|error| {
+            self.metrics.backend_failures.inc();
+            CacheError::Backend(error)
+        })
+    }
+
+    /// Borrow every physical page covered by several pending reservations.
+    ///
+    /// Reservation and segment order match the caller's slices, allowing one
+    /// batched model invocation to write directly into several sequences.
+    pub fn with_append_reservations<R, F>(
+        &mut self,
+        reservations: &[AppendReservation],
+        operation: F,
+    ) -> Result<R, B::Error>
+    where
+        F: FnOnce(&mut B, AppendReservations<'_, B::Page>) -> core::result::Result<R, B::Error>,
+    {
+        for reservation in reservations {
+            self.validate_reservation(reservation)?;
+        }
+        let (backend, slots) = (&mut self.backend, &self.pages);
+        let pages = AppendReservations {
+            reservations,
             slots,
         };
         operation(backend, pages).map_err(|error| {

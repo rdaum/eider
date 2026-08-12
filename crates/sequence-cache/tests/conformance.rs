@@ -430,6 +430,56 @@ fn exact_append_reservations_cover_single_and_multi_page_shapes() {
 }
 
 #[test]
+fn batched_append_lease_preserves_reservation_and_segment_order() {
+    let mut cache = cache(4_000);
+    let mut first_context = FakeContext::default();
+    let mut second_context = FakeContext::default();
+    let first = admit(&mut cache, 16, &mut first_context);
+    let second = admit(&mut cache, 16, &mut second_context);
+    append(&mut cache, first, &[1, 2], &mut first_context);
+    let first_reservation = cache
+        .reserve_append(first, 7, &mut first_context)
+        .expect("reserve first span");
+    let second_reservation = cache
+        .reserve_append(second, 5, &mut second_context)
+        .expect("reserve second span");
+
+    let lease = [first_reservation.clone(), second_reservation.clone()];
+    cache
+        .with_append_reservations(&lease, |_backend, reservations| {
+            assert_eq!(reservations.len(), 2);
+            let geometry = reservations
+                .iter()
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .map(|page| {
+                            let segment = page.segment();
+                            (
+                                segment.page_offset(),
+                                segment.input_offset(),
+                                segment.rows(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(geometry[0], [(2, 0, 2), (0, 2, 4), (0, 6, 1)]);
+            assert_eq!(geometry[1], [(0, 0, 4), (0, 4, 1)]);
+            Ok(())
+        })
+        .expect("lease batched reservations");
+
+    cache
+        .abort_append(first_reservation, &mut first_context)
+        .expect("abort first");
+    cache
+        .abort_append(second_reservation, &mut second_context)
+        .expect("abort second");
+    cache.validate().expect("valid after batched lease");
+}
+
+#[test]
 fn partial_commit_keeps_the_prefix_and_releases_unused_pages() {
     let mut cache = cache(4_000);
     let mut context = FakeContext::default();

@@ -54,9 +54,9 @@ mod metrics;
 pub use backend::{PageAllocation, PageBackend, RetireError, RetireOutcome};
 pub use error::{CacheError, ConfigError, Result};
 pub use manager::{
-    AdmissionOutcome, AdmissionRequest, AppendPage, AppendPages, AppendReservation, AppendSegment,
-    CacheConfig, CacheStats, PageId, PageTableView, PrefixEntryId, PrefixMatch, RetainOutcome,
-    SequenceCache, SequenceId, TokenBlockId,
+    AdmissionOutcome, AdmissionRequest, AppendPage, AppendPages, AppendReservation,
+    AppendReservations, AppendSegment, CacheConfig, CacheStats, PageId, PageTableView,
+    PrefixEntryId, PrefixMatch, RetainOutcome, SequenceCache, SequenceId, TokenBlockId,
 };
 pub use metrics::CacheMetrics;
 
