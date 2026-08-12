@@ -43,7 +43,7 @@ pub struct BitNetAdmissionProgress {
     pub request_id: BitNetRequestId,
     /// Sequence-specific device bytes.
     pub sequence_device_bytes: usize,
-    /// Prefix-cache hits; currently always zero for BitNet.
+    /// Tokens restored from a retained prefix; currently always zero for BitNet.
     pub cached_prompt_tokens: usize,
     /// Elapsed scheduler-tick time at admission.
     pub admitted_after_tick_start: Duration,

@@ -173,9 +173,9 @@ struct Args {
     #[arg(long)]
     max_context_tokens: Option<usize>,
 
-    /// Device-memory budget in GiB for prompt-prefix checkpoints; zero disables it.
+    /// Extra device-memory budget in GiB for retained prompt pages and snapshots.
     #[arg(long, default_value_t = 2)]
-    prefix_cache_gib: usize,
+    retained_prefix_gib: usize,
 
     /// Runtime storage for BF16 Qwen attention projections.
     #[arg(long, value_enum, default_value_t = QwenBf16StorageArg::Nvfp4)]
@@ -311,10 +311,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_active_sequences: args.max_active_sequences,
         max_context_tokens,
     };
-    actor_config.prefix_cache.max_device_bytes = args
-        .prefix_cache_gib
+    actor_config.sequence_cache.max_retained_bytes = args
+        .retained_prefix_gib
         .checked_mul(1024 * 1024 * 1024)
-        .ok_or("Qwen prefix-cache size exceeds usize")?;
+        .ok_or("retained-prefix size exceeds usize")?;
     actor_config.qwen_bf16_storage = Qwen36Bf16StorageConfig::new(
         args.qwen_bf16_attention.into(),
         args.qwen_bf16_lm_head.into(),

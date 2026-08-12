@@ -1,9 +1,9 @@
 //! Reusable request-scoped generation sessions.
 
+use super::cache_config::SequenceCacheConfig;
 use super::nemotron3_sequence_cache::{
     Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
 };
-use super::prefix_cache::PrefixCacheConfig;
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::scheduler::{
     Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, SchedulerConfig,
@@ -301,11 +301,11 @@ impl<'a> Qwen36GenerationSession<'a> {
             max_active_sequences: 1,
             max_context_tokens: max_tokens,
         };
-        let mut scheduler = Qwen36Scheduler::new_with_prefix_cache(
+        let mut scheduler = Qwen36Scheduler::new_with_cache_config(
             model,
             scheduler_config,
-            PrefixCacheConfig {
-                max_device_bytes: 0,
+            SequenceCacheConfig {
+                max_retained_bytes: 0,
             },
         )?;
         let request_id = scheduler.add_request(

@@ -1,8 +1,8 @@
 //! Structured chat serving over the multi-session Step-3.7 scheduler.
 
+use super::cache_config::SequenceCacheConfig;
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::prefix_cache::PrefixCacheConfig;
 use super::scheduler::{RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::step37_scheduler::{
@@ -64,18 +64,18 @@ impl<'template> Step37ChatService<'template> {
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_prefix_cache(model, template, scheduler, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, template, scheduler, SequenceCacheConfig::default())
     }
 
-    pub fn new_with_prefix_cache(
+    pub fn new_with_cache_config(
         model: Step37TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
-        prefix_cache: PrefixCacheConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         Ok(Self {
             template,
-            scheduler: Step37Scheduler::new_with_prefix_cache(model, scheduler, prefix_cache)?,
+            scheduler: Step37Scheduler::new_with_cache_config(model, scheduler, cache_config)?,
             requests: BTreeMap::new(),
         })
     }

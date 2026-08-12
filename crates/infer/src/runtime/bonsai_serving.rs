@@ -43,7 +43,7 @@ pub struct BonsaiAdmissionProgress {
     pub request_id: BonsaiRequestId,
     /// Sequence-specific device bytes.
     pub sequence_device_bytes: usize,
-    /// Prefix-cache hits; currently always zero for Bonsai.
+    /// Tokens restored from a retained prefix; currently always zero for Bonsai.
     pub cached_prompt_tokens: usize,
     /// Elapsed scheduler-tick time at admission.
     pub admitted_after_tick_start: Duration,

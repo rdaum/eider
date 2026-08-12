@@ -1,12 +1,12 @@
 //! Structured multi-session chat serving for Nemotron 3.
 
+use super::cache_config::SequenceCacheConfig;
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::nemotron3_sequence_cache::{
     Nemotron3CacheContext, Nemotron3Sequence, Nemotron3SequenceCache, nemotron3_cache_error,
     new_nemotron3_sequence_cache_with_budget,
 };
-use super::prefix_cache::PrefixCacheConfig;
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
@@ -158,7 +158,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
     }
 
     /// Creates a multi-session service with ART-backed reusable prompt prefixes.
@@ -166,16 +166,16 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         model: &'model Nemotron3Model,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
-        prefix_config: PrefixCacheConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         let sequence_cache = new_nemotron3_sequence_cache_with_budget(
             model,
             config.max_active_sequences,
             config.max_context_tokens,
-            (prefix_config.max_device_bytes != 0).then_some(prefix_config.max_device_bytes),
+            (cache_config.max_retained_bytes != 0).then_some(cache_config.max_retained_bytes),
         )?;
-        let retain_prefixes = prefix_config.max_device_bytes != 0;
+        let retain_prefixes = cache_config.max_retained_bytes != 0;
         Ok(Self {
             model,
             template,

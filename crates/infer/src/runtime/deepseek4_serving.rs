@@ -1,12 +1,12 @@
 //! Multi-session chat serving for DeepSeek V4.
 
+use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::deepseek4_sequence_cache::{
     Deepseek4CacheContext, Deepseek4Sequence, Deepseek4SequenceCache, deepseek4_cache_error,
     new_deepseek4_sequence_cache,
 };
-use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
@@ -31,20 +31,17 @@ fn prefill_chunk_capacity(prompt_position: usize, fair_share: usize) -> usize {
     }
 }
 
-fn checkpoint_bounded_chunk(
+fn retention_bounded_chunk(
     chunk: usize,
     prompt_position: usize,
-    prefix_cache_target: usize,
-    prefix_cache_key_present: bool,
-    prefix_cache_checkpointed: bool,
+    prefix_target: usize,
+    retention_enabled: bool,
+    prefix_retained: bool,
 ) -> usize {
-    if prefix_cache_checkpointed
-        || !prefix_cache_key_present
-        || prompt_position >= prefix_cache_target
-    {
+    if prefix_retained || !retention_enabled || prompt_position >= prefix_target {
         chunk
     } else {
-        chunk.min(prefix_cache_target - prompt_position)
+        chunk.min(prefix_target - prompt_position)
     }
 }
 
@@ -143,14 +140,14 @@ impl<'template> Deepseek4ChatService<'template> {
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
     }
 
     pub fn new_with_cache_config(
         model: Deepseek4TextModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
-        cache_config: PrefixCacheConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         let workspace = model.new_batch_workspace(
@@ -162,7 +159,7 @@ impl<'template> Deepseek4ChatService<'template> {
             &model,
             config.max_active_sequences,
             config.max_context_tokens,
-            (cache_config.max_device_bytes != 0).then_some(cache_config.max_device_bytes),
+            (cache_config.max_retained_bytes != 0).then_some(cache_config.max_retained_bytes),
         )?;
         Ok(Self {
             model,
@@ -173,7 +170,7 @@ impl<'template> Deepseek4ChatService<'template> {
             requests: BTreeMap::new(),
             active_sequences: 0,
             sequence_cache,
-            retain_prefixes: cache_config.max_device_bytes != 0,
+            retain_prefixes: cache_config.max_retained_bytes != 0,
             workspace,
         })
     }
@@ -222,7 +219,7 @@ impl<'template> Deepseek4ChatService<'template> {
             label: "DeepSeek V4 request ID",
             detail: "request ID space exhausted".to_string(),
         })?;
-        let prefix_target = cacheable_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_target = retained_prompt_prefix_tokens(prompt.token_ids.len());
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
@@ -498,7 +495,7 @@ impl<'template> Deepseek4ChatService<'template> {
             let fair_share = budget.div_ceil(remaining_sequences);
             let mut chunk =
                 batchable.min(prefill_chunk_capacity(request.prompt_position, fair_share));
-            chunk = checkpoint_bounded_chunk(
+            chunk = retention_bounded_chunk(
                 chunk,
                 request.prompt_position,
                 request.prefix_target,
@@ -545,7 +542,7 @@ impl<'template> Deepseek4ChatService<'template> {
             }
             for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
                 request.prompt_position += chunk;
-                if checkpoint_ready(
+                if retained_prefix_ready(
                     request.prompt_position,
                     request.prefix_target,
                     request.prefix_retained,
@@ -622,7 +619,7 @@ impl<'template> Deepseek4ChatService<'template> {
         for ((mut request, id), sampled) in requests.into_iter().zip(tail_ids).zip(sampled) {
             request.prompt_position += 1;
             request.pending_sample = Some(sampled);
-            if checkpoint_ready(
+            if retained_prefix_ready(
                 request.prompt_position,
                 request.prefix_target,
                 request.prefix_retained,
@@ -823,12 +820,12 @@ fn apply_sample(
     Ok(None)
 }
 
-fn checkpoint_ready(
+fn retained_prefix_ready(
     prompt_position: usize,
-    prefix_cache_target: usize,
-    prefix_cache_checkpointed: bool,
+    prefix_target: usize,
+    prefix_retained: bool,
 ) -> bool {
-    !prefix_cache_checkpointed && prefix_cache_target != 0 && prompt_position >= prefix_cache_target
+    !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
 }
 
 struct ResponseFilter {
@@ -896,7 +893,7 @@ impl ResponseFilter {
 mod tests {
     use super::{
         Deepseek4RequestId, MAX_CONTINUATION_PREFILL_TOKENS, ResponseFilter,
-        checkpoint_bounded_chunk, checkpoint_ready, prefill_chunk_capacity,
+        prefill_chunk_capacity, retained_prefix_ready, retention_bounded_chunk,
     };
     use crate::runtime::chat::{ChatFunctionCall, ChatToolCall};
     use crate::runtime::chat_output::ChatOutputEvent;
@@ -906,15 +903,15 @@ mod tests {
 
     #[test]
     fn checkpoint_is_ready_after_crossing_the_aligned_prefix() {
-        assert!(checkpoint_ready(384, 256, false));
-        assert!(checkpoint_ready(256, 256, false));
-        assert!(!checkpoint_ready(128, 256, false));
+        assert!(retained_prefix_ready(384, 256, false));
+        assert!(retained_prefix_ready(256, 256, false));
+        assert!(!retained_prefix_ready(128, 256, false));
     }
 
     #[test]
     fn disabled_or_completed_checkpoint_is_not_ready() {
-        assert!(!checkpoint_ready(256, 0, false));
-        assert!(!checkpoint_ready(256, 256, true));
+        assert!(!retained_prefix_ready(256, 0, false));
+        assert!(!retained_prefix_ready(256, 256, true));
     }
 
     #[test]
@@ -934,16 +931,13 @@ mod tests {
 
     #[test]
     fn prefill_stops_exactly_at_a_pending_prefix_checkpoint() {
-        assert_eq!(checkpoint_bounded_chunk(1_024, 128, 512, true, false), 384);
+        assert_eq!(retention_bounded_chunk(1_024, 128, 512, true, false), 384);
+        assert_eq!(retention_bounded_chunk(1_024, 512, 512, true, false), 1_024);
         assert_eq!(
-            checkpoint_bounded_chunk(1_024, 512, 512, true, false),
+            retention_bounded_chunk(1_024, 128, 512, false, false),
             1_024
         );
-        assert_eq!(
-            checkpoint_bounded_chunk(1_024, 128, 512, false, false),
-            1_024
-        );
-        assert_eq!(checkpoint_bounded_chunk(1_024, 128, 512, true, true), 1_024);
+        assert_eq!(retention_bounded_chunk(1_024, 128, 512, true, true), 1_024);
     }
 
     #[test]

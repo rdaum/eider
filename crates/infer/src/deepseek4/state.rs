@@ -45,7 +45,7 @@ pub struct Deepseek4SequenceState {
     device_bytes: usize,
 }
 
-/// Compact device checkpoint retained by the shared prompt-prefix cache.
+/// Compact device checkpoint retained alongside shared prompt pages.
 pub struct Deepseek4SequenceCheckpoint {
     sequence: Deepseek4SequenceState,
 }

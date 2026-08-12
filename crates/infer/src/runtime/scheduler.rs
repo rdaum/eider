@@ -1,6 +1,6 @@
 //! Tokenized Qwen3.6 scheduling over chunked prefill and batched decode.
 
-use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
+use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::qwen36_sequence::{Qwen36Sequence, Qwen36SequenceCache};
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
@@ -243,8 +243,8 @@ struct Qwen36Request {
     config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
-    prefix_cache_target: usize,
-    prefix_cache_checkpointed: bool,
+    prefix_target: usize,
+    prefix_retained: bool,
     sequence: Option<Box<Qwen36Sequence>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
@@ -327,14 +327,14 @@ pub struct Qwen36Scheduler<'model> {
 impl<'model> Qwen36Scheduler<'model> {
     /// Creates a scheduler with explicit execution and admission limits.
     pub fn new(model: &'model Qwen36TextModel, config: SchedulerConfig) -> Result<Self> {
-        Self::new_with_prefix_cache(model, config, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, config, SequenceCacheConfig::default())
     }
 
-    /// Creates a scheduler with explicit execution, admission, and prefix-cache limits.
-    pub fn new_with_prefix_cache(
+    /// Creates a scheduler with explicit execution, admission, and cache limits.
+    pub fn new_with_cache_config(
         model: &'model Qwen36TextModel,
         config: SchedulerConfig,
-        prefix_cache: PrefixCacheConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         let decode_workspaces = decode_capacity_classes(config.decode_capacity)
@@ -383,45 +383,50 @@ impl<'model> Qwen36Scheduler<'model> {
                     config.max_active_sequences
                 ),
             })?;
+        let eager_pages = config
+            .max_context_tokens
+            .div_ceil(SM12X_KV_PAGE_TOKENS)
+            .checked_mul(config.max_active_sequences)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 active sequence-cache pages",
+                expected: "page count without overflow".to_string(),
+                actual: format!(
+                    "context={} active={}",
+                    config.max_context_tokens, config.max_active_sequences
+                ),
+            })?;
+        let active_page_bytes =
+            eager_pages
+                .checked_mul(page_bytes)
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.6 active sequence-cache page bytes",
+                    expected: "page byte count without overflow".to_string(),
+                    actual: format!("pages={eager_pages} page_bytes={page_bytes}"),
+                })?;
+        let active_capacity = fixed_capacity
+            .checked_add(active_page_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 active sequence-cache capacity",
+                expected: "managed byte count without overflow".to_string(),
+                actual: format!("fixed={fixed_capacity} pages={active_page_bytes}"),
+            })?;
+        let retained_bytes = cache_config.max_retained_bytes;
+        let snapshot_capacity = retained_bytes / 4;
         let managed_bytes =
-            if prefix_cache.max_device_bytes == 0 {
-                let eager_pages = config
-                    .max_context_tokens
-                    .div_ceil(SM12X_KV_PAGE_TOKENS)
-                    .checked_mul(config.max_active_sequences)
-                    .ok_or_else(|| Error::Shape {
-                        label: "Qwen3.6 sequence-cache fallback pages",
-                        expected: "page count without overflow".to_string(),
-                        actual: format!(
-                            "context={} active={}",
-                            config.max_context_tokens, config.max_active_sequences
-                        ),
-                    })?;
-                fixed_capacity
-                    .checked_add(eager_pages.checked_mul(page_bytes).ok_or_else(|| {
-                        Error::Shape {
-                            label: "Qwen3.6 sequence-cache fallback page bytes",
-                            expected: "page byte count without overflow".to_string(),
-                            actual: format!("pages={eager_pages} page_bytes={page_bytes}"),
-                        }
-                    })?)
-                    .ok_or_else(|| Error::Shape {
-                        label: "Qwen3.6 sequence-cache fallback capacity",
-                        expected: "managed byte count without overflow".to_string(),
-                        actual: format!("fixed={fixed_capacity} pages={eager_pages}"),
-                    })?
-            } else {
-                prefix_cache.max_device_bytes
-            };
-        let snapshot_capacity = if prefix_cache.max_device_bytes == 0 {
-            0
-        } else {
-            managed_bytes / 4
-        };
-        let page_slots = managed_bytes
-            .saturating_sub(fixed_capacity)
-            .saturating_sub(snapshot_capacity)
-            / page_bytes;
+            active_capacity
+                .checked_add(retained_bytes)
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.6 sequence-cache capacity",
+                    expected: "active and retained byte count without overflow".to_string(),
+                    actual: format!("active={active_capacity} retained={retained_bytes}"),
+                })?;
+        let page_slots = eager_pages
+            .checked_add(retained_bytes.saturating_sub(snapshot_capacity) / page_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 sequence-cache page slots",
+                expected: "page count without overflow".to_string(),
+                actual: format!("active={eager_pages} retained={retained_bytes}"),
+            })?;
         if page_slots == 0 {
             return Err(Error::Shape {
                 label: "Qwen3.6 sequence-cache capacity",
@@ -446,7 +451,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 page_tokens: SM12X_KV_PAGE_TOKENS,
                 max_managed_bytes: managed_bytes,
                 max_snapshot_bytes: snapshot_capacity,
-                max_prefix_entries: (prefix_cache.max_device_bytes == 0).then_some(0),
+                max_prefix_entries: (retained_bytes == 0).then_some(0),
                 emergency_bytes: 0,
             },
             backend,
@@ -525,7 +530,7 @@ impl<'model> Qwen36Scheduler<'model> {
         let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
-        let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt_tokens.len());
+        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens.len());
         self.requests.insert(
             id,
             Box::new(Qwen36Request {
@@ -534,8 +539,8 @@ impl<'model> Qwen36Scheduler<'model> {
                 config,
                 prompt_tokens,
                 prompt_position: 0,
-                prefix_cache_target,
-                prefix_cache_checkpointed: false,
+                prefix_target,
+                prefix_retained: false,
                 sequence: None,
                 device_token_counts: None,
                 sequence_device_bytes: 0,
@@ -648,8 +653,8 @@ impl<'model> Qwen36Scheduler<'model> {
             let cached_prompt_tokens = sequence.position();
             let sequence = Qwen36Sequence::from_admission(cache_sequence, page_table, sequence);
             request.prompt_position = cached_prompt_tokens;
-            request.prefix_cache_checkpointed =
-                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
+            request.prefix_retained =
+                cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
             request.sequence_device_bytes = sequence.device_bytes()
                 + device_token_counts
                     .as_ref()
@@ -829,24 +834,24 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 
     fn retain_request_checkpoint(&mut self, request: &mut Qwen36Request) {
-        if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
+        if request.prefix_retained || request.prefix_target == 0 {
             return;
         }
         if self.sequence_cache.config().max_prefix_entries == Some(0) {
-            request.prefix_cache_checkpointed = true;
+            request.prefix_retained = true;
             return;
         }
         let Some(sequence) = request.sequence.as_deref_mut() else {
             return;
         };
-        if sequence.position() != request.prefix_cache_target {
+        if sequence.position() != request.prefix_target {
             return;
         }
         if self
             .sequence_cache
-            .contains_prefix(&request.prompt_tokens, request.prefix_cache_target)
+            .contains_prefix(&request.prompt_tokens, request.prefix_target)
         {
-            request.prefix_cache_checkpointed = true;
+            request.prefix_retained = true;
             return;
         }
         let snapshot = match self.model.snapshot_sequence(&sequence.state) {
@@ -857,7 +862,7 @@ impl<'model> Qwen36Scheduler<'model> {
                     %error,
                     "failed to copy recurrent prompt-prefix snapshot"
                 );
-                request.prefix_cache_checkpointed = true;
+                request.prefix_retained = true;
                 return;
             }
         };
@@ -876,7 +881,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 "failed to retain shared prompt prefix"
             );
         }
-        request.prefix_cache_checkpointed = true;
+        request.prefix_retained = true;
     }
 
     fn run_prefill_phase(
@@ -919,8 +924,8 @@ impl<'model> Qwen36Scheduler<'model> {
                 available,
                 fair_share,
                 request.prompt_position,
-                request.prefix_cache_target,
-                request.prefix_cache_checkpointed,
+                request.prefix_target,
+                request.prefix_retained,
             );
             token_budget -= chunk;
             slots_remaining -= 1;

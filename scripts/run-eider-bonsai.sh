@@ -29,5 +29,5 @@ exec cargo run --release \
   --bin eider-serve \
   -- --model-dir "$runtime_dir" \
   --served-model-name eider-ternary-bonsai-8b \
-  --prefix-cache-gib 0 \
+  --retained-prefix-gib 0 \
   "$@"

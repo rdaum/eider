@@ -1,8 +1,8 @@
 //! Structured chat serving over the Qwen3.6 continuous scheduler.
 
+use super::cache_config::SequenceCacheConfig;
 use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::prefix_cache::PrefixCacheConfig;
 use super::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
     Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState,
@@ -146,19 +146,19 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_prefix_cache(model, template, scheduler, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, template, scheduler, SequenceCacheConfig::default())
     }
 
-    /// Creates a serving bridge with explicit scheduler and prefix-cache limits.
-    pub fn new_with_prefix_cache(
+    /// Creates a serving bridge with explicit scheduler and cache limits.
+    pub fn new_with_cache_config(
         model: &'model Qwen36TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
-        prefix_cache: PrefixCacheConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         Ok(Self {
             template,
-            scheduler: Qwen36Scheduler::new_with_prefix_cache(model, scheduler, prefix_cache)?,
+            scheduler: Qwen36Scheduler::new_with_cache_config(model, scheduler, cache_config)?,
             requests: BTreeMap::new(),
         })
     }

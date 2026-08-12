@@ -21,9 +21,6 @@ static EXPERT_GAUGE_LOCK: Mutex<()> = Mutex::new(());
 static EXPERT_RESIDENT_SLOTS: AtomicI64 = AtomicI64::new(0);
 static EXPERT_SLOT_CAPACITY: AtomicI64 = AtomicI64::new(0);
 static EXPERT_RESIDENT_BYTES: AtomicI64 = AtomicI64::new(0);
-static PREFIX_CACHE_GAUGE_LOCK: Mutex<()> = Mutex::new(());
-static PREFIX_CACHE_ENTRIES: AtomicI64 = AtomicI64::new(0);
-static PREFIX_CACHE_DEVICE_BYTES: AtomicI64 = AtomicI64::new(0);
 
 #[derive(ExportMetrics)]
 #[metric_prefix = "eider_infer"]
@@ -76,26 +73,8 @@ pub struct InferMetrics {
     #[help = "Device bytes allocated for paged routed-expert slots"]
     pub expert_resident_bytes: Gauge,
 
-    #[help = "Prompt-prefix lookups restored from a cached hybrid-state checkpoint"]
-    pub prefix_cache_hits: Counter,
-
-    #[help = "Prompt-prefix lookups without a reusable hybrid-state checkpoint"]
-    pub prefix_cache_misses: Counter,
-
-    #[help = "Prompt tokens restored from cached hybrid-state checkpoints"]
-    pub prefix_cache_hit_tokens: Counter,
-
     #[help = "Laguna attention-layer rows processed directly from compact KV storage"]
     pub laguna_compact_prefill_attention_rows: Counter,
-
-    #[help = "Hybrid-state checkpoints evicted from the prompt-prefix cache"]
-    pub prefix_cache_evictions: Counter,
-
-    #[help = "Hybrid-state checkpoints currently retained by prompt-prefix caches"]
-    pub prefix_cache_entries: Gauge,
-
-    #[help = "Device bytes currently retained by prompt-prefix caches"]
-    pub prefix_cache_device_bytes: Gauge,
 
     #[help = "Time to first token in microseconds"]
     pub ttft_us: Histogram,
@@ -117,12 +96,6 @@ pub struct InferMetrics {
 
     #[help = "Host time blocked waiting to reuse routed-expert staging buffers in microseconds"]
     pub expert_staging_wait_us: Histogram,
-
-    #[help = "Wall time spent copying a hybrid-state prompt checkpoint in microseconds"]
-    pub prefix_cache_checkpoint_us: Histogram,
-
-    #[help = "Wall time spent restoring a hybrid-state prompt checkpoint in microseconds"]
-    pub prefix_cache_restore_us: Histogram,
 
     #[help = "Wall time spent allocating Gemma 4 active sequence state in microseconds"]
     pub gemma4_sequence_allocation_us: Histogram,
@@ -150,13 +123,7 @@ impl InferMetrics {
             expert_resident_slots: Gauge::new(),
             expert_slot_capacity: Gauge::new(),
             expert_resident_bytes: Gauge::new(),
-            prefix_cache_hits: Counter::new(shard_count),
-            prefix_cache_misses: Counter::new(shard_count),
-            prefix_cache_hit_tokens: Counter::new(shard_count),
             laguna_compact_prefill_attention_rows: Counter::new(shard_count),
-            prefix_cache_evictions: Counter::new(shard_count),
-            prefix_cache_entries: Gauge::new(),
-            prefix_cache_device_bytes: Gauge::new(),
             ttft_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             decode_tick_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             prefill_tick_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
@@ -164,8 +131,6 @@ impl InferMetrics {
             expert_page_upload_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             expert_page_resolve_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             expert_staging_wait_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
-            prefix_cache_checkpoint_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
-            prefix_cache_restore_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             gemma4_sequence_allocation_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
             gemma4_checkpoint_copy_us: Histogram::new(LATENCY_BUCKETS_US, shard_count),
         }
@@ -244,61 +209,6 @@ impl Drop for ExpertPagingMetricHandle {
     }
 }
 
-/// Process-wide accounting for one prompt-prefix cache.
-pub(crate) struct PrefixCacheMetricHandle {
-    entries: i64,
-    device_bytes: i64,
-}
-
-impl PrefixCacheMetricHandle {
-    pub(crate) fn new() -> Self {
-        Self {
-            entries: 0,
-            device_bytes: 0,
-        }
-    }
-
-    pub(crate) fn record_hit(&self, cached_tokens: usize, elapsed: Duration) {
-        let infer = metrics();
-        infer.prefix_cache_hits.inc();
-        infer
-            .prefix_cache_hit_tokens
-            .add(metric_count(cached_tokens));
-        infer.prefix_cache_restore_us.record(duration_us(elapsed));
-    }
-
-    pub(crate) fn record_miss(&self) {
-        metrics().prefix_cache_misses.inc();
-    }
-
-    pub(crate) fn record_checkpoint(&self, elapsed: Duration) {
-        metrics()
-            .prefix_cache_checkpoint_us
-            .record(duration_us(elapsed));
-    }
-
-    pub(crate) fn record_insert(&mut self, device_bytes: usize) {
-        let device_bytes = metric_value(device_bytes);
-        adjust_prefix_cache_gauges(1, device_bytes);
-        self.entries += 1;
-        self.device_bytes += device_bytes;
-    }
-
-    pub(crate) fn record_eviction(&mut self, device_bytes: usize) {
-        metrics().prefix_cache_evictions.inc();
-        let device_bytes = metric_value(device_bytes);
-        adjust_prefix_cache_gauges(-1, -device_bytes);
-        self.entries -= 1;
-        self.device_bytes -= device_bytes;
-    }
-}
-
-impl Drop for PrefixCacheMetricHandle {
-    fn drop(&mut self) {
-        adjust_prefix_cache_gauges(-self.entries, -self.device_bytes);
-    }
-}
-
 fn adjust_expert_gauges(resident_slots: i64, capacity: i64, resident_bytes: i64) {
     let _guard = EXPERT_GAUGE_LOCK
         .lock()
@@ -312,18 +222,6 @@ fn adjust_expert_gauges(resident_slots: i64, capacity: i64, resident_bytes: i64)
     infer.expert_resident_slots.set(resident_slots);
     infer.expert_slot_capacity.set(capacity);
     infer.expert_resident_bytes.set(resident_bytes);
-}
-
-fn adjust_prefix_cache_gauges(entries: i64, device_bytes: i64) {
-    let _guard = PREFIX_CACHE_GAUGE_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let entries = PREFIX_CACHE_ENTRIES.fetch_add(entries, Ordering::Relaxed) + entries;
-    let device_bytes =
-        PREFIX_CACHE_DEVICE_BYTES.fetch_add(device_bytes, Ordering::Relaxed) + device_bytes;
-    let infer = metrics();
-    infer.prefix_cache_entries.set(entries);
-    infer.prefix_cache_device_bytes.set(device_bytes);
 }
 
 fn metric_value(value: usize) -> i64 {
@@ -356,14 +254,6 @@ mod tests {
         metrics.expert_page_upload_us.record(20);
         metrics.expert_page_resolve_us.record(30);
         metrics.expert_staging_wait_us.record(40);
-        metrics.prefix_cache_hits.inc();
-        metrics.prefix_cache_misses.inc();
-        metrics.prefix_cache_hit_tokens.add(128);
-        metrics.prefix_cache_evictions.inc();
-        metrics.prefix_cache_entries.set(2);
-        metrics.prefix_cache_device_bytes.set(4096);
-        metrics.prefix_cache_checkpoint_us.record(50);
-        metrics.prefix_cache_restore_us.record(60);
         metrics.laguna_compact_prefill_attention_rows.add(256);
         metrics.gemma4_sequence_allocation_us.record(70);
         metrics.gemma4_checkpoint_copy_us.record(80);
@@ -382,14 +272,6 @@ mod tests {
             "eider_infer_expert_page_upload_us",
             "eider_infer_expert_page_resolve_us",
             "eider_infer_expert_staging_wait_us",
-            "eider_infer_prefix_cache_hits",
-            "eider_infer_prefix_cache_misses",
-            "eider_infer_prefix_cache_hit_tokens",
-            "eider_infer_prefix_cache_evictions",
-            "eider_infer_prefix_cache_entries",
-            "eider_infer_prefix_cache_device_bytes",
-            "eider_infer_prefix_cache_checkpoint_us",
-            "eider_infer_prefix_cache_restore_us",
             "eider_infer_laguna_compact_prefill_attention_rows",
             "eider_infer_gemma4_sequence_allocation_us",
             "eider_infer_gemma4_checkpoint_copy_us",
@@ -412,14 +294,6 @@ mod tests {
             "eider_infer.expert_page_upload_us",
             "eider_infer.expert_page_resolve_us",
             "eider_infer.expert_staging_wait_us",
-            "eider_infer.prefix_cache_hits",
-            "eider_infer.prefix_cache_misses",
-            "eider_infer.prefix_cache_hit_tokens",
-            "eider_infer.prefix_cache_evictions",
-            "eider_infer.prefix_cache_entries",
-            "eider_infer.prefix_cache_device_bytes",
-            "eider_infer.prefix_cache_checkpoint_us",
-            "eider_infer.prefix_cache_restore_us",
             "eider_infer.laguna_compact_prefill_attention_rows",
             "eider_infer.gemma4_sequence_allocation_us",
             "eider_infer.gemma4_checkpoint_copy_us",

@@ -18,6 +18,7 @@ use infer::runtime::bitnet_serving::{
 use infer::runtime::bonsai_serving::{
     BonsaiAdmissionProgress, BonsaiCancelOutcome, BonsaiChatService, BonsaiRequestId,
 };
+use infer::runtime::cache_config::SequenceCacheConfig;
 use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::deepseek4_serving::{
@@ -40,7 +41,6 @@ use infer::runtime::muse_glimmer_serving::{
 use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
 };
-use infer::runtime::prefix_cache::PrefixCacheConfig;
 use infer::runtime::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, RequestLifecycleEvent,
     SchedulerConfig,
@@ -70,7 +70,7 @@ pub struct InferenceActorConfig {
     pub artifact_dir: PathBuf,
     pub dflash_gguf: Option<PathBuf>,
     pub scheduler: SchedulerConfig,
-    pub prefix_cache: PrefixCacheConfig,
+    pub sequence_cache: SequenceCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
     pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
     pub step_expert_capacity: usize,
@@ -88,7 +88,7 @@ impl InferenceActorConfig {
             dflash_gguf: None,
             model_dir,
             scheduler: SchedulerConfig::default(),
-            prefix_cache: PrefixCacheConfig::default(),
+            sequence_cache: SequenceCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
             qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
             step_expert_capacity: 240,
@@ -270,7 +270,7 @@ fn actor_main(
         artifact_dir,
         dflash_gguf,
         scheduler,
-        prefix_cache,
+        sequence_cache,
         qwen_bf16_storage,
         qwen_fp8_attention_storage,
         step_expert_capacity,
@@ -383,7 +383,7 @@ fn actor_main(
             }
             info!(
                 model_dir = %model_dir.display(),
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 "loading Muse Glimmer model"
             );
             let model_result = match dflash_gguf {
@@ -411,7 +411,7 @@ fn actor_main(
                 &model,
                 &template,
                 muse_scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -453,7 +453,7 @@ fn actor_main(
         CheckpointArchitecture::Qwen36 => {
             info!(
                 model_dir = %model_dir.display(),
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 bf16_storage = ?qwen_bf16_storage,
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
                 "loading Qwen3.6 model"
@@ -470,11 +470,11 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Qwen36ChatService::new_with_prefix_cache(
+            let service = match Qwen36ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -489,7 +489,7 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 expert_capacity = step_expert_capacity,
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 bf16_storage = ?step_bf16_storage,
                 "loading Step-3.7 model"
             );
@@ -505,11 +505,11 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Step37ChatService::new_with_prefix_cache(
+            let service = match Step37ChatService::new_with_cache_config(
                 model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -529,7 +529,7 @@ fn actor_main(
             defaults.sampling.temperature = 0.0;
             info!(
                 model_dir = %model_dir.display(),
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 storage = ?nemotron_storage,
                 "loading Nemotron 3 model"
             );
@@ -544,7 +544,7 @@ fn actor_main(
                 &model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -563,7 +563,7 @@ fn actor_main(
             defaults.sampling.temperature = 0.0;
             info!(
                 model_dir = %model_dir.display(),
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 "loading Gemma 4 model"
             );
             let model = match Gemma4Model::load(&model_dir) {
@@ -577,11 +577,11 @@ fn actor_main(
                 device_weights_gib = model.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                 "loaded Gemma 4 text model"
             );
-            let service = match Gemma4ChatService::new_with_prefix_cache(
+            let service = match Gemma4ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -600,7 +600,7 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 "loading Laguna-S-2.1 model"
             );
             let model = match LagunaModel::load_with_artifact_dir(&model_dir, &artifact_dir) {
@@ -610,11 +610,11 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match LagunaChatService::new_with_prefix_cache(
+            let service = match LagunaChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {
@@ -630,7 +630,7 @@ fn actor_main(
                 model_dir = %model_dir.display(),
                 expert_store_dir = %artifact_dir.display(),
                 expert_capacity = deepseek_expert_capacity,
-                prefix_cache_max_device_bytes = prefix_cache.max_device_bytes,
+                retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 "loading DeepSeek V4 model"
             );
             let model = match Deepseek4TextModel::load_paged_nvfp4(
@@ -652,7 +652,7 @@ fn actor_main(
                 model,
                 &template,
                 scheduler,
-                prefix_cache,
+                sequence_cache,
             ) {
                 Ok(service) => service,
                 Err(error) => {

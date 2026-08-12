@@ -19,7 +19,7 @@ A cache miss cannot fall back to a lower-precision weight.
 The default eight slots per layer retain about 4.54 GiB of expert weights.
 Together with the roughly 8.25 GiB thin checkpoint and pinned upload staging,
 this leaves most of the Spark's unified memory available for CUDA workspaces,
-sequence state, and the prompt-prefix cache. Increase
+sequence state, and retained sequence-cache prefixes. Increase
 `--deepseek-expert-capacity` only after accounting for both device slots and
 the shared 128 GiB host/device pool.
 
