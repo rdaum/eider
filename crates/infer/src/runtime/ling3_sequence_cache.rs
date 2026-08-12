@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::ling3::{Ling3Model, Ling3ModelState, Ling3ModelWorkspace};
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
     CacheError, PageAllocation, PageBackend, RetireError, RetireOutcome, SequenceCache, SequenceId,
 };

@@ -14,7 +14,7 @@ use super::sm12x_sequence_cache::Sm12xPageTable;
 use super::stop::StopBuffer;
 use crate::deepseek4::{Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4TextModel};
 use nvfp4::{Error, Result};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::Path;

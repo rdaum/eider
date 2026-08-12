@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::muse_glimmer::{MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceSnapshot};
 use nvfp4::{Error, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, PageBackend, SequenceCache,
     SequenceId,
 };
@@ -11,7 +11,7 @@ use sequence_cache::{
 pub type MuseGlimmerSequenceCache = SequenceCache<Sm12xPageBackend, MuseGlimmerSequenceSnapshot>;
 
 pub(crate) struct MuseGlimmerAppend<'a> {
-    pub(crate) reservation: &'a sequence_cache::AppendReservation,
+    pub(crate) reservation: &'a seqcache::AppendReservation,
     pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
 }
 

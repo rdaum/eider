@@ -17,7 +17,7 @@ use nvfp4::{
     rope_neox_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     sigmoid_mul_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
-use sequence_cache::RetainedSnapshot;
+use seqcache::RetainedSnapshot;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -1765,7 +1765,7 @@ mod tests {
             MuseGlimmerSequence, new_muse_glimmer_sequence_cache_with_budget,
         };
         use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
-        use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+        use seqcache::{AdmissionOutcome, AdmissionRequest};
 
         let model_dir = std::env::var_os("MUSE_GLIMMER_MODEL")
             .map(std::path::PathBuf::from)

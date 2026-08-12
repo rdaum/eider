@@ -1367,7 +1367,7 @@ impl Deepseek4AttentionWeights {
         workspace: &'a mut Deepseek4AttentionWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         backend: &mut Deepseek4PageBackend,
-        append_pages: sequence_cache::AppendReservations<
+        append_pages: seqcache::AppendReservations<
             '_,
             crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
         >,
@@ -2428,7 +2428,7 @@ impl Deepseek4ResidentLayer {
         workspace: &mut Deepseek4LayerWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         backend: &mut Deepseek4PageBackend,
-        append_pages: sequence_cache::AppendReservations<
+        append_pages: seqcache::AppendReservations<
             '_,
             crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
         >,
@@ -3068,7 +3068,7 @@ impl Deepseek4TextModel {
         workspace: &mut Deepseek4BatchWorkspace,
         rows: &mut [Deepseek4BatchRow<'_, '_>],
         cache: &mut Deepseek4SequenceCache,
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
     ) -> Result<()> {
         let total_tokens = validate_model_rows(&self.weights.config, workspace, rows)?;
         let mut token_offset = 0;
@@ -3171,7 +3171,7 @@ fn reserve_model_rows(
     rows: &mut [Deepseek4BatchRow<'_, '_>],
     cache: &mut Deepseek4SequenceCache,
     stream: &CudaStream,
-) -> Result<Vec<sequence_cache::AppendReservation>> {
+) -> Result<Vec<seqcache::AppendReservation>> {
     let mut reservations = Vec::with_capacity(rows.len());
     for index in 0..rows.len() {
         let row = &mut rows[index];
@@ -3224,7 +3224,7 @@ fn reserve_model_rows(
 
 fn abort_model_rows(
     rows: &mut [Deepseek4BatchRow<'_, '_>],
-    reservations: Vec<sequence_cache::AppendReservation>,
+    reservations: Vec<seqcache::AppendReservation>,
     cache: &mut Deepseek4SequenceCache,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -3250,7 +3250,7 @@ fn abort_model_rows(
 
 fn commit_model_rows(
     rows: &mut [Deepseek4BatchRow<'_, '_>],
-    reservations: Vec<sequence_cache::AppendReservation>,
+    reservations: Vec<seqcache::AppendReservation>,
     cache: &mut Deepseek4SequenceCache,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -3477,9 +3477,7 @@ mod tests {
         deepseek4_cache_error,
     };
     use crate::runtime::sm12x_sequence_cache::Sm12xPageTable;
-    use sequence_cache::{
-        AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache,
-    };
+    use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache};
 
     const CONFIG: &str = r#"{
         "architectures":["DeepseekV4ForCausalLM"],

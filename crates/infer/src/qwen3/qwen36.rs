@@ -5920,7 +5920,7 @@ pub struct Qwen36SequenceSnapshot {
     device_bytes: usize,
 }
 
-impl sequence_cache::RetainedSnapshot for Qwen36SequenceSnapshot {
+impl seqcache::RetainedSnapshot for Qwen36SequenceSnapshot {
     fn retained_bytes(&self) -> usize {
         self.device_bytes
     }

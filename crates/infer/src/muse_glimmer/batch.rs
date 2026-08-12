@@ -285,7 +285,7 @@ impl MuseGlimmerModel {
         extract_layers: &[usize; DFLASH_EXTRACT_COUNT],
         output_logits: bool,
         cache: &mut MuseGlimmerSequenceCache,
-    ) -> Result<sequence_cache::AppendReservation> {
+    ) -> Result<seqcache::AppendReservation> {
         let reservation = cache
             .reserve_append(
                 sequence.cache_id,
@@ -684,7 +684,7 @@ impl MuseGlimmerModel {
         tokens: &[u32; DFLASH_BLOCK_SIZE],
         extract_layers: &[usize; DFLASH_EXTRACT_COUNT],
         cache: &mut MuseGlimmerSequenceCache,
-    ) -> Result<sequence_cache::AppendReservation> {
+    ) -> Result<seqcache::AppendReservation> {
         sequence.state.batch_logits_row = None;
         self.reserve_dflash_target_rows(sequence, tokens, extract_layers, true, cache)
     }

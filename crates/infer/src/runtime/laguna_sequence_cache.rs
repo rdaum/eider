@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::laguna::{HEAD_DIM, KV_HEADS, LAYERS, LagunaDecodeState, LagunaModel};
 use nvfp4::{CudaStream, Error, Result};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
 
@@ -133,7 +133,7 @@ pub fn new_laguna_sequence_cache(
         KV_HEADS,
         HEAD_DIM,
     )?;
-    let page_bytes = sequence_cache::PageBackend::page_bytes(&backend);
+    let page_bytes = seqcache::PageBackend::page_bytes(&backend);
     let private_bytes = model.new_sequence_state(max_context_tokens)?.device_bytes();
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
     let fixed_bytes = private_bytes
@@ -155,7 +155,7 @@ pub fn new_laguna_sequence_cache(
             actual: format!("page_bytes={page_bytes} page_slots={page_slots}"),
         })?;
     LagunaSequenceCache::new(
-        sequence_cache::CacheConfig {
+        seqcache::CacheConfig {
             page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,

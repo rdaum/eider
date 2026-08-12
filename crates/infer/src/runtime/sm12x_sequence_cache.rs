@@ -4,7 +4,7 @@ use nvfp4::{
     CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
     Sm12xKvPagePool, Sm12xKvTailSnapshot,
 };
-use sequence_cache::{
+use seqcache::{
     BackendAppendCommit, BackendAppendPage, PageAllocation, PageBackend, RetireError, RetireOutcome,
 };
 
@@ -527,7 +527,7 @@ impl PageBackend for Sm12xPageBackend {
 mod tests {
     use super::*;
     use nvfp4::Sm12xKvAttentionWorkspace;
-    use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, SequenceCache};
+    use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, SequenceCache};
 
     const TEST_KV_HEADS: usize = 1;
     const TEST_Q_HEADS: usize = 8;
@@ -542,7 +542,7 @@ mod tests {
         }
     }
 
-    fn admitted(outcome: AdmissionOutcome) -> sequence_cache::SequenceId {
+    fn admitted(outcome: AdmissionOutcome) -> seqcache::SequenceId {
         match outcome {
             AdmissionOutcome::Admitted(sequence) => sequence,
             AdmissionOutcome::WouldBlock => panic!("unexpected admission pressure"),
@@ -574,7 +574,7 @@ mod tests {
 
     fn write_compact_rows(
         cache: &mut SequenceCache<Sm12xPageBackend, ()>,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
         key: &[f32],
         value: &[f32],
         stream: &CudaStream,
@@ -603,7 +603,7 @@ mod tests {
 
     fn append_compact_rows(
         cache: &mut SequenceCache<Sm12xPageBackend, ()>,
-        sequence: sequence_cache::SequenceId,
+        sequence: seqcache::SequenceId,
         table: &mut Sm12xPageTable,
         key: &[f32],
         value: &[f32],

@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::deepseek4::{Deepseek4SequenceCheckpoint, Deepseek4SequenceState, Deepseek4TextModel};
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{
+use seqcache::{
     BackendAppendCommit, BackendAppendPage, CacheConfig, CacheError, PageAllocation, PageBackend,
     RetireError, RetireOutcome, SequenceCache, SequenceId,
 };
@@ -482,7 +482,7 @@ impl PageBackend for Deepseek4PageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+    use seqcache::{AdmissionOutcome, AdmissionRequest};
 
     #[test]
     fn backend_reserves_and_commits_a_multi_page_prefill() -> Result<()> {

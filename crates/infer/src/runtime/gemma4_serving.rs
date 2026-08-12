@@ -16,7 +16,7 @@ use crate::gemma4::{
 };
 use crate::metrics::{duration_us, metrics};
 use nvfp4::{CudaStream, Error, Result};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};

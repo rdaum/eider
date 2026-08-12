@@ -17,7 +17,7 @@ use crate::nemotron3::{
     Nemotron3SpeculativeCycleWorkspace,
 };
 use nvfp4::{DeviceBuffer, Error, Result};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;

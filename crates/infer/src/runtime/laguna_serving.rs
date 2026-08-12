@@ -14,7 +14,7 @@ use crate::laguna::{
     LagunaPrefillRow,
 };
 use nvfp4::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
+use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;

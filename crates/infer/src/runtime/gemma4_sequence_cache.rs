@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::gemma4::{Gemma4DecodeState, Gemma4Model};
 use nvfp4::{CudaStream, Error, Result};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
 
@@ -133,7 +133,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
             ),
         })?;
     let probe = Sm12xPageBackend::new_heterogeneous(model.sequence_layer_geometries(), 1)?;
-    let page_bytes = sequence_cache::PageBackend::page_bytes(&probe);
+    let page_bytes = seqcache::PageBackend::page_bytes(&probe);
     let private_bytes = model.new_sequence_state(max_context_tokens)?.device_bytes();
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
     let fixed_bytes = private_bytes
@@ -173,7 +173,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
     let backend =
         Sm12xPageBackend::new_heterogeneous(model.sequence_layer_geometries(), page_slots)?;
     Gemma4SequenceCache::new(
-        sequence_cache::CacheConfig {
+        seqcache::CacheConfig {
             page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,

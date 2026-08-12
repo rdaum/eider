@@ -901,7 +901,7 @@ impl Ling3Model {
         state: &mut Ling3ModelState,
         workspace: &mut Ling3ModelWorkspace,
         cache: &mut Ling3SequenceCache,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
         page_table: &DeviceBuffer<u32>,
         input_offset: usize,
         stream: &CudaStream,

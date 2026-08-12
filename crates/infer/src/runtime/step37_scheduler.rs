@@ -11,7 +11,7 @@ use crate::step37::{
     HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
+use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::time::{Duration, Instant};

@@ -9,7 +9,7 @@ use nvfp4::{
     CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS, Sm12xKvPagePool,
     Sm12xKvTailSnapshot,
 };
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
     CacheError, PageAllocation, PageBackend, RetireError, RetireOutcome, SequenceCache, SequenceId,
 };

@@ -2,11 +2,11 @@
 
 ## Status and intent
 
-This document specifies a new reusable Rust crate, provisionally named
-`sequence-cache`, to be implemented under `crates/sequence-cache` in the Eider
-workspace. It is a production component for both Eider and tinfer. Eider will
-own the crate initially; tinfer will consume the same crate rather than grow a
-second implementation.
+This document records the design of the reusable
+[`seqcache`](https://github.com/rdaum/seqcache) Rust crate. The implementation
+now lives in its own repository, and Eider consumes an exact Git revision. It
+is intended to be shared with CPU inference runtimes rather than duplicated in
+each project.
 
 The crate must unify two things which are currently separate:
 
@@ -91,12 +91,12 @@ The shared crate will not:
   configurations, or cache geometries; or
 - hide backend synchronization behind an implicit blocking operation.
 
-## Crate placement and dependencies
+## Repository and dependencies
 
-Add the package to the Eider workspace:
+The implementation lives in the standalone repository:
 
 ```text
-crates/sequence-cache/
+seqcache/
     Cargo.toml
     src/
         lib.rs
@@ -114,28 +114,26 @@ should be limited to:
 ```toml
 [dependencies]
 fast-telemetry = "0.8"
-rart = "0.10"
+rart = "0.11"
 ```
 
-Use the workspace dependencies when building in Eider. Do not add `tokio`,
-`tracing`, `serde`, `thiserror`, `parking_lot`, CUDA crates, half-precision
-types, or a model runtime dependency. Implement `Display` and `Error` directly
-for the small error enum. Standard-library collections and ownership types are
-expected.
+Do not add `tokio`, `tracing`, `serde`, `thiserror`, `parking_lot`, CUDA crates,
+half-precision types, or a model runtime dependency. Implement `Display` and
+`Error` directly for the small error enum. Standard-library collections and
+ownership types are expected.
 
 Tinfer currently uses `fast-telemetry` 0.7. It must be upgraded to the same
 0.8 line before consuming this crate so that metric types and export behaviour
 are not split across two library versions.
 
-During joint development, tinfer may use a sibling path dependency:
+Repository consumers should pin an exact tested revision:
 
 ```toml
-sequence-cache = { path = "../eider/crates/sequence-cache" }
+seqcache = { git = "https://github.com/rdaum/seqcache", rev = "<commit>" }
 ```
 
-Once the API settles, normal cross-repository consumption should use a pinned
-Git revision or a published crate. A branch-floating Git dependency is not an
-acceptable production dependency.
+Once published, consumers may use a compatible crates.io release. A
+branch-floating Git dependency is not an acceptable production dependency.
 
 ## Ownership and concurrency model
 
@@ -754,7 +752,7 @@ page sealing changes the point at which format conversion occurs.
 
 ### Phase 1: backend-independent core
 
-Create `crates/sequence-cache` with:
+Create the backend-independent `seqcache` core with:
 
 - checked configuration and typed IDs;
 - a deterministic fake page backend;

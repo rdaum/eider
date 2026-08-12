@@ -3,7 +3,7 @@
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheConfig, CacheError, PageBackend,
     SequenceCache, SequenceId,
 };

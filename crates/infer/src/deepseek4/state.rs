@@ -708,7 +708,7 @@ impl Deepseek4SequenceCheckpoint {
     }
 }
 
-impl sequence_cache::RetainedSnapshot for Deepseek4SequenceCheckpoint {
+impl seqcache::RetainedSnapshot for Deepseek4SequenceCheckpoint {
     fn retained_bytes(&self) -> usize {
         self.device_bytes()
     }

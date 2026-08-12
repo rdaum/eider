@@ -10,7 +10,7 @@ use nvfp4::{
     rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     sigmoid_scale_heads_f32_into_on_stream, sigmoid_scale_heads_f32_prefix_into_on_stream,
 };
-use sequence_cache::AppendPages;
+use seqcache::AppendPages;
 
 /// One checkpoint-backed Ling 3 multi-head latent attention layer.
 pub struct Ling3MlaAttention {

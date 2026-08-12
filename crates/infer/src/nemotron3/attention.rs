@@ -8,7 +8,7 @@ use nvfp4::{
     append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
     ragged_paged_gqa_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
-use sequence_cache::AppendReservations;
+use seqcache::AppendReservations;
 
 /// Per-layer attention-cache storage selected for a Nemotron 3 sequence.
 pub enum Nemotron3AttentionCache {
@@ -283,10 +283,7 @@ impl Nemotron3AttentionLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3AttentionWorkspace,
         backend: &mut Nemotron3PageBackend,
-        pages: sequence_cache::AppendPages<
-            '_,
-            crate::runtime::nemotron3_sequence_cache::Nemotron3Page,
-        >,
+        pages: seqcache::AppendPages<'_, crate::runtime::nemotron3_sequence_cache::Nemotron3Page>,
         page_table: &DeviceBuffer<u32>,
         position: usize,
         compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,

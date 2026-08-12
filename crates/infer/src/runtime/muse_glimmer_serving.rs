@@ -14,7 +14,7 @@ use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
 use super::stop::StopBuffer;
 use crate::muse_glimmer::{MuseGlimmerDFlashCycle, MuseGlimmerModel};
 use nvfp4::{Error, Result};
-use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;

@@ -1533,7 +1533,7 @@ impl LagunaModel {
         &self,
         sequence: &mut LagunaSequence,
         cache: &mut LagunaSequenceCache,
-    ) -> Result<sequence_cache::AppendReservation> {
+    ) -> Result<seqcache::AppendReservation> {
         cache
             .reserve_append(
                 sequence.cache_id,
@@ -1550,7 +1550,7 @@ impl LagunaModel {
         &self,
         sequence: &mut LagunaSequence,
         cache: &mut LagunaSequenceCache,
-        reservation: sequence_cache::AppendReservation,
+        reservation: seqcache::AppendReservation,
         result: Result<()>,
     ) -> Result<()> {
         if let Err(error) = result {
@@ -1584,7 +1584,7 @@ impl LagunaModel {
         sequence: &mut LagunaSequence,
         token: u32,
         cache: &mut LagunaSequenceCache,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if state.model_id != self.model_id {

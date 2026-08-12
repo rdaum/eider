@@ -9,7 +9,7 @@ use crate::qwen3::qwen36::{
     Qwen36PrefillRow, Qwen36TextModel,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
-use sequence_cache::{
+use seqcache::{
     AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, CacheStats, PageBackend,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

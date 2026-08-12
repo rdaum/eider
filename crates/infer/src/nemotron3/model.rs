@@ -778,7 +778,7 @@ impl Nemotron3Model {
         workspace: &mut Nemotron3BlockWorkspace,
         commit_all: bool,
         cache: &mut Nemotron3SequenceCache,
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
         page_tables: &[&DeviceBuffer<u32>],
     ) -> Result<()> {
         let sequence_count = states.len();
@@ -885,7 +885,7 @@ impl Nemotron3Model {
         workspace: &mut Nemotron3BlockWorkspace,
         commit_all: bool,
         cache: &mut Nemotron3SequenceCache,
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
         page_tables: &[&DeviceBuffer<u32>],
     ) -> Result<()> {
         let sequence_count = states.len();
@@ -1220,7 +1220,7 @@ impl Nemotron3Model {
     fn abort_speculative_reservations_from(
         &self,
         sequences: &mut [&mut Nemotron3Sequence],
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
         cache: &mut Nemotron3SequenceCache,
         start: usize,
         state_end: usize,
@@ -1251,7 +1251,7 @@ impl Nemotron3Model {
     fn finish_speculative_reservations(
         &self,
         sequences: &mut [&mut Nemotron3Sequence],
-        reservations: Vec<sequence_cache::AppendReservation>,
+        reservations: Vec<seqcache::AppendReservation>,
         cache: &mut Nemotron3SequenceCache,
         result: Result<Nemotron3SpeculativeResult>,
     ) -> Result<Nemotron3SpeculativeResult> {
@@ -1570,7 +1570,7 @@ impl Nemotron3Model {
         sequence_count: usize,
         rows: usize,
         cache: &mut Nemotron3SequenceCache,
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
         page_tables: &[&DeviceBuffer<u32>],
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1614,7 +1614,7 @@ impl Nemotron3Model {
         mamba_layer: usize,
         _attention_layer: usize,
         cache: &mut Nemotron3SequenceCache,
-        reservations: &[sequence_cache::AppendReservation],
+        reservations: &[seqcache::AppendReservation],
         page_tables: &[&DeviceBuffer<u32>],
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1776,7 +1776,7 @@ impl Nemotron3Model {
         &self,
         state: &mut Nemotron3DecodeState,
         cache: &mut Nemotron3SequenceCache,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
         page_table: &DeviceBuffer<u32>,
         token: u32,
     ) -> Result<()> {
@@ -2384,7 +2384,7 @@ impl Nemotron3SequenceSnapshot {
     }
 }
 
-impl sequence_cache::RetainedSnapshot for Nemotron3SequenceSnapshot {
+impl seqcache::RetainedSnapshot for Nemotron3SequenceSnapshot {
     fn retained_bytes(&self) -> usize {
         self.device_bytes()
     }

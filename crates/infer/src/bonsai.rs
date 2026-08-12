@@ -14,7 +14,7 @@ use nvfp4::{
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
 };
-use sequence_cache::AppendPages;
+use seqcache::AppendPages;
 use std::f32::consts::PI;
 use std::path::Path;
 

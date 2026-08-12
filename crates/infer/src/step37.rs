@@ -2127,7 +2127,7 @@ impl Step37TextModel {
         &self,
         sequence: &mut Step37Sequence,
         cache: &mut Step37SequenceCache,
-    ) -> Result<sequence_cache::AppendReservation> {
+    ) -> Result<seqcache::AppendReservation> {
         cache
             .reserve_append(
                 sequence.cache_id,
@@ -2144,7 +2144,7 @@ impl Step37TextModel {
         &self,
         sequence: &mut Step37Sequence,
         cache: &mut Step37SequenceCache,
-        reservation: sequence_cache::AppendReservation,
+        reservation: seqcache::AppendReservation,
         result: Result<()>,
     ) -> Result<()> {
         if let Err(error) = result {
@@ -2178,7 +2178,7 @@ impl Step37TextModel {
         sequence: &mut Step37Sequence,
         token: u32,
         cache: &mut Step37SequenceCache,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if token as usize >= self.vocab {

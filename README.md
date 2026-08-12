@@ -189,8 +189,9 @@ The workspace has three main crates:
 
 - `nvfp4` owns CUDA, cuBLASLt, device storage, checkpoint formats, and focused
   GPU benchmarks.
-- `infer` owns model execution, sequence state, sampling, scheduling, prefix
-  caching, and model-runtime benchmarks.
+- `infer` owns model execution, sampling, scheduling, and model-runtime
+  benchmarks. Paged sequence ownership and retained-prefix transactions use
+  the standalone [`seqcache`](https://github.com/rdaum/seqcache) crate.
 - `eider-api` owns catalogue deployment, the inference actor, HTTP/SSE, and
   telemetry.
 

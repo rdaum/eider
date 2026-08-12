@@ -15,7 +15,7 @@ use nvfp4::{
     rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
     split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
 };
-use sequence_cache::AppendPages;
+use seqcache::AppendPages;
 use serde_json::Value;
 use std::path::Path;
 

@@ -2009,7 +2009,7 @@ impl Gemma4Model {
         output: Gemma4PrefillOutput,
         stream: &CudaStream,
         cache: &mut Gemma4SequenceCache,
-        reservation: &sequence_cache::AppendReservation,
+        reservation: &seqcache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if token as usize >= self.config.vocab_size {
