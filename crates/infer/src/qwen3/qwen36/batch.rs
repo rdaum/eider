@@ -6,9 +6,10 @@ use super::{
 };
 use std::collections::HashMap;
 
-use crate::runtime::qwen36_sequence_cache::{
-    Qwen36Append, Qwen36CacheContext, Qwen36Sequence, Qwen36SequenceCache, cache_error,
+use crate::runtime::qwen36_sequence::{
+    Qwen36Append, Qwen36Sequence, Qwen36SequenceCache, qwen36_cache_error as cache_error,
 };
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
@@ -1509,7 +1510,7 @@ impl Qwen36TextModel {
             let target = match cache.reserve_append(
                 row.sequence.cache_id,
                 row.token_ids.len(),
-                &mut Qwen36CacheContext {
+                &mut Sm12xCacheContext {
                     stream: workspace.stream(),
                     page_table: &mut row.sequence.page_table,
                 },
@@ -1566,7 +1567,7 @@ impl Qwen36TextModel {
                 .commit_append(
                     target,
                     tokens,
-                    &mut Qwen36CacheContext {
+                    &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,
                     },
@@ -2111,7 +2112,7 @@ impl Qwen36TextModel {
             let target = match cache.reserve_append(
                 row.sequence.cache_id,
                 1,
-                &mut Qwen36CacheContext {
+                &mut Sm12xCacheContext {
                     stream: workspace.stream(),
                     page_table: &mut row.sequence.page_table,
                 },
@@ -2153,7 +2154,7 @@ impl Qwen36TextModel {
                 .commit_append(
                     target,
                     1,
-                    &mut Qwen36CacheContext {
+                    &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,
                     },

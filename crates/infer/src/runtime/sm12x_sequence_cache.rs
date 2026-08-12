@@ -1,196 +1,18 @@
-//! Shared paged sequence storage for Qwen3.6 full-attention layers.
+//! Shared SM12x paged sequence storage.
 
-use crate::qwen3::infer::QwenLayerKind;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
     Sm12xKvPagePool,
 };
-use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheConfig, CacheError, PageAllocation,
-    PageBackend, RetireError, RetireOutcome, SequenceCache, SequenceId,
-};
-
-use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
-
-/// Scheduler-owned Qwen3.6 shared KV manager.
-pub type Qwen36SequenceCache = SequenceCache<Qwen36PageBackend, Qwen36SequenceSnapshot>;
-
-/// Per-row append capability and stable page table passed into model execution.
-pub(crate) struct Qwen36Append<'a> {
-    pub(crate) target: AppendTarget,
-    pub(crate) page_table: &'a DeviceBuffer<u32>,
-}
-
-/// One admitted Qwen3.6 sequence and all of its request-private state.
-pub struct Qwen36Sequence {
-    pub(crate) cache_id: SequenceId,
-    pub(crate) page_table: Qwen36PageTable,
-    pub(crate) state: Qwen36SequenceState,
-}
-
-impl Qwen36Sequence {
-    /// Admits an empty sequence into `cache` with capacity for `max_tokens`.
-    pub fn admit(
-        model: &Qwen36TextModel,
-        cache: &mut Qwen36SequenceCache,
-        max_tokens: usize,
-        stream: &CudaStream,
-    ) -> Result<Self> {
-        let state = model.new_sequence_state(max_tokens)?;
-        let mut page_table = Qwen36PageTable::new(max_tokens)?;
-        let outcome = cache
-            .admit(
-                None,
-                AdmissionRequest {
-                    max_position: max_tokens,
-                    private_state_bytes: state.device_bytes(),
-                    page_table_bytes: page_table.managed_bytes(),
-                    allow_emergency: false,
-                },
-                &mut Qwen36CacheContext {
-                    stream,
-                    page_table: &mut page_table,
-                },
-                |snapshot, position| {
-                    debug_assert!(snapshot.is_none());
-                    debug_assert_eq!(position, 0);
-                    Ok(())
-                },
-            )
-            .map_err(cache_error)?;
-        let AdmissionOutcome::Admitted(cache_id) = outcome else {
-            return Err(Error::Format {
-                label: "Qwen3.6 sequence admission",
-                detail: "configured cache has insufficient capacity".to_string(),
-            });
-        };
-        stream.synchronize()?;
-        Ok(Self {
-            cache_id,
-            page_table,
-            state,
-        })
-    }
-
-    pub(crate) fn from_admission(
-        cache_id: SequenceId,
-        page_table: Qwen36PageTable,
-        state: Qwen36SequenceState,
-    ) -> Self {
-        Self {
-            cache_id,
-            page_table,
-            state,
-        }
-    }
-
-    /// Returns the next logical token position.
-    pub fn position(&self) -> usize {
-        self.state.position()
-    }
-
-    /// Returns the admitted maximum logical position.
-    pub fn max_tokens(&self) -> usize {
-        self.state.max_tokens()
-    }
-
-    /// Returns request-private recurrent-state and page-table bytes.
-    pub fn device_bytes(&self) -> usize {
-        self.state.device_bytes() + self.page_table.managed_bytes()
-    }
-
-    /// Releases this sequence's page ownership and outstanding reservation.
-    pub fn finish(self, cache: &mut Qwen36SequenceCache, stream: &CudaStream) -> Result<()> {
-        let mut page_table = self.page_table;
-        cache
-            .finish(
-                self.cache_id,
-                &mut Qwen36CacheContext {
-                    stream,
-                    page_table: &mut page_table,
-                },
-            )
-            .map_err(cache_error)
-    }
-}
-
-/// Allocates a non-retaining cache for direct execution and benchmarks.
-pub fn new_qwen36_sequence_cache(
-    model: &Qwen36TextModel,
-    sequence_capacity: usize,
-    max_context_tokens: usize,
-) -> Result<Qwen36SequenceCache> {
-    if sequence_capacity == 0 || max_context_tokens == 0 {
-        return Err(Error::Shape {
-            label: "Qwen3.6 sequence cache",
-            expected: "positive sequence and context capacities".to_string(),
-            actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
-        });
-    }
-    let pages_per_sequence = max_context_tokens.div_ceil(SM12X_KV_PAGE_TOKENS);
-    let page_slots = sequence_capacity
-        .checked_mul(pages_per_sequence)
-        .ok_or_else(|| Error::Shape {
-            label: "Qwen3.6 sequence cache pages",
-            expected: "page count without overflow".to_string(),
-            actual: format!(
-                "sequences={sequence_capacity} pages_per_sequence={pages_per_sequence}"
-            ),
-        })?;
-    let backend = Qwen36PageBackend::new(
-        &model.manifest().layer_kinds,
-        page_slots,
-        model.manifest().kv_heads,
-        model.manifest().head_dim,
-    )?;
-    let page_bytes = backend.page_bytes();
-    let private_bytes = model.new_sequence_state(max_context_tokens)?.device_bytes();
-    let table_bytes = Qwen36PageTable::new(max_context_tokens)?.managed_bytes();
-    let fixed_bytes = private_bytes
-        .checked_add(table_bytes)
-        .and_then(|bytes| bytes.checked_mul(sequence_capacity))
-        .ok_or_else(|| Error::Shape {
-            label: "Qwen3.6 sequence cache private bytes",
-            expected: "private byte count without overflow".to_string(),
-            actual: format!(
-                "private={private_bytes} table={table_bytes} sequences={sequence_capacity}"
-            ),
-        })?;
-    let managed_bytes = page_bytes
-        .checked_mul(page_slots)
-        .and_then(|bytes| bytes.checked_add(fixed_bytes))
-        .ok_or_else(|| Error::Shape {
-            label: "Qwen3.6 sequence cache managed bytes",
-            expected: "managed byte count without overflow".to_string(),
-            actual: format!("page_bytes={page_bytes} page_slots={page_slots}"),
-        })?;
-    Qwen36SequenceCache::new(
-        CacheConfig {
-            page_tokens: SM12X_KV_PAGE_TOKENS,
-            max_managed_bytes: managed_bytes,
-            max_snapshot_bytes: 0,
-            max_prefix_entries: Some(0),
-            emergency_bytes: 0,
-        },
-        backend,
-    )
-    .map_err(cache_error)
-}
-
-pub(crate) fn cache_error(error: CacheError<Error>) -> Error {
-    Error::Format {
-        label: "Qwen3.6 sequence cache",
-        detail: error.to_string(),
-    }
-}
+use sequence_cache::{PageAllocation, PageBackend, RetireError, RetireOutcome};
 
 /// Stable physical slot shared across every full-attention layer pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen36Page {
+pub struct Sm12xPage {
     slot: u32,
 }
 
-impl Qwen36Page {
+impl Sm12xPage {
     /// Returns the backend pool slot used by this page bundle.
     pub fn slot(self) -> usize {
         self.slot as usize
@@ -198,19 +20,19 @@ impl Qwen36Page {
 }
 
 /// Stable host/device page table owned by one active sequence.
-pub struct Qwen36PageTable {
+pub struct Sm12xPageTable {
     host: PinnedHostBuffer<u32>,
     device: DeviceBuffer<u32>,
     page_capacity: usize,
     position: usize,
 }
 
-impl Qwen36PageTable {
+impl Sm12xPageTable {
     /// Allocates a fixed-address page table for a maximum logical position.
     pub fn new(max_position: usize) -> Result<Self> {
         if max_position == 0 {
             return Err(Error::Shape {
-                label: "Qwen3.6 page table",
+                label: "SM12x page table",
                 expected: "positive maximum position".to_string(),
                 actual: "0".to_string(),
             });
@@ -246,16 +68,11 @@ impl Qwen36PageTable {
         self.page_capacity * (size_of::<u32>() + size_of::<u32>())
     }
 
-    fn update(
-        &mut self,
-        pages: &[&Qwen36Page],
-        position: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
+    fn update(&mut self, pages: &[&Sm12xPage], position: usize, stream: &CudaStream) -> Result<()> {
         if pages.len() > self.page_capacity || position > self.page_capacity * SM12X_KV_PAGE_TOKENS
         {
             return Err(Error::Shape {
-                label: "Qwen3.6 page-table update",
+                label: "SM12x page-table update",
                 expected: format!(
                     "at most {} pages and position <= {}",
                     self.page_capacity,
@@ -284,13 +101,13 @@ impl Qwen36PageTable {
 }
 
 /// Borrowed explicit CUDA state for one manager operation.
-pub struct Qwen36CacheContext<'a> {
+pub struct Sm12xCacheContext<'a> {
     pub stream: &'a CudaStream,
-    pub page_table: &'a mut Qwen36PageTable,
+    pub page_table: &'a mut Sm12xPageTable,
 }
 
-/// Preallocated CUDA slabs for every Qwen3.6 full-attention layer.
-pub struct Qwen36PageBackend {
+/// Preallocated CUDA slabs for every paged attention layer.
+pub struct Sm12xPageBackend {
     pools: Vec<Option<Sm12xKvPagePool>>,
     free_slots: Vec<u32>,
     used_slots: Vec<bool>,
@@ -298,33 +115,33 @@ pub struct Qwen36PageBackend {
     page_bytes: usize,
 }
 
-impl Qwen36PageBackend {
+impl Sm12xPageBackend {
     /// Allocates fixed-address per-layer pools with a common physical slot index.
     pub fn new(
-        layer_kinds: &[QwenLayerKind],
+        paged_layers: impl IntoIterator<Item = bool>,
         page_slots: usize,
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
         if page_slots == 0 || page_slots > u32::MAX as usize {
             return Err(Error::Shape {
-                label: "Qwen3.6 KV page slots",
+                label: "SM12x KV page slots",
                 expected: format!("1..={}", u32::MAX),
                 actual: page_slots.to_string(),
             });
         }
-        let mut pools = Vec::with_capacity(layer_kinds.len());
+        let mut pools = Vec::new();
         let mut page_bytes = 0usize;
-        for kind in layer_kinds {
-            if *kind == QwenLayerKind::FullAttention {
+        for paged in paged_layers {
+            if paged {
                 let pool = Sm12xKvPagePool::new(page_slots, kv_heads, head_dim)?;
                 page_bytes =
                     page_bytes
                         .checked_add(pool.page_bytes())
                         .ok_or_else(|| Error::Shape {
-                            label: "Qwen3.6 page bundle bytes",
+                            label: "SM12x page bundle bytes",
                             expected: "full-layer page byte sum without overflow".to_string(),
-                            actual: format!("layers={}", layer_kinds.len()),
+                            actual: format!("layers={}", pools.len() + 1),
                         })?;
                 pools.push(Some(pool));
             } else {
@@ -347,7 +164,7 @@ impl Qwen36PageBackend {
             .get(layer)
             .and_then(Option::as_ref)
             .ok_or_else(|| Error::Shape {
-                label: "Qwen3.6 full-attention page pool",
+                label: "SM12x attention page pool",
                 expected: "a valid full-attention layer index".to_string(),
                 actual: layer.to_string(),
             })
@@ -359,7 +176,7 @@ impl Qwen36PageBackend {
             .get_mut(layer)
             .and_then(Option::as_mut)
             .ok_or_else(|| Error::Shape {
-                label: "Qwen3.6 full-attention page pool",
+                label: "SM12x attention page pool",
                 expected: "a valid full-attention layer index".to_string(),
                 actual: layer.to_string(),
             })
@@ -374,11 +191,11 @@ impl Qwen36PageBackend {
             .sum()
     }
 
-    fn validate_page(&self, page: Qwen36Page) -> Result<()> {
+    fn validate_page(&self, page: Sm12xPage) -> Result<()> {
         let slot = page.slot();
         if slot >= self.used_slots.len() || !self.used_slots[slot] {
             return Err(Error::Shape {
-                label: "Qwen3.6 physical page",
+                label: "SM12x physical page",
                 expected: "an allocated pool slot".to_string(),
                 actual: slot.to_string(),
             });
@@ -387,9 +204,9 @@ impl Qwen36PageBackend {
     }
 }
 
-impl PageBackend for Qwen36PageBackend {
-    type Page = Qwen36Page;
-    type Context<'a> = Qwen36CacheContext<'a>;
+impl PageBackend for Sm12xPageBackend {
+    type Page = Sm12xPage;
+    type Context<'a> = Sm12xCacheContext<'a>;
     type Error = Error;
 
     fn page_bytes(&self) -> usize {
@@ -405,7 +222,7 @@ impl PageBackend for Qwen36PageBackend {
         _context: &mut Self::Context<'_>,
     ) -> Result<PageAllocation<Self::Page>> {
         let slot = self.free_slots.pop().ok_or_else(|| Error::Shape {
-            label: "Qwen3.6 physical page allocation",
+            label: "SM12x physical page allocation",
             expected: "a free preallocated slot".to_string(),
             actual: "pool exhausted".to_string(),
         })?;
@@ -414,7 +231,7 @@ impl PageBackend for Qwen36PageBackend {
         self.used_slots[slot_index] = true;
         self.ever_used_slots[slot_index] = true;
         Ok(PageAllocation {
-            page: Qwen36Page { slot },
+            page: Sm12xPage { slot },
             recycled,
         })
     }
@@ -433,7 +250,7 @@ impl PageBackend for Qwen36PageBackend {
         self.validate_page(*source)?;
         if valid_tokens == 0 || valid_tokens >= SM12X_KV_PAGE_TOKENS {
             return Err(Error::Shape {
-                label: "Qwen3.6 partial page copy",
+                label: "SM12x partial page copy",
                 expected: format!("valid tokens in 1..{SM12X_KV_PAGE_TOKENS}"),
                 actual: valid_tokens.to_string(),
             });
@@ -530,14 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn qwen_backend_shares_aligned_pages_and_copies_only_an_unaligned_tail() {
+    fn backend_shares_aligned_pages_and_copies_only_an_unaligned_tail() {
         let stream = CudaStream::new_non_blocking().expect("CUDA stream");
-        let layer_kinds = [
-            QwenLayerKind::FullAttention,
-            QwenLayerKind::LinearAttention,
-            QwenLayerKind::FullAttention,
-        ];
-        let backend = Qwen36PageBackend::new(&layer_kinds, 16, 2, 128).expect("page pools");
+        let backend = Sm12xPageBackend::new([true, false, true], 16, 2, 128).expect("page pools");
         let page_bytes = backend.page_bytes();
         let mut cache = SequenceCache::<_, ()>::new(
             CacheConfig {
@@ -550,10 +362,10 @@ mod tests {
             backend,
         )
         .expect("sequence cache");
-        let mut source_table = Qwen36PageTable::new(512).expect("source page table");
+        let mut source_table = Sm12xPageTable::new(512).expect("source page table");
         let table_bytes = source_table.managed_bytes();
         let source = {
-            let mut context = Qwen36CacheContext {
+            let mut context = Sm12xCacheContext {
                 stream: &stream,
                 page_table: &mut source_table,
             };
@@ -573,7 +385,7 @@ mod tests {
         };
 
         let first = {
-            let mut context = Qwen36CacheContext {
+            let mut context = Sm12xCacheContext {
                 stream: &stream,
                 page_table: &mut source_table,
             };
@@ -593,7 +405,7 @@ mod tests {
                 source,
                 &vec![7; SM12X_KV_PAGE_TOKENS],
                 (),
-                &mut Qwen36CacheContext {
+                &mut Sm12xCacheContext {
                     stream: &stream,
                     page_table: &mut source_table,
                 },
@@ -603,13 +415,13 @@ mod tests {
         let prefix = cache
             .lookup_prefix(&vec![7; SM12X_KV_PAGE_TOKENS + 1])
             .expect("aligned prefix");
-        let mut restored_table = Qwen36PageTable::new(512).expect("restored page table");
+        let mut restored_table = Sm12xPageTable::new(512).expect("restored page table");
         let restored = admitted(
             cache
                 .admit(
                     Some(prefix),
                     request(512, restored_table.managed_bytes()),
-                    &mut Qwen36CacheContext {
+                    &mut Sm12xCacheContext {
                         stream: &stream,
                         page_table: &mut restored_table,
                     },
@@ -627,7 +439,7 @@ mod tests {
             .reserve_append(
                 source,
                 3,
-                &mut Qwen36CacheContext {
+                &mut Sm12xCacheContext {
                     stream: &stream,
                     page_table: &mut source_table,
                 },
@@ -637,7 +449,7 @@ mod tests {
             .commit_append(
                 tail,
                 3,
-                &mut Qwen36CacheContext {
+                &mut Sm12xCacheContext {
                     stream: &stream,
                     page_table: &mut source_table,
                 },
@@ -645,13 +457,13 @@ mod tests {
             .expect("commit source tail");
         let source_tail = cache.page(tail.page()).expect("source tail").slot();
 
-        let mut branch_table = Qwen36PageTable::new(512).expect("branch page table");
+        let mut branch_table = Sm12xPageTable::new(512).expect("branch page table");
         let branch = admitted(
             cache
                 .branch(
                     source,
                     request(512, branch_table.managed_bytes()),
-                    &mut Qwen36CacheContext {
+                    &mut Sm12xCacheContext {
                         stream: &stream,
                         page_table: &mut branch_table,
                     },

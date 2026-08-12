@@ -763,6 +763,7 @@ unsafe extern "C" {
         partial_output: *mut f32,
         output: *mut f32,
         cache_len: u32,
+        window_start: u32,
         max_tokens: u32,
         page_tokens: u32,
         page_stride_bytes: u32,

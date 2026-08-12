@@ -4,11 +4,15 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::runtime::step37_sequence_cache::{
+    Step37Append, Step37Sequence, Step37SequenceCache, step37_cache_error,
+};
 use fs2::FileExt as Fs2FileExt;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     ModelOptCheckpoint, ModelOptNvfp4Linear, PinnedHostBuffer, Result, Sm12xFp4TileSet,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm121W4A16GateUp, Sm121W4A16HostWeight,
+    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight,
     add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
@@ -973,12 +977,11 @@ impl Step37Attention {
     }
 
     /// Runs one decode token while appending K/V to a persistent layer cache.
-    pub fn run_decode<'a>(
+    fn run_decode<'a>(
         &self,
         workspace: &'a mut Step37AttentionWorkspace,
         input: &DeviceBuffer<f32>,
-        cache: &mut Sm12xKvCache,
-        compact_attention: &mut Sm12xKvAttentionWorkspace,
+        cache: Step37LayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
@@ -989,11 +992,11 @@ impl Step37Attention {
                 actual: format!("{} tokens", workspace.tokens),
             });
         }
-        if cache.len() != position {
+        if cache.page_offset != position % nvfp4::SM12X_KV_PAGE_TOKENS {
             return Err(Error::Shape {
                 label: "Step-3.7 decode attention position",
-                expected: format!("position {}", cache.len()),
-                actual: position.to_string(),
+                expected: format!("page offset {}", position % nvfp4::SM12X_KV_PAGE_TOKENS),
+                actual: cache.page_offset.to_string(),
             });
         }
 
@@ -1053,24 +1056,32 @@ impl Step37Attention {
             position,
             stream,
         )?;
-        cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
-        if let Some(window) = self.window {
-            let window_start = cache.len().saturating_sub(window);
-            compact_attention.attention_window_into_on_stream(
-                cache,
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
+            &workspace.k_rope,
+            0,
+            &workspace.v,
+            0,
+            stream,
+        )?;
+        let cache_len = position + 1;
+        let window_start = self
+            .window
+            .map_or(0, |window| cache_len.saturating_sub(window));
+        cache
+            .attention
+            .attention_paged_window_offsets_into_on_stream(
+                cache.pool,
+                cache.page_table,
+                cache_len,
                 &workspace.q_rope,
+                0,
                 workspace.attended.output(),
+                0,
                 window_start,
                 stream,
             )?;
-        } else {
-            compact_attention.attention_into_on_stream(
-                cache,
-                &workspace.q_rope,
-                workspace.attended.output(),
-                stream,
-            )?;
-        }
         self.gate.run_with_quantized_into(
             input,
             &workspace.input_quantized,
@@ -1751,12 +1762,11 @@ impl Step37Layer {
         })
     }
 
-    pub fn run_one<'a>(
+    fn run_one<'a>(
         &'a mut self,
         workspace: &'a mut Step37LayerWorkspace,
         input: &DeviceBuffer<f32>,
-        cache: &mut Sm12xKvCache,
-        compact_attention: &mut Sm12xKvAttentionWorkspace,
+        cache: Step37LayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
@@ -1766,7 +1776,6 @@ impl Step37Layer {
             &mut workspace.attention,
             &workspace.normed,
             cache,
-            compact_attention,
             position,
             stream,
         )?;
@@ -1901,10 +1910,11 @@ pub struct Step37TextModel {
 /// Mutable scratch and persistent KV state for one Step decode session.
 pub struct Step37DecodeState {
     model_id: u64,
+    pub(crate) position: usize,
+    max_tokens: usize,
     token: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<Step37LayerWorkspace>,
-    kv_cache: Vec<Sm12xKvCache>,
     kv_attention: Vec<Sm12xKvAttentionWorkspace>,
     final_hidden: DeviceBuffer<f32>,
     lm_head_quantized: Option<Step37QuantizedRows>,
@@ -1914,17 +1924,18 @@ pub struct Step37DecodeState {
     sampler: GpuTokenSampler,
 }
 
-/// Immutable, 128-token-aligned Step KV checkpoint.
-pub struct Step37SequenceCheckpoint {
-    model_id: u64,
-    position: usize,
-    kv_cache: Vec<Sm12xKvCache>,
-}
-
 /// One Step next-token argmax result.
 pub struct Step37NextToken {
     pub id: u32,
     pub value: f32,
+}
+
+struct Step37LayerCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
+    attention: &'a mut Sm12xKvAttentionWorkspace,
 }
 
 impl Step37TextModel {
@@ -1999,18 +2010,17 @@ impl Step37TextModel {
         })
     }
 
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Step37DecodeState> {
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Step37DecodeState> {
         Ok(Step37DecodeState {
             model_id: self.model_id,
+            position: 0,
+            max_tokens,
             token: DeviceBuffer::zeroed(1)?,
             hidden: DeviceBuffer::zeroed(HIDDEN)?,
             layers: self
                 .layers
                 .iter()
                 .map(Step37Layer::new_workspace)
-                .collect::<Result<Vec<_>>>()?,
-            kv_cache: (0..self.layers.len())
-                .map(|_| Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM))
                 .collect::<Result<Vec<_>>>()?,
             kv_attention: self
                 .layers
@@ -2036,68 +2046,8 @@ impl Step37TextModel {
         })
     }
 
-    /// Copies a sequence's current aligned KV prefix into an immutable checkpoint.
-    pub fn checkpoint_sequence(
-        &self,
-        source: &Step37DecodeState,
-    ) -> Result<Step37SequenceCheckpoint> {
-        if source.model_id != self.model_id {
-            return Err(Error::Format {
-                label: "Step-3.7 sequence checkpoint",
-                detail: "sequence was created by a different model instance".to_string(),
-            });
-        }
-        source.checkpoint_device_bytes()?;
-        self.stream.synchronize()?;
-        let position = source.len();
-        let mut kv_cache = (0..source.kv_cache.len())
-            .map(|_| Sm12xKvCache::new(position, KV_HEADS, HEAD_DIM))
-            .collect::<Result<Vec<_>>>()?;
-        let stream = CudaStream::new_non_blocking()?;
-        for (destination, source) in kv_cache.iter_mut().zip(&source.kv_cache) {
-            destination.copy_aligned_prefix_from_on_stream(source, position, &stream)?;
-        }
-        stream.synchronize()?;
-        Ok(Step37SequenceCheckpoint {
-            model_id: self.model_id,
-            position,
-            kv_cache,
-        })
-    }
-
-    /// Creates active sequence state from a cached aligned KV checkpoint.
-    pub fn restore_sequence_checkpoint(
-        &self,
-        checkpoint: &Step37SequenceCheckpoint,
-        max_tokens: usize,
-    ) -> Result<Step37DecodeState> {
-        if checkpoint.model_id != self.model_id {
-            return Err(Error::Format {
-                label: "Step-3.7 sequence checkpoint restore",
-                detail: "checkpoint was created by a different model instance".to_string(),
-            });
-        }
-        if max_tokens < checkpoint.position || checkpoint.kv_cache.len() != self.layers.len() {
-            return Err(Error::Shape {
-                label: "Step-3.7 sequence checkpoint restore",
-                expected: format!(
-                    "max_tokens >= {} and {} layer caches",
-                    checkpoint.position,
-                    self.layers.len()
-                ),
-                actual: format!(
-                    "max_tokens={max_tokens} layer_caches={}",
-                    checkpoint.kv_cache.len()
-                ),
-            });
-        }
-        let mut state = self.new_decode_state(max_tokens)?;
-        let stream = CudaStream::new_non_blocking()?;
-        for (destination, source) in state.kv_cache.iter_mut().zip(&checkpoint.kv_cache) {
-            destination.copy_aligned_prefix_from_on_stream(source, checkpoint.position, &stream)?;
-        }
-        stream.synchronize()?;
-        Ok(state)
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 
     /// Returns the checkpoint vocabulary size.
@@ -2106,22 +2056,31 @@ impl Step37TextModel {
     }
 
     /// Advances one sequence token without selecting from the resulting logits.
-    pub fn consume_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)
+    pub fn consume_one(
+        &mut self,
+        sequence: &mut Step37Sequence,
+        token: u32,
+        cache: &mut Step37SequenceCache,
+    ) -> Result<()> {
+        let target = self.reserve_token(sequence, cache)?;
+        let result = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        self.complete_token(sequence, cache, target, result)
     }
 
     /// Advances one sequence token and samples from its device-resident logits.
     pub fn sample_one(
         &mut self,
-        state: &mut Step37DecodeState,
+        sequence: &mut Step37Sequence,
         token: u32,
         sampling: &mut GpuSamplingRow<'_>,
+        cache: &mut Step37SequenceCache,
     ) -> Result<GpuSampledToken> {
-        self.forward_one(state, token)?;
-        state
+        self.forward_one(sequence, token, cache)?;
+        sequence
+            .state
             .sampler
             .sample(
-                &state.logits,
+                &sequence.state.logits,
                 std::slice::from_mut(sampling),
                 self.vocab,
                 &self.stream,
@@ -2135,30 +2094,85 @@ impl Step37TextModel {
     }
 
     /// Advances one sequence token and copies the resulting logits to the host.
-    pub fn logits_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<Vec<f32>> {
-        self.forward_one(state, token)?;
-        Ok(state.logits.copy_to_host(&self.stream)?.into_vec())
+    pub fn logits_one(
+        &mut self,
+        sequence: &mut Step37Sequence,
+        token: u32,
+        cache: &mut Step37SequenceCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_one(sequence, token, cache)?;
+        Ok(sequence.state.logits.copy_to_host(&self.stream)?.into_vec())
     }
 
     pub fn decode_one(
         &mut self,
-        state: &mut Step37DecodeState,
+        sequence: &mut Step37Sequence,
         token: u32,
+        cache: &mut Step37SequenceCache,
     ) -> Result<Step37NextToken> {
-        self.forward_one(state, token)?;
+        self.forward_one(sequence, token, cache)?;
         argmax_f32_into_on_stream(
-            &state.logits,
-            state.next_index.output(),
-            state.next_value.output(),
+            &sequence.state.logits,
+            sequence.state.next_index.output(),
+            sequence.state.next_value.output(),
             &self.stream,
         )?;
         Ok(Step37NextToken {
-            id: state.next_index.copy_to_host(&self.stream)?[0],
-            value: state.next_value.copy_to_host(&self.stream)?[0],
+            id: sequence.state.next_index.copy_to_host(&self.stream)?[0],
+            value: sequence.state.next_value.copy_to_host(&self.stream)?[0],
         })
     }
 
-    fn forward_hidden(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
+    fn reserve_token(
+        &self,
+        sequence: &mut Step37Sequence,
+        cache: &mut Step37SequenceCache,
+    ) -> Result<sequence_cache::AppendTarget> {
+        cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(step37_cache_error)
+    }
+
+    fn complete_token(
+        &self,
+        sequence: &mut Step37Sequence,
+        cache: &mut Step37SequenceCache,
+        target: sequence_cache::AppendTarget,
+        result: Result<()>,
+    ) -> Result<()> {
+        if let Err(error) = result {
+            cache.abort_append(target).map_err(step37_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                target,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(step37_cache_error)?;
+        sequence.state.position += 1;
+        Ok(())
+    }
+
+    fn forward_hidden_uncommitted(
+        &mut self,
+        sequence: &mut Step37Sequence,
+        token: u32,
+        cache: &mut Step37SequenceCache,
+        target: sequence_cache::AppendTarget,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
         if token as usize >= self.vocab {
             return Err(Error::Shape {
                 label: "Step-3.7 token",
@@ -2166,14 +2180,17 @@ impl Step37TextModel {
                 actual: token.to_string(),
             });
         }
-        let position = state
-            .kv_cache
-            .first()
-            .ok_or_else(|| Error::Format {
+        if state.model_id != self.model_id || state.position >= state.max_tokens {
+            return Err(Error::Shape {
                 label: "Step-3.7 decode state",
-                detail: "model has no KV caches".to_string(),
-            })?
-            .len();
+                expected: format!(
+                    "model {} and position below {}",
+                    self.model_id, state.max_tokens
+                ),
+                actual: format!("model={} position={}", state.model_id, state.position),
+            });
+        }
+        let position = state.position;
         state.token.copy_from_host(&[token])?;
         copy_bf16_row_to_f32_indexed_into_on_stream(
             self.vocab,
@@ -2190,20 +2207,40 @@ impl Step37TextModel {
             } else {
                 previous[layer - 1].output()
             };
-            self.layers[layer].run_one(
-                &mut current[0],
-                input,
-                &mut state.kv_cache[layer],
-                &mut state.kv_attention[layer],
-                position,
-                &self.stream,
-            )?;
+            cache
+                .with_append_page(target, |backend, page| {
+                    self.layers[layer].run_one(
+                        &mut current[0],
+                        input,
+                        Step37LayerCache {
+                            pool: backend.pool_mut(layer)?,
+                            page_slot: page.slot(),
+                            page_offset: target.page_offset(),
+                            page_table: sequence.page_table.device(),
+                            attention: &mut state.kv_attention[layer],
+                        },
+                        position,
+                        &self.stream,
+                    )?;
+                    Ok(())
+                })
+                .map_err(step37_cache_error)?;
         }
         Ok(())
     }
 
-    fn forward_one(&mut self, state: &mut Step37DecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)?;
+    fn forward_one(
+        &mut self,
+        sequence: &mut Step37Sequence,
+        token: u32,
+        cache: &mut Step37SequenceCache,
+    ) -> Result<()> {
+        let target = self.reserve_token(sequence, cache)?;
+        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        if let Err(error) = hidden {
+            return self.complete_token(sequence, cache, target, Err(error));
+        }
+        let state = &mut sequence.state;
         let last = state
             .layers
             .last()
@@ -2214,7 +2251,7 @@ impl Step37TextModel {
             .output();
         self.final_norm
             .run_into(last, &mut state.final_hidden, 1, HIDDEN, &self.stream)?;
-        match &self.lm_head {
+        let result = match &self.lm_head {
             Step37LmHead::Bf16(weight) => bf16_linear_logits_f32_into_on_stream(
                 &state.final_hidden,
                 weight,
@@ -2239,7 +2276,8 @@ impl Step37TextModel {
                     &self.stream,
                 )
             }
-        }
+        };
+        self.complete_token(sequence, cache, target, result)
     }
 
     /// Returns cumulative paging activity across all routed-expert layers.
@@ -2257,14 +2295,18 @@ impl Step37TextModel {
 }
 
 impl Step37DecodeState {
-    /// Returns the number of tokens retained in this sequence's KV cache.
+    /// Returns the number of tokens retained in this sequence.
     pub fn len(&self) -> usize {
-        self.kv_cache.first().map_or(0, Sm12xKvCache::len)
+        self.position
     }
 
     /// Returns whether this sequence has not consumed any tokens.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.position == 0
+    }
+
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
     }
 
     /// Returns exact device bytes owned by this sequence state and its scratch.
@@ -2275,11 +2317,6 @@ impl Step37DecodeState {
                 .layers
                 .iter()
                 .map(Step37LayerWorkspace::device_bytes)
-                .sum::<usize>()
-            + self
-                .kv_cache
-                .iter()
-                .map(Sm12xKvCache::device_bytes)
                 .sum::<usize>()
             + self
                 .kv_attention
@@ -2295,41 +2332,6 @@ impl Step37DecodeState {
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()
             + self.sampler.device_bytes()
-    }
-
-    /// Returns the device bytes needed to retain the current aligned KV prefix.
-    pub fn checkpoint_device_bytes(&self) -> Result<usize> {
-        let position = self.len();
-        if position == 0
-            || !position.is_multiple_of(128)
-            || self.kv_cache.iter().any(|cache| cache.len() != position)
-        {
-            return Err(Error::Shape {
-                label: "Step-3.7 sequence checkpoint byte estimate",
-                expected: "matching nonzero 128-token-aligned KV positions".to_string(),
-                actual: format!("position={position}"),
-            });
-        }
-        self.kv_cache.iter().try_fold(0usize, |total, cache| {
-            let bytes = cache.device_bytes_for_capacity(position)?;
-            total.checked_add(bytes).ok_or_else(|| Error::Shape {
-                label: "Step-3.7 sequence checkpoint byte estimate",
-                expected: "device-byte total without overflow".to_string(),
-                actual: format!("position={position}"),
-            })
-        })
-    }
-}
-
-impl Step37SequenceCheckpoint {
-    /// Returns the number of prompt tokens represented by this checkpoint.
-    pub fn position(&self) -> usize {
-        self.position
-    }
-
-    /// Returns the exact device bytes retained by this checkpoint.
-    pub fn device_bytes(&self) -> usize {
-        self.kv_cache.iter().map(Sm12xKvCache::device_bytes).sum()
     }
 }
 

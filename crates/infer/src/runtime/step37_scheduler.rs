@@ -1,18 +1,19 @@
 //! Multi-session scheduling for the paged Step-3.7 runtime.
 
-use super::prefix_cache::{
-    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
-};
+use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{
     RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
+use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
+use super::step37_sequence_cache::{Step37Sequence, Step37SequenceCache, step37_cache_error};
 use crate::step37::{
-    Step37DecodeState, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37SequenceCheckpoint,
-    Step37TextModel,
+    HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
 };
-use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
+use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -103,10 +104,9 @@ struct Step37Request {
     config: RequestConfig,
     prompt_tokens: Vec<u32>,
     prompt_position: usize,
-    prefix_cache_key: Option<PrefixCacheKey>,
     prefix_cache_target: usize,
     prefix_cache_checkpointed: bool,
-    sequence: Option<Box<Step37DecodeState>>,
+    sequence: Option<Box<Step37Sequence>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     sampler: Sampler,
@@ -180,7 +180,8 @@ pub struct Step37Scheduler {
     prefilling: VecDeque<Step37RequestId>,
     decoding: VecDeque<Step37RequestId>,
     next_id: u64,
-    prefix_cache: Option<PrefixCache<Step37SequenceCheckpoint>>,
+    sequence_cache: Step37SequenceCache,
+    cache_stream: CudaStream,
 }
 
 impl Step37Scheduler {
@@ -199,6 +200,103 @@ impl Step37Scheduler {
             config.prefill_token_capacity,
             config.max_context_tokens,
         )?;
+        let probe_backend = Sm12xPageBackend::new(
+            std::iter::repeat_n(true, model.layer_count()),
+            1,
+            KV_HEADS,
+            HEAD_DIM,
+        )?;
+        let page_bytes = probe_backend.page_bytes();
+        let private_state_bytes = model
+            .new_sequence_state(config.max_context_tokens)?
+            .device_bytes();
+        let page_table_bytes = Sm12xPageTable::new(config.max_context_tokens)?.managed_bytes();
+        let sampling_bytes =
+            model
+                .vocab()
+                .checked_mul(size_of::<u32>())
+                .ok_or_else(|| Error::Shape {
+                    label: "Step-3.7 sequence-cache sampling bytes",
+                    expected: "vocabulary byte count without overflow".to_string(),
+                    actual: model.vocab().to_string(),
+                })?;
+        let fixed_per_sequence = private_state_bytes
+            .checked_add(page_table_bytes)
+            .and_then(|bytes| bytes.checked_add(sampling_bytes))
+            .ok_or_else(|| Error::Shape {
+                label: "Step-3.7 sequence-cache fixed bytes",
+                expected: "per-sequence byte count without overflow".to_string(),
+                actual: format!(
+                    "private={private_state_bytes} table={page_table_bytes} sampling={sampling_bytes}"
+                ),
+            })?;
+        let fixed_capacity = fixed_per_sequence
+            .checked_mul(config.max_active_sequences)
+            .ok_or_else(|| Error::Shape {
+                label: "Step-3.7 sequence-cache fixed capacity",
+                expected: "active fixed-state byte count without overflow".to_string(),
+                actual: format!(
+                    "per_sequence={fixed_per_sequence} active={}",
+                    config.max_active_sequences
+                ),
+            })?;
+        let managed_bytes =
+            if prefix_cache.max_device_bytes == 0 {
+                let eager_pages = config
+                    .max_context_tokens
+                    .div_ceil(SM12X_KV_PAGE_TOKENS)
+                    .checked_mul(config.max_active_sequences)
+                    .ok_or_else(|| Error::Shape {
+                        label: "Step-3.7 sequence-cache fallback pages",
+                        expected: "page count without overflow".to_string(),
+                        actual: format!(
+                            "context={} active={}",
+                            config.max_context_tokens, config.max_active_sequences
+                        ),
+                    })?;
+                fixed_capacity
+                    .checked_add(eager_pages.checked_mul(page_bytes).ok_or_else(|| {
+                        Error::Shape {
+                            label: "Step-3.7 sequence-cache fallback page bytes",
+                            expected: "page byte count without overflow".to_string(),
+                            actual: format!("pages={eager_pages} page_bytes={page_bytes}"),
+                        }
+                    })?)
+                    .ok_or_else(|| Error::Shape {
+                        label: "Step-3.7 sequence-cache fallback capacity",
+                        expected: "managed byte count without overflow".to_string(),
+                        actual: format!("fixed={fixed_capacity} pages={eager_pages}"),
+                    })?
+            } else {
+                prefix_cache.max_device_bytes
+            };
+        let page_slots = managed_bytes.saturating_sub(fixed_capacity) / page_bytes;
+        if page_slots == 0 {
+            return Err(Error::Shape {
+                label: "Step-3.7 sequence-cache capacity",
+                expected: format!(
+                    "budget greater than fixed active capacity {fixed_capacity} and one {page_bytes}-byte page"
+                ),
+                actual: managed_bytes.to_string(),
+            });
+        }
+        let backend = Sm12xPageBackend::new(
+            std::iter::repeat_n(true, model.layer_count()),
+            page_slots,
+            KV_HEADS,
+            HEAD_DIM,
+        )?;
+        let sequence_cache = Step37SequenceCache::new(
+            CacheConfig {
+                page_tokens: SM12X_KV_PAGE_TOKENS,
+                max_managed_bytes: managed_bytes,
+                max_snapshot_bytes: 0,
+                max_prefix_entries: (prefix_cache.max_device_bytes == 0).then_some(0),
+                emergency_bytes: 0,
+            },
+            backend,
+        )
+        .map_err(step37_cache_error)?;
         Ok(Self {
             model,
             prefill_workspace,
@@ -208,8 +306,8 @@ impl Step37Scheduler {
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
             next_id: 0,
-            prefix_cache: (prefix_cache.max_device_bytes != 0)
-                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
+            sequence_cache,
+            cache_stream: CudaStream::new_blocking()?,
         })
     }
 
@@ -264,14 +362,6 @@ impl Step37Scheduler {
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
         let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt_tokens.len());
-        let prefix_cache_key = if prefix_cache_target == 0 {
-            None
-        } else {
-            self.prefix_cache
-                .as_mut()
-                .map(|cache| cache.prompt_key(&prompt_tokens, prefix_cache_target))
-                .transpose()?
-        };
         self.requests.insert(
             id,
             Box::new(Step37Request {
@@ -280,7 +370,6 @@ impl Step37Scheduler {
                 config,
                 prompt_tokens,
                 prompt_position: 0,
-                prefix_cache_key,
                 prefix_cache_target,
                 prefix_cache_checkpointed: false,
                 sequence: None,
@@ -330,33 +419,15 @@ impl Step37Scheduler {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
+            let prefix = self
+                .sequence_cache
+                .lookup_prefix(&self.requests[&id].prompt_tokens);
             let request = self
                 .requests
                 .get_mut(&id)
                 .expect("waiting request retained");
-            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
-                (Some(cache), Some(key)) => {
-                    cache.restore(key, Step37SequenceCheckpoint::position, |checkpoint| {
-                        self.model
-                            .restore_sequence_checkpoint(checkpoint, request.max_tokens().max(1))
-                    })?
-                }
-                _ => None,
-            };
-            let cached_prompt_tokens = restored.as_ref().map_or(0, Step37DecodeState::len);
-            let sequence = match restored
-                .map(Ok)
-                .unwrap_or_else(|| self.model.new_decode_state(request.max_tokens().max(1)))
-            {
-                Ok(sequence) => sequence,
-                Err(error) => {
-                    self.waiting.push_front(id);
-                    return Err(error);
-                }
-            };
-            request.prompt_position = cached_prompt_tokens;
-            request.prefix_cache_checkpointed =
-                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
+            let mut state = self.model.new_sequence_state(request.max_tokens().max(1))?;
+            let mut page_table = Sm12xPageTable::new(request.max_tokens().max(1))?;
             let device_token_counts = if request.config.sampling.supports_gpu_sampling()
                 && request.config.sampling.uses_history_penalties()
             {
@@ -366,6 +437,43 @@ impl Step37Scheduler {
             } else {
                 None
             };
+            let private_state_bytes = state.device_bytes()
+                + device_token_counts
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::device_bytes);
+            let outcome = self
+                .sequence_cache
+                .admit(
+                    prefix,
+                    AdmissionRequest {
+                        max_position: request.max_tokens().max(1),
+                        private_state_bytes,
+                        page_table_bytes: page_table.managed_bytes(),
+                        allow_emergency: false,
+                    },
+                    &mut Sm12xCacheContext {
+                        stream: &self.cache_stream,
+                        page_table: &mut page_table,
+                    },
+                    |_snapshot, position| {
+                        state.position = position;
+                        Ok(())
+                    },
+                )
+                .map_err(step37_cache_error)?;
+            let cache_id = match outcome {
+                AdmissionOutcome::Admitted(id) => id,
+                AdmissionOutcome::WouldBlock => {
+                    self.waiting.push_front(id);
+                    break;
+                }
+            };
+            self.cache_stream.synchronize()?;
+            let cached_prompt_tokens = state.len();
+            let sequence = Step37Sequence::from_admission(cache_id, page_table, state);
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_cache_checkpointed =
+                cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             request.sequence_device_bytes = sequence.device_bytes()
                 + device_token_counts
                     .as_ref()
@@ -439,7 +547,11 @@ impl Step37Scheduler {
             let token = request.apply_sample(sample);
             tick.generated.push(token);
             if request.lifecycle == RequestState::Finished {
-                request.sequence.take();
+                let sequence = request
+                    .sequence
+                    .take()
+                    .expect("finished admitted request has a sequence");
+                (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)?;
                 request.device_token_counts.take();
                 tick.finished.push(request.id);
             } else {
@@ -478,14 +590,18 @@ impl Step37Scheduler {
                 draw,
                 token_counts: request.device_token_counts.as_mut(),
             };
-            let sampled = self.model.sample_one(state, token, &mut row)?;
+            let sampled =
+                self.model
+                    .sample_one(state, token, &mut row, &mut self.sequence_cache)?;
             return Ok(SampledToken {
                 id: sampled.id,
                 logit: sampled.logit,
                 adjusted_logit: sampled.adjusted_logit,
             });
         }
-        let logits = self.model.logits_one(state, token)?;
+        let logits = self
+            .model
+            .logits_one(state, token, &mut self.sequence_cache)?;
         request.sampler.sample(&logits, &request.history)
     }
 
@@ -493,50 +609,37 @@ impl Step37Scheduler {
         if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
             return;
         }
-        let (Some(cache), Some(key), Some(sequence)) = (
-            self.prefix_cache.as_mut(),
-            request.prefix_cache_key.as_ref(),
-            request.sequence.as_deref(),
-        ) else {
-            return;
-        };
-        if sequence.len() != request.prefix_cache_target {
+        if self.sequence_cache.config().max_prefix_entries == Some(0) {
+            request.prefix_cache_checkpointed = true;
             return;
         }
-        if !cache.contains(key) {
-            let estimated_bytes = match sequence.checkpoint_device_bytes() {
-                Ok(device_bytes) => device_bytes,
-                Err(error) => {
-                    warn!(
-                        request = request.id.get(),
-                        %error,
-                        "failed to size Step prompt prefix checkpoint"
-                    );
-                    request.prefix_cache_checkpointed = true;
-                    return;
-                }
-            };
-            if cache.prepare_insert(estimated_bytes) {
-                let started = Instant::now();
-                match self.model.checkpoint_sequence(sequence) {
-                    Ok(checkpoint) => {
-                        cache.record_checkpoint(started);
-                        let device_bytes = checkpoint.device_bytes();
-                        if let Err(error) = cache.insert(key.clone(), checkpoint, device_bytes) {
-                            warn!(
-                                request = request.id.get(),
-                                %error,
-                                "failed to retain Step prompt prefix checkpoint"
-                            );
-                        }
-                    }
-                    Err(error) => warn!(
-                        request = request.id.get(),
-                        %error,
-                        "failed to copy Step prompt prefix checkpoint"
-                    ),
-                }
-            }
+        let Some(sequence) = request.sequence.as_deref_mut() else {
+            return;
+        };
+        if sequence.position() != request.prefix_cache_target {
+            return;
+        }
+        if self
+            .sequence_cache
+            .contains_prefix(&request.prompt_tokens, request.prefix_cache_target)
+        {
+            request.prefix_cache_checkpointed = true;
+            return;
+        }
+        if let Err(error) = self.sequence_cache.retain_prefix(
+            sequence.cache_id,
+            &request.prompt_tokens,
+            (),
+            &mut Sm12xCacheContext {
+                stream: &self.cache_stream,
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            warn!(
+                request = request.id.get(),
+                %error,
+                "failed to retain shared Step prompt prefix"
+            );
         }
         request.prefix_cache_checkpointed = true;
     }
@@ -576,6 +679,8 @@ impl Step37Scheduler {
             }
             let mut chunk = available.min(token_budget.div_ceil(slots_remaining));
             let request = &self.requests[&id];
+            chunk =
+                chunk.min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS);
             if !request.prefix_cache_checkpointed
                 && request.prompt_position < request.prefix_cache_target
                 && request.prompt_position + chunk > request.prefix_cache_target
@@ -607,18 +712,21 @@ impl Step37Scheduler {
                     let end = start + chunk;
                     Step37PrefillRow {
                         token_ids: &request.prompt_tokens[start..end],
-                        state: request
+                        sequence: request
                             .sequence
                             .as_deref_mut()
-                            .expect("prefilling request has admitted sequence state"),
+                            .expect("prefilling request has admitted sequence"),
                     }
                 })
                 .collect::<Vec<_>>();
             for &(id, _) in &selected {
                 on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             }
-            self.model
-                .prefill_batch(&mut self.prefill_workspace, &mut rows)
+            self.model.prefill_batch(
+                &mut self.prefill_workspace,
+                &mut rows,
+                &mut self.sequence_cache,
+            )
         };
         if let Err(error) = result {
             for request in requests.into_iter().rev() {
@@ -651,10 +759,15 @@ impl Step37Scheduler {
         self.waiting.retain(|queued| *queued != id);
         self.prefilling.retain(|queued| *queued != id);
         self.decoding.retain(|queued| *queued != id);
-        let request = self
+        let mut request = self
             .requests
             .remove(&id)
             .expect("cancellation target retained");
+        if let Some(sequence) = request.sequence.take()
+            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)
+        {
+            warn!(request = id.get(), %error, "failed to release cancelled Step sequence state");
+        }
         Step37CancelOutcome::Cancelled(Step37CancelledRequest {
             id,
             prompt_tokens: request.prompt_tokens,

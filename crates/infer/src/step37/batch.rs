@@ -14,6 +14,11 @@ const MAX_Q_HEADS: usize = 96;
 /// One ragged prompt chunk and its persistent Step sequence state.
 pub struct Step37PrefillRow<'tokens, 'state> {
     pub token_ids: &'tokens [u32],
+    pub sequence: &'state mut Step37Sequence,
+}
+
+struct Step37PrefillStateRow<'tokens, 'state> {
+    token_ids: &'tokens [u32],
     pub state: &'state mut Step37DecodeState,
 }
 
@@ -253,6 +258,87 @@ impl Step37TextModel {
         &mut self,
         workspace: &mut Step37PrefillBatchWorkspace,
         rows: &mut [Step37PrefillRow<'_, '_>],
+        cache: &mut Step37SequenceCache,
+    ) -> Result<()> {
+        let mut targets = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let target = match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    for target in targets.drain(..) {
+                        cache.abort_append(target).map_err(step37_cache_error)?;
+                    }
+                    return Err(step37_cache_error(error));
+                }
+            };
+            if target.max_rows() != row.token_ids.len() {
+                cache.abort_append(target).map_err(step37_cache_error)?;
+                for target in targets.drain(..) {
+                    cache.abort_append(target).map_err(step37_cache_error)?;
+                }
+                return Err(Error::Shape {
+                    label: "Step-3.7 prefill chunk",
+                    expected: format!(
+                        "each row to fit within its current {}-token cache page",
+                        nvfp4::SM12X_KV_PAGE_TOKENS
+                    ),
+                    actual: format!("{} tokens", row.token_ids.len()),
+                });
+            }
+            targets.push(target);
+        }
+        let result = {
+            let mut state_rows = Vec::with_capacity(rows.len());
+            let mut appends = Vec::with_capacity(rows.len());
+            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+                let sequence = &mut *row.sequence;
+                state_rows.push(Step37PrefillStateRow {
+                    token_ids: row.token_ids,
+                    state: &mut sequence.state,
+                });
+                appends.push(Step37Append {
+                    target,
+                    page_table: sequence.page_table.device(),
+                });
+            }
+            self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
+        };
+        if let Err(error) = result {
+            for target in targets {
+                cache.abort_append(target).map_err(step37_cache_error)?;
+            }
+            return Err(error);
+        }
+        for (row, target) in rows.iter_mut().zip(targets) {
+            let tokens = row.token_ids.len();
+            cache
+                .commit_append(
+                    target,
+                    tokens,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(step37_cache_error)?;
+            row.sequence.state.position += tokens;
+        }
+        Ok(())
+    }
+
+    fn prefill_batch_impl(
+        &mut self,
+        workspace: &mut Step37PrefillBatchWorkspace,
+        rows: &mut [Step37PrefillStateRow<'_, '_>],
+        cache: &mut Step37SequenceCache,
+        appends: &[Step37Append<'_>],
     ) -> Result<()> {
         if rows.is_empty() || rows.len() > workspace.sequence_capacity {
             return Err(Error::Shape {
@@ -295,7 +381,7 @@ impl Step37TextModel {
                     actual: token.to_string(),
                 });
             }
-            let position = row.state.kv_cache[0].len();
+            let position = row.state.position;
             let end = position
                 .checked_add(row.token_ids.len())
                 .ok_or_else(|| Error::Shape {
@@ -310,15 +396,11 @@ impl Step37TextModel {
                     actual: format!("end={end}"),
                 });
             }
-            if row
-                .state
-                .kv_cache
-                .iter()
-                .any(|cache| cache.len() != position)
-            {
-                return Err(Error::Format {
+            if end > row.state.max_tokens {
+                return Err(Error::Shape {
                     label: "Step-3.7 prefill state",
-                    detail: "layer KV positions disagree".to_string(),
+                    expected: format!("end <= {}", row.state.max_tokens),
+                    actual: format!("end={end}"),
                 });
             }
         }
@@ -346,6 +428,8 @@ impl Step37TextModel {
                 rows,
                 total_tokens,
                 &self.stream,
+                cache,
+                appends,
             )?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
         }
@@ -353,13 +437,16 @@ impl Step37TextModel {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_layer_prefill(
     layer: &mut Step37Layer,
     layer_index: usize,
     workspace: &mut Step37PrefillBatchWorkspace,
-    rows: &mut [Step37PrefillRow<'_, '_>],
+    rows: &mut [Step37PrefillStateRow<'_, '_>],
     total_tokens: usize,
     stream: &CudaStream,
+    cache: &mut Step37SequenceCache,
+    appends: &[Step37Append<'_>],
 ) -> Result<()> {
     let capacity = workspace.token_capacity;
     layer.input_norm.run_into(
@@ -383,6 +470,8 @@ fn run_layer_prefill(
         layer_index,
         capacity,
         stream,
+        cache,
+        appends,
     )?;
     add_f32_into_on_stream(
         &workspace.hidden,
@@ -498,10 +587,12 @@ fn run_attention_prefill(
     workspace: &mut Step37BatchAttentionWorkspace,
     linear: &mut Step37BatchLinearWorkspace,
     input: &DeviceBuffer<f32>,
-    rows: &mut [Step37PrefillRow<'_, '_>],
+    rows: &mut [Step37PrefillStateRow<'_, '_>],
     layer_index: usize,
     capacity: usize,
     stream: &CudaStream,
+    cache: &mut Step37SequenceCache,
+    appends: &[Step37Append<'_>],
 ) -> Result<()> {
     debug_assert_eq!(workspace.q_heads, attention.q_heads);
     linear.run(&attention.q, input, &mut workspace.q, capacity, stream)?;
@@ -522,8 +613,8 @@ fn run_attention_prefill(
         stream,
     )?;
     let mut row_offset = 0;
-    for row in rows.iter_mut() {
-        let position = row.state.kv_cache[layer_index].len();
+    for (row, append) in rows.iter_mut().zip(appends) {
+        let position = row.state.position;
         rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream(
             row.token_ids.len(),
             attention.q_heads,
@@ -548,19 +639,42 @@ fn run_attention_prefill(
             position,
             stream,
         )?;
-        workspace
-            .compact
-            .append_causal_rows_at_offset_into_on_stream(
-                &mut row.state.kv_cache[layer_index],
-                &workspace.q_rope,
-                &workspace.k_rope,
-                &workspace.v,
-                row_offset,
-                row.token_ids.len(),
-                attention.window,
-                workspace.attended.output(),
-                stream,
-            )?;
+        cache
+            .with_append_page(append.target, |backend, page| {
+                let pool = backend.pool_mut(layer_index)?;
+                let q_width = attention.q_heads * HEAD_DIM;
+                let kv_width = KV_HEADS * HEAD_DIM;
+                for token in 0..row.token_ids.len() {
+                    pool.append_at_offsets_on_stream(
+                        page.slot(),
+                        append.target.page_offset() + token,
+                        &workspace.k_rope,
+                        (row_offset + token) * kv_width,
+                        &workspace.v,
+                        (row_offset + token) * kv_width,
+                        stream,
+                    )?;
+                    let cache_len = position + token + 1;
+                    let window_start = attention
+                        .window
+                        .map_or(0, |window| cache_len.saturating_sub(window));
+                    workspace
+                        .compact
+                        .attention_paged_window_offsets_into_on_stream(
+                            pool,
+                            append.page_table,
+                            cache_len,
+                            &workspace.q_rope,
+                            (row_offset + token) * q_width,
+                            workspace.attended.output(),
+                            (row_offset + token) * q_width,
+                            window_start,
+                            stream,
+                        )?;
+                }
+                Ok(())
+            })
+            .map_err(step37_cache_error)?;
         row_offset += row.token_ids.len();
     }
     linear.run(

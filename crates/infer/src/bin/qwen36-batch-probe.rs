@@ -1,6 +1,6 @@
 use infer::nvfp4::{CudaStream, Error, Result};
 use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
-use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
+use infer::runtime::qwen36_sequence::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 

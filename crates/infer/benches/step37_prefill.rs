@@ -1,3 +1,7 @@
+use infer::nvfp4::CudaStream;
+use infer::runtime::step37_sequence_cache::{
+    Step37Sequence, Step37SequenceCache, new_step37_sequence_cache,
+};
 use infer::step37::{Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -15,6 +19,8 @@ const MAX_CONTEXT_TOKENS: usize = 256;
 struct PrefillCase {
     model: Step37TextModel,
     workspace: Step37PrefillBatchWorkspace,
+    cache: Step37SequenceCache,
+    stream: CudaStream,
     prompt: Vec<u32>,
 }
 
@@ -40,18 +46,25 @@ fn repeated_sample(
     let mut operations = 0;
     for _ in 0..chunk_size {
         let mut case = context.case.borrow_mut();
-        let mut state = case
-            .model
-            .new_decode_state(MAX_CONTEXT_TOKENS)
-            .expect("repeated prefill state");
         let prompt = case.prompt.clone();
+        let PrefillCase {
+            model,
+            cache,
+            stream,
+            ..
+        } = &mut *case;
+        let mut sequence = Step37Sequence::admit(model, cache, MAX_CONTEXT_TOKENS, stream)
+            .expect("repeated prefill state");
         let started = Instant::now();
         for token in prompt.iter().copied() {
-            case.model
-                .consume_one(&mut state, token)
+            model
+                .consume_one(&mut sequence, token, cache)
                 .expect("repeated prefill token");
         }
         black_box(started.elapsed());
+        sequence
+            .finish(cache, stream)
+            .expect("finish repeated sequence");
         operations += prompt.len() as u64;
     }
     BenchSampleResult::operations(operations)
@@ -65,26 +78,41 @@ fn batch_sample(
     let mut operations = 0;
     for _ in 0..chunk_size {
         let mut case = context.case.borrow_mut();
-        let mut state = case
-            .model
-            .new_decode_state(MAX_CONTEXT_TOKENS)
-            .expect("batch prefill state");
         let prompt = case.prompt.clone();
         let PrefillCase {
-            model, workspace, ..
+            model,
+            workspace,
+            cache,
+            stream,
+            ..
         } = &mut *case;
+        let mut sequence = Step37Sequence::admit(model, cache, MAX_CONTEXT_TOKENS, stream)
+            .expect("batch prefill state");
         let mut rows = [Step37PrefillRow {
             token_ids: &prompt,
-            state: &mut state,
+            sequence: &mut sequence,
         }];
         let started = Instant::now();
         model
-            .prefill_batch(workspace, &mut rows)
+            .prefill_batch(workspace, &mut rows, cache)
             .expect("batch prefill");
         black_box(started.elapsed());
+        sequence
+            .finish(cache, stream)
+            .expect("finish batch sequence");
         operations += prompt.len() as u64;
     }
     BenchSampleResult::operations(operations)
+}
+
+fn new_sequence(case: &mut PrefillCase) -> Step37Sequence {
+    Step37Sequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.stream,
+    )
+    .expect("admit benchmark sequence")
 }
 
 fn validate(case: &mut PrefillCase) {
@@ -92,35 +120,35 @@ fn validate(case: &mut PrefillCase) {
         .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
         .collect::<Vec<_>>();
     let final_token = 9707;
-    let mut repeated = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("repeated validation state");
+    let mut repeated = new_sequence(case);
     for token in prompt.iter().copied() {
         case.model
-            .consume_one(&mut repeated, token)
+            .consume_one(&mut repeated, token, &mut case.cache)
             .expect("repeated validation prefill");
     }
     let expected = case
         .model
-        .logits_one(&mut repeated, final_token)
+        .logits_one(&mut repeated, final_token, &mut case.cache)
         .expect("repeated validation logits");
+    repeated
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish repeated validation");
 
-    let mut batch = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("batch validation state");
+    let mut batch = new_sequence(case);
     let mut rows = [Step37PrefillRow {
         token_ids: &prompt,
-        state: &mut batch,
+        sequence: &mut batch,
     }];
     case.model
-        .prefill_batch(&mut case.workspace, &mut rows)
+        .prefill_batch(&mut case.workspace, &mut rows, &mut case.cache)
         .expect("validation batch prefill");
     let actual = case
         .model
-        .logits_one(&mut batch, final_token)
+        .logits_one(&mut batch, final_token, &mut case.cache)
         .expect("batch validation logits");
+    batch
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish batch validation");
     let top = |values: &[f32]| {
         values
             .iter()
@@ -146,23 +174,23 @@ fn validate(case: &mut PrefillCase) {
     );
     assert!(nrmse <= 0.12, "batched prefill nrmse={nrmse:.6}");
 
-    let mut split = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("split validation state");
+    let mut split = new_sequence(case);
     for chunk in [&prompt[..3], &prompt[3..]] {
         let mut rows = [Step37PrefillRow {
             token_ids: chunk,
-            state: &mut split,
+            sequence: &mut split,
         }];
         case.model
-            .prefill_batch(&mut case.workspace, &mut rows)
+            .prefill_batch(&mut case.workspace, &mut rows, &mut case.cache)
             .expect("split validation prefill");
     }
     let split_logits = case
         .model
-        .logits_one(&mut split, final_token)
+        .logits_one(&mut split, final_token, &mut case.cache)
         .expect("split validation logits");
+    split
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish split validation");
     assert_eq!(
         top(&split_logits),
         top(&expected),
@@ -171,48 +199,48 @@ fn validate(case: &mut PrefillCase) {
 
     let second_prompt = [3710, 9707, 3710, 9707, 3710];
     let second_final = 3710;
-    let mut second_repeated = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("second repeated validation state");
+    let mut second_repeated = new_sequence(case);
     for token in second_prompt {
         case.model
-            .consume_one(&mut second_repeated, token)
+            .consume_one(&mut second_repeated, token, &mut case.cache)
             .expect("second repeated validation prefill");
     }
     let second_expected = case
         .model
-        .logits_one(&mut second_repeated, second_final)
+        .logits_one(&mut second_repeated, second_final, &mut case.cache)
         .expect("second repeated validation logits");
-    let mut first_ragged = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("first ragged validation state");
-    let mut second_ragged = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("second ragged validation state");
+    second_repeated
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish second repeated validation");
+    let mut first_ragged = new_sequence(case);
+    let mut second_ragged = new_sequence(case);
     let mut rows = [
         Step37PrefillRow {
             token_ids: &prompt,
-            state: &mut first_ragged,
+            sequence: &mut first_ragged,
         },
         Step37PrefillRow {
             token_ids: &second_prompt,
-            state: &mut second_ragged,
+            sequence: &mut second_ragged,
         },
     ];
     case.model
-        .prefill_batch(&mut case.workspace, &mut rows)
+        .prefill_batch(&mut case.workspace, &mut rows, &mut case.cache)
         .expect("ragged validation prefill");
     let first_actual = case
         .model
-        .logits_one(&mut first_ragged, final_token)
+        .logits_one(&mut first_ragged, final_token, &mut case.cache)
         .expect("first ragged validation logits");
     let second_actual = case
         .model
-        .logits_one(&mut second_ragged, second_final)
+        .logits_one(&mut second_ragged, second_final, &mut case.cache)
         .expect("second ragged validation logits");
+    first_ragged
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish first ragged validation");
+    second_ragged
+        .finish(&mut case.cache, &case.stream)
+        .expect("finish second ragged validation");
     assert_eq!(
         top(&first_actual),
         top(&expected),
@@ -244,12 +272,16 @@ fn main() {
     let workspace = model
         .new_prefill_batch_workspace(2, TOKEN_CAPACITY, MAX_CONTEXT_TOKENS)
         .expect("prefill workspace");
+    let cache = new_step37_sequence_cache(&model, 2, MAX_CONTEXT_TOKENS).expect("sequence cache");
+    let stream = CudaStream::new_non_blocking().expect("sequence-cache stream");
     let prompt = (0..TOKEN_CAPACITY)
         .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
         .collect();
     let case = Rc::new(RefCell::new(PrefillCase {
         model,
         workspace,
+        cache,
+        stream,
         prompt,
     }));
     validate(&mut case.borrow_mut());

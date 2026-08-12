@@ -1,6 +1,7 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
-use infer::nvfp4::{Error, Result};
+use infer::nvfp4::{CudaStream, Error, Result};
+use infer::runtime::step37_sequence_cache::{Step37Sequence, new_step37_sequence_cache};
 use infer::step37::{
     Step37Bf16Storage, Step37Bf16StorageConfig, Step37PagingStats, Step37TextModel,
 };
@@ -67,9 +68,12 @@ fn main() -> Result<()> {
     let load_started = Instant::now();
     let mut model =
         Step37TextModel::open_with_bf16_storage(model_dir, capacity as usize, bf16_storage)?;
+    let mut cache = new_step37_sequence_cache(&model, 1, tokens as usize)?;
+    let cache_stream = CudaStream::new_non_blocking()?;
     let load_elapsed = load_started.elapsed();
     for pass in 0..passes {
-        let mut state = model.new_decode_state(tokens as usize)?;
+        let mut sequence =
+            Step37Sequence::admit(&model, &mut cache, tokens as usize, &cache_stream)?;
         let pass_start_stats = model.expert_paging_stats();
         let decode_started = Instant::now();
         let mut input = token;
@@ -79,7 +83,7 @@ fn main() -> Result<()> {
         for step in 0..tokens {
             let token_started = Instant::now();
             let token_start_stats = model.expert_paging_stats();
-            let next = model.decode_one(&mut state, input)?;
+            let next = model.decode_one(&mut sequence, input, &mut cache)?;
             let token_elapsed = token_started.elapsed();
             let token_stats = subtract_stats(model.expert_paging_stats(), token_start_stats);
             if tokens <= 64 {
@@ -114,6 +118,7 @@ fn main() -> Result<()> {
                 window_start_stats = model.expert_paging_stats();
             }
         }
+        sequence.finish(&mut cache, &cache_stream)?;
         let decode_elapsed = decode_started.elapsed();
         let stats = subtract_stats(model.expert_paging_stats(), pass_start_stats);
         let lookups = stats.hits + stats.misses;

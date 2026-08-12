@@ -3,7 +3,7 @@ use infer::nvfp4::{
     nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
 use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
-use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
+use infer::runtime::qwen36_sequence::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 

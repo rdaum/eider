@@ -2331,7 +2331,8 @@ extern "C" cudaError_t infer_sm12x_kv_paged_attention_on_stream(
     std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
     std::uint8_t* probability_tiles, std::uint32_t* probability_scales,
     float* partial_output, float* output,
-    std::uint32_t cache_len, std::uint32_t max_tokens, std::uint32_t page_tokens,
+    std::uint32_t cache_len, std::uint32_t window_start, std::uint32_t max_tokens,
+    std::uint32_t page_tokens,
     std::uint32_t page_stride_bytes, std::uint32_t q_heads,
     std::uint32_t kv_heads, std::uint32_t head_dim, std::uint32_t pv_splits,
     cudaStream_t stream) {
@@ -2339,7 +2340,7 @@ extern "C" cudaError_t infer_sm12x_kv_paged_attention_on_stream(
     return infer_sm12x_kv_attention_impl(
         query, key_values, key_scales, key_tail, value_values, value_scales, value_tail,
         query_tiles, query_scales, scores, probability_tiles, probability_scales,
-        partial_output, output, cache_len, 0, max_tokens, q_heads, kv_heads, head_dim,
+        partial_output, output, cache_len, window_start, max_tokens, q_heads, kv_heads, head_dim,
         pv_splits, page_table, page_tokens, page_stride_bytes, stream);
 }
 

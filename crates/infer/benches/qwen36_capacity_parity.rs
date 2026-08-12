@@ -3,7 +3,7 @@ use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8AttentionStorage, Qwen36TextModel,
 };
-use infer::runtime::qwen36_sequence_cache::{
+use infer::runtime::qwen36_sequence::{
     Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
 };
 use micromeasure::{

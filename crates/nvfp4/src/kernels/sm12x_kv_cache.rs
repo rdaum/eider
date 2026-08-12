@@ -1781,8 +1781,35 @@ impl Sm12xKvAttentionWorkspace {
         cache_len: usize,
         query: &DeviceBuffer<f32>,
         query_offset: usize,
+        output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.attention_paged_window_offsets_into_on_stream(
+            pool,
+            page_table,
+            cache_len,
+            query,
+            query_offset,
+            output,
+            output_offset,
+            0,
+            stream,
+        )
+    }
+
+    /// Enqueues compact windowed attention through a stable device page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_window_offsets_into_on_stream(
+        &mut self,
+        pool: &Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        cache_len: usize,
+        query: &DeviceBuffer<f32>,
+        query_offset: usize,
         mut output: DeviceOutput<'_, f32>,
         output_offset: usize,
+        window_start: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         let logical_capacity = page_table
@@ -1795,6 +1822,7 @@ impl Sm12xKvAttentionWorkspace {
             })?;
         if cache_len == 0
             || cache_len > logical_capacity
+            || window_start >= cache_len
             || logical_capacity > self.max_tokens
             || pool.kv_heads != self.kv_heads
             || pool.head_dim != self.head_dim
@@ -1851,6 +1879,7 @@ impl Sm12xKvAttentionWorkspace {
                     self.pv_partials.as_mut_ptr().cast(),
                     output.as_mut_ptr().cast::<f32>().add(output_offset),
                     cache_len as u32,
+                    window_start as u32,
                     logical_capacity as u32,
                     SM12X_KV_PAGE_TOKENS as u32,
                     layout.total_bytes as u32,
@@ -2272,6 +2301,42 @@ mod tests {
                     .copy_to_host(&stream)
                     .expect("contiguous output read"),
                 "cache_len={cache_len}"
+            );
+            let window_start = cache_len.saturating_sub(17);
+            let mut contiguous_window =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("contiguous window output");
+            workspace
+                .attention_window_into_on_stream(
+                    &contiguous,
+                    &query,
+                    contiguous_window.output(),
+                    window_start,
+                    &stream,
+                )
+                .expect("contiguous window attention");
+            let mut paged_window =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("paged window output");
+            workspace
+                .attention_paged_window_offsets_into_on_stream(
+                    &pool,
+                    &page_table,
+                    cache_len,
+                    &query,
+                    0,
+                    paged_window.output(),
+                    0,
+                    window_start,
+                    &stream,
+                )
+                .expect("paged window attention");
+            assert_eq!(
+                paged_window
+                    .copy_to_host(&stream)
+                    .expect("paged window output read"),
+                contiguous_window
+                    .copy_to_host(&stream)
+                    .expect("contiguous window output read"),
+                "windowed cache_len={cache_len} window_start={window_start}"
             );
         }
 

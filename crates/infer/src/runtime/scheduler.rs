@@ -1,10 +1,9 @@
 //! Tokenized Qwen3.6 scheduling over chunked prefill and batched decode.
 
 use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
-use super::qwen36_sequence_cache::{
-    Qwen36CacheContext, Qwen36PageBackend, Qwen36PageTable, Qwen36Sequence, Qwen36SequenceCache,
-};
+use super::qwen36_sequence::{Qwen36Sequence, Qwen36SequenceCache};
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36NextToken, Qwen36PrefillBatchWorkspace,
     Qwen36PrefillRow, Qwen36TextModel,
@@ -342,15 +341,19 @@ impl<'model> Qwen36Scheduler<'model> {
             .into_iter()
             .map(|capacity| model.new_decode_batch_workspace(capacity, config.max_context_tokens))
             .collect::<Result<Vec<_>>>()?;
-        let probe_backend = Qwen36PageBackend::new(
-            &model.manifest().layer_kinds,
+        let probe_backend = Sm12xPageBackend::new(
+            model
+                .manifest()
+                .layer_kinds
+                .iter()
+                .map(|kind| *kind == crate::qwen3::infer::QwenLayerKind::FullAttention),
             1,
             model.manifest().kv_heads,
             model.manifest().head_dim,
         )?;
         let page_bytes = probe_backend.page_bytes();
         let private_state_bytes = model.new_sequence_state(1)?.device_bytes();
-        let page_table_bytes = Qwen36PageTable::new(config.max_context_tokens)?.managed_bytes();
+        let page_table_bytes = Sm12xPageTable::new(config.max_context_tokens)?.managed_bytes();
         let sampling_bytes = model
             .manifest()
             .vocab
@@ -428,8 +431,12 @@ impl<'model> Qwen36Scheduler<'model> {
                 actual: managed_bytes.to_string(),
             });
         }
-        let backend = Qwen36PageBackend::new(
-            &model.manifest().layer_kinds,
+        let backend = Sm12xPageBackend::new(
+            model
+                .manifest()
+                .layer_kinds
+                .iter()
+                .map(|kind| *kind == crate::qwen3::infer::QwenLayerKind::FullAttention),
             page_slots,
             model.manifest().kv_heads,
             model.manifest().head_dim,
@@ -588,7 +595,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 .get_mut(&id)
                 .expect("waiting request is retained");
             let mut sequence = model.new_sequence_state(request.max_tokens().max(1))?;
-            let mut page_table = Qwen36PageTable::new(request.max_tokens().max(1))?;
+            let mut page_table = Sm12xPageTable::new(request.max_tokens().max(1))?;
             let device_token_counts = if request.config.sampling.supports_gpu_sampling()
                 && request.config.sampling.uses_history_penalties()
             {
@@ -613,7 +620,7 @@ impl<'model> Qwen36Scheduler<'model> {
                         page_table_bytes,
                         allow_emergency: false,
                     },
-                    &mut Qwen36CacheContext {
+                    &mut Sm12xCacheContext {
                         stream: &self.cache_stream,
                         page_table: &mut page_table,
                     },
@@ -858,7 +865,7 @@ impl<'model> Qwen36Scheduler<'model> {
             sequence.cache_id,
             &request.prompt_tokens,
             snapshot,
-            &mut Qwen36CacheContext {
+            &mut Sm12xCacheContext {
                 stream: &self.cache_stream,
                 page_table: &mut sequence.page_table,
             },
