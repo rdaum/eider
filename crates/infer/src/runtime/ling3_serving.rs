@@ -2,11 +2,14 @@
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::ling3_sequence_cache::{
+    Ling3Sequence, Ling3SequenceCache, admit_ling3_sequence, new_ling3_sequence_cache,
+};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::ling3::{Ling3Model, Ling3ModelState, Ling3ModelWorkspace};
+use crate::ling3::Ling3Model;
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -76,17 +79,6 @@ pub enum Ling3CancelOutcome {
     NotFound,
 }
 
-struct Ling3Sequence {
-    state: Ling3ModelState,
-    workspace: Ling3ModelWorkspace,
-}
-
-impl Ling3Sequence {
-    fn device_bytes(&self) -> usize {
-        self.state.device_bytes() + self.workspace.device_bytes()
-    }
-}
-
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
@@ -108,6 +100,7 @@ pub struct Ling3ChatService<'model, 'template> {
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
     stream: CudaStream,
+    sequence_cache: Ling3SequenceCache,
     next_id: u64,
     waiting: VecDeque<Ling3RequestId>,
     requests: BTreeMap<Ling3RequestId, ActiveRequest<'template>>,
@@ -128,11 +121,18 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
                 actual: format!("{} tokens", config.max_context_tokens),
             });
         }
+        let stream = CudaStream::new_non_blocking()?;
+        let sequence_cache = new_ling3_sequence_cache(
+            model,
+            config.max_active_sequences,
+            config.max_context_tokens,
+        )?;
         Ok(Self {
             model,
             template,
             config,
-            stream: CudaStream::new_non_blocking()?,
+            stream,
+            sequence_cache,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -280,7 +280,10 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             .sequence
             .as_ref()
             .map_or(0, Ling3Sequence::device_bytes);
-        if request.sequence.is_some() {
+        if let Some(sequence) = request.sequence {
+            if let Err(error) = sequence.finish(&self.stream, &mut self.sequence_cache) {
+                tracing::warn!(%error, request_id = id.get(), "failed to release cancelled Ling sequence");
+            }
             self.active_sequences -= 1;
         }
         Ling3CancelOutcome::Cancelled {
@@ -304,11 +307,16 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let mut state = self.model.new_state(capacity.max(1))?;
-            let mut workspace = self.model.new_workspace()?;
-            self.model
-                .prepare_decode_graphs(&mut state, &mut workspace, &self.stream)?;
-            let sequence = Ling3Sequence { state, workspace };
+            let Some(sequence) = admit_ling3_sequence(
+                self.model,
+                &mut self.sequence_cache,
+                capacity.max(1),
+                &self.stream,
+            )?
+            else {
+                self.waiting.push_front(id);
+                break;
+            };
             let progress = Ling3AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: sequence.device_bytes(),
@@ -343,14 +351,12 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             let end = start + chunk;
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             let sequence = request.sequence.as_mut().expect("request is admitted");
-            for &token in &request.prompt[start..end] {
-                self.model.decode_token(
-                    token,
-                    &mut sequence.state,
-                    &mut sequence.workspace,
-                    &self.stream,
-                )?;
-            }
+            self.model.prefill(
+                sequence,
+                &mut self.sequence_cache,
+                &request.prompt[start..end],
+                &self.stream,
+            )?;
             request.prompt_position = end;
             request.prompt_logits_ready = end == request.prompt.len();
             tick.prefilled.push(Ling3PrefillProgress {
@@ -378,8 +384,8 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
                 request
                     .last_token
                     .expect("generated token exists after prompt logits"),
-                &mut sequence.state,
-                &mut sequence.workspace,
+                sequence,
+                &mut self.sequence_cache,
                 &self.stream,
             )?;
         }
@@ -431,11 +437,12 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let released = request
+        let sequence = request
             .sequence
             .take()
-            .expect("terminal request is admitted")
-            .device_bytes();
+            .expect("terminal request is admitted");
+        let released = sequence.device_bytes();
+        sequence.finish(&self.stream, &mut self.sequence_cache)?;
         self.active_sequences -= 1;
         tick.finished.push(Ling3Finished {
             request_id: id,

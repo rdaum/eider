@@ -10678,6 +10678,77 @@ pub fn ling3_mla_attention_f32_into_on_stream(
     }
 }
 
+/// Computes one-token Ling MLA attention over physical F32 KV pages.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_mla_paged_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_pool: &DeviceBuffer<f32>,
+    value_pool: &DeviceBuffer<f32>,
+    page_table: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    cache_len: usize,
+    page_tokens: usize,
+    heads: usize,
+    qk_dim: usize,
+    value_dim: usize,
+    scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_len = heads.saturating_mul(qk_dim);
+    let output_len = heads.saturating_mul(value_dim);
+    let pages = cache_len.div_ceil(page_tokens);
+    if cache_len == 0
+        || page_tokens == 0
+        || heads == 0
+        || qk_dim == 0
+        || qk_dim > 512
+        || value_dim == 0
+        || value_dim > 256
+        || [cache_len, page_tokens, heads, qk_dim, value_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query.len() != query_len
+        || !key_pool.len().is_multiple_of(page_tokens * query_len)
+        || !value_pool.len().is_multiple_of(page_tokens * output_len)
+        || page_table.len() < pages
+        || output.len() != output_len
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 paged MLA attention",
+            expected: format!("query={query_len} aligned pools table>={pages} output={output_len}"),
+            actual: format!(
+                "query={} keys={} values={} table={} output={} cache={cache_len} page={page_tokens}",
+                query.len(),
+                key_pool.len(),
+                value_pool.len(),
+                page_table.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_paged_attention_f32_on_stream",
+            ffi::infer_ling3_mla_paged_attention_f32_on_stream(
+                query.ptr,
+                key_pool.ptr,
+                value_pool.ptr,
+                page_table.ptr,
+                output.buffer_mut().ptr,
+                cache_len as u32,
+                page_tokens as u32,
+                heads as u32,
+                qk_dim as u32,
+                value_dim as u32,
+                scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Computes Qwen3.6 GDN gates for every row in a decode batch.
 #[allow(clippy::too_many_arguments)]
 pub fn qwen36_gdn_gate_batch_into_on_stream(
@@ -16736,6 +16807,53 @@ mod tests {
             &expected,
             2.0e-6,
             "Ling MLA attention",
+        );
+
+        let page_tokens = 2usize;
+        let page_table = [2u32, 0];
+        let page_slots = 3usize;
+        let mut paged_keys = vec![0.0; page_slots * page_tokens * heads * qk_dim];
+        let mut paged_values = vec![0.0; page_slots * page_tokens * heads * value_dim];
+        for token in 0..cache_len {
+            let slot = page_table[token / page_tokens] as usize;
+            let row = slot * page_tokens + token % page_tokens;
+            let key_width = heads * qk_dim;
+            let value_width = heads * value_dim;
+            paged_keys[row * key_width..(row + 1) * key_width].copy_from_slice(
+                &key_cache.copy_to_host(&stream).unwrap()
+                    [token * key_width..(token + 1) * key_width],
+            );
+            paged_values[row * value_width..(row + 1) * value_width].copy_from_slice(
+                &value_cache.copy_to_host(&stream).unwrap()
+                    [token * value_width..(token + 1) * value_width],
+            );
+        }
+        let paged_keys = DeviceBuffer::from_host(&paged_keys).expect("paged keys");
+        let paged_values = DeviceBuffer::from_host(&paged_values).expect("paged values");
+        let page_table = DeviceBuffer::from_host(&page_table).expect("page table");
+        let mut paged_output = DeviceBuffer::zeroed(heads * value_dim).expect("paged output");
+        ling3_mla_paged_attention_f32_into_on_stream(
+            &query,
+            &paged_keys,
+            &paged_values,
+            &page_table,
+            paged_output.output(),
+            cache_len,
+            page_tokens,
+            heads,
+            qk_dim,
+            value_dim,
+            scale,
+            &stream,
+        )
+        .expect("paged MLA attention");
+        assert_close(
+            &paged_output
+                .copy_to_host(&stream)
+                .expect("paged output download"),
+            &expected,
+            2.0e-6,
+            "Ling paged MLA attention",
         );
     }
 

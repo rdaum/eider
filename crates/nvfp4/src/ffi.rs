@@ -2922,6 +2922,20 @@ unsafe extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_paged_attention_f32_on_stream(
+        query: *const f32,
+        key_pool: *const f32,
+        value_pool: *const f32,
+        page_table: *const u32,
+        output: *mut f32,
+        cache_len: u32,
+        page_tokens: u32,
+        heads: u32,
+        qk_dim: u32,
+        value_dim: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_qwen36_gdn_prep_batch_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,

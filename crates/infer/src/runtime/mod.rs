@@ -15,6 +15,7 @@ pub mod generation;
 pub mod kv_cache;
 pub mod laguna_sequence_cache;
 pub mod laguna_serving;
+pub mod ling3_sequence_cache;
 pub mod ling3_serving;
 pub mod muse_glimmer_sequence_cache;
 pub mod muse_glimmer_serving;

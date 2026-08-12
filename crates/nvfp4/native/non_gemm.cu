@@ -10129,6 +10129,94 @@ extern "C" cudaError_t infer_ling3_mla_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_ling3_mla_paged_attention_f32_kernel(
+    const float* query,
+    const float* key_pool,
+    const float* value_pool,
+    const std::uint32_t* page_table,
+    float* output,
+    std::uint32_t cache_len,
+    std::uint32_t page_tokens,
+    std::uint32_t heads,
+    std::uint32_t qk_dim,
+    std::uint32_t value_dim,
+    float scale) {
+    const std::uint32_t head = blockIdx.x;
+    if (head >= heads) return;
+    const float* q = query + head * qk_dim;
+    __shared__ float score;
+    __shared__ float maximum;
+    __shared__ float denominator;
+    if (threadIdx.x == 0) maximum = -INFINITY;
+    __syncthreads();
+    for (std::uint32_t token = 0; token < cache_len; ++token) {
+        const std::uint32_t slot = page_table[token / page_tokens];
+        const std::size_t row = static_cast<std::size_t>(slot) * page_tokens + token % page_tokens;
+        const float* k = key_pool + (row * heads + head) * qk_dim;
+        float dot = 0.0f;
+        for (std::uint32_t feature = threadIdx.x; feature < qk_dim; feature += blockDim.x) {
+            dot = fmaf(q[feature], k[feature], dot);
+        }
+        dot = infer_block_reduce_sum(dot);
+        if (threadIdx.x == 0) {
+            score = dot * scale;
+            maximum = fmaxf(maximum, score);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denominator = 0.0f;
+    float accumulator = 0.0f;
+    __syncthreads();
+    for (std::uint32_t token = 0; token < cache_len; ++token) {
+        const std::uint32_t slot = page_table[token / page_tokens];
+        const std::size_t row = static_cast<std::size_t>(slot) * page_tokens + token % page_tokens;
+        const float* k = key_pool + (row * heads + head) * qk_dim;
+        float dot = 0.0f;
+        for (std::uint32_t feature = threadIdx.x; feature < qk_dim; feature += blockDim.x) {
+            dot = fmaf(q[feature], k[feature], dot);
+        }
+        dot = infer_block_reduce_sum(dot);
+        if (threadIdx.x == 0) {
+            score = expf(dot * scale - maximum);
+            denominator += score;
+        }
+        __syncthreads();
+        if (threadIdx.x < value_dim) {
+            const float* v = value_pool + (row * heads + head) * value_dim;
+            accumulator = fmaf(score, v[threadIdx.x], accumulator);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < value_dim) {
+        output[head * value_dim + threadIdx.x] = accumulator / denominator;
+    }
+}
+
+extern "C" cudaError_t infer_ling3_mla_paged_attention_f32_on_stream(
+    const float* query,
+    const float* key_pool,
+    const float* value_pool,
+    const std::uint32_t* page_table,
+    float* output,
+    std::uint32_t cache_len,
+    std::uint32_t page_tokens,
+    std::uint32_t heads,
+    std::uint32_t qk_dim,
+    std::uint32_t value_dim,
+    float scale,
+    cudaStream_t stream) {
+    if (query == nullptr || key_pool == nullptr || value_pool == nullptr ||
+        page_table == nullptr || output == nullptr || cache_len == 0 || page_tokens == 0 ||
+        heads == 0 || qk_dim == 0 || qk_dim > 512 || value_dim == 0 || value_dim > 256 ||
+        !isfinite(scale) || scale <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    infer_ling3_mla_paged_attention_f32_kernel<<<heads, 256, 0, stream>>>(
+        query, key_pool, value_pool, page_table, output, cache_len, page_tokens,
+        heads, qk_dim, value_dim, scale);
+    return cudaGetLastError();
+}
+
 __global__ void infer_gated_rms_norm_quantize_nvfp4_col_major_f32_kernel(
     const float* input,
     const float* gate,

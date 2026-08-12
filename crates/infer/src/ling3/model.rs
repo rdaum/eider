@@ -1,8 +1,11 @@
 use super::kda::{Ling3KdaAttention, Ling3KdaAttentionState, Ling3KdaAttentionWorkspace};
 use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host};
-use super::mla::{Ling3MlaAttention, Ling3MlaState, Ling3MlaWorkspace};
+use super::mla::{Ling3MlaAttention, Ling3MlaWorkspace};
 use super::moe::{Ling3Moe, Ling3MoeWorkspace};
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
+use crate::runtime::ling3_sequence_cache::{
+    Ling3CacheContext, Ling3Sequence, Ling3SequenceCache, ling3_cache_error,
+};
 use nvfp4::{
     CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     add_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
@@ -106,14 +109,14 @@ enum Attention {
 
 enum AttentionState {
     Kda(Ling3KdaAttentionState),
-    Mla(Ling3MlaState),
+    Mla,
 }
 
 impl AttentionState {
     fn device_bytes(&self) -> usize {
         match self {
             Self::Kda(state) => state.device_bytes(),
-            Self::Mla(state) => state.device_bytes(),
+            Self::Mla => 0,
         }
     }
 }
@@ -218,10 +221,10 @@ impl DecoderLayer {
         })
     }
 
-    fn new_state(&self, capacity: usize) -> Result<AttentionState> {
+    fn new_state(&self) -> Result<AttentionState> {
         match &self.attention {
             Attention::Kda(attention) => Ok(AttentionState::Kda(attention.new_state()?)),
-            Attention::Mla(attention) => Ok(AttentionState::Mla(attention.new_state(capacity)?)),
+            Attention::Mla(_) => Ok(AttentionState::Mla),
         }
     }
 
@@ -261,31 +264,32 @@ impl DecoderLayer {
             stream,
         )?;
         let normed = &workspace.normed;
-        let attention_output = match (&self.attention, &mut workspace.attention, state) {
+        match (&self.attention, &mut workspace.attention, state) {
             (
                 Attention::Kda(attention),
-                AttentionWorkspace::Kda(workspace),
+                AttentionWorkspace::Kda(attention_workspace),
                 AttentionState::Kda(state),
             ) => {
-                attention.run_one_token(normed, workspace, state, stream)?;
-                attention.output(workspace)
+                attention.run_one_token(normed, attention_workspace, state, stream)?;
+                add_f32_into_on_stream(
+                    input,
+                    attention.output(attention_workspace),
+                    workspace.post_attention.output(),
+                    stream,
+                )?;
             }
-            (
-                Attention::Mla(attention),
-                AttentionWorkspace::Mla(workspace),
-                AttentionState::Mla(state),
-            ) => {
-                attention.run_one_token(normed, workspace, state, stream)?;
-                attention.output(workspace)
+            (Attention::Mla(_), AttentionWorkspace::Mla(_), AttentionState::Mla) => {
+                return Err(Error::Format {
+                    label: "Ling 3 MLA execution",
+                    detail: "paged MLA layers require a sequence-cache reservation".to_string(),
+                });
             }
             _ => unreachable!("Ling attention state/workspace variant mismatch"),
-        };
-        add_f32_into_on_stream(
-            input,
-            attention_output,
-            workspace.post_attention.output(),
-            stream,
-        )?;
+        }
+        self.finish_ffn(workspace, stream)
+    }
+
+    fn finish_ffn(&self, workspace: &mut DecoderLayerWorkspace, stream: &CudaStream) -> Result<()> {
         rms_norm_f32_into_on_stream(
             1,
             self.hidden,
@@ -337,13 +341,13 @@ pub struct Ling3Model {
     lm_head: DeviceBuffer<u16>,
 }
 
-pub struct Ling3ModelState {
+pub(crate) struct Ling3ModelState {
     layers: Vec<AttentionState>,
     position: usize,
     capacity: usize,
 }
 
-pub struct Ling3ModelWorkspace {
+pub(crate) struct Ling3ModelWorkspace {
     current: DeviceBuffer<f32>,
     layer: Vec<DecoderLayerWorkspace>,
     layer_graphs: Vec<Option<CudaGraphExec>>,
@@ -380,7 +384,7 @@ impl Ling3Model {
         })
     }
 
-    pub fn new_state(&self, capacity: usize) -> Result<Ling3ModelState> {
+    pub(crate) fn new_state(&self, capacity: usize) -> Result<Ling3ModelState> {
         if capacity == 0 || capacity > self.manifest.max_position_embeddings {
             return Err(Error::Shape {
                 label: "Ling 3 sequence capacity",
@@ -392,14 +396,14 @@ impl Ling3Model {
             layers: self
                 .layers
                 .iter()
-                .map(|layer| layer.new_state(capacity))
+                .map(|layer| layer.new_state())
                 .collect::<Result<Vec<_>>>()?,
             position: 0,
             capacity,
         })
     }
 
-    pub fn new_workspace(&self) -> Result<Ling3ModelWorkspace> {
+    pub(crate) fn new_workspace(&self) -> Result<Ling3ModelWorkspace> {
         Ok(Ling3ModelWorkspace {
             current: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             layer: self
@@ -413,7 +417,7 @@ impl Ling3Model {
         })
     }
 
-    pub fn prepare_decode_graphs(
+    pub(crate) fn prepare_decode_graphs(
         &self,
         state: &mut Ling3ModelState,
         workspace: &mut Ling3ModelWorkspace,
@@ -442,8 +446,82 @@ impl Ling3Model {
     pub fn decode_token(
         &self,
         token: u32,
+        sequence: &mut Ling3Sequence,
+        cache: &mut Ling3SequenceCache,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.prefill(sequence, cache, std::slice::from_ref(&token), stream)
+    }
+
+    pub fn prefill(
+        &self,
+        sequence: &mut Ling3Sequence,
+        cache: &mut Ling3SequenceCache,
+        tokens: &[u32],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::Shape {
+                label: "Ling 3 prefill",
+                expected: "at least one token".to_string(),
+                actual: "0 tokens".to_string(),
+            });
+        }
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                tokens.len(),
+                &mut Ling3CacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(ling3_cache_error)?;
+        for (offset, &token) in tokens.iter().enumerate() {
+            if let Err(error) = self.decode_token_reserved(
+                token,
+                &mut sequence.state,
+                &mut sequence.workspace,
+                cache,
+                &reservation,
+                sequence.page_table.device(),
+                offset,
+                stream,
+            ) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Ling3CacheContext {
+                            stream,
+                            page_table: &mut sequence.page_table,
+                        },
+                    )
+                    .map_err(ling3_cache_error)?;
+                return Err(error);
+            }
+        }
+        cache
+            .commit_append(
+                reservation,
+                tokens.len(),
+                &mut Ling3CacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(ling3_cache_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_token_reserved(
+        &self,
+        token: u32,
         state: &mut Ling3ModelState,
         workspace: &mut Ling3ModelWorkspace,
+        cache: &mut Ling3SequenceCache,
+        reservation: &sequence_cache::AppendReservation,
+        page_table: &DeviceBuffer<u32>,
+        input_offset: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         if token as usize >= self.manifest.vocab_size || state.position >= state.capacity {
@@ -468,12 +546,70 @@ impl Ling3Model {
             if let Some(graph) = &workspace.layer_graphs[layer_index] {
                 graph.launch(stream)?;
             } else {
-                self.layers[layer_index].run(
-                    &workspace.current,
-                    &mut workspace.layer[layer_index],
+                let layer = &self.layers[layer_index];
+                let layer_workspace = &mut workspace.layer[layer_index];
+                match (
+                    &layer.attention,
+                    &mut layer_workspace.attention,
                     &mut state.layers[layer_index],
-                    stream,
-                )?;
+                ) {
+                    (
+                        Attention::Mla(attention),
+                        AttentionWorkspace::Mla(attention_workspace),
+                        AttentionState::Mla,
+                    ) => {
+                        rms_norm_f32_into_on_stream(
+                            1,
+                            layer.hidden,
+                            &workspace.current,
+                            &layer.input_norm,
+                            layer_workspace.normed.output(),
+                            layer.rms_eps,
+                            stream,
+                        )?;
+                        cache
+                            .with_append_pages(reservation, |backend, pages| {
+                                let page = pages
+                                    .iter()
+                                    .find(|page| {
+                                        let segment = page.segment();
+                                        input_offset >= segment.input_offset()
+                                            && input_offset
+                                                < segment.input_offset() + segment.rows()
+                                    })
+                                    .ok_or_else(|| Error::Format {
+                                        label: "Ling 3 append segment",
+                                        detail: format!("no segment for input row {input_offset}"),
+                                    })?;
+                                let segment = page.segment();
+                                attention.run_one_token_paged(
+                                    &layer_workspace.normed,
+                                    attention_workspace,
+                                    backend.pool_mut(layer_index)?,
+                                    *page.page(),
+                                    segment.page_offset() + input_offset - segment.input_offset(),
+                                    page_table,
+                                    state.position,
+                                    stream,
+                                )
+                            })
+                            .map_err(ling3_cache_error)?;
+                        let attention_output = attention.output(attention_workspace);
+                        add_f32_into_on_stream(
+                            &workspace.current,
+                            attention_output,
+                            layer_workspace.post_attention.output(),
+                            stream,
+                        )?;
+                        layer.finish_ffn(layer_workspace, stream)?;
+                    }
+                    _ => layer.run(
+                        &workspace.current,
+                        layer_workspace,
+                        &mut state.layers[layer_index],
+                        stream,
+                    )?,
+                }
             }
             workspace.current.copy_prefix_from_device_on_stream(
                 &workspace.layer[layer_index].output,
@@ -502,8 +638,22 @@ impl Ling3Model {
         Ok(())
     }
 
-    pub fn logits<'a>(&self, workspace: &'a Ling3ModelWorkspace) -> &'a DeviceBuffer<f32> {
+    pub(crate) fn mla_page_layouts(&self) -> Vec<Option<(usize, usize)>> {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.attention {
+                Attention::Mla(attention) => Some(attention.page_layout()),
+                Attention::Kda(_) => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn logits<'a>(&self, workspace: &'a Ling3ModelWorkspace) -> &'a DeviceBuffer<f32> {
         &workspace.logits
+    }
+
+    pub fn sequence_logits<'a>(&self, sequence: &'a Ling3Sequence) -> &'a DeviceBuffer<f32> {
+        &sequence.workspace.logits
     }
 
     pub fn max_context_tokens(&self) -> usize {
@@ -523,17 +673,17 @@ impl Ling3Model {
 }
 
 impl Ling3ModelState {
-    pub fn position(&self) -> usize {
+    pub(crate) fn position(&self) -> usize {
         self.position
     }
 
-    pub fn device_bytes(&self) -> usize {
+    pub(crate) fn device_bytes(&self) -> usize {
         self.layers.iter().map(AttentionState::device_bytes).sum()
     }
 }
 
 impl Ling3ModelWorkspace {
-    pub fn device_bytes(&self) -> usize {
+    pub(crate) fn device_bytes(&self) -> usize {
         self.current.device_bytes()
             + self
                 .layer

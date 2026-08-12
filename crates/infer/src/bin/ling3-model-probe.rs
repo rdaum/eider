@@ -2,6 +2,7 @@
 
 use infer::ling3::Ling3Model;
 use infer::nvfp4::{CudaStream, Error, Result, SafeTensorShard};
+use infer::runtime::ling3_sequence_cache::{admit_ling3_sequence, new_ling3_sequence_cache};
 use std::path::PathBuf;
 
 const MIN_NVFP4_COSINE: f64 = 0.94;
@@ -31,10 +32,10 @@ fn main() -> Result<()> {
 
     println!("loading complete Ling 3 model...");
     let model = Ling3Model::load(&model_dir)?;
-    let mut state = model.new_state(tokens.len())?;
-    let mut workspace = model.new_workspace()?;
     let stream = CudaStream::new_non_blocking()?;
-    model.prepare_decode_graphs(&mut state, &mut workspace, &stream)?;
+    let mut cache = new_ling3_sequence_cache(&model, 1, tokens.len())?;
+    let mut sequence = admit_ling3_sequence(&model, &mut cache, tokens.len(), &stream)?
+        .expect("single probe sequence fits its dedicated cache");
     println!(
         "loaded {:.3} GiB; decoding {} reference tokens",
         model.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -50,8 +51,8 @@ fn main() -> Result<()> {
         });
     }
     for (position, &token) in tokens.iter().enumerate() {
-        model.decode_token(token, &mut state, &mut workspace, &stream)?;
-        let actual = model.logits(&workspace).copy_to_host(&stream)?;
+        model.decode_token(token, &mut sequence, &mut cache, &stream)?;
+        let actual = model.sequence_logits(&sequence).copy_to_host(&stream)?;
         let expected = &expected[position * vocab..(position + 1) * vocab];
         compare(position, token, &actual, expected)?;
     }
