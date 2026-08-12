@@ -254,7 +254,14 @@ impl Ling3PageBackend {
                 })
                 .transpose()?;
             if let Some(pool) = &pool {
-                page_bytes += pool.page_bytes();
+                page_bytes =
+                    page_bytes
+                        .checked_add(pool.page_bytes())
+                        .ok_or_else(|| Error::Shape {
+                            label: "Ling 3 page bytes",
+                            expected: "page bytes without overflow".to_string(),
+                            actual: format!("accumulated={page_bytes} next={}", pool.page_bytes()),
+                        })?;
             }
             pools.push(pool);
         }
@@ -411,12 +418,15 @@ impl PageBackend for Ling3PageBackend {
     fn retire_pages(
         &mut self,
         pages: Vec<Self::Page>,
-        _context: &mut Self::Context<'_>,
+        context: &mut Self::Context<'_>,
     ) -> core::result::Result<RetireOutcome, RetireError<Self::Error, Self::Page>> {
         for page in &pages {
             if let Err(error) = self.validate(*page) {
                 return Err(RetireError { error, pages });
             }
+        }
+        if let Err(error) = context.stream.synchronize() {
+            return Err(RetireError { error, pages });
         }
         for page in pages {
             self.used_slots[page.slot()] = false;
