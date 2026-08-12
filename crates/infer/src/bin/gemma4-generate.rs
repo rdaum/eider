@@ -1,19 +1,22 @@
 use infer::gemma4::Gemma4Model;
 use infer::nvfp4::{CudaStream, Error, Result};
+use infer::runtime::gemma4_sequence_cache::{Gemma4Sequence, new_gemma4_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let (model_dir, tokens) = parse_args()?;
     let model = Gemma4Model::load(&model_dir)?;
-    let mut state = model.new_decode_state(tokens.len())?;
     let stream = CudaStream::new_blocking()?;
+    let mut cache = new_gemma4_sequence_cache(&model, 1, tokens.len())?;
+    let mut sequence = Gemma4Sequence::admit(&model, &mut cache, tokens.len(), &stream)?;
     for token in tokens {
-        let next = model.decode_one(&mut state, token, &stream)?;
+        let next = model.decode_one(&mut sequence, token, &stream, &mut cache)?;
         println!(
             "Gemma 4 decode: input_token={} next_token={} logit={}",
             next.input_token, next.token, next.logit
         );
     }
+    sequence.finish(&mut cache, &stream)?;
     Ok(())
 }
 

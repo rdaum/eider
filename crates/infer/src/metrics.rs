@@ -85,12 +85,6 @@ pub struct InferMetrics {
     #[help = "Prompt tokens restored from cached hybrid-state checkpoints"]
     pub prefix_cache_hit_tokens: Counter,
 
-    #[help = "Gemma 4 local-attention layer rows processed directly from compact KV storage"]
-    pub gemma4_compact_local_prefill_rows: Counter,
-
-    #[help = "Gemma 4 local-attention layer rows processed after BF16 KV staging"]
-    pub gemma4_bf16_local_prefill_rows: Counter,
-
     #[help = "Laguna attention-layer rows processed directly from compact KV storage"]
     pub laguna_compact_prefill_attention_rows: Counter,
 
@@ -159,8 +153,6 @@ impl InferMetrics {
             prefix_cache_hits: Counter::new(shard_count),
             prefix_cache_misses: Counter::new(shard_count),
             prefix_cache_hit_tokens: Counter::new(shard_count),
-            gemma4_compact_local_prefill_rows: Counter::new(shard_count),
-            gemma4_bf16_local_prefill_rows: Counter::new(shard_count),
             laguna_compact_prefill_attention_rows: Counter::new(shard_count),
             prefix_cache_evictions: Counter::new(shard_count),
             prefix_cache_entries: Gauge::new(),
@@ -372,8 +364,6 @@ mod tests {
         metrics.prefix_cache_device_bytes.set(4096);
         metrics.prefix_cache_checkpoint_us.record(50);
         metrics.prefix_cache_restore_us.record(60);
-        metrics.gemma4_compact_local_prefill_rows.add(128);
-        metrics.gemma4_bf16_local_prefill_rows.add(64);
         metrics.laguna_compact_prefill_attention_rows.add(256);
         metrics.gemma4_sequence_allocation_us.record(70);
         metrics.gemma4_checkpoint_copy_us.record(80);
@@ -400,8 +390,6 @@ mod tests {
             "eider_infer_prefix_cache_device_bytes",
             "eider_infer_prefix_cache_checkpoint_us",
             "eider_infer_prefix_cache_restore_us",
-            "eider_infer_gemma4_compact_local_prefill_rows",
-            "eider_infer_gemma4_bf16_local_prefill_rows",
             "eider_infer_laguna_compact_prefill_attention_rows",
             "eider_infer_gemma4_sequence_allocation_us",
             "eider_infer_gemma4_checkpoint_copy_us",
@@ -432,8 +420,6 @@ mod tests {
             "eider_infer.prefix_cache_device_bytes",
             "eider_infer.prefix_cache_checkpoint_us",
             "eider_infer.prefix_cache_restore_us",
-            "eider_infer.gemma4_compact_local_prefill_rows",
-            "eider_infer.gemma4_bf16_local_prefill_rows",
             "eider_infer.laguna_compact_prefill_attention_rows",
             "eider_infer.gemma4_sequence_allocation_us",
             "eider_infer.gemma4_checkpoint_copy_us",

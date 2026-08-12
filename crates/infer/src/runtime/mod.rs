@@ -7,6 +7,7 @@ pub mod chat_output;
 pub mod deepseek4_serving;
 pub mod expert_cache;
 pub mod expert_hotset;
+pub mod gemma4_sequence_cache;
 pub mod gemma4_serving;
 pub mod generation;
 pub mod kv_cache;

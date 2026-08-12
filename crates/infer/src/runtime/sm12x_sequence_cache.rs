@@ -123,6 +123,19 @@ impl Sm12xPageBackend {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
+        Self::new_heterogeneous(
+            paged_layers
+                .into_iter()
+                .map(|paged| paged.then_some((kv_heads, head_dim))),
+            page_slots,
+        )
+    }
+
+    /// Allocates per-layer pools whose K/V geometry may differ by layer.
+    pub fn new_heterogeneous(
+        layer_geometries: impl IntoIterator<Item = Option<(usize, usize)>>,
+        page_slots: usize,
+    ) -> Result<Self> {
         if page_slots == 0 || page_slots > u32::MAX as usize {
             return Err(Error::Shape {
                 label: "SM12x KV page slots",
@@ -132,8 +145,8 @@ impl Sm12xPageBackend {
         }
         let mut pools = Vec::new();
         let mut page_bytes = 0usize;
-        for paged in paged_layers {
-            if paged {
+        for geometry in layer_geometries {
+            if let Some((kv_heads, head_dim)) = geometry {
                 let pool = Sm12xKvPagePool::new(page_slots, kv_heads, head_dim)?;
                 page_bytes =
                     page_bytes

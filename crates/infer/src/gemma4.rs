@@ -4,12 +4,16 @@
 //! tensors are converted during loading without materializing a whole expert
 //! stack on the host.
 
+use crate::runtime::gemma4_sequence_cache::{
+    Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream,
-    bf16_linear_argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    gather_indexed_mul_f32_into_on_stream, gelu_tanh_mul_f32_into_on_stream,
-    lm_head_top1_f32_into_on_stream, moe_topk_f32_into_on_stream,
+    ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
+    add_f32_into_on_stream, bf16_linear_argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, gather_indexed_mul_f32_into_on_stream,
+    gelu_tanh_mul_f32_into_on_stream, lm_head_top1_f32_into_on_stream, moe_topk_f32_into_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
@@ -428,13 +432,12 @@ pub struct Gemma4Model {
 pub struct Gemma4DecodeState {
     hidden: DeviceBuffer<f32>,
     layers: Vec<Gemma4DecoderLayerWorkspace>,
-    kv_caches: Vec<Sm12xKvCache>,
     compact_attention: Gemma4CompactAttentionWorkspaces,
     lm_logits: DeviceBuffer<f32>,
     lm_top1_scratch_index: DeviceBuffer<u32>,
     lm_argmax: DeviceBuffer<u32>,
     lm_argmax_value: DeviceBuffer<f32>,
-    position: usize,
+    pub(crate) position: usize,
     max_tokens: usize,
 }
 
@@ -448,12 +451,12 @@ impl Gemma4CompactAttentionWorkspaces {
         let local = layers
             .iter()
             .find(|layer| layer.attention.window.is_some())
-            .map(|layer| layer.new_compact_attention_workspace(max_tokens))
+            .map(|layer| layer.attention.new_compact_attention_workspace(max_tokens))
             .transpose()?;
         let global = layers
             .iter()
             .find(|layer| layer.attention.window.is_none())
-            .map(|layer| layer.new_compact_attention_workspace(max_tokens))
+            .map(|layer| layer.attention.new_compact_attention_workspace(max_tokens))
             .transpose()?;
         Ok(Self { local, global })
     }
@@ -484,10 +487,12 @@ impl Gemma4CompactAttentionWorkspaces {
     }
 }
 
-/// Compact device-resident state for one reusable aligned prompt prefix.
-pub struct Gemma4SequenceCheckpoint {
-    kv_caches: Vec<Sm12xKvCache>,
-    position: usize,
+struct Gemma4LayerCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
+    attention: &'a mut Sm12xKvAttentionWorkspace,
 }
 
 /// The argmax result for one Gemma input token.
@@ -1458,11 +1463,6 @@ impl Gemma4Attention {
         })
     }
 
-    /// Allocates an empty heterogeneous K/V cache for this layer.
-    pub fn new_kv_cache(&self, max_tokens: usize) -> Result<Sm12xKvCache> {
-        Sm12xKvCache::new(max_tokens, self.kv_heads, self.head_dim)
-    }
-
     /// Allocates compact-cache attention workspace for this layer.
     pub fn new_compact_attention_workspace(
         &self,
@@ -1491,20 +1491,19 @@ impl Gemma4Attention {
 
     /// Runs one token, appending this layer's K/V and reading its own cache.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_decode_into(
+    fn run_decode_into(
         &self,
         input: &DeviceBuffer<f32>,
         workspace: &mut Gemma4AttentionWorkspace,
-        cache: &mut Sm12xKvCache,
-        compact_attention: &mut Sm12xKvAttentionWorkspace,
+        cache: Gemma4LayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        if input.len() != self.q.shape().1 || cache.len() != position {
+        if input.len() != self.q.shape().1 {
             return Err(Error::Shape {
                 label: "Gemma 4 decode attention inputs",
                 expected: format!("input={} and cache position={position}", self.q.shape().1),
-                actual: format!("input={} cache position={}", input.len(), cache.len()),
+                actual: format!("input={}", input.len()),
             });
         }
         self.q.run_rows_into(input, &mut workspace.q, 1, stream)?;
@@ -1550,23 +1549,32 @@ impl Gemma4Attention {
             position,
             stream,
         )?;
-        cache.append_at_on_stream(&workspace.k_rope, &workspace.v_normed, position, stream)?;
-        if let Some(window) = self.window {
-            compact_attention.attention_window_into_on_stream(
-                cache,
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
+            &workspace.k_rope,
+            0,
+            &workspace.v_normed,
+            0,
+            stream,
+        )?;
+        let cache_len = position + 1;
+        let window_start = self
+            .window
+            .map_or(0, |window| cache_len.saturating_sub(window));
+        cache
+            .attention
+            .attention_paged_window_offsets_into_on_stream(
+                cache.pool,
+                cache.page_table,
+                cache_len,
                 &workspace.q_rope,
+                0,
                 workspace.attended.output(),
-                cache.len().saturating_sub(window),
+                0,
+                window_start,
                 stream,
             )?;
-        } else {
-            compact_attention.attention_into_on_stream(
-                cache,
-                &workspace.q_rope,
-                workspace.attended.output(),
-                stream,
-            )?;
-        }
         self.output
             .run_rows_into(&workspace.attended, &mut workspace.output, 1, stream)
     }
@@ -1690,12 +1698,11 @@ impl Gemma4DecoderLayer {
 
     /// Runs one decoder layer at `position` using its own heterogeneous cache.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_decode_into(
+    fn run_decode_into(
         &self,
         input: &DeviceBuffer<f32>,
         workspace: &mut Gemma4DecoderLayerWorkspace,
-        cache: &mut Sm12xKvCache,
-        compact_attention: &mut Sm12xKvAttentionWorkspace,
+        cache: Gemma4LayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1713,7 +1720,6 @@ impl Gemma4DecoderLayer {
             &workspace.normalized,
             &mut workspace.attention,
             cache,
-            compact_attention,
             position,
             stream,
         )?;
@@ -1795,19 +1801,6 @@ impl Gemma4DecoderLayer {
         )
     }
 
-    /// Allocates this layer's compact cache at `max_tokens` positions.
-    pub fn new_kv_cache(&self, max_tokens: usize) -> Result<Sm12xKvCache> {
-        self.attention.new_kv_cache(max_tokens)
-    }
-
-    /// Allocates this layer's compact attention workspace at `max_tokens` positions.
-    pub fn new_compact_attention_workspace(
-        &self,
-        max_tokens: usize,
-    ) -> Result<Sm12xKvAttentionWorkspace> {
-        self.attention.new_compact_attention_workspace(max_tokens)
-    }
-
     /// Returns this layer's most recent output.
     pub fn output<'a>(&self, workspace: &'a Gemma4DecoderLayerWorkspace) -> &'a DeviceBuffer<f32> {
         &workspace.output
@@ -1886,8 +1879,8 @@ impl Gemma4Model {
             + self.final_norm.device_bytes()
     }
 
-    /// Allocates one independent decode sequence with `max_tokens` capacity.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Gemma4DecodeState> {
+    /// Allocates request-private execution state for one sequence.
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Gemma4DecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_position_embeddings {
             return Err(Error::Shape {
                 label: "Gemma 4 decode capacity",
@@ -1896,16 +1889,13 @@ impl Gemma4Model {
             });
         }
         let mut layers = Vec::with_capacity(self.layers.len());
-        let mut kv_caches = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             layers.push(layer.new_workspace()?);
-            kv_caches.push(layer.new_kv_cache(max_tokens)?);
         }
         let compact_attention = Gemma4CompactAttentionWorkspaces::new(&self.layers, max_tokens)?;
         Ok(Gemma4DecodeState {
             hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
             layers,
-            kv_caches,
             compact_attention,
             lm_logits: DeviceBuffer::zeroed(self.config.vocab_size)?,
             lm_top1_scratch_index: DeviceBuffer::zeroed(self.config.vocab_size)?,
@@ -1916,15 +1906,24 @@ impl Gemma4Model {
         })
     }
 
+    pub(crate) fn sequence_layer_geometries(
+        &self,
+    ) -> impl Iterator<Item = Option<(usize, usize)>> + '_ {
+        self.layers
+            .iter()
+            .map(|layer| Some((layer.attention.kv_heads, layer.attention.head_dim)))
+    }
+
     /// Enqueues prompt tokens without materializing vocabulary logits.
     pub fn prefill_tokens(
         &self,
-        state: &mut Gemma4DecodeState,
+        sequence: &mut Gemma4Sequence,
         tokens: &[u32],
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
     ) -> Result<()> {
         for &token in tokens {
-            self.forward_token(state, token, Gemma4PrefillOutput::None, stream)?;
+            self.forward_token(sequence, token, Gemma4PrefillOutput::None, stream, cache)?;
         }
         Ok(())
     }
@@ -1932,29 +1931,78 @@ impl Gemma4Model {
     /// Runs one token and leaves tied-language-head logits in `state`.
     pub fn forward_one(
         &self,
-        state: &mut Gemma4DecodeState,
+        sequence: &mut Gemma4Sequence,
         token: u32,
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
     ) -> Result<()> {
-        self.forward_token(state, token, Gemma4PrefillOutput::FullLogits, stream)
+        self.forward_token(
+            sequence,
+            token,
+            Gemma4PrefillOutput::FullLogits,
+            stream,
+            cache,
+        )
     }
 
     pub(crate) fn forward_one_top1(
         &self,
-        state: &mut Gemma4DecodeState,
+        sequence: &mut Gemma4Sequence,
         token: u32,
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
     ) -> Result<()> {
-        self.forward_token(state, token, Gemma4PrefillOutput::Top1, stream)
+        self.forward_token(sequence, token, Gemma4PrefillOutput::Top1, stream, cache)
     }
 
     fn forward_token(
         &self,
-        state: &mut Gemma4DecodeState,
+        sequence: &mut Gemma4Sequence,
         token: u32,
         output: Gemma4PrefillOutput,
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
     ) -> Result<()> {
+        let target = cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(gemma4_cache_error)?;
+        let result = self.forward_token_uncommitted(sequence, token, output, stream, cache, target);
+        if let Err(error) = result {
+            cache.abort_append(target).map_err(gemma4_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                target,
+                1,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(gemma4_cache_error)?;
+        sequence.state.position += 1;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_token_uncommitted(
+        &self,
+        sequence: &mut Gemma4Sequence,
+        token: u32,
+        output: Gemma4PrefillOutput,
+        stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
+        target: sequence_cache::AppendTarget,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
         if token as usize >= self.config.vocab_size {
             return Err(Error::Shape {
                 label: "Gemma 4 input token",
@@ -1992,14 +2040,23 @@ impl Gemma4Model {
             } else {
                 self.layers[layer_index - 1].output(&previous[layer_index - 1])
             };
-            self.layers[layer_index].run_decode_into(
-                input,
-                &mut current[0],
-                &mut state.kv_caches[layer_index],
-                state.compact_attention.for_layer_mut(local_attention)?,
-                state.position,
-                stream,
-            )?;
+            cache
+                .with_append_page(target, |backend, page| {
+                    self.layers[layer_index].run_decode_into(
+                        input,
+                        &mut current[0],
+                        Gemma4LayerCache {
+                            pool: backend.pool_mut(layer_index)?,
+                            page_slot: page.slot(),
+                            page_offset: target.page_offset(),
+                            page_table: sequence.page_table.device(),
+                            attention: state.compact_attention.for_layer_mut(local_attention)?,
+                        },
+                        state.position,
+                        stream,
+                    )
+                })
+                .map_err(gemma4_cache_error)?;
         }
         if output != Gemma4PrefillOutput::None {
             let final_input = self
@@ -2039,7 +2096,6 @@ impl Gemma4Model {
                 )?,
             }
         }
-        state.position += 1;
         Ok(())
     }
 
@@ -2070,98 +2126,18 @@ impl Gemma4Model {
     /// Decodes one token through all layers and returns the tied-LM-head argmax.
     pub fn decode_one(
         &self,
-        state: &mut Gemma4DecodeState,
+        sequence: &mut Gemma4Sequence,
         token: u32,
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
     ) -> Result<Gemma4NextToken> {
-        self.forward_one(state, token, stream)?;
-        let (next_token, logit) = self.argmax_with_logit(state, stream)?;
+        self.forward_one(sequence, token, stream, cache)?;
+        let (next_token, logit) = self.argmax_with_logit(&sequence.state, stream)?;
         Ok(Gemma4NextToken {
             input_token: token,
             token: next_token,
             logit,
         })
-    }
-
-    /// Returns the compact device footprint of an aligned prefix checkpoint.
-    pub fn checkpoint_sequence_device_bytes(
-        &self,
-        state: &Gemma4DecodeState,
-        prefix_tokens: usize,
-    ) -> Result<usize> {
-        if prefix_tokens == 0
-            || !prefix_tokens.is_multiple_of(128)
-            || prefix_tokens > state.position
-        {
-            return Err(Error::Shape {
-                label: "Gemma 4 sequence checkpoint byte estimate",
-                expected: format!(
-                    "a nonzero 128-token-aligned prefix at most {} tokens",
-                    state.position
-                ),
-                actual: prefix_tokens.to_string(),
-            });
-        }
-        state.kv_caches.iter().try_fold(0usize, |total, cache| {
-            let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
-            total.checked_add(bytes).ok_or_else(|| Error::Shape {
-                label: "Gemma 4 sequence checkpoint byte estimate",
-                expected: "device-byte total without overflow".to_string(),
-                actual: format!("prefix_tokens={prefix_tokens}"),
-            })
-        })
-    }
-
-    /// Copies an aligned K/V prefix into compact retained storage.
-    pub fn checkpoint_sequence(
-        &self,
-        state: &Gemma4DecodeState,
-        prefix_tokens: usize,
-        stream: &CudaStream,
-    ) -> Result<Gemma4SequenceCheckpoint> {
-        self.checkpoint_sequence_device_bytes(state, prefix_tokens)?;
-        let mut kv_caches = Vec::with_capacity(self.layers.len());
-        for (layer, source) in self.layers.iter().zip(&state.kv_caches) {
-            let mut cache = layer.new_kv_cache(prefix_tokens)?;
-            cache.copy_aligned_prefix_from_on_stream(source, prefix_tokens, stream)?;
-            kv_caches.push(cache);
-        }
-        stream.synchronize()?;
-        Ok(Gemma4SequenceCheckpoint {
-            kv_caches,
-            position: prefix_tokens,
-        })
-    }
-
-    /// Restores an aligned prompt checkpoint into freshly allocated active state.
-    pub(crate) fn restore_sequence_checkpoint_into(
-        &self,
-        checkpoint: &Gemma4SequenceCheckpoint,
-        state: &mut Gemma4DecodeState,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if checkpoint.position > state.max_tokens || checkpoint.kv_caches.len() != self.layers.len()
-        {
-            return Err(Error::Shape {
-                label: "Gemma 4 sequence checkpoint restore",
-                expected: format!(
-                    "capacity >= {} and {} K/V layers",
-                    checkpoint.position,
-                    self.layers.len()
-                ),
-                actual: format!(
-                    "capacity={} layers={}",
-                    state.max_tokens,
-                    checkpoint.kv_caches.len()
-                ),
-            });
-        }
-        for (destination, source) in state.kv_caches.iter_mut().zip(&checkpoint.kv_caches) {
-            destination.copy_aligned_prefix_from_on_stream(source, checkpoint.position, stream)?;
-        }
-        stream.synchronize()?;
-        state.position = checkpoint.position;
-        Ok(())
     }
 
     fn softcap_logit(&self, logit: f32) -> f32 {
@@ -2194,28 +2170,11 @@ impl Gemma4DecodeState {
                 .iter()
                 .map(Gemma4DecoderLayerWorkspace::device_bytes)
                 .sum::<usize>()
-            + self
-                .kv_caches
-                .iter()
-                .map(Sm12xKvCache::device_bytes)
-                .sum::<usize>()
             + self.compact_attention.device_bytes()
             + self.lm_logits.device_bytes()
             + self.lm_top1_scratch_index.device_bytes()
             + self.lm_argmax.device_bytes()
             + self.lm_argmax_value.device_bytes()
-    }
-}
-
-impl Gemma4SequenceCheckpoint {
-    /// Returns the number of prompt tokens represented by this checkpoint.
-    pub fn position(&self) -> usize {
-        self.position
-    }
-
-    /// Returns exact bytes retained by compact checkpoint K/V state.
-    pub fn device_bytes(&self) -> usize {
-        self.kv_caches.iter().map(Sm12xKvCache::device_bytes).sum()
     }
 }
 
@@ -2642,13 +2601,17 @@ mod tests {
             .join("models/gemma-4-26b-a4b-nvfp4");
         let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
         let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
-        let mut serial = model
-            .new_decode_state(prompt.len() + 1)
-            .expect("serial state");
-        let mut batched = model
-            .new_decode_state(prompt.len() + 1)
-            .expect("batched state");
         let stream = CudaStream::new_blocking().expect("stream");
+        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
+            &model,
+            2,
+            prompt.len() + 1,
+        )
+        .expect("sequence cache");
+        let mut serial = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
+            .expect("serial sequence");
+        let mut batched = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
+            .expect("batched sequence");
         let mut serial_workspace = model
             .new_prefill_batch_workspace(1, 1, prompt.len() + 1)
             .expect("serial W4A4 workspace");
@@ -2658,15 +2621,16 @@ mod tests {
                     &mut serial_workspace,
                     &mut [Gemma4PrefillRow {
                         token_ids: std::slice::from_ref(token),
-                        state: &mut serial,
+                        sequence: &mut serial,
                         output: Gemma4PrefillOutput::None,
                     }],
                     &stream,
+                    &mut cache,
                 )
                 .expect("serial W4A4 prefill");
         }
         model
-            .forward_one(&mut serial, prompt[prompt.len() - 1], &stream)
+            .forward_one(&mut serial, prompt[prompt.len() - 1], &stream, &mut cache)
             .expect("serial prompt logits");
         let mut workspace = model
             .new_prefill_batch_workspace(1, prompt.len(), prompt.len() + 1)
@@ -2676,17 +2640,18 @@ mod tests {
                 &mut workspace,
                 &mut [Gemma4PrefillRow {
                     token_ids: &prompt,
-                    state: &mut batched,
+                    sequence: &mut batched,
                     output: Gemma4PrefillOutput::FullLogits,
                 }],
                 &stream,
+                &mut cache,
             )
             .expect("batch prefill");
         let serial_logits = model
-            .logits_to_host(&serial, &stream)
+            .logits_to_host(&serial.state, &stream)
             .expect("serial prompt logits");
         let batched_logits = model
-            .logits_to_host(&batched, &stream)
+            .logits_to_host(&batched.state, &stream)
             .expect("batched prompt logits");
         let error_rms = (serial_logits
             .iter()
@@ -2713,13 +2678,17 @@ mod tests {
         let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
         let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
         let next_input = 107;
-        let mut serial = model
-            .new_decode_state(prompt.len() + 1)
-            .expect("serial state");
-        let mut batched = model
-            .new_decode_state(prompt.len() + 1)
-            .expect("batched state");
         let stream = CudaStream::new_blocking().expect("stream");
+        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
+            &model,
+            2,
+            prompt.len() + 1,
+        )
+        .expect("sequence cache");
+        let mut serial = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
+            .expect("serial sequence");
+        let mut batched = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
+            .expect("batched sequence");
         let mut serial_workspace = model
             .new_prefill_batch_workspace(1, 1, prompt.len() + 1)
             .expect("serial W4A4 workspace");
@@ -2729,10 +2698,11 @@ mod tests {
                     &mut serial_workspace,
                     &mut [Gemma4PrefillRow {
                         token_ids: std::slice::from_ref(token),
-                        state: &mut serial,
+                        sequence: &mut serial,
                         output: Gemma4PrefillOutput::None,
                     }],
                     &stream,
+                    &mut cache,
                 )
                 .expect("serial W4A4 prefill");
         }
@@ -2744,19 +2714,20 @@ mod tests {
                 &mut workspace,
                 &mut [Gemma4PrefillRow {
                     token_ids: &prompt,
-                    state: &mut batched,
+                    sequence: &mut batched,
                     output: Gemma4PrefillOutput::None,
                 }],
                 &stream,
+                &mut cache,
             )
             .expect("batch prefill");
         let serial_next = model
-            .decode_one(&mut serial, next_input, &stream)
+            .decode_one(&mut serial, next_input, &stream, &mut cache)
             .expect("serial next token");
         let batched_next = model
-            .decode_one(&mut batched, next_input, &stream)
+            .decode_one(&mut batched, next_input, &stream, &mut cache)
             .expect("batched next token");
-        assert_eq!(batched.len(), serial.len());
+        assert_eq!(batched.position(), serial.position());
         assert_eq!(batched_next.token, serial_next.token);
         assert!(
             (batched_next.logit - serial_next.logit).abs()

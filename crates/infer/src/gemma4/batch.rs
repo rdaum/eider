@@ -1,41 +1,27 @@
 use super::*;
-use crate::metrics::metrics;
+use crate::runtime::gemma4_sequence_cache::{
+    Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
-    Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape,
-    Gemma4LocalPrefillAttention, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
-    causal_window_softmax_f32_to_bf16_on_stream,
+    CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape, MoeSortedNvfp4Rows,
+    MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
     dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
     gather_indexed_mul_f32_prefix_into_on_stream,
     gelu_tanh_mul_quantize_nvfp4_col_major_f32_into_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
-    pack_token_heads_bf16_at_offset_into_on_stream,
+    quantize_nvfp4_col_major_f32_device_into_on_stream,
     rms_norm_add_then_rms_norm_quantize_nvfp4_f32_into_on_stream,
     rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     rms_norm_quantize_nvfp4_pair_col_major_f32_into_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream,
-    unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream,
 };
 use std::collections::HashMap;
-use std::mem::size_of;
-
-#[cfg(test)]
-use nvfp4::quantize_nvfp4_col_major_f32_device_into_on_stream;
 
 const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
-const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
-const ATTENTION_QUERY_TILE_ROWS: usize = 256;
-// Direct compact-cache attention overtakes whole-cache BF16 staging at a 16:1
-// cached-prefix/query ratio in the integrated local-attention micromeasure.
-const COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY: usize = 16;
-
-fn use_compact_local_attention(start_position: usize, query_rows: usize) -> bool {
-    start_position != 0
-        && start_position >= query_rows.saturating_mul(COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY)
-}
-
 /// One scheduler-selected Gemma prompt chunk and its persistent sequence state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Gemma4PrefillOutput {
@@ -46,8 +32,14 @@ pub enum Gemma4PrefillOutput {
 
 pub struct Gemma4PrefillRow<'tokens, 'state> {
     pub token_ids: &'tokens [u32],
-    pub state: &'state mut Gemma4DecodeState,
+    pub sequence: &'state mut Gemma4Sequence,
     pub output: Gemma4PrefillOutput,
+}
+
+struct Gemma4PrefillStateRow<'tokens, 'state> {
+    token_ids: &'tokens [u32],
+    state: &'state mut Gemma4DecodeState,
+    output: Gemma4PrefillOutput,
 }
 
 struct Gemma4BatchLinearWorkspace {
@@ -243,357 +235,49 @@ impl Gemma4BatchLinearWorkspace {
 }
 
 struct Gemma4BatchAttentionWorkspace {
-    tensor_core: Gemma4TensorCoreAttentionWorkspace,
+    compact: Sm12xKvAttentionWorkspace,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     v_normed: DeviceBuffer<f32>,
     q_rope: DeviceBuffer<f32>,
     k_rope: DeviceBuffer<f32>,
+    attended: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
 }
 
-struct Gemma4TensorCoreAttentionWorkspace {
-    lt: CublasLt,
-    local: Option<Gemma4LocalPrefillAttention>,
-    qk_plans: HashMap<(usize, usize), Bf16TnMatmulPlan>,
-    pv_plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
-    packed_query: DeviceBuffer<u16>,
-    packed_key: DeviceBuffer<u16>,
-    packed_value: DeviceBuffer<u16>,
-    scores: DeviceBuffer<f32>,
-    packed_probabilities: DeviceBuffer<u16>,
-    packed_output: DeviceBuffer<u16>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-}
-
-impl Gemma4TensorCoreAttentionWorkspace {
-    fn new(attention: &Gemma4Attention, rows: usize) -> Result<Self> {
-        let initial_context = rows;
-        let q_values = rows * attention.q_heads * attention.head_dim;
-        let kv_values = initial_context * attention.kv_heads * attention.head_dim;
-        let score_values = attention.q_heads * rows * initial_context;
-        Ok(Self {
-            lt: CublasLt::new()?,
-            local: (attention.window == Some(1024)
-                && attention.q_heads == 16
-                && attention.kv_heads == 8
-                && attention.head_dim == 256)
-                .then(Gemma4LocalPrefillAttention::new)
-                .transpose()?,
-            qk_plans: HashMap::new(),
-            pv_plans: HashMap::new(),
-            packed_query: DeviceBuffer::zeroed(q_values)?,
-            packed_key: DeviceBuffer::zeroed(kv_values)?,
-            packed_value: DeviceBuffer::zeroed(kv_values)?,
-            scores: DeviceBuffer::zeroed(score_values)?,
-            packed_probabilities: DeviceBuffer::zeroed(score_values)?,
-            packed_output: DeviceBuffer::zeroed(q_values)?,
-            q_heads: attention.q_heads,
-            kv_heads: attention.kv_heads,
-            head_dim: attention.head_dim,
-        })
-    }
-
-    fn tile_rows(&self, requested: usize, key_tokens: usize) -> usize {
-        let values_per_row = self.q_heads.saturating_mul(key_tokens).max(1);
-        let budget_rows = (ATTENTION_SCORE_BUDGET_BYTES / size_of::<f32>())
-            .checked_div(values_per_row)
-            .unwrap_or(0)
-            .max(1);
-        let rows = requested.min(budget_rows).min(ATTENTION_QUERY_TILE_ROWS);
-        if rows >= 16 { rows / 16 * 16 } else { rows }
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        query_rows: usize,
-        cache_tokens: usize,
-        score_key_tokens: usize,
-    ) -> Result<()> {
-        let query_values = query_rows * self.q_heads * self.head_dim;
-        let key_values = cache_tokens * self.kv_heads * self.head_dim;
-        let score_values = query_rows * self.q_heads * score_key_tokens;
-        grow_device_buffer(&mut self.packed_query, query_values)?;
-        grow_device_buffer(&mut self.packed_key, key_values)?;
-        grow_device_buffer(&mut self.packed_value, key_values)?;
-        grow_device_buffer(&mut self.scores, score_values)?;
-        grow_device_buffer(&mut self.packed_probabilities, score_values)?;
-        grow_device_buffer(&mut self.packed_output, query_values)
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.packed_query.device_bytes()
-            + self.packed_key.device_bytes()
-            + self.packed_value.device_bytes()
-            + self.scores.device_bytes()
-            + self.packed_probabilities.device_bytes()
-            + self.packed_output.device_bytes()
-            + self
-                .qk_plans
-                .values()
-                .map(Bf16TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self
-                .pv_plans
-                .values()
-                .map(Bf16TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_sequence(
-        &mut self,
-        cache: &mut Sm12xKvCache,
-        query: &DeviceBuffer<f32>,
-        key: &DeviceBuffer<f32>,
-        value: &DeviceBuffer<f32>,
-        input_row_offset: usize,
-        rows: usize,
-        window_tokens: Option<usize>,
-        output: &mut Nvfp4Matrix,
-        output_row_offset: usize,
-        output_input_scale: f32,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let start_position = cache.len();
-        let cache_tokens = start_position + rows;
-
-        if let Some(local) = &self.local {
-            let query_values = rows * self.q_heads * self.head_dim;
-            grow_device_buffer(&mut self.packed_query, query_values)?;
-            grow_device_buffer(&mut self.packed_output, query_values)?;
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset,
-                stream,
-            )?;
-
-            if use_compact_local_attention(start_position, rows) {
-                cache.append_rows_at_offset_on_stream(
-                    key,
-                    value,
-                    input_row_offset,
-                    rows,
-                    stream,
-                )?;
-                local.run_compact_on_stream(
-                    &self.packed_query,
-                    cache,
-                    self.packed_output.output(),
-                    rows,
-                    start_position,
-                    stream,
-                )?;
-                unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
-                    &self.packed_output,
-                    output,
-                    rows,
-                    self.q_heads,
-                    self.head_dim,
-                    output_row_offset,
-                    output_input_scale,
-                    stream,
-                )?;
-                metrics()
-                    .gemma4_compact_local_prefill_rows
-                    .add(rows.min(isize::MAX as usize) as isize);
-                return Ok(());
-            }
-        }
-
-        let cache_values = cache_tokens * self.kv_heads * self.head_dim;
-        grow_device_buffer(&mut self.packed_key, cache_values)?;
-        grow_device_buffer(&mut self.packed_value, cache_values)?;
-        if start_position == 0 {
-            cache.append_initial_rows_and_stage_bf16_on_stream(
-                key,
-                value,
-                input_row_offset,
-                rows,
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        } else {
-            cache.append_rows_at_offset_on_stream(key, value, input_row_offset, rows, stream)?;
-            cache.unpack_bf16_on_stream(
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        }
-
-        if let Some(local) = &self.local {
-            local.run_on_stream(
-                &self.packed_query,
-                &self.packed_key,
-                &self.packed_value,
-                self.packed_output.output(),
-                rows,
-                cache_tokens,
-                start_position,
-                stream,
-            )?;
-            unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
-                &self.packed_output,
-                output,
-                rows,
-                self.q_heads,
-                self.head_dim,
-                output_row_offset,
-                output_input_scale,
-                stream,
-            )?;
-            metrics()
-                .gemma4_bf16_local_prefill_rows
-                .add(rows.min(isize::MAX as usize) as isize);
-            return Ok(());
-        }
-
-        let queries_per_kv = self.q_heads / self.kv_heads;
-        let mut query_offset = 0;
-        while query_offset < rows {
-            let requested = rows - query_offset;
-            let absolute_query_start = start_position + query_offset;
-            let tentative_key_start = window_tokens
-                .map(|window| (absolute_query_start + 1).saturating_sub(window))
-                .unwrap_or(0);
-            let tentative_key_tokens = absolute_query_start + requested - tentative_key_start;
-            let query_rows = self.tile_rows(requested, tentative_key_tokens);
-            let key_start = window_tokens
-                .map(|window| (absolute_query_start + 1).saturating_sub(window))
-                .unwrap_or(0);
-            let key_end = absolute_query_start + query_rows;
-            let key_tokens = key_end - key_start;
-            self.ensure_capacity(query_rows, cache_tokens, key_tokens)?;
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset + query_offset,
-                stream,
-            )?;
-
-            let qk_key = (key_tokens, query_rows);
-            if !self.qk_plans.contains_key(&qk_key) {
-                self.qk_plans.insert(
-                    qk_key,
-                    Bf16TnMatmulPlan::new_strided_batch(
-                        &self.lt,
-                        GemmShape::new(key_tokens, query_rows * queries_per_kv, self.head_dim),
-                        self.kv_heads,
-                        cache_tokens * self.head_dim,
-                        queries_per_kv * query_rows * self.head_dim,
-                        queries_per_kv * query_rows * key_tokens,
-                        PREFILL_GEMM_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            let qk = self.qk_plans.get(&qk_key).expect("QK plan exists");
-            qk.run_offsets_on_stream(
-                &self.lt,
-                &self.packed_key,
-                key_start * self.head_dim,
-                &self.packed_query,
-                0,
-                self.scores.output(),
-                0,
-                stream,
-            )?;
-            causal_window_softmax_f32_to_bf16_on_stream(
-                &self.scores,
-                self.packed_probabilities.output(),
-                query_rows,
-                key_tokens,
-                absolute_query_start - key_start,
-                self.q_heads,
-                self.head_dim,
-                window_tokens,
-                stream,
-            )?;
-            let pv_key = (key_tokens, query_rows, cache_tokens);
-            if !self.pv_plans.contains_key(&pv_key) {
-                self.pv_plans.insert(
-                    pv_key,
-                    Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension_bf16_output(
-                        &self.lt,
-                        GemmShape::new(self.head_dim, query_rows * queries_per_kv, key_tokens),
-                        cache_tokens,
-                        self.kv_heads,
-                        self.head_dim * cache_tokens,
-                        queries_per_kv * query_rows * key_tokens,
-                        queries_per_kv * query_rows * self.head_dim,
-                        PREFILL_GEMM_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            let pv = self.pv_plans.get(&pv_key).expect("PV plan exists");
-            pv.run_bf16_offsets_on_stream(
-                &self.lt,
-                &self.packed_value,
-                key_start,
-                &self.packed_probabilities,
-                0,
-                self.packed_output.output(),
-                0,
-                stream,
-            )?;
-            unpack_heads_quantize_nvfp4_col_major_bf16_at_offset_into_on_stream(
-                &self.packed_output,
-                output,
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                output_row_offset + query_offset,
-                output_input_scale,
-                stream,
-            )?;
-            query_offset += query_rows;
-        }
-        Ok(())
-    }
-}
-
-fn grow_device_buffer<T: Copy>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
-    if buffer.len() < required {
-        *buffer = DeviceBuffer::zeroed(required)?;
-    }
-    Ok(())
-}
-
 impl Gemma4BatchAttentionWorkspace {
-    fn new(attention: &Gemma4Attention, rows: usize, _max_context_tokens: usize) -> Result<Self> {
+    fn new(attention: &Gemma4Attention, rows: usize, max_context_tokens: usize) -> Result<Self> {
         let q_width = attention.q_heads * attention.head_dim;
         let kv_width = attention.kv_heads * attention.head_dim;
         Ok(Self {
-            tensor_core: Gemma4TensorCoreAttentionWorkspace::new(attention, rows)?,
+            compact: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_context_tokens,
+                attention.q_heads,
+                attention.kv_heads,
+                attention.head_dim,
+                16,
+            )?,
             q: DeviceBuffer::zeroed(rows * q_width)?,
             k: DeviceBuffer::zeroed(rows * kv_width)?,
             v: DeviceBuffer::zeroed(rows * kv_width)?,
             v_normed: DeviceBuffer::zeroed(rows * kv_width)?,
             q_rope: DeviceBuffer::zeroed(rows * q_width)?,
             k_rope: DeviceBuffer::zeroed(rows * kv_width)?,
+            attended: DeviceBuffer::zeroed(rows * q_width)?,
             output: DeviceBuffer::zeroed(rows * attention.output.out_features)?,
         })
     }
 
     fn device_bytes(&self) -> usize {
-        self.tensor_core.device_bytes()
+        self.compact.device_bytes()
             + self.q.device_bytes()
             + self.k.device_bytes()
             + self.v.device_bytes()
             + self.v_normed.device_bytes()
             + self.q_rope.device_bytes()
             + self.k_rope.device_bytes()
+            + self.attended.device_bytes()
             + self.output.device_bytes()
     }
 }
@@ -834,6 +518,89 @@ impl Gemma4Model {
         workspace: &mut Gemma4PrefillBatchWorkspace,
         rows: &mut [Gemma4PrefillRow<'_, '_>],
         stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
+    ) -> Result<()> {
+        let mut targets = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let target = match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    for target in targets.drain(..) {
+                        cache.abort_append(target).map_err(gemma4_cache_error)?;
+                    }
+                    return Err(gemma4_cache_error(error));
+                }
+            };
+            if target.max_rows() != row.token_ids.len() {
+                cache.abort_append(target).map_err(gemma4_cache_error)?;
+                for target in targets.drain(..) {
+                    cache.abort_append(target).map_err(gemma4_cache_error)?;
+                }
+                return Err(Error::Shape {
+                    label: "Gemma 4 prefill chunk",
+                    expected: format!(
+                        "each row to fit within its current {}-token cache page",
+                        nvfp4::SM12X_KV_PAGE_TOKENS
+                    ),
+                    actual: format!("{} tokens", row.token_ids.len()),
+                });
+            }
+            targets.push(target);
+        }
+        let result = {
+            let mut state_rows = Vec::with_capacity(rows.len());
+            let mut appends = Vec::with_capacity(rows.len());
+            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+                let sequence = &mut *row.sequence;
+                state_rows.push(Gemma4PrefillStateRow {
+                    token_ids: row.token_ids,
+                    state: &mut sequence.state,
+                    output: row.output,
+                });
+                appends.push(Gemma4Append {
+                    target,
+                    page_table: sequence.page_table.device(),
+                });
+            }
+            self.prefill_batch_impl(workspace, &mut state_rows, stream, cache, &appends)
+        };
+        if let Err(error) = result {
+            for target in targets {
+                cache.abort_append(target).map_err(gemma4_cache_error)?;
+            }
+            return Err(error);
+        }
+        for (row, target) in rows.iter_mut().zip(targets) {
+            let tokens = row.token_ids.len();
+            cache
+                .commit_append(
+                    target,
+                    tokens,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(gemma4_cache_error)?;
+            row.sequence.state.position += tokens;
+        }
+        Ok(())
+    }
+
+    fn prefill_batch_impl(
+        &self,
+        workspace: &mut Gemma4PrefillBatchWorkspace,
+        rows: &mut [Gemma4PrefillStateRow<'_, '_>],
+        stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
+        appends: &[Gemma4Append<'_>],
     ) -> Result<()> {
         if rows.is_empty() || rows.len() > workspace.sequence_capacity {
             return Err(Error::Shape {
@@ -887,17 +654,6 @@ impl Gemma4Model {
                     actual: format!("end={end} max_tokens={}", row.state.max_tokens),
                 });
             }
-            if row
-                .state
-                .kv_caches
-                .iter()
-                .any(|cache| cache.len() != row.state.position)
-            {
-                return Err(Error::Format {
-                    label: "Gemma 4 prefill state",
-                    detail: "layer KV positions disagree".to_string(),
-                });
-            }
         }
 
         workspace.linear.set_rows(total_tokens)?;
@@ -937,7 +693,7 @@ impl Gemma4Model {
         )?;
 
         for (layer_index, layer) in self.layers.iter().enumerate() {
-            run_layer_prefill(layer, layer_index, workspace, rows, stream)?;
+            run_layer_prefill(layer, layer_index, workspace, rows, stream, cache, appends)?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
         }
         let mut row_offset = 0;
@@ -991,21 +747,23 @@ impl Gemma4Model {
                 }
             }
             row_offset += row.token_ids.len();
-            row.state.position += row.token_ids.len();
         }
         Ok(())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_layer_prefill(
     layer: &Gemma4DecoderLayer,
     layer_index: usize,
     workspace: &mut Gemma4PrefillBatchWorkspace,
-    rows: &mut [Gemma4PrefillRow<'_, '_>],
+    rows: &mut [Gemma4PrefillStateRow<'_, '_>],
     stream: &CudaStream,
+    cache: &mut Gemma4SequenceCache,
+    appends: &[Gemma4Append<'_>],
 ) -> Result<()> {
     run_layer_pre_attention_prefill(layer, workspace, stream)?;
-    run_layer_attention_prefill(layer, layer_index, workspace, rows, stream)?;
+    run_layer_attention_prefill(layer, layer_index, workspace, rows, stream, cache, appends)?;
     run_layer_post_attention_prefill(layer, layer_index, workspace, stream)
 }
 
@@ -1033,8 +791,10 @@ fn run_layer_attention_prefill(
     layer: &Gemma4DecoderLayer,
     layer_index: usize,
     workspace: &mut Gemma4PrefillBatchWorkspace,
-    rows: &mut [Gemma4PrefillRow<'_, '_>],
+    rows: &mut [Gemma4PrefillStateRow<'_, '_>],
     stream: &CudaStream,
+    cache: &mut Gemma4SequenceCache,
+    appends: &[Gemma4Append<'_>],
 ) -> Result<()> {
     let attention_workspace = if layer.attention.window.is_some() {
         &mut workspace.local_attention
@@ -1048,6 +808,8 @@ fn run_layer_attention_prefill(
         rows,
         layer_index,
         stream,
+        cache,
+        appends,
     )
 }
 
@@ -1176,19 +938,22 @@ fn run_attention_prefill_pre(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_attention_prefill_body(
     attention: &Gemma4Attention,
     workspace: &mut Gemma4BatchAttentionWorkspace,
     linear: &mut Gemma4BatchLinearWorkspace,
-    rows: &mut [Gemma4PrefillRow<'_, '_>],
+    rows: &mut [Gemma4PrefillStateRow<'_, '_>],
     layer_index: usize,
     stream: &CudaStream,
+    cache: &mut Gemma4SequenceCache,
+    appends: &[Gemma4Append<'_>],
 ) -> Result<()> {
     let mut offset = 0;
     linear.ensure_plan(&attention.output)?;
     let attention_width = attention.output.in_features;
     let output_input_scale = attention.output.cublaslt_weight().input_scale();
-    for row in rows {
+    for (row, append) in rows.iter_mut().zip(appends) {
         let position = row.state.position;
         dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream(
             row.token_ids.len(),
@@ -1209,24 +974,55 @@ fn run_attention_prefill_body(
             attention.rope_theta,
             stream,
         )?;
-        workspace.tensor_core.run_sequence(
-            &mut row.state.kv_caches[layer_index],
-            &workspace.q_rope,
-            &workspace.k_rope,
-            &workspace.v_normed,
-            offset,
-            row.token_ids.len(),
-            attention.window,
-            linear
-                .activations
-                .get_mut(&attention_width)
-                .expect("attention output activation exists"),
-            offset,
-            output_input_scale,
-            stream,
-        )?;
+        cache
+            .with_append_page(append.target, |backend, page| {
+                let pool = backend.pool_mut(layer_index)?;
+                let q_width = attention.q_heads * attention.head_dim;
+                let kv_width = attention.kv_heads * attention.head_dim;
+                for token in 0..row.token_ids.len() {
+                    pool.append_at_offsets_on_stream(
+                        page.slot(),
+                        append.target.page_offset() + token,
+                        &workspace.k_rope,
+                        (offset + token) * kv_width,
+                        &workspace.v_normed,
+                        (offset + token) * kv_width,
+                        stream,
+                    )?;
+                    let cache_len = position + token + 1;
+                    let window_start = attention
+                        .window
+                        .map_or(0, |window| cache_len.saturating_sub(window));
+                    workspace
+                        .compact
+                        .attention_paged_window_offsets_into_on_stream(
+                            pool,
+                            append.page_table,
+                            cache_len,
+                            &workspace.q_rope,
+                            (offset + token) * q_width,
+                            workspace.attended.output(),
+                            (offset + token) * q_width,
+                            window_start,
+                            stream,
+                        )?;
+                }
+                Ok(())
+            })
+            .map_err(gemma4_cache_error)?;
         offset += row.token_ids.len();
     }
+    quantize_nvfp4_col_major_f32_device_into_on_stream(
+        attention_width,
+        linear.rows,
+        &workspace.attended,
+        linear
+            .activations
+            .get_mut(&attention_width)
+            .expect("attention output activation exists"),
+        output_input_scale,
+        stream,
+    )?;
     Ok(())
 }
 
@@ -1419,14 +1215,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_local_attention_requires_a_long_prefix_relative_to_the_query() {
-        assert!(!use_compact_local_attention(0, 1));
-        assert!(!use_compact_local_attention(4_096, 512));
-        assert!(use_compact_local_attention(8_192, 512));
-        assert!(use_compact_local_attention(2_688, 128));
-    }
-
-    #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
     fn local_w4a4_projection_matches_w4a16_reference() {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1540,83 +1328,18 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
-    fn local_batched_first_layer_matches_token_serial_execution() {
-        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("models/gemma-4-26b-a4b-nvfp4");
-        let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
-        let rows = 4;
-        let hidden = model.config.hidden_size;
-        let input_host = (0..rows * hidden)
-            .map(|index| ((index % 83) as f32 - 41.0) / 41.0)
-            .collect::<Vec<_>>();
-        let mut batch_state = model.new_decode_state(rows).expect("batch state");
-        let mut serial_state = model.new_decode_state(rows).expect("serial state");
-        let mut workspace = model
-            .new_prefill_batch_workspace(1, rows, rows)
-            .expect("batch workspace");
-        workspace
-            .hidden
-            .copy_from_host(&input_host)
-            .expect("upload layer input");
-        let stream = CudaStream::new_blocking().expect("stream");
-        let token_ids = vec![0; rows];
-        run_layer_prefill(
-            &model.layers[0],
-            0,
-            &mut workspace,
-            &mut [Gemma4PrefillRow {
-                token_ids: &token_ids,
-                state: &mut batch_state,
-                output: Gemma4PrefillOutput::None,
-            }],
-            &stream,
-        )
-        .expect("batch layer");
-        let actual = workspace
-            .layer_output
-            .copy_to_host(&stream)
-            .expect("batch output");
-        for row in 0..rows {
-            let start = row * hidden;
-            let end = start + hidden;
-            let input = DeviceBuffer::from_host(&input_host[start..end]).expect("serial input");
-            model.layers[0]
-                .run_decode_into(
-                    &input,
-                    &mut serial_state.layers[0],
-                    &mut serial_state.kv_caches[0],
-                    serial_state
-                        .compact_attention
-                        .for_layer_mut(true)
-                        .expect("local compact attention workspace"),
-                    row,
-                    &stream,
-                )
-                .expect("serial layer");
-            let reference = model.layers[0]
-                .output(&serial_state.layers[0])
-                .copy_to_host(&stream)
-                .expect("serial output");
-            let max_error = actual[start..end]
-                .iter()
-                .zip(reference.iter())
-                .map(|(actual, reference)| (actual - reference).abs())
-                .fold(0.0f32, f32::max);
-            assert!(max_error <= 1.0, "row={row} max layer error={max_error}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires the local Gemma 4 checkpoint"]
     fn local_active_rows_match_exact_workspace() {
         let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("models/gemma-4-26b-a4b-nvfp4");
         let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
         let tokens = [2, 3, 2, 3];
-        let mut exact_state = model.new_decode_state(tokens.len()).expect("exact state");
-        let mut padded_state = model.new_decode_state(tokens.len()).expect("padded state");
+        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
+            &model,
+            2,
+            tokens.len(),
+        )
+        .expect("sequence cache");
         let mut exact = model
             .new_prefill_batch_workspace(1, tokens.len(), tokens.len())
             .expect("exact workspace");
@@ -1624,16 +1347,21 @@ mod tests {
             .new_prefill_batch_workspace(1, 8, tokens.len())
             .expect("padded workspace");
         let stream = CudaStream::new_blocking().expect("stream");
+        let mut exact_state = Gemma4Sequence::admit(&model, &mut cache, tokens.len(), &stream)
+            .expect("exact sequence");
+        let mut padded_state = Gemma4Sequence::admit(&model, &mut cache, tokens.len(), &stream)
+            .expect("padded sequence");
 
         model
             .prefill_batch(
                 &mut exact,
                 &mut [Gemma4PrefillRow {
                     token_ids: &tokens,
-                    state: &mut exact_state,
+                    sequence: &mut exact_state,
                     output: Gemma4PrefillOutput::None,
                 }],
                 &stream,
+                &mut cache,
             )
             .expect("exact prefill");
         model
@@ -1641,10 +1369,11 @@ mod tests {
                 &mut padded,
                 &mut [Gemma4PrefillRow {
                     token_ids: &tokens,
-                    state: &mut padded_state,
+                    sequence: &mut padded_state,
                     output: Gemma4PrefillOutput::None,
                 }],
                 &stream,
+                &mut cache,
             )
             .expect("padded prefill");
 
