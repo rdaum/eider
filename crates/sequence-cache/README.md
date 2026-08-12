@@ -150,6 +150,33 @@ runtime's storage, choose a `RetainedSnapshot` type for any non-paged state, and
 construct `SequenceCache<Backend, Snapshot>`. Use `()` when there is no
 additional retained state.
 
+### Paged CPU KV-cache example
+
+[`examples/cpu_paged_kv.rs`](examples/cpu_paged_kv.rs) implements a complete
+in-memory CPU backend. Each physical page owns token-major key and value
+matrices for every attention layer, following the simple storage shape used by
+CPU inference engines such as [tinfer](https://github.com/rdaum/tinfer). The
+example demonstrates:
+
+- backend-owned physical storage behind compact page handles;
+- a model-sized write scattered directly across several cache pages;
+- append-only transactions without unnecessary content snapshots;
+- actual allocation reuse when pages are recycled;
+- a causal-attention read through the enlarged page table before commit;
+- retaining an aligned prompt prefix; and
+- restoring the same physical pages for a later request.
+
+Run it with:
+
+```sh
+cargo run -p sequence-cache --example cpu_paged_kv
+```
+
+The generated floating-point rows stand in for a model's key and value
+projection output. The ownership, transaction, page-table, recycling, and read
+paths are real. Cache accounting covers the managed KV payload; ordinary Rust
+collection and allocator metadata remains process overhead.
+
 ## Core model
 
 ### Pages and sequences
