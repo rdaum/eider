@@ -1,5 +1,8 @@
-use infer::muse_glimmer::{MuseGlimmerDecodeState, MuseGlimmerModel};
+use infer::muse_glimmer::MuseGlimmerModel;
 use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
+use infer::runtime::muse_glimmer_sequence_cache::{
+    MuseGlimmerSequence, MuseGlimmerSequenceCache, new_muse_glimmer_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, Throughput, black_box, run_benchmark_main,
@@ -10,7 +13,8 @@ use std::time::Duration;
 
 struct MuseGlimmerDFlashBench {
     model: Rc<MuseGlimmerModel>,
-    state: MuseGlimmerDecodeState,
+    sequence: MuseGlimmerSequence,
+    sequence_cache: MuseGlimmerSequenceCache,
     anchor: u32,
 }
 
@@ -26,17 +30,19 @@ impl BenchContext for MuseGlimmerDFlashBench {
 
 impl MuseGlimmerDFlashBench {
     fn new(model: Rc<MuseGlimmerModel>, prompt: &[u32]) -> Self {
-        let mut state = model
-            .new_decode_state(4_096)
-            .expect("allocate Muse Glimmer DFlash state");
-        prefill(&model, &mut state, prompt);
+        let mut sequence_cache = new_muse_glimmer_sequence_cache(&model, 1, 4_096)
+            .expect("allocate Muse Glimmer DFlash cache");
+        let mut sequence = MuseGlimmerSequence::admit(&model, &mut sequence_cache, 4_096)
+            .expect("admit Muse Glimmer DFlash sequence");
+        prefill(&model, &mut sequence, &mut sequence_cache, prompt);
         let anchor = model
-            .argmax_with_logit(&mut state)
+            .argmax_with_logit(&mut sequence)
             .expect("select DFlash anchor")
             .0;
         Self {
             model,
-            state,
+            sequence,
+            sequence_cache,
             anchor,
         }
     }
@@ -44,7 +50,7 @@ impl MuseGlimmerDFlashBench {
     fn cycle(&mut self) -> usize {
         let result = self
             .model
-            .dflash_cycle(&mut self.state, self.anchor)
+            .dflash_cycle(&mut self.sequence, self.anchor, &mut self.sequence_cache)
             .expect("DFlash cycle");
         self.anchor = result.next_token;
         let emitted = result.tokens.len();
@@ -54,14 +60,15 @@ impl MuseGlimmerDFlashBench {
 }
 
 fn validate(model: &MuseGlimmerModel, prompt: &[u32]) {
-    let mut speculative = model
-        .new_decode_state(prompt.len() + 32)
-        .expect("allocate speculative validation state");
-    let mut serial = model
-        .new_decode_state(prompt.len() + 32)
-        .expect("allocate serial validation state");
-    prefill(model, &mut speculative, prompt);
-    prefill(model, &mut serial, prompt);
+    let capacity = prompt.len() + 32;
+    let mut cache =
+        new_muse_glimmer_sequence_cache(model, 2, capacity).expect("allocate validation cache");
+    let mut speculative = MuseGlimmerSequence::admit(model, &mut cache, capacity)
+        .expect("admit speculative validation sequence");
+    let mut serial = MuseGlimmerSequence::admit(model, &mut cache, capacity)
+        .expect("admit serial validation sequence");
+    prefill(model, &mut speculative, &mut cache, prompt);
+    prefill(model, &mut serial, &mut cache, prompt);
     let anchor = model
         .argmax_with_logit(&mut speculative)
         .expect("speculative validation anchor")
@@ -73,13 +80,13 @@ fn validate(model: &MuseGlimmerModel, prompt: &[u32]) {
     assert_eq!(anchor, serial_token, "validation anchors differ");
 
     let cycle = model
-        .dflash_cycle(&mut speculative, anchor)
+        .dflash_cycle(&mut speculative, anchor, &mut cache)
         .expect("validation DFlash cycle");
     let mut expected = Vec::with_capacity(cycle.tokens.len() + 1);
     for _ in 0..=cycle.tokens.len() {
         expected.push(serial_token);
         model
-            .dflash_prefill_chunk(&mut serial, &[serial_token], true)
+            .dflash_prefill_chunk(&mut serial, &[serial_token], true, &mut cache)
             .expect("serial target step");
         serial_token = model
             .argmax_with_logit(&mut serial)
@@ -90,10 +97,15 @@ fn validate(model: &MuseGlimmerModel, prompt: &[u32]) {
     assert_eq!(cycle.next_token, expected[cycle.tokens.len()]);
 }
 
-fn prefill(model: &MuseGlimmerModel, state: &mut MuseGlimmerDecodeState, prompt: &[u32]) {
+fn prefill(
+    model: &MuseGlimmerModel,
+    sequence: &mut MuseGlimmerSequence,
+    cache: &mut MuseGlimmerSequenceCache,
+    prompt: &[u32],
+) {
     for (index, chunk) in prompt.chunks(16).enumerate() {
         model
-            .dflash_prefill_chunk(state, chunk, (index + 1) * 16 >= prompt.len())
+            .dflash_prefill_chunk(sequence, chunk, (index + 1) * 16 >= prompt.len(), cache)
             .expect("DFlash prompt chunk");
     }
 }
