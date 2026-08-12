@@ -1,4 +1,7 @@
-use infer::bitnet::{BitNetDecodeState, BitNetModel};
+use infer::bitnet::{BitNetModel, BitNetPrefillWorkspace};
+use infer::runtime::bitnet_sequence_cache::{
+    BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,
@@ -11,19 +14,22 @@ const BOS_TOKEN: u32 = 128_000;
 
 struct BitNetDecodeBench {
     model: Rc<BitNetModel>,
-    state: BitNetDecodeState,
+    sequence: BitNetSequence,
+    cache: BitNetSequenceCache,
     token: u32,
 }
 
 impl BenchContext for BitNetDecodeBench {
     fn prepare(_num_chunks: usize) -> Self {
         let model = Rc::new(BitNetModel::load(&model_dir()).expect("load BitNet model"));
-        let state = model
-            .new_decode_state(model.config().max_context)
-            .expect("allocate BitNet decode state");
+        let mut cache = new_bitnet_sequence_cache(&model, 1, model.config().max_context)
+            .expect("allocate BitNet sequence cache");
+        let sequence = BitNetSequence::admit(&model, &mut cache, model.config().max_context)
+            .expect("admit BitNet sequence");
         let mut bench = Self {
             model,
-            state,
+            sequence,
+            cache,
             token: BOS_TOKEN,
         };
         bench.validate();
@@ -38,6 +44,8 @@ impl BenchContext for BitNetDecodeBench {
 struct BitNetPrefillBench {
     model: Rc<BitNetModel>,
     prompt: Vec<u32>,
+    cache: BitNetSequenceCache,
+    workspace: BitNetPrefillWorkspace,
 }
 
 impl BenchContext for BitNetPrefillBench {
@@ -53,11 +61,11 @@ impl BenchContext for BitNetPrefillBench {
 impl BitNetDecodeBench {
     fn validate(&mut self) {
         self.model
-            .forward_one(&mut self.state, self.token)
+            .forward_one(&mut self.sequence, self.token, &mut self.cache)
             .expect("BitNet correctness forward");
         let logits = self
             .model
-            .logits_to_host(&mut self.state)
+            .logits_to_host(&mut self.sequence)
             .expect("BitNet correctness logits");
         let expected = logits
             .iter()
@@ -70,7 +78,7 @@ impl BitNetDecodeBench {
             .expect("non-empty BitNet vocabulary");
         let actual = self
             .model
-            .argmax_with_logit(&mut self.state)
+            .argmax_with_logit(&mut self.sequence)
             .expect("BitNet direct top-1");
         let tolerance = expected.1.abs().max(1.0) * 1.0e-4;
         assert_eq!(actual.0, expected.0, "BitNet direct top-1 token mismatch");
@@ -85,11 +93,11 @@ impl BitNetDecodeBench {
 
     fn decode_one(&mut self) {
         self.model
-            .forward_one(&mut self.state, self.token)
+            .forward_one(&mut self.sequence, self.token, &mut self.cache)
             .expect("BitNet decode forward");
         let (token, logit) = self
             .model
-            .argmax_with_logit(&mut self.state)
+            .argmax_with_logit(&mut self.sequence)
             .expect("BitNet decode top-1");
         self.token = token;
         black_box((token, logit));
@@ -114,15 +122,22 @@ fn prefill_sample(
 ) -> BenchSampleResult {
     let mut operations = 0u64;
     for _ in 0..chunk_size {
-        let mut state = context
-            .model
-            .new_decode_state(context.prompt.len() + 1)
-            .expect("allocate BitNet prefill state");
+        let mut sequence =
+            BitNetSequence::admit(&context.model, &mut context.cache, context.prompt.len() + 1)
+                .expect("admit BitNet prefill sequence");
         context
             .model
-            .prefill(&mut state, &context.prompt)
+            .prefill(
+                &mut context.workspace,
+                &mut sequence,
+                &context.prompt,
+                &mut context.cache,
+            )
             .expect("BitNet batched prefill");
-        black_box(state.len());
+        black_box(sequence.position());
+        sequence
+            .finish(&mut context.cache)
+            .expect("finish BitNet prefill sequence");
         operations += context.prompt.len() as u64;
     }
     BenchSampleResult::operations(operations)
@@ -144,23 +159,28 @@ fn validate_batched_prefill(model: &BitNetModel) {
 }
 
 fn assert_batched_prefill(model: &BitNetModel, prompt: &[u32], max_relative_rmse: f64) {
-    let mut reference = model
-        .new_decode_state(prompt.len() + 1)
-        .expect("allocate sequential reference state");
+    let mut reference_cache =
+        new_bitnet_sequence_cache(model, 1, prompt.len() + 1).expect("reference cache");
+    let mut reference = BitNetSequence::admit(model, &mut reference_cache, prompt.len() + 1)
+        .expect("admit sequential reference");
     for &token in prompt {
         model
-            .forward_one(&mut reference, token)
+            .forward_one(&mut reference, token, &mut reference_cache)
             .expect("sequential reference token");
     }
     let expected = model
         .logits_to_host(&mut reference)
         .expect("sequential reference logits");
 
-    let mut batched = model
-        .new_decode_state(prompt.len() + 1)
-        .expect("allocate batched prefill state");
+    let mut batched_cache =
+        new_bitnet_sequence_cache(model, 1, prompt.len() + 1).expect("batched cache");
+    let mut batched = BitNetSequence::admit(model, &mut batched_cache, prompt.len() + 1)
+        .expect("admit batched sequence");
+    let mut workspace = model
+        .new_prefill_workspace(prompt.len(), prompt.len() + 1)
+        .expect("batched prefill workspace");
     model
-        .prefill(&mut batched, &prompt)
+        .prefill(&mut workspace, &mut batched, prompt, &mut batched_cache)
         .expect("batched correctness prefill");
     let actual = model
         .logits_to_host(&mut batched)
@@ -241,12 +261,15 @@ fn main() {
     run_benchmark_main(options, |runner| {
         runner.group::<BitNetDecodeBench>("BitNet b1.58 full decode", |group| {
             let factory = || {
-                let state = model
-                    .new_decode_state(model.config().max_context)
-                    .expect("allocate BitNet decode state");
+                let mut cache = new_bitnet_sequence_cache(&model, 1, model.config().max_context)
+                    .expect("allocate BitNet sequence cache");
+                let sequence =
+                    BitNetSequence::admit(&model, &mut cache, model.config().max_context)
+                        .expect("admit BitNet sequence");
                 let mut bench = BitNetDecodeBench {
                     model: Rc::clone(&model),
-                    state,
+                    sequence,
+                    cache,
                     token: BOS_TOKEN,
                 };
                 bench.validate();
@@ -270,6 +293,11 @@ fn main() {
                 let factory = || BitNetPrefillBench {
                     model: Rc::clone(&model),
                     prompt: prompt.clone(),
+                    cache: new_bitnet_sequence_cache(&model, 1, rows + 1)
+                        .expect("allocate BitNet prefill cache"),
+                    workspace: model
+                        .new_prefill_workspace(rows, rows + 1)
+                        .expect("allocate BitNet prefill workspace"),
                 };
                 group
                     .throughput(Throughput::per_operation(1, "tokens"))

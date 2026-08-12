@@ -1,16 +1,19 @@
 use infer::bitnet::BitNetModel;
 use infer::nvfp4::{Error, Result};
+use infer::runtime::bitnet_sequence_cache::{BitNetSequence, new_bitnet_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let (model_dir, tokens) = parse_args()?;
     let model = BitNetModel::load(&model_dir)?;
-    let mut state = model.new_decode_state(tokens.len())?;
+    let mut cache = new_bitnet_sequence_cache(&model, 1, tokens.len())?;
+    let mut sequence = BitNetSequence::admit(&model, &mut cache, tokens.len())?;
     for token in tokens {
-        model.forward_one(&mut state, token)?;
-        let (next, logit) = model.argmax_with_logit(&mut state)?;
+        model.forward_one(&mut sequence, token, &mut cache)?;
+        let (next, logit) = model.argmax_with_logit(&mut sequence)?;
         println!("BitNet decode: input_token={token} next_token={next} logit={logit}");
     }
+    sequence.finish(&mut cache)?;
     Ok(())
 }
 

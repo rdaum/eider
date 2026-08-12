@@ -1,16 +1,19 @@
 use infer::bonsai::BonsaiModel;
 use infer::nvfp4::{Error, Result};
+use infer::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let (gguf, tokens) = parse_args()?;
     let model = BonsaiModel::load(&gguf)?;
-    let mut state = model.new_decode_state(tokens.len())?;
+    let mut cache = new_bonsai_sequence_cache(&model, 1, tokens.len())?;
+    let mut sequence = BonsaiSequence::admit(&model, &mut cache, tokens.len())?;
     for token in tokens {
-        model.forward_one(&mut state, token)?;
-        let (next, logit) = model.argmax_with_logit(&mut state)?;
+        model.forward_one(&mut sequence, token, &mut cache)?;
+        let (next, logit) = model.argmax_with_logit(&mut sequence)?;
         println!("Bonsai decode: input_token={token} next_token={next} logit={logit}");
     }
+    sequence.finish(&mut cache)?;
     Ok(())
 }
 

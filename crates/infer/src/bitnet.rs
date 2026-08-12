@@ -1,17 +1,21 @@
 //! BitNet b1.58 dense decoder using checkpoint-exact ternary GPU linears.
 
+use crate::runtime::bitnet_sequence_cache::{
+    BitNetSequence, BitNetSequenceCache, bitnet_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+
 use nvfp4::{
-    Bf16TnMatmulPlan, BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt,
-    CudaStream, DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, ModelOptCheckpoint, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, pack_token_heads_bf16_into_on_stream,
+    BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt, CudaStream,
+    DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, ModelOptCheckpoint, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     relu_squared_mul_halves_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
     split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
-    unpack_heads_f32_at_offset_into_on_stream,
 };
+use sequence_cache::AppendPages;
 use serde_json::Value;
 use std::path::Path;
 
@@ -151,13 +155,12 @@ struct BitNetLayer {
 
 /// Mutable state for one BitNet sequence.
 pub struct BitNetDecodeState {
-    kv_cache: Vec<Sm12xKvCache>,
-    position: usize,
+    pub(crate) position: usize,
+    max_tokens: usize,
     token: DeviceBuffer<u32>,
     position_device: DeviceBuffer<u32>,
     stream: CudaStream,
     workspace: BitNetDecodeWorkspace,
-    prefill_workspace: Option<BitNetPrefillWorkspace>,
 }
 
 struct BitNetDecodeWorkspace {
@@ -189,16 +192,14 @@ struct BitNetDecodeWorkspace {
     compact_attention: Sm12xKvAttentionWorkspace,
 }
 
-struct BitNetPrefillWorkspace {
+pub struct BitNetPrefillWorkspace {
     rows: usize,
-    cache_tokens: usize,
+    max_tokens: usize,
     lt: CublasLt,
     qkv_plan: Int8TnMatmulPlan,
     output_plan: Int8TnMatmulPlan,
     gate_up_plan: Int8TnMatmulPlan,
     down_plan: Int8TnMatmulPlan,
-    qk_plan: Bf16TnMatmulPlan,
-    pv_plan: Bf16TnMatmulPlan,
     token_ids: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
@@ -209,12 +210,6 @@ struct BitNetPrefillWorkspace {
     q_rope: DeviceBuffer<f32>,
     k_rope: DeviceBuffer<f32>,
     attention: DeviceBuffer<f32>,
-    packed_query: DeviceBuffer<u16>,
-    packed_key: DeviceBuffer<u16>,
-    packed_value: DeviceBuffer<u16>,
-    attention_scores: DeviceBuffer<f32>,
-    packed_probabilities: DeviceBuffer<u16>,
-    packed_attention: DeviceBuffer<f32>,
     attention_normed: DeviceBuffer<f32>,
     projected: DeviceBuffer<f32>,
     residual: DeviceBuffer<f32>,
@@ -265,7 +260,7 @@ impl BitNetModel {
     }
 
     /// Allocates one sequence with capacity for `max_tokens`.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<BitNetDecodeState> {
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<BitNetDecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_context {
             return Err(Error::Shape {
                 label: "BitNet sequence capacity",
@@ -276,18 +271,40 @@ impl BitNetModel {
         BitNetDecodeState::new(self.config, max_tokens)
     }
 
+    /// Allocates the reusable workspace for one contiguous prefill chunk.
+    pub fn new_prefill_workspace(
+        &self,
+        token_capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<BitNetPrefillWorkspace> {
+        if token_capacity == 0 || token_capacity > max_context_tokens {
+            return Err(Error::Shape {
+                label: "BitNet prefill workspace",
+                expected: "0 < token capacity <= maximum context".to_string(),
+                actual: format!("tokens={token_capacity} context={max_context_tokens}"),
+            });
+        }
+        BitNetPrefillWorkspace::new(self.config, token_capacity, max_context_tokens)
+    }
+
     /// Runs one token through the transformer and leaves final hidden state ready.
     ///
     /// The vocabulary projection is deferred until the caller selects greedy
     /// top-1 or sampled logits. This avoids scanning the tied BF16 embedding
     /// table for intermediate prompt tokens.
-    pub fn forward_one(&self, state: &mut BitNetDecodeState, token_id: u32) -> Result<()> {
-        if token_id as usize >= self.config.vocab || state.position >= self.config.max_context {
+    pub fn forward_one(
+        &self,
+        sequence: &mut BitNetSequence,
+        token_id: u32,
+        cache: &mut BitNetSequenceCache,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
+        if token_id as usize >= self.config.vocab || state.position >= state.max_tokens {
             return Err(Error::Shape {
                 label: "BitNet decode token",
                 expected: format!(
                     "token < {} and position < {}",
-                    self.config.vocab, self.config.max_context
+                    self.config.vocab, state.max_tokens
                 ),
                 actual: format!("token={token_id} position={}", state.position),
             });
@@ -304,31 +321,82 @@ impl BitNetModel {
             state.workspace.hidden.output(),
             &state.stream,
         )?;
-        for (layer, kv_cache) in self.layers.iter().zip(&mut state.kv_cache) {
-            state.workspace.run_layer(
-                self.config,
-                layer,
-                kv_cache,
-                &state.position_device,
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bitnet_cache_error)?;
+        let result = (|| {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                cache
+                    .with_append_pages(&reservation, |backend, pages| {
+                        let page = pages.iter().next().expect("one decode append page");
+                        let segment = page.segment();
+                        state.workspace.run_layer(
+                            self.config,
+                            layer,
+                            BitNetLayerCache {
+                                pool: backend.pool_mut(layer_index)?,
+                                page_slot: page.page().slot(),
+                                page_offset: segment.page_offset(),
+                                page_table: sequence.page_table.device(),
+                            },
+                            state.position,
+                            &state.position_device,
+                            &state.stream,
+                        )
+                    })
+                    .map_err(bitnet_cache_error)?;
+            }
+            rms_norm_f32_into_on_stream(
+                1,
+                self.config.hidden,
+                &state.workspace.hidden,
+                &self.final_norm,
+                state.workspace.final_hidden.output(),
+                self.config.rms_eps,
                 &state.stream,
             )?;
+            state.stream.synchronize()
+        })();
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(bitnet_cache_error)?;
+            return Err(error);
         }
-        rms_norm_f32_into_on_stream(
-            1,
-            self.config.hidden,
-            &state.workspace.hidden,
-            &self.final_norm,
-            state.workspace.final_hidden.output(),
-            self.config.rms_eps,
-            &state.stream,
-        )?;
-        state.stream.synchronize()?;
+        cache
+            .commit_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bitnet_cache_error)?;
         state.position += 1;
         Ok(())
     }
 
     /// Prefills a contiguous prompt chunk through the batched GPU path.
-    pub fn prefill(&self, state: &mut BitNetDecodeState, token_ids: &[u32]) -> Result<()> {
+    pub fn prefill(
+        &self,
+        workspace: &mut BitNetPrefillWorkspace,
+        sequence: &mut BitNetSequence,
+        token_ids: &[u32],
+        cache: &mut BitNetSequenceCache,
+    ) -> Result<()> {
         if token_ids.is_empty() {
             return Err(Error::Shape {
                 label: "BitNet prefill",
@@ -339,7 +407,7 @@ impl BitNetModel {
         if token_ids
             .iter()
             .any(|&token| token as usize >= self.config.vocab)
-            || state.position + token_ids.len() > self.config.max_context
+            || sequence.state.position + token_ids.len() > sequence.state.max_tokens
         {
             return Err(Error::Shape {
                 label: "BitNet prefill",
@@ -349,63 +417,101 @@ impl BitNetModel {
                 ),
                 actual: format!(
                     "start={} tokens={} max_token={:?}",
-                    state.position,
+                    sequence.state.position,
                     token_ids.len(),
                     token_ids.iter().max()
                 ),
             });
         }
         let rows = token_ids.len();
-        let start_position = state.position;
-        let cache_tokens = start_position + rows;
-        let mut workspace = match state.prefill_workspace.take() {
-            Some(workspace) if workspace.rows == rows && workspace.cache_tokens == cache_tokens => {
-                workspace
-            }
-            _ => BitNetPrefillWorkspace::new(
-                self.config,
-                rows,
-                cache_tokens,
-                state.kv_cache[0].max_tokens(),
-            )?,
-        };
-        workspace.token_ids.copy_from_host(token_ids)?;
-        copy_bf16_rows_to_f32_indexed_into_on_stream(
-            self.config.vocab,
-            self.config.hidden,
-            &self.embeddings,
-            &workspace.token_ids,
-            workspace.hidden.output(),
-            &state.stream,
-        )?;
-        for (layer, kv_cache) in self.layers.iter().zip(&mut state.kv_cache) {
-            workspace.run_layer(self.config, layer, kv_cache, start_position, &state.stream)?;
+        if workspace.rows != rows {
+            *workspace = BitNetPrefillWorkspace::new(self.config, rows, workspace.max_tokens)?;
         }
-        rms_norm_f32_into_on_stream(
-            rows,
-            self.config.hidden,
-            &workspace.hidden,
-            &self.final_norm,
-            workspace.final_hidden.output(),
-            self.config.rms_eps,
-            &state.stream,
-        )?;
-        copy_row_f32_into_on_stream(
-            rows,
-            self.config.hidden,
-            rows - 1,
-            &workspace.final_hidden,
-            state.workspace.final_hidden.output(),
-            &state.stream,
-        )?;
-        state.stream.synchronize()?;
-        state.position += rows;
-        state.prefill_workspace = Some(workspace);
+        let start_position = sequence.state.position;
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream: &sequence.state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bitnet_cache_error)?;
+        let result = (|| {
+            let state = &mut sequence.state;
+            workspace.token_ids.copy_from_host(token_ids)?;
+            copy_bf16_rows_to_f32_indexed_into_on_stream(
+                self.config.vocab,
+                self.config.hidden,
+                &self.embeddings,
+                &workspace.token_ids,
+                workspace.hidden.output(),
+                &state.stream,
+            )?;
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                cache
+                    .with_append_pages(&reservation, |backend, pages| {
+                        workspace.run_layer(
+                            self.config,
+                            layer,
+                            backend.pool_mut(layer_index)?,
+                            pages,
+                            sequence.page_table.device(),
+                            start_position,
+                            &state.stream,
+                        )
+                    })
+                    .map_err(bitnet_cache_error)?;
+            }
+            rms_norm_f32_into_on_stream(
+                rows,
+                self.config.hidden,
+                &workspace.hidden,
+                &self.final_norm,
+                workspace.final_hidden.output(),
+                self.config.rms_eps,
+                &state.stream,
+            )?;
+            copy_row_f32_into_on_stream(
+                rows,
+                self.config.hidden,
+                rows - 1,
+                &workspace.final_hidden,
+                state.workspace.final_hidden.output(),
+                &state.stream,
+            )?;
+            state.stream.synchronize()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &sequence.state.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(bitnet_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: &sequence.state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bitnet_cache_error)?;
+        sequence.state.position += rows;
         Ok(())
     }
 
     /// Copies the most recent full vocabulary logits to the host.
-    pub fn logits_to_host(&self, state: &mut BitNetDecodeState) -> Result<Vec<f32>> {
+    pub fn logits_to_host(&self, sequence: &mut BitNetSequence) -> Result<Vec<f32>> {
+        let state = &mut sequence.state;
         if state.position == 0 {
             return Err(Error::Format {
                 label: "BitNet logits",
@@ -428,7 +534,8 @@ impl BitNetModel {
     }
 
     /// Returns the argmax token and logit without copying the vocabulary.
-    pub fn argmax_with_logit(&self, state: &mut BitNetDecodeState) -> Result<(u32, f32)> {
+    pub fn argmax_with_logit(&self, sequence: &mut BitNetSequence) -> Result<(u32, f32)> {
+        let state = &mut sequence.state;
         bf16_linear_logits_f32_into_on_stream(
             &state.workspace.final_hidden,
             &self.embeddings,
@@ -451,17 +558,13 @@ impl BitNetModel {
 
 impl BitNetDecodeState {
     fn new(config: BitNetConfig, max_tokens: usize) -> Result<Self> {
-        let kv_cache = (0..config.layers)
-            .map(|_| Sm12xKvCache::new(max_tokens, config.kv_heads, config.head_dim))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            kv_cache,
             position: 0,
+            max_tokens,
             token: DeviceBuffer::from_host(&[0])?,
             position_device: DeviceBuffer::from_host(&[0])?,
             stream: CudaStream::new_non_blocking()?,
             workspace: BitNetDecodeWorkspace::new(config, max_tokens)?,
-            prefill_workspace: None,
         })
     }
 
@@ -477,18 +580,19 @@ impl BitNetDecodeState {
 
     /// Device bytes owned by sequence-specific state and workspace.
     pub fn device_bytes(&self) -> usize {
-        let cache = self
-            .kv_cache
-            .iter()
-            .map(Sm12xKvCache::device_bytes)
-            .sum::<usize>();
-        cache
-            + self.workspace.device_bytes()
-            + self
-                .prefill_workspace
-                .as_ref()
-                .map_or(0, BitNetPrefillWorkspace::device_bytes)
+        self.workspace.device_bytes()
     }
+
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+}
+
+struct BitNetLayerCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
 }
 
 impl BitNetLayer {
@@ -571,6 +675,8 @@ impl BitNetDecodeWorkspace {
     fn new(config: BitNetConfig, max_tokens: usize) -> Result<Self> {
         let q_width = config.q_width();
         let kv_width = config.kv_width();
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             hidden: DeviceBuffer::zeroed(config.hidden)?,
             normed: DeviceBuffer::zeroed(config.hidden)?,
@@ -598,7 +704,7 @@ impl BitNetDecodeWorkspace {
             gate_up_activation: BitNetActivationWorkspace::new(1, config.hidden)?,
             down_activation: BitNetActivationWorkspace::new(1, config.intermediate)?,
             compact_attention: Sm12xKvAttentionWorkspace::new_gqa(
-                max_tokens,
+                attention_capacity,
                 config.q_heads,
                 config.kv_heads,
                 config.head_dim,
@@ -610,7 +716,8 @@ impl BitNetDecodeWorkspace {
         &mut self,
         config: BitNetConfig,
         weights: &BitNetLayer,
-        kv_cache: &mut Sm12xKvCache,
+        cache: BitNetLayerCache<'_>,
+        position: usize,
         position_device: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -655,13 +762,26 @@ impl BitNetDecodeWorkspace {
             config.rope_theta,
             stream,
         )?;
-        kv_cache.append_on_stream(&self.k_rope, &self.v, stream)?;
-        self.compact_attention.attention_into_on_stream(
-            kv_cache,
-            &self.q_rope,
-            self.attention.output(),
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
+            &self.k_rope,
+            0,
+            &self.v,
+            0,
             stream,
         )?;
+        self.compact_attention
+            .attention_paged_offsets_into_on_stream(
+                cache.pool,
+                cache.page_table,
+                position + 1,
+                &self.q_rope,
+                0,
+                self.attention.output(),
+                0,
+                stream,
+            )?;
         rms_norm_f32_into_on_stream(
             1,
             config.q_width(),
@@ -757,12 +877,7 @@ impl BitNetDecodeWorkspace {
 }
 
 impl BitNetPrefillWorkspace {
-    fn new(
-        config: BitNetConfig,
-        rows: usize,
-        cache_tokens: usize,
-        max_tokens: usize,
-    ) -> Result<Self> {
+    fn new(config: BitNetConfig, rows: usize, max_tokens: usize) -> Result<Self> {
         let q_width = config.q_width();
         let kv_width = config.kv_width();
         let lt = CublasLt::new()?;
@@ -787,36 +902,16 @@ impl BitNetPrefillWorkspace {
             GemmShape::new(config.hidden, rows, config.intermediate),
             WORKSPACE_LIMIT,
         )?;
-        let queries_per_kv = config.q_heads / config.kv_heads;
-        let qk_plan = Bf16TnMatmulPlan::new_strided_batch(
-            &lt,
-            GemmShape::new(cache_tokens, rows * queries_per_kv, config.head_dim),
-            config.kv_heads,
-            cache_tokens * config.head_dim,
-            queries_per_kv * rows * config.head_dim,
-            queries_per_kv * rows * cache_tokens,
-            4 * 1024 * 1024,
-        )?;
-        let pv_plan = Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
-            &lt,
-            GemmShape::new(config.head_dim, rows * queries_per_kv, cache_tokens),
-            cache_tokens,
-            config.kv_heads,
-            config.head_dim * cache_tokens,
-            queries_per_kv * rows * cache_tokens,
-            queries_per_kv * rows * config.head_dim,
-            4 * 1024 * 1024,
-        )?;
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             rows,
-            cache_tokens,
+            max_tokens,
             lt,
             qkv_plan,
             output_plan,
             gate_up_plan,
             down_plan,
-            qk_plan,
-            pv_plan,
             token_ids: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * config.hidden)?,
             normed: DeviceBuffer::zeroed(rows * config.hidden)?,
@@ -827,12 +922,6 @@ impl BitNetPrefillWorkspace {
             q_rope: DeviceBuffer::zeroed(rows * q_width)?,
             k_rope: DeviceBuffer::zeroed(rows * kv_width)?,
             attention: DeviceBuffer::zeroed(rows * q_width)?,
-            packed_query: DeviceBuffer::zeroed(rows * q_width)?,
-            packed_key: DeviceBuffer::zeroed(cache_tokens * kv_width)?,
-            packed_value: DeviceBuffer::zeroed(cache_tokens * kv_width)?,
-            attention_scores: DeviceBuffer::zeroed(rows * config.q_heads * cache_tokens)?,
-            packed_probabilities: DeviceBuffer::zeroed(rows * config.q_heads * cache_tokens)?,
-            packed_attention: DeviceBuffer::zeroed(rows * q_width)?,
             attention_normed: DeviceBuffer::zeroed(rows * q_width)?,
             projected: DeviceBuffer::zeroed(rows * config.hidden)?,
             residual: DeviceBuffer::zeroed(rows * config.hidden)?,
@@ -851,7 +940,7 @@ impl BitNetPrefillWorkspace {
             gate_up_activation: BitNetActivationWorkspace::new(rows, config.hidden)?,
             down_activation: BitNetActivationWorkspace::new(rows, config.intermediate)?,
             compact_attention: Sm12xKvAttentionWorkspace::new_gqa_batched(
-                max_tokens,
+                attention_capacity,
                 config.q_heads,
                 config.kv_heads,
                 config.head_dim,
@@ -860,11 +949,14 @@ impl BitNetPrefillWorkspace {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_layer(
         &mut self,
         config: BitNetConfig,
         weights: &BitNetLayer,
-        kv_cache: &mut Sm12xKvCache,
+        pool: &mut Sm12xKvPagePool,
+        pages: AppendPages<'_, crate::runtime::sm12x_sequence_cache::Sm12xPage>,
+        page_table: &DeviceBuffer<u32>,
         start_position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -917,102 +1009,37 @@ impl BitNetPrefillWorkspace {
             config.rope_theta,
             stream,
         )?;
-        if self.rows < 64 {
-            let mut row_offset = 0;
-            while row_offset < self.rows {
-                let rows_until_tail_wrap = 16 - kv_cache.len() % 16;
-                let rows = (self.rows - row_offset).min(rows_until_tail_wrap);
+        let q_width = config.q_width();
+        let kv_width = config.kv_width();
+        for page in pages.iter() {
+            let segment = page.segment();
+            for local_row in 0..segment.rows() {
+                let token = segment.input_offset() + local_row;
+                pool.append_at_offsets_on_stream(
+                    page.page().slot(),
+                    segment.page_offset() + local_row,
+                    &self.k_rope,
+                    token * kv_width,
+                    &self.v,
+                    token * kv_width,
+                    stream,
+                )?;
                 self.compact_attention
-                    .append_causal_rows_at_offset_into_on_stream(
-                        kv_cache,
+                    .attention_paged_offsets_into_on_stream(
+                        pool,
+                        page_table,
+                        start_position + token + 1,
                         &self.q_rope,
-                        &self.k_rope,
-                        &self.v,
-                        row_offset,
-                        rows,
-                        None,
+                        token * q_width,
                         self.attention.output(),
+                        token * q_width,
                         stream,
                     )?;
-                row_offset += rows;
             }
-        } else {
-            pack_token_heads_bf16_into_on_stream(
-                &self.q_rope,
-                self.packed_query.output(),
-                self.rows,
-                config.q_heads,
-                config.head_dim,
-                stream,
-            )?;
-            if start_position == 0 {
-                kv_cache.append_initial_rows_and_stage_bf16_on_stream(
-                    &self.k_rope,
-                    &self.v,
-                    0,
-                    self.rows,
-                    self.packed_key.output(),
-                    self.packed_value.output(),
-                    stream,
-                )?;
-            } else {
-                kv_cache.append_rows_at_offset_on_stream(
-                    &self.k_rope,
-                    &self.v,
-                    0,
-                    self.rows,
-                    stream,
-                )?;
-                kv_cache.unpack_bf16_on_stream(
-                    self.packed_key.output(),
-                    self.packed_value.output(),
-                    stream,
-                )?;
-            }
-            self.qk_plan.run_offsets_on_stream(
-                &self.lt,
-                &self.packed_key,
-                0,
-                &self.packed_query,
-                0,
-                self.attention_scores.output(),
-                0,
-                stream,
-            )?;
-            causal_window_softmax_f32_to_bf16_on_stream(
-                &self.attention_scores,
-                self.packed_probabilities.output(),
-                self.rows,
-                self.cache_tokens,
-                start_position,
-                config.q_heads,
-                config.head_dim,
-                None,
-                stream,
-            )?;
-            self.pv_plan.run_offsets_on_stream(
-                &self.lt,
-                &self.packed_value,
-                0,
-                &self.packed_probabilities,
-                0,
-                self.packed_attention.output(),
-                0,
-                stream,
-            )?;
-            unpack_heads_f32_at_offset_into_on_stream(
-                &self.packed_attention,
-                self.attention.output(),
-                self.rows,
-                config.q_heads,
-                config.head_dim,
-                0,
-                stream,
-            )?;
         }
         rms_norm_f32_into_on_stream(
             self.rows,
-            config.q_width(),
+            q_width,
             &self.attention,
             &weights.attention_sub_norm,
             self.attention_normed.output(),
@@ -1083,13 +1110,12 @@ impl BitNetPrefillWorkspace {
         add_f32_into_on_stream(&self.residual, &self.down, self.hidden.output(), stream)
     }
 
-    fn device_bytes(&self) -> usize {
+    /// Device memory retained by this reusable execution workspace.
+    pub fn device_bytes(&self) -> usize {
         self.qkv_plan.workspace_bytes()
             + self.output_plan.workspace_bytes()
             + self.gate_up_plan.workspace_bytes()
             + self.down_plan.workspace_bytes()
-            + self.qk_plan.workspace_bytes()
-            + self.pv_plan.workspace_bytes()
             + self.token_ids.device_bytes()
             + self.hidden.device_bytes()
             + self.normed.device_bytes()
@@ -1100,12 +1126,6 @@ impl BitNetPrefillWorkspace {
             + self.q_rope.device_bytes()
             + self.k_rope.device_bytes()
             + self.attention.device_bytes()
-            + self.packed_query.device_bytes()
-            + self.packed_key.device_bytes()
-            + self.packed_value.device_bytes()
-            + self.attention_scores.device_bytes()
-            + self.packed_probabilities.device_bytes()
-            + self.packed_attention.device_bytes()
             + self.attention_normed.device_bytes()
             + self.projected.device_bytes()
             + self.residual.device_bytes()

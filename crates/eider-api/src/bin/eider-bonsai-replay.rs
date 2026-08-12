@@ -1,9 +1,10 @@
-//! Deterministically replays one Responses request through a Bonsai prefill path.
+//! Deterministically replays one Responses request through Bonsai.
 
 use eider_api::protocol::ResponseRequest;
 use infer::bonsai::{BonsaiModel, BonsaiPrefillMode};
 use infer::gguf::{GgufIndex, GgufValue};
 use infer::nvfp4::{Error, Result};
+use infer::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
 use infer::runtime::chat::{ChatMessage, CheckpointChatTemplate};
 use infer::runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use infer::runtime::generation::GenerationConfig;
@@ -87,9 +88,17 @@ fn main() -> Result<()> {
     let loaded_at = Instant::now();
     let model = BonsaiModel::load_with_prefill_mode(&model_dir.join(GGUF_NAME), mode)?;
     let load_ms = loaded_at.elapsed().as_secs_f64() * 1000.0;
-    let mut state = model.new_decode_state(prompt.token_ids.len() + max_new_tokens)?;
+    let capacity = prompt.token_ids.len() + max_new_tokens;
+    let mut cache = new_bonsai_sequence_cache(&model, 1, capacity)?;
+    let mut sequence = BonsaiSequence::admit(&model, &mut cache, capacity)?;
+    let mut prefill_workspace = model.new_prefill_workspace(prompt.token_ids.len(), capacity)?;
     let prefill_at = Instant::now();
-    model.prefill(&mut state, &prompt.token_ids)?;
+    model.prefill(
+        &mut prefill_workspace,
+        &mut sequence,
+        &prompt.token_ids,
+        &mut cache,
+    )?;
     let prefill_ms = prefill_at.elapsed().as_secs_f64() * 1000.0;
 
     let mut output = ChatOutputCodec::new(template.tokenizer(), &chat.tools, starts_in_reasoning)?;
@@ -100,9 +109,9 @@ fn main() -> Result<()> {
     let mut finish_reason = "length";
     for step in 0..max_new_tokens {
         if step != 0 {
-            model.forward_one(&mut state, token_ids[step - 1])?;
+            model.forward_one(&mut sequence, token_ids[step - 1], &mut cache)?;
         }
-        let logits = model.logits_to_host(&mut state)?;
+        let logits = model.logits_to_host(&mut sequence)?;
         let candidates = top_logits(&logits, LOGIT_CANDIDATES);
         let token_id = candidates[0].0;
         token_ids.push(token_id);
@@ -134,6 +143,7 @@ fn main() -> Result<()> {
             label: "Responses replay output",
             detail: error.to_string(),
         })?;
+    sequence.finish(&mut cache)?;
     let report = serde_json::to_string_pretty(&json!({
         "prefill_mode": mode_name(mode),
         "prompt_token_count": prompt.token_ids.len(),

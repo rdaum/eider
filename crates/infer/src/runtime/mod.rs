@@ -1,6 +1,8 @@
 //! Runtime state and execution support shared by model frontends.
 
+pub mod bitnet_sequence_cache;
 pub mod bitnet_serving;
+pub mod bonsai_sequence_cache;
 pub mod bonsai_serving;
 pub mod chat;
 pub mod chat_output;

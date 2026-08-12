@@ -1,16 +1,19 @@
 //! Multi-session chat serving for BitNet.
 
+use super::bitnet_sequence_cache::{
+    BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache,
+};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::bitnet::{BitNetDecodeState, BitNetModel};
+use crate::bitnet::{BitNetModel, BitNetPrefillWorkspace};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Stable identity assigned to a BitNet request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -109,7 +112,7 @@ struct ActiveRequest<'tokenizer> {
     generated_tokens: usize,
     last_token: Option<u32>,
     prompt_logits_ready: bool,
-    state: Option<BitNetDecodeState>,
+    sequence: Option<Box<BitNetSequence>>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -126,6 +129,8 @@ pub struct BitNetChatService<'model, 'template> {
     waiting: VecDeque<BitNetRequestId>,
     requests: BTreeMap<BitNetRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
+    sequence_cache: BitNetSequenceCache,
+    prefill_workspace: BitNetPrefillWorkspace,
 }
 
 impl<'model, 'template> BitNetChatService<'model, 'template> {
@@ -145,8 +150,21 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         }
         let warmup_started = Instant::now();
         let warmup_rows = config.prefill_token_capacity.min(config.max_context_tokens);
-        let mut warmup_state = model.new_decode_state(warmup_rows)?;
-        model.prefill(&mut warmup_state, &vec![0; warmup_rows])?;
+        let mut sequence_cache = new_bitnet_sequence_cache(
+            model,
+            config.max_active_sequences,
+            config.max_context_tokens,
+        )?;
+        let mut prefill_workspace =
+            model.new_prefill_workspace(warmup_rows, config.max_context_tokens)?;
+        let mut warmup_sequence = BitNetSequence::admit(model, &mut sequence_cache, warmup_rows)?;
+        model.prefill(
+            &mut prefill_workspace,
+            &mut warmup_sequence,
+            &vec![0; warmup_rows],
+            &mut sequence_cache,
+        )?;
+        warmup_sequence.finish(&mut sequence_cache)?;
         info!(
             tokens = warmup_rows,
             elapsed_ms = warmup_started.elapsed().as_secs_f64() * 1000.0,
@@ -160,6 +178,8 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
+            sequence_cache,
+            prefill_workspace,
         })
     }
 
@@ -228,7 +248,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
                 generated_tokens: 0,
                 last_token: None,
                 prompt_logits_ready: false,
-                state: None,
+                sequence: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -266,7 +286,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.prompt_position == request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -283,7 +303,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -292,7 +312,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             .collect::<Vec<_>>();
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
         for (&id, request) in &self.requests {
-            if request.state.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
@@ -309,7 +329,15 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             return BitNetCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
-        let released = request.state.map_or(0, |state| state.device_bytes());
+        let released = request
+            .sequence
+            .as_ref()
+            .map_or(0, |sequence| sequence.device_bytes());
+        if let Some(sequence) = request.sequence
+            && let Err(error) = (*sequence).finish(&mut self.sequence_cache)
+        {
+            warn!(%error, request_id = id.get(), "failed to release cancelled BitNet sequence");
+        }
         if released != 0 {
             self.active_sequences -= 1;
         }
@@ -337,14 +365,15 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let state = self.model.new_decode_state(capacity.max(1))?;
+            let sequence =
+                BitNetSequence::admit(self.model, &mut self.sequence_cache, capacity.max(1))?;
             let progress = BitNetAdmissionProgress {
                 request_id: id,
-                sequence_device_bytes: state.device_bytes(),
+                sequence_device_bytes: sequence.device_bytes(),
                 cached_prompt_tokens: 0,
                 admitted_after_tick_start: started.elapsed(),
             };
-            request.state = Some(state);
+            request.sequence = Some(Box::new(sequence));
             self.active_sequences += 1;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
             tick.admitted.push(progress);
@@ -374,8 +403,13 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             let end = start + chunk;
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             self.model.prefill(
-                request.state.as_mut().expect("request is admitted"),
+                &mut self.prefill_workspace,
+                request
+                    .sequence
+                    .as_deref_mut()
+                    .expect("request is admitted"),
                 &request.prompt[start..end],
+                &mut self.sequence_cache,
             )?;
             request.prompt_position = end;
             request.prompt_logits_ready = end == request.prompt.len();
@@ -393,19 +427,23 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         tick: &mut BitNetTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
-        let state = request.state.as_mut().expect("decode request is admitted");
+        let sequence = request
+            .sequence
+            .as_deref_mut()
+            .expect("decode request is admitted");
         if request.prompt_logits_ready {
             request.prompt_logits_ready = false;
         } else {
             self.model.forward_one(
-                state,
+                sequence,
                 request
                     .last_token
                     .expect("generated token exists after prompt logits"),
+                &mut self.sequence_cache,
             )?;
         }
         let sampled = if request.sampler.config().uses_fast_argmax() {
-            let (id, logit) = self.model.argmax_with_logit(state)?;
+            let (id, logit) = self.model.argmax_with_logit(sequence)?;
             super::sampling::SampledToken {
                 id,
                 logit,
@@ -414,7 +452,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         } else {
             request
                 .sampler
-                .sample(&self.model.logits_to_host(state)?, &request.history)?
+                .sample(&self.model.logits_to_host(sequence)?, &request.history)?
         };
         request.generated_tokens += 1;
         request.last_token = Some(sampled.id);
@@ -459,11 +497,12 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let released = request
-            .state
+        let sequence = request
+            .sequence
             .take()
-            .expect("terminal request is admitted")
-            .device_bytes();
+            .expect("terminal request is admitted");
+        let released = sequence.device_bytes();
+        (*sequence).finish(&mut self.sequence_cache)?;
         self.active_sequences -= 1;
         tick.finished.push(BitNetFinished {
             request_id: id,

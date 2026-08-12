@@ -1,16 +1,19 @@
 //! Ternary Bonsai dense Qwen3 inference from mainline `Q2_0_g64` GGUF files.
 
 use crate::gguf::{GgufIndex, GgufValue};
+use crate::runtime::bonsai_sequence_cache::{
+    BonsaiSequence, BonsaiSequenceCache, bonsai_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape,
-    Nvfp4Matrix, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache, TERNARY_G64_GROUP_SIZE,
+    Nvfp4Matrix, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool, TERNARY_G64_GROUP_SIZE,
     TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
-    copy_row_f32_into_on_stream, pack_token_heads_bf16_at_offset_into_on_stream,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, copy_row_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
-    unpack_heads_f32_at_offset_into_on_stream,
 };
+use sequence_cache::AppendPages;
 use std::f32::consts::PI;
 use std::path::Path;
 
@@ -153,18 +156,14 @@ struct BonsaiLayer {
 
 /// Mutable state for one Bonsai sequence.
 pub struct BonsaiDecodeState {
-    kv_cache: Vec<Sm12xKvCache>,
-    position: usize,
+    pub(crate) position: usize,
+    max_tokens: usize,
     token: DeviceBuffer<u32>,
     stream: CudaStream,
-    workspace: BonsaiWorkspace,
-    prefill_workspace: Option<BonsaiWorkspace>,
+    workspace: BonsaiDecodeWorkspace,
 }
 
-struct BonsaiWorkspace {
-    rows: usize,
-    cache_tokens: usize,
-    token_ids: DeviceBuffer<u32>,
+struct BonsaiDecodeWorkspace {
     hidden: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
     qkv: DeviceBuffer<f32>,
@@ -190,13 +189,39 @@ struct BonsaiWorkspace {
     down_activation: TernaryG64ActivationWorkspace,
     logits_activation: TernaryG64ActivationWorkspace,
     compact_attention: Sm12xKvAttentionWorkspace,
+}
+
+pub struct BonsaiPrefillWorkspace {
+    rows: usize,
+    max_tokens: usize,
+    token_ids: DeviceBuffer<u32>,
+    hidden: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    qkv: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+    k: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    q_normed: DeviceBuffer<f32>,
+    k_normed: DeviceBuffer<f32>,
+    attention: DeviceBuffer<f32>,
+    projected: DeviceBuffer<f32>,
+    residual: DeviceBuffer<f32>,
+    ffn_normed: DeviceBuffer<f32>,
+    gate_up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
+    final_hidden: DeviceBuffer<f32>,
+    qkv_activation: TernaryG64ActivationWorkspace,
+    output_activation: TernaryG64ActivationWorkspace,
+    gate_up_activation: TernaryG64ActivationWorkspace,
+    down_activation: TernaryG64ActivationWorkspace,
+    compact_attention: Sm12xKvAttentionWorkspace,
     tensor_prefill: Option<BonsaiTensorPrefillWorkspace>,
 }
 
 struct BonsaiTensorPrefillWorkspace {
     lt: CublasLt,
     projections: BonsaiProjectionPrefillWorkspace,
-    attention: Option<BonsaiTensorAttentionWorkspace>,
 }
 
 enum BonsaiProjectionPrefillWorkspace {
@@ -220,18 +245,11 @@ enum BonsaiProjectionPrefillWorkspace {
     },
 }
 
-struct BonsaiTensorAttentionWorkspace {
-    cache_tokens: usize,
-    chunk_rows: usize,
-    qk_plan: Bf16TnMatmulPlan,
-    pv_plan: Bf16TnMatmulPlan,
-    tail_plans: Option<(Bf16TnMatmulPlan, Bf16TnMatmulPlan)>,
-    packed_query: DeviceBuffer<u16>,
-    packed_key: DeviceBuffer<u16>,
-    packed_value: DeviceBuffer<u16>,
-    attention_scores: DeviceBuffer<f32>,
-    packed_probabilities: DeviceBuffer<u16>,
-    packed_attention: DeviceBuffer<f32>,
+struct BonsaiLayerCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
 }
 
 impl BonsaiModel {
@@ -278,8 +296,8 @@ impl BonsaiModel {
         self.config
     }
 
-    /// Allocates sequence-local KV and workspace storage.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<BonsaiDecodeState> {
+    /// Allocates sequence-local workspace storage.
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<BonsaiDecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_context {
             return Err(Error::Shape {
                 label: "Bonsai sequence capacity",
@@ -290,101 +308,219 @@ impl BonsaiModel {
         BonsaiDecodeState::new(self, max_tokens)
     }
 
+    /// Allocates the reusable workspace for one contiguous prefill chunk.
+    pub fn new_prefill_workspace(
+        &self,
+        token_capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<BonsaiPrefillWorkspace> {
+        if token_capacity == 0 || token_capacity > max_context_tokens {
+            return Err(Error::Shape {
+                label: "Bonsai prefill workspace",
+                expected: "0 < token capacity <= maximum context".to_string(),
+                actual: format!("tokens={token_capacity} context={max_context_tokens}"),
+            });
+        }
+        BonsaiPrefillWorkspace::new(
+            self.config,
+            &self.layers[0],
+            self.prefill_mode,
+            token_capacity,
+            max_context_tokens,
+        )
+    }
+
     /// Evaluates one token and leaves its final hidden state on the device.
-    pub fn forward_one(&self, state: &mut BonsaiDecodeState, token_id: u32) -> Result<()> {
-        self.validate_tokens(state.position, &[token_id])?;
+    pub fn forward_one(
+        &self,
+        sequence: &mut BonsaiSequence,
+        token_id: u32,
+        cache: &mut BonsaiSequenceCache,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
+        self.validate_tokens(state.position, &[token_id], state.max_tokens)?;
         state.token.copy_from_host(&[token_id])?;
         self.embeddings.lookup_rows_f32_into_on_stream(
             &state.token,
             state.workspace.hidden.output(),
             &state.stream,
         )?;
-        for (layer, cache) in self.layers.iter().zip(&mut state.kv_cache) {
-            state.workspace.run_layer(
-                self.config,
-                layer,
-                cache,
-                state.position,
-                &self.rope_inv_freq,
-                self.rope_attention_scale,
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bonsai_cache_error)?;
+        let result = (|| {
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                cache
+                    .with_append_pages(&reservation, |backend, pages| {
+                        let page = pages.iter().next().expect("one decode append page");
+                        let segment = page.segment();
+                        state.workspace.run_layer(
+                            self.config,
+                            layer,
+                            BonsaiLayerCache {
+                                pool: backend.pool_mut(layer_index)?,
+                                page_slot: page.page().slot(),
+                                page_offset: segment.page_offset(),
+                                page_table: sequence.page_table.device(),
+                            },
+                            state.position,
+                            &self.rope_inv_freq,
+                            self.rope_attention_scale,
+                            &state.stream,
+                        )
+                    })
+                    .map_err(bonsai_cache_error)?;
+            }
+            rms_norm_f32_into_on_stream(
+                1,
+                self.config.hidden,
+                &state.workspace.hidden,
+                &self.final_norm,
+                state.workspace.final_hidden.output(),
+                self.config.rms_eps,
                 &state.stream,
             )?;
+            state.stream.synchronize()
+        })();
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(bonsai_cache_error)?;
+            return Err(error);
         }
-        rms_norm_f32_into_on_stream(
-            1,
-            self.config.hidden,
-            &state.workspace.hidden,
-            &self.final_norm,
-            state.workspace.final_hidden.output(),
-            self.config.rms_eps,
-            &state.stream,
-        )?;
-        state.stream.synchronize()?;
+        cache
+            .commit_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bonsai_cache_error)?;
         state.position += 1;
         Ok(())
     }
 
-    /// Prefills a contiguous prompt with batched packed ternary projections.
-    pub fn prefill(&self, state: &mut BonsaiDecodeState, token_ids: &[u32]) -> Result<()> {
-        self.validate_tokens(state.position, token_ids)?;
+    /// Prefills a prompt through the canonical paged sequence path.
+    pub fn prefill(
+        &self,
+        workspace: &mut BonsaiPrefillWorkspace,
+        sequence: &mut BonsaiSequence,
+        token_ids: &[u32],
+        cache: &mut BonsaiSequenceCache,
+    ) -> Result<()> {
+        self.validate_tokens(
+            sequence.state.position,
+            token_ids,
+            sequence.state.max_tokens,
+        )?;
         let rows = token_ids.len();
-        let start_position = state.position;
-        let cache_tokens = start_position + rows;
-        let mut workspace = match state.prefill_workspace.take() {
-            Some(workspace) if workspace.rows == rows && workspace.cache_tokens == cache_tokens => {
-                workspace
-            }
-            _ => BonsaiWorkspace::new(
+        if workspace.rows != rows {
+            *workspace = BonsaiPrefillWorkspace::new(
                 self.config,
                 &self.layers[0],
                 self.prefill_mode,
                 rows,
-                cache_tokens,
-                state.kv_cache[0].max_tokens(),
-            )?,
-        };
-        workspace.token_ids.copy_from_host(token_ids)?;
-        self.embeddings.lookup_rows_f32_into_on_stream(
-            &workspace.token_ids,
-            workspace.hidden.output(),
-            &state.stream,
-        )?;
-        for (layer, cache) in self.layers.iter().zip(&mut state.kv_cache) {
-            workspace.run_layer(
-                self.config,
-                layer,
-                cache,
-                start_position,
-                &self.rope_inv_freq,
-                self.rope_attention_scale,
-                &state.stream,
+                workspace.max_tokens,
             )?;
         }
-        rms_norm_f32_into_on_stream(
-            rows,
-            self.config.hidden,
-            &workspace.hidden,
-            &self.final_norm,
-            workspace.final_hidden.output(),
-            self.config.rms_eps,
-            &state.stream,
-        )?;
-        copy_row_f32_into_on_stream(
-            rows,
-            self.config.hidden,
-            rows - 1,
-            &workspace.final_hidden,
-            state.workspace.final_hidden.output(),
-            &state.stream,
-        )?;
-        state.stream.synchronize()?;
-        state.position += rows;
-        state.prefill_workspace = Some(workspace);
+        let start_position = sequence.state.position;
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream: &sequence.state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bonsai_cache_error)?;
+        let result = (|| {
+            let state = &mut sequence.state;
+            workspace.token_ids.copy_from_host(token_ids)?;
+            self.embeddings.lookup_rows_f32_into_on_stream(
+                &workspace.token_ids,
+                workspace.hidden.output(),
+                &state.stream,
+            )?;
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                cache
+                    .with_append_pages(&reservation, |backend, pages| {
+                        workspace.run_layer(
+                            self.config,
+                            layer,
+                            backend.pool_mut(layer_index)?,
+                            pages,
+                            sequence.page_table.device(),
+                            start_position,
+                            &self.rope_inv_freq,
+                            self.rope_attention_scale,
+                            &state.stream,
+                        )
+                    })
+                    .map_err(bonsai_cache_error)?;
+            }
+            rms_norm_f32_into_on_stream(
+                rows,
+                self.config.hidden,
+                &workspace.hidden,
+                &self.final_norm,
+                workspace.final_hidden.output(),
+                self.config.rms_eps,
+                &state.stream,
+            )?;
+            copy_row_f32_into_on_stream(
+                rows,
+                self.config.hidden,
+                rows - 1,
+                &workspace.final_hidden,
+                state.workspace.final_hidden.output(),
+                &state.stream,
+            )?;
+            state.stream.synchronize()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &sequence.state.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(bonsai_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: &sequence.state.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(bonsai_cache_error)?;
+        sequence.state.position += rows;
         Ok(())
     }
 
     /// Copies the most recent full-vocabulary logits to the host.
-    pub fn logits_to_host(&self, state: &mut BonsaiDecodeState) -> Result<Vec<f32>> {
+    pub fn logits_to_host(&self, sequence: &mut BonsaiSequence) -> Result<Vec<f32>> {
+        let state = &mut sequence.state;
         self.require_evaluated(state)?;
         self.run_lm_head(state)?;
         Ok(state
@@ -395,7 +531,8 @@ impl BonsaiModel {
     }
 
     /// Returns the argmax token and logit without copying the vocabulary.
-    pub fn argmax_with_logit(&self, state: &mut BonsaiDecodeState) -> Result<(u32, f32)> {
+    pub fn argmax_with_logit(&self, sequence: &mut BonsaiSequence) -> Result<(u32, f32)> {
+        let state = &mut sequence.state;
         self.require_evaluated(state)?;
         self.run_lm_head(state)?;
         argmax_f32_into_on_stream(
@@ -429,18 +566,23 @@ impl BonsaiModel {
         Ok(())
     }
 
-    fn validate_tokens(&self, start_position: usize, tokens: &[u32]) -> Result<()> {
+    fn validate_tokens(
+        &self,
+        start_position: usize,
+        tokens: &[u32],
+        max_position: usize,
+    ) -> Result<()> {
         if tokens.is_empty()
             || tokens
                 .iter()
                 .any(|&token| token as usize >= self.config.vocab)
-            || start_position + tokens.len() > self.config.max_context
+            || start_position + tokens.len() > max_position
         {
             return Err(Error::Shape {
                 label: "Bonsai tokens",
                 expected: format!(
                     "non-empty tokens below {} and final position at most {}",
-                    self.config.vocab, self.config.max_context
+                    self.config.vocab, max_position
                 ),
                 actual: format!(
                     "start={start_position} tokens={} max_token={:?}",
@@ -456,23 +598,12 @@ impl BonsaiModel {
 impl BonsaiDecodeState {
     fn new(model: &BonsaiModel, max_tokens: usize) -> Result<Self> {
         let config = model.config;
-        let kv_cache = (0..config.layers)
-            .map(|_| Sm12xKvCache::new(max_tokens, config.kv_heads, config.head_dim))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            kv_cache,
             position: 0,
+            max_tokens,
             token: DeviceBuffer::from_host(&[0])?,
             stream: CudaStream::new_non_blocking()?,
-            workspace: BonsaiWorkspace::new(
-                config,
-                &model.layers[0],
-                model.prefill_mode,
-                1,
-                1,
-                max_tokens,
-            )?,
-            prefill_workspace: None,
+            workspace: BonsaiDecodeWorkspace::new(config, max_tokens)?,
         })
     }
 
@@ -488,15 +619,11 @@ impl BonsaiDecodeState {
 
     /// Device bytes owned by sequence-local state and workspaces.
     pub fn device_bytes(&self) -> usize {
-        self.kv_cache
-            .iter()
-            .map(Sm12xKvCache::device_bytes)
-            .sum::<usize>()
-            + self.workspace.device_bytes()
-            + self
-                .prefill_workspace
-                .as_ref()
-                .map_or(0, BonsaiWorkspace::device_bytes)
+        self.workspace.device_bytes()
+    }
+
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
     }
 }
 
@@ -582,38 +709,238 @@ impl BonsaiLayer {
     }
 }
 
-impl BonsaiWorkspace {
+impl BonsaiDecodeWorkspace {
+    fn new(config: BonsaiConfig, max_tokens: usize) -> Result<Self> {
+        let q_width = config.q_width();
+        let kv_width = config.kv_width();
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        Ok(Self {
+            hidden: DeviceBuffer::zeroed(config.hidden)?,
+            normed: DeviceBuffer::zeroed(config.hidden)?,
+            qkv: DeviceBuffer::zeroed(q_width + 2 * kv_width)?,
+            q: DeviceBuffer::zeroed(q_width)?,
+            k: DeviceBuffer::zeroed(kv_width)?,
+            v: DeviceBuffer::zeroed(kv_width)?,
+            q_rope: DeviceBuffer::zeroed(q_width)?,
+            k_rope: DeviceBuffer::zeroed(kv_width)?,
+            attention: DeviceBuffer::zeroed(q_width)?,
+            projected: DeviceBuffer::zeroed(config.hidden)?,
+            residual: DeviceBuffer::zeroed(config.hidden)?,
+            ffn_normed: DeviceBuffer::zeroed(config.hidden)?,
+            gate_up: DeviceBuffer::zeroed(config.intermediate * 2)?,
+            activated: DeviceBuffer::zeroed(config.intermediate)?,
+            down: DeviceBuffer::zeroed(config.hidden)?,
+            final_hidden: DeviceBuffer::zeroed(config.hidden)?,
+            logits: DeviceBuffer::zeroed(config.vocab)?,
+            argmax_index: DeviceBuffer::zeroed(1)?,
+            argmax_value: DeviceBuffer::zeroed(1)?,
+            qkv_activation: TernaryG64ActivationWorkspace::new(1, config.hidden)?,
+            output_activation: TernaryG64ActivationWorkspace::new(1, q_width)?,
+            gate_up_activation: TernaryG64ActivationWorkspace::new(1, config.hidden)?,
+            down_activation: TernaryG64ActivationWorkspace::new(1, config.intermediate)?,
+            logits_activation: TernaryG64ActivationWorkspace::new(1, config.hidden)?,
+            compact_attention: Sm12xKvAttentionWorkspace::new_gqa(
+                attention_capacity,
+                config.q_heads,
+                config.kv_heads,
+                config.head_dim,
+            )?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_layer(
+        &mut self,
+        config: BonsaiConfig,
+        weights: &BonsaiLayer,
+        cache: BonsaiLayerCache<'_>,
+        position: usize,
+        rope_inv_freq: &DeviceBuffer<f32>,
+        rope_attention_scale: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        rms_norm_f32_into_on_stream(
+            1,
+            config.hidden,
+            &self.hidden,
+            &weights.input_norm,
+            self.normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.qkv.run_f32_batch_into_on_stream(
+            self.normed.input(),
+            self.qkv.output(),
+            1,
+            &mut self.qkv_activation,
+            stream,
+        )?;
+        split_qkv_f32_batch_into_on_stream(
+            &self.qkv,
+            self.q.output(),
+            self.k.output(),
+            self.v.output(),
+            1,
+            config.q_width(),
+            config.kv_width(),
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            config.q_heads,
+            config.head_dim,
+            &self.q,
+            &weights.q_norm,
+            self.q_rope.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            config.kv_heads,
+            config.head_dim,
+            &self.k,
+            &weights.k_norm,
+            self.k_rope.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        rope_neox_inv_freq_scaled_sequence_f32_into_on_stream(
+            1,
+            config.q_heads,
+            config.head_dim,
+            config.head_dim,
+            &self.q_rope,
+            rope_inv_freq,
+            self.q.output(),
+            position,
+            rope_attention_scale,
+            stream,
+        )?;
+        rope_neox_inv_freq_scaled_sequence_f32_into_on_stream(
+            1,
+            config.kv_heads,
+            config.head_dim,
+            config.head_dim,
+            &self.k_rope,
+            rope_inv_freq,
+            self.k.output(),
+            position,
+            rope_attention_scale,
+            stream,
+        )?;
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
+            &self.k,
+            0,
+            &self.v,
+            0,
+            stream,
+        )?;
+        self.compact_attention
+            .attention_paged_offsets_into_on_stream(
+                cache.pool,
+                cache.page_table,
+                position + 1,
+                &self.q,
+                0,
+                self.attention.output(),
+                0,
+                stream,
+            )?;
+        weights.output.run_f32_batch_into_on_stream(
+            self.attention.input(),
+            self.projected.output(),
+            1,
+            &mut self.output_activation,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            &self.hidden,
+            &self.projected,
+            self.residual.output(),
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            1,
+            config.hidden,
+            &self.residual,
+            &weights.post_attention_norm,
+            self.ffn_normed.output(),
+            config.rms_eps,
+            stream,
+        )?;
+        weights.gate_up.run_f32_batch_into_on_stream(
+            self.ffn_normed.input(),
+            self.gate_up.output(),
+            1,
+            &mut self.gate_up_activation,
+            stream,
+        )?;
+        silu_mul_halves_f32_batch_into_on_stream(
+            &self.gate_up,
+            self.activated.output(),
+            1,
+            config.intermediate,
+            stream,
+        )?;
+        weights.down.run_f32_batch_into_on_stream(
+            self.activated.input(),
+            self.down.output(),
+            1,
+            &mut self.down_activation,
+            stream,
+        )?;
+        add_f32_into_on_stream(&self.residual, &self.down, self.hidden.output(), stream)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.hidden.device_bytes()
+            + self.normed.device_bytes()
+            + self.qkv.device_bytes()
+            + self.q.device_bytes()
+            + self.k.device_bytes()
+            + self.v.device_bytes()
+            + self.q_rope.device_bytes()
+            + self.k_rope.device_bytes()
+            + self.attention.device_bytes()
+            + self.projected.device_bytes()
+            + self.residual.device_bytes()
+            + self.ffn_normed.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.down.device_bytes()
+            + self.final_hidden.device_bytes()
+            + self.logits.device_bytes()
+            + self.argmax_index.device_bytes()
+            + self.argmax_value.device_bytes()
+            + self.qkv_activation.device_bytes()
+            + self.output_activation.device_bytes()
+            + self.gate_up_activation.device_bytes()
+            + self.down_activation.device_bytes()
+            + self.logits_activation.device_bytes()
+            + self.compact_attention.device_bytes()
+    }
+}
+
+impl BonsaiPrefillWorkspace {
     fn new(
         config: BonsaiConfig,
         plan_layer: &BonsaiLayer,
         prefill_mode: BonsaiPrefillMode,
         rows: usize,
-        cache_tokens: usize,
         max_tokens: usize,
     ) -> Result<Self> {
-        if rows == 0 || cache_tokens < rows || cache_tokens > max_tokens {
-            return Err(Error::Shape {
-                label: "Bonsai workspace",
-                expected: "0 < rows <= cache_tokens <= max_tokens".to_string(),
-                actual: format!("rows={rows} cache_tokens={cache_tokens} max_tokens={max_tokens}"),
-            });
-        }
         let q_width = config.q_width();
         let kv_width = config.kv_width();
-        let tensor_prefill = if rows >= 4 {
-            Some(BonsaiTensorPrefillWorkspace::new(
-                config,
-                plan_layer,
-                prefill_mode,
-                rows,
-                cache_tokens,
-            )?)
-        } else {
-            None
-        };
+        let tensor_prefill = (rows >= 4)
+            .then(|| BonsaiTensorPrefillWorkspace::new(config, plan_layer, prefill_mode, rows));
+        let tensor_prefill = tensor_prefill.transpose()?;
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             rows,
-            cache_tokens,
+            max_tokens,
             token_ids: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * config.hidden)?,
             normed: DeviceBuffer::zeroed(rows * config.hidden)?,
@@ -621,8 +948,8 @@ impl BonsaiWorkspace {
             q: DeviceBuffer::zeroed(rows * q_width)?,
             k: DeviceBuffer::zeroed(rows * kv_width)?,
             v: DeviceBuffer::zeroed(rows * kv_width)?,
-            q_rope: DeviceBuffer::zeroed(rows * q_width)?,
-            k_rope: DeviceBuffer::zeroed(rows * kv_width)?,
+            q_normed: DeviceBuffer::zeroed(rows * q_width)?,
+            k_normed: DeviceBuffer::zeroed(rows * kv_width)?,
             attention: DeviceBuffer::zeroed(rows * q_width)?,
             projected: DeviceBuffer::zeroed(rows * config.hidden)?,
             residual: DeviceBuffer::zeroed(rows * config.hidden)?,
@@ -631,16 +958,12 @@ impl BonsaiWorkspace {
             activated: DeviceBuffer::zeroed(rows * config.intermediate)?,
             down: DeviceBuffer::zeroed(rows * config.hidden)?,
             final_hidden: DeviceBuffer::zeroed(rows * config.hidden)?,
-            logits: DeviceBuffer::zeroed(config.vocab)?,
-            argmax_index: DeviceBuffer::zeroed(1)?,
-            argmax_value: DeviceBuffer::zeroed(1)?,
             qkv_activation: TernaryG64ActivationWorkspace::new(rows, config.hidden)?,
             output_activation: TernaryG64ActivationWorkspace::new(rows, q_width)?,
             gate_up_activation: TernaryG64ActivationWorkspace::new(rows, config.hidden)?,
             down_activation: TernaryG64ActivationWorkspace::new(rows, config.intermediate)?,
-            logits_activation: TernaryG64ActivationWorkspace::new(1, config.hidden)?,
             compact_attention: Sm12xKvAttentionWorkspace::new_gqa_batched(
-                max_tokens,
+                attention_capacity,
                 config.q_heads,
                 config.kv_heads,
                 config.head_dim,
@@ -649,12 +972,15 @@ impl BonsaiWorkspace {
             tensor_prefill,
         })
     }
+
     #[allow(clippy::too_many_arguments)]
     fn run_layer(
         &mut self,
         config: BonsaiConfig,
         weights: &BonsaiLayer,
-        cache: &mut Sm12xKvCache,
+        pool: &mut Sm12xKvPagePool,
+        pages: AppendPages<'_, crate::runtime::sm12x_sequence_cache::Sm12xPage>,
+        page_table: &DeviceBuffer<u32>,
         start_position: usize,
         rope_inv_freq: &DeviceBuffer<f32>,
         rope_attention_scale: f32,
@@ -722,7 +1048,7 @@ impl BonsaiWorkspace {
             config.head_dim,
             &self.q,
             &weights.q_norm,
-            self.q_rope.output(),
+            self.q_normed.output(),
             config.rms_eps,
             stream,
         )?;
@@ -731,7 +1057,7 @@ impl BonsaiWorkspace {
             config.head_dim,
             &self.k,
             &weights.k_norm,
-            self.k_rope.output(),
+            self.k_normed.output(),
             config.rms_eps,
             stream,
         )?;
@@ -740,7 +1066,7 @@ impl BonsaiWorkspace {
             config.q_heads,
             config.head_dim,
             config.head_dim,
-            &self.q_rope,
+            &self.q_normed,
             rope_inv_freq,
             self.q.output(),
             start_position,
@@ -752,52 +1078,39 @@ impl BonsaiWorkspace {
             config.kv_heads,
             config.head_dim,
             config.head_dim,
-            &self.k_rope,
+            &self.k_normed,
             rope_inv_freq,
             self.k.output(),
             start_position,
             rope_attention_scale,
             stream,
         )?;
-        let tensor_attention = if let Some(prefill) = &mut self.tensor_prefill {
-            if let Some(attention) = &mut prefill.attention {
-                attention.run(
-                    &prefill.lt,
-                    config,
-                    cache,
-                    &self.q,
+        let q_width = config.q_width();
+        let kv_width = config.kv_width();
+        for page in pages.iter() {
+            let segment = page.segment();
+            for local_row in 0..segment.rows() {
+                let token = segment.input_offset() + local_row;
+                pool.append_at_offsets_on_stream(
+                    page.page().slot(),
+                    segment.page_offset() + local_row,
                     &self.k,
+                    token * kv_width,
                     &self.v,
-                    &mut self.attention,
-                    self.rows,
-                    start_position,
+                    token * kv_width,
                     stream,
                 )?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !tensor_attention {
-            let mut row_offset = 0;
-            while row_offset < self.rows {
-                let rows_until_tail_wrap = 16 - cache.len() % 16;
-                let rows = (self.rows - row_offset).min(rows_until_tail_wrap);
                 self.compact_attention
-                    .append_causal_rows_at_offset_into_on_stream(
-                        cache,
+                    .attention_paged_offsets_into_on_stream(
+                        pool,
+                        page_table,
+                        start_position + token + 1,
                         &self.q,
-                        &self.k,
-                        &self.v,
-                        row_offset,
-                        rows,
-                        None,
+                        token * q_width,
                         self.attention.output(),
+                        token * q_width,
                         stream,
                     )?;
-                row_offset += rows;
             }
         }
         if let Some(prefill) = &mut self.tensor_prefill {
@@ -939,7 +1252,8 @@ impl BonsaiWorkspace {
         add_f32_into_on_stream(&self.residual, &self.down, self.hidden.output(), stream)
     }
 
-    fn device_bytes(&self) -> usize {
+    /// Device memory retained by this reusable execution workspace.
+    pub fn device_bytes(&self) -> usize {
         self.token_ids.device_bytes()
             + self.hidden.device_bytes()
             + self.normed.device_bytes()
@@ -947,8 +1261,8 @@ impl BonsaiWorkspace {
             + self.q.device_bytes()
             + self.k.device_bytes()
             + self.v.device_bytes()
-            + self.q_rope.device_bytes()
-            + self.k_rope.device_bytes()
+            + self.q_normed.device_bytes()
+            + self.k_normed.device_bytes()
             + self.attention.device_bytes()
             + self.projected.device_bytes()
             + self.residual.device_bytes()
@@ -957,14 +1271,10 @@ impl BonsaiWorkspace {
             + self.activated.device_bytes()
             + self.down.device_bytes()
             + self.final_hidden.device_bytes()
-            + self.logits.device_bytes()
-            + self.argmax_index.device_bytes()
-            + self.argmax_value.device_bytes()
             + self.qkv_activation.device_bytes()
             + self.output_activation.device_bytes()
             + self.gate_up_activation.device_bytes()
             + self.down_activation.device_bytes()
-            + self.logits_activation.device_bytes()
             + self.compact_attention.device_bytes()
             + self
                 .tensor_prefill
@@ -979,7 +1289,6 @@ impl BonsaiTensorPrefillWorkspace {
         plan_layer: &BonsaiLayer,
         prefill_mode: BonsaiPrefillMode,
         rows: usize,
-        cache_tokens: usize,
     ) -> Result<Self> {
         let q_width = config.q_width();
         let lt = CublasLt::new()?;
@@ -1045,28 +1354,11 @@ impl BonsaiTensorPrefillWorkspace {
                 }
             }
         };
-        Ok(Self {
-            projections,
-            attention: if rows >= 64 {
-                Some(BonsaiTensorAttentionWorkspace::new(
-                    &lt,
-                    config,
-                    rows,
-                    cache_tokens,
-                )?)
-            } else {
-                None
-            },
-            lt,
-        })
+        Ok(Self { lt, projections })
     }
 
     fn device_bytes(&self) -> usize {
         self.projections.device_bytes()
-            + self
-                .attention
-                .as_ref()
-                .map_or(0, BonsaiTensorAttentionWorkspace::device_bytes)
     }
 }
 
@@ -1108,180 +1400,6 @@ impl BonsaiProjectionPrefillWorkspace {
                     + down_plan.workspace_bytes()
             }
         }
-    }
-}
-
-impl BonsaiTensorAttentionWorkspace {
-    const CHUNK_ROWS: usize = 256;
-    const WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
-
-    fn new(lt: &CublasLt, config: BonsaiConfig, rows: usize, cache_tokens: usize) -> Result<Self> {
-        let chunk_rows = rows.min(Self::CHUNK_ROWS);
-        let (qk_plan, pv_plan) = Self::plans(lt, config, chunk_rows, cache_tokens)?;
-        let tail_rows = rows % chunk_rows;
-        let tail_plans = if tail_rows == 0 {
-            None
-        } else {
-            Some(Self::plans(lt, config, tail_rows, cache_tokens)?)
-        };
-        Ok(Self {
-            cache_tokens,
-            chunk_rows,
-            qk_plan,
-            pv_plan,
-            tail_plans,
-            packed_query: DeviceBuffer::zeroed(chunk_rows * config.q_width())?,
-            packed_key: DeviceBuffer::zeroed(cache_tokens * config.kv_width())?,
-            packed_value: DeviceBuffer::zeroed(cache_tokens * config.kv_width())?,
-            attention_scores: DeviceBuffer::zeroed(chunk_rows * config.q_heads * cache_tokens)?,
-            packed_probabilities: DeviceBuffer::zeroed(chunk_rows * config.q_heads * cache_tokens)?,
-            packed_attention: DeviceBuffer::zeroed(chunk_rows * config.q_width())?,
-        })
-    }
-
-    fn plans(
-        lt: &CublasLt,
-        config: BonsaiConfig,
-        query_rows: usize,
-        cache_tokens: usize,
-    ) -> Result<(Bf16TnMatmulPlan, Bf16TnMatmulPlan)> {
-        let queries_per_kv = config.q_heads / config.kv_heads;
-        let qk_plan = Bf16TnMatmulPlan::new_strided_batch(
-            lt,
-            GemmShape::new(cache_tokens, query_rows * queries_per_kv, config.head_dim),
-            config.kv_heads,
-            cache_tokens * config.head_dim,
-            queries_per_kv * query_rows * config.head_dim,
-            queries_per_kv * query_rows * cache_tokens,
-            Self::WORKSPACE_LIMIT,
-        )?;
-        let pv_plan = Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
-            lt,
-            GemmShape::new(config.head_dim, query_rows * queries_per_kv, cache_tokens),
-            cache_tokens,
-            config.kv_heads,
-            config.head_dim * cache_tokens,
-            queries_per_kv * query_rows * cache_tokens,
-            queries_per_kv * query_rows * config.head_dim,
-            Self::WORKSPACE_LIMIT,
-        )?;
-        Ok((qk_plan, pv_plan))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run(
-        &mut self,
-        lt: &CublasLt,
-        config: BonsaiConfig,
-        cache: &mut Sm12xKvCache,
-        query: &DeviceBuffer<f32>,
-        key: &DeviceBuffer<f32>,
-        value: &DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
-        rows: usize,
-        start_position: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if start_position == 0 {
-            cache.append_initial_rows_and_stage_bf16_on_stream(
-                key,
-                value,
-                0,
-                rows,
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        } else {
-            cache.append_rows_at_offset_on_stream(key, value, 0, rows, stream)?;
-            cache.unpack_bf16_on_stream(
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        }
-
-        let mut row_offset = 0;
-        while row_offset < rows {
-            let query_rows = (rows - row_offset).min(self.chunk_rows);
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                query_rows,
-                config.q_heads,
-                config.head_dim,
-                row_offset,
-                stream,
-            )?;
-            let (qk_plan, pv_plan) = if query_rows == self.chunk_rows {
-                (&self.qk_plan, &self.pv_plan)
-            } else {
-                let Some((qk_plan, pv_plan)) = self.tail_plans.as_ref() else {
-                    return Err(Error::Format {
-                        label: "Bonsai tensor prefill attention",
-                        detail: format!("missing plans for {query_rows}-row tail"),
-                    });
-                };
-                (qk_plan, pv_plan)
-            };
-            qk_plan.run_offsets_on_stream(
-                lt,
-                &self.packed_key,
-                0,
-                &self.packed_query,
-                0,
-                self.attention_scores.output(),
-                0,
-                stream,
-            )?;
-            causal_window_softmax_f32_to_bf16_on_stream(
-                &self.attention_scores,
-                self.packed_probabilities.output(),
-                query_rows,
-                self.cache_tokens,
-                start_position + row_offset,
-                config.q_heads,
-                config.head_dim,
-                None,
-                stream,
-            )?;
-            pv_plan.run_offsets_on_stream(
-                lt,
-                &self.packed_value,
-                0,
-                &self.packed_probabilities,
-                0,
-                self.packed_attention.output(),
-                0,
-                stream,
-            )?;
-            unpack_heads_f32_at_offset_into_on_stream(
-                &self.packed_attention,
-                output.output(),
-                query_rows,
-                config.q_heads,
-                config.head_dim,
-                row_offset,
-                stream,
-            )?;
-            row_offset += query_rows;
-        }
-        Ok(())
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.qk_plan.workspace_bytes()
-            + self.pv_plan.workspace_bytes()
-            + self
-                .tail_plans
-                .as_ref()
-                .map_or(0, |(qk, pv)| qk.workspace_bytes() + pv.workspace_bytes())
-            + self.packed_query.device_bytes()
-            + self.packed_key.device_bytes()
-            + self.packed_value.device_bytes()
-            + self.attention_scores.device_bytes()
-            + self.packed_probabilities.device_bytes()
-            + self.packed_attention.device_bytes()
     }
 }
 
@@ -1456,10 +1574,6 @@ fn yarn_inverse_frequencies(config: BonsaiConfig) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    fn round_bf16(value: f32) -> f32 {
-        nvfp4::format::bf16_to_f32(nvfp4::format::f32_to_bf16(value))
-    }
-
     #[test]
     fn bonsai_yarn_frequency_endpoints_match_reference_formula() {
         let config = BonsaiConfig {
@@ -1481,146 +1595,6 @@ mod tests {
         assert!((frequencies[0] - 1.0).abs() < 1.0e-7);
         let unscaled_last = config.rope_theta.powf(-126.0 / config.head_dim as f32);
         assert!((frequencies[63] - unscaled_last / 4.0).abs() < 1.0e-9);
-    }
-
-    #[test]
-    fn chunked_bf16_attention_matches_causal_gqa_reference() {
-        const ROWS: usize = 257;
-        const Q_HEADS: usize = 4;
-        const KV_HEADS: usize = 2;
-        const HEAD_DIM: usize = 64;
-        let config = BonsaiConfig {
-            hidden: Q_HEADS * HEAD_DIM,
-            intermediate: Q_HEADS * HEAD_DIM,
-            layers: 1,
-            q_heads: Q_HEADS,
-            kv_heads: KV_HEADS,
-            head_dim: HEAD_DIM,
-            vocab: 32,
-            max_context: ROWS,
-            rms_eps: 1.0e-6,
-            rope_theta: 1_000_000.0,
-            rope_factor: 1.0,
-            rope_original_context: ROWS,
-        };
-        let query = (0..ROWS * Q_HEADS * HEAD_DIM)
-            .map(|index| ((index * 17 % 97) as f32 - 48.0) / 64.0)
-            .collect::<Vec<_>>();
-        let key = (0..ROWS * KV_HEADS * HEAD_DIM)
-            .map(|index| ((index * 23 % 89) as f32 - 44.0) / 64.0)
-            .collect::<Vec<_>>();
-        let value = (0..ROWS * KV_HEADS * HEAD_DIM)
-            .map(|index| ((index * 29 % 83) as f32 - 41.0) / 53.0)
-            .collect::<Vec<_>>();
-
-        let query_reference = query.clone();
-        let lt = CublasLt::new().expect("cuBLASLt");
-        let mut workspace =
-            BonsaiTensorAttentionWorkspace::new(&lt, config, ROWS, ROWS).expect("workspace");
-        let query = DeviceBuffer::from_host(&query).expect("query");
-        let key = DeviceBuffer::from_host(&key).expect("key");
-        let value = DeviceBuffer::from_host(&value).expect("value");
-        let mut output = DeviceBuffer::zeroed(ROWS * Q_HEADS * HEAD_DIM).expect("output");
-        let mut cache = Sm12xKvCache::new(ROWS, KV_HEADS, HEAD_DIM).expect("cache");
-        let stream = CudaStream::new_non_blocking().expect("stream");
-        workspace
-            .run(
-                &lt,
-                config,
-                &mut cache,
-                &query,
-                &key,
-                &value,
-                &mut output,
-                ROWS,
-                0,
-                &stream,
-            )
-            .expect("attention");
-        let actual = output.copy_to_host(&stream).expect("download");
-        let staged_key = workspace
-            .packed_key
-            .copy_to_host(&stream)
-            .expect("staged key");
-        let staged_value = workspace
-            .packed_value
-            .copy_to_host(&stream)
-            .expect("staged value");
-        let queries_per_kv = Q_HEADS / KV_HEADS;
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let mut expected = vec![0.0f32; ROWS * Q_HEADS * HEAD_DIM];
-        for token in 0..ROWS {
-            for q_head in 0..Q_HEADS {
-                let kv_head = q_head / queries_per_kv;
-                let mut scores = Vec::with_capacity(token + 1);
-                for key_token in 0..=token {
-                    let score = (0..HEAD_DIM)
-                        .map(|dim| {
-                            round_bf16(query_reference[(token * Q_HEADS + q_head) * HEAD_DIM + dim])
-                                * nvfp4::format::bf16_to_f32(
-                                    staged_key[(kv_head * ROWS + key_token) * HEAD_DIM + dim],
-                                )
-                        })
-                        .sum::<f32>()
-                        * scale;
-                    scores.push(score);
-                }
-                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let denominator = scores
-                    .iter()
-                    .map(|score| (*score - maximum).exp())
-                    .sum::<f32>();
-                for dim in 0..HEAD_DIM {
-                    expected[(token * Q_HEADS + q_head) * HEAD_DIM + dim] = scores
-                        .iter()
-                        .enumerate()
-                        .map(|(key_token, score)| {
-                            let probability = round_bf16((*score - maximum).exp() / denominator);
-                            probability
-                                * nvfp4::format::bf16_to_f32(
-                                    staged_value[(kv_head * HEAD_DIM + dim) * ROWS + key_token],
-                                )
-                        })
-                        .sum::<f32>();
-                }
-            }
-        }
-        let max_abs = actual
-            .iter()
-            .zip(&expected)
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0f32, f32::max);
-        let (worst_index, worst_actual, worst_expected) = actual
-            .iter()
-            .zip(&expected)
-            .enumerate()
-            .max_by(
-                |(_, (left_actual, left_expected)), (_, (right_actual, right_expected))| {
-                    (*left_actual - *left_expected)
-                        .abs()
-                        .total_cmp(&(*right_actual - *right_expected).abs())
-                },
-            )
-            .map(|(index, (&actual, &expected))| (index, actual, expected))
-            .expect("non-empty attention output");
-        let rmse = (actual
-            .iter()
-            .zip(&expected)
-            .map(|(actual, expected)| (actual - expected).powi(2) as f64)
-            .sum::<f64>()
-            / actual.len() as f64)
-            .sqrt();
-        let reference_scale = (expected
-            .iter()
-            .map(|value| value.powi(2) as f64)
-            .sum::<f64>()
-            / expected.len() as f64)
-            .sqrt();
-        let relative_rmse = rmse / reference_scale.max(f64::EPSILON);
-        assert!(
-            relative_rmse <= 3.0e-3,
-            "chunked BF16 attention max_abs={max_abs} relative_rmse={relative_rmse} scale={reference_scale} worst_index={worst_index} actual={worst_actual} expected={worst_expected}"
-        );
     }
 
     #[test]
@@ -1714,5 +1688,67 @@ mod tests {
             )
             .expect("key norm");
         }
+    }
+
+    #[test]
+    #[ignore = "requires EIDER_BONSAI_GGUF with the pinned real checkpoint"]
+    fn real_bonsai_multi_page_prefill_matches_serial_decode() {
+        use crate::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
+
+        let path = std::env::var_os("EIDER_BONSAI_GGUF").expect("EIDER_BONSAI_GGUF");
+        let model = BonsaiModel::load(Path::new(&path)).expect("load Bonsai model");
+        let prompt = vec![1; 129];
+        let capacity = prompt.len() + 1;
+
+        let mut serial_cache =
+            new_bonsai_sequence_cache(&model, 1, capacity).expect("serial cache");
+        let mut serial =
+            BonsaiSequence::admit(&model, &mut serial_cache, capacity).expect("serial sequence");
+        for &token in &prompt {
+            model
+                .forward_one(&mut serial, token, &mut serial_cache)
+                .expect("serial token");
+        }
+        let expected = model.logits_to_host(&mut serial).expect("serial logits");
+
+        let mut batched_cache =
+            new_bonsai_sequence_cache(&model, 1, capacity).expect("batched cache");
+        let mut batched =
+            BonsaiSequence::admit(&model, &mut batched_cache, capacity).expect("batched sequence");
+        let mut workspace = model
+            .new_prefill_workspace(prompt.len(), capacity)
+            .expect("prefill workspace");
+        model
+            .prefill(&mut workspace, &mut batched, &prompt, &mut batched_cache)
+            .expect("multi-page prefill");
+        let actual = model.logits_to_host(&mut batched).expect("batched logits");
+
+        let top = |logits: &[f32]| {
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index)
+                .expect("non-empty vocabulary")
+        };
+        let rmse = (actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).powi(2) as f64)
+            .sum::<f64>()
+            / actual.len() as f64)
+            .sqrt();
+        let scale = (expected
+            .iter()
+            .map(|value| value.powi(2) as f64)
+            .sum::<f64>()
+            / expected.len() as f64)
+            .sqrt();
+        let relative_rmse = rmse / scale.max(f64::EPSILON);
+        assert_eq!(top(&actual), top(&expected));
+        assert!(
+            relative_rmse <= 0.05,
+            "multi-page prefill relative RMSE {relative_rmse} exceeds 0.05"
+        );
     }
 }
