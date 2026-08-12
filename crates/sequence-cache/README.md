@@ -177,6 +177,28 @@ projection output. The ownership, transaction, page-table, recycling, and read
 paths are real. Cache accounting covers the managed KV payload; ordinary Rust
 collection and allocator metadata remains process overhead.
 
+### CUDA paged-state example
+
+[`examples/cuda_paged_state.rs`](examples/cuda_paged_state.rs) implements a
+small accelerator backend with stable device allocations and a device-resident
+logical page table. It publishes the complete enlarged table, launches one CUDA
+kernel which scatters rows directly across three physical pages, synchronizes
+before commit, and reads the committed result back for validation.
+
+The example uses the CUDA Driver API directly and does not depend on Eider's
+CUDA crates. It requires Linux, an NVIDIA driver, and a CUDA-capable device; a
+CUDA toolkit is not required because the embedded PTX is compiled by the
+driver. Run it with:
+
+```sh
+cargo run -p sequence-cache --features cuda-example --example cuda_paged_state
+```
+
+For clarity, commit and retirement synchronize the stream before shortening a
+page table or recycling storage. A production backend can replace those host
+waits with event-based deferred retirement while preserving the same ownership
+contract.
+
 ## Core model
 
 ### Pages and sequences
