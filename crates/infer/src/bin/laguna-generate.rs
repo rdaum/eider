@@ -1,7 +1,8 @@
 //! Minimal Laguna load and greedy-decode probe.
 
 use infer::laguna::LagunaModel;
-use infer::nvfp4::{Error, Result};
+use infer::nvfp4::{CudaStream, Error, Result};
+use infer::runtime::laguna_sequence_cache::{LagunaSequence, new_laguna_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -69,10 +70,13 @@ fn main() -> Result<()> {
         "loaded Laguna in {:.3}s",
         load_started.elapsed().as_secs_f64()
     );
-    let mut state = model.new_decode_state(prompt_tokens.len() + tokens as usize)?;
+    let capacity = (prompt_tokens.len() + tokens as usize).max(1);
+    let stream = CudaStream::new_blocking()?;
+    let mut cache = new_laguna_sequence_cache(&model, 1, capacity)?;
+    let mut sequence = LagunaSequence::admit(&model, &mut cache, capacity, &stream)?;
     if let Some((&last, prefix)) = prompt_tokens.split_last() {
         for &prompt_token in prefix {
-            model.consume_one(&mut state, prompt_token)?;
+            model.consume_one(&mut sequence, prompt_token, &mut cache)?;
         }
         token = last;
         println!("prompt_tokens={} {prompt_tokens:?}", prompt_tokens.len());
@@ -81,7 +85,7 @@ fn main() -> Result<()> {
     let mut generated = Vec::with_capacity(tokens as usize);
     for step in 0..tokens {
         let token_started = Instant::now();
-        let next = model.decode_one(&mut state, token)?;
+        let next = model.decode_one(&mut sequence, token, &mut cache)?;
         println!(
             "decode {step:03}: {token} -> {} (logit {:.6}) ms={:.3}",
             next.token,
@@ -106,6 +110,7 @@ fn main() -> Result<()> {
         elapsed.as_secs_f64(),
         tokens as f64 / elapsed.as_secs_f64(),
     );
+    sequence.finish(&mut cache, &stream)?;
     Ok(())
 }
 

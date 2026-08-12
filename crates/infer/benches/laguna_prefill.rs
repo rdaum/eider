@@ -1,4 +1,8 @@
 use infer::laguna::{LagunaModel, LagunaPrefillBatchWorkspace, LagunaPrefillRow};
+use infer::nvfp4::CudaStream;
+use infer::runtime::laguna_sequence_cache::{
+    LagunaSequence, LagunaSequenceCache, new_laguna_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,
@@ -16,6 +20,8 @@ const REVISION: &str = "07614121b31898586430f189d27a25a0be310843";
 struct PrefillCase {
     model: LagunaModel,
     workspace: LagunaPrefillBatchWorkspace,
+    cache: LagunaSequenceCache,
+    cache_stream: CudaStream,
     prompt: Vec<u32>,
 }
 
@@ -40,20 +46,28 @@ fn serial_sample(
 ) -> BenchSampleResult {
     let mut operations = 0;
     for _ in 0..chunk_size {
-        let case = context.case.borrow_mut();
-        let mut state = case
-            .model
-            .new_decode_state(MAX_CONTEXT_TOKENS)
-            .expect("serial prefill state");
+        let mut case = context.case.borrow_mut();
+        let PrefillCase {
+            model,
+            cache,
+            cache_stream,
+            prompt,
+            ..
+        } = &mut *case;
+        let mut sequence = LagunaSequence::admit(model, cache, MAX_CONTEXT_TOKENS, cache_stream)
+            .expect("serial prefill sequence");
         let started = Instant::now();
-        for token in case.prompt.iter().copied() {
-            case.model
-                .consume_one(&mut state, token)
+        for token in prompt.iter().copied() {
+            model
+                .consume_one(&mut sequence, token, cache)
                 .expect("serial prefill token");
         }
-        case.model.synchronize().expect("serial prefill sync");
+        model.synchronize().expect("serial prefill sync");
         black_box(started.elapsed());
-        operations += case.prompt.len() as u64;
+        operations += prompt.len() as u64;
+        sequence
+            .finish(cache, cache_stream)
+            .expect("finish serial sequence");
     }
     BenchSampleResult::operations(operations)
 }
@@ -66,27 +80,33 @@ fn batch_sample(
     let mut operations = 0;
     for _ in 0..chunk_size {
         let mut case = context.case.borrow_mut();
-        let mut state = case
-            .model
-            .new_decode_state(MAX_CONTEXT_TOKENS)
-            .expect("batch prefill state");
         let prompt = case.prompt.clone();
         let PrefillCase {
-            model, workspace, ..
+            model,
+            workspace,
+            cache,
+            cache_stream,
+            ..
         } = &mut *case;
+        let mut sequence = LagunaSequence::admit(model, cache, MAX_CONTEXT_TOKENS, cache_stream)
+            .expect("batch prefill sequence");
         let started = Instant::now();
         model
             .prefill_batch(
                 workspace,
                 &mut [LagunaPrefillRow {
                     token_ids: &prompt,
-                    state: &mut state,
+                    sequence: &mut sequence,
                 }],
+                cache,
             )
             .expect("batch prefill");
         model.synchronize().expect("batch prefill sync");
         black_box(started.elapsed());
         operations += prompt.len() as u64;
+        sequence
+            .finish(cache, cache_stream)
+            .expect("finish batch sequence");
     }
     BenchSampleResult::operations(operations)
 }
@@ -113,18 +133,27 @@ fn nrmse(actual: &[f32], expected: &[f32]) -> f64 {
     (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt()
 }
 
-fn serial_logits(model: &LagunaModel, prompt: &[u32], final_token: u32) -> Vec<f32> {
-    let mut state = model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("serial validation state");
+fn serial_logits(case: &mut PrefillCase, prompt: &[u32], final_token: u32) -> Vec<f32> {
+    let mut sequence = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("serial validation sequence");
     for token in prompt.iter().copied() {
-        model
-            .consume_one(&mut state, token)
+        case.model
+            .consume_one(&mut sequence, token, &mut case.cache)
             .expect("serial validation prefill");
     }
-    model
-        .logits_one(&mut state, final_token)
-        .expect("serial validation logits")
+    let logits = case
+        .model
+        .logits_one(&mut sequence, final_token, &mut case.cache)
+        .expect("serial validation logits");
+    sequence
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish serial validation sequence");
+    logits
 }
 
 fn validate(case: &mut PrefillCase) {
@@ -132,24 +161,28 @@ fn validate(case: &mut PrefillCase) {
         .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
         .collect::<Vec<_>>();
     let final_token = 9707;
-    let expected = serial_logits(&case.model, &prompt, final_token);
+    let expected = serial_logits(case, &prompt, final_token);
 
-    let mut batch = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("batch validation state");
+    let mut batch = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("batch validation sequence");
     case.model
         .prefill_batch(
             &mut case.workspace,
             &mut [LagunaPrefillRow {
                 token_ids: &prompt,
-                state: &mut batch,
+                sequence: &mut batch,
             }],
+            &mut case.cache,
         )
         .expect("validation batch prefill");
     let actual = case
         .model
-        .logits_one(&mut batch, final_token)
+        .logits_one(&mut batch, final_token, &mut case.cache)
         .expect("batch validation logits");
     let error = nrmse(&actual, &expected);
     assert!(
@@ -161,24 +194,31 @@ fn validate(case: &mut PrefillCase) {
         "batched BF16 prefill diverged excessively from token-serial F32 accumulation: nrmse={error:.6}"
     );
 
-    let mut split = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("split validation state");
+    batch
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish batch validation sequence");
+    let mut split = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("split validation sequence");
     for chunk in [&prompt[..3], &prompt[3..]] {
         case.model
             .prefill_batch(
                 &mut case.workspace,
                 &mut [LagunaPrefillRow {
                     token_ids: chunk,
-                    state: &mut split,
+                    sequence: &mut split,
                 }],
+                &mut case.cache,
             )
             .expect("split validation prefill");
     }
     let split_logits = case
         .model
-        .logits_one(&mut split, final_token)
+        .logits_one(&mut split, final_token, &mut case.cache)
         .expect("split validation logits");
     assert_eq!(
         top(&split_logits),
@@ -190,62 +230,85 @@ fn validate(case: &mut PrefillCase) {
         split_error <= 0.12,
         "split batched prefill nrmse={split_error:.6}"
     );
+    split
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish split validation sequence");
 
     let second_prompt = [3710, 9707, 3710, 9707, 3710];
     let second_final = 3710;
-    let mut second_reference = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("second reference state");
+    let mut second_reference = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("second reference sequence");
     case.model
         .prefill_batch(
             &mut case.workspace,
             &mut [LagunaPrefillRow {
                 token_ids: &second_prompt,
-                state: &mut second_reference,
+                sequence: &mut second_reference,
             }],
+            &mut case.cache,
         )
         .expect("second reference prefill");
     let second_expected = case
         .model
-        .logits_one(&mut second_reference, second_final)
+        .logits_one(&mut second_reference, second_final, &mut case.cache)
         .expect("second reference logits");
-    let mut first_ragged = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("first ragged validation state");
-    let mut second_ragged = case
-        .model
-        .new_decode_state(MAX_CONTEXT_TOKENS)
-        .expect("second ragged validation state");
+    second_reference
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish second reference sequence");
+    let mut first_ragged = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("first ragged validation sequence");
+    let mut second_ragged = LagunaSequence::admit(
+        &case.model,
+        &mut case.cache,
+        MAX_CONTEXT_TOKENS,
+        &case.cache_stream,
+    )
+    .expect("second ragged validation sequence");
     case.model
         .prefill_batch(
             &mut case.workspace,
             &mut [
                 LagunaPrefillRow {
                     token_ids: &prompt,
-                    state: &mut first_ragged,
+                    sequence: &mut first_ragged,
                 },
                 LagunaPrefillRow {
                     token_ids: &second_prompt,
-                    state: &mut second_ragged,
+                    sequence: &mut second_ragged,
                 },
             ],
+            &mut case.cache,
         )
         .expect("ragged validation prefill");
     let first_actual = case
         .model
-        .logits_one(&mut first_ragged, final_token)
+        .logits_one(&mut first_ragged, final_token, &mut case.cache)
         .expect("first ragged validation logits");
     let second_actual = case
         .model
-        .logits_one(&mut second_ragged, second_final)
+        .logits_one(&mut second_ragged, second_final, &mut case.cache)
         .expect("second ragged validation logits");
     assert_eq!(
         top(&first_actual),
         top(&expected),
         "first ragged prefill selected a different token"
     );
+    first_ragged
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish first ragged sequence");
+    second_ragged
+        .finish(&mut case.cache, &case.cache_stream)
+        .expect("finish second ragged sequence");
     assert_eq!(
         top(&second_actual),
         top(&second_expected),
@@ -285,12 +348,15 @@ fn main() {
     let workspace = model
         .new_prefill_batch_workspace(2, TOKEN_CAPACITY, MAX_CONTEXT_TOKENS)
         .expect("prefill workspace");
+    let cache = new_laguna_sequence_cache(&model, 4, MAX_CONTEXT_TOKENS).expect("sequence cache");
     let prompt = (0..TOKEN_CAPACITY)
         .map(|token| if token % 2 == 0 { 9707 } else { 3710 })
         .collect();
     let case = Rc::new(RefCell::new(PrefillCase {
         model,
         workspace,
+        cache,
+        cache_stream: CudaStream::new_blocking().expect("cache stream"),
         prompt,
     }));
     validate(&mut case.borrow_mut());

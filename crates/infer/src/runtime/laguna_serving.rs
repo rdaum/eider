@@ -2,18 +2,19 @@
 
 use super::chat::{ChatReasoningEffort, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::prefix_cache::{
-    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
-};
+use super::laguna_sequence_cache::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
+use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
+use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use super::stop::StopBuffer;
 use crate::laguna::{
-    LagunaDecodeState, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace, LagunaPrefillRow,
-    LagunaSequenceCheckpoint,
+    HEAD_DIM, KV_HEADS, LAYERS, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace,
+    LagunaPrefillRow,
 };
-use nvfp4::{Error, Result};
+use nvfp4::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
+use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -119,7 +120,6 @@ pub enum LagunaCancelOutcome {
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
-    prefix_cache_key: Option<PrefixCacheKey>,
     prefix_cache_target: usize,
     prefix_cache_checkpointed: bool,
     generation: RequestConfig,
@@ -127,7 +127,7 @@ struct ActiveRequest<'tokenizer> {
     reasoning_token_budget: Option<usize>,
     last_token: Option<u32>,
     pending_sample: Option<SampledToken>,
-    state: Option<LagunaDecodeState>,
+    sequence: Option<Box<LagunaSequence>>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -143,7 +143,8 @@ pub struct LagunaChatService<'model, 'template> {
     waiting: VecDeque<LagunaRequestId>,
     requests: BTreeMap<LagunaRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
-    prefix_cache: Option<PrefixCache<LagunaSequenceCheckpoint>>,
+    sequence_cache: LagunaSequenceCache,
+    cache_stream: CudaStream,
     prefill_workspace: LagunaPrefillBatchWorkspace,
     tail_prefill_workspace: Option<LagunaPrefillBatchWorkspace>,
     reasoning_end_token: u32,
@@ -187,6 +188,87 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     label: "Laguna reasoning token",
                     detail: format!("tokenizer does not define {REASONING_END:?}"),
                 })?;
+        let probe_backend =
+            Sm12xPageBackend::new(std::iter::repeat_n(true, LAYERS), 1, KV_HEADS, HEAD_DIM)?;
+        let page_bytes = probe_backend.page_bytes();
+        let private_state_bytes = model
+            .new_sequence_state(config.max_context_tokens)?
+            .device_bytes();
+        let page_table_bytes = Sm12xPageTable::new(config.max_context_tokens)?.managed_bytes();
+        let fixed_per_sequence = private_state_bytes
+            .checked_add(page_table_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Laguna sequence-cache fixed bytes",
+                expected: "per-sequence byte count without overflow".to_string(),
+                actual: format!("private={private_state_bytes} table={page_table_bytes}"),
+            })?;
+        let fixed_capacity = fixed_per_sequence
+            .checked_mul(config.max_active_sequences)
+            .ok_or_else(|| Error::Shape {
+                label: "Laguna sequence-cache fixed capacity",
+                expected: "active fixed-state byte count without overflow".to_string(),
+                actual: format!(
+                    "per_sequence={fixed_per_sequence} active={}",
+                    config.max_active_sequences
+                ),
+            })?;
+        let managed_bytes =
+            if prefix_cache.max_device_bytes == 0 {
+                let eager_pages = config
+                    .max_context_tokens
+                    .div_ceil(SM12X_KV_PAGE_TOKENS)
+                    .checked_mul(config.max_active_sequences)
+                    .ok_or_else(|| Error::Shape {
+                        label: "Laguna sequence-cache fallback pages",
+                        expected: "page count without overflow".to_string(),
+                        actual: format!(
+                            "context={} active={}",
+                            config.max_context_tokens, config.max_active_sequences
+                        ),
+                    })?;
+                fixed_capacity
+                    .checked_add(eager_pages.checked_mul(page_bytes).ok_or_else(|| {
+                        Error::Shape {
+                            label: "Laguna sequence-cache fallback page bytes",
+                            expected: "page byte count without overflow".to_string(),
+                            actual: format!("pages={eager_pages} page_bytes={page_bytes}"),
+                        }
+                    })?)
+                    .ok_or_else(|| Error::Shape {
+                        label: "Laguna sequence-cache fallback capacity",
+                        expected: "managed byte count without overflow".to_string(),
+                        actual: format!("fixed={fixed_capacity} pages={eager_pages}"),
+                    })?
+            } else {
+                prefix_cache.max_device_bytes
+            };
+        let page_slots = managed_bytes.saturating_sub(fixed_capacity) / page_bytes;
+        if page_slots == 0 {
+            return Err(Error::Shape {
+                label: "Laguna sequence-cache capacity",
+                expected: format!(
+                    "budget greater than fixed active capacity {fixed_capacity} and one {page_bytes}-byte page"
+                ),
+                actual: managed_bytes.to_string(),
+            });
+        }
+        let backend = Sm12xPageBackend::new(
+            std::iter::repeat_n(true, LAYERS),
+            page_slots,
+            KV_HEADS,
+            HEAD_DIM,
+        )?;
+        let sequence_cache = LagunaSequenceCache::new(
+            CacheConfig {
+                page_tokens: SM12X_KV_PAGE_TOKENS,
+                max_managed_bytes: managed_bytes,
+                max_snapshot_bytes: 0,
+                max_prefix_entries: (prefix_cache.max_device_bytes == 0).then_some(0),
+                emergency_bytes: 0,
+            },
+            backend,
+        )
+        .map_err(laguna_cache_error)?;
         Ok(Self {
             model,
             template,
@@ -195,8 +277,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
-            prefix_cache: (prefix_cache.max_device_bytes != 0)
-                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
+            sequence_cache,
+            cache_stream: CudaStream::new_blocking()?,
             prefill_workspace,
             tail_prefill_workspace,
             reasoning_end_token,
@@ -248,14 +330,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             detail: "request ID space exhausted".to_string(),
         })?;
         let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt.token_ids.len());
-        let prefix_cache_key = if prefix_cache_target == 0 {
-            None
-        } else {
-            self.prefix_cache
-                .as_mut()
-                .map(|cache| cache.prompt_key(&prompt.token_ids, prefix_cache_target))
-                .transpose()?
-        };
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
@@ -273,7 +347,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             ActiveRequest {
                 prompt: prompt.token_ids.clone(),
                 prompt_position: 0,
-                prefix_cache_key,
                 prefix_cache_target,
                 prefix_cache_checkpointed: false,
                 generation: request.generation.clone(),
@@ -281,7 +354,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 reasoning_token_budget,
                 last_token: None,
                 pending_sample: None,
-                state: None,
+                sequence: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -330,7 +403,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.prompt_position >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -347,7 +420,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -357,7 +430,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
-            if request.state.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
@@ -373,7 +446,15 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             return LagunaCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
-        let released = request.state.map_or(0, |state| state.device_bytes());
+        let released = request
+            .sequence
+            .as_ref()
+            .map_or(0, |sequence| sequence.device_bytes());
+        if let Some(sequence) = request.sequence
+            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)
+        {
+            warn!(%error, "failed to release cancelled Laguna sequence");
+        }
         if released != 0 {
             self.active_sequences -= 1;
         }
@@ -400,42 +481,52 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             };
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let mut allocation_duration = Duration::ZERO;
-            let mut checkpoint_copy_duration = Duration::ZERO;
-            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
-                (Some(cache), Some(key)) => {
-                    cache.restore(key, LagunaSequenceCheckpoint::position, |checkpoint| {
-                        let restore_started = Instant::now();
-                        let state = self
-                            .model
-                            .restore_sequence_checkpoint(checkpoint, capacity.max(1))?;
-                        checkpoint_copy_duration = restore_started.elapsed();
-                        Ok(state)
-                    })?
+            let allocation_started = Instant::now();
+            let prefix = self.sequence_cache.lookup_prefix(&request.prompt);
+            let mut state = self.model.new_sequence_state(capacity.max(1))?;
+            let mut page_table = Sm12xPageTable::new(capacity.max(1))?;
+            let outcome = self
+                .sequence_cache
+                .admit(
+                    prefix,
+                    AdmissionRequest {
+                        max_position: capacity.max(1),
+                        private_state_bytes: state.device_bytes(),
+                        page_table_bytes: page_table.managed_bytes(),
+                        allow_emergency: false,
+                    },
+                    &mut Sm12xCacheContext {
+                        stream: &self.cache_stream,
+                        page_table: &mut page_table,
+                    },
+                    |_snapshot, position| {
+                        state.position = position;
+                        Ok(())
+                    },
+                )
+                .map_err(laguna_cache_error)?;
+            let cache_id = match outcome {
+                AdmissionOutcome::Admitted(id) => id,
+                AdmissionOutcome::WouldBlock => {
+                    self.waiting.push_front(id);
+                    break;
                 }
-                _ => None,
             };
-            let cached_prompt_tokens = restored.as_ref().map_or(0, LagunaDecodeState::len);
-            let state = if let Some(restored) = restored {
-                restored
-            } else {
-                let allocation_started = Instant::now();
-                let state = self.model.new_decode_state(capacity.max(1))?;
-                allocation_duration = allocation_started.elapsed();
-                state
-            };
-            let bytes = state.device_bytes();
+            self.cache_stream.synchronize()?;
+            let cached_prompt_tokens = state.len();
+            let sequence = LagunaSequence::from_admission(cache_id, page_table, state);
+            let bytes = sequence.device_bytes();
             request.prompt_position = cached_prompt_tokens;
             request.prefix_cache_checkpointed =
                 cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
-            request.state = Some(state);
+            request.sequence = Some(Box::new(sequence));
             self.active_sequences += 1;
             let progress = LagunaAdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
                 cached_prompt_tokens,
-                allocation_duration,
-                checkpoint_copy_duration,
+                allocation_duration: allocation_started.elapsed(),
+                checkpoint_copy_duration: Duration::ZERO,
                 admitted_after_tick_start: tick_started.elapsed(),
             };
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
@@ -466,7 +557,18 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             let batchable = available.saturating_sub(1);
             let remaining_sequences = ids.len() - index;
             let fair_share = budget.div_ceil(remaining_sequences);
-            let chunk = batchable.min(prefill_chunk_capacity(request.prompt_position, fair_share));
+            let chunk = batchable
+                .min(prefill_chunk_capacity(request.prompt_position, fair_share))
+                .min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS)
+                .min(
+                    if !request.prefix_cache_checkpointed
+                        && request.prompt_position < request.prefix_cache_target
+                    {
+                        request.prefix_cache_target - request.prompt_position
+                    } else {
+                        usize::MAX
+                    },
+                );
             if chunk == 0 {
                 continue;
             }
@@ -492,7 +594,10 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                         let start = request.prompt_position;
                         LagunaPrefillRow {
                             token_ids: &request.prompt[start..start + chunk],
-                            state: request.state.as_mut().expect("prefill request is admitted"),
+                            sequence: request
+                                .sequence
+                                .as_deref_mut()
+                                .expect("prefill request is admitted"),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -500,7 +605,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
                 }
                 self.model
-                    .prefill_batch(workspace, &mut rows)
+                    .prefill_batch(workspace, &mut rows, &mut self.sequence_cache)
                     .and_then(|()| self.model.synchronize())
             };
             if let Err(error) = result {
@@ -517,8 +622,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     request.prefix_cache_checkpointed,
                 ) {
                     Self::retain_request_checkpoint(
-                        self.model,
-                        &mut self.prefix_cache,
+                        &mut self.sequence_cache,
+                        &self.cache_stream,
                         &mut request,
                     );
                 }
@@ -540,14 +645,24 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             let token = request.prompt[request.prompt_position];
             request.prompt_position += 1;
             let sampled = if request.sampler.config().uses_fast_argmax() {
-                sampled_from_top1(self.model.decode_one(
-                    request.state.as_mut().expect("prefill request is admitted"),
-                    token,
-                )?)
+                sampled_from_top1(
+                    self.model.decode_one(
+                        request
+                            .sequence
+                            .as_deref_mut()
+                            .expect("prefill request is admitted"),
+                        token,
+                        &mut self.sequence_cache,
+                    )?,
+                )
             } else {
                 let logits = self.model.logits_one(
-                    request.state.as_mut().expect("prefill request is admitted"),
+                    request
+                        .sequence
+                        .as_deref_mut()
+                        .expect("prefill request is admitted"),
                     token,
+                    &mut self.sequence_cache,
                 )?;
                 request.sampler.sample(&logits, &request.history)?
             };
@@ -558,7 +673,11 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 request.prefix_cache_target,
                 request.prefix_cache_checkpointed,
             ) {
-                Self::retain_request_checkpoint(self.model, &mut self.prefix_cache, request);
+                Self::retain_request_checkpoint(
+                    &mut self.sequence_cache,
+                    &self.cache_stream,
+                    request,
+                );
             }
             tick.prefilled.push(LagunaPrefillProgress {
                 request_id: id,
@@ -569,44 +688,37 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
     }
 
     fn retain_request_checkpoint(
-        model: &LagunaModel,
-        prefix_cache: &mut Option<PrefixCache<LagunaSequenceCheckpoint>>,
+        sequence_cache: &mut LagunaSequenceCache,
+        cache_stream: &CudaStream,
         request: &mut ActiveRequest<'template>,
     ) {
         if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
             return;
         }
-        let (Some(cache), Some(key), Some(state)) = (
-            prefix_cache.as_mut(),
-            request.prefix_cache_key.as_ref(),
-            request.state.as_ref(),
-        ) else {
+        if sequence_cache.config().max_prefix_entries == Some(0) {
             request.prefix_cache_checkpointed = true;
             return;
+        }
+        let Some(sequence) = request.sequence.as_deref_mut() else {
+            return;
         };
-        if state.len() < request.prefix_cache_target {
+        if sequence.position() != request.prefix_cache_target {
             return;
         }
-        if !cache.contains(key) {
-            let Ok(estimated_bytes) =
-                model.checkpoint_sequence_device_bytes(state, request.prefix_cache_target)
-            else {
-                request.prefix_cache_checkpointed = true;
-                return;
-            };
-            if cache.prepare_insert(estimated_bytes) {
-                let started = Instant::now();
-                match model.checkpoint_sequence(state, request.prefix_cache_target) {
-                    Ok(checkpoint) => {
-                        cache.record_checkpoint(started);
-                        let bytes = checkpoint.device_bytes();
-                        if let Err(error) = cache.insert(key.clone(), checkpoint, bytes) {
-                            warn!(%error, "failed to retain Laguna prompt prefix checkpoint");
-                        }
-                    }
-                    Err(error) => warn!(%error, "failed to checkpoint Laguna prompt prefix"),
-                }
-            }
+        if sequence_cache.contains_prefix(&request.prompt, request.prefix_cache_target) {
+            request.prefix_cache_checkpointed = true;
+            return;
+        }
+        if let Err(error) = sequence_cache.retain_prefix(
+            sequence.cache_id,
+            &request.prompt,
+            (),
+            &mut Sm12xCacheContext {
+                stream: cache_stream,
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            warn!(%error, "failed to retain shared Laguna prompt prefix");
         }
         request.prefix_cache_checkpointed = true;
     }
@@ -626,8 +738,12 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 .last_token
                 .expect("budgeted Laguna request has generated reasoning");
             self.model.consume_one(
-                request.state.as_mut().expect("decode request is admitted"),
+                request
+                    .sequence
+                    .as_deref_mut()
+                    .expect("decode request is admitted"),
                 token,
+                &mut self.sequence_cache,
             )?;
             SampledToken {
                 id: self.reasoning_end_token,
@@ -641,14 +757,24 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 .last_token
                 .expect("generated Laguna token exists after prompt logits");
             if request.sampler.config().uses_fast_argmax() {
-                sampled_from_top1(self.model.decode_one(
-                    request.state.as_mut().expect("decode request is admitted"),
-                    token,
-                )?)
+                sampled_from_top1(
+                    self.model.decode_one(
+                        request
+                            .sequence
+                            .as_deref_mut()
+                            .expect("decode request is admitted"),
+                        token,
+                        &mut self.sequence_cache,
+                    )?,
+                )
             } else {
                 let logits = self.model.logits_one(
-                    request.state.as_mut().expect("decode request is admitted"),
+                    request
+                        .sequence
+                        .as_deref_mut()
+                        .expect("decode request is admitted"),
                     token,
+                    &mut self.sequence_cache,
                 )?;
                 request.sampler.sample(&logits, &request.history)?
             }
@@ -696,8 +822,12 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let state = request.state.take().expect("terminal request is admitted");
-        let released = state.device_bytes();
+        let sequence = request
+            .sequence
+            .take()
+            .expect("terminal request is admitted");
+        let released = sequence.device_bytes();
+        (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)?;
         self.active_sequences -= 1;
         tick.finished.push(LagunaFinished {
             request_id: id,

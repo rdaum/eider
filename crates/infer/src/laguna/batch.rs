@@ -1,37 +1,36 @@
 use super::*;
 use crate::metrics::metrics;
+use crate::runtime::laguna_sequence_cache::{
+    LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, GemmShape, MoeSortedNvfp4Rows,
-    MoeSortedRoutes, add_f32_prefix_into_on_stream, causal_window_softmax_f32_to_bf16_on_stream,
+    MoeSortedRoutes, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
-    pack_token_heads_bf16_at_offset_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_prefix_into_on_stream,
-    softplus_scale_heads_f32_prefix_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,
+    softplus_scale_heads_f32_prefix_into_on_stream,
 };
 use std::collections::HashMap;
-use std::mem::size_of;
 
 const CUBLAS_WORKSPACE_LIMIT: u64 = 32 << 20;
-const PREFILL_ATTENTION_WORKSPACE_LIMIT: u64 = 4 << 20;
-const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 << 20;
-const ATTENTION_QUERY_TILE_ROWS: usize = 256;
-const TENSOR_CORE_ATTENTION_MIN_ROWS: usize = 32;
 const MAX_Q_HEADS: usize = 72;
-
-fn use_compact_prefill_attention(start_position: usize, query_rows: usize) -> bool {
-    start_position != 0 || query_rows < TENSOR_CORE_ATTENTION_MIN_ROWS
-}
 
 /// One ragged Laguna prompt chunk and its persistent sequence state.
 pub struct LagunaPrefillRow<'tokens, 'state> {
     /// Tokens to append to this sequence.
     pub token_ids: &'tokens [u32],
     /// Sequence state receiving the new K/V rows.
-    pub state: &'state mut LagunaDecodeState,
+    pub sequence: &'state mut LagunaSequence,
+}
+
+struct LagunaPrefillStateRow<'tokens, 'state> {
+    token_ids: &'tokens [u32],
+    state: &'state mut LagunaDecodeState,
 }
 
 struct LagunaBatchLinearWorkspace {
@@ -115,7 +114,6 @@ impl LagunaBatchLinearWorkspace {
 struct LagunaBatchAttentionWorkspace {
     q_heads: usize,
     compact: Sm12xKvAttentionWorkspace,
-    tensor_core: LagunaTensorCoreAttentionWorkspace,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -142,12 +140,6 @@ impl LagunaBatchAttentionWorkspace {
                 HEAD_DIM,
                 16,
             )?,
-            tensor_core: LagunaTensorCoreAttentionWorkspace::new(
-                token_capacity,
-                q_heads,
-                KV_HEADS,
-                HEAD_DIM,
-            )?,
             q: DeviceBuffer::zeroed(q_values)?,
             k: DeviceBuffer::zeroed(kv_values)?,
             v: DeviceBuffer::zeroed(kv_values)?,
@@ -161,221 +153,6 @@ impl LagunaBatchAttentionWorkspace {
             output: DeviceBuffer::zeroed(token_capacity * HIDDEN)?,
         })
     }
-}
-
-struct LagunaTensorCoreAttentionWorkspace {
-    lt: CublasLt,
-    qk_plans: HashMap<(usize, usize), Bf16TnMatmulPlan>,
-    pv_plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
-    packed_query: DeviceBuffer<u16>,
-    packed_key: DeviceBuffer<u16>,
-    packed_value: DeviceBuffer<u16>,
-    scores: DeviceBuffer<f32>,
-    packed_probabilities: DeviceBuffer<u16>,
-    packed_output: DeviceBuffer<f32>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-}
-
-impl LagunaTensorCoreAttentionWorkspace {
-    fn new(rows: usize, q_heads: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
-        let q_values = rows * q_heads * head_dim;
-        let kv_values = rows * kv_heads * head_dim;
-        Ok(Self {
-            lt: CublasLt::new()?,
-            qk_plans: HashMap::new(),
-            pv_plans: HashMap::new(),
-            packed_query: DeviceBuffer::zeroed(q_values)?,
-            packed_key: DeviceBuffer::zeroed(kv_values)?,
-            packed_value: DeviceBuffer::zeroed(kv_values)?,
-            scores: DeviceBuffer::zeroed(rows * q_heads * rows)?,
-            packed_probabilities: DeviceBuffer::zeroed(rows * q_heads * rows)?,
-            packed_output: DeviceBuffer::zeroed(q_values)?,
-            q_heads,
-            kv_heads,
-            head_dim,
-        })
-    }
-
-    fn tile_rows(&self, requested: usize, key_tokens: usize) -> usize {
-        let values_per_row = self.q_heads.saturating_mul(key_tokens).max(1);
-        let budget_rows = (ATTENTION_SCORE_BUDGET_BYTES / size_of::<f32>())
-            .checked_div(values_per_row)
-            .unwrap_or(0)
-            .max(1);
-        let rows = requested.min(budget_rows).min(ATTENTION_QUERY_TILE_ROWS);
-        if rows >= 16 { rows / 16 * 16 } else { rows }
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        query_rows: usize,
-        cache_tokens: usize,
-        score_key_tokens: usize,
-    ) -> Result<()> {
-        grow_device_buffer(
-            &mut self.packed_query,
-            query_rows * self.q_heads * self.head_dim,
-        )?;
-        let kv_values = cache_tokens * self.kv_heads * self.head_dim;
-        grow_device_buffer(&mut self.packed_key, kv_values)?;
-        grow_device_buffer(&mut self.packed_value, kv_values)?;
-        let score_values = query_rows * self.q_heads * score_key_tokens;
-        grow_device_buffer(&mut self.scores, score_values)?;
-        grow_device_buffer(&mut self.packed_probabilities, score_values)?;
-        grow_device_buffer(
-            &mut self.packed_output,
-            query_rows * self.q_heads * self.head_dim,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_sequence(
-        &mut self,
-        cache: &mut Sm12xKvCache,
-        query: &DeviceBuffer<f32>,
-        key: &DeviceBuffer<f32>,
-        value: &DeviceBuffer<f32>,
-        input_row_offset: usize,
-        rows: usize,
-        window_tokens: Option<usize>,
-        output: &mut DeviceBuffer<f32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let start_position = cache.len();
-        let cache_tokens = start_position + rows;
-        let cache_values = cache_tokens * self.kv_heads * self.head_dim;
-        grow_device_buffer(&mut self.packed_key, cache_values)?;
-        grow_device_buffer(&mut self.packed_value, cache_values)?;
-        if start_position == 0 {
-            cache.append_initial_rows_and_stage_bf16_on_stream(
-                key,
-                value,
-                input_row_offset,
-                rows,
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        } else {
-            cache.append_rows_at_offset_on_stream(key, value, input_row_offset, rows, stream)?;
-            cache.unpack_bf16_on_stream(
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        }
-
-        let queries_per_kv = self.q_heads / self.kv_heads;
-        let mut query_offset = 0;
-        while query_offset < rows {
-            let requested = rows - query_offset;
-            let absolute_query_start = start_position + query_offset;
-            let tentative_key_start = window_tokens
-                .map(|window| (absolute_query_start + 1).saturating_sub(window))
-                .unwrap_or(0);
-            let tentative_key_tokens = absolute_query_start + requested - tentative_key_start;
-            let query_rows = self.tile_rows(requested, tentative_key_tokens);
-            let key_start = window_tokens
-                .map(|window| (absolute_query_start + 1).saturating_sub(window))
-                .unwrap_or(0);
-            let key_end = absolute_query_start + query_rows;
-            let key_tokens = key_end - key_start;
-            self.ensure_capacity(query_rows, cache_tokens, key_tokens)?;
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset + query_offset,
-                stream,
-            )?;
-
-            let qk_key = (key_tokens, query_rows);
-            if !self.qk_plans.contains_key(&qk_key) {
-                self.qk_plans.insert(
-                    qk_key,
-                    Bf16TnMatmulPlan::new_strided_batch(
-                        &self.lt,
-                        GemmShape::new(key_tokens, query_rows * queries_per_kv, self.head_dim),
-                        self.kv_heads,
-                        cache_tokens * self.head_dim,
-                        queries_per_kv * query_rows * self.head_dim,
-                        queries_per_kv * query_rows * key_tokens,
-                        PREFILL_ATTENTION_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            self.qk_plans[&qk_key].run_offsets_on_stream(
-                &self.lt,
-                &self.packed_key,
-                key_start * self.head_dim,
-                &self.packed_query,
-                0,
-                self.scores.output(),
-                0,
-                stream,
-            )?;
-            causal_window_softmax_f32_to_bf16_on_stream(
-                &self.scores,
-                self.packed_probabilities.output(),
-                query_rows,
-                key_tokens,
-                absolute_query_start - key_start,
-                self.q_heads,
-                self.head_dim,
-                window_tokens,
-                stream,
-            )?;
-
-            let pv_key = (key_tokens, query_rows, cache_tokens);
-            if !self.pv_plans.contains_key(&pv_key) {
-                self.pv_plans.insert(
-                    pv_key,
-                    Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
-                        &self.lt,
-                        GemmShape::new(self.head_dim, query_rows * queries_per_kv, key_tokens),
-                        cache_tokens,
-                        self.kv_heads,
-                        self.head_dim * cache_tokens,
-                        queries_per_kv * query_rows * key_tokens,
-                        queries_per_kv * query_rows * self.head_dim,
-                        PREFILL_ATTENTION_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            self.pv_plans[&pv_key].run_offsets_on_stream(
-                &self.lt,
-                &self.packed_value,
-                key_start,
-                &self.packed_probabilities,
-                0,
-                self.packed_output.output(),
-                0,
-                stream,
-            )?;
-            unpack_heads_f32_at_offset_into_on_stream(
-                &self.packed_output,
-                output.output(),
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset + query_offset,
-                stream,
-            )?;
-            query_offset += query_rows;
-        }
-        Ok(())
-    }
-}
-
-fn grow_device_buffer<T: Copy>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
-    if buffer.len() < required {
-        *buffer = DeviceBuffer::zeroed(required)?;
-    }
-    Ok(())
 }
 
 struct LagunaBatchMlpWorkspace {
@@ -534,6 +311,87 @@ impl LagunaModel {
         &self,
         workspace: &mut LagunaPrefillBatchWorkspace,
         rows: &mut [LagunaPrefillRow<'_, '_>],
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<()> {
+        let mut targets = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let target = match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    for target in targets.drain(..) {
+                        cache.abort_append(target).map_err(laguna_cache_error)?;
+                    }
+                    return Err(laguna_cache_error(error));
+                }
+            };
+            if target.max_rows() != row.token_ids.len() {
+                cache.abort_append(target).map_err(laguna_cache_error)?;
+                for target in targets.drain(..) {
+                    cache.abort_append(target).map_err(laguna_cache_error)?;
+                }
+                return Err(Error::Shape {
+                    label: "Laguna prefill chunk",
+                    expected: format!(
+                        "each row to fit within its current {}-token cache page",
+                        nvfp4::SM12X_KV_PAGE_TOKENS
+                    ),
+                    actual: format!("{} tokens", row.token_ids.len()),
+                });
+            }
+            targets.push(target);
+        }
+        let result = {
+            let mut state_rows = Vec::with_capacity(rows.len());
+            let mut appends = Vec::with_capacity(rows.len());
+            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+                let sequence = &mut *row.sequence;
+                state_rows.push(LagunaPrefillStateRow {
+                    token_ids: row.token_ids,
+                    state: &mut sequence.state,
+                });
+                appends.push(LagunaAppend {
+                    target,
+                    page_table: sequence.page_table.device(),
+                });
+            }
+            self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
+        };
+        if let Err(error) = result {
+            for target in targets {
+                cache.abort_append(target).map_err(laguna_cache_error)?;
+            }
+            return Err(error);
+        }
+        for (row, target) in rows.iter_mut().zip(targets) {
+            let tokens = row.token_ids.len();
+            cache
+                .commit_append(
+                    target,
+                    tokens,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(laguna_cache_error)?;
+            row.sequence.state.position += tokens;
+        }
+        Ok(())
+    }
+
+    fn prefill_batch_impl(
+        &self,
+        workspace: &mut LagunaPrefillBatchWorkspace,
+        rows: &mut [LagunaPrefillStateRow<'_, '_>],
+        cache: &mut LagunaSequenceCache,
+        appends: &[LagunaAppend<'_>],
     ) -> Result<()> {
         validate_rows(self, workspace, rows)?;
         let total_tokens = rows.iter().map(|row| row.token_ids.len()).sum::<usize>();
@@ -561,11 +419,10 @@ impl LagunaModel {
                 rows,
                 total_tokens,
                 &self.stream,
+                cache,
+                appends,
             )?;
             std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
-        }
-        for row in rows {
-            row.state.position += row.token_ids.len();
         }
         debug_assert!(total_tokens <= workspace.token_capacity);
         Ok(())
@@ -575,7 +432,7 @@ impl LagunaModel {
 fn validate_rows(
     model: &LagunaModel,
     workspace: &LagunaPrefillBatchWorkspace,
-    rows: &[LagunaPrefillRow<'_, '_>],
+    rows: &[LagunaPrefillStateRow<'_, '_>],
 ) -> Result<()> {
     if rows.is_empty() || rows.len() > workspace.sequence_capacity {
         return Err(Error::Shape {
@@ -643,28 +500,20 @@ fn validate_rows(
                 actual: format!("end={end}"),
             });
         }
-        if row
-            .state
-            .kv_cache
-            .iter()
-            .any(|cache| cache.len() != row.state.position)
-        {
-            return Err(Error::Format {
-                label: "Laguna prefill state",
-                detail: "layer K/V positions disagree".to_string(),
-            });
-        }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_layer_prefill(
     layer: &LagunaLayer,
     layer_index: usize,
     workspace: &mut LagunaPrefillBatchWorkspace,
-    rows: &mut [LagunaPrefillRow<'_, '_>],
+    rows: &mut [LagunaPrefillStateRow<'_, '_>],
     active_tokens: usize,
     stream: &CudaStream,
+    cache: &mut LagunaSequenceCache,
+    appends: &[LagunaAppend<'_>],
 ) -> Result<()> {
     layer.input_norm.run_into(
         &workspace.hidden,
@@ -686,6 +535,8 @@ fn run_layer_prefill(
         layer_index,
         active_tokens,
         stream,
+        cache,
+        appends,
     )?;
     add_f32_prefix_into_on_stream(
         &workspace.hidden,
@@ -744,10 +595,12 @@ fn run_attention_prefill(
     workspace: &mut LagunaBatchAttentionWorkspace,
     linear: &mut LagunaBatchLinearWorkspace,
     input: &DeviceBuffer<f32>,
-    rows: &mut [LagunaPrefillRow<'_, '_>],
+    rows: &mut [LagunaPrefillStateRow<'_, '_>],
     layer_index: usize,
     capacity: usize,
     stream: &CudaStream,
+    cache: &mut LagunaSequenceCache,
+    appends: &[LagunaAppend<'_>],
 ) -> Result<()> {
     debug_assert_eq!(workspace.q_heads, attention.q_heads);
     linear.run_bf16(&attention.q, input, &mut workspace.q, capacity, stream)?;
@@ -807,40 +660,47 @@ fn run_attention_prefill(
         stream,
     )?;
     row_offset = 0;
-    for row in rows {
-        if use_compact_prefill_attention(row.state.position, row.token_ids.len()) {
-            workspace
-                .compact
-                .append_causal_rows_at_offset_into_on_stream(
-                    &mut row.state.kv_cache[layer_index],
-                    &workspace.q_rope,
-                    &workspace.k_rope,
-                    &workspace.v,
-                    row_offset,
-                    row.token_ids.len(),
-                    attention.window,
-                    workspace.attended.output(),
-                    stream,
-                )?;
-            metrics()
-                .laguna_compact_prefill_attention_rows
-                .add(row.token_ids.len().min(isize::MAX as usize) as isize);
-        } else {
-            workspace.tensor_core.run_sequence(
-                &mut row.state.kv_cache[layer_index],
-                &workspace.q_rope,
-                &workspace.k_rope,
-                &workspace.v,
-                row_offset,
-                row.token_ids.len(),
-                attention.window,
-                &mut workspace.attended,
-                stream,
-            )?;
-            metrics()
-                .laguna_tensor_core_prefill_attention_rows
-                .add(row.token_ids.len().min(isize::MAX as usize) as isize);
-        }
+    for (row, append) in rows.iter_mut().zip(appends) {
+        let position = row.state.position;
+        cache
+            .with_append_page(append.target, |backend, page| {
+                let pool = backend.pool_mut(layer_index)?;
+                let q_width = attention.q_heads * HEAD_DIM;
+                let kv_width = KV_HEADS * HEAD_DIM;
+                for token in 0..row.token_ids.len() {
+                    pool.append_at_offsets_on_stream(
+                        page.slot(),
+                        append.target.page_offset() + token,
+                        &workspace.k_rope,
+                        (row_offset + token) * kv_width,
+                        &workspace.v,
+                        (row_offset + token) * kv_width,
+                        stream,
+                    )?;
+                    let cache_len = position + token + 1;
+                    let window_start = attention
+                        .window
+                        .map_or(0, |window| cache_len.saturating_sub(window));
+                    workspace
+                        .compact
+                        .attention_paged_window_offsets_into_on_stream(
+                            pool,
+                            append.page_table,
+                            cache_len,
+                            &workspace.q_rope,
+                            (row_offset + token) * q_width,
+                            workspace.attended.output(),
+                            (row_offset + token) * q_width,
+                            window_start,
+                            stream,
+                        )?;
+                }
+                Ok(())
+            })
+            .map_err(laguna_cache_error)?;
+        metrics()
+            .laguna_compact_prefill_attention_rows
+            .add(row.token_ids.len().min(isize::MAX as usize) as isize);
         row_offset += row.token_ids.len();
     }
     linear.run_bf16(
@@ -1009,305 +869,4 @@ fn run_moe_prefill(
         capacity * HIDDEN,
         stream,
     )
-}
-
-#[cfg(test)]
-pub(super) fn validate_initial_batch_layers(model: &LagunaModel, token: u32) {
-    let mut serial = model.new_decode_state(32).expect("serial diagnostic state");
-    serial
-        .token
-        .copy_from_host(&[token])
-        .expect("diagnostic token");
-    copy_bf16_row_to_f32_indexed_into_on_stream(
-        VOCAB,
-        HIDDEN,
-        &model.embedding,
-        &serial.token,
-        serial.hidden.output(),
-        &model.stream,
-    )
-    .expect("serial diagnostic embedding");
-    let mut serial_q = DeviceBuffer::zeroed(48 * HEAD_DIM).expect("serial diagnostic q");
-    model.layers[0]
-        .attention
-        .q
-        .run_into(&serial.hidden, &mut serial_q, &model.stream)
-        .expect("serial diagnostic q projection");
-
-    let mut workspace = model
-        .new_prefill_batch_workspace(1, 1, 32)
-        .expect("batch diagnostic workspace");
-    workspace
-        .token_ids
-        .copy_from_host(&[token])
-        .expect("batch diagnostic token");
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
-        VOCAB,
-        HIDDEN,
-        &model.embedding,
-        &workspace.token_ids,
-        workspace.hidden.output(),
-        1,
-        &model.stream,
-    )
-    .expect("batch diagnostic embedding");
-    workspace
-        .linear
-        .run_bf16(
-            &model.layers[0].attention.q,
-            &workspace.hidden,
-            &mut workspace.full_attention.q,
-            1,
-            &model.stream,
-        )
-        .expect("batch diagnostic q projection");
-    let expected = serial_q
-        .copy_to_host(&model.stream)
-        .expect("serial diagnostic q host");
-    let actual = workspace
-        .full_attention
-        .q
-        .copy_to_host(&model.stream)
-        .expect("batch diagnostic q host");
-    let squared_error = actual
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
-        .sum::<f64>();
-    let expected_norm = expected
-        .iter()
-        .map(|value| (*value as f64).powi(2))
-        .sum::<f64>();
-    let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
-    assert!(nrmse <= 0.01, "batched q projection nrmse={nrmse:.6}");
-
-    model.layers[0]
-        .run_one(
-            &mut serial.layers[0],
-            &serial.hidden,
-            &mut serial.kv_cache[0],
-            serial.compact_attention.for_layer(0),
-            0,
-            &model.stream,
-        )
-        .expect("serial diagnostic layer");
-    let mut batch_state = model.new_decode_state(32).expect("batch diagnostic state");
-    run_layer_prefill(
-        &model.layers[0],
-        0,
-        &mut workspace,
-        &mut [LagunaPrefillRow {
-            token_ids: &[token],
-            state: &mut batch_state,
-        }],
-        1,
-        &model.stream,
-    )
-    .expect("batch diagnostic layer");
-    let expected = serial.layers[0]
-        .output
-        .copy_to_host(&model.stream)
-        .expect("serial diagnostic layer host");
-    let actual = workspace
-        .layer_output
-        .copy_to_host(&model.stream)
-        .expect("batch diagnostic layer host");
-    let squared_error = actual
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
-        .sum::<f64>();
-    let expected_norm = expected
-        .iter()
-        .map(|value| (*value as f64).powi(2))
-        .sum::<f64>();
-    let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
-    assert!(nrmse <= 0.05, "batched first layer nrmse={nrmse:.6}");
-
-    let (serial_previous, serial_current) = serial.layers.split_at_mut(1);
-    model.layers[1]
-        .run_one(
-            &mut serial_current[0],
-            &serial_previous[0].output,
-            &mut serial.kv_cache[1],
-            serial.compact_attention.for_layer(1),
-            0,
-            &model.stream,
-        )
-        .expect("serial diagnostic second layer");
-    std::mem::swap(&mut workspace.hidden, &mut workspace.layer_output);
-    run_layer_prefill(
-        &model.layers[1],
-        1,
-        &mut workspace,
-        &mut [LagunaPrefillRow {
-            token_ids: &[token],
-            state: &mut batch_state,
-        }],
-        1,
-        &model.stream,
-    )
-    .expect("batch diagnostic second layer");
-    let expected_attention = serial.layers[1]
-        .attention_residual
-        .copy_to_host(&model.stream)
-        .expect("serial diagnostic second attention host");
-    let actual_attention = workspace
-        .post_attention
-        .copy_to_host(&model.stream)
-        .expect("batch diagnostic second attention host");
-    let squared_error = actual_attention
-        .iter()
-        .zip(expected_attention.iter())
-        .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
-        .sum::<f64>();
-    let expected_norm = expected_attention
-        .iter()
-        .map(|value| (*value as f64).powi(2))
-        .sum::<f64>();
-    let attention_nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
-    assert!(
-        attention_nrmse <= 0.05,
-        "batched second-layer attention nrmse={attention_nrmse:.6}"
-    );
-    let serial_route = match &serial.layers[1].ffn {
-        LagunaFfnWorkspace::Moe(workspace) => workspace
-            .route_indices
-            .copy_to_host(&model.stream)
-            .expect("serial diagnostic route host"),
-        LagunaFfnWorkspace::Dense(_) => panic!("second Laguna layer should be sparse"),
-    };
-    let batch_route = workspace
-        .moe
-        .route_indices
-        .copy_prefix_to_host(TOP_K, &model.stream)
-        .expect("batch diagnostic route host");
-    let mut serial_route_set = serial_route.to_vec();
-    serial_route_set.sort_unstable();
-    let mut batch_route_set = batch_route.to_vec();
-    batch_route_set.sort_unstable();
-    assert_eq!(
-        batch_route_set, serial_route_set,
-        "batched second-layer router selected different experts"
-    );
-    let expected = serial.layers[1]
-        .output
-        .copy_to_host(&model.stream)
-        .expect("serial diagnostic second layer host");
-    let actual = workspace
-        .layer_output
-        .copy_to_host(&model.stream)
-        .expect("batch diagnostic second layer host");
-    let squared_error = actual
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
-        .sum::<f64>();
-    let expected_norm = expected
-        .iter()
-        .map(|value| (*value as f64).powi(2))
-        .sum::<f64>();
-    let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
-    assert!(nrmse <= 0.05, "batched second layer nrmse={nrmse:.6}");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn attention_path_keeps_continuations_on_compact_storage() {
-        assert!(!use_compact_prefill_attention(0, 4_096));
-        assert!(!use_compact_prefill_attention(0, 32));
-        assert!(use_compact_prefill_attention(0, 31));
-        assert!(use_compact_prefill_attention(4_096, 1_024));
-    }
-
-    #[test]
-    fn tensor_core_attention_is_stable_across_prompt_chunks() {
-        const TOKENS: usize = 64;
-        const CHUNK: usize = 32;
-        const Q_HEADS: usize = 48;
-        const MAX_TOKENS: usize = 96;
-
-        let q_width = Q_HEADS * HEAD_DIM;
-        let kv_width = KV_HEADS * HEAD_DIM;
-        let values = |len: usize, factor: usize| {
-            (0..len)
-                .map(|index| ((index * factor % 251) as f32 - 125.0) / 256.0)
-                .collect::<Vec<_>>()
-        };
-        let query = DeviceBuffer::from_host(&values(TOKENS * q_width, 17)).expect("query buffer");
-        let key = DeviceBuffer::from_host(&values(TOKENS * kv_width, 29)).expect("key buffer");
-        let value = DeviceBuffer::from_host(&values(TOKENS * kv_width, 43)).expect("value buffer");
-        let stream = CudaStream::new_blocking().expect("stream");
-
-        let mut whole_workspace =
-            LagunaTensorCoreAttentionWorkspace::new(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
-                .expect("whole workspace");
-        let mut whole_cache =
-            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("whole cache");
-        let mut whole_output = DeviceBuffer::zeroed(TOKENS * q_width).expect("whole output");
-        whole_workspace
-            .run_sequence(
-                &mut whole_cache,
-                &query,
-                &key,
-                &value,
-                0,
-                TOKENS,
-                None,
-                &mut whole_output,
-                &stream,
-            )
-            .expect("whole attention");
-
-        let mut split_workspace =
-            LagunaTensorCoreAttentionWorkspace::new(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
-                .expect("split workspace");
-        let mut split_cache =
-            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("split cache");
-        let mut split_output = DeviceBuffer::zeroed(TOKENS * q_width).expect("split output");
-        for offset in [0, CHUNK] {
-            split_workspace
-                .run_sequence(
-                    &mut split_cache,
-                    &query,
-                    &key,
-                    &value,
-                    offset,
-                    CHUNK,
-                    None,
-                    &mut split_output,
-                    &stream,
-                )
-                .expect("split attention");
-        }
-
-        let whole = whole_output
-            .copy_to_host(&stream)
-            .expect("whole output download");
-        let split = split_output
-            .copy_to_host(&stream)
-            .expect("split output download");
-        let squared_error = split
-            .iter()
-            .zip(whole.iter())
-            .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
-            .sum::<f64>();
-        let expected_norm = whole
-            .iter()
-            .map(|value| (*value as f64).powi(2))
-            .sum::<f64>();
-        let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
-        let max_error = split
-            .iter()
-            .zip(whole.iter())
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            nrmse <= 0.01,
-            "split tensor-core attention nrmse={nrmse:.6} max_error={max_error:.6}"
-        );
-    }
 }

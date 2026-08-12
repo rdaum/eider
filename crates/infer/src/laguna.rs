@@ -4,11 +4,15 @@
 //! routed experts. The checkpoint's dense, attention, shared-expert, embedding,
 //! and LM-head weights remain BF16.
 
+use crate::runtime::laguna_sequence_cache::{
+    LagunaSequence, LagunaSequenceCache, laguna_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
     CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
     GpuSamplingRow, GpuTokenSampler, ModelOptCheckpoint, ModelOptCublasLtWeight,
     ModelOptNvfp4Linear, Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, fill_f32_into_on_stream,
     indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
@@ -29,9 +33,9 @@ mod batch;
 pub use batch::{LagunaPrefillBatchWorkspace, LagunaPrefillRow};
 
 const HIDDEN: usize = 3_072;
-const LAYERS: usize = 48;
-const KV_HEADS: usize = 8;
-const HEAD_DIM: usize = 128;
+pub(crate) const LAYERS: usize = 48;
+pub(crate) const KV_HEADS: usize = 8;
+pub(crate) const HEAD_DIM: usize = 128;
 const EXPERTS: usize = 256;
 const TOP_K: usize = 10;
 const EXPERT_INTERMEDIATE: usize = 1_024;
@@ -638,8 +642,7 @@ impl LagunaAttention {
         &self,
         workspace: &'a mut LagunaAttentionWorkspace,
         input: &DeviceBuffer<f32>,
-        cache: &mut Sm12xKvCache,
-        compact: &mut Sm12xKvAttentionWorkspace,
+        cache: LagunaLayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
@@ -676,23 +679,32 @@ impl LagunaAttention {
             stream,
         )?;
         round_f32_to_bf16_in_place_on_stream(workspace.k_rope.inout(), stream)?;
-        cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
-        if let Some(window) = self.window {
-            compact.attention_window_into_on_stream(
-                cache,
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
+            &workspace.k_rope,
+            0,
+            &workspace.v,
+            0,
+            stream,
+        )?;
+        let cache_len = position + 1;
+        let window_start = self
+            .window
+            .map_or(0, |window| cache_len.saturating_sub(window));
+        cache
+            .attention
+            .attention_paged_window_offsets_into_on_stream(
+                cache.pool,
+                cache.page_table,
+                cache_len,
                 &workspace.q_rope,
+                0,
                 workspace.attended.output(),
-                cache.len().saturating_sub(window),
+                0,
+                window_start,
                 stream,
             )?;
-        } else {
-            compact.attention_into_on_stream(
-                cache,
-                &workspace.q_rope,
-                workspace.attended.output(),
-                stream,
-            )?;
-        }
         self.gate.run_into(input, &mut workspace.gate, stream)?;
         softplus_scale_heads_f32_into_on_stream(
             &workspace.gate,
@@ -1230,8 +1242,7 @@ impl LagunaLayer {
         &self,
         workspace: &mut LagunaLayerWorkspace,
         input: &DeviceBuffer<f32>,
-        cache: &mut Sm12xKvCache,
-        compact: &mut Sm12xKvAttentionWorkspace,
+        cache: LagunaLayerCache<'_>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1241,7 +1252,6 @@ impl LagunaLayer {
             &mut workspace.attention,
             &workspace.normalized,
             cache,
-            compact,
             position,
             stream,
         )?;
@@ -1333,22 +1343,22 @@ pub struct LagunaDecodeState {
     token: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
     layers: Vec<LagunaLayerWorkspace>,
-    kv_cache: Vec<Sm12xKvCache>,
     compact_attention: LagunaCompactAttention,
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
     sampler: GpuTokenSampler,
-    position: usize,
+    pub(crate) position: usize,
     max_tokens: usize,
 }
 
-/// Immutable aligned Laguna prompt-prefix state.
-pub struct LagunaSequenceCheckpoint {
-    model_id: u64,
-    position: usize,
-    kv_cache: Vec<Sm12xKvCache>,
+struct LagunaLayerCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
+    attention: &'a mut Sm12xKvAttentionWorkspace,
 }
 
 /// One greedy Laguna next-token result.
@@ -1420,8 +1430,8 @@ impl LagunaModel {
         self.stream.synchronize()
     }
 
-    /// Allocates execution state and a compact K/V cache for one sequence.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<LagunaDecodeState> {
+    /// Allocates request-private execution state for one sequence.
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<LagunaDecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_position_embeddings {
             return Err(Error::Shape {
                 label: "Laguna decode capacity",
@@ -1438,9 +1448,6 @@ impl LagunaModel {
                 .iter()
                 .map(LagunaLayer::new_workspace)
                 .collect::<Result<Vec<_>>>()?,
-            kv_cache: (0..LAYERS)
-                .map(|_| Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM))
-                .collect::<Result<Vec<_>>>()?,
             compact_attention: LagunaCompactAttention::new(max_tokens)?,
             final_hidden: DeviceBuffer::zeroed(HIDDEN)?,
             logits: DeviceBuffer::zeroed(VOCAB)?,
@@ -1453,19 +1460,37 @@ impl LagunaModel {
     }
 
     /// Advances one input token without selecting a result.
-    pub fn consume_one(&self, state: &mut LagunaDecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)
+    pub fn consume_one(
+        &self,
+        sequence: &mut LagunaSequence,
+        token: u32,
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<()> {
+        let target = self.reserve_token(sequence, cache)?;
+        let result = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        self.complete_token(sequence, cache, target, result)
     }
 
     /// Advances one token and returns all output logits.
-    pub fn logits_one(&self, state: &mut LagunaDecodeState, token: u32) -> Result<Vec<f32>> {
-        self.forward_one(state, token)?;
-        Ok(state.logits.copy_to_host(&self.stream)?.into_vec())
+    pub fn logits_one(
+        &self,
+        sequence: &mut LagunaSequence,
+        token: u32,
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_one(sequence, token, cache)?;
+        Ok(sequence.state.logits.copy_to_host(&self.stream)?.into_vec())
     }
 
     /// Advances one token and performs greedy selection.
-    pub fn decode_one(&self, state: &mut LagunaDecodeState, token: u32) -> Result<LagunaNextToken> {
-        self.forward_one(state, token)?;
+    pub fn decode_one(
+        &self,
+        sequence: &mut LagunaSequence,
+        token: u32,
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<LagunaNextToken> {
+        self.forward_one(sequence, token, cache)?;
+        let state = &mut sequence.state;
         argmax_f32_into_on_stream(
             &state.logits,
             state.next_index.output(),
@@ -1481,15 +1506,17 @@ impl LagunaModel {
     /// Advances one token and samples from its device-resident logits.
     pub fn sample_one(
         &self,
-        state: &mut LagunaDecodeState,
+        sequence: &mut LagunaSequence,
         token: u32,
         sampling: &mut GpuSamplingRow<'_>,
+        cache: &mut LagunaSequenceCache,
     ) -> Result<GpuSampledToken> {
-        self.forward_one(state, token)?;
-        state
+        self.forward_one(sequence, token, cache)?;
+        sequence
+            .state
             .sampler
             .sample(
-                &state.logits,
+                &sequence.state.logits,
                 std::slice::from_mut(sampling),
                 VOCAB,
                 &self.stream,
@@ -1502,7 +1529,56 @@ impl LagunaModel {
             })
     }
 
-    fn forward_hidden(&self, state: &mut LagunaDecodeState, token: u32) -> Result<()> {
+    fn reserve_token(
+        &self,
+        sequence: &mut LagunaSequence,
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<sequence_cache::AppendTarget> {
+        cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(laguna_cache_error)
+    }
+
+    fn complete_token(
+        &self,
+        sequence: &mut LagunaSequence,
+        cache: &mut LagunaSequenceCache,
+        target: sequence_cache::AppendTarget,
+        result: Result<()>,
+    ) -> Result<()> {
+        if let Err(error) = result {
+            cache.abort_append(target).map_err(laguna_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                target,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(laguna_cache_error)?;
+        sequence.state.position += 1;
+        Ok(())
+    }
+
+    fn forward_hidden_uncommitted(
+        &self,
+        sequence: &mut LagunaSequence,
+        token: u32,
+        cache: &mut LagunaSequenceCache,
+        target: sequence_cache::AppendTarget,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
         if state.model_id != self.model_id {
             return Err(Error::Format {
                 label: "Laguna decode state",
@@ -1532,22 +1608,39 @@ impl LagunaModel {
             } else {
                 &previous[layer - 1].output
             };
-            let compact = state.compact_attention.for_layer(layer);
-            self.layers[layer].run_one(
-                &mut current[0],
-                input,
-                &mut state.kv_cache[layer],
-                compact,
-                state.position,
-                &self.stream,
-            )?;
+            cache
+                .with_append_page(target, |backend, page| {
+                    self.layers[layer].run_one(
+                        &mut current[0],
+                        input,
+                        LagunaLayerCache {
+                            pool: backend.pool_mut(layer)?,
+                            page_slot: page.slot(),
+                            page_offset: target.page_offset(),
+                            page_table: sequence.page_table.device(),
+                            attention: state.compact_attention.for_layer(layer),
+                        },
+                        state.position,
+                        &self.stream,
+                    )
+                })
+                .map_err(laguna_cache_error)?;
         }
-        state.position += 1;
         Ok(())
     }
 
-    fn forward_one(&self, state: &mut LagunaDecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)?;
+    fn forward_one(
+        &self,
+        sequence: &mut LagunaSequence,
+        token: u32,
+        cache: &mut LagunaSequenceCache,
+    ) -> Result<()> {
+        let target = self.reserve_token(sequence, cache)?;
+        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        if let Err(error) = hidden {
+            return self.complete_token(sequence, cache, target, Err(error));
+        }
+        let state = &mut sequence.state;
         let last = &state
             .layers
             .last()
@@ -1558,93 +1651,10 @@ impl LagunaModel {
             .output;
         self.final_norm
             .run_into(last, &mut state.final_hidden, 1, &self.stream)?;
-        self.lm_head
-            .run_into(&state.final_hidden, &mut state.logits, &self.stream)
-    }
-
-    /// Returns compact checkpoint storage required for an aligned prefix.
-    pub fn checkpoint_sequence_device_bytes(
-        &self,
-        state: &LagunaDecodeState,
-        prefix_tokens: usize,
-    ) -> Result<usize> {
-        if prefix_tokens == 0
-            || !prefix_tokens.is_multiple_of(128)
-            || prefix_tokens > state.position
-        {
-            return Err(Error::Shape {
-                label: "Laguna sequence checkpoint byte estimate",
-                expected: format!(
-                    "a nonzero 128-token-aligned prefix at most {} tokens",
-                    state.position
-                ),
-                actual: prefix_tokens.to_string(),
-            });
-        }
-        state.kv_cache.iter().try_fold(0usize, |total, cache| {
-            let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
-            total.checked_add(bytes).ok_or_else(|| Error::Shape {
-                label: "Laguna checkpoint byte estimate",
-                expected: "device-byte total without overflow".to_string(),
-                actual: prefix_tokens.to_string(),
-            })
-        })
-    }
-
-    /// Copies an aligned K/V prefix into immutable compact storage.
-    pub fn checkpoint_sequence(
-        &self,
-        state: &LagunaDecodeState,
-        prefix_tokens: usize,
-    ) -> Result<LagunaSequenceCheckpoint> {
-        self.checkpoint_sequence_device_bytes(state, prefix_tokens)?;
-        let mut kv_cache = (0..LAYERS)
-            .map(|_| Sm12xKvCache::new(prefix_tokens, KV_HEADS, HEAD_DIM))
-            .collect::<Result<Vec<_>>>()?;
-        for (destination, source) in kv_cache.iter_mut().zip(&state.kv_cache) {
-            destination.copy_aligned_prefix_from_on_stream(source, prefix_tokens, &self.stream)?;
-        }
-        self.stream.synchronize()?;
-        Ok(LagunaSequenceCheckpoint {
-            model_id: self.model_id,
-            position: prefix_tokens,
-            kv_cache,
-        })
-    }
-
-    /// Restores a compact prompt checkpoint into a new active state.
-    pub fn restore_sequence_checkpoint(
-        &self,
-        checkpoint: &LagunaSequenceCheckpoint,
-        max_tokens: usize,
-    ) -> Result<LagunaDecodeState> {
-        if checkpoint.model_id != self.model_id
-            || checkpoint.position > max_tokens
-            || checkpoint.kv_cache.len() != LAYERS
-        {
-            return Err(Error::Shape {
-                label: "Laguna sequence checkpoint restore",
-                expected: format!(
-                    "matching model, capacity >= {}, and {LAYERS} layer caches",
-                    checkpoint.position
-                ),
-                actual: format!(
-                    "capacity={max_tokens} layer_caches={}",
-                    checkpoint.kv_cache.len()
-                ),
-            });
-        }
-        let mut state = self.new_decode_state(max_tokens)?;
-        for (destination, source) in state.kv_cache.iter_mut().zip(&checkpoint.kv_cache) {
-            destination.copy_aligned_prefix_from_on_stream(
-                source,
-                checkpoint.position,
-                &self.stream,
-            )?;
-        }
-        self.stream.synchronize()?;
-        state.position = checkpoint.position;
-        Ok(state)
+        let result = self
+            .lm_head
+            .run_into(&state.final_hidden, &mut state.logits, &self.stream);
+        self.complete_token(sequence, cache, target, result)
     }
 }
 
@@ -1693,29 +1703,12 @@ impl LagunaDecodeState {
                 .iter()
                 .map(LagunaLayerWorkspace::device_bytes)
                 .sum::<usize>()
-            + self
-                .kv_cache
-                .iter()
-                .map(Sm12xKvCache::device_bytes)
-                .sum::<usize>()
             + self.compact_attention.device_bytes()
             + self.final_hidden.device_bytes()
             + self.logits.device_bytes()
             + self.next_index.device_bytes()
             + self.next_value.device_bytes()
             + self.sampler.device_bytes()
-    }
-}
-
-impl LagunaSequenceCheckpoint {
-    /// Returns the represented prompt position.
-    pub fn position(&self) -> usize {
-        self.position
-    }
-
-    /// Returns exact retained K/V bytes.
-    pub fn device_bytes(&self) -> usize {
-        self.kv_cache.iter().map(Sm12xKvCache::device_bytes).sum()
     }
 }
 
@@ -1757,10 +1750,14 @@ mod tests {
             local_checkpoint().expect("set LAGUNA_MODEL and LAGUNA_ARTIFACT_DIR");
         let model =
             LagunaModel::load_with_artifact_dir(model_dir, artifact_dir).expect("load Laguna");
-        batch::validate_initial_batch_layers(&model, 9707);
         let prompt = [9707, 3710, 9707, 3710, 9707, 3710, 9707, 3710];
         let final_token = 9707;
-        let mut batched = model.new_decode_state(32).expect("whole validation state");
+        let cache_stream = CudaStream::new_blocking().expect("cache stream");
+        let mut cache =
+            crate::runtime::laguna_sequence_cache::new_laguna_sequence_cache(&model, 2, 96)
+                .expect("sequence cache");
+        let mut batched = LagunaSequence::admit(&model, &mut cache, 32, &cache_stream)
+            .expect("whole validation sequence");
         let mut workspace = model
             .new_prefill_batch_workspace(1, 128, 32)
             .expect("batch validation workspace");
@@ -1769,28 +1766,34 @@ mod tests {
                 &mut workspace,
                 &mut [LagunaPrefillRow {
                     token_ids: &prompt,
-                    state: &mut batched,
+                    sequence: &mut batched,
                 }],
+                &mut cache,
             )
             .expect("whole validation prefill");
         let whole = model
-            .logits_one(&mut batched, final_token)
+            .logits_one(&mut batched, final_token, &mut cache)
             .expect("whole validation logits");
+        batched
+            .finish(&mut cache, &cache_stream)
+            .expect("finish whole validation sequence");
 
-        let mut split = model.new_decode_state(32).expect("split validation state");
+        let mut split = LagunaSequence::admit(&model, &mut cache, 32, &cache_stream)
+            .expect("split validation sequence");
         for chunk in [&prompt[..3], &prompt[3..]] {
             model
                 .prefill_batch(
                     &mut workspace,
                     &mut [LagunaPrefillRow {
                         token_ids: chunk,
-                        state: &mut split,
+                        sequence: &mut split,
                     }],
+                    &mut cache,
                 )
                 .expect("split validation prefill");
         }
-        let split = model
-            .logits_one(&mut split, final_token)
+        let split_logits = model
+            .logits_one(&mut split, final_token, &mut cache)
             .expect("split validation logits");
         let top = |values: &[f32]| {
             values
@@ -1800,7 +1803,7 @@ mod tests {
                 .expect("non-empty logits")
                 .0
         };
-        let squared_error = split
+        let squared_error = split_logits
             .iter()
             .zip(&whole)
             .map(|(actual, expected)| ((actual - expected) as f64).powi(2))
@@ -1811,47 +1814,57 @@ mod tests {
             .sum::<f64>();
         let nrmse = (squared_error / expected_norm.max(f64::MIN_POSITIVE)).sqrt();
         assert_eq!(
-            top(&split),
+            top(&split_logits),
             top(&whole),
             "split batched prefill selected a different token; nrmse={nrmse:.6}"
         );
         assert!(nrmse <= 0.12, "split batched prefill nrmse={nrmse:.6}");
+        split
+            .finish(&mut cache, &cache_stream)
+            .expect("finish split validation sequence");
 
         let prompt = (0usize..64)
             .map(|index| if index.is_multiple_of(2) { 9707 } else { 3710 })
             .collect::<Vec<_>>();
-        let mut tensor_core_workspace = model
+        let mut long_prompt_workspace = model
             .new_prefill_batch_workspace(1, 128, 96)
-            .expect("tensor-core validation workspace");
-        let mut whole_state = model.new_decode_state(96).expect("whole tensor-core state");
+            .expect("long-prompt validation workspace");
+        let mut whole_state = LagunaSequence::admit(&model, &mut cache, 96, &cache_stream)
+            .expect("whole long-prompt sequence");
         model
             .prefill_batch(
-                &mut tensor_core_workspace,
+                &mut long_prompt_workspace,
                 &mut [LagunaPrefillRow {
                     token_ids: &prompt,
-                    state: &mut whole_state,
+                    sequence: &mut whole_state,
                 }],
+                &mut cache,
             )
-            .expect("whole tensor-core prefill");
+            .expect("whole long-prompt prefill");
         let whole = model
-            .logits_one(&mut whole_state, final_token)
-            .expect("whole tensor-core logits");
+            .logits_one(&mut whole_state, final_token, &mut cache)
+            .expect("whole long-prompt logits");
+        whole_state
+            .finish(&mut cache, &cache_stream)
+            .expect("finish whole long-prompt sequence");
 
-        let mut split_state = model.new_decode_state(96).expect("split tensor-core state");
+        let mut split_state = LagunaSequence::admit(&model, &mut cache, 96, &cache_stream)
+            .expect("split long-prompt sequence");
         for chunk in prompt.chunks(32) {
             model
                 .prefill_batch(
-                    &mut tensor_core_workspace,
+                    &mut long_prompt_workspace,
                     &mut [LagunaPrefillRow {
                         token_ids: chunk,
-                        state: &mut split_state,
+                        sequence: &mut split_state,
                     }],
+                    &mut cache,
                 )
-                .expect("split tensor-core prefill");
+                .expect("split long-prompt prefill");
         }
         let split = model
-            .logits_one(&mut split_state, final_token)
-            .expect("split tensor-core logits");
+            .logits_one(&mut split_state, final_token, &mut cache)
+            .expect("split long-prompt logits");
         let squared_error = split
             .iter()
             .zip(&whole)
@@ -1865,8 +1878,11 @@ mod tests {
         assert_eq!(
             top(&split),
             top(&whole),
-            "split tensor-core prefill selected a different token; nrmse={nrmse:.6}"
+            "split long-prompt prefill selected a different token; nrmse={nrmse:.6}"
         );
-        assert!(nrmse <= 0.12, "split tensor-core prefill nrmse={nrmse:.6}");
+        assert!(nrmse <= 0.12, "split long-prompt prefill nrmse={nrmse:.6}");
+        split_state
+            .finish(&mut cache, &cache_stream)
+            .expect("finish split long-prompt sequence");
     }
 }
