@@ -2,6 +2,9 @@
 
 use infer::muse_glimmer::MuseGlimmerModel;
 use infer::nvfp4::{Error, Result};
+use infer::runtime::muse_glimmer_sequence_cache::{
+    MuseGlimmerSequence, new_muse_glimmer_sequence_cache,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -76,12 +79,13 @@ fn main() -> Result<()> {
         model.device_bytes() as f64 / (1u64 << 30) as f64,
     );
     let capacity = prompt_tokens.len() + tokens as usize + usize::from(dflash.is_some()) * 16;
-    let mut state = model.new_decode_state(capacity.max(1))?;
+    let mut cache = new_muse_glimmer_sequence_cache(&model, 1, capacity.max(1))?;
+    let mut sequence = MuseGlimmerSequence::admit(&model, &mut cache, capacity.max(1))?;
     if dflash.is_none()
         && let Some((&last, prefix)) = prompt_tokens.split_last()
     {
         for &prompt_token in prefix {
-            model.consume_one(&mut state, prompt_token)?;
+            model.consume_one(&mut sequence, prompt_token, &mut cache)?;
         }
         token = last;
         println!("prompt_tokens={} {prompt_tokens:?}", prompt_tokens.len());
@@ -96,14 +100,14 @@ fn main() -> Result<()> {
         };
         for (index, chunk) in target_prompt.chunks(16).enumerate() {
             let output_logits = (index + 1) * 16 >= target_prompt.len();
-            model.dflash_prefill_chunk(&mut state, chunk, output_logits)?;
+            model.dflash_prefill_chunk(&mut sequence, chunk, output_logits, &mut cache)?;
         }
         println!("prompt_tokens={} {target_prompt:?}", target_prompt.len());
-        let (mut anchor, _) = model.argmax_with_logit(&mut state)?;
+        let (mut anchor, _) = model.argmax_with_logit(&mut sequence)?;
         let mut generated: Vec<u32> = Vec::with_capacity(tokens as usize);
         while generated.len() < tokens as usize {
             let cycle_started = Instant::now();
-            let cycle = model.dflash_cycle(&mut state, anchor)?;
+            let cycle = model.dflash_cycle(&mut sequence, anchor, &mut cache)?;
             let remaining = tokens as usize - generated.len();
             generated.extend(cycle.tokens.iter().take(remaining).copied());
             println!(
@@ -124,12 +128,13 @@ fn main() -> Result<()> {
             elapsed.as_secs_f64(),
             generated.len() as f64 / elapsed.as_secs_f64(),
         );
+        sequence.finish(&model, &mut cache)?;
         return Ok(());
     }
     let mut generated = Vec::with_capacity(tokens as usize);
     for step in 0..tokens {
         let token_started = Instant::now();
-        let next = model.decode_one(&mut state, token)?;
+        let next = model.decode_one(&mut sequence, token, &mut cache)?;
         println!(
             "decode {step:03}: {token} -> {} (logit {:.6}) ms={:.3}",
             next.token,
@@ -154,6 +159,7 @@ fn main() -> Result<()> {
         elapsed.as_secs_f64(),
         tokens as f64 / elapsed.as_secs_f64(),
     );
+    sequence.finish(&model, &mut cache)?;
     Ok(())
 }
 

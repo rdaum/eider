@@ -154,7 +154,6 @@ pub(super) struct MuseTargetBatchWorkspace {
     layer_output: DeviceBuffer<f32>,
     local_attention: Option<Sm12xKvAttentionWorkspace>,
     global_attention: Option<Sm12xKvAttentionWorkspace>,
-    pub(super) tail_snapshots: Vec<Sm12xKvTailSnapshot>,
     pub(super) features: DeviceBuffer<f32>,
     final_hidden: DeviceBuffer<f32>,
     pub(super) logits: DeviceBuffer<f32>,
@@ -177,6 +176,8 @@ impl MuseTargetBatchWorkspace {
             .layers
             .iter()
             .find(|layer| layer.attention.window.is_none());
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             tokens: DeviceBuffer::zeroed(rows)?,
             linear: MuseBatchLinearWorkspace::new(rows)?,
@@ -204,7 +205,7 @@ impl MuseTargetBatchWorkspace {
             local_attention: local
                 .map(|layer| {
                     Sm12xKvAttentionWorkspace::new_gqa_batched(
-                        max_tokens,
+                        attention_capacity,
                         layer.attention.q_heads,
                         layer.attention.kv_heads,
                         layer.attention.head_dim,
@@ -215,7 +216,7 @@ impl MuseTargetBatchWorkspace {
             global_attention: global
                 .map(|layer| {
                     Sm12xKvAttentionWorkspace::new_gqa_batched(
-                        max_tokens,
+                        attention_capacity,
                         layer.attention.q_heads,
                         layer.attention.kv_heads,
                         layer.attention.head_dim,
@@ -223,13 +224,6 @@ impl MuseTargetBatchWorkspace {
                     )
                 })
                 .transpose()?,
-            tail_snapshots: model
-                .layers
-                .iter()
-                .map(|layer| {
-                    Sm12xKvTailSnapshot::new(layer.attention.kv_heads, layer.attention.head_dim)
-                })
-                .collect::<Result<_>>()?,
             features: DeviceBuffer::zeroed(rows * DFLASH_EXTRACT_COUNT * hidden)?,
             final_hidden: DeviceBuffer::zeroed(rows * hidden)?,
             logits: DeviceBuffer::zeroed(rows * model.config.vocab_size)?,
@@ -280,21 +274,61 @@ impl MuseTargetBatchWorkspace {
                 .global_attention
                 .as_ref()
                 .map_or(0, Sm12xKvAttentionWorkspace::device_bytes)
-            + self
-                .tail_snapshots
-                .iter()
-                .map(Sm12xKvTailSnapshot::device_bytes)
-                .sum::<usize>()
     }
 }
 
 impl MuseGlimmerModel {
-    fn forward_dflash_target_rows(
+    fn reserve_dflash_target_rows(
+        &self,
+        sequence: &mut MuseGlimmerSequence,
+        tokens: &[u32],
+        extract_layers: &[usize; DFLASH_EXTRACT_COUNT],
+        output_logits: bool,
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<sequence_cache::AppendReservation> {
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                tokens.len(),
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(muse_glimmer_cache_error)?;
+        if let Err(error) = self.run_dflash_target_rows(
+            &mut sequence.state,
+            tokens,
+            extract_layers,
+            output_logits,
+            cache,
+            MuseGlimmerAppend {
+                reservation: &reservation,
+                page_table: sequence.page_table.device(),
+            },
+        ) {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(muse_glimmer_cache_error)?;
+            return Err(error);
+        }
+        Ok(reservation)
+    }
+
+    fn run_dflash_target_rows(
         &self,
         state: &mut MuseGlimmerDecodeState,
         tokens: &[u32],
         extract_layers: &[usize; DFLASH_EXTRACT_COUNT],
         output_logits: bool,
+        cache: &mut MuseGlimmerSequenceCache,
+        append: MuseGlimmerAppend<'_>,
     ) -> Result<()> {
         let active_rows = tokens.len();
         let start_position = state.position;
@@ -472,17 +506,43 @@ impl MuseGlimmerModel {
                     if local { "local" } else { "global" }
                 ),
             })?;
-            attention_workspace.append_causal_rows_at_offset_into_on_stream(
-                &mut state.kv_caches[layer_index],
-                q_positioned,
-                k_positioned,
-                v,
-                0,
-                active_rows,
-                attention.window,
-                attended.output(),
-                &self.stream,
-            )?;
+            let q_width = attention.q_heads * attention.head_dim;
+            let kv_width = attention.kv_heads * attention.head_dim;
+            cache
+                .with_append_pages(append.reservation, |backend, pages| {
+                    let pool = backend.pool_mut(layer_index)?;
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        for local_row in 0..segment.rows() {
+                            let token = segment.input_offset() + local_row;
+                            pool.append_at_offsets_on_stream(
+                                page.page().slot(),
+                                segment.page_offset() + local_row,
+                                k_positioned,
+                                token * kv_width,
+                                v,
+                                token * kv_width,
+                                &self.stream,
+                            )?;
+                            let cache_len = start_position + token + 1;
+                            attention_workspace.attention_paged_window_offsets_into_on_stream(
+                                pool,
+                                append.page_table,
+                                cache_len,
+                                q_positioned,
+                                token * q_width,
+                                attended.output(),
+                                token * q_width,
+                                attention
+                                    .window
+                                    .map_or(0, |window| cache_len.saturating_sub(window)),
+                                &self.stream,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(muse_glimmer_cache_error)?;
             sigmoid_mul_f32_prefix_into_on_stream(
                 &workspace.gate,
                 &workspace.attended,
@@ -613,27 +673,28 @@ impl MuseGlimmerModel {
                 &self.stream,
             )?;
         }
-        state.position += active_rows;
         Ok(())
     }
 
     pub(super) fn forward_verification_block(
         &self,
-        state: &mut MuseGlimmerDecodeState,
+        sequence: &mut MuseGlimmerSequence,
         tokens: &[u32; DFLASH_BLOCK_SIZE],
         extract_layers: &[usize; DFLASH_EXTRACT_COUNT],
-    ) -> Result<()> {
-        state.batch_logits_row = None;
-        self.forward_dflash_target_rows(state, tokens, extract_layers, true)
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<sequence_cache::AppendReservation> {
+        sequence.state.batch_logits_row = None;
+        self.reserve_dflash_target_rows(sequence, tokens, extract_layers, true, cache)
     }
 
     /// Advances a greedy DFlash request through one prompt chunk using the
     /// target's fixed-N=16 projection regime.
     pub fn dflash_prefill_chunk(
         &self,
-        state: &mut MuseGlimmerDecodeState,
+        sequence: &mut MuseGlimmerSequence,
         tokens: &[u32],
         output_logits: bool,
+        cache: &mut MuseGlimmerSequenceCache,
     ) -> Result<()> {
         let target_layers = self
             .dflash
@@ -644,8 +705,26 @@ impl MuseGlimmerModel {
             })?
             .config
             .target_layers;
-        self.forward_dflash_target_rows(state, tokens, &target_layers, output_logits)?;
-        state.batch_logits_row = output_logits.then_some(tokens.len() - 1);
+        let start_position = sequence.state.position;
+        let reservation = self.reserve_dflash_target_rows(
+            sequence,
+            tokens,
+            &target_layers,
+            output_logits,
+            cache,
+        )?;
+        cache
+            .commit_append(
+                reservation,
+                tokens.len(),
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(muse_glimmer_cache_error)?;
+        sequence.state.position = start_position + tokens.len();
+        sequence.state.batch_logits_row = output_logits.then_some(tokens.len() - 1);
         Ok(())
     }
 }

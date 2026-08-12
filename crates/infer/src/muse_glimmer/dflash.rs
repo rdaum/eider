@@ -2,9 +2,10 @@ use super::*;
 use crate::gguf::{GgufIndex, GgufValue};
 use crate::gguf_quant::{dequantize_to_bf16, quantized_byte_len};
 use nvfp4::{
-    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
-    round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_prefix_into_on_stream,
+    Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_prefix_into_on_stream,
+    argmax_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
+    silu_mul_f32_prefix_into_on_stream,
 };
 use std::path::Path;
 
@@ -844,55 +845,57 @@ impl MuseGlimmerModel {
     /// verification pass.
     pub fn dflash_cycle(
         &self,
-        state: &mut MuseGlimmerDecodeState,
+        sequence: &mut MuseGlimmerSequence,
         anchor: u32,
+        cache: &mut MuseGlimmerSequenceCache,
     ) -> Result<MuseGlimmerDFlashCycle> {
         let dflash = self.dflash.as_ref().ok_or_else(|| Error::Format {
             label: "Muse Glimmer DFlash",
             detail: "model was loaded without a DFlash companion".to_string(),
         })?;
-        let start_position = state.position;
-        if start_position + dflash.config.block_size > state.max_tokens {
+        let start_position = sequence.state.position;
+        if start_position + dflash.config.block_size > sequence.state.max_tokens {
             return Err(Error::Shape {
                 label: "Muse Glimmer DFlash cycle capacity",
                 expected: format!("at least {} remaining positions", dflash.config.block_size),
-                actual: format!("position={} capacity={}", start_position, state.max_tokens),
+                actual: format!(
+                    "position={} capacity={}",
+                    start_position, sequence.state.max_tokens
+                ),
             });
         }
-        {
-            let MuseGlimmerDecodeState {
-                kv_caches,
-                verification,
-                dflash_state,
-                ..
-            } = state;
-            let verification = verification
-                .as_mut()
-                .expect("DFlash verification workspace");
-            for (cache, snapshot) in kv_caches.iter().zip(&mut verification.tail_snapshots) {
-                cache.snapshot_tail_on_stream(snapshot, &self.stream)?;
-            }
-            dflash_state
-                .as_mut()
-                .expect("DFlash sequence state")
-                .snapshot_tails(&self.stream)?;
-        }
+        sequence
+            .state
+            .dflash_state
+            .as_mut()
+            .expect("DFlash sequence state")
+            .snapshot_tails(&self.stream)?;
         let drafts = dflash.draft(
             &self.embedding,
             &self.lm_head,
             self.config.vocab_size,
-            state.dflash_state.as_mut().ok_or_else(|| Error::Format {
-                label: "Muse Glimmer DFlash state",
-                detail: "decode state has no drafter state".to_string(),
-            })?,
+            sequence
+                .state
+                .dflash_state
+                .as_mut()
+                .ok_or_else(|| Error::Format {
+                    label: "Muse Glimmer DFlash state",
+                    detail: "decode state has no drafter state".to_string(),
+                })?,
             anchor,
             start_position,
             &self.stream,
         )?;
         let mut verification_tokens = [anchor; super::batch::DFLASH_BLOCK_SIZE];
         verification_tokens[1..].copy_from_slice(&drafts);
-        self.forward_verification_block(state, &verification_tokens, &dflash.config.target_layers)?;
-        let target = state
+        let reservation = self.forward_verification_block(
+            sequence,
+            &verification_tokens,
+            &dflash.config.target_layers,
+            cache,
+        )?;
+        let target = sequence
+            .state
             .verification
             .as_ref()
             .expect("DFlash verification workspace")
@@ -904,38 +907,38 @@ impl MuseGlimmerModel {
             .zip(target.iter())
             .take_while(|(draft, target)| draft == target)
             .count();
+        let committed_rows = 1 + accepted;
         let retained_position = start_position + 1 + accepted;
+        cache
+            .commit_append(
+                reservation,
+                committed_rows,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(muse_glimmer_cache_error)?;
         if retained_position / super::batch::DFLASH_BLOCK_SIZE
             == start_position / super::batch::DFLASH_BLOCK_SIZE
         {
             let restore_rows = start_position % super::batch::DFLASH_BLOCK_SIZE;
-            let MuseGlimmerDecodeState {
-                kv_caches,
-                verification,
-                dflash_state,
-                ..
-            } = state;
-            let verification = verification
-                .as_ref()
-                .expect("DFlash verification workspace");
-            for (cache, snapshot) in kv_caches.iter_mut().zip(&verification.tail_snapshots) {
-                cache.restore_tail_prefix_on_stream(snapshot, restore_rows, &self.stream)?;
-            }
-            dflash_state
+            sequence
+                .state
+                .dflash_state
                 .as_mut()
                 .expect("DFlash sequence state")
                 .restore_tail_prefix(restore_rows, &self.stream)?;
         }
-        for cache in &mut state.kv_caches {
-            cache.truncate(retained_position)?;
-        }
-        state
+        sequence
+            .state
             .dflash_state
             .as_mut()
             .expect("DFlash sequence state")
             .truncate(retained_position)?;
-        state.position = retained_position;
-        let dflash_position = state
+        sequence.state.position = retained_position;
+        let dflash_position = sequence
+            .state
             .dflash_state
             .as_ref()
             .expect("DFlash sequence state")
@@ -948,7 +951,7 @@ impl MuseGlimmerModel {
             next_token: target[accepted],
             accepted_drafts: accepted,
             drafted_tokens: drafts.len(),
-            target_position: state.position,
+            target_position: sequence.state.position,
             dflash_position,
         })
     }

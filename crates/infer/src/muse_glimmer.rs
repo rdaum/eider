@@ -4,16 +4,20 @@
 //! converts the checkpoint's BF16 attention gates and language head to NVFP4
 //! during loading. Embeddings and normalization vectors remain BF16.
 
+use crate::runtime::muse_glimmer_sequence_cache::{
+    MuseGlimmerAppend, MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use nvfp4::{
     CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
     ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    copy_f32_rows_into_columns_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
-    round_f32_to_bf16_in_place_on_stream, sigmoid_mul_f32_into_on_stream,
-    silu_mul_f32_into_on_stream,
+    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_f32_rows_into_columns_on_stream,
+    quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
+    sigmoid_mul_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
+use sequence_cache::RetainedSnapshot;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -568,6 +572,13 @@ struct MuseAttentionWorkspace {
     output: MuseNvfp4LinearWorkspace,
 }
 
+struct MuseAttentionCache<'a> {
+    pool: &'a mut Sm12xKvPagePool,
+    page_slot: usize,
+    page_offset: usize,
+    page_table: &'a DeviceBuffer<u32>,
+}
+
 impl MuseAttentionWorkspace {
     fn output(&self) -> &DeviceBuffer<f32> {
         self.output.output()
@@ -652,15 +663,18 @@ impl MuseAttention {
         })
     }
 
-    fn new_kv_cache(&self, max_tokens: usize) -> Result<Sm12xKvCache> {
-        Sm12xKvCache::new(max_tokens, self.kv_heads, self.head_dim)
-    }
-
     fn new_compact_attention_workspace(
         &self,
         max_tokens: usize,
     ) -> Result<Sm12xKvAttentionWorkspace> {
-        Sm12xKvAttentionWorkspace::new_gqa(max_tokens, self.q_heads, self.kv_heads, self.head_dim)
+        let attention_capacity =
+            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        Sm12xKvAttentionWorkspace::new_gqa(
+            attention_capacity,
+            self.q_heads,
+            self.kv_heads,
+            self.head_dim,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -670,18 +684,11 @@ impl MuseAttention {
         plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
         workspace: &mut MuseAttentionWorkspace,
-        cache: &mut Sm12xKvCache,
+        cache: MuseAttentionCache<'_>,
         compact_attention: &mut Sm12xKvAttentionWorkspace,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        if cache.len() != position {
-            return Err(Error::Shape {
-                label: "Muse Glimmer attention cache position",
-                expected: position.to_string(),
-                actual: cache.len().to_string(),
-            });
-        }
         self.q
             .run_into(lt, plans, input, &mut workspace.q, stream)?;
         self.k
@@ -736,28 +743,27 @@ impl MuseAttention {
                 stream,
             )?;
         }
-        cache.append_at_on_stream(
+        cache.pool.append_at_offsets_on_stream(
+            cache.page_slot,
+            cache.page_offset,
             &workspace.k_positioned,
+            0,
             workspace.v.output(),
-            position,
+            0,
             stream,
         )?;
-        if let Some(window) = self.window {
-            compact_attention.attention_window_into_on_stream(
-                cache,
-                &workspace.q_positioned,
-                workspace.attended.output(),
-                cache.len().saturating_sub(window),
-                stream,
-            )?;
-        } else {
-            compact_attention.attention_into_on_stream(
-                cache,
-                &workspace.q_positioned,
-                workspace.attended.output(),
-                stream,
-            )?;
-        }
+        compact_attention.attention_paged_window_offsets_into_on_stream(
+            cache.pool,
+            cache.page_table,
+            position + 1,
+            &workspace.q_positioned,
+            0,
+            workspace.attended.output(),
+            0,
+            self.window
+                .map_or(0, |window| (position + 1).saturating_sub(window)),
+            stream,
+        )?;
         sigmoid_mul_f32_into_on_stream(
             workspace.gate.output(),
             &workspace.attended,
@@ -852,7 +858,7 @@ impl MuseDecoderLayer {
         plans: &MuseLinearPlans,
         input: &DeviceBuffer<f32>,
         workspace: &mut MuseDecoderLayerWorkspace,
-        cache: &mut Sm12xKvCache,
+        cache: MuseAttentionCache<'_>,
         compact_attention: &mut Sm12xKvAttentionWorkspace,
         position: usize,
         stream: &CudaStream,
@@ -1053,7 +1059,6 @@ pub struct MuseGlimmerDecodeState {
     hidden: DeviceBuffer<f32>,
     embedding_output: DeviceBuffer<f32>,
     layers: Vec<MuseDecoderLayerWorkspace>,
-    kv_caches: Vec<Sm12xKvCache>,
     compact_attention: MuseCompactAttentionWorkspaces,
     final_hidden: DeviceBuffer<f32>,
     lm_head: MuseNvfp4LinearWorkspace,
@@ -1067,10 +1072,9 @@ pub struct MuseGlimmerDecodeState {
 }
 
 /// Immutable aligned Muse Glimmer prompt-prefix state.
-pub struct MuseGlimmerSequenceCheckpoint {
+pub struct MuseGlimmerSequenceSnapshot {
     model_id: u64,
     position: usize,
-    kv_caches: Vec<Sm12xKvCache>,
     dflash: Option<dflash::DFlashSequenceCheckpoint>,
 }
 
@@ -1173,8 +1177,12 @@ impl MuseGlimmerModel {
         self.stream.synchronize()
     }
 
-    /// Allocates execution scratch and compact K/V storage for one sequence.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<MuseGlimmerDecodeState> {
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    /// Allocates execution scratch and private state for one sequence.
+    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<MuseGlimmerDecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_position_embeddings {
             return Err(Error::Shape {
                 label: "Muse Glimmer decode capacity",
@@ -1205,11 +1213,6 @@ impl MuseGlimmerModel {
                 .iter()
                 .map(MuseDecoderLayer::new_workspace)
                 .collect::<Result<Vec<_>>>()?,
-            kv_caches: self
-                .layers
-                .iter()
-                .map(|layer| layer.attention.new_kv_cache(max_tokens))
-                .collect::<Result<Vec<_>>>()?,
             compact_attention: MuseCompactAttentionWorkspaces::new(&self.layers, max_tokens)?,
             final_hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
             lm_head: self.lm_head.new_workspace()?,
@@ -1224,29 +1227,41 @@ impl MuseGlimmerModel {
     }
 
     /// Advances one token without materializing vocabulary logits.
-    pub fn consume_one(&self, state: &mut MuseGlimmerDecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)
+    pub fn consume_one(
+        &self,
+        sequence: &mut MuseGlimmerSequence,
+        token: u32,
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<()> {
+        self.forward_hidden(sequence, token, cache)
     }
 
     /// Advances one token and copies transformed vocabulary logits to the host.
-    pub fn logits_one(&self, state: &mut MuseGlimmerDecodeState, token: u32) -> Result<Vec<f32>> {
-        self.forward_one(state, token)?;
-        self.logits_to_host(state)
+    pub fn logits_one(
+        &self,
+        sequence: &mut MuseGlimmerSequence,
+        token: u32,
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<Vec<f32>> {
+        self.forward_one(sequence, token, cache)?;
+        self.logits_to_host(sequence)
     }
 
     /// Advances one token and performs greedy selection.
     pub fn decode_one(
         &self,
-        state: &mut MuseGlimmerDecodeState,
+        sequence: &mut MuseGlimmerSequence,
         token: u32,
+        cache: &mut MuseGlimmerSequenceCache,
     ) -> Result<MuseGlimmerNextToken> {
-        self.forward_one(state, token)?;
-        let (token, logit) = self.argmax_with_logit(state)?;
+        self.forward_one(sequence, token, cache)?;
+        let (token, logit) = self.argmax_with_logit(sequence)?;
         Ok(MuseGlimmerNextToken { token, logit })
     }
 
     /// Copies the most recent transformed vocabulary logits to the host.
-    pub fn logits_to_host(&self, state: &MuseGlimmerDecodeState) -> Result<Vec<f32>> {
+    pub fn logits_to_host(&self, sequence: &MuseGlimmerSequence) -> Result<Vec<f32>> {
+        let state = &sequence.state;
         if state.position == 0 {
             return Err(Error::Format {
                 label: "Muse Glimmer logits",
@@ -1265,7 +1280,8 @@ impl MuseGlimmerModel {
     }
 
     /// Returns the greedy token and transformed logit without copying the vocabulary.
-    pub fn argmax_with_logit(&self, state: &mut MuseGlimmerDecodeState) -> Result<(u32, f32)> {
+    pub fn argmax_with_logit(&self, sequence: &mut MuseGlimmerSequence) -> Result<(u32, f32)> {
+        let state = &mut sequence.state;
         if state.position == 0 {
             return Err(Error::Format {
                 label: "Muse Glimmer logits",
@@ -1292,7 +1308,13 @@ impl MuseGlimmerModel {
         Ok((token, logit))
     }
 
-    fn forward_hidden(&self, state: &mut MuseGlimmerDecodeState, token: u32) -> Result<()> {
+    fn forward_hidden(
+        &self,
+        sequence: &mut MuseGlimmerSequence,
+        token: u32,
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<()> {
+        let state = &mut sequence.state;
         state.batch_logits_row = None;
         if state.model_id != self.model_id {
             return Err(Error::Format {
@@ -1310,86 +1332,139 @@ impl MuseGlimmerModel {
                 actual: format!("token={token} position={}", state.position),
             });
         }
-        copy_bf16_row_to_f32_into_on_stream(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            token as usize,
-            &self.embedding,
-            state.hidden.output(),
-            &self.stream,
-        )?;
-        self.embedding_norm.run_into(
-            1,
-            self.config.hidden_size,
-            &state.hidden,
-            &mut state.embedding_output,
-            &self.stream,
-        )?;
-        for layer_index in 0..self.layers.len() {
-            let local = self.layers[layer_index].attention.window.is_some();
-            let (previous, current) = state.layers.split_at_mut(layer_index);
-            let input = if layer_index == 0 {
-                &state.embedding_output
-            } else {
-                &previous[layer_index - 1].output
-            };
-            if let Some(dflash) = &self.dflash
-                && let Some(extract_index) = dflash
-                    .config
-                    .target_layers
-                    .iter()
-                    .position(|&extract| extract == layer_index)
-            {
-                copy_f32_rows_into_columns_on_stream(
-                    1,
-                    self.config.hidden_size,
-                    dflash.config.target_layers.len() * self.config.hidden_size,
-                    extract_index * self.config.hidden_size,
-                    input,
-                    state
-                        .verification
-                        .as_mut()
+        let position = state.position;
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(muse_glimmer_cache_error)?;
+        let result = (|| {
+            copy_bf16_row_to_f32_into_on_stream(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                token as usize,
+                &self.embedding,
+                state.hidden.output(),
+                &self.stream,
+            )?;
+            self.embedding_norm.run_into(
+                1,
+                self.config.hidden_size,
+                &state.hidden,
+                &mut state.embedding_output,
+                &self.stream,
+            )?;
+            for layer_index in 0..self.layers.len() {
+                let local = self.layers[layer_index].attention.window.is_some();
+                let (previous, current) = state.layers.split_at_mut(layer_index);
+                let input = if layer_index == 0 {
+                    &state.embedding_output
+                } else {
+                    &previous[layer_index - 1].output
+                };
+                if let Some(dflash) = &self.dflash
+                    && let Some(extract_index) = dflash
+                        .config
+                        .target_layers
+                        .iter()
+                        .position(|&extract| extract == layer_index)
+                {
+                    copy_f32_rows_into_columns_on_stream(
+                        1,
+                        self.config.hidden_size,
+                        dflash.config.target_layers.len() * self.config.hidden_size,
+                        extract_index * self.config.hidden_size,
+                        input,
+                        state
+                            .verification
+                            .as_mut()
+                            .expect("DFlash verification workspace")
+                            .features
+                            .output(),
+                        &self.stream,
+                    )?;
+                }
+                cache
+                    .with_append_pages(&reservation, |backend, pages| {
+                        let page = pages.iter().next().expect("one Muse append page");
+                        let segment = page.segment();
+                        self.layers[layer_index].run_into(
+                            &self.lt,
+                            &self.linear_plans,
+                            input,
+                            &mut current[0],
+                            MuseAttentionCache {
+                                pool: backend.pool_mut(layer_index)?,
+                                page_slot: page.page().slot(),
+                                page_offset: segment.page_offset(),
+                                page_table: sequence.page_table.device(),
+                            },
+                            state.compact_attention.for_layer_mut(local)?,
+                            position,
+                            &self.stream,
+                        )
+                    })
+                    .map_err(muse_glimmer_cache_error)?;
+            }
+            if let Some(dflash) = &self.dflash {
+                let MuseGlimmerDecodeState {
+                    verification,
+                    dflash_state,
+                    ..
+                } = state;
+                dflash.inject_features(
+                    &verification
+                        .as_ref()
                         .expect("DFlash verification workspace")
-                        .features
-                        .output(),
+                        .features,
+                    dflash_state.as_mut().expect("DFlash sequence state"),
+                    1,
+                    position,
                     &self.stream,
                 )?;
             }
-            self.layers[layer_index].run_into(
-                &self.lt,
-                &self.linear_plans,
-                input,
-                &mut current[0],
-                &mut state.kv_caches[layer_index],
-                state.compact_attention.for_layer_mut(local)?,
-                state.position,
-                &self.stream,
-            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(muse_glimmer_cache_error)?;
+            return Err(error);
         }
-        if let Some(dflash) = &self.dflash {
-            let MuseGlimmerDecodeState {
-                verification,
-                dflash_state,
-                ..
-            } = state;
-            dflash.inject_features(
-                &verification
-                    .as_ref()
-                    .expect("DFlash verification workspace")
-                    .features,
-                dflash_state.as_mut().expect("DFlash sequence state"),
+        cache
+            .commit_append(
+                reservation,
                 1,
-                state.position,
-                &self.stream,
-            )?;
-        }
-        state.position += 1;
+                &mut Sm12xCacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(muse_glimmer_cache_error)?;
+        state.position = position + 1;
         Ok(())
     }
 
     /// Advances one token and leaves its vocabulary logits resident on the device.
-    pub fn forward_one(&self, state: &mut MuseGlimmerDecodeState, token: u32) -> Result<()> {
-        self.forward_hidden(state, token)?;
+    pub fn forward_one(
+        &self,
+        sequence: &mut MuseGlimmerSequence,
+        token: u32,
+        cache: &mut MuseGlimmerSequenceCache,
+    ) -> Result<()> {
+        self.forward_hidden(sequence, token, cache)?;
+        let state = &mut sequence.state;
         let last = &state
             .layers
             .last()
@@ -1420,8 +1495,8 @@ impl MuseGlimmerModel {
         (logit * self.config.output_multiplier / cap).tanh() * cap
     }
 
-    /// Returns compact storage required for an aligned prefix checkpoint.
-    pub fn checkpoint_sequence_device_bytes(
+    /// Returns private snapshot storage required for an aligned shared prefix.
+    pub fn snapshot_sequence_device_bytes(
         &self,
         state: &MuseGlimmerDecodeState,
         prefix_tokens: usize,
@@ -1431,7 +1506,7 @@ impl MuseGlimmerModel {
             || prefix_tokens > state.position
         {
             return Err(Error::Shape {
-                label: "Muse Glimmer sequence checkpoint byte estimate",
+                label: "Muse Glimmer sequence snapshot byte estimate",
                 expected: format!(
                     "a nonzero 128-token-aligned prefix at most {} tokens",
                     state.position
@@ -1439,15 +1514,7 @@ impl MuseGlimmerModel {
                 actual: prefix_tokens.to_string(),
             });
         }
-        let target_bytes = state.kv_caches.iter().try_fold(0usize, |total, cache| {
-            let bytes = cache.device_bytes_for_capacity(prefix_tokens)?;
-            total.checked_add(bytes).ok_or_else(|| Error::Shape {
-                label: "Muse Glimmer checkpoint byte estimate",
-                expected: "device-byte total without overflow".to_string(),
-                actual: prefix_tokens.to_string(),
-            })
-        })?;
-        let dflash_bytes = match (&self.dflash, &state.dflash_state) {
+        Ok(match (&self.dflash, &state.dflash_state) {
             (Some(model), Some(state)) => {
                 model.checkpoint_sequence_device_bytes(state, prefix_tokens)?
             }
@@ -1463,31 +1530,16 @@ impl MuseGlimmerModel {
                     ),
                 });
             }
-        };
-        target_bytes
-            .checked_add(dflash_bytes)
-            .ok_or_else(|| Error::Shape {
-                label: "Muse Glimmer checkpoint byte estimate",
-                expected: "target and DFlash device-byte total without overflow".to_string(),
-                actual: prefix_tokens.to_string(),
-            })
+        })
     }
 
-    /// Copies an aligned K/V prefix into immutable compact storage.
-    pub fn checkpoint_sequence(
+    /// Captures private DFlash state for an aligned shared KV-page prefix.
+    pub fn snapshot_sequence(
         &self,
         state: &MuseGlimmerDecodeState,
         prefix_tokens: usize,
-    ) -> Result<MuseGlimmerSequenceCheckpoint> {
-        self.checkpoint_sequence_device_bytes(state, prefix_tokens)?;
-        let mut kv_caches = self
-            .layers
-            .iter()
-            .map(|layer| layer.attention.new_kv_cache(prefix_tokens))
-            .collect::<Result<Vec<_>>>()?;
-        for (destination, source) in kv_caches.iter_mut().zip(&state.kv_caches) {
-            destination.copy_aligned_prefix_from_on_stream(source, prefix_tokens, &self.stream)?;
-        }
+    ) -> Result<MuseGlimmerSequenceSnapshot> {
+        self.snapshot_sequence_device_bytes(state, prefix_tokens)?;
         let dflash = match (&self.dflash, &state.dflash_state) {
             (Some(model), Some(state)) => {
                 Some(model.checkpoint_sequence(state, prefix_tokens, &self.stream)?)
@@ -1506,62 +1558,51 @@ impl MuseGlimmerModel {
             }
         };
         self.stream.synchronize()?;
-        Ok(MuseGlimmerSequenceCheckpoint {
+        Ok(MuseGlimmerSequenceSnapshot {
             model_id: self.model_id,
             position: prefix_tokens,
-            kv_caches,
             dflash,
         })
     }
 
-    /// Restores a compact prompt checkpoint into a new active state.
-    pub fn restore_sequence_checkpoint(
+    /// Restores private state associated with shared prefix pages.
+    pub fn restore_sequence_snapshot(
         &self,
-        checkpoint: &MuseGlimmerSequenceCheckpoint,
-        max_tokens: usize,
-    ) -> Result<MuseGlimmerDecodeState> {
-        if checkpoint.model_id != self.model_id
-            || checkpoint.position > max_tokens
-            || checkpoint.kv_caches.len() != self.layers.len()
-            || checkpoint.dflash.is_some() != self.dflash.is_some()
+        snapshot: &MuseGlimmerSequenceSnapshot,
+        state: &mut MuseGlimmerDecodeState,
+        position: usize,
+    ) -> Result<()> {
+        if snapshot.model_id != self.model_id
+            || snapshot.position != position
+            || position > state.max_tokens
+            || snapshot.dflash.is_some() != self.dflash.is_some()
         {
             return Err(Error::Shape {
-                label: "Muse Glimmer sequence checkpoint restore",
+                label: "Muse Glimmer sequence snapshot restore",
                 expected: format!(
-                    "matching model, capacity >= {}, {} layer caches, and matching DFlash state",
-                    checkpoint.position,
-                    self.layers.len()
+                    "matching model, position {position}, sufficient capacity, and matching DFlash state"
                 ),
                 actual: format!(
-                    "capacity={max_tokens} layer_caches={} dflash={}",
-                    checkpoint.kv_caches.len(),
-                    checkpoint.dflash.is_some()
+                    "snapshot_position={} capacity={} dflash={}",
+                    snapshot.position,
+                    state.max_tokens,
+                    snapshot.dflash.is_some()
                 ),
             });
         }
-        let mut state = self.new_decode_state(max_tokens)?;
-        for (destination, source) in state.kv_caches.iter_mut().zip(&checkpoint.kv_caches) {
-            destination.copy_aligned_prefix_from_on_stream(
-                source,
-                checkpoint.position,
-                &self.stream,
-            )?;
-        }
-        if let (Some(model), Some(dflash_checkpoint), Some(dflash_state)) = (
-            &self.dflash,
-            &checkpoint.dflash,
-            state.dflash_state.as_mut(),
-        ) {
+        if let (Some(model), Some(dflash_checkpoint), Some(dflash_state)) =
+            (&self.dflash, &snapshot.dflash, state.dflash_state.as_mut())
+        {
             model.restore_sequence_checkpoint(
                 dflash_checkpoint,
                 dflash_state,
-                checkpoint.position,
+                position,
                 &self.stream,
             )?;
         }
         self.stream.synchronize()?;
-        state.position = checkpoint.position;
-        Ok(state)
+        state.position = position;
+        Ok(())
     }
 }
 
@@ -1607,11 +1648,6 @@ impl MuseGlimmerDecodeState {
                         + layer.output.device_bytes()
                 })
                 .sum::<usize>()
-            + self
-                .kv_caches
-                .iter()
-                .map(Sm12xKvCache::device_bytes)
-                .sum::<usize>()
             + self.compact_attention.device_bytes()
             + self.final_hidden.device_bytes()
             + self.lm_head.device_bytes()
@@ -1628,20 +1664,21 @@ impl MuseGlimmerDecodeState {
     }
 }
 
-impl MuseGlimmerSequenceCheckpoint {
+impl MuseGlimmerSequenceSnapshot {
     pub fn position(&self) -> usize {
         self.position
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.kv_caches
-            .iter()
-            .map(Sm12xKvCache::device_bytes)
-            .sum::<usize>()
-            + self
-                .dflash
-                .as_ref()
-                .map_or(0, dflash::DFlashSequenceCheckpoint::device_bytes)
+        self.dflash
+            .as_ref()
+            .map_or(0, dflash::DFlashSequenceCheckpoint::device_bytes)
+    }
+}
+
+impl RetainedSnapshot for MuseGlimmerSequenceSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.device_bytes()
     }
 }
 
@@ -1695,16 +1732,26 @@ mod tests {
     #[test]
     #[ignore = "requires the local Muse Glimmer NVFP4 checkpoint and an SM121 GPU"]
     fn local_checkpoint_greedy_continuation_is_stable() {
+        use crate::runtime::muse_glimmer_sequence_cache::{
+            MuseGlimmerSequence, new_muse_glimmer_sequence_cache,
+        };
+
         let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("models/muse-glimmer-30b-nvfp4");
         let model = MuseGlimmerModel::load(model_dir).expect("load local Muse Glimmer model");
-        let mut state = model.new_decode_state(16).expect("decode state");
-        model.consume_one(&mut state, 200_000).expect("consume BOS");
+        let mut cache = new_muse_glimmer_sequence_cache(&model, 1, 16).expect("sequence cache");
+        let mut sequence =
+            MuseGlimmerSequence::admit(&model, &mut cache, 16).expect("sequence admission");
+        model
+            .consume_one(&mut sequence, 200_000, &mut cache)
+            .expect("consume BOS");
         let mut token = 19_873;
         let mut generated = Vec::new();
         for _ in 0..8 {
-            let next = model.decode_one(&mut state, token).expect("greedy decode");
+            let next = model
+                .decode_one(&mut sequence, token, &mut cache)
+                .expect("greedy decode");
             token = next.token;
             generated.push(token);
         }
@@ -1714,6 +1761,12 @@ mod tests {
     #[test]
     #[ignore = "requires the local Muse Glimmer NVFP4 and DFlash checkpoints and an SM121 GPU"]
     fn dflash_checkpoint_restore_preserves_the_next_speculative_cycle() {
+        use crate::runtime::muse_glimmer_sequence_cache::{
+            MuseGlimmerSequence, new_muse_glimmer_sequence_cache_with_budget,
+        };
+        use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
+        use sequence_cache::{AdmissionOutcome, AdmissionRequest};
+
         let model_dir = std::env::var_os("MUSE_GLIMMER_MODEL")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1728,29 +1781,77 @@ mod tests {
             MuseGlimmerModel::load_with_dflash(model_dir, dflash).expect("load Muse with DFlash");
         let prefix = (0..128).map(|token| token as u32 + 1).collect::<Vec<_>>();
         let suffix = [129, 130, 131];
-        let mut direct = model.new_decode_state(160).expect("direct state");
+        let mut cache = new_muse_glimmer_sequence_cache_with_budget(
+            &model,
+            2,
+            160,
+            Some(4 * 1024 * 1024 * 1024),
+        )
+        .expect("sequence cache");
+        let mut direct =
+            MuseGlimmerSequence::admit(&model, &mut cache, 160).expect("direct sequence");
         for chunk in prefix.chunks(16) {
             model
-                .dflash_prefill_chunk(&mut direct, chunk, false)
+                .dflash_prefill_chunk(&mut direct, chunk, false, &mut cache)
                 .expect("prefill checkpoint prefix");
         }
         let estimated = model
-            .checkpoint_sequence_device_bytes(&direct, prefix.len())
-            .expect("estimate checkpoint bytes");
-        let checkpoint = model
-            .checkpoint_sequence(&direct, prefix.len())
-            .expect("checkpoint target and DFlash caches");
-        assert_eq!(checkpoint.device_bytes(), estimated);
-        let mut restored = model
-            .restore_sequence_checkpoint(&checkpoint, 160)
-            .expect("restore target and DFlash caches");
-        assert_eq!(restored.len(), prefix.len());
+            .snapshot_sequence_device_bytes(&direct.state, prefix.len())
+            .expect("estimate snapshot bytes");
+        let snapshot = model
+            .snapshot_sequence(&direct.state, prefix.len())
+            .expect("snapshot DFlash state");
+        assert_eq!(snapshot.device_bytes(), estimated);
+        cache
+            .retain_prefix(
+                direct.cache_id,
+                &prefix,
+                snapshot,
+                &mut Sm12xCacheContext {
+                    stream: model.stream(),
+                    page_table: &mut direct.page_table,
+                },
+            )
+            .expect("retain shared target pages");
+        let matched = cache
+            .lookup_prefix(&[prefix.as_slice(), &[999]].concat())
+            .expect("lookup retained prefix");
+        let mut restored_state = model.new_sequence_state(160).expect("restored state");
+        let mut restored_table = Sm12xPageTable::new(160).expect("restored table");
+        let outcome = cache
+            .admit(
+                Some(matched),
+                AdmissionRequest {
+                    max_position: 160,
+                    private_state_bytes: restored_state.device_bytes(),
+                    page_table_bytes: restored_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream: model.stream(),
+                    page_table: &mut restored_table,
+                },
+                |snapshot, position| {
+                    model.restore_sequence_snapshot(
+                        snapshot.expect("retained snapshot"),
+                        &mut restored_state,
+                        position,
+                    )
+                },
+            )
+            .expect("restore admission");
+        let AdmissionOutcome::Admitted(restored_id) = outcome else {
+            panic!("restored admission would block");
+        };
+        let mut restored =
+            MuseGlimmerSequence::from_admission(restored_id, restored_table, restored_state);
+        assert_eq!(restored.position(), prefix.len());
 
         model
-            .dflash_prefill_chunk(&mut direct, &suffix, true)
+            .dflash_prefill_chunk(&mut direct, &suffix, true, &mut cache)
             .expect("continue direct state");
         model
-            .dflash_prefill_chunk(&mut restored, &suffix, true)
+            .dflash_prefill_chunk(&mut restored, &suffix, true, &mut cache)
             .expect("continue restored state");
         let direct_anchor = model
             .argmax_with_logit(&mut direct)
@@ -1762,10 +1863,10 @@ mod tests {
             .0;
         assert_eq!(restored_anchor, direct_anchor);
         let direct_cycle = model
-            .dflash_cycle(&mut direct, direct_anchor)
+            .dflash_cycle(&mut direct, direct_anchor, &mut cache)
             .expect("direct DFlash cycle");
         let restored_cycle = model
-            .dflash_cycle(&mut restored, restored_anchor)
+            .dflash_cycle(&mut restored, restored_anchor, &mut cache)
             .expect("restored DFlash cycle");
         assert_eq!(restored_cycle, direct_cycle);
     }

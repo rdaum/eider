@@ -2,17 +2,19 @@
 
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::prefix_cache::{
-    PrefixCache, PrefixCacheConfig, PrefixCacheKey, cacheable_prompt_prefix_tokens,
+use super::muse_glimmer_sequence_cache::{
+    MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
+    new_muse_glimmer_sequence_cache_with_budget,
 };
+use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
+use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
 use super::stop::StopBuffer;
-use crate::muse_glimmer::{
-    MuseGlimmerDFlashCycle, MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceCheckpoint,
-};
+use crate::muse_glimmer::{MuseGlimmerDFlashCycle, MuseGlimmerModel};
 use nvfp4::{Error, Result};
+use sequence_cache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -161,7 +163,6 @@ pub enum MuseGlimmerCancelOutcome {
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
-    prefix_cache_key: Option<PrefixCacheKey>,
     prefix_cache_target: usize,
     prefix_cache_checkpointed: bool,
     generation: RequestConfig,
@@ -171,7 +172,7 @@ struct ActiveRequest<'tokenizer> {
     pending_dflash_token: Option<u32>,
     dflash_stats: MuseGlimmerDFlashStats,
     prompt_logits_ready: bool,
-    state: Option<MuseGlimmerDecodeState>,
+    sequence: Option<Box<MuseGlimmerSequence>>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -188,7 +189,7 @@ pub struct MuseGlimmerChatService<'model, 'template> {
     waiting: VecDeque<MuseGlimmerRequestId>,
     requests: BTreeMap<MuseGlimmerRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
-    prefix_cache: Option<PrefixCache<MuseGlimmerSequenceCheckpoint>>,
+    sequence_cache: MuseGlimmerSequenceCache,
 }
 
 impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
@@ -198,11 +199,11 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
     ) -> Result<Self> {
-        Self::new_with_prefix_cache(model, template, config, PrefixCacheConfig::default())
+        Self::new_with_cache_config(model, template, config, PrefixCacheConfig::default())
     }
 
     /// Creates a service with explicit scheduling and prompt-prefix limits.
-    pub fn new_with_prefix_cache(
+    pub fn new_with_cache_config(
         model: &'model MuseGlimmerModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -216,6 +217,12 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 actual: format!("{} tokens", config.max_context_tokens),
             });
         }
+        let sequence_cache = new_muse_glimmer_sequence_cache_with_budget(
+            model,
+            config.max_active_sequences,
+            config.max_context_tokens,
+            (prefix_cache.max_device_bytes != 0).then_some(prefix_cache.max_device_bytes),
+        )?;
         Ok(Self {
             model,
             template,
@@ -224,8 +231,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
-            prefix_cache: (prefix_cache.max_device_bytes != 0)
-                .then(|| PrefixCache::new(prefix_cache.max_device_bytes)),
+            sequence_cache,
         })
     }
 
@@ -277,14 +283,6 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prefix_cache_target = cacheable_prompt_prefix_tokens(prompt.token_ids.len());
-        let prefix_cache_key = if prefix_cache_target == 0 {
-            None
-        } else {
-            self.prefix_cache
-                .as_mut()
-                .map(|cache| cache.prompt_key(&prompt.token_ids, prefix_cache_target))
-                .transpose()?
-        };
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
         let dflash_enabled = self.model.has_dflash()
@@ -297,7 +295,6 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             ActiveRequest {
                 prompt: prompt.token_ids.clone(),
                 prompt_position: 0,
-                prefix_cache_key,
                 prefix_cache_target,
                 prefix_cache_checkpointed: false,
                 generation: request.generation.clone(),
@@ -307,7 +304,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 pending_dflash_token: None,
                 dflash_stats: MuseGlimmerDFlashStats::default(),
                 prompt_logits_ready: false,
-                state: None,
+                sequence: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -352,7 +349,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.prompt_position == request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -369,7 +366,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.state.is_some()
+                request.sequence.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -378,7 +375,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             .collect::<Vec<_>>();
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
         for (&id, request) in &self.requests {
-            if request.state.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
@@ -395,7 +392,15 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             return MuseGlimmerCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
-        let released = request.state.map_or(0, |state| state.device_bytes());
+        let released = request
+            .sequence
+            .as_ref()
+            .map_or(0, |sequence| sequence.device_bytes());
+        if let Some(sequence) = request.sequence
+            && let Err(error) = (*sequence).finish(self.model, &mut self.sequence_cache)
+        {
+            warn!(%error, request_id = id.get(), "failed to release cancelled Muse Glimmer sequence");
+        }
         if released != 0 {
             self.active_sequences -= 1;
         }
@@ -425,42 +430,65 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             let capacity = request.prompt.len()
                 + request.generation.max_new_tokens
                 + usize::from(request.dflash_enabled) * 15;
-            let mut allocation_duration = Duration::ZERO;
+            let allocation_started = Instant::now();
             let mut checkpoint_copy_duration = Duration::ZERO;
-            let restored = match (&mut self.prefix_cache, request.prefix_cache_key.as_ref()) {
-                (Some(cache), Some(key)) => {
-                    cache.restore(key, MuseGlimmerSequenceCheckpoint::position, |checkpoint| {
+            let prefix = self.sequence_cache.lookup_prefix(&request.prompt);
+            let mut state = self.model.new_sequence_state(capacity.max(1))?;
+            let mut page_table = Sm12xPageTable::new(capacity.max(1))?;
+            let outcome = self
+                .sequence_cache
+                .admit(
+                    prefix,
+                    AdmissionRequest {
+                        max_position: capacity.max(1),
+                        private_state_bytes: state.device_bytes(),
+                        page_table_bytes: page_table.managed_bytes(),
+                        allow_emergency: false,
+                    },
+                    &mut Sm12xCacheContext {
+                        stream: self.model.stream(),
+                        page_table: &mut page_table,
+                    },
+                    |snapshot, position| {
+                        if position == 0 {
+                            return Ok(());
+                        }
+                        let snapshot = snapshot.ok_or_else(|| Error::Format {
+                            label: "Muse Glimmer sequence snapshot restore",
+                            detail: "retained prefix has no private snapshot".to_string(),
+                        })?;
                         let restore_started = Instant::now();
-                        let state = self
-                            .model
-                            .restore_sequence_checkpoint(checkpoint, capacity.max(1))?;
+                        self.model
+                            .restore_sequence_snapshot(snapshot, &mut state, position)?;
                         checkpoint_copy_duration = restore_started.elapsed();
-                        Ok(state)
-                    })?
+                        Ok(())
+                    },
+                )
+                .map_err(muse_glimmer_cache_error)?;
+            let cache_id = match outcome {
+                AdmissionOutcome::Admitted(id) => id,
+                AdmissionOutcome::WouldBlock => {
+                    self.waiting.push_front(id);
+                    break;
                 }
-                _ => None,
             };
-            let cached_prompt_tokens = restored.as_ref().map_or(0, MuseGlimmerDecodeState::len);
-            let state = if let Some(restored) = restored {
-                restored
-            } else {
-                let allocation_started = Instant::now();
-                let state = self.model.new_decode_state(capacity.max(1))?;
-                allocation_duration = allocation_started.elapsed();
-                state
-            };
+            self.model.stream().synchronize()?;
+            let allocation_duration = allocation_started.elapsed();
+            let cached_prompt_tokens = state.len();
+            let sequence = MuseGlimmerSequence::from_admission(cache_id, page_table, state);
+            let sequence_device_bytes = sequence.device_bytes();
             request.prompt_position = cached_prompt_tokens;
             request.prefix_cache_checkpointed =
                 cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             let progress = MuseGlimmerAdmissionProgress {
                 request_id: id,
-                sequence_device_bytes: state.device_bytes(),
+                sequence_device_bytes,
                 cached_prompt_tokens,
                 allocation_duration,
                 checkpoint_copy_duration,
                 admitted_after_tick_start: started.elapsed(),
             };
-            request.state = Some(state);
+            request.sequence = Some(Box::new(sequence));
             self.active_sequences += 1;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
             tick.admitted.push(progress);
@@ -481,7 +509,15 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             let request = self.requests.get_mut(&id).expect("prefill request exists");
             let available = request.prompt.len() - request.prompt_position;
             let remaining = ids.len() - index;
-            let chunk = available.min(budget.div_ceil(remaining));
+            let chunk = available.min(budget.div_ceil(remaining)).min(
+                if !request.prefix_cache_checkpointed
+                    && request.prompt_position < request.prefix_cache_target
+                {
+                    request.prefix_cache_target - request.prompt_position
+                } else {
+                    usize::MAX
+                },
+            );
             if chunk == 0 {
                 continue;
             }
@@ -489,24 +525,30 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             let start = request.prompt_position;
             let end = start + chunk;
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
-            let state = request.state.as_mut().expect("request is admitted");
+            let sequence = request
+                .sequence
+                .as_deref_mut()
+                .expect("request is admitted");
             if request.dflash_enabled {
                 let mut chunk_start = start;
                 while chunk_start < end {
                     let chunk_end = (chunk_start + 16).min(end);
                     self.model.dflash_prefill_chunk(
-                        state,
+                        sequence,
                         &request.prompt[chunk_start..chunk_end],
                         chunk_end == request.prompt.len(),
+                        &mut self.sequence_cache,
                     )?;
                     chunk_start = chunk_end;
                 }
             } else {
                 for (offset, &token) in request.prompt[start..end].iter().enumerate() {
                     if start + offset + 1 == request.prompt.len() {
-                        self.model.forward_one(state, token)?;
+                        self.model
+                            .forward_one(sequence, token, &mut self.sequence_cache)?;
                     } else {
-                        self.model.consume_one(state, token)?;
+                        self.model
+                            .consume_one(sequence, token, &mut self.sequence_cache)?;
                     }
                 }
             }
@@ -517,7 +559,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 request.prefix_cache_target,
                 request.prefix_cache_checkpointed,
             ) {
-                Self::retain_request_checkpoint(self.model, &mut self.prefix_cache, request);
+                Self::retain_request_prefix(self.model, &mut self.sequence_cache, request);
             }
             tick.prefilled.push(MuseGlimmerPrefillProgress {
                 request_id: id,
@@ -527,45 +569,46 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         Ok(())
     }
 
-    fn retain_request_checkpoint(
+    fn retain_request_prefix(
         model: &MuseGlimmerModel,
-        prefix_cache: &mut Option<PrefixCache<MuseGlimmerSequenceCheckpoint>>,
+        sequence_cache: &mut MuseGlimmerSequenceCache,
         request: &mut ActiveRequest<'template>,
     ) {
         if request.prefix_cache_checkpointed || request.prefix_cache_target == 0 {
             return;
         }
-        let (Some(cache), Some(key), Some(state)) = (
-            prefix_cache.as_mut(),
-            request.prefix_cache_key.as_ref(),
-            request.state.as_ref(),
-        ) else {
+        if sequence_cache.config().max_prefix_entries == Some(0) {
             request.prefix_cache_checkpointed = true;
             return;
+        }
+        let Some(sequence) = request.sequence.as_deref_mut() else {
+            return;
         };
-        if state.len() < request.prefix_cache_target {
+        if sequence.position() != request.prefix_cache_target {
             return;
         }
-        if !cache.contains(key) {
-            let Ok(estimated_bytes) =
-                model.checkpoint_sequence_device_bytes(state, request.prefix_cache_target)
-            else {
+        if sequence_cache.contains_prefix(&request.prompt, request.prefix_cache_target) {
+            request.prefix_cache_checkpointed = true;
+            return;
+        }
+        let snapshot = match model.snapshot_sequence(&sequence.state, request.prefix_cache_target) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(%error, "failed to snapshot Muse Glimmer prompt prefix");
                 request.prefix_cache_checkpointed = true;
                 return;
-            };
-            if cache.prepare_insert(estimated_bytes) {
-                let started = Instant::now();
-                match model.checkpoint_sequence(state, request.prefix_cache_target) {
-                    Ok(checkpoint) => {
-                        cache.record_checkpoint(started);
-                        let bytes = checkpoint.device_bytes();
-                        if let Err(error) = cache.insert(key.clone(), checkpoint, bytes) {
-                            warn!(%error, "failed to retain Muse Glimmer prompt prefix checkpoint");
-                        }
-                    }
-                    Err(error) => warn!(%error, "failed to checkpoint Muse Glimmer prompt prefix"),
-                }
             }
+        };
+        if let Err(error) = sequence_cache.retain_prefix(
+            sequence.cache_id,
+            &request.prompt,
+            snapshot,
+            &mut Sm12xCacheContext {
+                stream: model.stream(),
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            warn!(%error, "failed to retain shared Muse Glimmer prompt prefix");
         }
         request.prefix_cache_checkpointed = true;
     }
@@ -577,21 +620,25 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         if request.dflash_enabled {
-            return Self::generate_dflash(self.model, id, request, tick);
+            return Self::generate_dflash(self.model, &mut self.sequence_cache, id, request, tick);
         }
-        let state = request.state.as_mut().expect("decode request is admitted");
+        let sequence = request
+            .sequence
+            .as_deref_mut()
+            .expect("decode request is admitted");
         if request.prompt_logits_ready {
             request.prompt_logits_ready = false;
         } else {
             self.model.forward_one(
-                state,
+                sequence,
                 request
                     .last_token
                     .expect("generated token exists after prompt logits"),
+                &mut self.sequence_cache,
             )?;
         }
         let sampled = if request.sampler.config().uses_fast_argmax() {
-            let (id, logit) = self.model.argmax_with_logit(state)?;
+            let (id, logit) = self.model.argmax_with_logit(sequence)?;
             super::sampling::SampledToken {
                 id,
                 logit,
@@ -600,7 +647,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         } else {
             request
                 .sampler
-                .sample(&self.model.logits_to_host(state)?, &request.history)?
+                .sample(&self.model.logits_to_host(sequence)?, &request.history)?
         };
         request.generated_tokens += 1;
         request.last_token = Some(sampled.id);
@@ -625,6 +672,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
 
     fn generate_dflash(
         model: &MuseGlimmerModel,
+        sequence_cache: &mut MuseGlimmerSequenceCache,
         id: MuseGlimmerRequestId,
         request: &mut ActiveRequest<'template>,
         tick: &mut MuseGlimmerTick,
@@ -640,12 +688,23 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             }
             request.prompt_logits_ready = false;
             model
-                .argmax_with_logit(request.state.as_mut().expect("request is admitted"))?
+                .argmax_with_logit(
+                    request
+                        .sequence
+                        .as_deref_mut()
+                        .expect("request is admitted"),
+                )?
                 .0
         };
         let cycle_started = Instant::now();
-        let cycle =
-            model.dflash_cycle(request.state.as_mut().expect("request is admitted"), anchor)?;
+        let cycle = model.dflash_cycle(
+            request
+                .sequence
+                .as_deref_mut()
+                .expect("request is admitted"),
+            anchor,
+            sequence_cache,
+        )?;
         let cycle_duration = cycle_started.elapsed();
         request.pending_dflash_token = Some(cycle.next_token);
         let mut emitted_tokens = 0;
@@ -706,11 +765,12 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let released = request
-            .state
+        let sequence = request
+            .sequence
             .take()
-            .expect("terminal request is admitted")
-            .device_bytes();
+            .expect("terminal request is admitted");
+        let released = sequence.device_bytes();
+        (*sequence).finish(self.model, &mut self.sequence_cache)?;
         self.active_sequences -= 1;
         tick.finished.push(MuseGlimmerFinished {
             request_id: id,

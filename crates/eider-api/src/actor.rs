@@ -407,7 +407,7 @@ fn actor_main(
                     .min(model.config().max_position_embeddings),
                 ..scheduler
             };
-            let service = match MuseGlimmerChatService::new_with_prefix_cache(
+            let service = match MuseGlimmerChatService::new_with_cache_config(
                 &model,
                 &template,
                 muse_scheduler,
