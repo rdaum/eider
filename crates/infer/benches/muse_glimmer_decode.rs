@@ -1,4 +1,7 @@
-use infer::muse_glimmer::{MuseGlimmerDecodeState, MuseGlimmerModel};
+use infer::muse_glimmer::MuseGlimmerModel;
+use infer::runtime::muse_glimmer_sequence_cache::{
+    MuseGlimmerSequence, MuseGlimmerSequenceCache, new_muse_glimmer_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, Throughput, black_box, run_benchmark_main,
@@ -11,7 +14,8 @@ const BOS_TOKEN: u32 = 200_000;
 
 struct MuseGlimmerDecodeBench {
     model: Rc<MuseGlimmerModel>,
-    state: MuseGlimmerDecodeState,
+    sequence: MuseGlimmerSequence,
+    sequence_cache: MuseGlimmerSequenceCache,
     token: u32,
 }
 
@@ -27,12 +31,14 @@ impl BenchContext for MuseGlimmerDecodeBench {
 
 impl MuseGlimmerDecodeBench {
     fn new(model: Rc<MuseGlimmerModel>) -> Self {
-        let state = model
-            .new_decode_state(4_096)
-            .expect("allocate Muse Glimmer decode state");
+        let mut sequence_cache = new_muse_glimmer_sequence_cache(&model, 1, 4_096)
+            .expect("allocate Muse Glimmer sequence cache");
+        let sequence = MuseGlimmerSequence::admit(&model, &mut sequence_cache, 4_096)
+            .expect("admit Muse Glimmer benchmark sequence");
         let mut bench = Self {
             model,
-            state,
+            sequence,
+            sequence_cache,
             token: BOS_TOKEN,
         };
         bench.validate();
@@ -42,7 +48,7 @@ impl MuseGlimmerDecodeBench {
     fn validate(&mut self) {
         let direct = self
             .model
-            .decode_one(&mut self.state, self.token)
+            .decode_one(&mut self.sequence, self.token, &mut self.sequence_cache)
             .expect("Muse Glimmer correctness decode");
         assert_eq!(direct.token, 15, "unexpected Muse Glimmer BOS continuation");
         self.token = direct.token;
@@ -51,7 +57,7 @@ impl MuseGlimmerDecodeBench {
     fn decode_one(&mut self) {
         let next = self
             .model
-            .decode_one(&mut self.state, self.token)
+            .decode_one(&mut self.sequence, self.token, &mut self.sequence_cache)
             .expect("Muse Glimmer decode");
         self.token = next.token;
         black_box((next.token, next.logit));
