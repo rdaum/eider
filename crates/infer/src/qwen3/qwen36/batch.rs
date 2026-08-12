@@ -1505,68 +1505,72 @@ impl Qwen36TextModel {
         rows: &mut [Qwen36PrefillRow<'_, '_>],
         cache: &mut Qwen36SequenceCache,
     ) -> Result<()> {
-        let mut targets = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
-            let target = match cache.reserve_append(
-                row.sequence.cache_id,
-                row.token_ids.len(),
-                &mut Sm12xCacheContext {
-                    stream: workspace.stream(),
-                    page_table: &mut row.sequence.page_table,
-                },
-            ) {
-                Ok(target) => target,
+        let mut reservations = Vec::with_capacity(rows.len());
+        for index in 0..rows.len() {
+            let reservation = {
+                let row = &mut rows[index];
+                cache.reserve_append(
+                    row.sequence.cache_id,
+                    row.token_ids.len(),
+                    &mut Sm12xCacheContext {
+                        stream: workspace.stream(),
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+            };
+            match reservation {
+                Ok(reservation) => reservations.push(reservation),
                 Err(error) => {
-                    for target in targets.drain(..) {
-                        cache.abort_append(target).map_err(cache_error)?;
+                    for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Sm12xCacheContext {
+                                    stream: workspace.stream(),
+                                    page_table: &mut row.sequence.page_table,
+                                },
+                            )
+                            .map_err(cache_error)?;
                     }
                     return Err(cache_error(error));
                 }
-            };
-            if target.max_rows() != row.token_ids.len() {
-                cache.abort_append(target).map_err(cache_error)?;
-                for target in targets.drain(..) {
-                    cache.abort_append(target).map_err(cache_error)?;
-                }
-                return Err(crate::nvfp4::Error::Shape {
-                    label: "Qwen3.6 prefill chunk",
-                    expected: format!(
-                        "each row to fit within its current {}-token cache page",
-                        crate::nvfp4::SM12X_KV_PAGE_TOKENS
-                    ),
-                    actual: format!("{} tokens", row.token_ids.len()),
-                });
             }
-            targets.push(target);
         }
         let result = {
             let mut state_rows = Vec::with_capacity(rows.len());
             let mut appends = Vec::with_capacity(rows.len());
-            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+            for (row, reservation) in rows.iter_mut().zip(&reservations) {
                 let sequence = &mut *row.sequence;
                 state_rows.push(Qwen36PrefillStateRow {
                     token_ids: row.token_ids,
                     state: &mut sequence.state,
                 });
                 appends.push(Qwen36Append {
-                    target,
+                    reservation,
                     page_table: sequence.page_table.device(),
                 });
             }
             self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
         };
         if let Err(error) = result {
-            for target in targets {
-                cache.abort_append(target).map_err(cache_error)?;
+            for (row, reservation) in rows.iter_mut().zip(reservations) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: workspace.stream(),
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(cache_error)?;
             }
             return Err(error);
         }
-        for (row, target) in rows.iter_mut().zip(targets) {
+        for (row, reservation) in rows.iter_mut().zip(reservations) {
             let tokens = row.token_ids.len();
             cache
                 .commit_append(
-                    target,
-                    tokens,
+                    reservation,
                     &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,
@@ -2107,53 +2111,71 @@ impl Qwen36TextModel {
         cache: &mut Qwen36SequenceCache,
         trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
     ) -> Result<()> {
-        let mut targets = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
-            let target = match cache.reserve_append(
-                row.sequence.cache_id,
-                1,
-                &mut Sm12xCacheContext {
-                    stream: workspace.stream(),
-                    page_table: &mut row.sequence.page_table,
-                },
-            ) {
-                Ok(target) => target,
+        let mut reservations = Vec::with_capacity(rows.len());
+        for index in 0..rows.len() {
+            let reservation = {
+                let row = &mut rows[index];
+                cache.reserve_append(
+                    row.sequence.cache_id,
+                    1,
+                    &mut Sm12xCacheContext {
+                        stream: workspace.stream(),
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+            };
+            match reservation {
+                Ok(reservation) => reservations.push(reservation),
                 Err(error) => {
-                    for target in targets.drain(..) {
-                        cache.abort_append(target).map_err(cache_error)?;
+                    for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Sm12xCacheContext {
+                                    stream: workspace.stream(),
+                                    page_table: &mut row.sequence.page_table,
+                                },
+                            )
+                            .map_err(cache_error)?;
                     }
                     return Err(cache_error(error));
                 }
-            };
-            targets.push(target);
+            }
         }
         let result = {
             let mut state_rows = Vec::with_capacity(rows.len());
             let mut appends = Vec::with_capacity(rows.len());
-            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+            for (row, reservation) in rows.iter_mut().zip(&reservations) {
                 let sequence = &mut *row.sequence;
                 state_rows.push(Qwen36DecodeStateRow {
                     token_id: row.token_id,
                     state: &mut sequence.state,
                 });
                 appends.push(Qwen36Append {
-                    target,
+                    reservation,
                     page_table: sequence.page_table.device(),
                 });
             }
             self.decode_batch_impl(workspace, &mut state_rows, cache, &appends, trace)
         };
         if let Err(error) = result {
-            for target in targets {
-                cache.abort_append(target).map_err(cache_error)?;
+            for (row, reservation) in rows.iter_mut().zip(reservations) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: workspace.stream(),
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(cache_error)?;
             }
             return Err(error);
         }
-        for (row, target) in rows.iter_mut().zip(targets) {
+        for (row, reservation) in rows.iter_mut().zip(reservations) {
             cache
                 .commit_append(
-                    target,
-                    1,
+                    reservation,
                     &mut Sm12xCacheContext {
                         stream: workspace.stream(),
                         page_table: &mut row.sequence.page_table,
@@ -2963,24 +2985,24 @@ impl Qwen36FullAttentionWeights {
             rows.iter_mut().zip(appends).enumerate().take(active_rows)
         {
             let position = decode_row.state.position;
-            if append.target.page_offset() != position % crate::nvfp4::SM12X_KV_PAGE_TOKENS
-                || append.target.max_rows() == 0
+            let segments = append.reservation.segments();
+            if append.reservation.start_position() != position
+                || append.reservation.rows() != 1
+                || segments.len() != 1
             {
                 return Err(crate::nvfp4::Error::Format {
                     label: "Qwen3.6 decode append",
-                    detail: format!(
-                        "target offset/max rows {}/{} does not match position {position}",
-                        append.target.page_offset(),
-                        append.target.max_rows()
-                    ),
+                    detail: "reservation does not cover exactly one decode row".to_string(),
                 });
             }
             cache
-                .with_append_page(append.target, |backend, page| {
+                .with_append_pages(append.reservation, |backend, pages| {
+                    let page = pages.iter().next().expect("one decode append page");
+                    let segment = page.segment();
                     let pool = backend.pool_mut(layer_idx)?;
                     pool.append_at_offsets_on_stream(
-                        page.slot(),
-                        append.target.page_offset(),
+                        page.page().slot(),
+                        segment.page_offset(),
                         &workspace.k_rope,
                         row * kv_width,
                         &workspace.v,
@@ -3023,16 +3045,15 @@ impl Qwen36FullAttentionWeights {
         let q_width = model.manifest.q_heads * model.manifest.head_dim;
         let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
         for (sequence, (row, append)) in rows.iter_mut().zip(appends).enumerate() {
-            if append.target.page_offset()
-                != row.state.position % crate::nvfp4::SM12X_KV_PAGE_TOKENS
-                || row.token_ids.len() > append.target.max_rows()
+            if append.reservation.start_position() != row.state.position
+                || append.reservation.rows() != row.token_ids.len()
             {
                 return Err(crate::nvfp4::Error::Format {
                     label: "Qwen3.6 prefill append",
                     detail: format!(
-                        "target offset/max rows {}/{} does not cover position {} and {} rows",
-                        append.target.page_offset(),
-                        append.target.max_rows(),
+                        "reservation at {} for {} rows does not cover position {} and {} rows",
+                        append.reservation.start_position(),
+                        append.reservation.rows(),
                         row.state.position,
                         row.token_ids.len()
                     ),
@@ -3040,30 +3061,34 @@ impl Qwen36FullAttentionWeights {
             }
             let input_row = row_offsets[sequence] as usize;
             cache
-                .with_append_page(append.target, |backend, page| {
+                .with_append_pages(append.reservation, |backend, pages| {
                     let pool = backend.pool_mut(layer_idx)?;
-                    for token in 0..row.token_ids.len() {
-                        pool.append_at_offsets_on_stream(
-                            page.slot(),
-                            append.target.page_offset() + token,
-                            &workspace.k_rope,
-                            (input_row + token) * kv_width,
-                            &workspace.v,
-                            (input_row + token) * kv_width,
-                            stream,
-                        )?;
-                        workspace
-                            .compact_attention
-                            .attention_paged_offsets_into_on_stream(
-                                pool,
-                                append.page_table,
-                                row.state.position + token + 1,
-                                &workspace.q_rope,
-                                (input_row + token) * q_width,
-                                workspace.attention.output(),
-                                (input_row + token) * q_width,
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        for local_row in 0..segment.rows() {
+                            let token = segment.input_offset() + local_row;
+                            pool.append_at_offsets_on_stream(
+                                page.page().slot(),
+                                segment.page_offset() + local_row,
+                                &workspace.k_rope,
+                                (input_row + token) * kv_width,
+                                &workspace.v,
+                                (input_row + token) * kv_width,
                                 stream,
                             )?;
+                            workspace
+                                .compact_attention
+                                .attention_paged_offsets_into_on_stream(
+                                    pool,
+                                    append.page_table,
+                                    row.state.position + token + 1,
+                                    &workspace.q_rope,
+                                    (input_row + token) * q_width,
+                                    workspace.attention.output(),
+                                    (input_row + token) * q_width,
+                                    stream,
+                                )?;
+                        }
                     }
                     Ok(())
                 })

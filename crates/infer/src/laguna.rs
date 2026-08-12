@@ -1467,7 +1467,7 @@ impl LagunaModel {
         cache: &mut LagunaSequenceCache,
     ) -> Result<()> {
         let target = self.reserve_token(sequence, cache)?;
-        let result = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        let result = self.forward_hidden_uncommitted(sequence, token, cache, &target);
         self.complete_token(sequence, cache, target, result)
     }
 
@@ -1533,7 +1533,7 @@ impl LagunaModel {
         &self,
         sequence: &mut LagunaSequence,
         cache: &mut LagunaSequenceCache,
-    ) -> Result<sequence_cache::AppendTarget> {
+    ) -> Result<sequence_cache::AppendReservation> {
         cache
             .reserve_append(
                 sequence.cache_id,
@@ -1550,17 +1550,24 @@ impl LagunaModel {
         &self,
         sequence: &mut LagunaSequence,
         cache: &mut LagunaSequenceCache,
-        target: sequence_cache::AppendTarget,
+        reservation: sequence_cache::AppendReservation,
         result: Result<()>,
     ) -> Result<()> {
         if let Err(error) = result {
-            cache.abort_append(target).map_err(laguna_cache_error)?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(laguna_cache_error)?;
             return Err(error);
         }
         cache
             .commit_append(
-                target,
-                1,
+                reservation,
                 &mut Sm12xCacheContext {
                     stream: &self.stream,
                     page_table: &mut sequence.page_table,
@@ -1576,7 +1583,7 @@ impl LagunaModel {
         sequence: &mut LagunaSequence,
         token: u32,
         cache: &mut LagunaSequenceCache,
-        target: sequence_cache::AppendTarget,
+        reservation: &sequence_cache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if state.model_id != self.model_id {
@@ -1609,14 +1616,16 @@ impl LagunaModel {
                 &previous[layer - 1].output
             };
             cache
-                .with_append_page(target, |backend, page| {
+                .with_append_pages(reservation, |backend, pages| {
+                    let page = pages.iter().next().expect("one decode append page");
+                    let segment = page.segment();
                     self.layers[layer].run_one(
                         &mut current[0],
                         input,
                         LagunaLayerCache {
                             pool: backend.pool_mut(layer)?,
-                            page_slot: page.slot(),
-                            page_offset: target.page_offset(),
+                            page_slot: page.page().slot(),
+                            page_offset: segment.page_offset(),
                             page_table: sequence.page_table.device(),
                             attention: state.compact_attention.for_layer(layer),
                         },
@@ -1635,10 +1644,10 @@ impl LagunaModel {
         token: u32,
         cache: &mut LagunaSequenceCache,
     ) -> Result<()> {
-        let target = self.reserve_token(sequence, cache)?;
-        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        let reservation = self.reserve_token(sequence, cache)?;
+        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, &reservation);
         if let Err(error) = hidden {
-            return self.complete_token(sequence, cache, target, Err(error));
+            return self.complete_token(sequence, cache, reservation, Err(error));
         }
         let state = &mut sequence.state;
         let last = &state
@@ -1654,7 +1663,7 @@ impl LagunaModel {
         let result = self
             .lm_head
             .run_into(&state.final_hidden, &mut state.logits, &self.stream);
-        self.complete_token(sequence, cache, target, result)
+        self.complete_token(sequence, cache, reservation, result)
     }
 }
 

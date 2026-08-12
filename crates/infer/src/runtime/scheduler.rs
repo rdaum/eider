@@ -914,16 +914,14 @@ impl<'model> Qwen36Scheduler<'model> {
                 continue;
             }
             let fair_share = token_budget.div_ceil(slots_remaining);
-            let mut chunk = available.min(fair_share);
             let request = &self.requests[&id];
-            chunk =
-                chunk.min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS);
-            if !request.prefix_cache_checkpointed
-                && request.prompt_position < request.prefix_cache_target
-                && request.prompt_position + chunk > request.prefix_cache_target
-            {
-                chunk = request.prefix_cache_target - request.prompt_position;
-            }
+            let chunk = prefill_chunk_tokens(
+                available,
+                fair_share,
+                request.prompt_position,
+                request.prefix_cache_target,
+                request.prefix_cache_checkpointed,
+            );
             token_budget -= chunk;
             slots_remaining -= 1;
             chunk_lengths.push(chunk);
@@ -1150,11 +1148,29 @@ fn sequence_cache_error(error: CacheError<Error>) -> Error {
     }
 }
 
+fn prefill_chunk_tokens(
+    available: usize,
+    fair_share: usize,
+    prompt_position: usize,
+    checkpoint_target: usize,
+    checkpointed: bool,
+) -> usize {
+    let chunk = available.min(fair_share);
+    if !checkpointed
+        && prompt_position < checkpoint_target
+        && prompt_position + chunk > checkpoint_target
+    {
+        checkpoint_target - prompt_position
+    } else {
+        chunk
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
-        SchedulerConfig, argmax_logits, decode_capacity_classes,
+        SchedulerConfig, argmax_logits, decode_capacity_classes, prefill_chunk_tokens,
     };
     use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
     use crate::runtime::sampling::SamplingConfig;
@@ -1177,6 +1193,13 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunks_follow_compute_capacity_not_cache_page_boundaries() {
+        assert_eq!(prefill_chunk_tokens(2_048, 2_048, 0, 0, true), 2_048);
+        assert_eq!(prefill_chunk_tokens(2_048, 2_048, 64, 0, true), 2_048);
+        assert_eq!(prefill_chunk_tokens(2_048, 2_048, 64, 384, false), 320);
+    }
+
+    #[test]
     fn decode_capacity_classes_bound_padding_and_include_the_maximum() {
         assert_eq!(decode_capacity_classes(1), [1]);
         assert_eq!(decode_capacity_classes(8), [1, 2, 4, 8]);
@@ -1194,6 +1217,47 @@ mod tests {
                 assert!(selected < active_rows.saturating_mul(2));
             }
         }
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.6 checkpoint"]
+    fn real_model_prefills_multiple_cache_pages_in_one_operation() {
+        let model_dir = std::env::var_os("QWEN36_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/qwen3.6-35b-a3-nvfp4")
+            });
+        let model = Qwen36TextModel::open(model_dir).expect("load Qwen3.6 model");
+        let mut scheduler = Qwen36Scheduler::new(
+            &model,
+            SchedulerConfig {
+                decode_capacity: 1,
+                prefill_sequence_capacity: 1,
+                prefill_token_capacity: 384,
+                max_active_sequences: 1,
+                max_context_tokens: 386,
+            },
+        )
+        .expect("scheduler");
+        scheduler
+            .add_request(
+                vec![9707; 385],
+                RequestConfig {
+                    sampling: SamplingConfig {
+                        temperature: 0.0,
+                        ..SamplingConfig::default()
+                    },
+                    max_new_tokens: 1,
+                    ..RequestConfig::default()
+                },
+            )
+            .expect("request");
+
+        let tick = scheduler.tick().expect("multi-page prefill tick");
+        assert_eq!(tick.prefilled.len(), 1);
+        assert_eq!(tick.prefilled[0].tokens, 384);
     }
 
     #[test]

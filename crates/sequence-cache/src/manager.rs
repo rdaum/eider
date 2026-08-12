@@ -1,3 +1,9 @@
+//! Sequence ownership, admission control, and prefix retention.
+//!
+//! This module holds the cache's handle types, configuration, exact stats, and
+//! the [`SequenceCache`] state machine. Storage operations are delegated to the
+//! configured backend; index bookkeeping lives in the crate's index module.
+
 use crate::RetainedSnapshot;
 use crate::backend::PageBackend;
 use crate::error::{CacheError, ConfigError, Result};
@@ -8,8 +14,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::time::Instant;
 
+/// Declares a copyable arena handle which rejects reuse after removal.
+///
+/// The handle pairs a slot index with the slot's current generation, so a stale
+/// copy fails validation once the slot is recycled for a new owner.
 macro_rules! generational_id {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name {
             slot: u32,
@@ -31,14 +42,32 @@ macro_rules! generational_id {
     };
 }
 
-generational_id!(PageId);
-generational_id!(SequenceId);
+generational_id!(
+    /// Handle for one manager-owned logical page.
+    ///
+    /// Resolved through [`SequenceCache::page`] and invalidated when the page is
+    /// retired. Stale handles fail with [`CacheError::StalePage`].
+    PageId
+);
+generational_id!(
+    /// Handle for one admitted sequence.
+    ///
+    /// Obtained from [`SequenceCache::admit`] or [`SequenceCache::branch`] and
+    /// invalidated by [`SequenceCache::finish`]. Stale handles fail with
+    /// [`CacheError::StaleSequence`].
+    SequenceId
+);
 
 /// Stable, never-reused identity for one retained prefix entry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PrefixEntryId(u64);
 
-/// Stable identity for one interned page-sized token block.
+/// Stable, never-reused identity for one interned page-sized token block.
+///
+/// Token blocks are the key material of the content-based prefix index: two
+/// prefixes sharing a leading run of identical page-sized token runs resolve to
+/// the same block IDs. Identities are assigned monotonically and survive only
+/// as long as some prefix entry references the block.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TokenBlockId(u64);
 
@@ -53,21 +82,43 @@ impl TokenBlockId {
 }
 
 /// Immutable manager geometry and byte limits.
+///
+/// The byte budget covers unique resident pages, outstanding reservations,
+/// per-sequence private state and page tables, and retained snapshots. Physical
+/// page size is reported by the backend, so all accounting is exact once the
+/// cache is constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheConfig {
+    /// Tokens stored per page; every shared or sealed page covers exactly this
+    /// many positions.
     pub page_tokens: usize,
+    /// Total bytes the cache may commit across pages, reservations, private
+    /// state, page tables, and snapshots.
     pub max_managed_bytes: usize,
+    /// Total bytes retained snapshots may occupy within the managed budget.
     pub max_snapshot_bytes: usize,
+    /// Optional hard cap on retained prefix entries, in addition to the byte
+    /// limits.
     pub max_prefix_entries: Option<usize>,
     /// Capacity unavailable to ordinary admissions but usable by runtime policy.
+    ///
+    /// Admissions with `allow_emergency` set may draw on this margin; all other
+    /// admissions must fit below `max_managed_bytes - emergency_bytes`.
     pub emergency_bytes: usize,
 }
 
 /// Per-request strict admission requirements.
+///
+/// A request either fits completely — including the reserved pages required to
+/// reach `max_position` — or is declined with
+/// [`AdmissionOutcome::WouldBlock`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionRequest {
+    /// Maximum sequence length in tokens the admission must provision for.
     pub max_position: usize,
+    /// Exact bytes of per-sequence private (non-paged) state.
     pub private_state_bytes: usize,
+    /// Exact bytes of the per-sequence backend page table.
     pub page_table_bytes: usize,
     /// Whether this request may consume the configured emergency margin.
     pub allow_emergency: bool,
@@ -82,60 +133,175 @@ pub struct PrefixMatch {
 }
 
 impl PrefixMatch {
+    /// Identity of the matched prefix entry.
     pub fn entry_id(self) -> PrefixEntryId {
         self.entry
     }
 
+    /// Page-aligned token position where the matched prefix ends.
     pub fn position(self) -> usize {
         self.position
     }
 
+    /// Number of pages the matched prefix occupies.
     pub fn page_count(self) -> usize {
         self.page_count
     }
 }
 
+/// Result of an admission request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionOutcome {
+    /// The request fit within capacity; carries the new sequence handle.
     Admitted(SequenceId),
+    /// The request cannot currently fit, even after evicting evictable
+    /// prefixes. The caller should retry after other work finishes.
+    ///
+    /// Pressure is reported here rather than as an error because it is part of
+    /// normal scheduler behaviour.
     WouldBlock,
 }
 
+/// Result of retaining a sequence's aligned prefix.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetainOutcome {
+    /// The prefix was newly retained; carries the entry identity.
     Inserted(PrefixEntryId),
+    /// The exact prefix was already retained; carries the existing entry
+    /// identity. No additional ownership is taken.
     Duplicate(PrefixEntryId),
 }
 
-/// Capability returned for one pending append.
+/// One ordered writable segment of an append reservation.
+///
+/// Segments cover the reservation without gaps. `input_offset` addresses the
+/// first row in the caller's compute chunk; `page_offset` addresses the first
+/// row in the physical page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AppendTarget {
-    sequence: SequenceId,
+pub struct AppendSegment {
     page: PageId,
-    start: usize,
-    max_rows: usize,
-    nonce: u64,
+    page_offset: usize,
+    input_offset: usize,
+    rows: usize,
 }
 
-impl AppendTarget {
-    pub fn sequence(self) -> SequenceId {
-        self.sequence
-    }
-
+impl AppendSegment {
+    /// Logical page receiving this segment.
     pub fn page(self) -> PageId {
         self.page
     }
 
+    /// First writable row in the physical page.
     pub fn page_offset(self) -> usize {
-        self.start
+        self.page_offset
     }
 
-    pub fn max_rows(self) -> usize {
-        self.max_rows
+    /// First source row in the caller's compute chunk.
+    pub fn input_offset(self) -> usize {
+        self.input_offset
+    }
+
+    /// Number of consecutive rows in this segment.
+    pub fn rows(self) -> usize {
+        self.rows
+    }
+}
+
+/// Capability for one exact, possibly multi-page append.
+///
+/// Obtained from [`SequenceCache::reserve_append`] and consumed by exactly one
+/// [`SequenceCache::commit_append`] or [`SequenceCache::abort_append`]. The
+/// embedded nonce makes copied or replayed reservations fail with
+/// [`CacheError::AppendReservationMismatch`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendReservation {
+    sequence: SequenceId,
+    start_position: usize,
+    rows: usize,
+    segments: Box<[AppendSegment]>,
+    nonce: u64,
+}
+
+impl AppendReservation {
+    /// Sequence the append belongs to.
+    pub fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+
+    /// Committed sequence position immediately before this append.
+    pub fn start_position(&self) -> usize {
+        self.start_position
+    }
+
+    /// Exact number of rows reserved and required at commit.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Ordered physical-page segments covering the complete append.
+    pub fn segments(&self) -> &[AppendSegment] {
+        &self.segments
+    }
+}
+
+/// One physical page borrowed for a reservation segment.
+pub struct AppendPage<'a, P> {
+    segment: AppendSegment,
+    page: &'a P,
+}
+
+/// Allocation-free ordered view of every page in an append reservation.
+pub struct AppendPages<'a, P> {
+    segments: &'a [AppendSegment],
+    slots: &'a [Slot<PageRecord<P>>],
+}
+
+impl<'a, P> AppendPages<'a, P> {
+    /// Number of writable physical segments in this reservation.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Whether the reservation contains no writable segments.
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Iterates over writable pages in logical token order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = AppendPage<'a, P>> + '_ {
+        self.segments.iter().map(|segment| {
+            let page = self
+                .slots
+                .get(segment.page.slot())
+                .filter(|slot| slot.generation == segment.page.generation)
+                .and_then(|slot| slot.value.as_ref())
+                .and_then(|record| record.physical.as_ref())
+                .expect("validated append page remains present");
+            AppendPage {
+                segment: *segment,
+                page,
+            }
+        })
+    }
+}
+
+impl<'a, P> AppendPage<'a, P> {
+    /// Logical and row-range description for this physical page.
+    pub fn segment(&self) -> AppendSegment {
+        self.segment
+    }
+
+    /// Backend page backing the segment.
+    pub fn page(&self) -> &'a P {
+        self.page
     }
 }
 
 /// Borrowed logical page ordering for an attention operation.
+///
+/// Pages are listed in token order; [`PageTableView::position`] gives the total
+/// valid tokens across them. Only the final page may be partially valid, and
+/// only while it is the sequence's private writable tail.
 pub struct PageTableView<'a> {
     pages: &'a [PageId],
     position: usize,
@@ -143,80 +309,141 @@ pub struct PageTableView<'a> {
 }
 
 impl PageTableView<'_> {
+    /// Logical pages in token order.
     pub fn pages(&self) -> &[PageId] {
         self.pages
     }
 
+    /// Total valid token position published with this table.
     pub fn position(&self) -> usize {
         self.position
     }
 
+    /// Tokens per page for interpreting the table.
     pub fn page_tokens(&self) -> usize {
         self.page_tokens
     }
 }
 
 /// Exact synchronous state owned by one manager.
+///
+/// Recomputed from ownership records after every mutation
+/// ([`SequenceCache::stats`]) and mirrored to the exported gauges, so optimizing
+/// telemetry against ownership is checked by [`SequenceCache::validate`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheStats {
+    /// Live sequences admitted but not yet finished.
     pub active_sequences: usize,
+    /// Currently retained prefix entries.
     pub retained_prefix_entries: usize,
+    /// Interned page-sized token blocks currently referenced by prefix entries.
     pub interned_token_blocks: usize,
+    /// Physical pages occupying storage, including deferred retirements.
     pub resident_pages: usize,
+    /// Pages a subsequent reserve could still commit, subject to the byte
+    /// budget and any backend slot cap.
     pub free_pages: usize,
+    /// Future pages promised to admitted sequences but not yet allocated.
     pub reserved_pages: usize,
+    /// Retired pages awaiting asynchronous backend reclamation.
     pub deferred_retirement_pages: usize,
+    /// Bytes occupied by `resident_pages`; shared pages are counted once.
     pub unique_resident_page_bytes: usize,
+    /// Bytes promised to admitted sequences for pages not yet allocated.
     pub outstanding_reservation_bytes: usize,
+    /// Per-sequence private state bytes across active sequences.
     pub active_private_state_bytes: usize,
+    /// Snapshot bytes held by retained prefix entries.
     pub retained_snapshot_bytes: usize,
+    /// Page-table bytes across active sequences.
     pub page_table_bytes: usize,
+    /// Bytes held solely by prefix entries and immediately reclaimable by
+    /// eviction.
     pub reclaimable_prefix_only_bytes: usize,
+    /// Sum of every managed byte class; admission keeps this within budget.
     pub total_managed_bytes: usize,
 }
 
+/// One arena slot: the value currently occupying it plus the generation the
+/// next handle minted from this slot must carry.
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
 }
 
+/// Ownership state of one logical page.
 struct PageRecord<P> {
+    /// Backend-owned storage. `None` marks a record being retired
+    /// transactionally; readers treat it as stale.
     physical: Option<P>,
+    /// Live sequences whose page tables include this page.
     active_refs: usize,
+    /// Retained prefix entries which share this page.
     prefix_refs: usize,
+    /// Committed tokens in this page; equals `page_tokens` once sealed.
     valid_tokens: usize,
+    /// Whether the page is complete and immutable, hence safe to share.
     sealed: bool,
 }
 
-#[derive(Clone, Copy)]
+/// In-flight exact append spanning one or more pages.
+#[derive(Clone)]
 struct PendingAppend {
-    page: PageId,
-    start: usize,
-    max_rows: usize,
+    start_position: usize,
+    rows: usize,
+    segments: Box<[AppendSegment]>,
+    new_pages: Box<[PageId]>,
     nonce: u64,
 }
 
+/// Ownership state of one admitted sequence.
 struct SequenceRecord {
+    /// Logical pages in token order.
     pages: Vec<PageId>,
+    /// Committed token position.
     position: usize,
+    /// Admitted maximum token position.
     max_position: usize,
+    /// Pages still promised for growth toward `max_position`.
     reserved_pages: usize,
+    /// Exact declared private-state bytes.
     private_state_bytes: usize,
+    /// Exact declared page-table bytes.
     page_table_bytes: usize,
+    /// Pending append, if any.
     pending: Option<PendingAppend>,
 }
 
+/// One retained prefix checkpoint.
 struct PrefixEntry<S> {
+    /// ART key over the interned token block IDs.
     key: PrefixKey,
+    /// Blocks contributing to the key, held for refcounted release.
     blocks: Vec<TokenBlockId>,
+    /// Sealed shared pages backing the entry, in token order.
     pages: Vec<PageId>,
+    /// Page-aligned token position covered by the entry.
     position: usize,
+    /// Runtime-defined immutable snapshot stored at the prefix end.
     snapshot: S,
+    /// Managed bytes attributed to the snapshot.
     snapshot_bytes: usize,
+    /// Logical clock of the last lookup or retention, for LRU eviction.
     last_used: u64,
 }
 
 /// Single-owner logical sequence and reusable-prefix manager.
+///
+/// The cache owns page lifetimes, prefix indexing, admission reservations, and
+/// exact byte accounting for one model runtime. It is generic over:
+///
+/// - `B` — a [`PageBackend`] supplying transactional physical storage; and
+/// - `S` — a [`RetainedSnapshot`] stored at retained prefix endpoints.
+///
+/// All mutation is serialized through `&mut self`, so no interior locking is
+/// required on either the manager or the backend. The cache is deliberately
+/// `!Sync`; callers which share it across tasks must serialize access
+/// themselves.
 pub struct SequenceCache<B: PageBackend, S: RetainedSnapshot> {
     config: CacheConfig,
     page_bytes: usize,
@@ -238,10 +465,15 @@ pub struct SequenceCache<B: PageBackend, S: RetainedSnapshot> {
 }
 
 impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
+    /// Create a cache over `backend` with default single-shard metrics.
     pub fn new(config: CacheConfig, backend: B) -> Result<Self, B::Error> {
         Self::with_metrics(config, backend, CacheMetrics::default())
     }
 
+    /// Create a cache exporting into a pre-built [`CacheMetrics`] set.
+    ///
+    /// Supplying the metric set lets a runtime choose the shard count and reuse
+    /// one registry across several caches.
     pub fn with_metrics(
         config: CacheConfig,
         backend: B,
@@ -273,32 +505,49 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(cache)
     }
 
+    /// Immutable geometry and byte limits the cache was built with.
     pub fn config(&self) -> CacheConfig {
         self.config
     }
 
+    /// The storage backend, for read-only runtime queries.
     pub fn backend(&self) -> &B {
         &self.backend
     }
 
     /// Perform a short backend configuration or diagnostic operation.
+    ///
+    /// The closure runs synchronously while no other cache operation is in
+    /// flight. It must not mutate page storage or tables the manager currently
+    /// owns.
     pub fn with_backend<R>(&mut self, operation: impl FnOnce(&mut B) -> R) -> R {
         operation(&mut self.backend)
     }
 
+    /// Exported counters, gauges, and latency histograms for this cache.
     pub fn metrics(&self) -> &CacheMetrics {
         &self.metrics
     }
 
+    /// Exact ownership snapshot; identical to the exported gauges.
     pub fn stats(&self) -> CacheStats {
         self.stats
     }
 
     /// Default checkpoint position, preserving the final prompt token for decode.
+    ///
+    /// The result is the largest page-aligned position strictly below
+    /// `prompt_tokens`, since the final prompt token has not been processed when
+    /// a prompt is checkpointed before decode.
     pub fn cacheable_prefix_tokens(&self, prompt_tokens: usize) -> usize {
         prompt_tokens.saturating_sub(1) / self.config.page_tokens * self.config.page_tokens
     }
 
+    /// Find the longest retained prefix covering the start of `tokens`.
+    ///
+    /// The query is truncated to [`SequenceCache::cacheable_prefix_tokens`]
+    /// before matching. A miss never interns token blocks, so speculative
+    /// lookups cannot grow the index. A hit refreshes the entry's LRU clock.
     pub fn lookup_prefix(&mut self, tokens: &[u32]) -> Option<PrefixMatch> {
         let started = Instant::now();
         self.metrics.prefix_lookups.inc();
@@ -346,8 +595,16 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
 
     /// Admit a sequence, optionally sharing a previously matched aligned prefix.
     ///
-    /// `restore` receives the retained immutable snapshot before any manager
-    /// ownership is committed. A failure leaves cache metadata unchanged.
+    /// Admission is strict: the request reserves every page needed to reach
+    /// [`AdmissionRequest::max_position`], so an admitted sequence can always
+    /// grow to its full length. When a [`PrefixMatch`] is supplied, its sealed
+    /// pages are shared without copying and the sequence starts past the prefix.
+    ///
+    /// The `restore` callback receives the retained immutable snapshot and the
+    /// aligned position before any manager ownership is committed, letting the
+    /// runtime rebuild non-paged state. Its failure leaves cache metadata
+    /// unchanged. When capacity cannot be guaranteed the call returns
+    /// [`AdmissionOutcome::WouldBlock`] rather than an error.
     pub fn admit<F>(
         &mut self,
         prefix: Option<PrefixMatch>,
@@ -434,232 +691,289 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(AdmissionOutcome::Admitted(id))
     }
 
-    /// Begin an append, allocating exactly one page when crossing a boundary.
+    /// Reserve an exact append, allocating every physical page it spans.
+    ///
+    /// The returned reservation covers the requested rows without regard to
+    /// page boundaries. Its complete page table is published before this
+    /// method returns, allowing one model operation to write and attend through
+    /// every segment. Only one append may be pending per sequence.
     pub fn reserve_append(
         &mut self,
         sequence: SequenceId,
-        requested_rows: usize,
+        rows: usize,
         context: &mut B::Context<'_>,
-    ) -> Result<AppendTarget, B::Error> {
-        if requested_rows == 0 {
+    ) -> Result<AppendReservation, B::Error> {
+        if rows == 0 {
             return Err(CacheError::InvalidPosition);
         }
-        let (position, max_position, old_pages, reserved_pages, pending) = {
+        let (position, max_position, old_page_count, tail, reserved_pages, pending) = {
             let record = self.sequence_record(sequence)?;
             (
                 record.position,
                 record.max_position,
-                record.pages.clone(),
+                record.pages.len(),
+                record.pages.last().copied(),
                 record.reserved_pages,
-                record.pending,
+                record.pending.is_some(),
             )
         };
-        if pending.is_some() {
+        if pending {
             return Err(CacheError::AppendPending);
         }
-        if position >= max_position {
+        let new_position = position
+            .checked_add(rows)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        if new_position > max_position {
             return Err(CacheError::InvalidPosition);
         }
-        let mut page_ids = old_pages.clone();
-        let offset = position % self.config.page_tokens;
-        let page = if offset == 0 {
-            let reusable_empty_tail = old_pages.last().copied().filter(|page| {
-                self.page_record(*page)
-                    .map(|record| record.valid_tokens == 0 && !record.sealed)
-                    .unwrap_or(false)
-            });
-            if let Some(page) = reusable_empty_tail {
-                page
-            } else {
-                if reserved_pages == 0 {
-                    return Err(CacheError::Invariant("append has no admitted reservation"));
-                }
-                self.prepare_page_slot()?;
-                let allocation = match self.backend.allocate_page(context) {
-                    Ok(allocation) => allocation,
-                    Err(error) => {
-                        self.metrics.backend_failures.inc();
-                        return Err(CacheError::Backend(error));
+        if let Some(tail) = tail.filter(|_| !position.is_multiple_of(self.config.page_tokens)) {
+            let record = self.page_record(tail)?;
+            if record.sealed || record.active_refs != 1 || record.prefix_refs != 0 {
+                return Err(CacheError::Invariant("writable tail is not private"));
+            }
+        }
+
+        let required_pages = div_ceil(new_position, self.config.page_tokens)?;
+        let new_page_count = required_pages
+            .checked_sub(old_page_count)
+            .ok_or(CacheError::Invariant("append page count moved backwards"))?;
+        if new_page_count > reserved_pages {
+            return Err(CacheError::Invariant("append exceeds admitted reservation"));
+        }
+        self.prepare_page_slots(new_page_count)?;
+        let nonce = self.next_append_nonce()?;
+
+        let mut allocations = Vec::with_capacity(new_page_count);
+        for _ in 0..new_page_count {
+            match self.backend.allocate_page(context) {
+                Ok(allocation) => allocations.push(allocation),
+                Err(error) => {
+                    for allocation in allocations.drain(..).rev() {
+                        self.backend.rollback_page(allocation.page, context);
                     }
-                };
-                let physical = allocation.page;
-                page_ids.push(self.peek_page_id()?);
-                let (backend, pages) = (&mut self.backend, &self.pages);
-                let mut refs = physical_refs_from::<B>(pages, &old_pages)?;
-                refs.push(&physical);
-                if let Err(error) = backend.update_page_table(&refs, position, context) {
-                    backend.rollback_page(physical, context);
                     self.metrics.backend_failures.inc();
                     return Err(CacheError::Backend(error));
                 }
-                let page = self.insert_page(PageRecord {
-                    physical: Some(physical),
-                    active_refs: 1,
-                    prefix_refs: 0,
-                    valid_tokens: 0,
-                    sealed: false,
-                })?;
-                debug_assert_eq!(page_ids.last().copied(), Some(page));
-                let sequence_record = self.sequence_record_mut(sequence)?;
-                sequence_record.pages.push(page);
-                sequence_record.reserved_pages -= 1;
-                if allocation.recycled {
-                    self.metrics.pages_recycled.inc();
-                } else {
-                    self.metrics.pages_allocated.inc();
-                }
-                page
             }
-        } else {
-            *old_pages
-                .last()
-                .ok_or(CacheError::Invariant("non-zero position has no tail page"))?
-        };
-        let page_record = self.page_record(page)?;
-        if page_record.sealed || page_record.active_refs != 1 || page_record.prefix_refs != 0 {
-            return Err(CacheError::Invariant("writable tail is not private"));
         }
-        let available = (self.config.page_tokens - offset).min(max_position - position);
-        let max_rows = requested_rows.min(available);
-        let nonce = self.next_append_nonce()?;
+        if !allocations.is_empty() {
+            let old_pages = self.sequence_record(sequence)?.pages.clone();
+            let (backend, page_slots) = (&mut self.backend, &self.pages);
+            let mut table = physical_refs_from::<B>(page_slots, &old_pages)?;
+            table.extend(allocations.iter().map(|allocation| &allocation.page));
+            if let Err(error) = backend.update_page_table(&table, position, context) {
+                for allocation in allocations.drain(..).rev() {
+                    backend.rollback_page(allocation.page, context);
+                }
+                self.metrics.backend_failures.inc();
+                return Err(CacheError::Backend(error));
+            }
+        }
+
+        let mut new_pages = Vec::with_capacity(new_page_count);
+        for allocation in allocations {
+            let page = self.insert_page_prepared(PageRecord {
+                physical: Some(allocation.page),
+                active_refs: 1,
+                prefix_refs: 0,
+                valid_tokens: 0,
+                sealed: false,
+            });
+            new_pages.push(page);
+            if allocation.recycled {
+                self.metrics.pages_recycled.inc();
+            } else {
+                self.metrics.pages_allocated.inc();
+            }
+        }
+        let mut segments =
+            Vec::with_capacity(rows.div_ceil(self.config.page_tokens).saturating_add(1));
+        let mut input_offset = 0;
+        let mut logical_position = position;
+        while input_offset < rows {
+            let logical_page = logical_position / self.config.page_tokens;
+            let page_offset = logical_position % self.config.page_tokens;
+            let segment_rows = (rows - input_offset).min(self.config.page_tokens - page_offset);
+            let page = if logical_page < old_page_count {
+                *self
+                    .sequence_record(sequence)?
+                    .pages
+                    .get(logical_page)
+                    .ok_or(CacheError::Invariant(
+                        "existing page missing from append span",
+                    ))?
+            } else {
+                *new_pages
+                    .get(logical_page - old_page_count)
+                    .ok_or(CacheError::Invariant("new page missing from append span"))?
+            };
+            segments.push(AppendSegment {
+                page,
+                page_offset,
+                input_offset,
+                rows: segment_rows,
+            });
+            input_offset += segment_rows;
+            logical_position += segment_rows;
+        }
+        let segments = segments.into_boxed_slice();
         let pending = PendingAppend {
-            page,
-            start: offset,
-            max_rows,
+            start_position: position,
+            rows,
+            segments: segments.clone(),
+            new_pages: new_pages.clone().into_boxed_slice(),
             nonce,
         };
-        self.sequence_record_mut(sequence)?.pending = Some(pending);
+        let record = self.sequence_record_mut(sequence)?;
+        record.reserved_pages -= new_page_count;
+        record.pending = Some(pending);
         self.refresh_stats()?;
-        Ok(AppendTarget {
+        Ok(AppendReservation {
             sequence,
-            page,
-            start: offset,
-            max_rows,
+            start_position: position,
+            rows,
+            segments,
             nonce,
         })
     }
 
-    /// Borrow the backend and pending writable page for a runtime append enqueue.
-    pub fn with_append_page<R, F>(
+    /// Borrow every physical page covered by a pending reservation.
+    ///
+    /// The pages are ordered exactly like the reservation segments. Runtime
+    /// kernels may scatter one compute chunk directly into these pages.
+    pub fn with_append_pages<R, F>(
         &mut self,
-        target: AppendTarget,
+        reservation: &AppendReservation,
         operation: F,
     ) -> Result<R, B::Error>
     where
-        F: FnOnce(&mut B, &mut B::Page) -> core::result::Result<R, B::Error>,
+        F: FnOnce(&mut B, AppendPages<'_, B::Page>) -> core::result::Result<R, B::Error>,
     {
-        self.validate_target(target)?;
-        let slot = target.page.slot();
-        let (backend, pages) = (&mut self.backend, &mut self.pages);
-        let record = pages
-            .get_mut(slot)
-            .and_then(|slot| (slot.generation == target.page.generation).then_some(slot))
-            .and_then(|slot| slot.value.as_mut())
-            .ok_or(CacheError::StalePage)?;
-        let page = record.physical.as_mut().ok_or(CacheError::StalePage)?;
-        operation(backend, page).map_err(|error| {
+        self.validate_reservation(reservation)?;
+        let (backend, slots) = (&mut self.backend, &self.pages);
+        let pages = AppendPages {
+            segments: &reservation.segments,
+            slots,
+        };
+        operation(backend, pages).map_err(|error| {
             self.metrics.backend_failures.inc();
             CacheError::Backend(error)
         })
     }
 
-    /// Commit rows previously written through an [`AppendTarget`].
+    /// Commit the complete span described by a reservation.
+    ///
+    /// Exact reservations do not support partial commit. A backend failure
+    /// leaves the prior logical position intact and the reservation pending.
     pub fn commit_append(
         &mut self,
-        target: AppendTarget,
-        rows: usize,
+        reservation: AppendReservation,
         context: &mut B::Context<'_>,
     ) -> Result<(), B::Error> {
-        self.validate_target(target)?;
-        if rows == 0 || rows > target.max_rows {
-            return Err(CacheError::InvalidPosition);
-        }
-        let (page_ids, old_position) = {
-            let sequence = self.sequence_record(target.sequence)?;
-            (sequence.pages.clone(), sequence.position)
+        self.validate_reservation(&reservation)?;
+        let new_pages = {
+            let sequence = self.sequence_record(reservation.sequence)?;
+            let pending = sequence
+                .pending
+                .as_ref()
+                .ok_or(CacheError::NoAppendPending)?;
+            pending.new_pages.to_vec()
         };
-        let new_position = old_position
-            .checked_add(rows)
+        let new_position = reservation
+            .start_position
+            .checked_add(reservation.rows)
             .ok_or(CacheError::ArithmeticOverflow)?;
-        let new_valid = target
-            .start
-            .checked_add(rows)
-            .ok_or(CacheError::ArithmeticOverflow)?;
-        let seal = new_valid == self.config.page_tokens;
-
-        let target_slot = target.page.slot();
-        let (backend, pages) = (&mut self.backend, &mut self.pages);
-        let (before, rest) = pages.split_at_mut(target_slot);
-        let (target_slot_ref, after) = rest.split_first_mut().ok_or(CacheError::StalePage)?;
-        if target_slot_ref.generation != target.page.generation {
-            return Err(CacheError::StalePage);
-        }
-        let target_record = target_slot_ref
-            .value
-            .as_mut()
-            .ok_or(CacheError::StalePage)?;
-        let target_physical = target_record
-            .physical
-            .as_mut()
-            .ok_or(CacheError::StalePage)?;
-        let target_logical = page_ids
+        let mut sealed_ids = Vec::new();
+        for segment in reservation
+            .segments
             .iter()
-            .position(|page| *page == target.page)
-            .ok_or(CacheError::Invariant(
-                "append page missing from sequence table",
-            ))?;
-        let mut table_before = Vec::with_capacity(target_logical);
-        let mut table_after = Vec::with_capacity(page_ids.len().saturating_sub(target_logical + 1));
-        for (logical, id) in page_ids.iter().enumerate() {
-            if logical == target_logical {
-                debug_assert_eq!(*id, target.page);
-                continue;
-            }
-            let slot = if id.slot() < target_slot {
-                before.get(id.slot())
-            } else {
-                after.get(id.slot() - target_slot - 1)
-            }
-            .filter(|slot| slot.generation == id.generation)
-            .and_then(|slot| slot.value.as_ref())
-            .and_then(|record| record.physical.as_ref())
-            .ok_or(CacheError::StalePage)?;
-            if logical < target_logical {
-                table_before.push(slot);
-            } else {
-                table_after.push(slot);
+            .filter(|segment| segment.page_offset + segment.rows == self.config.page_tokens)
+        {
+            if !self.page_record(segment.page)?.sealed {
+                sealed_ids.push(segment.page);
             }
         }
-        if let Err(error) = backend.commit_append(
-            target_physical,
-            &table_before,
-            &table_after,
-            new_position,
-            seal,
-            context,
-        ) {
-            self.metrics.backend_failures.inc();
-            return Err(CacheError::Backend(error));
+        {
+            let (backend, slots) = (&mut self.backend, &self.pages);
+            let sealed = physical_refs_from::<B>(slots, &sealed_ids)?;
+            if let Err(error) = backend.commit_append(&sealed, new_position, context) {
+                self.metrics.backend_failures.inc();
+                return Err(CacheError::Backend(error));
+            }
         }
-        target_record.valid_tokens = new_valid;
-        target_record.sealed = seal;
-        let sequence = self.sequence_record_mut(target.sequence)?;
+        let page_tokens = self.config.page_tokens;
+        for segment in reservation.segments.iter().copied() {
+            let record = self.page_record_mut(segment.page)?;
+            record.valid_tokens = segment.page_offset + segment.rows;
+            record.sealed = record.valid_tokens == page_tokens;
+        }
+        let sequence = self.sequence_record_mut(reservation.sequence)?;
+        sequence.pages.extend_from_slice(&new_pages);
         sequence.position = new_position;
         sequence.pending = None;
-        if seal {
-            self.metrics.pages_sealed.inc();
-        }
+        self.metrics
+            .pages_sealed
+            .add(sealed_ids.len().min(isize::MAX as usize) as isize);
         self.refresh_stats()?;
         Ok(())
     }
 
-    /// Cancel a pending append without changing logical length.
-    pub fn abort_append(&mut self, target: AppendTarget) -> Result<(), B::Error> {
-        self.validate_target(target)?;
-        self.sequence_record_mut(target.sequence)?.pending = None;
+    /// Abort a reservation and restore the exact prior page table.
+    ///
+    /// If restoring the backend table fails, the reservation remains pending
+    /// and may be retried. On success every newly allocated page is returned.
+    pub fn abort_append(
+        &mut self,
+        reservation: AppendReservation,
+        context: &mut B::Context<'_>,
+    ) -> Result<(), B::Error> {
+        self.validate_reservation(&reservation)?;
+        let (old_pages, new_pages, old_position) = {
+            let sequence = self.sequence_record(reservation.sequence)?;
+            let pending = sequence
+                .pending
+                .as_ref()
+                .ok_or(CacheError::NoAppendPending)?;
+            (
+                sequence.pages.clone(),
+                pending.new_pages.to_vec(),
+                sequence.position,
+            )
+        };
+        if !new_pages.is_empty() {
+            let (backend, slots) = (&mut self.backend, &self.pages);
+            let table = physical_refs_from::<B>(slots, &old_pages)?;
+            if let Err(error) = backend.update_page_table(&table, old_position, context) {
+                self.metrics.backend_failures.inc();
+                return Err(CacheError::Backend(error));
+            }
+        }
+        {
+            let (backend, slots) = (&mut self.backend, &self.pages);
+            let physical_pages = physical_refs_from::<B>(slots, &new_pages)?;
+            if let Err(error) = backend.abort_append(&physical_pages, context) {
+                self.metrics.backend_failures.inc();
+                return Err(CacheError::Backend(error));
+            }
+        }
+        for page in &new_pages {
+            self.page_record_mut(*page)?
+                .physical
+                .take()
+                .ok_or(CacheError::StalePage)?;
+            self.remove_page(*page)?;
+        }
+        let sequence = self.sequence_record_mut(reservation.sequence)?;
+        sequence.reserved_pages = sequence
+            .reserved_pages
+            .checked_add(new_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        sequence.pending = None;
+        self.refresh_stats()?;
         Ok(())
     }
 
+    /// Borrow the sequence's logical page table and committed position.
     pub fn page_table(&self, sequence: SequenceId) -> Result<PageTableView<'_>, B::Error> {
         let sequence = self.sequence_record(sequence)?;
         Ok(PageTableView {
@@ -669,6 +983,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         })
     }
 
+    /// Resolve a page handle to its backend storage.
     pub fn page(&self, page: PageId) -> Result<&B::Page, B::Error> {
         self.page_record(page)?
             .physical
@@ -677,6 +992,17 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     /// Retain the sequence's current aligned pages without copying KV storage.
+    ///
+    /// The sequence must end exactly on a page boundary with all pages sealed;
+    /// the retained entry shares those pages, its interned token blocks become
+    /// the index key, and `snapshot` records any extra model state a future
+    /// admission needs to resume past the prefix. Already-retained prefixes
+    /// report [`RetainOutcome::Duplicate`] and refresh the existing entry's LRU
+    /// clock instead of evicting a competitor.
+    ///
+    /// When capacity is tight the manager first evicts colder prefix entries,
+    /// including ones sharing pages with active sequences; only entry metadata
+    /// and unshared pages are reclaimed.
     pub fn retain_prefix(
         &mut self,
         sequence: SequenceId,
@@ -787,6 +1113,11 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(RetainOutcome::Inserted(id))
     }
 
+    /// Drop one retained prefix entry.
+    ///
+    /// Pages also referenced by live sequences stay resident; pages owned only
+    /// by the entry are retired through the backend. Any outstanding
+    /// [`PrefixMatch`] against the entry becomes stale.
     pub fn evict_prefix(
         &mut self,
         entry: PrefixEntryId,
@@ -801,6 +1132,11 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     /// Branch an unaligned live sequence, sharing sealed pages and copying one tail.
+    ///
+    /// The new sequence starts at the source's current position. Its complete
+    /// pages are shared with the source; its writable tail is a private
+    /// copy-on-write duplicate, after which the branch is independent. The
+    /// source must not have a pending append.
     pub fn branch(
         &mut self,
         source: SequenceId,
@@ -904,6 +1240,11 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     /// Finish or cancel a sequence and release reservations and active page refs.
+    ///
+    /// Pages the sequence shares with retained prefixes or other live sequences
+    /// remain resident; unshared pages and unused reservations are freed. A
+    /// sequence with a pending append must finish that append first, either by
+    /// commit or abort.
     pub fn finish(
         &mut self,
         sequence: SequenceId,
@@ -938,6 +1279,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     /// Poll backend synchronization and release completed deferred retirements.
+    ///
+    /// Deferred pages remain charged against capacity until reclaimed, so
+    /// runtimes with asynchronous retirement should call this periodically —
+    /// admission does so automatically. Returns the number of pages reclaimed.
     pub fn reclaim_deferred(&mut self, context: &mut B::Context<'_>) -> Result<usize, B::Error> {
         let reclaimed = self.backend.poll_reclaimed(context).map_err(|error| {
             self.metrics.backend_failures.inc();
@@ -954,6 +1299,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     /// Recompute references and byte totals from first principles.
+    ///
+    /// Checks every ownership invariant — reference counts, alignment, sealing,
+    /// exact stats, and gauge agreement — without mutating state. Intended for
+    /// tests and debug-enabled health checks, not the hot path.
     pub fn validate(&self) -> Result<(), B::Error> {
         let mut active_refs: HashMap<PageId, usize> = HashMap::new();
         for slot in &self.sequences {
@@ -983,6 +1332,21 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             for page in &sequence.pages {
                 *active_refs.entry(*page).or_default() += 1;
             }
+            if let Some(pending) = &sequence.pending {
+                for page in pending.new_pages.iter().copied() {
+                    *active_refs.entry(page).or_default() += 1;
+                    let record = self.page_record(page)?;
+                    if record.valid_tokens != 0
+                        || record.sealed
+                        || record.active_refs != 1
+                        || record.prefix_refs != 0
+                    {
+                        return Err(CacheError::Invariant(
+                            "pending append page is not private and empty",
+                        ));
+                    }
+                }
+            }
             if let Some(tail) = sequence.pages.last().filter(|_| !has_preallocated_tail) {
                 let tail = self.page_record(*tail)?;
                 let expected = if sequence.position.is_multiple_of(self.config.page_tokens) {
@@ -1002,7 +1366,11 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 }
             }
             let max_pages = div_ceil(sequence.max_position, self.config.page_tokens)?;
-            if sequence.pages.len() + sequence.reserved_pages != max_pages {
+            let pending_pages = sequence
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.new_pages.len());
+            if sequence.pages.len() + pending_pages + sequence.reserved_pages != max_pages {
                 return Err(CacheError::Invariant(
                     "sequence reservation disagrees with maximum",
                 ));
@@ -1311,17 +1679,18 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(nonce)
     }
 
-    fn validate_target(&self, target: AppendTarget) -> Result<(), B::Error> {
+    fn validate_reservation(&self, reservation: &AppendReservation) -> Result<(), B::Error> {
         let pending = self
-            .sequence_record(target.sequence)?
+            .sequence_record(reservation.sequence)?
             .pending
+            .as_ref()
             .ok_or(CacheError::NoAppendPending)?;
-        if pending.page != target.page
-            || pending.start != target.start
-            || pending.max_rows != target.max_rows
-            || pending.nonce != target.nonce
+        if pending.start_position != reservation.start_position
+            || pending.rows != reservation.rows
+            || pending.segments.as_ref() != reservation.segments.as_ref()
+            || pending.nonce != reservation.nonce
         {
-            return Err(CacheError::AppendTargetMismatch);
+            return Err(CacheError::AppendReservationMismatch);
         }
         Ok(())
     }
@@ -1365,6 +1734,19 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(())
     }
 
+    fn prepare_page_slots(&self, count: usize) -> Result<(), B::Error> {
+        let new_slots = count.saturating_sub(self.free_page_slots.len());
+        let final_len = self
+            .pages
+            .len()
+            .checked_add(new_slots)
+            .ok_or(CacheError::IdExhausted("page slot"))?;
+        if final_len > u32::MAX as usize + 1 {
+            return Err(CacheError::IdExhausted("page slot"));
+        }
+        Ok(())
+    }
+
     fn peek_page_id(&self) -> Result<PageId, B::Error> {
         if let Some(slot) = self.free_page_slots.last().copied() {
             Ok(PageId::new(slot, self.pages[slot].generation))
@@ -1387,6 +1769,22 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 value: Some(value),
             });
             Ok(PageId::new(slot, 0))
+        }
+    }
+
+    fn insert_page_prepared(&mut self, value: PageRecord<B::Page>) -> PageId {
+        if let Some(slot) = self.free_page_slots.pop() {
+            let id = PageId::new(slot, self.pages[slot].generation);
+            self.pages[slot].value = Some(value);
+            id
+        } else {
+            let slot = self.pages.len();
+            debug_assert!(slot <= u32::MAX as usize);
+            self.pages.push(Slot {
+                generation: 0,
+                value: Some(value),
+            });
+            PageId::new(slot, 0)
         }
     }
 
@@ -1701,6 +2099,14 @@ mod tests {
 
         fn rollback_page(&mut self, _page: Self::Page, _context: &mut Self::Context<'_>) {}
 
+        fn abort_append(
+            &mut self,
+            _pages: &[&Self::Page],
+            _context: &mut Self::Context<'_>,
+        ) -> core::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
         fn copy_partial_page(
             &mut self,
             _source: &Self::Page,
@@ -1715,11 +2121,8 @@ mod tests {
 
         fn commit_append(
             &mut self,
-            _page: &mut Self::Page,
-            _pages_before: &[&Self::Page],
-            _pages_after: &[&Self::Page],
+            _sealed_pages: &[&Self::Page],
             _new_position: usize,
-            _seal: bool,
             _context: &mut Self::Context<'_>,
         ) -> core::result::Result<(), Self::Error> {
             Ok(())

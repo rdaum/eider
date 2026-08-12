@@ -15,7 +15,12 @@ pub struct RetireError<E, P> {
 /// One backend page allocation and whether it reused an existing physical slot.
 #[derive(Debug)]
 pub struct PageAllocation<P> {
+    /// The newly writable page.
     pub page: P,
+    /// Whether the page came from a recycled slot rather than fresh storage.
+    ///
+    /// This is informational only; the manager uses it to distinguish
+    /// allocation from reclamation in its exported counters.
     pub recycled: bool,
 }
 
@@ -28,14 +33,29 @@ pub struct RetireOutcome {
 
 /// Runtime-owned physical storage and synchronization operations.
 ///
-/// Metadata mutation is serialized by [`crate::SequenceCache`]. Implementations
-/// must not partially succeed: allocation and copy errors return no page, page
-/// table updates leave the previous table intact on failure, and retirement
-/// returns all input pages in [`RetireError`] on failure.
+/// The manager owns logical page lifetimes, reference counts, and accounting;
+/// the backend owns the physical storage those pages alias (for example device
+/// KV slabs) plus the page table each sequence reads through.
+///
+/// Metadata mutation is serialized by [`crate::SequenceCache`], so
+/// implementations do not need interior locking. Implementations must not
+/// partially succeed: allocation and copy errors return no page, page table
+/// updates leave the previous table intact on failure, and retirement returns
+/// all input pages in [`RetireError`] on failure. Pages handed to
+/// [`PageBackend::retire_pages`] become backend-owned again; until
+/// [`PageBackend::poll_reclaimed`] reports them reusable they remain charged
+/// against the cache's capacity.
 pub trait PageBackend {
     /// One physical page bundle.
+    ///
+    /// A bundle groups the per-layer storage addressed by one shared physical
+    /// slot so that the manager can account for it as a single page.
     type Page;
     /// Explicit runtime synchronization or executor context.
+    ///
+    /// The caller threads one context through every operation of a higher-level
+    /// cache call so the backend can enrol page updates and retirement into its
+    /// own synchronization discipline.
     type Context<'a>;
     /// Backend-specific error.
     type Error;
@@ -64,6 +84,18 @@ pub trait PageBackend {
     /// be infallible and need not follow normal asynchronous retirement.
     fn rollback_page(&mut self, page: Self::Page, context: &mut Self::Context<'_>);
 
+    /// Reclaim all pages from an aborted reservation after its old table is
+    /// republished.
+    ///
+    /// Implementations must ensure that earlier work using these pages has
+    /// completed before making them reusable. On failure every page must
+    /// remain allocated and unchanged.
+    fn abort_append(
+        &mut self,
+        pages: &[&Self::Page],
+        context: &mut Self::Context<'_>,
+    ) -> core::result::Result<(), Self::Error>;
+
     /// Copy the valid prefix of a writable tail into a new private page.
     fn copy_partial_page(
         &mut self,
@@ -72,21 +104,23 @@ pub trait PageBackend {
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<PageAllocation<Self::Page>, Self::Error>;
 
-    /// Commit a logical append and optionally seal its now-complete page.
+    /// Commit a logical append spanning one or more physical pages.
     ///
-    /// The page-table length update and sealing transition are one fallible
-    /// operation: on error the prior table and writable-page state remain valid.
+    /// The complete logical page table was already published by reservation.
+    /// `sealed_pages` is the ordered subset which became full in this append.
+    /// Publishing `new_position` and sealing those pages must be atomic: on
+    /// error the reservation remains writable and may be retried or aborted.
     fn commit_append(
         &mut self,
-        page: &mut Self::Page,
-        pages_before: &[&Self::Page],
-        pages_after: &[&Self::Page],
+        sealed_pages: &[&Self::Page],
         new_position: usize,
-        seal: bool,
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<(), Self::Error>;
 
     /// Atomically replace a sequence's backend-native page table.
+    ///
+    /// On failure both the previously published page ordering and position
+    /// must remain unchanged.
     fn update_page_table(
         &mut self,
         pages: &[&Self::Page],

@@ -1963,7 +1963,7 @@ impl Gemma4Model {
         stream: &CudaStream,
         cache: &mut Gemma4SequenceCache,
     ) -> Result<()> {
-        let target = cache
+        let reservation = cache
             .reserve_append(
                 sequence.cache_id,
                 1,
@@ -1973,15 +1973,23 @@ impl Gemma4Model {
                 },
             )
             .map_err(gemma4_cache_error)?;
-        let result = self.forward_token_uncommitted(sequence, token, output, stream, cache, target);
+        let result =
+            self.forward_token_uncommitted(sequence, token, output, stream, cache, &reservation);
         if let Err(error) = result {
-            cache.abort_append(target).map_err(gemma4_cache_error)?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(gemma4_cache_error)?;
             return Err(error);
         }
         cache
             .commit_append(
-                target,
-                1,
+                reservation,
                 &mut Sm12xCacheContext {
                     stream,
                     page_table: &mut sequence.page_table,
@@ -2000,7 +2008,7 @@ impl Gemma4Model {
         output: Gemma4PrefillOutput,
         stream: &CudaStream,
         cache: &mut Gemma4SequenceCache,
-        target: sequence_cache::AppendTarget,
+        reservation: &sequence_cache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if token as usize >= self.config.vocab_size {
@@ -2041,14 +2049,16 @@ impl Gemma4Model {
                 self.layers[layer_index - 1].output(&previous[layer_index - 1])
             };
             cache
-                .with_append_page(target, |backend, page| {
+                .with_append_pages(reservation, |backend, pages| {
+                    let page = pages.iter().next().expect("one decode append page");
+                    let segment = page.segment();
                     self.layers[layer_index].run_decode_into(
                         input,
                         &mut current[0],
                         Gemma4LayerCache {
                             pool: backend.pool_mut(layer_index)?,
-                            page_slot: page.slot(),
-                            page_offset: target.page_offset(),
+                            page_slot: page.page().slot(),
+                            page_offset: segment.page_offset(),
                             page_table: sequence.page_table.device(),
                             attention: state.compact_attention.for_layer_mut(local_attention)?,
                         },

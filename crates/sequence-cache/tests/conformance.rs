@@ -2,18 +2,20 @@ use sequence_cache::{
     AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, PageAllocation, PageBackend,
     RetainOutcome, RetainedSnapshot, RetireError, RetireOutcome, SequenceCache, SequenceId,
 };
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 #[derive(Clone, Debug)]
 struct FakePage {
     id: u64,
-    rows: Vec<u32>,
-    sealed: bool,
+    rows: RefCell<Vec<u32>>,
+    sealed: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
     Allocate,
+    Abort,
     Copy,
     Update,
     Commit,
@@ -46,9 +48,11 @@ struct FakeBackend {
     retirements: usize,
     rollbacks: usize,
     fail_next: Option<Operation>,
+    fail_allocation_after: Option<usize>,
     immediate_retirement: bool,
     deferred_pages: usize,
     complete_deferred: bool,
+    recycled_pages: Vec<FakePage>,
 }
 
 impl FakeBackend {
@@ -62,9 +66,11 @@ impl FakeBackend {
             retirements: 0,
             rollbacks: 0,
             fail_next: None,
+            fail_allocation_after: None,
             immediate_retirement: true,
             deferred_pages: 0,
             complete_deferred: false,
+            recycled_pages: Vec::new(),
         }
     }
 
@@ -77,6 +83,10 @@ impl FakeBackend {
 
     fn fail(&mut self, operation: Operation) {
         self.fail_next = Some(operation);
+    }
+
+    fn fail_allocation_after(&mut self, successful_allocations: usize) {
+        self.fail_allocation_after = Some(successful_allocations);
     }
 
     fn with_page_capacity(mut self, page_capacity: usize) -> Self {
@@ -111,22 +121,46 @@ impl PageBackend for FakeBackend {
         &mut self,
         _context: &mut Self::Context<'_>,
     ) -> Result<PageAllocation<Self::Page>, Self::Error> {
+        if let Some(remaining) = &mut self.fail_allocation_after {
+            if *remaining == 0 {
+                self.fail_allocation_after = None;
+                return Err(FakeError(Operation::Allocate));
+            }
+            *remaining -= 1;
+        }
         self.take_failure(Operation::Allocate)?;
-        let page = FakePage {
-            id: self.next_id,
-            rows: Vec::new(),
-            sealed: false,
+        let (page, recycled) = if let Some(page) = self.recycled_pages.pop() {
+            page.rows.borrow_mut().clear();
+            page.sealed.set(false);
+            (page, true)
+        } else {
+            let page = FakePage {
+                id: self.next_id,
+                rows: RefCell::new(Vec::new()),
+                sealed: Cell::new(false),
+            };
+            self.next_id += 1;
+            (page, false)
         };
-        self.next_id += 1;
         self.allocations += 1;
-        Ok(PageAllocation {
-            page,
-            recycled: false,
-        })
+        Ok(PageAllocation { page, recycled })
     }
 
-    fn rollback_page(&mut self, _page: Self::Page, _context: &mut Self::Context<'_>) {
+    fn rollback_page(&mut self, page: Self::Page, _context: &mut Self::Context<'_>) {
         self.rollbacks += 1;
+        self.recycled_pages.push(page);
+    }
+
+    fn abort_append(
+        &mut self,
+        pages: &[&Self::Page],
+        _context: &mut Self::Context<'_>,
+    ) -> Result<(), Self::Error> {
+        self.take_failure(Operation::Abort)?;
+        self.rollbacks += pages.len();
+        self.recycled_pages
+            .extend(pages.iter().map(|page| (*page).clone()));
+        Ok(())
     }
 
     fn copy_partial_page(
@@ -138,8 +172,8 @@ impl PageBackend for FakeBackend {
         self.take_failure(Operation::Copy)?;
         let page = FakePage {
             id: self.next_id,
-            rows: source.rows[..valid_tokens].to_vec(),
-            sealed: false,
+            rows: RefCell::new(source.rows.borrow()[..valid_tokens].to_vec()),
+            sealed: Cell::new(false),
         };
         self.next_id += 1;
         self.copies += 1;
@@ -151,20 +185,15 @@ impl PageBackend for FakeBackend {
 
     fn commit_append(
         &mut self,
-        page: &mut Self::Page,
-        pages_before: &[&Self::Page],
-        pages_after: &[&Self::Page],
+        sealed_pages: &[&Self::Page],
         new_position: usize,
-        seal: bool,
         context: &mut Self::Context<'_>,
     ) -> Result<(), Self::Error> {
         self.take_failure(Operation::Commit)?;
-        let mut table = pages_before.iter().map(|page| page.id).collect::<Vec<_>>();
-        table.push(page.id);
-        table.extend(pages_after.iter().map(|page| page.id));
-        context.table = table;
         context.position = new_position;
-        page.sealed = seal;
+        for page in sealed_pages {
+            page.sealed.set(true);
+        }
         Ok(())
     }
 
@@ -190,6 +219,7 @@ impl PageBackend for FakeBackend {
         }
         self.retirements += pages.len();
         let deferred_pages = if self.immediate_retirement {
+            self.recycled_pages.extend(pages);
             0
         } else {
             self.deferred_pages += pages.len();
@@ -273,25 +303,25 @@ fn append(
     rows: &[u32],
     context: &mut FakeContext,
 ) {
-    let mut consumed = 0;
-    while consumed < rows.len() {
-        let target = cache
-            .reserve_append(sequence, rows.len() - consumed, context)
-            .expect("reserve append");
-        let count = target.max_rows();
-        cache
-            .with_append_page(target, |_backend, page| {
-                assert_eq!(page.rows.len(), target.page_offset());
-                page.rows
-                    .extend_from_slice(&rows[consumed..consumed + count]);
-                Ok(())
-            })
-            .expect("write append rows");
-        cache
-            .commit_append(target, count, context)
-            .expect("commit append");
-        consumed += count;
-    }
+    let reservation = cache
+        .reserve_append(sequence, rows.len(), context)
+        .expect("reserve append");
+    cache
+        .with_append_pages(&reservation, |_backend, pages| {
+            for page in pages.iter() {
+                let segment = page.segment();
+                let mut physical_rows = page.page().rows.borrow_mut();
+                assert_eq!(physical_rows.len(), segment.page_offset());
+                physical_rows.extend_from_slice(
+                    &rows[segment.input_offset()..segment.input_offset() + segment.rows()],
+                );
+            }
+            Ok(())
+        })
+        .expect("write append rows");
+    cache
+        .commit_append(reservation, context)
+        .expect("commit append");
 }
 
 fn make_retained_prefix(
@@ -323,6 +353,232 @@ fn cacheable_positions_cover_empty_short_aligned_and_multi_page_prompts() {
     assert_eq!(cache.cacheable_prefix_tokens(5), 4);
     assert_eq!(cache.cacheable_prefix_tokens(8), 4);
     assert_eq!(cache.cacheable_prefix_tokens(9), 8);
+}
+
+fn segment_geometry(reservation: &sequence_cache::AppendReservation) -> Vec<(usize, usize, usize)> {
+    reservation
+        .segments()
+        .iter()
+        .map(|segment| {
+            (
+                segment.page_offset(),
+                segment.input_offset(),
+                segment.rows(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn exact_append_reservations_cover_single_and_multi_page_shapes() {
+    let cases = [
+        (0, 3, vec![(0, 0, 3)]),
+        (0, 12, vec![(0, 0, 4), (0, 4, 4), (0, 8, 4)]),
+        (2, 9, vec![(2, 0, 2), (0, 2, 4), (0, 6, 3)]),
+        (2, 6, vec![(2, 0, 2), (0, 2, 4)]),
+    ];
+    for (start, rows, expected) in cases {
+        let mut cache = cache(4_000);
+        let mut context = FakeContext::default();
+        let sequence = admit(&mut cache, 16, &mut context);
+        if start != 0 {
+            append(
+                &mut cache,
+                sequence,
+                &(0..start as u32).collect::<Vec<_>>(),
+                &mut context,
+            );
+        }
+        let reservation = cache
+            .reserve_append(sequence, rows, &mut context)
+            .expect("reserve exact span");
+        assert_eq!(reservation.start_position(), start);
+        assert_eq!(reservation.rows(), rows);
+        assert_eq!(segment_geometry(&reservation), expected);
+        assert_eq!(context.table.len(), (start + rows).div_ceil(4));
+        assert_eq!(context.position, start);
+        cache
+            .with_append_pages(&reservation, |_backend, pages| {
+                for page in pages.iter() {
+                    let segment = page.segment();
+                    let mut contents = page.page().rows.borrow_mut();
+                    contents.resize(segment.page_offset() + segment.rows(), 7);
+                }
+                Ok(())
+            })
+            .expect("write exact span");
+        cache
+            .commit_append(reservation, &mut context)
+            .expect("commit exact span");
+        let page_table = cache.page_table(sequence).expect("page table");
+        assert_eq!(page_table.position(), start + rows);
+        for (logical_page, &page_id) in page_table.pages().iter().enumerate() {
+            let valid_tokens = (start + rows - logical_page * 4).min(4);
+            let page = cache.page(page_id).expect("committed physical page");
+            assert_eq!(page.rows.borrow().len(), valid_tokens);
+            assert_eq!(page.sealed.get(), valid_tokens == 4);
+        }
+        assert_eq!(context.position, start + rows);
+        cache.validate().expect("valid exact span");
+    }
+}
+
+#[test]
+fn multi_page_reservation_enforces_maximum_without_mutation() {
+    let mut cache = cache(2_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 8, &mut context);
+    let before = cache.stats();
+    let error = cache
+        .reserve_append(sequence, 9, &mut context)
+        .expect_err("reservation beyond maximum");
+    assert!(matches!(error, CacheError::InvalidPosition));
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    cache.validate().expect("valid after rejected span");
+}
+
+#[test]
+fn multi_page_allocation_and_publication_failures_roll_back_every_page() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 16, &mut context);
+    let before = cache.stats();
+
+    cache.with_backend(|backend| backend.fail_allocation_after(2));
+    let error = cache
+        .reserve_append(sequence, 12, &mut context)
+        .expect_err("third allocation fails");
+    assert!(matches!(
+        error,
+        CacheError::Backend(FakeError(Operation::Allocate))
+    ));
+    assert_eq!(cache.backend().rollbacks, 2);
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    cache
+        .validate()
+        .expect("valid after partial allocation failure");
+
+    cache.with_backend(|backend| backend.fail(Operation::Update));
+    let error = cache
+        .reserve_append(sequence, 12, &mut context)
+        .expect_err("multi-page publication fails");
+    assert!(matches!(
+        error,
+        CacheError::Backend(FakeError(Operation::Update))
+    ));
+    assert_eq!(cache.backend().rollbacks, 5);
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    cache.validate().expect("valid after publication failure");
+}
+
+#[test]
+fn abort_restores_table_reservations_and_accounting_after_multi_page_publish() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 12, &mut context);
+    let before = cache.stats();
+    let reservation = cache
+        .reserve_append(sequence, 10, &mut context)
+        .expect("reserve three pages");
+    assert_eq!(context.table.len(), 3);
+    assert_eq!(cache.stats().resident_pages, 3);
+    assert_eq!(cache.stats().reserved_pages, 0);
+    cache
+        .abort_append(reservation, &mut context)
+        .expect("abort span");
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    assert_eq!(context.position, 0);
+    cache.validate().expect("valid after span abort");
+}
+
+#[test]
+fn failed_abort_restore_keeps_the_complete_reservation_pending() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 12, &mut context);
+    let before = cache.stats();
+    let reservation = cache
+        .reserve_append(sequence, 10, &mut context)
+        .expect("reserve three pages");
+    let reserved = cache.stats();
+    let published_table = context.table.clone();
+
+    cache.with_backend(|backend| backend.fail(Operation::Update));
+    let error = cache
+        .abort_append(reservation.clone(), &mut context)
+        .expect_err("table restoration fails");
+    assert!(matches!(
+        error,
+        CacheError::Backend(FakeError(Operation::Update))
+    ));
+    assert_eq!(cache.stats(), reserved);
+    assert_eq!(context.table, published_table);
+    cache.validate().expect("reservation remains valid");
+
+    cache
+        .abort_append(reservation, &mut context)
+        .expect("retry abort");
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    cache.validate().expect("valid after retried abort");
+}
+
+#[test]
+fn failed_abort_reclamation_preserves_every_reserved_page_for_retry() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 12, &mut context);
+    let before = cache.stats();
+    let reservation = cache
+        .reserve_append(sequence, 10, &mut context)
+        .expect("reserve three pages");
+    let reserved = cache.stats();
+
+    cache.with_backend(|backend| backend.fail(Operation::Abort));
+    let error = cache
+        .abort_append(reservation.clone(), &mut context)
+        .expect_err("page reclamation fails");
+    assert!(matches!(
+        error,
+        CacheError::Backend(FakeError(Operation::Abort))
+    ));
+    assert_eq!(cache.stats(), reserved);
+    assert!(context.table.is_empty());
+    cache.validate().expect("all pending pages were restored");
+
+    cache
+        .abort_append(reservation, &mut context)
+        .expect("retry abort");
+    assert_eq!(cache.stats(), before);
+    cache.validate().expect("valid after retried reclamation");
+}
+
+#[test]
+fn stale_multi_page_reservation_cannot_commit_over_a_new_one() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let sequence = admit(&mut cache, 12, &mut context);
+    let stale = cache
+        .reserve_append(sequence, 8, &mut context)
+        .expect("first reservation");
+    cache
+        .abort_append(stale.clone(), &mut context)
+        .expect("abort first reservation");
+    let current = cache
+        .reserve_append(sequence, 8, &mut context)
+        .expect("second reservation");
+    let error = cache
+        .commit_append(stale, &mut context)
+        .expect_err("stale commit");
+    assert!(matches!(error, CacheError::AppendReservationMismatch));
+    cache
+        .abort_append(current, &mut context)
+        .expect("abort current reservation");
+    cache.validate().expect("valid after stale reservation");
 }
 
 #[test]
@@ -480,7 +736,7 @@ fn page_table_order_is_logical_after_manager_slot_reuse() {
         .finish(temporary, &mut temporary_context)
         .expect("finish temporary sequence");
     append(&mut cache, sequence, &[5, 6, 7, 8], &mut context);
-    assert_eq!(context.table, vec![1, 2]);
+    assert_eq!(context.table, vec![1, 0]);
     cache.validate().expect("valid after page-slot reuse");
 }
 
@@ -511,7 +767,49 @@ fn unaligned_branch_shares_complete_pages_and_copies_one_tail() {
     assert_ne!(branch_pages[1], source_pages[1]);
     assert_eq!(cache.backend().copies, 1);
     assert_eq!(cache.stats().reserved_pages, 2);
+    let mut branch_context = FakeContext::default();
+    append(
+        &mut cache,
+        branch,
+        &[7, 8, 9, 10, 11, 12],
+        &mut branch_context,
+    );
+    let extended = cache.page_table(branch).expect("extended branch");
+    assert_eq!(extended.position(), 12);
+    assert_eq!(extended.pages()[0], source_pages[0]);
+    assert_ne!(extended.pages()[1], source_pages[1]);
+    assert_eq!(cache.page_table(source).expect("source").position(), 6);
     cache.validate().expect("valid branch");
+}
+
+#[test]
+fn multi_page_commit_and_recycling_metrics_match_page_transitions() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let first = admit(&mut cache, 12, &mut context);
+    append(
+        &mut cache,
+        first,
+        &(0..10).collect::<Vec<_>>(),
+        &mut context,
+    );
+    assert_eq!(cache.metrics().pages_allocated.sum(), 3);
+    assert_eq!(cache.metrics().pages_recycled.sum(), 0);
+    assert_eq!(cache.metrics().pages_sealed.sum(), 2);
+    assert_eq!(cache.stats().resident_pages, 3);
+    cache
+        .finish(first, &mut context)
+        .expect("retire first span");
+    assert_eq!(cache.metrics().pages_retired.sum(), 3);
+    assert_eq!(cache.stats().resident_pages, 0);
+
+    let second = admit(&mut cache, 8, &mut context);
+    append(&mut cache, second, &[10, 11, 12, 13, 14], &mut context);
+    assert_eq!(cache.metrics().pages_allocated.sum(), 3);
+    assert_eq!(cache.metrics().pages_recycled.sum(), 2);
+    assert_eq!(cache.metrics().pages_sealed.sum(), 3);
+    assert_eq!(cache.stats().resident_pages, 2);
+    cache.validate().expect("valid recycled span metrics");
 }
 
 #[test]
@@ -674,25 +972,34 @@ fn backend_failures_leave_accounting_valid() {
     ));
     assert_eq!(cache.stats(), branch_stats);
 
-    let target = cache
+    let reservation = cache
         .reserve_append(sequence, 1, &mut context)
         .expect("pending append");
     cache
-        .with_append_page(target, |_backend, page| {
-            page.rows.push(4);
+        .with_append_pages(&reservation, |_backend, pages| {
+            pages
+                .iter()
+                .next()
+                .expect("one append page")
+                .page()
+                .rows
+                .borrow_mut()
+                .push(4);
             Ok(())
         })
         .expect("write row");
     cache.with_backend(|backend| backend.fail(Operation::Commit));
     let error = cache
-        .commit_append(target, 1, &mut context)
+        .commit_append(reservation.clone(), &mut context)
         .expect_err("commit failure");
     assert!(matches!(
         error,
         CacheError::Backend(FakeError(Operation::Commit))
     ));
     assert_eq!(cache.page_table(sequence).expect("table").position(), 3);
-    cache.abort_append(target).expect("abort failed append");
+    cache
+        .abort_append(reservation, &mut context)
+        .expect("abort failed append");
     cache.validate().expect("valid after commit failure");
 }
 

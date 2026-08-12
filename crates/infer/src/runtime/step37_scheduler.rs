@@ -679,8 +679,6 @@ impl Step37Scheduler {
             }
             let mut chunk = available.min(token_budget.div_ceil(slots_remaining));
             let request = &self.requests[&id];
-            chunk =
-                chunk.min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS);
             if !request.prefix_cache_checkpointed
                 && request.prompt_position < request.prefix_cache_target
                 && request.prompt_position + chunk > request.prefix_cache_target

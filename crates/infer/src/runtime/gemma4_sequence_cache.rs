@@ -4,13 +4,13 @@ use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPage
 use crate::gemma4::{Gemma4DecodeState, Gemma4Model};
 use nvfp4::{CudaStream, Error, Result};
 use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheError, SequenceCache, SequenceId,
+    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
 
 pub type Gemma4SequenceCache = SequenceCache<Sm12xPageBackend, ()>;
 
 pub(crate) struct Gemma4Append<'a> {
-    pub(crate) target: AppendTarget,
+    pub(crate) reservation: &'a AppendReservation,
     pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
 }
 

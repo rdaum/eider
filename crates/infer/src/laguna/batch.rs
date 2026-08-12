@@ -313,68 +313,72 @@ impl LagunaModel {
         rows: &mut [LagunaPrefillRow<'_, '_>],
         cache: &mut LagunaSequenceCache,
     ) -> Result<()> {
-        let mut targets = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
-            let target = match cache.reserve_append(
-                row.sequence.cache_id,
-                row.token_ids.len(),
-                &mut Sm12xCacheContext {
-                    stream: &self.stream,
-                    page_table: &mut row.sequence.page_table,
-                },
-            ) {
-                Ok(target) => target,
+        let mut reservations = Vec::with_capacity(rows.len());
+        for index in 0..rows.len() {
+            let reservation = {
+                let row = &mut rows[index];
+                cache.reserve_append(
+                    row.sequence.cache_id,
+                    row.token_ids.len(),
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+            };
+            match reservation {
+                Ok(reservation) => reservations.push(reservation),
                 Err(error) => {
-                    for target in targets.drain(..) {
-                        cache.abort_append(target).map_err(laguna_cache_error)?;
+                    for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Sm12xCacheContext {
+                                    stream: &self.stream,
+                                    page_table: &mut row.sequence.page_table,
+                                },
+                            )
+                            .map_err(laguna_cache_error)?;
                     }
                     return Err(laguna_cache_error(error));
                 }
-            };
-            if target.max_rows() != row.token_ids.len() {
-                cache.abort_append(target).map_err(laguna_cache_error)?;
-                for target in targets.drain(..) {
-                    cache.abort_append(target).map_err(laguna_cache_error)?;
-                }
-                return Err(Error::Shape {
-                    label: "Laguna prefill chunk",
-                    expected: format!(
-                        "each row to fit within its current {}-token cache page",
-                        nvfp4::SM12X_KV_PAGE_TOKENS
-                    ),
-                    actual: format!("{} tokens", row.token_ids.len()),
-                });
             }
-            targets.push(target);
         }
         let result = {
             let mut state_rows = Vec::with_capacity(rows.len());
             let mut appends = Vec::with_capacity(rows.len());
-            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+            for (row, reservation) in rows.iter_mut().zip(&reservations) {
                 let sequence = &mut *row.sequence;
                 state_rows.push(LagunaPrefillStateRow {
                     token_ids: row.token_ids,
                     state: &mut sequence.state,
                 });
                 appends.push(LagunaAppend {
-                    target,
+                    reservation,
                     page_table: sequence.page_table.device(),
                 });
             }
             self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
         };
         if let Err(error) = result {
-            for target in targets {
-                cache.abort_append(target).map_err(laguna_cache_error)?;
+            for (row, reservation) in rows.iter_mut().zip(reservations) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &self.stream,
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(laguna_cache_error)?;
             }
             return Err(error);
         }
-        for (row, target) in rows.iter_mut().zip(targets) {
+        for (row, reservation) in rows.iter_mut().zip(reservations) {
             let tokens = row.token_ids.len();
             cache
                 .commit_append(
-                    target,
-                    tokens,
+                    reservation,
                     &mut Sm12xCacheContext {
                         stream: &self.stream,
                         page_table: &mut row.sequence.page_table,
@@ -662,38 +666,50 @@ fn run_attention_prefill(
     row_offset = 0;
     for (row, append) in rows.iter_mut().zip(appends) {
         let position = row.state.position;
+        if append.reservation.start_position() != position
+            || append.reservation.rows() != row.token_ids.len()
+        {
+            return Err(Error::Format {
+                label: "Laguna prefill append",
+                detail: "reservation does not match the prompt chunk".to_string(),
+            });
+        }
         cache
-            .with_append_page(append.target, |backend, page| {
+            .with_append_pages(append.reservation, |backend, pages| {
                 let pool = backend.pool_mut(layer_index)?;
                 let q_width = attention.q_heads * HEAD_DIM;
                 let kv_width = KV_HEADS * HEAD_DIM;
-                for token in 0..row.token_ids.len() {
-                    pool.append_at_offsets_on_stream(
-                        page.slot(),
-                        append.target.page_offset() + token,
-                        &workspace.k_rope,
-                        (row_offset + token) * kv_width,
-                        &workspace.v,
-                        (row_offset + token) * kv_width,
-                        stream,
-                    )?;
-                    let cache_len = position + token + 1;
-                    let window_start = attention
-                        .window
-                        .map_or(0, |window| cache_len.saturating_sub(window));
-                    workspace
-                        .compact
-                        .attention_paged_window_offsets_into_on_stream(
-                            pool,
-                            append.page_table,
-                            cache_len,
-                            &workspace.q_rope,
-                            (row_offset + token) * q_width,
-                            workspace.attended.output(),
-                            (row_offset + token) * q_width,
-                            window_start,
+                for page in pages.iter() {
+                    let segment = page.segment();
+                    for local_row in 0..segment.rows() {
+                        let token = segment.input_offset() + local_row;
+                        pool.append_at_offsets_on_stream(
+                            page.page().slot(),
+                            segment.page_offset() + local_row,
+                            &workspace.k_rope,
+                            (row_offset + token) * kv_width,
+                            &workspace.v,
+                            (row_offset + token) * kv_width,
                             stream,
                         )?;
+                        let cache_len = position + token + 1;
+                        let window_start = attention
+                            .window
+                            .map_or(0, |window| cache_len.saturating_sub(window));
+                        workspace
+                            .compact
+                            .attention_paged_window_offsets_into_on_stream(
+                                pool,
+                                append.page_table,
+                                cache_len,
+                                &workspace.q_rope,
+                                (row_offset + token) * q_width,
+                                workspace.attended.output(),
+                                (row_offset + token) * q_width,
+                                window_start,
+                                stream,
+                            )?;
+                    }
                 }
                 Ok(())
             })

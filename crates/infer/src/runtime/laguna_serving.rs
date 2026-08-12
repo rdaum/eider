@@ -559,7 +559,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             let fair_share = budget.div_ceil(remaining_sequences);
             let chunk = batchable
                 .min(prefill_chunk_capacity(request.prompt_position, fair_share))
-                .min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS)
                 .min(
                     if !request.prefix_cache_checkpointed
                         && request.prompt_position < request.prefix_cache_target

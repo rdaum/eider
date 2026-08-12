@@ -2063,7 +2063,7 @@ impl Step37TextModel {
         cache: &mut Step37SequenceCache,
     ) -> Result<()> {
         let target = self.reserve_token(sequence, cache)?;
-        let result = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        let result = self.forward_hidden_uncommitted(sequence, token, cache, &target);
         self.complete_token(sequence, cache, target, result)
     }
 
@@ -2127,7 +2127,7 @@ impl Step37TextModel {
         &self,
         sequence: &mut Step37Sequence,
         cache: &mut Step37SequenceCache,
-    ) -> Result<sequence_cache::AppendTarget> {
+    ) -> Result<sequence_cache::AppendReservation> {
         cache
             .reserve_append(
                 sequence.cache_id,
@@ -2144,17 +2144,24 @@ impl Step37TextModel {
         &self,
         sequence: &mut Step37Sequence,
         cache: &mut Step37SequenceCache,
-        target: sequence_cache::AppendTarget,
+        reservation: sequence_cache::AppendReservation,
         result: Result<()>,
     ) -> Result<()> {
         if let Err(error) = result {
-            cache.abort_append(target).map_err(step37_cache_error)?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(step37_cache_error)?;
             return Err(error);
         }
         cache
             .commit_append(
-                target,
-                1,
+                reservation,
                 &mut Sm12xCacheContext {
                     stream: &self.stream,
                     page_table: &mut sequence.page_table,
@@ -2170,7 +2177,7 @@ impl Step37TextModel {
         sequence: &mut Step37Sequence,
         token: u32,
         cache: &mut Step37SequenceCache,
-        target: sequence_cache::AppendTarget,
+        reservation: &sequence_cache::AppendReservation,
     ) -> Result<()> {
         let state = &mut sequence.state;
         if token as usize >= self.vocab {
@@ -2208,14 +2215,16 @@ impl Step37TextModel {
                 previous[layer - 1].output()
             };
             cache
-                .with_append_page(target, |backend, page| {
+                .with_append_pages(reservation, |backend, pages| {
+                    let page = pages.iter().next().expect("one decode append page");
+                    let segment = page.segment();
                     self.layers[layer].run_one(
                         &mut current[0],
                         input,
                         Step37LayerCache {
                             pool: backend.pool_mut(layer)?,
-                            page_slot: page.slot(),
-                            page_offset: target.page_offset(),
+                            page_slot: page.page().slot(),
+                            page_offset: segment.page_offset(),
                             page_table: sequence.page_table.device(),
                             attention: &mut state.kv_attention[layer],
                         },
@@ -2235,10 +2244,10 @@ impl Step37TextModel {
         token: u32,
         cache: &mut Step37SequenceCache,
     ) -> Result<()> {
-        let target = self.reserve_token(sequence, cache)?;
-        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, target);
+        let reservation = self.reserve_token(sequence, cache)?;
+        let hidden = self.forward_hidden_uncommitted(sequence, token, cache, &reservation);
         if let Err(error) = hidden {
-            return self.complete_token(sequence, cache, target, Err(error));
+            return self.complete_token(sequence, cache, reservation, Err(error));
         }
         let state = &mut sequence.state;
         let last = state
@@ -2277,7 +2286,7 @@ impl Step37TextModel {
                 )
             }
         };
-        self.complete_token(sequence, cache, target, result)
+        self.complete_token(sequence, cache, reservation, result)
     }
 
     /// Returns cumulative paging activity across all routed-expert layers.

@@ -22,6 +22,7 @@ impl Sm12xPage {
 /// Stable host/device page table owned by one active sequence.
 pub struct Sm12xPageTable {
     host: PinnedHostBuffer<u32>,
+    staging: PinnedHostBuffer<u32>,
     device: DeviceBuffer<u32>,
     page_capacity: usize,
     position: usize,
@@ -40,8 +41,11 @@ impl Sm12xPageTable {
         let page_capacity = max_position.div_ceil(SM12X_KV_PAGE_TOKENS);
         let mut host = PinnedHostBuffer::zeroed(page_capacity)?;
         host.as_mut_slice().fill(u32::MAX);
+        let mut staging = PinnedHostBuffer::zeroed(page_capacity)?;
+        staging.as_mut_slice().fill(u32::MAX);
         Ok(Self {
             host,
+            staging,
             device: DeviceBuffer::zeroed(page_capacity)?,
             page_capacity,
             position: 0,
@@ -65,7 +69,7 @@ impl Sm12xPageTable {
 
     /// Returns exact host and device bytes retained by the table.
     pub fn managed_bytes(&self) -> usize {
-        self.page_capacity * (size_of::<u32>() + size_of::<u32>())
+        self.page_capacity * (size_of::<u32>() * 3)
     }
 
     fn update(&mut self, pages: &[&Sm12xPage], position: usize, stream: &CudaStream) -> Result<()> {
@@ -81,19 +85,21 @@ impl Sm12xPageTable {
                 actual: format!("pages={} position={position}", pages.len()),
             });
         }
-        let host = self.host.as_mut_slice();
+        let host = self.host.as_slice();
         let changed = host[..pages.len()]
             .iter()
             .zip(pages)
             .any(|(slot, page)| *slot != page.slot)
             || host[pages.len()..].iter().any(|slot| *slot != u32::MAX);
         if changed {
-            for (destination, page) in host.iter_mut().zip(pages) {
+            let staging = self.staging.as_mut_slice();
+            for (destination, page) in staging.iter_mut().zip(pages) {
                 *destination = page.slot;
             }
-            host[pages.len()..].fill(u32::MAX);
+            staging[pages.len()..].fill(u32::MAX);
             self.device
-                .copy_range_from_pinned_on_stream(0, &self.host, stream)?;
+                .copy_range_from_pinned_on_stream(0, &self.staging, stream)?;
+            std::mem::swap(&mut self.host, &mut self.staging);
         }
         self.position = position;
         Ok(())
@@ -254,6 +260,23 @@ impl PageBackend for Sm12xPageBackend {
         self.free_slots.push(page.slot);
     }
 
+    fn abort_append(
+        &mut self,
+        pages: &[&Self::Page],
+        context: &mut Self::Context<'_>,
+    ) -> Result<()> {
+        for page in pages {
+            self.validate_page(**page)?;
+        }
+        context.stream.synchronize()?;
+        for page in pages {
+            let slot = page.slot();
+            self.used_slots[slot] = false;
+            self.free_slots.push(slot as u32);
+        }
+        Ok(())
+    }
+
     fn copy_partial_page(
         &mut self,
         source: &Self::Page,
@@ -282,21 +305,15 @@ impl PageBackend for Sm12xPageBackend {
 
     fn commit_append(
         &mut self,
-        page: &mut Self::Page,
-        pages_before: &[&Self::Page],
-        pages_after: &[&Self::Page],
+        sealed_pages: &[&Self::Page],
         new_position: usize,
-        _seal: bool,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        self.validate_page(*page)?;
-        let mut pages = Vec::with_capacity(pages_before.len() + 1 + pages_after.len());
-        pages.extend_from_slice(pages_before);
-        pages.push(page);
-        pages.extend_from_slice(pages_after);
-        context
-            .page_table
-            .update(&pages, new_position, context.stream)
+        for page in sealed_pages {
+            self.validate_page(**page)?;
+        }
+        context.page_table.position = new_position;
+        Ok(())
     }
 
     fn update_page_table(
@@ -402,16 +419,14 @@ mod tests {
                 stream: &stream,
                 page_table: &mut source_table,
             };
-            let target = cache
+            let reservation = cache
                 .reserve_append(source, SM12X_KV_PAGE_TOKENS, &mut context)
                 .expect("reserve first page");
+            let first_page = reservation.segments()[0].page();
             cache
-                .commit_append(target, SM12X_KV_PAGE_TOKENS, &mut context)
+                .commit_append(reservation, &mut context)
                 .expect("commit first page");
-            cache
-                .page(target.page())
-                .expect("first physical page")
-                .slot()
+            cache.page(first_page).expect("first physical page").slot()
         };
         cache
             .retain_prefix(
@@ -458,17 +473,17 @@ mod tests {
                 },
             )
             .expect("reserve source tail");
+        let tail_page = tail.segments()[0].page();
         cache
             .commit_append(
                 tail,
-                3,
                 &mut Sm12xCacheContext {
                     stream: &stream,
                     page_table: &mut source_table,
                 },
             )
             .expect("commit source tail");
-        let source_tail = cache.page(tail.page()).expect("source tail").slot();
+        let source_tail = cache.page(tail_page).expect("source tail").slot();
 
         let mut branch_table = Sm12xPageTable::new(512).expect("branch page table");
         let branch = admitted(

@@ -4,7 +4,7 @@ use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPage
 use crate::step37::{HEAD_DIM, KV_HEADS, Step37DecodeState, Step37TextModel};
 use nvfp4::{CudaStream, Error, Result};
 use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheError, SequenceCache, SequenceId,
+    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
 
 /// Scheduler-owned Step-3.7 shared KV manager.
@@ -12,7 +12,7 @@ pub type Step37SequenceCache = SequenceCache<Sm12xPageBackend, ()>;
 
 /// Per-row append capability and stable page table passed into model execution.
 pub(crate) struct Step37Append<'a> {
-    pub(crate) target: AppendTarget,
+    pub(crate) reservation: &'a AppendReservation,
     pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
 }
 

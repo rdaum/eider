@@ -8,7 +8,7 @@ use super::scheduler::{
 use super::stop::StopBuffer;
 use crate::nemotron3::{Nemotron3DecodeState, Nemotron3Model};
 use crate::qwen3::qwen36::Qwen36TextModel;
-use nvfp4::{Error, Result, SM12X_KV_PAGE_TOKENS};
+use nvfp4::{Error, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -293,7 +293,8 @@ impl<'a> Qwen36GenerationSession<'a> {
         let scheduler_config = SchedulerConfig {
             decode_capacity: 1,
             prefill_sequence_capacity: 1,
-            prefill_token_capacity: max_tokens.min(SM12X_KV_PAGE_TOKENS),
+            prefill_token_capacity: max_tokens
+                .min(SchedulerConfig::default().prefill_token_capacity),
             max_active_sequences: 1,
             max_context_tokens: max_tokens,
         };

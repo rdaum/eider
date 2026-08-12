@@ -15,7 +15,7 @@ use crate::gemma4::{
     Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
 };
 use crate::metrics::{duration_us, metrics};
-use nvfp4::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
+use nvfp4::{CudaStream, Error, Result};
 use sequence_cache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -478,18 +478,15 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             let request = self.requests.get(&id).expect("prefill request exists");
             let available = request.prompt.len().saturating_sub(request.prompt_position);
             let remaining_sequences = ids.len() - index;
-            let chunk = available
-                .min(budget.div_ceil(remaining_sequences))
-                .min(SM12X_KV_PAGE_TOKENS - request.prompt_position % SM12X_KV_PAGE_TOKENS)
-                .min(
-                    if !request.prefix_cache_checkpointed
-                        && request.prompt_position < request.prefix_cache_target
-                    {
-                        request.prefix_cache_target - request.prompt_position
-                    } else {
-                        usize::MAX
-                    },
-                );
+            let chunk = available.min(budget.div_ceil(remaining_sequences)).min(
+                if !request.prefix_cache_checkpointed
+                    && request.prompt_position < request.prefix_cache_target
+                {
+                    request.prefix_cache_target - request.prompt_position
+                } else {
+                    usize::MAX
+                },
+            );
             if chunk == 0 {
                 continue;
             }

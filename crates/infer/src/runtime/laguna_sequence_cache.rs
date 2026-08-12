@@ -4,7 +4,7 @@ use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPage
 use crate::laguna::{HEAD_DIM, KV_HEADS, LAYERS, LagunaDecodeState, LagunaModel};
 use nvfp4::{CudaStream, Error, Result};
 use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheError, SequenceCache, SequenceId,
+    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
 
 /// Service-owned Laguna shared KV manager.
@@ -12,7 +12,7 @@ pub type LagunaSequenceCache = SequenceCache<Sm12xPageBackend, ()>;
 
 /// Per-row append capability and stable page table passed into model execution.
 pub(crate) struct LagunaAppend<'a> {
-    pub(crate) target: AppendTarget,
+    pub(crate) reservation: &'a AppendReservation,
     pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
 }
 

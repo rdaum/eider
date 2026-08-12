@@ -4,14 +4,14 @@ use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPage
 use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheConfig, CacheError, PageBackend,
+    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheConfig, CacheError, PageBackend,
     SequenceCache, SequenceId,
 };
 
 pub type Qwen36SequenceCache = SequenceCache<Sm12xPageBackend, Qwen36SequenceSnapshot>;
 
 pub(crate) struct Qwen36Append<'a> {
-    pub(crate) target: AppendTarget,
+    pub(crate) reservation: &'a AppendReservation,
     pub(crate) page_table: &'a DeviceBuffer<u32>,
 }
 
