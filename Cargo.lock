@@ -2638,6 +2638,7 @@ name = "sequence-cache"
 version = "0.1.0"
 dependencies = [
  "fast-telemetry",
+ "micromeasure",
  "rart",
 ]
 

@@ -6,3 +6,10 @@ edition.workspace = true
 [dependencies]
 fast-telemetry.workspace = true
 rart.workspace = true
+
+[dev-dependencies]
+micromeasure.workspace = true
+
+[[bench]]
+name = "sequence_cache"
+harness = false
