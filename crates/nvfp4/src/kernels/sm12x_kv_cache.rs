@@ -12,6 +12,8 @@ const COMPACT_TILE_BYTES: usize = MMA_N * MMA_K / 2;
 const SCALE_BYTES_PER_TILE: usize = MMA_K / 16;
 const PV_SPLIT_CAPACITY: usize = 32;
 const PV_SPLIT_MIN_TOKENS: usize = 1_024;
+/// Initial physical page size used by Eider's compact SM12x cache pool.
+pub const SM12X_KV_PAGE_TOKENS: usize = 128;
 
 fn pv_split_count(tokens: usize) -> usize {
     if tokens < PV_SPLIT_MIN_TOKENS {
@@ -33,6 +35,15 @@ pub struct Sm12xKvCache {
     layout: Sm12xKvCacheLayout,
     max_tokens: usize,
     len: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+/// Stable-slot compact FP4 K/V pages for one attention layer.
+pub struct Sm12xKvPagePool {
+    storage: DeviceBuffer<u8>,
+    layout: Sm12xKvCacheLayout,
+    page_slots: usize,
     kv_heads: usize,
     head_dim: usize,
 }
@@ -953,6 +964,240 @@ impl Sm12xKvCache {
     }
 }
 
+impl Sm12xKvPagePool {
+    /// Preallocates stable physical slots for one full-attention layer.
+    pub fn new(page_slots: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
+        if page_slots == 0 {
+            return Err(Error::Shape {
+                label: "SM12x KV page pool",
+                expected: "at least one physical page slot".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let layout = Sm12xKvCache::layout(SM12X_KV_PAGE_TOKENS, kv_heads, head_dim)?;
+        u32::try_from(layout.total_bytes).map_err(|_| Error::Shape {
+            label: "SM12x KV page stride",
+            expected: "page bytes fitting u32".to_string(),
+            actual: layout.total_bytes.to_string(),
+        })?;
+        let total_bytes =
+            layout
+                .total_bytes
+                .checked_mul(page_slots)
+                .ok_or_else(|| Error::Shape {
+                    label: "SM12x KV page pool",
+                    expected: "pool byte count without overflow".to_string(),
+                    actual: format!("page_slots={page_slots} page_bytes={}", layout.total_bytes),
+                })?;
+        Ok(Self {
+            storage: DeviceBuffer::uninitialized(total_bytes)?,
+            layout,
+            page_slots,
+            kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Returns the number of stable physical slots.
+    pub fn page_slots(&self) -> usize {
+        self.page_slots
+    }
+
+    /// Returns the exact bytes occupied by one slot.
+    pub fn page_bytes(&self) -> usize {
+        self.layout.total_bytes
+    }
+
+    /// Returns total device bytes preallocated by the pool.
+    pub fn device_bytes(&self) -> usize {
+        self.storage.device_bytes()
+    }
+
+    fn check_slot(&self, slot: usize) -> Result<()> {
+        if slot >= self.page_slots {
+            return Err(Error::Shape {
+                label: "SM12x KV page slot",
+                expected: format!("slot < {}", self.page_slots),
+                actual: slot.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn component_ptr(&self, offset: usize) -> *const u8 {
+        unsafe { self.storage.as_const_ptr().cast::<u8>().add(offset) }
+    }
+
+    fn component_mut_ptr(&mut self, slot: usize, offset: usize) -> *mut u8 {
+        let byte = slot * self.layout.total_bytes + offset;
+        unsafe { self.storage.as_mut_ptr().cast::<u8>().add(byte) }
+    }
+
+    /// Copies one physical page slot on the explicit stream.
+    pub fn copy_page_on_stream(
+        &mut self,
+        source_slot: usize,
+        destination_slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.check_slot(source_slot)?;
+        self.check_slot(destination_slot)?;
+        let bytes = self.layout.total_bytes;
+        let source_offset = source_slot * bytes;
+        let destination_offset = destination_slot * bytes;
+        unsafe {
+            let source = self.storage.as_const_ptr().cast::<u8>().add(source_offset);
+            let destination = self
+                .storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(destination_offset);
+            check_cuda(
+                "cudaMemcpyAsync(D2D SM12x KV page)",
+                crate::ffi::cudaMemcpyAsync(
+                    destination.cast(),
+                    source.cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Appends one projected K/V row to a physical page slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_at_offsets_on_stream(
+        &mut self,
+        slot: usize,
+        position: usize,
+        key: &DeviceBuffer<f32>,
+        key_offset: usize,
+        value: &DeviceBuffer<f32>,
+        value_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.check_slot(slot)?;
+        let width = self.kv_heads * self.head_dim;
+        if position >= SM12X_KV_PAGE_TOKENS
+            || key_offset
+                .checked_add(width)
+                .is_none_or(|end| end > key.len())
+            || value_offset
+                .checked_add(width)
+                .is_none_or(|end| end > value.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged KV append",
+                expected: format!(
+                    "position < {SM12X_KV_PAGE_TOKENS} and {width} readable K/V values"
+                ),
+                actual: format!(
+                    "position={position} key_len={} key_offset={key_offset} value_len={} value_offset={value_offset}",
+                    key.len(),
+                    value.len()
+                ),
+            });
+        }
+        let key_values_offset = self.layout.key_values;
+        let key_scales_offset = self.layout.key_scales;
+        let value_values_offset = self.layout.value_values;
+        let value_scales_offset = self.layout.value_scales;
+        let key_tail_offset = self.layout.key_tail;
+        let value_tail_offset = self.layout.value_tail;
+        let page_base = self.component_mut_ptr(slot, 0);
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_on_stream(
+                    key.as_const_ptr().cast::<f32>().add(key_offset),
+                    value.as_const_ptr().cast::<f32>().add(value_offset),
+                    page_base.add(key_values_offset),
+                    page_base.add(key_scales_offset),
+                    page_base.add(value_values_offset),
+                    page_base.add(value_scales_offset),
+                    page_base.add(key_tail_offset).cast(),
+                    page_base.add(value_tail_offset).cast(),
+                    position as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Appends projected rows which fit wholly within one physical page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_rows_at_offset_on_stream(
+        &mut self,
+        slot: usize,
+        start_position: usize,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.check_slot(slot)?;
+        let width = self.kv_heads * self.head_dim;
+        let input_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(width));
+        if rows == 0
+            || start_position
+                .checked_add(rows)
+                .is_none_or(|end| end > SM12X_KV_PAGE_TOKENS)
+            || input_end.is_none_or(|end| end > key.len() || end > value.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged KV row append",
+                expected: format!(
+                    "non-empty rows within a {SM12X_KV_PAGE_TOKENS}-token page and input buffers"
+                ),
+                actual: format!(
+                    "start={start_position} rows={rows} input_row_offset={input_row_offset} key={} value={}",
+                    key.len(),
+                    value.len()
+                ),
+            });
+        }
+        let key_values_offset = self.layout.key_values;
+        let key_scales_offset = self.layout.key_scales;
+        let value_values_offset = self.layout.value_values;
+        let value_scales_offset = self.layout.value_scales;
+        let key_tail_offset = self.layout.key_tail;
+        let value_tail_offset = self.layout.value_tail;
+        let page_base = self.component_mut_ptr(slot, 0);
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_append_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_append_rows_on_stream(
+                    key.as_const_ptr().cast(),
+                    value.as_const_ptr().cast(),
+                    page_base.add(key_values_offset),
+                    page_base.add(key_scales_offset),
+                    page_base.add(value_values_offset),
+                    page_base.add(value_scales_offset),
+                    page_base.add(key_tail_offset).cast(),
+                    page_base.add(value_tail_offset).cast(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    input_row_offset as u32,
+                    start_position as u32,
+                    rows as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+}
+
 impl Sm12xKvAttentionWorkspace {
     /// Allocates scratch for a cache with the given shape.
     pub fn new(max_tokens: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
@@ -1527,6 +1772,98 @@ impl Sm12xKvAttentionWorkspace {
         }
     }
 
+    /// Enqueues compact attention through a stable device page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_offsets_into_on_stream(
+        &mut self,
+        pool: &Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        cache_len: usize,
+        query: &DeviceBuffer<f32>,
+        query_offset: usize,
+        mut output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_capacity = page_table
+            .len()
+            .checked_mul(SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged KV capacity",
+                expected: "page-table capacity without overflow".to_string(),
+                actual: page_table.len().to_string(),
+            })?;
+        if cache_len == 0
+            || cache_len > logical_capacity
+            || logical_capacity > self.max_tokens
+            || pool.kv_heads != self.kv_heads
+            || pool.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged KV attention cache",
+                expected: format!(
+                    "cache_len in 1..={logical_capacity}, workspace max >= capacity, kv_heads={}, head_dim={}",
+                    self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "cache_len={cache_len} workspace_max={} pool_shape={}/{}",
+                    self.max_tokens, pool.kv_heads, pool.head_dim
+                ),
+            });
+        }
+        let query_width = self.q_heads * self.head_dim;
+        if query_offset
+            .checked_add(query_width)
+            .is_none_or(|end| end > query.len())
+            || output_offset
+                .checked_add(query_width)
+                .is_none_or(|end| end > output.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged KV attention offsets",
+                expected: format!("{query_width} readable/writable values at row offsets"),
+                actual: format!(
+                    "query_len={} query_offset={query_offset} output_len={} output_offset={output_offset}",
+                    query.len(),
+                    output.len()
+                ),
+            });
+        }
+        let layout = &pool.layout;
+        let pv_splits = pv_split_count(cache_len);
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_paged_attention_on_stream",
+                crate::ffi::infer_sm12x_kv_paged_attention_on_stream(
+                    query.as_const_ptr().cast::<f32>().add(query_offset),
+                    pool.component_ptr(layout.key_values),
+                    pool.component_ptr(layout.key_scales),
+                    pool.component_ptr(layout.key_tail).cast(),
+                    pool.component_ptr(layout.value_values),
+                    pool.component_ptr(layout.value_scales),
+                    pool.component_ptr(layout.value_tail).cast(),
+                    page_table.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast::<f32>().add(output_offset),
+                    cache_len as u32,
+                    logical_capacity as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    layout.total_bytes as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    pv_splits as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Enqueues compact attention using a device-resident cache length for CUDA graphs.
     pub fn attention_indexed_into_on_stream(
         &mut self,
@@ -1849,6 +2186,134 @@ mod tests {
             destination_output
                 .copy_to_host(&stream)
                 .expect("destination output read")
+        );
+    }
+
+    #[test]
+    fn paged_attention_matches_contiguous_cache_across_page_boundaries() {
+        const TOKENS: usize = 257;
+        const CAPACITY: usize = 3 * SM12X_KV_PAGE_TOKENS;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = 8;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let key = (0..TOKENS * kv_width)
+            .map(|index| ((index * 17 + 11) % 251) as f32 / 64.0 - 1.5)
+            .collect::<Vec<_>>();
+        let value = (0..TOKENS * kv_width)
+            .map(|index| ((index * 29 + 7) % 257) as f32 / 80.0 - 1.25)
+            .collect::<Vec<_>>();
+        let query = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 13 + 5) % 127) as f32 / 48.0 - 1.0)
+            .collect::<Vec<_>>();
+        let key = DeviceBuffer::from_host(&key).expect("key");
+        let value = DeviceBuffer::from_host(&value).expect("value");
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let page_table = DeviceBuffer::from_host(&[2_u32, 0, 3]).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut contiguous =
+            Sm12xKvCache::new(CAPACITY, KV_HEADS, HEAD_DIM).expect("contiguous cache");
+        let mut pool = Sm12xKvPagePool::new(4, KV_HEADS, HEAD_DIM).expect("page pool");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("attention workspace");
+        let checkpoints = [1, 7, 8, 15, 16, 127, 128, 129, 255, 256, 257];
+
+        for token in 0..TOKENS {
+            contiguous
+                .append_at_offsets_on_stream(
+                    &key,
+                    token * kv_width,
+                    &value,
+                    token * kv_width,
+                    token,
+                    &stream,
+                )
+                .expect("contiguous append");
+            let logical_page = token / SM12X_KV_PAGE_TOKENS;
+            let physical_slot = [2, 0, 3][logical_page];
+            pool.append_at_offsets_on_stream(
+                physical_slot,
+                token % SM12X_KV_PAGE_TOKENS,
+                &key,
+                token * kv_width,
+                &value,
+                token * kv_width,
+                &stream,
+            )
+            .expect("paged append");
+            let cache_len = token + 1;
+            if !checkpoints.contains(&cache_len) {
+                continue;
+            }
+            let mut contiguous_output =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("contiguous output");
+            workspace
+                .attention_into_on_stream(&contiguous, &query, contiguous_output.output(), &stream)
+                .expect("contiguous attention");
+            let mut paged_output = DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("paged output");
+            workspace
+                .attention_paged_offsets_into_on_stream(
+                    &pool,
+                    &page_table,
+                    cache_len,
+                    &query,
+                    0,
+                    paged_output.output(),
+                    0,
+                    &stream,
+                )
+                .expect("paged attention");
+            assert_eq!(
+                paged_output
+                    .copy_to_host(&stream)
+                    .expect("paged output read"),
+                contiguous_output
+                    .copy_to_host(&stream)
+                    .expect("contiguous output read"),
+                "cache_len={cache_len}"
+            );
+        }
+
+        pool.copy_page_on_stream(2, 1, &stream)
+            .expect("copy physical page");
+        let source_table = DeviceBuffer::from_host(&[2_u32]).expect("source table");
+        let copied_table = DeviceBuffer::from_host(&[1_u32]).expect("copied table");
+        let mut source_output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("source page output");
+        workspace
+            .attention_paged_offsets_into_on_stream(
+                &pool,
+                &source_table,
+                SM12X_KV_PAGE_TOKENS,
+                &query,
+                0,
+                source_output.output(),
+                0,
+                &stream,
+            )
+            .expect("source page attention");
+        let mut copied_output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("copied page output");
+        workspace
+            .attention_paged_offsets_into_on_stream(
+                &pool,
+                &copied_table,
+                SM12X_KV_PAGE_TOKENS,
+                &query,
+                0,
+                copied_output.output(),
+                0,
+                &stream,
+            )
+            .expect("copied page attention");
+        assert_eq!(
+            copied_output
+                .copy_to_host(&stream)
+                .expect("copied output read"),
+            source_output
+                .copy_to_host(&stream)
+                .expect("source output read")
         );
     }
 

@@ -12,7 +12,11 @@ const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// Device-memory bound for reusable prompt checkpoints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrefixCacheConfig {
-    /// Maximum device bytes retained by cached checkpoints. Zero disables the cache.
+    /// Maximum device bytes retained by cached checkpoints.
+    ///
+    /// Qwen3.6 uses this as the total managed sequence-cache budget, including
+    /// active page reservations and recurrent snapshots. Zero disables prefix
+    /// retention and preserves eager worst-case live capacity.
     pub max_device_bytes: usize,
 }
 

@@ -148,7 +148,7 @@ pub struct Qwen36FullAttentionWorkspace {
 
 /// Persistent full-attention state owned by one generated sequence.
 pub struct Qwen36FullAttentionState {
-    compact_cache: Sm12xKvCache,
+    compact_cache: Option<Sm12xKvCache>,
     cache_capacity: usize,
 }
 
@@ -805,14 +805,13 @@ impl Qwen36FullAttentionWeights {
         }
 
         self.prepare_qkv_one_token(workspace, state, manifest, hidden, position, stream)?;
-        state.compact_cache.append_at_on_stream(
-            &workspace.k_rope,
-            &workspace.v,
-            position,
-            stream,
-        )?;
+        let compact_cache = state.compact_cache.as_mut().ok_or_else(|| Error::Format {
+            label: "Qwen3.6 full-attention cache",
+            detail: "paged sequence used with contiguous single-row execution".to_string(),
+        })?;
+        compact_cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
         workspace.compact_attention.attention_into_on_stream(
-            &state.compact_cache,
+            compact_cache,
             &workspace.q_rope,
             workspace.attn.output(),
             stream,
@@ -881,7 +880,11 @@ impl Qwen36FullAttentionWeights {
             position,
             stream,
         )?;
-        state.compact_cache.append_indexed_on_stream(
+        let compact_cache = state.compact_cache.as_mut().ok_or_else(|| Error::Format {
+            label: "Qwen3.6 indexed full-attention cache",
+            detail: "paged sequence used with contiguous indexed execution".to_string(),
+        })?;
+        compact_cache.append_indexed_on_stream(
             &workspace.k_rope,
             &workspace.v,
             position,
@@ -890,7 +893,7 @@ impl Qwen36FullAttentionWeights {
         workspace
             .compact_attention
             .attention_indexed_into_on_stream(
-                &state.compact_cache,
+                compact_cache,
                 &workspace.q_rope,
                 cache_len,
                 workspace.attn.output(),
@@ -1490,13 +1493,26 @@ impl Qwen36FullAttentionState {
             });
         }
         Ok(Self {
-            compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
+            compact_cache: Some(Sm12xKvCache::new(
+                cache_capacity,
+                manifest.kv_heads,
+                manifest.head_dim,
+            )?),
             cache_capacity,
         })
     }
 
+    fn paged(cache_capacity: usize) -> Self {
+        Self {
+            compact_cache: None,
+            cache_capacity,
+        }
+    }
+
     fn device_bytes(&self) -> usize {
-        self.compact_cache.device_bytes()
+        self.compact_cache
+            .as_ref()
+            .map_or(0, Sm12xKvCache::device_bytes)
     }
 }
 
@@ -5267,6 +5283,32 @@ impl Qwen36LayerBlock {
         })
     }
 
+    fn paged_sequence_state(
+        &self,
+        model: &Qwen36Model,
+        cache_capacity: usize,
+    ) -> Result<Qwen36LayerSequenceState> {
+        let manifest = model.manifest();
+        let attention = match &self.attention {
+            Qwen36Attention::LinearAttention(weights) => {
+                let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 linear-attention state",
+                    detail: "manifest has no linear-attention configuration".to_string(),
+                })?;
+                Qwen36AttentionState::LinearAttention(Qwen36LinearAttentionState::new(
+                    linear, weights,
+                )?)
+            }
+            Qwen36Attention::FullAttention(_) => {
+                Qwen36AttentionState::FullAttention(Qwen36FullAttentionState::paged(cache_capacity))
+            }
+        };
+        Ok(Qwen36LayerSequenceState {
+            kind: self.kind,
+            attention,
+        })
+    }
+
     fn enqueue_linear_pre_gdn(
         &self,
         workspace: &mut Qwen36LayerBlockWorkspace,
@@ -5935,6 +5977,23 @@ pub struct Qwen36SequenceCheckpoint {
     sequence: Qwen36SequenceState,
 }
 
+/// Immutable page-aligned snapshot of Qwen3.6's non-pageable recurrent state.
+///
+/// Full-attention KV pages are intentionally absent and remain owned by the
+/// shared sequence cache.
+pub struct Qwen36SequenceSnapshot {
+    model_id: u64,
+    position: usize,
+    linear_states: Vec<Option<Qwen36LinearAttentionState>>,
+    device_bytes: usize,
+}
+
+impl sequence_cache::RetainedSnapshot for Qwen36SequenceSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.device_bytes
+    }
+}
+
 impl Qwen36SequenceState {
     /// Returns the next position that will be written by decode.
     pub fn position(&self) -> usize {
@@ -5971,6 +6030,11 @@ impl Qwen36SequenceState {
                 Qwen36AttentionState::LinearAttention(state) => state.device_bytes(),
                 Qwen36AttentionState::FullAttention(state) => state
                     .compact_cache
+                    .as_ref()
+                    .ok_or_else(|| Error::Format {
+                        label: "Qwen3.6 sequence checkpoint byte estimate",
+                        detail: "paged sequence KV is owned by the shared cache".to_string(),
+                    })?
                     .device_bytes_for_capacity(self.position)?,
             };
             total.checked_add(layer_bytes).ok_or_else(|| Error::Shape {
@@ -6033,13 +6097,23 @@ impl Qwen36SequenceState {
                 (
                     Qwen36AttentionState::FullAttention(destination),
                     Qwen36AttentionState::FullAttention(source),
-                ) => destination
-                    .compact_cache
-                    .copy_aligned_prefix_from_on_stream(
-                        &source.compact_cache,
+                ) => {
+                    let (Some(destination), Some(source)) = (
+                        destination.compact_cache.as_mut(),
+                        source.compact_cache.as_ref(),
+                    ) else {
+                        return Err(Error::Format {
+                            label: "Qwen3.6 sequence prefix copy",
+                            detail: "contiguous checkpoint copy requires contiguous KV state"
+                                .to_string(),
+                        });
+                    };
+                    destination.copy_aligned_prefix_from_on_stream(
+                        source,
                         prefix_tokens,
                         stream,
-                    )?,
+                    )?;
+                }
                 _ => {
                     return Err(Error::Format {
                         label: "Qwen3.6 sequence prefix copy",
@@ -6062,6 +6136,18 @@ impl Qwen36SequenceCheckpoint {
     /// Returns the exact device bytes retained by this checkpoint.
     pub fn device_bytes(&self) -> usize {
         self.sequence.device_bytes()
+    }
+}
+
+impl Qwen36SequenceSnapshot {
+    /// Returns the page-aligned position represented by this snapshot.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns exact device bytes retained outside shared KV pages.
+    pub fn device_bytes(&self) -> usize {
+        self.device_bytes
     }
 }
 
@@ -6362,6 +6448,149 @@ impl Qwen36TextModel {
             position: 0,
             max_tokens,
         })
+    }
+
+    /// Allocates only request-private recurrent state; full-attention KV is
+    /// supplied by the scheduler-owned shared page cache.
+    pub fn new_paged_sequence_state(&self, max_tokens: usize) -> Result<Qwen36SequenceState> {
+        if max_tokens == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.6 paged sequence state",
+                expected: "max_tokens > 0".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let model = Qwen36Model {
+            manifest: self.manifest.clone(),
+            checkpoint: self.checkpoint.clone(),
+            artifact_dir: self.artifact_dir.clone(),
+            bf16_storage: self.bf16_storage,
+            fp8_attention_storage: self.fp8_attention_storage,
+        };
+        let mut layer_states = Vec::with_capacity(self.layers.len());
+        for block in &self.layers {
+            layer_states.push(block.paged_sequence_state(&model, max_tokens)?);
+        }
+        Ok(Qwen36SequenceState {
+            model_id: self.model_id,
+            layer_states,
+            position: 0,
+            max_tokens,
+        })
+    }
+
+    /// Copies only Qwen3.6's fixed-size recurrent state for prefix retention.
+    pub fn snapshot_paged_sequence(
+        &self,
+        source: &Qwen36SequenceState,
+    ) -> Result<Qwen36SequenceSnapshot> {
+        if source.model_id != self.model_id
+            || source.position == 0
+            || !source.position.is_multiple_of(128)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.6 paged sequence snapshot",
+                expected: "matching model and nonzero 128-token-aligned position".to_string(),
+                actual: format!(
+                    "model={} expected_model={} position={}",
+                    source.model_id, self.model_id, source.position
+                ),
+            });
+        }
+        let stream = CudaStream::new_non_blocking()?;
+        let mut linear_states = Vec::with_capacity(source.layer_states.len());
+        let mut device_bytes = 0usize;
+        for layer in &source.layer_states {
+            match &layer.attention {
+                Qwen36AttentionState::LinearAttention(source) => {
+                    let mut destination = Qwen36LinearAttentionState {
+                        conv_state: DeviceBuffer::zeroed(source.conv_state.len())?,
+                        recurrent_state: DeviceBuffer::zeroed(source.recurrent_state.len())?,
+                    };
+                    destination.conv_state.copy_prefix_from_device_on_stream(
+                        &source.conv_state,
+                        source.conv_state.len(),
+                        &stream,
+                    )?;
+                    destination
+                        .recurrent_state
+                        .copy_prefix_from_device_on_stream(
+                            &source.recurrent_state,
+                            source.recurrent_state.len(),
+                            &stream,
+                        )?;
+                    device_bytes = device_bytes
+                        .checked_add(destination.device_bytes())
+                        .ok_or_else(|| Error::Shape {
+                            label: "Qwen3.6 paged snapshot bytes",
+                            expected: "byte total without overflow".to_string(),
+                            actual: source.device_bytes().to_string(),
+                        })?;
+                    linear_states.push(Some(destination));
+                }
+                Qwen36AttentionState::FullAttention(_) => linear_states.push(None),
+            }
+        }
+        stream.synchronize()?;
+        Ok(Qwen36SequenceSnapshot {
+            model_id: self.model_id,
+            position: source.position,
+            linear_states,
+            device_bytes,
+        })
+    }
+
+    /// Restores a retained recurrent snapshot into an empty paged sequence.
+    pub fn restore_paged_sequence_snapshot(
+        &self,
+        snapshot: &Qwen36SequenceSnapshot,
+        destination: &mut Qwen36SequenceState,
+    ) -> Result<()> {
+        if snapshot.model_id != self.model_id
+            || destination.model_id != self.model_id
+            || destination.position != 0
+            || snapshot.position > destination.max_tokens
+            || snapshot.linear_states.len() != destination.layer_states.len()
+        {
+            return Err(Error::Format {
+                label: "Qwen3.6 paged sequence snapshot restore",
+                detail: "snapshot and empty destination are incompatible".to_string(),
+            });
+        }
+        let stream = CudaStream::new_non_blocking()?;
+        for (snapshot, destination) in snapshot
+            .linear_states
+            .iter()
+            .zip(&mut destination.layer_states)
+        {
+            match (snapshot, &mut destination.attention) {
+                (Some(source), Qwen36AttentionState::LinearAttention(destination)) => {
+                    destination.conv_state.copy_prefix_from_device_on_stream(
+                        &source.conv_state,
+                        source.conv_state.len(),
+                        &stream,
+                    )?;
+                    destination
+                        .recurrent_state
+                        .copy_prefix_from_device_on_stream(
+                            &source.recurrent_state,
+                            source.recurrent_state.len(),
+                            &stream,
+                        )?;
+                }
+                (None, Qwen36AttentionState::FullAttention(state))
+                    if state.compact_cache.is_none() => {}
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.6 paged sequence snapshot restore",
+                        detail: "snapshot layer kinds differ from destination".to_string(),
+                    });
+                }
+            }
+        }
+        stream.synchronize()?;
+        destination.position = snapshot.position;
+        Ok(())
     }
 
     /// Copies a sequence's current aligned prefix into an immutable checkpoint.

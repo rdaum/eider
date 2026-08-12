@@ -1,0 +1,8 @@
+[package]
+name = "sequence-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fast-telemetry.workspace = true
+rart.workspace = true

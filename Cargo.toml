@@ -3,6 +3,7 @@ members = [
     "crates/eider-api",
     "crates/infer",
     "crates/nvfp4",
+    "crates/sequence-cache",
 ]
 resolver = "2"
 

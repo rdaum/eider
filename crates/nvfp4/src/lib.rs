@@ -179,7 +179,10 @@ pub use kernels::non_gemm::{
     unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream,
 };
 pub use kernels::qwen36_gdn::Qwen36ChunkedGdn;
-pub use kernels::sm12x_kv_cache::{Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvTailSnapshot};
+pub use kernels::sm12x_kv_cache::{
+    SM12X_KV_PAGE_TOKENS, Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool,
+    Sm12xKvTailSnapshot,
+};
 pub use kernels::sm12x_mma::{
     Sm12xFp4DeviceGemmVector, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xFp4Tile, Sm12xFp4TileSet, Sm12xRequantizedVector, Sm12xRequantizedWeight,

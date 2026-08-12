@@ -8,6 +8,8 @@ use super::{
 use std::collections::HashMap;
 use std::mem::size_of;
 
+use crate::runtime::qwen36_sequence_cache::{Qwen36PagedAppend, Qwen36SequenceCache};
+
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
@@ -43,6 +45,11 @@ const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
 const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
+
+struct Qwen36PagedBatch<'cache, 'table> {
+    cache: &'cache mut Qwen36SequenceCache,
+    appends: &'cache [Qwen36PagedAppend<'table>],
+}
 
 /// One scheduler-selected prompt chunk for batched prefill.
 pub struct Qwen36PrefillRow<'tokens, 'state> {
@@ -1420,6 +1427,10 @@ pub struct Qwen36PrefillBatchWorkspace {
 }
 
 impl Qwen36PrefillBatchWorkspace {
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
     /// Returns the maximum number of independent prompt chunks per call.
     pub fn sequence_capacity(&self) -> usize {
         self.sequence_capacity
@@ -1557,6 +1568,10 @@ pub struct Qwen36DecodeBatchWorkspace {
 }
 
 impl Qwen36DecodeBatchWorkspace {
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
     /// Returns the maximum number of sequence rows executable in one tick.
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -1724,6 +1739,29 @@ impl Qwen36TextModel {
         workspace: &mut Qwen36PrefillBatchWorkspace,
         rows: &mut [Qwen36PrefillRow<'_, '_>],
     ) -> Result<()> {
+        self.prefill_batch_impl(workspace, rows, None)
+    }
+
+    /// Advances prompt chunks through scheduler-owned shared KV pages.
+    ///
+    /// Every row must fit within the writable page described by its append
+    /// target. The scheduler therefore stops chunks at physical page borders.
+    pub fn prefill_batch_paged(
+        &self,
+        workspace: &mut Qwen36PrefillBatchWorkspace,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36PagedAppend<'_>],
+    ) -> Result<()> {
+        self.prefill_batch_impl(workspace, rows, Some(Qwen36PagedBatch { cache, appends }))
+    }
+
+    fn prefill_batch_impl(
+        &self,
+        workspace: &mut Qwen36PrefillBatchWorkspace,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        mut paged: Option<Qwen36PagedBatch<'_, '_>>,
+    ) -> Result<()> {
         if workspace.model_id != self.model_id {
             return Err(crate::nvfp4::Error::Format {
                 label: "Qwen3.6 prefill batch workspace",
@@ -1735,6 +1773,19 @@ impl Qwen36TextModel {
                 label: "Qwen3.6 prefill batch rows",
                 expected: format!("1..={}", workspace.sequence_capacity),
                 actual: rows.len().to_string(),
+            });
+        }
+        if paged
+            .as_ref()
+            .is_some_and(|paged| paged.appends.len() != rows.len())
+        {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 paged prefill rows",
+                expected: format!("{} append descriptors", rows.len()),
+                actual: paged
+                    .as_ref()
+                    .map_or(0, |paged| paged.appends.len())
+                    .to_string(),
             });
         }
         let total_tokens = rows.iter().try_fold(0usize, |total, row| {
@@ -1803,14 +1854,17 @@ impl Qwen36TextModel {
             }
             for layer in &row.state.layer_states {
                 if let Qwen36AttentionState::FullAttention(state) = &layer.attention
-                    && (state.compact_cache.len() != row.state.position
-                        || state.cache_capacity != row.state.max_tokens)
+                    && (state.cache_capacity != row.state.max_tokens
+                        || match &state.compact_cache {
+                            Some(cache) => paged.is_some() || cache.len() != row.state.position,
+                            None => paged.is_none(),
+                        })
                 {
                     return Err(crate::nvfp4::Error::Format {
                         label: "Qwen3.6 prefill sequence state",
                         detail: format!(
-                            "full-attention cache length/capacity {}/{} does not match sequence {}/{}",
-                            state.compact_cache.len(),
+                            "full-attention cache length/capacity {:?}/{} does not match sequence {}/{}",
+                            state.compact_cache.as_ref().map(Sm12xKvCache::len),
                             state.cache_capacity,
                             row.state.position,
                             row.state.max_tokens
@@ -1905,14 +1959,27 @@ impl Qwen36TextModel {
                         total_tokens,
                         stream,
                     )?;
-                    weights.enqueue_prefill_cache(
-                        self,
-                        &mut workspace.full,
-                        rows,
-                        &workspace.host_sequence_offsets,
-                        layer_idx,
-                        stream,
-                    )?;
+                    if let Some(paged) = paged.as_mut() {
+                        weights.enqueue_prefill_cache_paged(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            &workspace.host_sequence_offsets,
+                            layer_idx,
+                            stream,
+                            paged.cache,
+                            paged.appends,
+                        )?;
+                    } else {
+                        weights.enqueue_prefill_cache(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            &workspace.host_sequence_offsets,
+                            layer_idx,
+                            stream,
+                        )?;
+                    }
                     weights.enqueue_batch_post(self, &mut workspace.full, total_tokens, stream)?;
                     &workspace.full.output
                 }
@@ -2219,7 +2286,23 @@ impl Qwen36TextModel {
         workspace: &'w mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
     ) -> Result<Qwen36DecodedBatch<'w>> {
-        self.decode_batch_impl(workspace, rows, None)
+        self.decode_batch_impl(workspace, rows, None, None)
+    }
+
+    /// Decodes rows whose full-attention history lives in shared CUDA pages.
+    pub fn decode_batch_paged<'w>(
+        &self,
+        workspace: &'w mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36PagedAppend<'_>],
+    ) -> Result<Qwen36DecodedBatch<'w>> {
+        self.decode_batch_impl(
+            workspace,
+            rows,
+            Some(Qwen36PagedBatch { cache, appends }),
+            None,
+        )
     }
 
     /// Runs one diagnostic decode and copies each post-layer hidden row to the host.
@@ -2229,7 +2312,7 @@ impl Qwen36TextModel {
         rows: &mut [Qwen36DecodeRow<'_>],
     ) -> Result<Qwen36DecodeBatchTrace> {
         let mut layers = Vec::with_capacity(self.layers.len());
-        let decoded = self.decode_batch_impl(workspace, rows, Some(&mut layers))?;
+        let decoded = self.decode_batch_impl(workspace, rows, None, Some(&mut layers))?;
         Ok(Qwen36DecodeBatchTrace {
             logits: decoded.copy_logits()?,
             layers,
@@ -2240,6 +2323,7 @@ impl Qwen36TextModel {
         &self,
         workspace: &'w mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
+        mut paged: Option<Qwen36PagedBatch<'_, '_>>,
         mut trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
     ) -> Result<Qwen36DecodedBatch<'w>> {
         if workspace.model_id != self.model_id {
@@ -2253,6 +2337,19 @@ impl Qwen36TextModel {
                 label: "Qwen3.6 decode batch rows",
                 expected: format!("1..={}", workspace.capacity),
                 actual: rows.len().to_string(),
+            });
+        }
+        if paged
+            .as_ref()
+            .is_some_and(|paged| paged.appends.len() != rows.len())
+        {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.6 paged decode rows",
+                expected: format!("{} append descriptors", rows.len()),
+                actual: paged
+                    .as_ref()
+                    .map_or(0, |paged| paged.appends.len())
+                    .to_string(),
             });
         }
         for row in rows.iter() {
@@ -2286,14 +2383,17 @@ impl Qwen36TextModel {
             }
             for layer in &row.state.layer_states {
                 if let Qwen36AttentionState::FullAttention(state) = &layer.attention
-                    && (state.compact_cache.len() != row.state.position
-                        || state.cache_capacity != row.state.max_tokens)
+                    && (state.cache_capacity != row.state.max_tokens
+                        || match &state.compact_cache {
+                            Some(cache) => paged.is_some() || cache.len() != row.state.position,
+                            None => paged.is_none(),
+                        })
                 {
                     return Err(crate::nvfp4::Error::Format {
                         label: "Qwen3.6 sequence state",
                         detail: format!(
-                            "full-attention cache length/capacity {}/{} does not match sequence {}/{}",
-                            state.compact_cache.len(),
+                            "full-attention cache mode/capacity {:?}/{} does not match sequence {}/{}",
+                            state.compact_cache.as_ref().map(Sm12xKvCache::len),
                             state.cache_capacity,
                             row.state.position,
                             row.state.max_tokens
@@ -2347,14 +2447,27 @@ impl Qwen36TextModel {
                             unreachable!("full-attention graph matches its layer")
                         };
                         pre_attention.launch(stream)?;
-                        weights.enqueue_batch_cache(
-                            self,
-                            &mut workspace.full,
-                            rows,
-                            layer_idx,
-                            active_rows,
-                            stream,
-                        )?;
+                        if let Some(paged) = paged.as_mut() {
+                            weights.enqueue_batch_cache_paged(
+                                self,
+                                &mut workspace.full,
+                                rows,
+                                layer_idx,
+                                active_rows,
+                                stream,
+                                paged.cache,
+                                paged.appends,
+                            )?;
+                        } else {
+                            weights.enqueue_batch_cache(
+                                self,
+                                &mut workspace.full,
+                                rows,
+                                layer_idx,
+                                active_rows,
+                                stream,
+                            )?;
+                        }
                         post_attention.launch(stream)?;
                     }
                 }
@@ -2400,14 +2513,27 @@ impl Qwen36TextModel {
                         workspace.capacity,
                         stream,
                     )?;
-                    weights.enqueue_batch_cache(
-                        self,
-                        &mut workspace.full,
-                        rows,
-                        layer_idx,
-                        active_rows,
-                        stream,
-                    )?;
+                    if let Some(paged) = paged.as_mut() {
+                        weights.enqueue_batch_cache_paged(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            layer_idx,
+                            active_rows,
+                            stream,
+                            paged.cache,
+                            paged.appends,
+                        )?;
+                    } else {
+                        weights.enqueue_batch_cache(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            layer_idx,
+                            active_rows,
+                            stream,
+                        )?;
+                    }
                     weights.enqueue_batch_post(
                         self,
                         &mut workspace.full,
@@ -3046,8 +3172,16 @@ impl Qwen36FullAttentionWeights {
                     unreachable!("layer kind validated when sequence state was created")
                 }
             };
-            let position = state.compact_cache.len();
-            state.compact_cache.append_at_offsets_on_stream(
+            let compact_cache =
+                state
+                    .compact_cache
+                    .as_mut()
+                    .ok_or_else(|| crate::nvfp4::Error::Format {
+                        label: "Qwen3.6 contiguous decode cache",
+                        detail: "paged state requires decode_batch_paged".to_string(),
+                    })?;
+            let position = compact_cache.len();
+            compact_cache.append_at_offsets_on_stream(
                 &workspace.k_rope,
                 row * kv_width,
                 &workspace.v,
@@ -3058,13 +3192,76 @@ impl Qwen36FullAttentionWeights {
             workspace
                 .compact_attention
                 .attention_offsets_into_on_stream(
-                    &state.compact_cache,
+                    compact_cache,
                     &workspace.q_rope,
                     row * q_width,
                     workspace.attention.output(),
                     row * q_width,
                     stream,
                 )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_batch_cache_paged(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        rows: &mut [Qwen36DecodeRow<'_>],
+        layer_idx: usize,
+        active_rows: usize,
+        stream: &CudaStream,
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36PagedAppend<'_>],
+    ) -> Result<()> {
+        let q_width = model.manifest.q_heads * model.manifest.head_dim;
+        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
+        for (row, (decode_row, append)) in
+            rows.iter_mut().zip(appends).enumerate().take(active_rows)
+        {
+            let position = decode_row.state.position;
+            if append.target.page_offset() != position % crate::nvfp4::SM12X_KV_PAGE_TOKENS
+                || append.target.max_rows() == 0
+            {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 paged decode append",
+                    detail: format!(
+                        "target offset/max rows {}/{} does not match position {position}",
+                        append.target.page_offset(),
+                        append.target.max_rows()
+                    ),
+                });
+            }
+            cache
+                .with_append_page(append.target, |backend, page| {
+                    let pool = backend.pool_mut(layer_idx)?;
+                    pool.append_at_offsets_on_stream(
+                        page.slot(),
+                        append.target.page_offset(),
+                        &workspace.k_rope,
+                        row * kv_width,
+                        &workspace.v,
+                        row * kv_width,
+                        stream,
+                    )?;
+                    workspace
+                        .compact_attention
+                        .attention_paged_offsets_into_on_stream(
+                            pool,
+                            append.page_table,
+                            position + 1,
+                            &workspace.q_rope,
+                            row * q_width,
+                            workspace.attention.output(),
+                            row * q_width,
+                            stream,
+                        )
+                })
+                .map_err(|error| crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 paged decode cache",
+                    detail: error.to_string(),
+                })?;
         }
         Ok(())
     }
@@ -3086,13 +3283,21 @@ impl Qwen36FullAttentionWeights {
                     unreachable!("layer kind validated when sequence state was created")
                 }
             };
+            let compact_cache =
+                state
+                    .compact_cache
+                    .as_mut()
+                    .ok_or_else(|| crate::nvfp4::Error::Format {
+                        label: "Qwen3.6 contiguous prefill cache",
+                        detail: "paged state requires prefill_batch_paged".to_string(),
+                    })?;
             let row_offset = row_offsets[sequence] as usize;
             if row.token_ids.len() < 32 {
                 let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
                 let q_width = model.manifest.q_heads * model.manifest.head_dim;
                 if row.token_ids.len() == 1 {
-                    let position = state.compact_cache.len();
-                    state.compact_cache.append_at_offsets_on_stream(
+                    let position = compact_cache.len();
+                    compact_cache.append_at_offsets_on_stream(
                         &workspace.k_rope,
                         row_offset * kv_width,
                         &workspace.v,
@@ -3103,7 +3308,7 @@ impl Qwen36FullAttentionWeights {
                     workspace
                         .compact_attention
                         .attention_offsets_into_on_stream(
-                            &state.compact_cache,
+                            compact_cache,
                             &workspace.q_rope,
                             row_offset * q_width,
                             workspace.attention.output(),
@@ -3114,7 +3319,7 @@ impl Qwen36FullAttentionWeights {
                     workspace
                         .compact_attention
                         .append_causal_rows_at_offset_into_on_stream(
-                            &mut state.compact_cache,
+                            compact_cache,
                             &workspace.q_rope,
                             &workspace.k_rope,
                             &workspace.v,
@@ -3128,7 +3333,7 @@ impl Qwen36FullAttentionWeights {
             } else {
                 workspace.tensor_core_attention.run_sequence(
                     model,
-                    &mut state.compact_cache,
+                    compact_cache,
                     &workspace.q_rope,
                     &workspace.k_rope,
                     &workspace.v,
@@ -3138,6 +3343,73 @@ impl Qwen36FullAttentionWeights {
                     stream,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_prefill_cache_paged(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        row_offsets: &[u32],
+        layer_idx: usize,
+        stream: &CudaStream,
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36PagedAppend<'_>],
+    ) -> Result<()> {
+        let q_width = model.manifest.q_heads * model.manifest.head_dim;
+        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
+        for (sequence, (row, append)) in rows.iter_mut().zip(appends).enumerate() {
+            if append.target.page_offset()
+                != row.state.position % crate::nvfp4::SM12X_KV_PAGE_TOKENS
+                || row.token_ids.len() > append.target.max_rows()
+            {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 paged prefill append",
+                    detail: format!(
+                        "target offset/max rows {}/{} does not cover position {} and {} rows",
+                        append.target.page_offset(),
+                        append.target.max_rows(),
+                        row.state.position,
+                        row.token_ids.len()
+                    ),
+                });
+            }
+            let input_row = row_offsets[sequence] as usize;
+            cache
+                .with_append_page(append.target, |backend, page| {
+                    let pool = backend.pool_mut(layer_idx)?;
+                    for token in 0..row.token_ids.len() {
+                        pool.append_at_offsets_on_stream(
+                            page.slot(),
+                            append.target.page_offset() + token,
+                            &workspace.k_rope,
+                            (input_row + token) * kv_width,
+                            &workspace.v,
+                            (input_row + token) * kv_width,
+                            stream,
+                        )?;
+                        workspace
+                            .compact_attention
+                            .attention_paged_offsets_into_on_stream(
+                                pool,
+                                append.page_table,
+                                row.state.position + token + 1,
+                                &workspace.q_rope,
+                                (input_row + token) * q_width,
+                                workspace.attention.output(),
+                                (input_row + token) * q_width,
+                                stream,
+                            )?;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 paged prefill cache",
+                    detail: error.to_string(),
+                })?;
         }
         Ok(())
     }

@@ -15,6 +15,7 @@ pub mod ling3_serving;
 pub mod muse_glimmer_serving;
 pub mod nemotron3_serving;
 pub mod prefix_cache;
+pub mod qwen36_sequence_cache;
 pub mod sampling;
 pub mod scheduler;
 pub mod serving;
