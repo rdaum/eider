@@ -1,12 +1,15 @@
 //! Reusable request-scoped generation sessions.
 
+use super::nemotron3_sequence_cache::{
+    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
+};
 use super::prefix_cache::PrefixCacheConfig;
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::scheduler::{
     Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, SchedulerConfig,
 };
 use super::stop::StopBuffer;
-use crate::nemotron3::{Nemotron3DecodeState, Nemotron3Model};
+use crate::nemotron3::Nemotron3Model;
 use crate::qwen3::qwen36::Qwen36TextModel;
 use nvfp4::{Error, Result};
 use serde_json::Value;
@@ -399,7 +402,8 @@ impl<'a> Qwen36GenerationSession<'a> {
 /// One Nemotron 3 generation request with isolated recurrent, KV, and sampling state.
 pub struct Nemotron3GenerationSession<'a> {
     model: &'a Nemotron3Model,
-    state: Nemotron3DecodeState,
+    sequence: Nemotron3Sequence,
+    sequence_cache: Nemotron3SequenceCache,
     sampler: Sampler,
     decode_stream: TokenizerDecodeStream<'a>,
     config: GenerationConfig,
@@ -446,12 +450,14 @@ impl<'a> Nemotron3GenerationSession<'a> {
                 actual: format!("{} + {}", prompt_tokens.len(), config.max_new_tokens),
             })?
             .max(1);
-        let state = model.sequence_state(max_tokens)?;
+        let mut sequence_cache = new_nemotron3_sequence_cache(model, 1, max_tokens)?;
+        let sequence = Nemotron3Sequence::admit(model, &mut sequence_cache, max_tokens)?;
         let sampler = Sampler::new(config.sampling)?;
         let finish_reason = (config.max_new_tokens == 0).then_some(GenerationFinishReason::Length);
         Ok(Self {
             model,
-            state,
+            sequence,
+            sequence_cache,
             sampler,
             decode_stream: tokenizer.decode_stream(true),
             prompt_tokens: prompt_tokens.to_vec(),
@@ -527,24 +533,28 @@ impl<'a> Nemotron3GenerationSession<'a> {
             });
         }
         for index in 0..self.prompt_tokens.len() - 1 {
-            self.model
-                .forward_one(&mut self.state, self.prompt_tokens[index])?;
+            self.model.forward_one(
+                &mut self.sequence,
+                &mut self.sequence_cache,
+                self.prompt_tokens[index],
+            )?;
         }
         self.prefilled = true;
         Ok(*self.prompt_tokens.last().expect("non-empty prompt"))
     }
 
     fn decode_and_select(&mut self, input: u32) -> Result<SampledToken> {
-        self.model.forward_one(&mut self.state, input)?;
+        self.model
+            .forward_one(&mut self.sequence, &mut self.sequence_cache, input)?;
         if self.sampler.config().uses_fast_argmax() {
-            let (id, logit) = self.model.argmax_with_logit(&mut self.state)?;
+            let (id, logit) = self.model.argmax_with_logit(&mut self.sequence)?;
             return Ok(SampledToken {
                 id,
                 logit,
                 adjusted_logit: logit,
             });
         }
-        let logits = self.model.logits_to_host(&self.state)?;
+        let logits = self.model.logits_to_host(&self.sequence)?;
         self.sampler.sample(&logits, &self.history)
     }
 }

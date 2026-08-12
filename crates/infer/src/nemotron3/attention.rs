@@ -1,11 +1,14 @@
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::runtime::kv_cache::LayerKvCache;
+use crate::runtime::nemotron3_sequence_cache::Nemotron3PageBackend;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
     Sm12xKvCache, add_f32_into_on_stream, append_ragged_kv_f32_into_on_stream,
-    ragged_gqa_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
+    ragged_paged_gqa_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
+use sequence_cache::AppendReservations;
 
 /// Per-layer attention-cache storage selected for a Nemotron 3 sequence.
 pub enum Nemotron3AttentionCache {
@@ -37,30 +40,6 @@ impl Nemotron3AttentionCache {
         match self {
             Self::F32(cache) => cache.device_bytes(),
             Self::Nvfp4(cache) => cache.device_bytes(),
-        }
-    }
-
-    pub(super) fn advance_len(&mut self, rows: usize) -> Result<()> {
-        match self {
-            Self::F32(cache) => cache.advance_len(rows),
-            // Compact-cache appends advance their length on enqueue.
-            Self::Nvfp4(_) => Ok(()),
-        }
-    }
-
-    pub(super) fn commit_speculative(&mut self, start: usize, accepted: usize) -> Result<()> {
-        match self {
-            Self::F32(cache) => cache.advance_len(accepted),
-            Self::Nvfp4(cache) => cache.truncate(start.saturating_add(accepted)),
-        }
-    }
-
-    pub(super) fn checkpoint_device_bytes(&self) -> usize {
-        match self {
-            Self::F32(cache) => cache.checkpoint_device_bytes(),
-            Self::Nvfp4(cache) => cache
-                .device_bytes_for_capacity(cache.len())
-                .unwrap_or_else(|_| cache.device_bytes()),
         }
     }
 }
@@ -298,6 +277,124 @@ impl Nemotron3AttentionLayer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_one_token_paged(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        workspace: &mut Nemotron3AttentionWorkspace,
+        backend: &mut Nemotron3PageBackend,
+        pages: sequence_cache::AppendPages<
+            '_,
+            crate::runtime::nemotron3_sequence_cache::Nemotron3Page,
+        >,
+        page_table: &DeviceBuffer<u32>,
+        position: usize,
+        compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        workspace.require_manifest(&self.manifest)?;
+        rms_norm_f32_into_on_stream(
+            1,
+            self.manifest.hidden_size,
+            hidden,
+            &self.block_norm,
+            workspace.normed.output(),
+            self.manifest.norm_epsilon,
+            stream,
+        )?;
+        self.query
+            .run(&workspace.normed, &mut workspace.query, stream)?;
+        self.key
+            .run(&workspace.normed, &mut workspace.key, stream)?;
+        self.value
+            .run(&workspace.normed, &mut workspace.value, stream)?;
+        let page = pages.iter().next().ok_or_else(|| Error::Format {
+            label: "Nemotron 3 one-token append",
+            detail: "reservation contains no physical page".to_string(),
+        })?;
+        match backend.storage() {
+            super::Nemotron3KvCacheStorage::F32 => {
+                workspace
+                    .page_tables
+                    .copy_from_host(&[page_table.as_const_ptr().cast::<u32>()])?;
+                workspace
+                    .start_positions
+                    .copy_from_host(&[position as u32])?;
+                let pool = backend.f32_pool_mut(self.layer)?;
+                let (key_pool, value_pool) = pool.buffers_mut();
+                append_ragged_paged_kv_f32_into_on_stream(
+                    &workspace.key,
+                    &workspace.value,
+                    key_pool,
+                    value_pool,
+                    &workspace.page_tables,
+                    &workspace.sequence_offsets,
+                    &workspace.sequence_lengths,
+                    &workspace.start_positions,
+                    1,
+                    1,
+                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    self.manifest.kv_heads * self.manifest.attention_head_dim,
+                    stream,
+                )?;
+                let (key_pool, value_pool) = pool.buffers();
+                ragged_paged_gqa_attention_f32_into_on_stream(
+                    &workspace.query,
+                    key_pool,
+                    value_pool,
+                    &workspace.page_tables,
+                    &workspace.sequence_offsets,
+                    &workspace.sequence_lengths,
+                    &workspace.start_positions,
+                    workspace.attended.output(),
+                    1,
+                    1,
+                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    self.manifest.attention_heads,
+                    self.manifest.kv_heads,
+                    self.manifest.attention_head_dim,
+                    stream,
+                )?;
+            }
+            super::Nemotron3KvCacheStorage::Nvfp4 => {
+                let segment = page.segment();
+                let pool = backend.nvfp4_pool_mut(self.layer)?;
+                pool.append_at_offsets_on_stream(
+                    page.page().slot(),
+                    segment.page_offset(),
+                    &workspace.key,
+                    0,
+                    &workspace.value,
+                    0,
+                    stream,
+                )?;
+                compact_attention
+                    .ok_or_else(|| Error::Format {
+                        label: "Nemotron 3 compact attention",
+                        detail: "missing compact-attention scratch".to_string(),
+                    })?
+                    .attention_paged_offsets_into_on_stream(
+                        pool,
+                        page_table,
+                        position + 1,
+                        &workspace.query,
+                        0,
+                        workspace.attended.output(),
+                        0,
+                        stream,
+                    )?;
+            }
+        }
+        self.output
+            .run(&workspace.attended, &mut workspace.projected_output, stream)?;
+        add_f32_into_on_stream(
+            hidden,
+            &workspace.projected_output,
+            workspace.output.output(),
+            stream,
+        )
+    }
+
     /// Appends and attends flattened, ragged rows for multiple sequences.
     #[allow(clippy::too_many_arguments)]
     pub fn run_rows(
@@ -381,38 +478,29 @@ impl Nemotron3AttentionLayer {
         )
     }
 
-    /// Appends and attends flattened rows against compact FP4 caches.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_rows_compact(
+    pub(crate) fn run_rows_paged(
         &self,
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3AttentionRowsWorkspace,
-        caches: &mut [&mut Sm12xKvCache],
-        sequence_offsets: &[u32],
-        sequence_lengths: &[u32],
+        backend: &mut Nemotron3PageBackend,
+        reservations: AppendReservations<
+            '_,
+            crate::runtime::nemotron3_sequence_cache::Nemotron3Page,
+        >,
+        page_tables: &DeviceBuffer<*const u32>,
+        page_table_devices: &[&DeviceBuffer<u32>],
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        start_positions: &DeviceBuffer<u32>,
+        sequence_offsets_host: &[u32],
+        sequence_lengths_host: &[u32],
+        start_positions_host: &[u32],
+        sequence_count: usize,
         rows: usize,
-        compact_attention: &mut Sm12xKvAttentionWorkspace,
+        compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
         stream: &CudaStream,
     ) -> Result<()> {
-        if caches.len() != sequence_offsets.len() || caches.len() != sequence_lengths.len() {
-            return Err(Error::Shape {
-                label: "Nemotron 3 compact attention sequences",
-                expected: "matching cache, offset, and length counts".to_string(),
-                actual: format!(
-                    "caches={} offsets={} lengths={}",
-                    caches.len(),
-                    sequence_offsets.len(),
-                    sequence_lengths.len()
-                ),
-            });
-        }
-        if hidden.len() != rows.saturating_mul(self.manifest.hidden_size) {
-            return Err(Error::Shape {
-                label: "Nemotron 3 compact attention row hidden state",
-                expected: format!("{} values", rows.saturating_mul(self.manifest.hidden_size)),
-                actual: format!("{} values", hidden.len()),
-            });
-        }
         workspace.require_manifest(&self.manifest, rows)?;
         rms_norm_f32_into_on_stream(
             rows,
@@ -429,52 +517,107 @@ impl Nemotron3AttentionLayer {
             .run_rows(&workspace.normed, &mut workspace.key, rows, stream)?;
         self.value
             .run_rows(&workspace.normed, &mut workspace.value, rows, stream)?;
-        for ((cache, &offset), &length) in caches
-            .iter_mut()
-            .zip(sequence_offsets)
-            .zip(sequence_lengths)
-        {
-            let offset = offset as usize;
-            let length = length as usize;
-            if length == 0 || offset.saturating_add(length) > rows {
-                return Err(Error::Shape {
-                    label: "Nemotron 3 compact attention rows",
-                    expected: format!("non-empty rows within 0..{rows}"),
-                    actual: format!("offset={offset} length={length}"),
-                });
+        match backend.storage() {
+            super::Nemotron3KvCacheStorage::F32 => {
+                let pool = backend.f32_pool_mut(self.layer)?;
+                let (key_pool, value_pool) = pool.buffers_mut();
+                append_ragged_paged_kv_f32_into_on_stream(
+                    &workspace.key,
+                    &workspace.value,
+                    key_pool,
+                    value_pool,
+                    page_tables,
+                    sequence_offsets,
+                    sequence_lengths,
+                    start_positions,
+                    sequence_count,
+                    rows,
+                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    self.manifest.kv_heads * self.manifest.attention_head_dim,
+                    stream,
+                )?;
+                let (key_pool, value_pool) = pool.buffers();
+                ragged_paged_gqa_attention_f32_into_on_stream(
+                    &workspace.query,
+                    key_pool,
+                    value_pool,
+                    page_tables,
+                    sequence_offsets,
+                    sequence_lengths,
+                    start_positions,
+                    workspace.attended.output(),
+                    sequence_count,
+                    rows,
+                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    self.manifest.attention_heads,
+                    self.manifest.kv_heads,
+                    self.manifest.attention_head_dim,
+                    stream,
+                )?;
             }
-            if length == 1 {
-                let key_width = self.manifest.kv_heads * self.manifest.attention_head_dim;
-                let query_width = self.manifest.attention_heads * self.manifest.attention_head_dim;
-                let position = cache.len();
-                cache.append_at_offsets_on_stream(
-                    &workspace.key,
-                    offset * key_width,
-                    &workspace.value,
-                    offset * key_width,
-                    position,
-                    stream,
-                )?;
-                compact_attention.attention_offsets_into_on_stream(
-                    cache,
-                    &workspace.query,
-                    offset * query_width,
-                    workspace.attended.output(),
-                    offset * query_width,
-                    stream,
-                )?;
-            } else {
-                compact_attention.append_causal_rows_at_offset_into_on_stream(
-                    cache,
-                    &workspace.query,
-                    &workspace.key,
-                    &workspace.value,
-                    offset,
-                    length,
-                    None,
-                    workspace.attended.output(),
-                    stream,
-                )?;
+            super::Nemotron3KvCacheStorage::Nvfp4 => {
+                let compact = compact_attention.ok_or_else(|| Error::Format {
+                    label: "Nemotron 3 compact attention",
+                    detail: "missing compact-attention scratch".to_string(),
+                })?;
+                let pool = backend.nvfp4_pool_mut(self.layer)?;
+                for ((pages, &row_offset), &length) in reservations
+                    .iter()
+                    .zip(sequence_offsets_host)
+                    .zip(sequence_lengths_host)
+                {
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        pool.append_rows_at_offset_on_stream(
+                            page.page().slot(),
+                            segment.page_offset(),
+                            &workspace.key,
+                            &workspace.value,
+                            row_offset as usize + segment.input_offset(),
+                            segment.rows(),
+                            stream,
+                        )?;
+                    }
+                    debug_assert_eq!(
+                        length as usize,
+                        pages
+                            .iter()
+                            .map(|page| page.segment().rows())
+                            .sum::<usize>()
+                    );
+                }
+                let q_width = self.manifest.attention_heads * self.manifest.attention_head_dim;
+                for (((pages, &row_offset), &length), sequence) in reservations
+                    .iter()
+                    .zip(sequence_offsets_host)
+                    .zip(sequence_lengths_host)
+                    .zip(0..sequence_count)
+                {
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        for local in 0..segment.rows() {
+                            let token = segment.input_offset() + local;
+                            let flat_row = row_offset as usize + token;
+                            compact.attention_paged_offsets_into_on_stream(
+                                pool,
+                                page_table_devices[sequence],
+                                start_positions_host[sequence] as usize + token + 1,
+                                &workspace.query,
+                                flat_row * q_width,
+                                workspace.attended.output(),
+                                flat_row * q_width,
+                                stream,
+                            )?;
+                        }
+                    }
+                    debug_assert_eq!(
+                        length as usize,
+                        pages
+                            .iter()
+                            .map(|page| page.segment().rows())
+                            .sum::<usize>()
+                    );
+                }
             }
         }
         self.output.run_rows(
@@ -573,6 +716,10 @@ pub struct Nemotron3AttentionWorkspace {
     attended: DeviceBuffer<f32>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
+    page_tables: DeviceBuffer<*const u32>,
+    sequence_offsets: DeviceBuffer<u32>,
+    sequence_lengths: DeviceBuffer<u32>,
+    start_positions: DeviceBuffer<u32>,
 }
 
 /// Reusable scratch storage for flattened, ragged attention rows.
@@ -655,6 +802,10 @@ impl Nemotron3AttentionWorkspace {
             attended: DeviceBuffer::zeroed(query_width)?,
             projected_output: DeviceBuffer::zeroed(manifest.hidden_size)?,
             output: DeviceBuffer::zeroed(manifest.hidden_size)?,
+            page_tables: DeviceBuffer::zeroed(1)?,
+            sequence_offsets: DeviceBuffer::from_host(&[0])?,
+            sequence_lengths: DeviceBuffer::from_host(&[1])?,
+            start_positions: DeviceBuffer::zeroed(1)?,
         })
     }
 
@@ -686,5 +837,9 @@ impl Nemotron3AttentionWorkspace {
             + self.attended.device_bytes()
             + self.projected_output.device_bytes()
             + self.output.device_bytes()
+            + self.page_tables.device_bytes()
+            + self.sequence_offsets.device_bytes()
+            + self.sequence_lengths.device_bytes()
+            + self.start_positions.device_bytes()
     }
 }

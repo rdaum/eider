@@ -1,6 +1,7 @@
 use infer::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3StorageConfig,
 };
+use infer::runtime::nemotron3_sequence_cache::{Nemotron3Sequence, new_nemotron3_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -43,16 +44,18 @@ fn main() -> infer::nvfp4::Result<()> {
         });
     }
     let model = Nemotron3Model::load_with_storage(&model_dir, storage)?;
-    let mut state = model.sequence_state(warmup_tokens + decode_tokens)?;
+    let capacity = warmup_tokens + decode_tokens;
+    let mut cache = new_nemotron3_sequence_cache(&model, 1, capacity)?;
+    let mut sequence = Nemotron3Sequence::admit(&model, &mut cache, capacity)?;
     let mut next = token;
     for _ in 0..warmup_tokens {
-        model.forward_one(&mut state, next)?;
-        next = model.argmax(&mut state)?;
+        model.forward_one(&mut sequence, &mut cache, next)?;
+        next = model.argmax(&mut sequence)?;
     }
     let start = Instant::now();
     for _ in 0..decode_tokens {
-        model.forward_one(&mut state, next)?;
-        next = model.argmax(&mut state)?;
+        model.forward_one(&mut sequence, &mut cache, next)?;
+        next = model.argmax(&mut sequence)?;
     }
     let elapsed = start.elapsed();
     println!(

@@ -23,8 +23,9 @@ pub use linear::{
 pub use mamba::{
     Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace,
 };
+pub(crate) use model::Nemotron3DecodeState;
 pub use model::{
-    Nemotron3BlockWorkspace, Nemotron3DecodeState, Nemotron3Model, Nemotron3SequenceCheckpoint,
+    Nemotron3BlockWorkspace, Nemotron3Model, Nemotron3SequenceSnapshot,
     Nemotron3SpeculativeCycleResult, Nemotron3SpeculativeCycleWorkspace,
     Nemotron3SpeculativeResult,
 };

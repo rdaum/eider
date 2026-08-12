@@ -1,20 +1,23 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{
-    Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
-    Nemotron3AttentionWorkspace, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer,
-    Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest,
-    Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
+    Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
+    Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace,
+    Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest, Nemotron3MoeLayer,
+    Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
     Nemotron3StorageConfig,
 };
 use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
+use crate::runtime::nemotron3_sequence_cache::{
+    Nemotron3CacheContext, Nemotron3Sequence, Nemotron3SequenceCache, nemotron3_cache_error,
+};
 use nvfp4::{
-    CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, argmax_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
-    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
-    select_bf16_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
+    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
+    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
+    speculative_accept_argmax_f32_into_on_stream,
 };
 use std::path::Path;
 use tracing::info;
@@ -126,11 +129,23 @@ impl Nemotron3Model {
         self.mtp.is_some()
     }
 
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    pub fn kv_cache_storage(&self) -> Nemotron3KvCacheStorage {
+        if self.compact_kv_cache {
+            Nemotron3KvCacheStorage::Nvfp4
+        } else {
+            Nemotron3KvCacheStorage::F32
+        }
+    }
+
     /// Allocates recurrent, KV-cache, and scratch state for one sequence.
-    pub fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3DecodeState> {
+    pub(crate) fn sequence_state(&self, max_tokens: usize) -> Result<Nemotron3DecodeState> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            layers.push(layer.sequence_state(max_tokens, self.compact_kv_cache)?);
+            layers.push(layer.sequence_state()?);
         }
         Ok(Nemotron3DecodeState {
             hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
@@ -156,62 +171,23 @@ impl Nemotron3Model {
                 })
                 .transpose()?,
             tokens: 0,
+            max_tokens,
         })
     }
 
-    /// Returns the compact device footprint of a reusable prefix checkpoint.
-    pub fn checkpoint_sequence_device_bytes(&self, state: &Nemotron3DecodeState) -> usize {
-        state.final_hidden.device_bytes()
-            + state.logits.device_bytes()
-            + state
-                .layers
-                .iter()
-                .map(Nemotron3LayerState::checkpoint_device_bytes)
-                .sum::<usize>()
-            + state
-                .mtp
-                .as_ref()
-                .map_or(0, |mtp| mtp.cache.checkpoint_device_bytes())
-    }
-
-    /// Copies the state required to resume a processed prompt prefix.
-    pub fn checkpoint_sequence(
+    /// Copies the non-paged state required to resume a processed prompt prefix.
+    pub(crate) fn snapshot_sequence(
         &self,
         state: &Nemotron3DecodeState,
-    ) -> Result<Nemotron3SequenceCheckpoint> {
+    ) -> Result<Nemotron3SequenceSnapshot> {
         let mut layers = Vec::with_capacity(state.layers.len());
         for layer in &state.layers {
             layers.push(match layer {
                 Nemotron3LayerState::Mamba { state, .. } => {
-                    Nemotron3CheckpointLayer::Mamba(state.checkpoint_on_stream(&self.stream)?)
+                    Nemotron3SnapshotLayer::Mamba(state.checkpoint_on_stream(&self.stream)?)
                 }
-                Nemotron3LayerState::Moe(_) => Nemotron3CheckpointLayer::Moe,
-                Nemotron3LayerState::Attention { cache, .. } => match cache {
-                    Nemotron3AttentionCache::F32(cache) => Nemotron3CheckpointLayer::AttentionF32(
-                        cache.checkpoint_on_stream(&self.stream)?,
-                    ),
-                    Nemotron3AttentionCache::Nvfp4(cache) => {
-                        let tokens = state.tokens;
-                        if tokens == 0 || !tokens.is_multiple_of(128) {
-                            return Err(Error::Shape {
-                                label: "Nemotron 3 compact prefix checkpoint",
-                                expected: "a non-zero 128-token-aligned sequence".to_string(),
-                                actual: format!("{tokens} tokens"),
-                            });
-                        }
-                        let mut checkpoint = Sm12xKvCache::new(
-                            tokens,
-                            self.manifest.kv_heads,
-                            self.manifest.attention_head_dim,
-                        )?;
-                        checkpoint.copy_aligned_prefix_from_on_stream(
-                            cache,
-                            tokens,
-                            &self.stream,
-                        )?;
-                        Nemotron3CheckpointLayer::AttentionNvfp4(checkpoint)
-                    }
-                },
+                Nemotron3LayerState::Moe(_) => Nemotron3SnapshotLayer::Moe,
+                Nemotron3LayerState::Attention { .. } => Nemotron3SnapshotLayer::Attention,
             });
         }
         let mut final_hidden = DeviceBuffer::zeroed(state.final_hidden.len())?;
@@ -232,7 +208,7 @@ impl Nemotron3Model {
             .map(|mtp| mtp.cache.checkpoint_on_stream(&self.stream))
             .transpose()?;
         self.stream.synchronize()?;
-        Ok(Nemotron3SequenceCheckpoint {
+        Ok(Nemotron3SequenceSnapshot {
             layers,
             final_hidden,
             logits,
@@ -241,86 +217,69 @@ impl Nemotron3Model {
         })
     }
 
-    /// Restores a compact prefix checkpoint into a new sequence capacity.
-    pub fn restore_sequence_checkpoint(
+    /// Restores retained non-paged state into a new sequence capacity.
+    pub(crate) fn restore_sequence_snapshot(
         &self,
-        checkpoint: &Nemotron3SequenceCheckpoint,
-        max_tokens: usize,
-    ) -> Result<Nemotron3DecodeState> {
-        if checkpoint.tokens > max_tokens {
+        snapshot: &Nemotron3SequenceSnapshot,
+        state: &mut Nemotron3DecodeState,
+    ) -> Result<()> {
+        let max_tokens = state.max_tokens;
+        if snapshot.tokens > max_tokens {
             return Err(Error::Shape {
-                label: "Nemotron 3 prefix checkpoint capacity",
-                expected: format!("at least {} tokens", checkpoint.tokens),
+                label: "Nemotron 3 retained prefix capacity",
+                expected: format!("at least {} tokens", snapshot.tokens),
                 actual: format!("{max_tokens} tokens"),
             });
         }
-        let mut state = self.sequence_state(max_tokens)?;
-        if state.layers.len() != checkpoint.layers.len() {
+        if state.layers.len() != snapshot.layers.len() {
             return Err(Error::Shape {
-                label: "Nemotron 3 prefix checkpoint layers",
+                label: "Nemotron 3 retained prefix layers",
                 expected: format!("{} layers", state.layers.len()),
-                actual: format!("{} layers", checkpoint.layers.len()),
+                actual: format!("{} layers", snapshot.layers.len()),
             });
         }
-        for (state_layer, checkpoint_layer) in state.layers.iter_mut().zip(&checkpoint.layers) {
-            match (state_layer, checkpoint_layer) {
+        for (state_layer, snapshot_layer) in state.layers.iter_mut().zip(&snapshot.layers) {
+            match (state_layer, snapshot_layer) {
                 (
                     Nemotron3LayerState::Mamba { state, .. },
-                    Nemotron3CheckpointLayer::Mamba(checkpoint),
+                    Nemotron3SnapshotLayer::Mamba(checkpoint),
                 ) => state.restore_checkpoint_on_stream(checkpoint, &self.stream)?,
-                (Nemotron3LayerState::Moe(_), Nemotron3CheckpointLayer::Moe) => {}
-                (
-                    Nemotron3LayerState::Attention {
-                        cache: Nemotron3AttentionCache::F32(cache),
-                        ..
-                    },
-                    Nemotron3CheckpointLayer::AttentionF32(checkpoint),
-                ) => cache.restore_checkpoint_on_stream(checkpoint, &self.stream)?,
-                (
-                    Nemotron3LayerState::Attention {
-                        cache: Nemotron3AttentionCache::Nvfp4(cache),
-                        ..
-                    },
-                    Nemotron3CheckpointLayer::AttentionNvfp4(checkpoint),
-                ) => cache.copy_aligned_prefix_from_on_stream(
-                    checkpoint,
-                    checkpoint.len(),
-                    &self.stream,
-                )?,
+                (Nemotron3LayerState::Moe(_), Nemotron3SnapshotLayer::Moe) => {}
+                (Nemotron3LayerState::Attention { .. }, Nemotron3SnapshotLayer::Attention) => {}
                 _ => {
                     return Err(Error::Format {
-                        label: "Nemotron 3 prefix checkpoint",
-                        detail: "checkpoint layer topology does not match the loaded model"
+                        label: "Nemotron 3 retained prefix",
+                        detail: "snapshot layer topology does not match the loaded model"
                             .to_string(),
                     });
                 }
             }
         }
         state.final_hidden.copy_prefix_from_device_on_stream(
-            &checkpoint.final_hidden,
-            checkpoint.final_hidden.len(),
+            &snapshot.final_hidden,
+            snapshot.final_hidden.len(),
             &self.stream,
         )?;
         state.logits.copy_prefix_from_device_on_stream(
-            &checkpoint.logits,
-            checkpoint.logits.len(),
+            &snapshot.logits,
+            snapshot.logits.len(),
             &self.stream,
         )?;
-        match (&mut state.mtp, &checkpoint.mtp) {
+        match (&mut state.mtp, &snapshot.mtp) {
             (Some(state_mtp), Some(checkpoint_mtp)) => state_mtp
                 .cache
                 .restore_checkpoint_on_stream(checkpoint_mtp, &self.stream)?,
             (None, None) => {}
             _ => {
                 return Err(Error::Format {
-                    label: "Nemotron 3 prefix checkpoint MTP",
-                    detail: "checkpoint MTP state does not match the loaded model".to_string(),
+                    label: "Nemotron 3 retained prefix MTP",
+                    detail: "snapshot MTP state does not match the loaded model".to_string(),
                 });
             }
         }
-        state.tokens = checkpoint.tokens;
+        state.tokens = snapshot.tokens;
         self.stream.synchronize()?;
-        Ok(state)
+        Ok(())
     }
 
     /// Allocates an exact-shape workspace for flattened MTP execution.
@@ -340,7 +299,7 @@ impl Nemotron3Model {
     /// flattened sequence order.
     pub fn forward_mtp_block(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         token_chunks: &[&[u32]],
         target_hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MtpWorkspace,
@@ -349,8 +308,12 @@ impl Nemotron3Model {
             label: "Nemotron 3 MTP execution",
             detail: "the loaded checkpoint has no MTP block".to_string(),
         })?;
-        let mut caches = Vec::with_capacity(states.len());
-        for (sequence, state) in states.iter_mut().enumerate() {
+        let mut caches = Vec::with_capacity(sequences.len());
+        for (sequence, state) in sequences
+            .iter_mut()
+            .map(|sequence| &mut sequence.state)
+            .enumerate()
+        {
             let mtp_state = state.mtp.as_mut().ok_or_else(|| Error::Format {
                 label: "Nemotron 3 MTP state",
                 detail: format!("sequence {sequence} has no MTP state"),
@@ -373,10 +336,11 @@ impl Nemotron3Model {
     /// The first target token has no predecessor and must not be passed here.
     pub fn append_mtp_prompt_token(
         &self,
-        state: &mut Nemotron3DecodeState,
+        sequence: &mut Nemotron3Sequence,
         token: u32,
         workspace: &mut Nemotron3MtpWorkspace,
     ) -> Result<()> {
+        let state = &mut sequence.state;
         if state.tokens == 0 {
             return Ok(());
         }
@@ -432,10 +396,10 @@ impl Nemotron3Model {
     /// caller-owned buffer before a target-model prompt block overwrites it.
     pub fn capture_final_hidden_rows(
         &self,
-        states: &[&mut Nemotron3DecodeState],
+        sequences: &[&mut Nemotron3Sequence],
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        let expected = states.len().saturating_mul(self.manifest.hidden_size);
+        let expected = sequences.len().saturating_mul(self.manifest.hidden_size);
         if output.len() != expected {
             return Err(Error::Shape {
                 label: "Nemotron 3 prefill previous hidden states",
@@ -443,7 +407,7 @@ impl Nemotron3Model {
                 actual: format!("{} values", output.len()),
             });
         }
-        for (sequence, state) in states.iter().enumerate() {
+        for (sequence, state) in sequences.iter().map(|sequence| &sequence.state).enumerate() {
             output.copy_range_from_device_on_stream(
                 sequence * self.manifest.hidden_size,
                 &state.final_hidden,
@@ -463,7 +427,7 @@ impl Nemotron3Model {
     #[allow(clippy::too_many_arguments)]
     pub fn append_mtp_prompt_block(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         token_chunks: &[&[u32]],
         start_positions: &[usize],
         row_offsets: &[u32],
@@ -472,17 +436,17 @@ impl Nemotron3Model {
         mtp_hidden: &mut DeviceBuffer<f32>,
         workspace: &mut Nemotron3MtpWorkspace,
     ) -> Result<()> {
-        if states.len() != token_chunks.len()
-            || states.len() != start_positions.len()
-            || states.len() != row_offsets.len()
-            || previous_hidden.len() != states.len().saturating_mul(self.manifest.hidden_size)
+        if sequences.len() != token_chunks.len()
+            || sequences.len() != start_positions.len()
+            || sequences.len() != row_offsets.len()
+            || previous_hidden.len() != sequences.len().saturating_mul(self.manifest.hidden_size)
         {
             return Err(Error::Shape {
                 label: "Nemotron 3 MTP prompt block",
                 expected: "matching sequence metadata and previous hidden rows".to_string(),
                 actual: format!(
                     "states={} chunks={} starts={} offsets={} previous_hidden={}",
-                    states.len(),
+                    sequences.len(),
                     token_chunks.len(),
                     start_positions.len(),
                     row_offsets.len(),
@@ -510,8 +474,9 @@ impl Nemotron3Model {
         let mut selected_states = Vec::new();
         let mut selected_chunks = Vec::new();
         let mut destination_row = 0;
-        for (sequence, ((state, chunk), (&start, &row_offset))) in states
+        for (sequence, ((state, chunk), (&start, &row_offset))) in sequences
             .iter_mut()
+            .map(|sequence| &mut sequence.state)
             .zip(token_chunks)
             .zip(start_positions.iter().zip(row_offsets))
             .enumerate()
@@ -541,7 +506,7 @@ impl Nemotron3Model {
                 )?;
                 destination_row += rows;
             }
-            selected_states.push(&mut **state);
+            selected_states.push(state);
             selected_chunks.push(&chunk[skip..]);
         }
         debug_assert_eq!(destination_row, expected_rows);
@@ -557,7 +522,7 @@ impl Nemotron3Model {
     /// remain device resident in `workspace` in sequence-major order.
     pub fn draft_three_mtp_argmax(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         initial_tokens: &[u32],
         target_hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MtpWorkspace,
@@ -566,8 +531,12 @@ impl Nemotron3Model {
             label: "Nemotron 3 MTP drafting",
             detail: "the loaded checkpoint has no MTP block".to_string(),
         })?;
-        let mut caches = Vec::with_capacity(states.len());
-        for (sequence, state) in states.iter_mut().enumerate() {
+        let mut caches = Vec::with_capacity(sequences.len());
+        for (sequence, state) in sequences
+            .iter_mut()
+            .map(|sequence| &mut sequence.state)
+            .enumerate()
+        {
             let mtp_state = state.mtp.as_mut().ok_or_else(|| Error::Format {
                 label: "Nemotron 3 MTP state",
                 detail: format!("sequence {sequence} has no MTP state"),
@@ -625,34 +594,145 @@ impl Nemotron3Model {
     /// the workspace shape must exactly match the sequence and row counts.
     pub fn forward_block(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         token_chunks: &[&[u32]],
         workspace: &mut Nemotron3BlockWorkspace,
+        cache: &mut Nemotron3SequenceCache,
     ) -> Result<()> {
+        if sequences.is_empty() || token_chunks.len() != sequences.len() {
+            return Err(Error::Shape {
+                label: "Nemotron 3 block sequences",
+                expected: "matching non-empty sequence and token-chunk slices".to_string(),
+                actual: format!(
+                    "sequences={} token_chunks={}",
+                    sequences.len(),
+                    token_chunks.len()
+                ),
+            });
+        }
         if workspace.draft_count.is_some() {
             return Err(Error::Format {
                 label: "Nemotron 3 block execution",
                 detail: "transactional workspaces must use speculative verification".to_string(),
             });
         }
-        self.forward_block_impl(states, token_chunks, workspace, true)
+        let rows = token_chunks.iter().map(|chunk| chunk.len()).sum();
+        workspace.require_model(self, sequences.len(), rows)?;
+        if token_chunks.iter().any(|chunk| chunk.is_empty()) {
+            return Err(Error::Shape {
+                label: "Nemotron 3 block tokens",
+                expected: "one or more tokens per sequence".to_string(),
+                actual: token_chunks
+                    .iter()
+                    .map(|chunk| chunk.len().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            });
+        }
+        let mut reservations = Vec::with_capacity(sequences.len());
+        for index in 0..sequences.len() {
+            let sequence = &mut sequences[index];
+            match cache.reserve_append(
+                sequence.cache_id,
+                token_chunks[index].len(),
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    for (sequence, reservation) in
+                        sequences[..index].iter_mut().zip(reservations.drain(..))
+                    {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Nemotron3CacheContext {
+                                    stream: &self.stream,
+                                    page_table: &mut sequence.page_table,
+                                },
+                            )
+                            .map_err(nemotron3_cache_error)?;
+                    }
+                    return Err(nemotron3_cache_error(error));
+                }
+            }
+        }
+        let result = {
+            let mut states = Vec::with_capacity(sequences.len());
+            let mut page_tables = Vec::with_capacity(sequences.len());
+            for sequence in sequences.iter_mut() {
+                states.push(&mut sequence.state);
+                page_tables.push(sequence.page_table.device());
+            }
+            self.forward_block_impl(
+                &mut states,
+                token_chunks,
+                workspace,
+                true,
+                cache,
+                &reservations,
+                &page_tables,
+            )
+        };
+        if let Err(error) = result {
+            for (sequence, reservation) in sequences.iter_mut().zip(reservations) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Nemotron3CacheContext {
+                            stream: &self.stream,
+                            page_table: &mut sequence.page_table,
+                        },
+                    )
+                    .map_err(nemotron3_cache_error)?;
+            }
+            return Err(error);
+        }
+        for ((sequence, reservation), chunk) in
+            sequences.iter_mut().zip(reservations).zip(token_chunks)
+        {
+            cache
+                .commit_append(
+                    reservation,
+                    chunk.len(),
+                    &mut Nemotron3CacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(nemotron3_cache_error)?;
+            sequence.state.tokens += chunk.len();
+        }
+        Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_block_impl(
         &self,
         states: &mut [&mut Nemotron3DecodeState],
         token_chunks: &[&[u32]],
         workspace: &mut Nemotron3BlockWorkspace,
         commit_all: bool,
+        cache: &mut Nemotron3SequenceCache,
+        reservations: &[sequence_cache::AppendReservation],
+        page_tables: &[&DeviceBuffer<u32>],
     ) -> Result<()> {
         let sequence_count = states.len();
-        if sequence_count == 0 || token_chunks.len() != sequence_count {
+        if sequence_count == 0
+            || token_chunks.len() != sequence_count
+            || reservations.len() != sequence_count
+            || page_tables.len() != sequence_count
+        {
             return Err(Error::Shape {
                 label: "Nemotron 3 block sequences",
                 expected: "matching non-empty state and token-chunk slices".to_string(),
                 actual: format!(
-                    "states={sequence_count} token_chunks={}",
-                    token_chunks.len()
+                    "states={sequence_count} token_chunks={} reservations={} page_tables={}",
+                    token_chunks.len(),
+                    reservations.len(),
+                    page_tables.len()
                 ),
             });
         }
@@ -722,9 +802,19 @@ impl Nemotron3Model {
         workspace.sequence_lengths.copy_from_host(&lengths)?;
         workspace.start_positions.copy_from_host(&starts)?;
 
-        self.enqueue_prepared_block(states, &offsets, &lengths, workspace, commit_all)
+        self.enqueue_prepared_block(
+            states,
+            &offsets,
+            &lengths,
+            workspace,
+            commit_all,
+            cache,
+            reservations,
+            page_tables,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_prepared_block(
         &self,
         states: &mut [&mut Nemotron3DecodeState],
@@ -732,13 +822,14 @@ impl Nemotron3Model {
         lengths: &[u32],
         workspace: &mut Nemotron3BlockWorkspace,
         commit_all: bool,
+        cache: &mut Nemotron3SequenceCache,
+        reservations: &[sequence_cache::AppendReservation],
+        page_tables: &[&DeviceBuffer<u32>],
     ) -> Result<()> {
         let sequence_count = states.len();
         let rows = workspace.rows;
         let mut conv_ptrs = Vec::with_capacity(workspace.mamba_layers * sequence_count);
         let mut ssm_ptrs = Vec::with_capacity(workspace.mamba_layers * sequence_count);
-        let mut key_ptrs = Vec::with_capacity(workspace.attention_layers * sequence_count);
-        let mut value_ptrs = Vec::with_capacity(workspace.attention_layers * sequence_count);
         for layer in 0..self.layers.len() {
             match &self.layers[layer] {
                 Nemotron3Layer::Mamba(_) => {
@@ -754,30 +845,18 @@ impl Nemotron3Model {
                         ssm_ptrs.push(state.ssm_ptr());
                     }
                 }
-                Nemotron3Layer::Attention(_) => {
-                    for state in states.iter_mut() {
-                        let Nemotron3LayerState::Attention { cache, .. } = &mut state.layers[layer]
-                        else {
-                            return Err(Error::Format {
-                                label: "Nemotron 3 block attention state",
-                                detail: format!("state variant mismatch at layer {layer}"),
-                            });
-                        };
-                        if let Nemotron3AttentionCache::F32(cache) = cache {
-                            key_ptrs.push(cache.key_ptr());
-                            value_ptrs.push(cache.value_ptr());
-                        }
-                    }
-                }
+                Nemotron3Layer::Attention(_) => {}
                 Nemotron3Layer::Moe(_) => {}
             }
         }
         workspace.conv_state_table.copy_from_host(&conv_ptrs)?;
         workspace.ssm_state_table.copy_from_host(&ssm_ptrs)?;
-        if !self.compact_kv_cache {
-            workspace.key_cache_table.copy_from_host(&key_ptrs)?;
-            workspace.value_cache_table.copy_from_host(&value_ptrs)?;
-        }
+        workspace.page_table_table.copy_from_host(
+            &page_tables
+                .iter()
+                .map(|table| table.as_const_ptr().cast::<u32>())
+                .collect::<Vec<_>>(),
+        )?;
 
         copy_bf16_rows_to_f32_indexed_into_on_stream(
             self.manifest.vocab_size,
@@ -787,21 +866,18 @@ impl Nemotron3Model {
             workspace.hidden.output(),
             &self.stream,
         )?;
-        if let Some(graphs) = &workspace.layer_graphs {
-            for graph in graphs {
-                graph.launch(&self.stream)?;
-            }
-        } else {
-            self.enqueue_block_layers(
-                states,
-                offsets,
-                lengths,
-                workspace,
-                sequence_count,
-                rows,
-                &self.stream,
-            )?;
-        }
+        self.enqueue_block_layers(
+            states,
+            offsets,
+            lengths,
+            workspace,
+            sequence_count,
+            rows,
+            cache,
+            reservations,
+            page_tables,
+            &self.stream,
+        )?;
         let last = workspace
             .layers
             .last()
@@ -810,25 +886,21 @@ impl Nemotron3Model {
                 detail: "model has no layers".to_string(),
             })?
             .output();
-        if let Some(graph) = &workspace.tail_graph {
-            graph.launch(&self.stream)?;
-        } else {
-            rms_norm_f32_into_on_stream(
-                rows,
-                self.manifest.hidden_size,
-                last,
-                &self.final_norm,
-                workspace.final_hidden.output(),
-                self.manifest.norm_epsilon,
-                &self.stream,
-            )?;
-            self.lm_head.run_rows(
-                &workspace.final_hidden,
-                &mut workspace.logits,
-                rows,
-                &self.stream,
-            )?;
-        }
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.manifest.hidden_size,
+            last,
+            &self.final_norm,
+            workspace.final_hidden.output(),
+            self.manifest.norm_epsilon,
+            &self.stream,
+        )?;
+        self.lm_head.run_rows(
+            &workspace.final_hidden,
+            &mut workspace.logits,
+            rows,
+            &self.stream,
+        )?;
         if commit_all {
             for (sequence, state) in states.iter_mut().enumerate() {
                 let last_row = offsets[sequence] as usize + lengths[sequence] as usize - 1;
@@ -849,14 +921,6 @@ impl Nemotron3Model {
                     &self.stream,
                 )?;
             }
-            for (sequence, state) in states.iter_mut().enumerate() {
-                for layer in &mut state.layers {
-                    if let Nemotron3LayerState::Attention { cache, .. } = layer {
-                        cache.advance_len(lengths[sequence] as usize)?;
-                    }
-                }
-                state.tokens += lengths[sequence] as usize;
-            }
         }
         Ok(())
     }
@@ -866,44 +930,92 @@ impl Nemotron3Model {
     /// compact per-sequence result metadata is copied to the host.
     pub fn verify_speculative_argmax(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         draft_chunks: &[&[u32]],
         workspace: &mut Nemotron3BlockWorkspace,
+        cache: &mut Nemotron3SequenceCache,
     ) -> Result<Nemotron3SpeculativeResult> {
         let draft_count = workspace.draft_count.ok_or_else(|| Error::Format {
             label: "Nemotron 3 speculative verification",
             detail: "a transactional speculative workspace is required".to_string(),
         })?;
-        if states.len() != workspace.sequence_count || draft_chunks.len() != states.len() {
+        if sequences.len() != workspace.sequence_count || draft_chunks.len() != sequences.len() {
             return Err(Error::Shape {
                 label: "Nemotron 3 speculative sequences",
                 expected: format!("{} states and chunks", workspace.sequence_count),
-                actual: format!("states={} chunks={}", states.len(), draft_chunks.len()),
+                actual: format!("states={} chunks={}", sequences.len(), draft_chunks.len()),
             });
         }
-        let previous_logits = states
-            .iter()
-            .map(|state| state.logits.as_const_ptr().cast::<f32>())
-            .collect::<Vec<_>>();
-        workspace
-            .previous_logits_table
-            .copy_from_host(&previous_logits)?;
-        self.forward_block_impl(states, draft_chunks, workspace, false)?;
-        self.accept_speculative_argmax(states, workspace, draft_count)
+        let mut reservations = Vec::with_capacity(sequences.len());
+        for (index, sequence) in sequences.iter_mut().enumerate() {
+            match cache.reserve_append(
+                sequence.cache_id,
+                draft_count,
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    for (sequence, reservation) in
+                        sequences[..index].iter_mut().zip(reservations.drain(..))
+                    {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Nemotron3CacheContext {
+                                    stream: &self.stream,
+                                    page_table: &mut sequence.page_table,
+                                },
+                            )
+                            .map_err(nemotron3_cache_error)?;
+                    }
+                    return Err(nemotron3_cache_error(error));
+                }
+            }
+        }
+        let result = {
+            let previous_logits = sequences
+                .iter()
+                .map(|sequence| sequence.state.logits.as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>();
+            workspace
+                .previous_logits_table
+                .copy_from_host(&previous_logits)?;
+            let mut states = Vec::with_capacity(sequences.len());
+            let mut page_tables = Vec::with_capacity(sequences.len());
+            for sequence in sequences.iter_mut() {
+                states.push(&mut sequence.state);
+                page_tables.push(sequence.page_table.device());
+            }
+            self.forward_block_impl(
+                &mut states,
+                draft_chunks,
+                workspace,
+                false,
+                cache,
+                &reservations,
+                &page_tables,
+            )?;
+            self.accept_speculative_argmax(&mut states, workspace, draft_count)
+        };
+        self.finish_speculative_reservations(sequences, reservations, cache, result)
     }
 
     /// Verifies sequence-major drafts already resident on the device.
     pub fn verify_speculative_device_argmax(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         drafted_tokens: &DeviceBuffer<u32>,
         workspace: &mut Nemotron3BlockWorkspace,
+        cache: &mut Nemotron3SequenceCache,
     ) -> Result<Nemotron3SpeculativeResult> {
         let draft_count = workspace.draft_count.ok_or_else(|| Error::Format {
             label: "Nemotron 3 speculative verification",
             detail: "a transactional speculative workspace is required".to_string(),
         })?;
-        let sequence_count = states.len();
+        let sequence_count = sequences.len();
         if sequence_count == 0
             || sequence_count != workspace.sequence_count
             || drafted_tokens.len() != workspace.rows
@@ -923,7 +1035,7 @@ impl Nemotron3Model {
         let mut offsets = Vec::with_capacity(sequence_count);
         let mut lengths = Vec::with_capacity(sequence_count);
         let mut starts = Vec::with_capacity(sequence_count);
-        for (sequence, state) in states.iter().enumerate() {
+        for (sequence, state) in sequences.iter().map(|sequence| &sequence.state).enumerate() {
             if state.tokens.saturating_add(draft_count) > state.max_tokens()? {
                 return Err(Error::Shape {
                     label: "Nemotron 3 speculative sequence capacity",
@@ -945,9 +1057,9 @@ impl Nemotron3Model {
                 actual: state.tokens.to_string(),
             })?);
         }
-        let previous_logits = states
+        let previous_logits = sequences
             .iter()
-            .map(|state| state.logits.as_const_ptr().cast::<f32>())
+            .map(|sequence| sequence.state.logits.as_const_ptr().cast::<f32>())
             .collect::<Vec<_>>();
         workspace
             .previous_logits_table
@@ -960,8 +1072,111 @@ impl Nemotron3Model {
         workspace.sequence_offsets.copy_from_host(&offsets)?;
         workspace.sequence_lengths.copy_from_host(&lengths)?;
         workspace.start_positions.copy_from_host(&starts)?;
-        self.enqueue_prepared_block(states, &offsets, &lengths, workspace, false)?;
-        self.accept_speculative_argmax(states, workspace, draft_count)
+        let mut reservations = Vec::with_capacity(sequence_count);
+        for (index, sequence) in sequences.iter_mut().enumerate() {
+            match cache.reserve_append(
+                sequence.cache_id,
+                draft_count,
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    for (sequence, reservation) in
+                        sequences[..index].iter_mut().zip(reservations.drain(..))
+                    {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Nemotron3CacheContext {
+                                    stream: &self.stream,
+                                    page_table: &mut sequence.page_table,
+                                },
+                            )
+                            .map_err(nemotron3_cache_error)?;
+                    }
+                    return Err(nemotron3_cache_error(error));
+                }
+            }
+        }
+        let result = {
+            let mut states = Vec::with_capacity(sequence_count);
+            let mut page_tables = Vec::with_capacity(sequence_count);
+            for sequence in sequences.iter_mut() {
+                states.push(&mut sequence.state);
+                page_tables.push(sequence.page_table.device());
+            }
+            self.enqueue_prepared_block(
+                &mut states,
+                &offsets,
+                &lengths,
+                workspace,
+                false,
+                cache,
+                &reservations,
+                &page_tables,
+            )?;
+            self.accept_speculative_argmax(&mut states, workspace, draft_count)
+        };
+        self.finish_speculative_reservations(sequences, reservations, cache, result)
+    }
+
+    fn finish_speculative_reservations(
+        &self,
+        sequences: &mut [&mut Nemotron3Sequence],
+        reservations: Vec<sequence_cache::AppendReservation>,
+        cache: &mut Nemotron3SequenceCache,
+        result: Result<Nemotron3SpeculativeResult>,
+    ) -> Result<Nemotron3SpeculativeResult> {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                for (sequence, reservation) in sequences.iter_mut().zip(reservations) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Nemotron3CacheContext {
+                                stream: &self.stream,
+                                page_table: &mut sequence.page_table,
+                            },
+                        )
+                        .map_err(nemotron3_cache_error)?;
+                }
+                return Err(error);
+            }
+        };
+        for ((sequence, reservation), &accepted) in sequences
+            .iter_mut()
+            .zip(reservations)
+            .zip(result.accepted_counts())
+        {
+            if accepted == 0 {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Nemotron3CacheContext {
+                            stream: &self.stream,
+                            page_table: &mut sequence.page_table,
+                        },
+                    )
+                    .map_err(nemotron3_cache_error)?;
+            } else {
+                cache
+                    .commit_append(
+                        reservation,
+                        accepted as usize,
+                        &mut Nemotron3CacheContext {
+                            stream: &self.stream,
+                            page_table: &mut sequence.page_table,
+                        },
+                    )
+                    .map_err(nemotron3_cache_error)?;
+                sequence.state.tokens += accepted as usize;
+            }
+        }
+        Ok(result)
     }
 
     /// Runs one complete greedy MTP draft-and-verify cycle for active sequences.
@@ -972,11 +1187,12 @@ impl Nemotron3Model {
     /// accepted draft prefix followed by the next target token.
     pub fn speculative_cycle_argmax(
         &self,
-        states: &mut [&mut Nemotron3DecodeState],
+        sequences: &mut [&mut Nemotron3Sequence],
         input_tokens: &[u32],
         workspace: &mut Nemotron3SpeculativeCycleWorkspace,
+        cache: &mut Nemotron3SequenceCache,
     ) -> Result<Nemotron3SpeculativeCycleResult> {
-        let sequence_count = states.len();
+        let sequence_count = sequences.len();
         workspace.require(self, sequence_count)?;
         if input_tokens.len() != sequence_count {
             return Err(Error::Shape {
@@ -986,7 +1202,7 @@ impl Nemotron3Model {
             });
         }
         let mut mtp_base_lengths = Vec::with_capacity(sequence_count);
-        for (sequence, state) in states.iter().enumerate() {
+        for (sequence, state) in sequences.iter().map(|sequence| &sequence.state).enumerate() {
             let mtp = state.mtp.as_ref().ok_or_else(|| Error::Format {
                 label: "Nemotron 3 speculative cycle MTP state",
                 detail: format!("sequence {sequence} has no MTP state"),
@@ -1009,7 +1225,7 @@ impl Nemotron3Model {
             mtp_base_lengths.push(mtp.cache.len());
         }
         workspace.input_tokens.copy_from_host(input_tokens)?;
-        for (sequence, state) in states.iter().enumerate() {
+        for (sequence, state) in sequences.iter().map(|sequence| &sequence.state).enumerate() {
             workspace.target_hidden.copy_range_from_device_on_stream(
                 sequence * self.manifest.hidden_size,
                 &state.final_hidden,
@@ -1019,7 +1235,7 @@ impl Nemotron3Model {
             )?;
         }
         self.draft_three_mtp_argmax(
-            states,
+            sequences,
             input_tokens,
             &workspace.target_hidden,
             &mut workspace.mtp,
@@ -1033,9 +1249,10 @@ impl Nemotron3Model {
             &self.stream,
         )?;
         let verification = self.verify_speculative_device_argmax(
-            states,
+            sequences,
             &workspace.verification_tokens,
             &mut workspace.verification,
+            cache,
         )?;
         gather_group_row_f32_into_on_stream(
             workspace.verification.final_hidden(),
@@ -1055,15 +1272,22 @@ impl Nemotron3Model {
             .chunks_exact(NEMOTRON3_SPECULATIVE_DRAFTS)
             .map(|tokens| std::slice::from_ref(&tokens[NEMOTRON3_SPECULATIVE_DRAFTS - 1]))
             .collect::<Vec<_>>();
-        self.append_mtp_cache_block(
-            states,
-            &catchup_tokens,
-            &workspace.catchup_hidden,
-            &mut workspace.catchup,
-        )?;
+        {
+            let mut states = sequences
+                .iter_mut()
+                .map(|sequence| &mut sequence.state)
+                .collect::<Vec<_>>();
+            self.append_mtp_cache_block(
+                &mut states,
+                &catchup_tokens,
+                &workspace.catchup_hidden,
+                &mut workspace.catchup,
+            )?;
+        }
         let mut accepted_drafts = Vec::with_capacity(sequence_count);
-        for (sequence, ((state, &base), &accepted)) in states
+        for (sequence, ((state, &base), &accepted)) in sequences
             .iter_mut()
+            .map(|sequence| &mut sequence.state)
             .zip(&mtp_base_lengths)
             .zip(verification.accepted_counts())
             .enumerate()
@@ -1188,12 +1412,6 @@ impl Nemotron3Model {
                     &self.stream,
                 )?;
             }
-            for layer in &mut state.layers {
-                if let Nemotron3LayerState::Attention { cache, .. } = layer {
-                    cache.commit_speculative(state.tokens, accepted)?;
-                }
-            }
-            state.tokens += accepted;
         }
         Ok(Nemotron3SpeculativeResult {
             accepted_counts: accepted,
@@ -1210,6 +1428,9 @@ impl Nemotron3Model {
         workspace: &mut Nemotron3BlockWorkspace,
         sequence_count: usize,
         rows: usize,
+        cache: &mut Nemotron3SequenceCache,
+        reservations: &[sequence_cache::AppendReservation],
+        page_tables: &[&DeviceBuffer<u32>],
         stream: &CudaStream,
     ) -> Result<()> {
         let mut mamba_layer = 0;
@@ -1225,6 +1446,9 @@ impl Nemotron3Model {
                 rows,
                 mamba_layer,
                 attention_layer,
+                cache,
+                reservations,
+                page_tables,
                 stream,
             )?;
             match self.layers[layer] {
@@ -1247,7 +1471,10 @@ impl Nemotron3Model {
         sequence_count: usize,
         rows: usize,
         mamba_layer: usize,
-        attention_layer: usize,
+        _attention_layer: usize,
+        cache: &mut Nemotron3SequenceCache,
+        reservations: &[sequence_cache::AppendReservation],
+        page_tables: &[&DeviceBuffer<u32>],
         stream: &CudaStream,
     ) -> Result<()> {
         let (previous, current) = workspace.layers.split_at_mut(layer);
@@ -1297,57 +1524,32 @@ impl Nemotron3Model {
                 Nemotron3Layer::Attention(weights),
                 Nemotron3LayerRowsWorkspace::Attention(scratch),
             ) => {
-                if self.compact_kv_cache {
-                    let compact_attention =
-                        workspace
-                            .compact_attention
-                            .as_mut()
-                            .ok_or_else(|| Error::Format {
-                                label: "Nemotron 3 compact attention workspace",
-                                detail: "missing shared compact-attention scratch".to_string(),
-                            })?;
-                    let mut caches = Vec::with_capacity(sequence_count);
-                    for state in states.iter_mut() {
-                        let Nemotron3LayerState::Attention { cache, .. } = &mut state.layers[layer]
-                        else {
-                            return Err(Error::Format {
-                                label: "Nemotron 3 compact attention state",
-                                detail: format!("state variant mismatch at layer {layer}"),
-                            });
-                        };
-                        let Nemotron3AttentionCache::Nvfp4(cache) = cache else {
-                            return Err(Error::Format {
-                                label: "Nemotron 3 compact attention cache",
-                                detail: "loaded compact execution with an FP32 cache".to_string(),
-                            });
-                        };
-                        caches.push(cache);
-                    }
-                    weights.run_rows_compact(
-                        input,
-                        scratch,
-                        &mut caches,
-                        offsets,
-                        lengths,
-                        rows,
-                        compact_attention,
-                        stream,
-                    )
-                } else {
-                    weights.run_rows(
-                        input,
-                        scratch,
-                        &workspace.key_cache_table,
-                        &workspace.value_cache_table,
-                        attention_layer * sequence_count,
-                        &workspace.sequence_offsets,
-                        &workspace.sequence_lengths,
-                        &workspace.start_positions,
-                        sequence_count,
-                        rows,
-                        stream,
-                    )
-                }
+                let starts = states
+                    .iter()
+                    .map(|state| state.tokens as u32)
+                    .collect::<Vec<_>>();
+                cache
+                    .with_append_reservations(reservations, |backend, pages| {
+                        weights.run_rows_paged(
+                            input,
+                            scratch,
+                            backend,
+                            pages,
+                            &workspace.page_table_table,
+                            page_tables,
+                            &workspace.sequence_offsets,
+                            &workspace.sequence_lengths,
+                            &workspace.start_positions,
+                            offsets,
+                            lengths,
+                            &starts,
+                            sequence_count,
+                            rows,
+                            workspace.compact_attention.as_mut(),
+                            stream,
+                        )
+                    })
+                    .map_err(nemotron3_cache_error)
             }
             _ => Err(Error::Format {
                 label: "Nemotron 3 block layer workspace",
@@ -1356,64 +1558,64 @@ impl Nemotron3Model {
         }
     }
 
-    fn capture_block_graphs(
+    /// Runs one token through the complete backbone and language-model head.
+    pub fn forward_one(
         &self,
-        workspace: &mut Nemotron3BlockWorkspace,
-    ) -> Result<(Vec<CudaGraphExec>, CudaGraphExec)> {
-        let mut graphs = Vec::with_capacity(self.layers.len());
-        let mut mamba_layer = 0;
-        let mut attention_layer = 0;
-        for layer in 0..self.layers.len() {
-            graphs.push(self.stream.capture(|stream| {
-                self.enqueue_block_layer(
-                    &mut [],
-                    &[],
-                    &[],
-                    workspace,
-                    layer,
-                    workspace.sequence_count,
-                    workspace.rows,
-                    mamba_layer,
-                    attention_layer,
-                    stream,
-                )
-            })?);
-            match self.layers[layer] {
-                Nemotron3Layer::Mamba(_) => mamba_layer += 1,
-                Nemotron3Layer::Attention(_) => attention_layer += 1,
-                Nemotron3Layer::Moe(_) => {}
-            }
-        }
-        let last = workspace
-            .layers
-            .last()
-            .ok_or_else(|| Error::Format {
-                label: "Nemotron 3 block graph",
-                detail: "model has no layers".to_string(),
-            })?
-            .output();
-        let tail = self.stream.capture(|stream| {
-            rms_norm_f32_into_on_stream(
-                workspace.rows,
-                self.manifest.hidden_size,
-                last,
-                &self.final_norm,
-                workspace.final_hidden.output(),
-                self.manifest.norm_epsilon,
-                stream,
-            )?;
-            self.lm_head.run_rows(
-                &workspace.final_hidden,
-                &mut workspace.logits,
-                workspace.rows,
-                stream,
+        sequence: &mut Nemotron3Sequence,
+        cache: &mut Nemotron3SequenceCache,
+        token: u32,
+    ) -> Result<()> {
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                1,
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
             )
-        })?;
-        Ok((graphs, tail))
+            .map_err(nemotron3_cache_error)?;
+        let result = self.forward_one_reserved(
+            &mut sequence.state,
+            cache,
+            &reservation,
+            sequence.page_table.device(),
+            token,
+        );
+        if let Err(error) = result {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Nemotron3CacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(nemotron3_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                reservation,
+                1,
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(nemotron3_cache_error)?;
+        sequence.state.tokens += 1;
+        Ok(())
     }
 
-    /// Runs one token through the complete backbone and language-model head.
-    pub fn forward_one(&self, state: &mut Nemotron3DecodeState, token: u32) -> Result<()> {
+    fn forward_one_reserved(
+        &self,
+        state: &mut Nemotron3DecodeState,
+        cache: &mut Nemotron3SequenceCache,
+        reservation: &sequence_cache::AppendReservation,
+        page_table: &DeviceBuffer<u32>,
+        token: u32,
+    ) -> Result<()> {
         if token as usize >= self.manifest.vocab_size {
             return Err(Error::Shape {
                 label: "Nemotron 3 token",
@@ -1443,12 +1645,42 @@ impl Nemotron3Model {
             } else {
                 previous[layer - 1].output()
             };
-            self.layers[layer].run_one(
-                &mut current[0],
-                input,
-                state.compact_attention.as_mut(),
-                &self.stream,
-            )?;
+            match (&self.layers[layer], &mut current[0]) {
+                (
+                    Nemotron3Layer::Mamba(weights),
+                    Nemotron3LayerState::Mamba { workspace, state },
+                ) => {
+                    weights.run_one_token(input, workspace, state, &self.stream)?;
+                }
+                (Nemotron3Layer::Moe(weights), Nemotron3LayerState::Moe(workspace)) => {
+                    weights.run_one_token(input, workspace, &self.stream)?;
+                }
+                (
+                    Nemotron3Layer::Attention(weights),
+                    Nemotron3LayerState::Attention { workspace },
+                ) => {
+                    cache
+                        .with_append_pages(reservation, |backend, pages| {
+                            weights.run_one_token_paged(
+                                input,
+                                workspace,
+                                backend,
+                                pages,
+                                page_table,
+                                state.tokens,
+                                state.compact_attention.as_mut(),
+                                &self.stream,
+                            )
+                        })
+                        .map_err(nemotron3_cache_error)?;
+                }
+                _ => {
+                    return Err(Error::Format {
+                        label: "Nemotron 3 layer state",
+                        detail: format!("state variant mismatch at layer {layer}"),
+                    });
+                }
+            }
         }
         let last = state
             .layers
@@ -1469,17 +1701,17 @@ impl Nemotron3Model {
         )?;
         self.lm_head
             .run(&state.final_hidden, &mut state.logits, &self.stream)?;
-        state.tokens += 1;
         Ok(())
     }
 
     /// Returns the maximum-logit token after [`Self::forward_one`].
-    pub fn argmax(&self, state: &mut Nemotron3DecodeState) -> Result<u32> {
-        Ok(self.argmax_with_logit(state)?.0)
+    pub fn argmax(&self, sequence: &mut Nemotron3Sequence) -> Result<u32> {
+        Ok(self.argmax_with_logit(sequence)?.0)
     }
 
     /// Returns the maximum-logit token and its unmodified logit.
-    pub fn argmax_with_logit(&self, state: &mut Nemotron3DecodeState) -> Result<(u32, f32)> {
+    pub fn argmax_with_logit(&self, sequence: &mut Nemotron3Sequence) -> Result<(u32, f32)> {
+        let state = &mut sequence.state;
         argmax_f32_into_on_stream(
             &state.logits,
             state.next_token.output(),
@@ -1492,8 +1724,8 @@ impl Nemotron3Model {
     }
 
     /// Copies the current vocabulary logits to host memory for sampling.
-    pub fn logits_to_host(&self, state: &Nemotron3DecodeState) -> Result<Vec<f32>> {
-        Ok(state.logits.copy_to_host(&self.stream)?.into_vec())
+    pub fn logits_to_host(&self, sequence: &Nemotron3Sequence) -> Result<Vec<f32>> {
+        Ok(sequence.state.logits.copy_to_host(&self.stream)?.into_vec())
     }
 
     /// Copies flattened MTP logits to host memory.
@@ -1696,21 +1928,17 @@ pub struct Nemotron3BlockWorkspace {
     start_positions: DeviceBuffer<u32>,
     conv_state_table: DeviceBuffer<*mut u16>,
     ssm_state_table: DeviceBuffer<*mut u16>,
-    key_cache_table: DeviceBuffer<*mut f32>,
-    value_cache_table: DeviceBuffer<*mut f32>,
+    page_table_table: DeviceBuffer<*const u32>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     previous_logits_table: DeviceBuffer<*const f32>,
     accepted_counts: DeviceBuffer<u32>,
     next_tokens: DeviceBuffer<u32>,
     mamba_snapshots: Option<Vec<Nemotron3MambaSnapshots>>,
-    layer_graphs: Option<Vec<CudaGraphExec>>,
-    tail_graph: Option<CudaGraphExec>,
     sequence_count: usize,
     rows: usize,
     hidden_size: usize,
     vocab_size: usize,
     mamba_layers: usize,
-    attention_layers: usize,
     draft_count: Option<usize>,
 }
 
@@ -1749,11 +1977,6 @@ impl Nemotron3BlockWorkspace {
             .layers
             .iter()
             .filter(|layer| matches!(layer, Nemotron3Layer::Mamba(_)))
-            .count();
-        let attention_layers = model
-            .layers
-            .iter()
-            .filter(|layer| matches!(layer, Nemotron3Layer::Attention(_)))
             .count();
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
@@ -1794,7 +2017,7 @@ impl Nemotron3BlockWorkspace {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        let mut workspace = Self {
+        let workspace = Self {
             tokens: DeviceBuffer::zeroed(rows)?,
             hidden: DeviceBuffer::zeroed(rows * model.manifest.hidden_size)?,
             layers,
@@ -1805,8 +2028,7 @@ impl Nemotron3BlockWorkspace {
             start_positions: DeviceBuffer::zeroed(sequence_count)?,
             conv_state_table: DeviceBuffer::zeroed(mamba_layers * sequence_count)?,
             ssm_state_table: DeviceBuffer::zeroed(mamba_layers * sequence_count)?,
-            key_cache_table: DeviceBuffer::zeroed(attention_layers * sequence_count)?,
-            value_cache_table: DeviceBuffer::zeroed(attention_layers * sequence_count)?,
+            page_table_table: DeviceBuffer::zeroed(sequence_count)?,
             compact_attention: model
                 .compact_kv_cache
                 .then(|| {
@@ -1823,23 +2045,13 @@ impl Nemotron3BlockWorkspace {
             accepted_counts: DeviceBuffer::zeroed(sequence_count)?,
             next_tokens: DeviceBuffer::zeroed(sequence_count)?,
             mamba_snapshots,
-            layer_graphs: None,
-            tail_graph: None,
             sequence_count,
             rows,
             hidden_size: model.manifest.hidden_size,
             vocab_size: model.manifest.vocab_size,
             mamba_layers,
-            attention_layers,
             draft_count,
         };
-        let enable_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
-        if enable_graphs && !model.compact_kv_cache {
-            let (layers, tail) = model.capture_block_graphs(&mut workspace)?;
-            workspace.layer_graphs = Some(layers);
-            workspace.tail_graph = Some(tail);
-        }
         Ok(workspace)
     }
 
@@ -1897,8 +2109,7 @@ impl Nemotron3BlockWorkspace {
             + self.start_positions.device_bytes()
             + self.conv_state_table.device_bytes()
             + self.ssm_state_table.device_bytes()
-            + self.key_cache_table.device_bytes()
-            + self.value_cache_table.device_bytes()
+            + self.page_table_table.device_bytes()
             + self
                 .compact_attention
                 .as_ref()
@@ -1922,11 +2133,7 @@ enum Nemotron3Layer {
 }
 
 impl Nemotron3Layer {
-    fn sequence_state(
-        &self,
-        max_tokens: usize,
-        compact_kv_cache: bool,
-    ) -> Result<Nemotron3LayerState> {
+    fn sequence_state(&self) -> Result<Nemotron3LayerState> {
         match self {
             Self::Mamba(layer) => Ok(Nemotron3LayerState::Mamba {
                 workspace: layer.workspace()?,
@@ -1935,31 +2142,6 @@ impl Nemotron3Layer {
             Self::Moe(layer) => Ok(Nemotron3LayerState::Moe(layer.workspace()?)),
             Self::Attention(layer) => Ok(Nemotron3LayerState::Attention {
                 workspace: layer.workspace()?,
-                cache: layer.sequence_state_with_storage(max_tokens, compact_kv_cache)?,
-            }),
-        }
-    }
-
-    fn run_one(
-        &self,
-        state: &mut Nemotron3LayerState,
-        input: &DeviceBuffer<f32>,
-        compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        match (self, state) {
-            (Self::Mamba(layer), Nemotron3LayerState::Mamba { workspace, state }) => {
-                layer.run_one_token(input, workspace, state, stream)
-            }
-            (Self::Moe(layer), Nemotron3LayerState::Moe(workspace)) => {
-                layer.run_one_token(input, workspace, stream)
-            }
-            (Self::Attention(layer), Nemotron3LayerState::Attention { workspace, cache }) => {
-                layer.run_one_token(input, workspace, cache, compact_attention, stream)
-            }
-            _ => Err(Error::Format {
-                label: "Nemotron 3 layer state",
-                detail: "layer weights and sequence state variants do not match".to_string(),
             }),
         }
     }
@@ -1981,15 +2163,13 @@ enum Nemotron3LayerState {
     Moe(Nemotron3MoeWorkspace),
     Attention {
         workspace: Nemotron3AttentionWorkspace,
-        cache: Nemotron3AttentionCache,
     },
 }
 
-enum Nemotron3CheckpointLayer {
+enum Nemotron3SnapshotLayer {
     Mamba(Nemotron3MambaState),
     Moe,
-    AttentionF32(LayerKvCacheCheckpoint),
-    AttentionNvfp4(Sm12xKvCache),
+    Attention,
 }
 
 impl Nemotron3LayerState {
@@ -2005,35 +2185,22 @@ impl Nemotron3LayerState {
         match self {
             Self::Mamba { workspace, state } => workspace.device_bytes() + state.device_bytes(),
             Self::Moe(workspace) => workspace.device_bytes(),
-            Self::Attention { workspace, cache } => workspace.device_bytes() + cache.device_bytes(),
-        }
-    }
-
-    fn checkpoint_device_bytes(&self) -> usize {
-        match self {
-            Self::Mamba { state, .. } => state.device_bytes(),
-            Self::Moe(_) => 0,
-            Self::Attention { cache, .. } => cache.checkpoint_device_bytes(),
+            Self::Attention { workspace } => workspace.device_bytes(),
         }
     }
 }
 
-/// Compact device-resident state for one reusable Nemotron prompt prefix.
-pub struct Nemotron3SequenceCheckpoint {
-    layers: Vec<Nemotron3CheckpointLayer>,
+/// Compact device-resident non-paged state for one reusable Nemotron prompt prefix.
+pub struct Nemotron3SequenceSnapshot {
+    layers: Vec<Nemotron3SnapshotLayer>,
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     mtp: Option<LayerKvCacheCheckpoint>,
     tokens: usize,
 }
 
-impl Nemotron3SequenceCheckpoint {
-    /// Returns the number of target tokens represented by this checkpoint.
-    pub fn position(&self) -> usize {
-        self.tokens
-    }
-
-    /// Returns bytes retained by the compact checkpoint.
+impl Nemotron3SequenceSnapshot {
+    /// Returns bytes retained by the compact snapshot.
     pub fn device_bytes(&self) -> usize {
         self.final_hidden.device_bytes()
             + self.logits.device_bytes()
@@ -2041,10 +2208,9 @@ impl Nemotron3SequenceCheckpoint {
                 .layers
                 .iter()
                 .map(|layer| match layer {
-                    Nemotron3CheckpointLayer::Mamba(state) => state.device_bytes(),
-                    Nemotron3CheckpointLayer::Moe => 0,
-                    Nemotron3CheckpointLayer::AttentionF32(cache) => cache.device_bytes(),
-                    Nemotron3CheckpointLayer::AttentionNvfp4(cache) => cache.device_bytes(),
+                    Nemotron3SnapshotLayer::Mamba(state) => state.device_bytes(),
+                    Nemotron3SnapshotLayer::Moe => 0,
+                    Nemotron3SnapshotLayer::Attention => 0,
                 })
                 .sum::<usize>()
             + self
@@ -2054,8 +2220,14 @@ impl Nemotron3SequenceCheckpoint {
     }
 }
 
+impl sequence_cache::RetainedSnapshot for Nemotron3SequenceSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.device_bytes()
+    }
+}
+
 /// Per-sequence state for complete-model decode.
-pub struct Nemotron3DecodeState {
+pub(crate) struct Nemotron3DecodeState {
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerState>,
     final_hidden: DeviceBuffer<f32>,
@@ -2065,27 +2237,13 @@ pub struct Nemotron3DecodeState {
     mtp: Option<Nemotron3MtpState>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     tokens: usize,
+    pub(crate) max_tokens: usize,
 }
 
 impl Nemotron3DecodeState {
     /// Returns the number of tokens already processed by the backbone.
     pub fn len(&self) -> usize {
         self.tokens
-    }
-
-    /// Returns true before the first token is processed.
-    pub fn is_empty(&self) -> bool {
-        self.tokens == 0
-    }
-
-    /// Returns the current language-model logits.
-    pub fn logits(&self) -> &DeviceBuffer<f32> {
-        &self.logits
-    }
-
-    /// Returns the normalized final hidden state for the most recent token.
-    pub fn final_hidden(&self) -> &DeviceBuffer<f32> {
-        &self.final_hidden
     }
 
     /// Returns bytes owned by this sequence's device-resident state and scratch.
@@ -2108,15 +2266,6 @@ impl Nemotron3DecodeState {
     }
 
     fn max_tokens(&self) -> Result<usize> {
-        self.layers
-            .iter()
-            .find_map(|layer| match layer {
-                Nemotron3LayerState::Attention { cache, .. } => Some(cache.max_tokens()),
-                _ => None,
-            })
-            .ok_or_else(|| Error::Format {
-                label: "Nemotron 3 sequence state",
-                detail: "model has no attention KV cache".to_string(),
-            })
+        Ok(self.max_tokens)
     }
 }

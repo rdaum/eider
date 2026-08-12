@@ -5968,6 +5968,196 @@ extern "C" cudaError_t infer_ragged_gqa_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
+__device__ __forceinline__ std::uint32_t infer_paged_f32_slot(
+    const std::uint32_t* page_table,
+    std::uint32_t logical_row,
+    std::uint32_t page_tokens) {
+    return page_table[logical_row / page_tokens];
+}
+
+__global__ void infer_append_ragged_paged_kv_f32_kernel(
+    const float* key,
+    const float* value,
+    float* key_pool,
+    float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t page_tokens,
+    std::uint32_t width) {
+    const std::uint32_t row = blockIdx.x;
+    if (row >= total_tokens) return;
+    __shared__ std::uint32_t sequence;
+    __shared__ std::uint32_t local_row;
+    __shared__ bool valid;
+    if (threadIdx.x == 0) {
+        valid = infer_ragged_row_location(
+            row, sequence_offsets, sequence_lengths, sequence_count, &sequence, &local_row);
+    }
+    __syncthreads();
+    if (!valid) return;
+    const std::uint32_t logical_row = start_positions[sequence] + local_row;
+    const std::uint32_t slot =
+        infer_paged_f32_slot(page_tables[sequence], logical_row, page_tokens);
+    const std::size_t source = static_cast<std::size_t>(row) * width;
+    const std::size_t destination =
+        (static_cast<std::size_t>(slot) * page_tokens + logical_row % page_tokens) * width;
+    for (std::uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        key_pool[destination + column] = key[source + column];
+        value_pool[destination + column] = value[source + column];
+    }
+}
+
+extern "C" cudaError_t infer_append_ragged_paged_kv_f32_on_stream(
+    const float* key,
+    const float* value,
+    float* key_pool,
+    float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t page_tokens,
+    std::uint32_t width,
+    cudaStream_t stream) {
+    if (key == nullptr || value == nullptr || key_pool == nullptr || value_pool == nullptr ||
+        page_tables == nullptr || sequence_offsets == nullptr || sequence_lengths == nullptr ||
+        start_positions == nullptr || sequence_count == 0 || total_tokens == 0 ||
+        page_tokens == 0 || width == 0) {
+        return cudaErrorInvalidValue;
+    }
+    infer_append_ragged_paged_kv_f32_kernel<<<total_tokens, 256, 0, stream>>>(
+        key, value, key_pool, value_pool, page_tables, sequence_offsets,
+        sequence_lengths, start_positions, sequence_count, total_tokens, page_tokens, width);
+    return cudaGetLastError();
+}
+
+__global__ void infer_ragged_paged_gqa_attention_f32_kernel(
+    const float* query,
+    const float* key_pool,
+    const float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions,
+    float* output,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t page_tokens,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+    extern __shared__ float shmem[];
+    float* q_sh = shmem;
+    float* partial = shmem + head_dim;
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t q_head = blockIdx.y;
+    if (row >= total_tokens || q_head >= q_heads) return;
+    __shared__ std::uint32_t sequence;
+    __shared__ std::uint32_t local_row;
+    __shared__ bool valid;
+    if (threadIdx.x == 0) {
+        valid = infer_ragged_row_location(
+            row, sequence_offsets, sequence_lengths, sequence_count, &sequence, &local_row);
+    }
+    __syncthreads();
+    if (!valid) return;
+
+    const std::uint32_t groups_per_kv = q_heads / kv_heads;
+    const std::uint32_t kv_head = q_head / groups_per_kv;
+    const std::uint32_t kv_width = kv_heads * head_dim;
+    const std::uint32_t hidden = q_heads * head_dim;
+    const std::uint32_t cache_len = start_positions[sequence] + local_row + 1;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float* q = query + static_cast<std::size_t>(row) * hidden + q_head * head_dim;
+    const std::uint32_t* page_table = page_tables[sequence];
+    for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) q_sh[dim] = q[dim];
+    __syncthreads();
+
+    float maximum = -INFINITY;
+    float total_weight = 0.0f;
+    float accum = 0.0f;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t warps = blockDim.x >> 5u;
+    for (std::uint32_t cache_row = 0; cache_row < cache_len; ++cache_row) {
+        const std::uint32_t slot = infer_paged_f32_slot(page_table, cache_row, page_tokens);
+        const std::size_t storage_row =
+            static_cast<std::size_t>(slot) * page_tokens + cache_row % page_tokens;
+        const float* k = key_pool + storage_row * kv_width + kv_head * head_dim;
+        const float* v = value_pool + storage_row * kv_width + kv_head * head_dim;
+        float dot = threadIdx.x < head_dim ? q_sh[threadIdx.x] * k[threadIdx.x] : 0.0f;
+        dot += __shfl_xor_sync(0xffffffffu, dot, 16);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 8);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 4);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 2);
+        dot += __shfl_xor_sync(0xffffffffu, dot, 1);
+        if (lane == 0) partial[warp] = dot;
+        __syncthreads();
+        if (warp == 0 && lane == 0) {
+            dot = 0.0f;
+            for (std::uint32_t index = 0; index < warps; ++index) dot += partial[index];
+            const float score = dot * scale;
+            const float rescale = score > maximum ? expf(maximum - score) : 1.0f;
+            const float weight = score > maximum ? 1.0f : expf(score - maximum);
+            maximum = fmaxf(maximum, score);
+            total_weight = total_weight * rescale + weight;
+            partial[0] = rescale;
+            partial[1] = weight;
+        }
+        __syncthreads();
+        if (threadIdx.x < head_dim) {
+            accum *= partial[0];
+            accum = __fmaf_rn(partial[1], v[threadIdx.x], accum);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partial[0] = total_weight;
+    __syncthreads();
+    if (threadIdx.x < head_dim) {
+        output[static_cast<std::size_t>(row) * hidden + q_head * head_dim + threadIdx.x] =
+            accum / partial[0];
+    }
+}
+
+extern "C" cudaError_t infer_ragged_paged_gqa_attention_f32_on_stream(
+    const float* query,
+    const float* key_pool,
+    const float* value_pool,
+    const std::uint32_t* const* page_tables,
+    const std::uint32_t* sequence_offsets,
+    const std::uint32_t* sequence_lengths,
+    const std::uint32_t* start_positions,
+    float* output,
+    std::uint32_t sequence_count,
+    std::uint32_t total_tokens,
+    std::uint32_t page_tokens,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    if (query == nullptr || key_pool == nullptr || value_pool == nullptr ||
+        page_tables == nullptr || sequence_offsets == nullptr || sequence_lengths == nullptr ||
+        start_positions == nullptr || output == nullptr || sequence_count == 0 ||
+        total_tokens == 0 || page_tokens == 0 || q_heads == 0 || kv_heads == 0 ||
+        head_dim == 0 || head_dim > kThreads || q_heads % kv_heads != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 blocks(total_tokens, q_heads);
+    infer_ragged_paged_gqa_attention_f32_kernel<<<
+        blocks, kThreads, (head_dim + kThreads) * sizeof(float), stream>>>(
+        query, key_pool, value_pool, page_tables, sequence_offsets, sequence_lengths,
+        start_positions, output, sequence_count, total_tokens, page_tokens,
+        q_heads, kv_heads, head_dim);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_prefill_gqa_attention_f32_on_stream(const float* query,
                                                              const float* key_cache,
                                                              const float* value_cache,

@@ -72,6 +72,54 @@ impl Sm12xPageTable {
         self.page_capacity * (size_of::<u32>() * 3)
     }
 
+    pub(crate) fn update_slots(
+        &mut self,
+        slots: impl IntoIterator<Item = u32>,
+        page_count: usize,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if page_count > self.page_capacity || position > self.page_capacity * SM12X_KV_PAGE_TOKENS {
+            return Err(Error::Shape {
+                label: "SM12x page-table update",
+                expected: format!(
+                    "at most {} pages and position <= {}",
+                    self.page_capacity,
+                    self.page_capacity * SM12X_KV_PAGE_TOKENS
+                ),
+                actual: format!("pages={page_count} position={position}"),
+            });
+        }
+        let staging = self.staging.as_mut_slice();
+        let mut slots = slots.into_iter();
+        for destination in &mut staging[..page_count] {
+            let Some(slot) = slots.next() else {
+                return Err(Error::Shape {
+                    label: "SM12x page-table slots",
+                    expected: format!("exactly {page_count} slots"),
+                    actual: "fewer slots".to_string(),
+                });
+            };
+            *destination = slot;
+        }
+        if slots.next().is_some() {
+            return Err(Error::Shape {
+                label: "SM12x page-table slots",
+                expected: format!("exactly {page_count} slots"),
+                actual: "additional slots".to_string(),
+            });
+        }
+        staging[page_count..].fill(u32::MAX);
+        let changed = self.host.as_slice() != staging;
+        if changed {
+            self.device
+                .copy_range_from_pinned_on_stream(0, &self.staging, stream)?;
+            std::mem::swap(&mut self.host, &mut self.staging);
+        }
+        self.position = position;
+        Ok(())
+    }
+
     fn update(&mut self, pages: &[&Sm12xPage], position: usize, stream: &CudaStream) -> Result<()> {
         if pages.len() > self.page_capacity || position > self.page_capacity * SM12X_KV_PAGE_TOKENS
         {
@@ -85,24 +133,12 @@ impl Sm12xPageTable {
                 actual: format!("pages={} position={position}", pages.len()),
             });
         }
-        let host = self.host.as_slice();
-        let changed = host[..pages.len()]
-            .iter()
-            .zip(pages)
-            .any(|(slot, page)| *slot != page.slot)
-            || host[pages.len()..].iter().any(|slot| *slot != u32::MAX);
-        if changed {
-            let staging = self.staging.as_mut_slice();
-            for (destination, page) in staging.iter_mut().zip(pages) {
-                *destination = page.slot;
-            }
-            staging[pages.len()..].fill(u32::MAX);
-            self.device
-                .copy_range_from_pinned_on_stream(0, &self.staging, stream)?;
-            std::mem::swap(&mut self.host, &mut self.staging);
-        }
-        self.position = position;
-        Ok(())
+        self.update_slots(
+            pages.iter().map(|page| page.slot),
+            pages.len(),
+            position,
+            stream,
+        )
     }
 }
 

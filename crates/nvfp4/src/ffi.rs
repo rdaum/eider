@@ -2108,6 +2108,38 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_append_ragged_paged_kv_f32_on_stream(
+        key: *const f32,
+        value: *const f32,
+        key_pool: *mut f32,
+        value_pool: *mut f32,
+        page_tables: *const *const u32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        start_positions: *const u32,
+        sequence_count: u32,
+        total_tokens: u32,
+        page_tokens: u32,
+        width: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ragged_paged_gqa_attention_f32_on_stream(
+        query: *const f32,
+        key_pool: *const f32,
+        value_pool: *const f32,
+        page_tables: *const *const u32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        start_positions: *const u32,
+        output: *mut f32,
+        sequence_count: u32,
+        total_tokens: u32,
+        page_tokens: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_bf16_linear_argmax_f32_on_stream(
         input: *const f32,
         weight: *const u16,

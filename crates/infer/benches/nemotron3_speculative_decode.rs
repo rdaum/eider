@@ -1,6 +1,9 @@
 use infer::nemotron3::{
-    Nemotron3Bf16Storage, Nemotron3DecodeState, Nemotron3Fp8Storage, Nemotron3Model,
-    Nemotron3MtpWorkspace, Nemotron3SpeculativeCycleWorkspace, Nemotron3StorageConfig,
+    Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3MtpWorkspace,
+    Nemotron3SpeculativeCycleWorkspace, Nemotron3StorageConfig,
+};
+use infer::runtime::nemotron3_sequence_cache::{
+    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -27,9 +30,11 @@ enum Mode {
 struct SpeculativeCase {
     model: Rc<Nemotron3Model>,
     mode: Mode,
-    target_state: Nemotron3DecodeState,
+    target_sequence: Nemotron3Sequence,
+    target_cache: Nemotron3SequenceCache,
     target_workspace: infer::nemotron3::Nemotron3BlockWorkspace,
-    mtp_state: Nemotron3DecodeState,
+    mtp_sequence: Nemotron3Sequence,
+    _mtp_cache: Nemotron3SequenceCache,
     mtp_target_workspace: infer::nemotron3::Nemotron3BlockWorkspace,
     mtp_workspace: Nemotron3MtpWorkspace,
     cycle_workspace: Option<Nemotron3SpeculativeCycleWorkspace>,
@@ -54,7 +59,10 @@ impl BenchContext for SpeculativeBench {
 
 impl SpeculativeCase {
     fn new(model: Rc<Nemotron3Model>, mode: Mode, max_tokens: usize) -> Self {
-        let mut target_state = model.sequence_state(max_tokens).expect("target state");
+        let mut target_cache =
+            new_nemotron3_sequence_cache(&model, 1, max_tokens).expect("target cache");
+        let mut target_sequence = Nemotron3Sequence::admit(&model, &mut target_cache, max_tokens)
+            .expect("target sequence");
         let target_rows = match mode {
             Mode::TargetDecodeOne | Mode::MtpDraftThree | Mode::SpeculativeCycle => 1,
             Mode::TargetVerifyThree | Mode::TargetVerifyThreeTransactional => 3,
@@ -69,10 +77,17 @@ impl SpeculativeCase {
                 .block_workspace(1, target_rows)
                 .expect("target workspace")
         };
-        let mut mtp_state = model.sequence_state(max_tokens).expect("MTP state");
+        let mut mtp_cache = new_nemotron3_sequence_cache(&model, 1, max_tokens).expect("MTP cache");
+        let mut mtp_sequence =
+            Nemotron3Sequence::admit(&model, &mut mtp_cache, max_tokens).expect("MTP sequence");
         let mut mtp_target_workspace = model.block_workspace(1, 1).expect("MTP target workspace");
         model
-            .forward_block(&mut [&mut mtp_state], &[&[1]], &mut mtp_target_workspace)
+            .forward_block(
+                &mut [&mut mtp_sequence],
+                &[&[1]],
+                &mut mtp_target_workspace,
+                &mut mtp_cache,
+            )
             .expect("MTP target seed");
         model.synchronize().expect("MTP target seed completion");
         let mtp_workspace = model.mtp_workspace(1, 1).expect("MTP workspace");
@@ -83,18 +98,22 @@ impl SpeculativeCase {
         });
         let cycle_input = if matches!(mode, Mode::SpeculativeCycle) {
             model
-                .forward_one(&mut target_state, 1)
+                .forward_one(&mut target_sequence, &mut target_cache, 1)
                 .expect("cycle target seed");
-            model.argmax(&mut target_state).expect("cycle first token")
+            model
+                .argmax(&mut target_sequence)
+                .expect("cycle first token")
         } else {
             1
         };
         Self {
             model,
             mode,
-            target_state,
+            target_sequence,
+            target_cache,
             target_workspace,
-            mtp_state,
+            mtp_sequence,
+            _mtp_cache: mtp_cache,
             mtp_target_workspace,
             mtp_workspace,
             cycle_workspace,
@@ -109,40 +128,44 @@ impl SpeculativeCase {
             Mode::TargetDecodeOne => self
                 .model
                 .forward_block(
-                    &mut [&mut self.target_state],
+                    &mut [&mut self.target_sequence],
                     &[&[1]],
                     &mut self.target_workspace,
+                    &mut self.target_cache,
                 )
                 .expect("one-position target decode"),
             Mode::TargetVerifyFour => self
                 .model
                 .forward_block(
-                    &mut [&mut self.target_state],
+                    &mut [&mut self.target_sequence],
                     &[&[1, 17, 2, 19]],
                     &mut self.target_workspace,
+                    &mut self.target_cache,
                 )
                 .expect("four-position target verification"),
             Mode::TargetVerifyThree => self
                 .model
                 .forward_block(
-                    &mut [&mut self.target_state],
+                    &mut [&mut self.target_sequence],
                     &[&[1, 17, 2]],
                     &mut self.target_workspace,
+                    &mut self.target_cache,
                 )
                 .expect("three-position target verification"),
             Mode::TargetVerifyThreeTransactional => {
                 self.model
                     .verify_speculative_argmax(
-                        &mut [&mut self.target_state],
+                        &mut [&mut self.target_sequence],
                         &[&[1, 17, 2]],
                         &mut self.target_workspace,
+                        &mut self.target_cache,
                     )
                     .expect("transactional target verification");
             }
             Mode::MtpDraftThree => self
                 .model
                 .draft_three_mtp_argmax(
-                    &mut [&mut self.mtp_state],
+                    &mut [&mut self.mtp_sequence],
                     &[1],
                     self.mtp_target_workspace.final_hidden(),
                     &mut self.mtp_workspace,
@@ -152,9 +175,10 @@ impl SpeculativeCase {
                 let result = self
                     .model
                     .speculative_cycle_argmax(
-                        &mut [&mut self.target_state],
+                        &mut [&mut self.target_sequence],
                         &[self.cycle_input],
                         self.cycle_workspace.as_mut().expect("cycle workspace"),
+                        &mut self.target_cache,
                     )
                     .expect("complete speculative cycle");
                 let emitted = result.emitted_tokens(0).expect("cycle output");

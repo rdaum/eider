@@ -6147,6 +6147,171 @@ pub fn ragged_gqa_attention_f32_into_on_stream(
     }
 }
 
+/// Appends flattened ragged K/V rows into physical F32 page pools.
+#[allow(clippy::too_many_arguments)]
+pub fn append_ragged_paged_kv_f32_into_on_stream(
+    key: &DeviceBuffer<f32>,
+    value: &DeviceBuffer<f32>,
+    key_pool: &mut DeviceBuffer<f32>,
+    value_pool: &mut DeviceBuffer<f32>,
+    page_tables: &DeviceBuffer<*const u32>,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    start_positions: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    page_tokens: usize,
+    width: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = total_tokens.saturating_mul(width);
+    if sequence_count == 0
+        || total_tokens == 0
+        || page_tokens == 0
+        || width == 0
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || page_tokens > u32::MAX as usize
+        || width > u32::MAX as usize
+        || key.len() != values
+        || value.len() != values
+        || key_pool.len() != value_pool.len()
+        || !key_pool
+            .len()
+            .is_multiple_of(page_tokens.saturating_mul(width))
+        || page_tables.len() < sequence_count
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+        || start_positions.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "ragged paged KV append buffers",
+            expected: format!(
+                "key/value={values}; aligned page pools and metadata >= {sequence_count}"
+            ),
+            actual: format!(
+                "key={} value={} key_pool={} value_pool={} tables={} offsets={} lengths={} starts={} sequences={sequence_count} tokens={total_tokens} page_tokens={page_tokens} width={width}",
+                key.len(),
+                value.len(),
+                key_pool.len(),
+                value_pool.len(),
+                page_tables.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+                start_positions.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_append_ragged_paged_kv_f32_on_stream",
+            ffi::infer_append_ragged_paged_kv_f32_on_stream(
+                key.ptr,
+                value.ptr,
+                key_pool.ptr,
+                value_pool.ptr,
+                page_tables.ptr,
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                start_positions.ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                page_tokens as u32,
+                width as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Runs causal GQA for flattened ragged rows over physical F32 page pools.
+#[allow(clippy::too_many_arguments)]
+pub fn ragged_paged_gqa_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_pool: &DeviceBuffer<f32>,
+    value_pool: &DeviceBuffer<f32>,
+    page_tables: &DeviceBuffer<*const u32>,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    start_positions: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    page_tokens: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let query_width = q_heads.saturating_mul(head_dim);
+    let values = total_tokens.saturating_mul(query_width);
+    let kv_width = kv_heads.saturating_mul(head_dim);
+    if sequence_count == 0
+        || total_tokens == 0
+        || page_tokens == 0
+        || q_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || !q_heads.is_multiple_of(kv_heads)
+        || sequence_count > u32::MAX as usize
+        || total_tokens > u32::MAX as usize
+        || page_tokens > u32::MAX as usize
+        || q_heads > u32::MAX as usize
+        || kv_heads > u32::MAX as usize
+        || head_dim > 256
+        || query.len() != values
+        || output.len() != values
+        || key_pool.len() != value_pool.len()
+        || !key_pool
+            .len()
+            .is_multiple_of(page_tokens.saturating_mul(kv_width))
+        || page_tables.len() < sequence_count
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+        || start_positions.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "ragged paged GQA buffers",
+            expected: format!(
+                "query/output={values}; aligned page pools and metadata >= {sequence_count}"
+            ),
+            actual: format!(
+                "query={} output={} key_pool={} value_pool={} tables={} offsets={} lengths={} starts={} sequences={sequence_count} tokens={total_tokens} page_tokens={page_tokens} q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}",
+                query.len(),
+                output.len(),
+                key_pool.len(),
+                value_pool.len(),
+                page_tables.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len(),
+                start_positions.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ragged_paged_gqa_attention_f32_on_stream",
+            ffi::infer_ragged_paged_gqa_attention_f32_on_stream(
+                query.ptr,
+                key_pool.ptr,
+                value_pool.ptr,
+                page_tables.ptr,
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                start_positions.ptr,
+                output.buffer_mut().ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                page_tokens as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn prefill_gqa_attention_len(
     query: &DeviceBuffer<f32>,
     key_cache: &DeviceBuffer<f32>,
@@ -15643,12 +15808,13 @@ mod tests {
         const Q_HEADS: usize = 4;
         const KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 8;
-        const MAX_TOKENS: usize = 5;
+        const MAX_TOKENS: usize = 6;
+        const PAGE_TOKENS: usize = 4;
         const KV_WIDTH: usize = KV_HEADS * HEAD_DIM;
         const QUERY_WIDTH: usize = Q_HEADS * HEAD_DIM;
         let offsets = [0u32, 2];
         let lengths = [2u32, 3];
-        let starts = [2u32, 1];
+        let starts = [3u32, 3];
         let query = (0..TOKENS * QUERY_WIDTH)
             .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.0234375)
             .collect::<Vec<_>>();
@@ -15793,6 +15959,75 @@ mod tests {
             }
         }
         assert_close(&actual, &expected, 2.0e-6, "ragged GQA");
+
+        let page_slots = 4;
+        let page_table_rows = [[2u32, 0], [3u32, 1]];
+        let page_tables = page_table_rows
+            .iter()
+            .map(|table| DeviceBuffer::from_host(table).expect("page table"))
+            .collect::<Vec<_>>();
+        let page_table_ptrs = DeviceBuffer::from_host(
+            &page_tables
+                .iter()
+                .map(|table| table.as_const_ptr().cast::<u32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("page table pointers");
+        let mut paged_keys = vec![0.0; page_slots * PAGE_TOKENS * KV_WIDTH];
+        let mut paged_values = vec![0.0; page_slots * PAGE_TOKENS * KV_WIDTH];
+        for sequence in 0..SEQUENCES {
+            for logical_row in 0..MAX_TOKENS {
+                let slot = page_table_rows[sequence][logical_row / PAGE_TOKENS] as usize;
+                let physical_row = slot * PAGE_TOKENS + logical_row % PAGE_TOKENS;
+                let source = logical_row * KV_WIDTH;
+                let destination = physical_row * KV_WIDTH;
+                paged_keys[destination..destination + KV_WIDTH]
+                    .copy_from_slice(&initial_keys[sequence][source..source + KV_WIDTH]);
+                paged_values[destination..destination + KV_WIDTH]
+                    .copy_from_slice(&initial_values[sequence][source..source + KV_WIDTH]);
+            }
+        }
+        let mut paged_keys = DeviceBuffer::from_host(&paged_keys).expect("paged keys");
+        let mut paged_values = DeviceBuffer::from_host(&paged_values).expect("paged values");
+        append_ragged_paged_kv_f32_into_on_stream(
+            &key_device,
+            &value_device,
+            &mut paged_keys,
+            &mut paged_values,
+            &page_table_ptrs,
+            &offsets_device,
+            &lengths_device,
+            &starts_device,
+            SEQUENCES,
+            TOKENS,
+            PAGE_TOKENS,
+            KV_WIDTH,
+            &stream,
+        )
+        .expect("ragged paged KV append");
+        let mut paged_output = DeviceBuffer::zeroed(TOKENS * QUERY_WIDTH).expect("paged output");
+        ragged_paged_gqa_attention_f32_into_on_stream(
+            &query_device,
+            &paged_keys,
+            &paged_values,
+            &page_table_ptrs,
+            &offsets_device,
+            &lengths_device,
+            &starts_device,
+            paged_output.output(),
+            SEQUENCES,
+            TOKENS,
+            PAGE_TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("ragged paged GQA");
+        let paged_output = paged_output
+            .copy_to_host(&stream)
+            .expect("paged output download");
+        assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
     }
 
     #[test]

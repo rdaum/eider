@@ -540,7 +540,7 @@ fn actor_main(
                     return;
                 }
             };
-            let service = match Nemotron3ChatService::new_with_prefix_cache(
+            let service = match Nemotron3ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,

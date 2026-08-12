@@ -160,13 +160,6 @@ impl LayerKvCache {
         self.key.device_bytes() + self.value.device_bytes()
     }
 
-    pub(crate) fn checkpoint_device_bytes(&self) -> usize {
-        self.len
-            .saturating_mul(self.kv_width())
-            .saturating_mul(2)
-            .saturating_mul(std::mem::size_of::<f32>())
-    }
-
     /// Copies only the valid prefix into a compact device checkpoint.
     pub(crate) fn checkpoint_on_stream(
         &self,

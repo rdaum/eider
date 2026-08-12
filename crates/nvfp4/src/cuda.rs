@@ -865,6 +865,60 @@ impl<T: Copy> DeviceBuffer<T> {
         }
     }
 
+    /// Enqueues a non-overlapping device-to-device copy within this allocation.
+    pub fn copy_within_on_stream(
+        &mut self,
+        source_offset: usize,
+        destination_offset: usize,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let source_end = source_offset.checked_add(len).ok_or_else(|| Error::Shape {
+            label: "device within-copy source",
+            expected: "offset + length without overflow".to_string(),
+            actual: format!("offset={source_offset} length={len}"),
+        })?;
+        let destination_end = destination_offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Shape {
+                label: "device within-copy destination",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={destination_offset} length={len}"),
+            })?;
+        let overlaps = source_offset < destination_end && destination_offset < source_end;
+        if source_end > self.len || destination_end > self.len || overlaps {
+            return Err(Error::Shape {
+                label: "device within-copy",
+                expected: format!("non-overlapping ranges within {} values", self.len),
+                actual: format!(
+                    "source={source_offset}..{source_end} destination={destination_offset}..{destination_end}"
+                ),
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "device within-copy bytes",
+                expected: "length * element size without overflow".to_string(),
+                actual: format!("length={len} element_size={}", size_of::<T>()),
+            })?;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D within)",
+                ffi::cudaMemcpyAsync(
+                    self.ptr.add(destination_offset).cast(),
+                    self.ptr.add(source_offset).cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Copies host values into a contiguous element range of this allocation.
     pub fn copy_range_from_host(&mut self, element_offset: usize, values: &[T]) -> Result<()> {
         let end = element_offset
