@@ -2,7 +2,7 @@
 
 use crate::metrics::PrefixCacheMetricHandle;
 use nvfp4::{Error, Result};
-use rart::{AdaptiveRadixTree, VectorKey};
+use rart::{AdaptiveRadixTree, OverflowKey};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
@@ -28,7 +28,7 @@ impl Default for PrefixCacheConfig {
     }
 }
 
-pub(crate) type PrefixCacheKey = VectorKey;
+pub(crate) type PrefixCacheKey = OverflowKey<32, 8>;
 
 struct PrefixCacheEntry<V> {
     key: PrefixCacheKey,
@@ -86,7 +86,7 @@ impl<V> PrefixCache<V> {
             });
         }
         let block_count = prefix_tokens / PREFIX_CACHE_BLOCK_TOKENS;
-        let mut encoded = Vec::with_capacity(block_count * size_of::<u32>());
+        let mut key = PrefixCacheKey::builder();
         for block in prompt_tokens[..prefix_tokens].chunks_exact(PREFIX_CACHE_BLOCK_TOKENS) {
             let block_id = if let Some(&block_id) = self.blocks.get(block) {
                 block_id
@@ -102,9 +102,10 @@ impl<V> PrefixCache<V> {
                 self.blocks.insert(Box::from(block), block_id);
                 block_id
             };
-            encoded.extend_from_slice(&block_id.to_be_bytes());
+            key.extend_from_slice(&block_id.to_be_bytes());
         }
-        Ok(PrefixCacheKey::new_from_vec(encoded))
+        debug_assert_eq!(key.len(), block_count * size_of::<u32>());
+        Ok(key.finish())
     }
 
     pub(crate) fn restore<R>(

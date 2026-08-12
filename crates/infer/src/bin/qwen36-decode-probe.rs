@@ -1,5 +1,6 @@
-use infer::nvfp4::{Error, Result};
-use infer::qwen3::qwen36::Qwen36TextModel;
+use infer::nvfp4::{CudaStream, Error, Result};
+use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
+use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 
@@ -14,10 +15,22 @@ fn main() -> Result<()> {
         manifest.vocab,
         ffn_label(manifest.ffn)
     );
-    let mut state = model.new_decode_state(max_tokens)?;
+    let stream = CudaStream::new_non_blocking()?;
+    let mut cache = new_qwen36_sequence_cache(&model, 1, max_tokens)?;
+    let mut sequence = Qwen36Sequence::admit(&model, &mut cache, max_tokens, &stream)?;
+    let mut workspace = model.new_decode_batch_workspace(1, max_tokens)?;
     let mut token_id = start_token;
     for step in 0..steps {
-        let next = model.decode_one_token(&mut state, token_id)?;
+        let mut rows = [Qwen36DecodeRow {
+            token_id,
+            sequence: &mut sequence,
+        }];
+        let next = model
+            .decode_batch(&mut workspace, &mut rows, &mut cache)?
+            .top1()?
+            .into_iter()
+            .next()
+            .expect("one decode row");
         println!(
             "  step {step}: in={token_id} out={} value={:.6}",
             next.id, next.value

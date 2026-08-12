@@ -2,7 +2,8 @@ use infer::nvfp4::{
     CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, format,
     nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
-use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
+use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
+use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 
@@ -112,8 +113,19 @@ fn main() -> Result<()> {
 
     // Also compare against the full-model decode to make sure they agree
     let text = Qwen36TextModel::open(&model_dir)?;
-    let mut state = text.new_decode_state(2)?;
-    let next = text.decode_one_token(&mut state, 0)?;
+    let mut cache = new_qwen36_sequence_cache(&text, 1, 2)?;
+    let mut sequence = Qwen36Sequence::admit(&text, &mut cache, 2, &stream)?;
+    let mut workspace = text.new_decode_batch_workspace(1, 2)?;
+    let mut rows = [Qwen36DecodeRow {
+        token_id: 0,
+        sequence: &mut sequence,
+    }];
+    let next = text
+        .decode_batch(&mut workspace, &mut rows, &mut cache)?
+        .top1()?
+        .into_iter()
+        .next()
+        .expect("one decode row");
     println!("full decode: id={} value={:.6}", next.id, next.value);
 
     Ok(())

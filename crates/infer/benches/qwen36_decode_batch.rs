@@ -1,7 +1,10 @@
-use infer::nvfp4::GpuSamplingRow;
+use infer::nvfp4::{CudaStream, GpuSamplingRow, SM12X_KV_PAGE_TOKENS};
 use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
-    Qwen36Fp8AttentionStorage, Qwen36PrefillRow, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36Fp8AttentionStorage, Qwen36PrefillRow, Qwen36TextModel,
+};
+use infer::runtime::qwen36_sequence_cache::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
 };
 use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
@@ -37,7 +40,8 @@ struct DecodeBatchCase {
     output: DecodeOutput,
     batch: usize,
     workspace: Qwen36DecodeBatchWorkspace,
-    states: Vec<Qwen36SequenceState>,
+    sequences: Vec<Qwen36Sequence>,
+    cache: Qwen36SequenceCache,
     tokens: Vec<u32>,
     samplers: Vec<Sampler>,
     histories: Vec<TokenHistory>,
@@ -53,7 +57,8 @@ struct DecodeBatchBench {
 struct ProductionDecodeCase {
     model: Rc<Qwen36TextModel>,
     workspace: Qwen36DecodeBatchWorkspace,
-    state: Qwen36SequenceState,
+    sequence: Qwen36Sequence,
+    cache: Qwen36SequenceCache,
     token: u32,
     start_position: usize,
 }
@@ -84,16 +89,19 @@ impl BenchContext for ProductionDecodeBench {
 
 impl ProductionDecodeCase {
     fn new(model: Rc<Qwen36TextModel>, max_context_tokens: usize, start_position: usize) -> Self {
-        let state = model
-            .new_sequence_state(max_context_tokens)
-            .expect("production sequence state");
+        let stream = CudaStream::new_non_blocking().expect("production sequence stream");
+        let mut cache = new_qwen36_sequence_cache(&model, 1, max_context_tokens)
+            .expect("production sequence cache");
+        let sequence = Qwen36Sequence::admit(&model, &mut cache, max_context_tokens, &stream)
+            .expect("production sequence");
         let workspace = model
             .new_decode_batch_workspace(1, max_context_tokens)
             .expect("production decode workspace");
         let mut case = Self {
             model,
             workspace,
-            state,
+            sequence,
+            cache,
             token: seed_tokens(1)[0],
             start_position,
         };
@@ -102,14 +110,14 @@ impl ProductionDecodeCase {
     }
 
     fn prefill_to_start(&mut self) {
-        const PREFILL_CHUNK_TOKENS: usize = 2_048;
+        const PREFILL_CHUNK_TOKENS: usize = SM12X_KV_PAGE_TOKENS;
         if self.start_position == 0 {
             return;
         }
         let token_capacity = self.start_position.min(PREFILL_CHUNK_TOKENS);
         let mut workspace = self
             .model
-            .new_prefill_batch_workspace(1, token_capacity, self.state.max_tokens())
+            .new_prefill_batch_workspace(1, token_capacity, self.sequence.max_tokens())
             .expect("production prefill workspace");
         let tokens = vec![self.token; token_capacity];
         let mut consumed = 0;
@@ -117,10 +125,10 @@ impl ProductionDecodeCase {
             let chunk_tokens = (self.start_position - consumed).min(token_capacity);
             let mut rows = [Qwen36PrefillRow {
                 token_ids: &tokens[..chunk_tokens],
-                state: &mut self.state,
+                sequence: &mut self.sequence,
             }];
             self.model
-                .prefill_batch(&mut workspace, &mut rows)
+                .prefill_batch(&mut workspace, &mut rows, &mut self.cache)
                 .expect("production prefill");
             consumed += chunk_tokens;
         }
@@ -129,11 +137,11 @@ impl ProductionDecodeCase {
     fn tick(&mut self) {
         let mut rows = [Qwen36DecodeRow {
             token_id: self.token,
-            state: &mut self.state,
+            sequence: &mut self.sequence,
         }];
         self.token = self
             .model
-            .decode_batch(&mut self.workspace, &mut rows)
+            .decode_batch(&mut self.workspace, &mut rows, &mut self.cache)
             .and_then(|mut decoded| decoded.top1())
             .expect("production decode tick")[0]
             .id;
@@ -157,15 +165,17 @@ impl DecodeBatchCase {
         let workspace = model
             .new_decode_batch_workspace(workspace_capacity, max_context_tokens)
             .expect("decode batch workspace");
-        let states = (0..batch)
+        let stream = CudaStream::new_non_blocking().expect("decode batch sequence stream");
+        let mut cache = new_qwen36_sequence_cache(&model, batch, max_context_tokens)
+            .expect("decode batch sequence cache");
+        let sequences = (0..batch)
             .map(|_| {
-                model
-                    .new_sequence_state(max_context_tokens)
-                    .expect("sequence state")
+                Qwen36Sequence::admit(&model, &mut cache, max_context_tokens, &stream)
+                    .expect("decode batch sequence")
             })
             .collect::<Vec<_>>();
         let workspace_device_bytes = workspace.device_bytes();
-        let sequence_device_bytes = states.iter().map(Qwen36SequenceState::device_bytes).sum();
+        let sequence_device_bytes = sequences.iter().map(Qwen36Sequence::device_bytes).sum();
         let tokens = seed_tokens(batch);
         let samplers = (0..batch)
             .map(|row| {
@@ -187,7 +197,8 @@ impl DecodeBatchCase {
             output,
             batch,
             workspace,
-            states,
+            sequences,
+            cache,
             tokens,
             samplers,
             histories,
@@ -208,12 +219,12 @@ impl DecodeBatchCase {
                     .tokens
                     .iter()
                     .copied()
-                    .zip(self.states.iter_mut())
-                    .map(|(token_id, state)| Qwen36DecodeRow { token_id, state })
+                    .zip(self.sequences.iter_mut())
+                    .map(|(token_id, sequence)| Qwen36DecodeRow { token_id, sequence })
                     .collect::<Vec<_>>();
                 let mut decoded = self
                     .model
-                    .decode_batch(&mut self.workspace, &mut rows)
+                    .decode_batch(&mut self.workspace, &mut rows, &mut self.cache)
                     .expect("batched decode tick");
                 match self.output {
                     DecodeOutput::Top1 => {
@@ -264,11 +275,11 @@ impl DecodeBatchCase {
                 for row in 0..self.batch {
                     let mut rows = [Qwen36DecodeRow {
                         token_id: self.tokens[row],
-                        state: &mut self.states[row],
+                        sequence: &mut self.sequences[row],
                     }];
                     let next = self
                         .model
-                        .decode_batch(&mut self.workspace, &mut rows)
+                        .decode_batch(&mut self.workspace, &mut rows, &mut self.cache)
                         .and_then(|mut decoded| decoded.top1())
                         .expect("independent decode tick");
                     self.tokens[row] = next[0].id;
@@ -395,18 +406,21 @@ fn validate_batch(
     let mut independent_workspace = model
         .new_decode_batch_workspace(1, max_context_tokens)
         .expect("validation independent workspace");
-    let mut batched_states = (0..batch)
+    let stream = CudaStream::new_non_blocking().expect("validation sequence stream");
+    let mut batched_cache = new_qwen36_sequence_cache(model, batch, max_context_tokens)
+        .expect("validation batched cache");
+    let mut independent_cache = new_qwen36_sequence_cache(model, batch, max_context_tokens)
+        .expect("validation independent cache");
+    let mut batched_sequences = (0..batch)
         .map(|_| {
-            model
-                .new_sequence_state(max_context_tokens)
-                .expect("validation batched state")
+            Qwen36Sequence::admit(model, &mut batched_cache, max_context_tokens, &stream)
+                .expect("validation batched sequence")
         })
         .collect::<Vec<_>>();
-    let mut independent_states = (0..batch)
+    let mut independent_sequences = (0..batch)
         .map(|_| {
-            model
-                .new_sequence_state(max_context_tokens)
-                .expect("validation independent state")
+            Qwen36Sequence::admit(model, &mut independent_cache, max_context_tokens, &stream)
+                .expect("validation independent sequence")
         })
         .collect::<Vec<_>>();
     let tokens = seed_tokens(batch);
@@ -414,21 +428,25 @@ fn validate_batch(
     let mut rows = tokens
         .iter()
         .copied()
-        .zip(batched_states.iter_mut())
-        .map(|(token_id, state)| Qwen36DecodeRow { token_id, state })
+        .zip(batched_sequences.iter_mut())
+        .map(|(token_id, sequence)| Qwen36DecodeRow { token_id, sequence })
         .collect::<Vec<_>>();
     let batched_logits = model
-        .decode_batch(&mut batched_workspace, &mut rows)
+        .decode_batch(&mut batched_workspace, &mut rows, &mut batched_cache)
         .and_then(|decoded| decoded.copy_logits())
         .expect("validation batched decode");
     let vocab = batched_logits.len() / batch;
     for row in 0..batch {
         let mut rows = [Qwen36DecodeRow {
             token_id: tokens[row],
-            state: &mut independent_states[row],
+            sequence: &mut independent_sequences[row],
         }];
         let independent_logits = model
-            .decode_batch(&mut independent_workspace, &mut rows)
+            .decode_batch(
+                &mut independent_workspace,
+                &mut rows,
+                &mut independent_cache,
+            )
             .and_then(|decoded| decoded.copy_logits())
             .expect("validation independent decode");
         assert_logit_parity(
@@ -436,8 +454,8 @@ fn validate_batch(
             &batched_logits[row * vocab..(row + 1) * vocab],
             independent_logits.as_slice(),
         );
-        assert_eq!(batched_states[row].position(), 1);
-        assert_eq!(independent_states[row].position(), 1);
+        assert_eq!(batched_sequences[row].position(), 1);
+        assert_eq!(independent_sequences[row].position(), 1);
     }
 }
 
@@ -552,7 +570,7 @@ fn main() {
                 .throughput(Throughput::per_operation(1, "tokens"))
                 .measurement_domain(MeasurementDomain::Gpu)
                 .factory(&production_factory)
-                .bench_sample("decode_one_token_1", production_decode_sample);
+                .bench_sample("decode_sequence_1", production_decode_sample);
         });
 
         if production_only {

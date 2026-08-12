@@ -2,17 +2,16 @@
 
 use super::prefix_cache::{PrefixCacheConfig, cacheable_prompt_prefix_tokens};
 use super::qwen36_sequence_cache::{
-    Qwen36CacheContext, Qwen36PageBackend, Qwen36PageTable, Qwen36PagedAppend, Qwen36SequenceCache,
+    Qwen36CacheContext, Qwen36PageBackend, Qwen36PageTable, Qwen36Sequence, Qwen36SequenceCache,
 };
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36NextToken, Qwen36PrefillBatchWorkspace,
-    Qwen36PrefillRow, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36PrefillRow, Qwen36TextModel,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use sequence_cache::{
     AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, CacheStats, PageBackend,
-    SequenceId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
@@ -247,9 +246,7 @@ struct Qwen36Request {
     prompt_position: usize,
     prefix_cache_target: usize,
     prefix_cache_checkpointed: bool,
-    cache_sequence: Option<SequenceId>,
-    page_table: Option<Qwen36PageTable>,
-    sequence: Option<Box<Qwen36SequenceState>>,
+    sequence: Option<Box<Qwen36Sequence>>,
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     sampler: Sampler,
@@ -352,7 +349,7 @@ impl<'model> Qwen36Scheduler<'model> {
             model.manifest().head_dim,
         )?;
         let page_bytes = probe_backend.page_bytes();
-        let private_state_bytes = model.new_paged_sequence_state(1)?.device_bytes();
+        let private_state_bytes = model.new_sequence_state(1)?.device_bytes();
         let page_table_bytes = Qwen36PageTable::new(config.max_context_tokens)?.managed_bytes();
         let sampling_bytes = model
             .manifest()
@@ -532,8 +529,6 @@ impl<'model> Qwen36Scheduler<'model> {
                 prompt_position: 0,
                 prefix_cache_target,
                 prefix_cache_checkpointed: false,
-                cache_sequence: None,
-                page_table: None,
                 sequence: None,
                 device_token_counts: None,
                 sequence_device_bytes: 0,
@@ -592,7 +587,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 .requests
                 .get_mut(&id)
                 .expect("waiting request is retained");
-            let mut sequence = model.new_paged_sequence_state(request.max_tokens().max(1))?;
+            let mut sequence = model.new_sequence_state(request.max_tokens().max(1))?;
             let mut page_table = Qwen36PageTable::new(request.max_tokens().max(1))?;
             let device_token_counts = if request.config.sampling.supports_gpu_sampling()
                 && request.config.sampling.uses_history_penalties()
@@ -624,7 +619,7 @@ impl<'model> Qwen36Scheduler<'model> {
                     },
                     |snapshot, position| {
                         if let Some(snapshot) = snapshot {
-                            model.restore_paged_sequence_snapshot(snapshot, &mut sequence)?;
+                            model.restore_sequence_snapshot(snapshot, &mut sequence)?;
                         } else if position != 0 {
                             return Err(Error::Format {
                                 label: "Qwen3.6 sequence-cache restore",
@@ -642,19 +637,18 @@ impl<'model> Qwen36Scheduler<'model> {
                     break;
                 }
             };
+            self.cache_stream.synchronize()?;
             let cached_prompt_tokens = sequence.position();
+            let sequence = Qwen36Sequence::from_admission(cache_sequence, page_table, sequence);
             request.prompt_position = cached_prompt_tokens;
             request.prefix_cache_checkpointed =
                 cached_prompt_tokens == request.prefix_cache_target && cached_prompt_tokens != 0;
             request.sequence_device_bytes = sequence.device_bytes()
                 + device_token_counts
                     .as_ref()
-                    .map_or(0, DeviceBuffer::device_bytes)
-                + page_table.managed_bytes();
+                    .map_or(0, DeviceBuffer::device_bytes);
             request.sequence = Some(Box::new(sequence));
             request.device_token_counts = device_token_counts;
-            request.cache_sequence = Some(cache_sequence);
-            request.page_table = Some(page_table);
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
             let progress = Qwen36AdmissionProgress {
@@ -722,25 +716,12 @@ impl<'model> Qwen36Scheduler<'model> {
             let token = request.apply_sample(sample);
             tick.generated.push(token);
             if request.lifecycle == RequestState::Finished {
-                let cache_sequence = request
-                    .cache_sequence
+                let sequence = request
+                    .sequence
                     .take()
-                    .expect("finished admitted request has a cache sequence");
-                self.sequence_cache
-                    .finish(
-                        cache_sequence,
-                        &mut Qwen36CacheContext {
-                            stream: &self.cache_stream,
-                            page_table: request
-                                .page_table
-                                .as_mut()
-                                .expect("finished admitted request has a page table"),
-                        },
-                    )
-                    .map_err(sequence_cache_error)?;
-                request.sequence.take();
+                    .expect("finished admitted request has a sequence");
+                (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)?;
                 request.device_token_counts.take();
-                request.page_table.take();
                 tick.finished.push(request.id);
             } else {
                 self.decoding.push_back(request.id);
@@ -762,87 +743,23 @@ impl<'model> Qwen36Scheduler<'model> {
             .iter_mut()
             .find(|workspace| workspace.capacity() >= selected.len())
             .expect("decode capacity classes cover the configured maximum");
-        let mut targets = Vec::with_capacity(selected.len());
-        for request in selected.iter_mut() {
-            let cache_sequence = request.cache_sequence.ok_or_else(|| Error::Format {
-                label: "Qwen3.6 scheduled decode",
-                detail: format!("request {} has no cache sequence", request.id.get()),
-            })?;
-            let page_table = request.page_table.as_mut().ok_or_else(|| Error::Format {
-                label: "Qwen3.6 scheduled decode",
-                detail: format!("request {} has no page table", request.id.get()),
-            })?;
-            match self.sequence_cache.reserve_append(
-                cache_sequence,
-                1,
-                &mut Qwen36CacheContext {
-                    stream: workspace.stream(),
-                    page_table,
-                },
-            ) {
-                Ok(target) => targets.push(target),
-                Err(error) => {
-                    for target in targets.drain(..) {
-                        self.sequence_cache
-                            .abort_append(target)
-                            .map_err(sequence_cache_error)?;
-                    }
-                    return Err(sequence_cache_error(error));
-                }
-            }
-        }
         let mut rows = Vec::with_capacity(selected.len());
-        let mut appends = Vec::with_capacity(selected.len());
-        for (request, target) in selected.iter_mut().zip(targets.iter().copied()) {
+        for request in selected.iter_mut() {
             let token_id = request.decode_input_token()?;
-            let (sequence, page_table) = (&mut request.sequence, &request.page_table);
-            let state = sequence.as_deref_mut().ok_or_else(|| Error::Format {
-                label: "Qwen3.6 scheduled decode",
-                detail: format!(
-                    "request {} has no admitted sequence state",
-                    request.id.get()
-                ),
-            })?;
-            rows.push(Qwen36DecodeRow { token_id, state });
-            appends.push(Qwen36PagedAppend {
-                target,
-                page_table: page_table
-                    .as_ref()
-                    .expect("admitted request has a page table")
-                    .device(),
-            });
+            let sequence = request
+                .sequence
+                .as_deref_mut()
+                .ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 scheduled decode",
+                    detail: format!("request {} has no admitted sequence", request.id.get()),
+                })?;
+            rows.push(Qwen36DecodeRow { token_id, sequence });
         }
-        let decoded =
-            self.model
-                .decode_batch_paged(workspace, &mut rows, &mut self.sequence_cache, &appends);
+        let decoded = self
+            .model
+            .decode_batch(workspace, &mut rows, &mut self.sequence_cache);
         drop(rows);
-        drop(appends);
-        let mut decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                for target in targets {
-                    self.sequence_cache
-                        .abort_append(target)
-                        .map_err(sequence_cache_error)?;
-                }
-                return Err(error);
-            }
-        };
-        for (request, target) in selected.iter_mut().zip(targets) {
-            self.sequence_cache
-                .commit_append(
-                    target,
-                    1,
-                    &mut Qwen36CacheContext {
-                        stream: &self.cache_stream,
-                        page_table: request
-                            .page_table
-                            .as_mut()
-                            .expect("admitted request has a page table"),
-                    },
-                )
-                .map_err(sequence_cache_error)?;
-        }
+        let mut decoded = decoded?;
         if all_fast_argmax {
             return decoded
                 .top1()
@@ -912,11 +829,7 @@ impl<'model> Qwen36Scheduler<'model> {
             request.prefix_cache_checkpointed = true;
             return;
         }
-        let (Some(cache_sequence), Some(page_table), Some(sequence)) = (
-            request.cache_sequence,
-            request.page_table.as_mut(),
-            request.sequence.as_deref(),
-        ) else {
+        let Some(sequence) = request.sequence.as_deref_mut() else {
             return;
         };
         if sequence.position() != request.prefix_cache_target {
@@ -929,7 +842,7 @@ impl<'model> Qwen36Scheduler<'model> {
             request.prefix_cache_checkpointed = true;
             return;
         }
-        let snapshot = match self.model.snapshot_paged_sequence(sequence) {
+        let snapshot = match self.model.snapshot_sequence(&sequence.state) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(
@@ -942,12 +855,12 @@ impl<'model> Qwen36Scheduler<'model> {
             }
         };
         if let Err(error) = self.sequence_cache.retain_prefix(
-            cache_sequence,
+            sequence.cache_id,
             &request.prompt_tokens,
             snapshot,
             &mut Qwen36CacheContext {
                 stream: &self.cache_stream,
-                page_table,
+                page_table: &mut sequence.page_table,
             },
         ) {
             warn!(
@@ -1022,106 +935,34 @@ impl<'model> Qwen36Scheduler<'model> {
             .iter()
             .map(|request| request.id)
             .collect::<Vec<_>>();
-        let mut targets = Vec::with_capacity(selected.len());
-        for (request, chunk) in selected.iter_mut().zip(chunk_lengths.iter().copied()) {
-            let result = self.sequence_cache.reserve_append(
-                request
-                    .cache_sequence
-                    .expect("prefilling request has a cache sequence"),
-                chunk,
-                &mut Qwen36CacheContext {
-                    stream: self.prefill_workspace.stream(),
-                    page_table: request
-                        .page_table
-                        .as_mut()
-                        .expect("prefilling request has a page table"),
-                },
-            );
-            match result {
-                Ok(target) => targets.push(target),
-                Err(error) => {
-                    for target in targets.drain(..) {
-                        self.sequence_cache
-                            .abort_append(target)
-                            .map_err(sequence_cache_error)?;
-                    }
-                    for request in selected.into_iter().rev() {
-                        self.prefilling.push_front(request.id);
-                        self.requests.insert(request.id, request);
-                    }
-                    return Err(sequence_cache_error(error));
-                }
-            }
-        }
         let prefill_result = {
             let mut rows = Vec::with_capacity(selected.len());
-            let mut appends = Vec::with_capacity(selected.len());
-            for ((request, chunk), target) in selected
-                .iter_mut()
-                .zip(chunk_lengths.iter().copied())
-                .zip(targets.iter().copied())
-            {
+            for (request, chunk) in selected.iter_mut().zip(chunk_lengths.iter().copied()) {
                 let start = request.prompt_position;
                 let end = start + chunk;
-                let (prompt_tokens, sequence, page_table) = (
-                    &request.prompt_tokens,
-                    &mut request.sequence,
-                    &request.page_table,
-                );
+                let (prompt_tokens, sequence) = (&request.prompt_tokens, &mut request.sequence);
                 rows.push(Qwen36PrefillRow {
                     token_ids: &prompt_tokens[start..end],
-                    state: sequence
+                    sequence: sequence
                         .as_deref_mut()
-                        .expect("prefilling request has admitted sequence state"),
-                });
-                appends.push(Qwen36PagedAppend {
-                    target,
-                    page_table: page_table
-                        .as_ref()
-                        .expect("prefilling request has a page table")
-                        .device(),
+                        .expect("prefilling request has admitted sequence"),
                 });
             }
             for id in prefill_ids {
                 on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             }
-            self.model.prefill_batch_paged(
+            self.model.prefill_batch(
                 &mut self.prefill_workspace,
                 &mut rows,
                 &mut self.sequence_cache,
-                &appends,
             )
         };
         if let Err(error) = prefill_result {
-            for target in targets {
-                self.sequence_cache
-                    .abort_append(target)
-                    .map_err(sequence_cache_error)?;
-            }
             for request in selected.into_iter().rev() {
                 self.prefilling.push_front(request.id);
                 self.requests.insert(request.id, request);
             }
             return Err(error);
-        }
-        for ((request, chunk), target) in selected
-            .iter_mut()
-            .zip(chunk_lengths.iter().copied())
-            .zip(targets)
-        {
-            self.sequence_cache
-                .commit_append(
-                    target,
-                    chunk,
-                    &mut Qwen36CacheContext {
-                        stream: &self.cache_stream,
-                        page_table: request
-                            .page_table
-                            .as_mut()
-                            .expect("prefilling request has a page table"),
-                    },
-                )
-                .map_err(sequence_cache_error)?;
         }
         for (mut request, chunk) in selected.into_iter().zip(chunk_lengths) {
             request.prompt_position += chunk;
@@ -1152,15 +993,8 @@ impl<'model> Qwen36Scheduler<'model> {
             .requests
             .remove(&id)
             .expect("cancellation target remains retained");
-        if let (Some(cache_sequence), Some(page_table)) =
-            (request.cache_sequence.take(), request.page_table.as_mut())
-            && let Err(error) = self.sequence_cache.finish(
-                cache_sequence,
-                &mut Qwen36CacheContext {
-                    stream: &self.cache_stream,
-                    page_table,
-                },
-            )
+        if let Some(sequence) = request.sequence.take()
+            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)
         {
             warn!(request = id.get(), %error, "failed to release cancelled sequence cache state");
         }

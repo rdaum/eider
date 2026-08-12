@@ -1,5 +1,9 @@
+use infer::nvfp4::{CudaStream, SM12X_KV_PAGE_TOKENS};
 use infer::qwen3::qwen36::{
     Qwen36DecodeRow, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow, Qwen36TextModel,
+};
+use infer::runtime::qwen36_sequence_cache::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -17,6 +21,8 @@ const MAX_CONTEXT_TOKENS: usize = 4096;
 struct PrefillCase {
     model: Rc<Qwen36TextModel>,
     workspace: Qwen36PrefillBatchWorkspace,
+    cache: Qwen36SequenceCache,
+    stream: CudaStream,
     prompt: Vec<u32>,
 }
 
@@ -43,39 +49,52 @@ fn prefill_sample(
     for _ in 0..chunk_size {
         let mut case = context.case.borrow_mut();
         let model = Rc::clone(&case.model);
-        let mut state = model
-            .new_sequence_state(MAX_CONTEXT_TOKENS)
-            .expect("prefill benchmark state");
-        let prompt = case.prompt.clone();
-        let mut rows = [Qwen36PrefillRow {
-            token_ids: &prompt,
-            state: &mut state,
-        }];
+        let PrefillCase {
+            workspace,
+            cache,
+            stream,
+            prompt,
+            ..
+        } = &mut *case;
+        let mut sequence = Qwen36Sequence::admit(&model, cache, MAX_CONTEXT_TOKENS, stream)
+            .expect("prefill benchmark sequence");
+        let prompt = prompt.clone();
         let started = Instant::now();
-        model
-            .prefill_batch(&mut case.workspace, &mut rows)
-            .expect("prefill batch");
+        for chunk in prompt.chunks(SM12X_KV_PAGE_TOKENS) {
+            let mut rows = [Qwen36PrefillRow {
+                token_ids: chunk,
+                sequence: &mut sequence,
+            }];
+            model
+                .prefill_batch(workspace, &mut rows, cache)
+                .expect("prefill batch");
+        }
         black_box(started.elapsed());
         operations += prompt.len() as u64;
-        black_box(state.position());
+        black_box(sequence.position());
+        sequence
+            .finish(cache, stream)
+            .expect("finish benchmark sequence");
     }
     BenchSampleResult::operations(operations)
 }
 
 fn oracle_logits(model: &Qwen36TextModel, prompt: &[u32]) -> Vec<f32> {
-    let mut state = model
-        .new_sequence_state(MAX_CONTEXT_TOKENS)
-        .expect("oracle sequence state");
+    let stream = CudaStream::new_non_blocking().expect("oracle stream");
+    let mut cache =
+        new_qwen36_sequence_cache(model, 1, MAX_CONTEXT_TOKENS).expect("oracle sequence cache");
+    let mut sequence = Qwen36Sequence::admit(model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+        .expect("oracle sequence");
     let mut workspace = model
         .new_decode_batch_workspace(VALIDATION_TOKEN_CAPACITY, MAX_CONTEXT_TOKENS)
         .expect("oracle decode workspace");
     for (position, &token) in prompt.iter().enumerate() {
         let mut rows = [Qwen36DecodeRow {
             token_id: token,
-            state: &mut state,
+            sequence: &mut sequence,
         }];
         let decoded = model
-            .decode_batch(&mut workspace, &mut rows)
+            .decode_batch(&mut workspace, &mut rows, &mut cache)
             .expect("oracle decode token");
         if position + 1 == prompt.len() {
             return decoded.copy_logits().expect("oracle final logits");
@@ -90,16 +109,18 @@ fn prefill_then_logits(
     chunks: &[&[u32]],
     final_token: u32,
 ) -> Vec<f32> {
-    let mut state = model
-        .new_sequence_state(MAX_CONTEXT_TOKENS)
-        .expect("prefill sequence state");
+    let stream = CudaStream::new_non_blocking().expect("prefill stream");
+    let mut cache =
+        new_qwen36_sequence_cache(model, 1, MAX_CONTEXT_TOKENS).expect("prefill sequence cache");
+    let mut sequence = Qwen36Sequence::admit(model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+        .expect("prefill sequence");
     for &chunk in chunks {
         let mut rows = [Qwen36PrefillRow {
             token_ids: chunk,
-            state: &mut state,
+            sequence: &mut sequence,
         }];
         model
-            .prefill_batch(prefill, &mut rows)
+            .prefill_batch(prefill, &mut rows, &mut cache)
             .expect("prefill chunk");
     }
     let mut decode = model
@@ -107,10 +128,10 @@ fn prefill_then_logits(
         .expect("final-token decode workspace");
     let mut rows = [Qwen36DecodeRow {
         token_id: final_token,
-        state: &mut state,
+        sequence: &mut sequence,
     }];
     model
-        .decode_batch(&mut decode, &mut rows)
+        .decode_batch(&mut decode, &mut rows, &mut cache)
         .and_then(|decoded| decoded.copy_logits())
         .expect("final-token decode logits")
 }
@@ -241,44 +262,45 @@ fn validate_prefill(model: &Qwen36TextModel) {
     );
     assert_logits_close_with_tolerance("static FP8 prefill", &actual, &expected, 0.40);
 
-    let mut states = [
-        model
-            .new_sequence_state(MAX_CONTEXT_TOKENS)
-            .expect("first ragged state"),
-        model
-            .new_sequence_state(MAX_CONTEXT_TOKENS)
-            .expect("second ragged state"),
+    let stream = CudaStream::new_non_blocking().expect("ragged stream");
+    let mut cache =
+        new_qwen36_sequence_cache(model, 2, MAX_CONTEXT_TOKENS).expect("ragged sequence cache");
+    let mut sequences = [
+        Qwen36Sequence::admit(model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+            .expect("first ragged sequence"),
+        Qwen36Sequence::admit(model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+            .expect("second ragged sequence"),
     ];
-    let (left, right) = states.split_at_mut(1);
+    let (left, right) = sequences.split_at_mut(1);
     let mut rows = [
         Qwen36PrefillRow {
             token_ids: &first[..6],
-            state: &mut left[0],
+            sequence: &mut left[0],
         },
         Qwen36PrefillRow {
             token_ids: &second[..4],
-            state: &mut right[0],
+            sequence: &mut right[0],
         },
     ];
     model
-        .prefill_batch(&mut prefill, &mut rows)
+        .prefill_batch(&mut prefill, &mut rows, &mut cache)
         .expect("ragged prefill");
     let mut decode = model
         .new_decode_batch_workspace(2, MAX_CONTEXT_TOKENS)
         .expect("ragged final-token decode workspace");
-    let (left, right) = states.split_at_mut(1);
+    let (left, right) = sequences.split_at_mut(1);
     let mut decode_rows = [
         Qwen36DecodeRow {
             token_id: first[6],
-            state: &mut left[0],
+            sequence: &mut left[0],
         },
         Qwen36DecodeRow {
             token_id: second[4],
-            state: &mut right[0],
+            sequence: &mut right[0],
         },
     ];
     let actual = model
-        .decode_batch(&mut decode, &mut decode_rows)
+        .decode_batch(&mut decode, &mut decode_rows, &mut cache)
         .and_then(|decoded| decoded.copy_logits())
         .expect("ragged final-token decode logits");
     let vocab = actual.len() / 2;
@@ -328,9 +350,14 @@ fn main() {
                 let workspace = model
                     .new_prefill_batch_workspace(1, token_capacity, MAX_CONTEXT_TOKENS)
                     .expect("benchmark prefill workspace");
+                let cache = new_qwen36_sequence_cache(&model, 1, MAX_CONTEXT_TOKENS)
+                    .expect("benchmark sequence cache");
+                let stream = CudaStream::new_non_blocking().expect("benchmark stream");
                 let case = Rc::new(RefCell::new(PrefillCase {
                     model: Rc::clone(&model),
                     workspace,
+                    cache,
+                    stream,
                     prompt,
                 }));
                 let factory = || PrefillBench {

@@ -1,4 +1,4 @@
-//! CUDA page-pool adapter for Qwen3.6 full-attention layers.
+//! Shared paged sequence storage for Qwen3.6 full-attention layers.
 
 use crate::qwen3::infer::QwenLayerKind;
 use nvfp4::{
@@ -6,18 +6,182 @@ use nvfp4::{
     Sm12xKvPagePool,
 };
 use sequence_cache::{
-    AppendTarget, PageAllocation, PageBackend, RetireError, RetireOutcome, SequenceCache,
+    AdmissionOutcome, AdmissionRequest, AppendTarget, CacheConfig, CacheError, PageAllocation,
+    PageBackend, RetireError, RetireOutcome, SequenceCache, SequenceId,
 };
 
-use crate::qwen3::qwen36::Qwen36SequenceSnapshot;
+use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
 
 /// Scheduler-owned Qwen3.6 shared KV manager.
 pub type Qwen36SequenceCache = SequenceCache<Qwen36PageBackend, Qwen36SequenceSnapshot>;
 
-/// Per-row append capability and stable page table passed into paged execution.
-pub struct Qwen36PagedAppend<'a> {
-    pub target: AppendTarget,
-    pub page_table: &'a DeviceBuffer<u32>,
+/// Per-row append capability and stable page table passed into model execution.
+pub(crate) struct Qwen36Append<'a> {
+    pub(crate) target: AppendTarget,
+    pub(crate) page_table: &'a DeviceBuffer<u32>,
+}
+
+/// One admitted Qwen3.6 sequence and all of its request-private state.
+pub struct Qwen36Sequence {
+    pub(crate) cache_id: SequenceId,
+    pub(crate) page_table: Qwen36PageTable,
+    pub(crate) state: Qwen36SequenceState,
+}
+
+impl Qwen36Sequence {
+    /// Admits an empty sequence into `cache` with capacity for `max_tokens`.
+    pub fn admit(
+        model: &Qwen36TextModel,
+        cache: &mut Qwen36SequenceCache,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        let state = model.new_sequence_state(max_tokens)?;
+        let mut page_table = Qwen36PageTable::new(max_tokens)?;
+        let outcome = cache
+            .admit(
+                None,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Qwen36CacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+                |snapshot, position| {
+                    debug_assert!(snapshot.is_none());
+                    debug_assert_eq!(position, 0);
+                    Ok(())
+                },
+            )
+            .map_err(cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Err(Error::Format {
+                label: "Qwen3.6 sequence admission",
+                detail: "configured cache has insufficient capacity".to_string(),
+            });
+        };
+        stream.synchronize()?;
+        Ok(Self {
+            cache_id,
+            page_table,
+            state,
+        })
+    }
+
+    pub(crate) fn from_admission(
+        cache_id: SequenceId,
+        page_table: Qwen36PageTable,
+        state: Qwen36SequenceState,
+    ) -> Self {
+        Self {
+            cache_id,
+            page_table,
+            state,
+        }
+    }
+
+    /// Returns the next logical token position.
+    pub fn position(&self) -> usize {
+        self.state.position()
+    }
+
+    /// Returns the admitted maximum logical position.
+    pub fn max_tokens(&self) -> usize {
+        self.state.max_tokens()
+    }
+
+    /// Returns request-private recurrent-state and page-table bytes.
+    pub fn device_bytes(&self) -> usize {
+        self.state.device_bytes() + self.page_table.managed_bytes()
+    }
+
+    /// Releases this sequence's page ownership and outstanding reservation.
+    pub fn finish(self, cache: &mut Qwen36SequenceCache, stream: &CudaStream) -> Result<()> {
+        let mut page_table = self.page_table;
+        cache
+            .finish(
+                self.cache_id,
+                &mut Qwen36CacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(cache_error)
+    }
+}
+
+/// Allocates a non-retaining cache for direct execution and benchmarks.
+pub fn new_qwen36_sequence_cache(
+    model: &Qwen36TextModel,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+) -> Result<Qwen36SequenceCache> {
+    if sequence_capacity == 0 || max_context_tokens == 0 {
+        return Err(Error::Shape {
+            label: "Qwen3.6 sequence cache",
+            expected: "positive sequence and context capacities".to_string(),
+            actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
+        });
+    }
+    let pages_per_sequence = max_context_tokens.div_ceil(SM12X_KV_PAGE_TOKENS);
+    let page_slots = sequence_capacity
+        .checked_mul(pages_per_sequence)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.6 sequence cache pages",
+            expected: "page count without overflow".to_string(),
+            actual: format!(
+                "sequences={sequence_capacity} pages_per_sequence={pages_per_sequence}"
+            ),
+        })?;
+    let backend = Qwen36PageBackend::new(
+        &model.manifest().layer_kinds,
+        page_slots,
+        model.manifest().kv_heads,
+        model.manifest().head_dim,
+    )?;
+    let page_bytes = backend.page_bytes();
+    let private_bytes = model.new_sequence_state(max_context_tokens)?.device_bytes();
+    let table_bytes = Qwen36PageTable::new(max_context_tokens)?.managed_bytes();
+    let fixed_bytes = private_bytes
+        .checked_add(table_bytes)
+        .and_then(|bytes| bytes.checked_mul(sequence_capacity))
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.6 sequence cache private bytes",
+            expected: "private byte count without overflow".to_string(),
+            actual: format!(
+                "private={private_bytes} table={table_bytes} sequences={sequence_capacity}"
+            ),
+        })?;
+    let managed_bytes = page_bytes
+        .checked_mul(page_slots)
+        .and_then(|bytes| bytes.checked_add(fixed_bytes))
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.6 sequence cache managed bytes",
+            expected: "managed byte count without overflow".to_string(),
+            actual: format!("page_bytes={page_bytes} page_slots={page_slots}"),
+        })?;
+    Qwen36SequenceCache::new(
+        CacheConfig {
+            page_tokens: SM12X_KV_PAGE_TOKENS,
+            max_managed_bytes: managed_bytes,
+            max_snapshot_bytes: 0,
+            max_prefix_entries: Some(0),
+            emergency_bytes: 0,
+        },
+        backend,
+    )
+    .map_err(cache_error)
+}
+
+pub(crate) fn cache_error(error: CacheError<Error>) -> Error {
+    Error::Format {
+        label: "Qwen3.6 sequence cache",
+        detail: error.to_string(),
+    }
 }
 
 /// Stable physical slot shared across every full-attention layer pool.

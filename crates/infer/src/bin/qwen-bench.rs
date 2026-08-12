@@ -1,14 +1,18 @@
 use fast_telemetry::{Counter, ExportMetrics, Histogram};
-use infer::nvfp4::{Error, GpuCounterCollector, GpuCounterMetric, Result, device_memory_info};
+use infer::nvfp4::{
+    CudaStream, Error, GpuCounterCollector, GpuCounterMetric, Result, SM12X_KV_PAGE_TOKENS,
+    device_memory_info,
+};
 use infer::qwen3::infer::{
     Qwen3Model, QwenArchitecture, QwenDecodeProfile, QwenModelManifest, QwenRuntimeCounters,
     runtime_counters,
 };
 use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
 use infer::qwen3::qwen36::{
-    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36GpuCounterProbe,
-    Qwen36GpuCounterStage, Qwen36Model, Qwen36TextModel,
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8AttentionStorage,
+    Qwen36GpuCounterProbe, Qwen36GpuCounterStage, Qwen36Model, Qwen36PrefillRow, Qwen36TextModel,
 };
+use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -405,27 +409,56 @@ fn run_qwen36_once(
     decode_tokens: usize,
     profile_decode: bool,
 ) -> Result<BenchRun> {
-    let mut state = model.new_decode_state(prompt_ids.len() + decode_tokens)?;
+    if profile_decode {
+        return run_qwen36_reference_once(model, prompt_ids, decode_tokens);
+    }
+    let max_tokens = prompt_ids.len() + decode_tokens;
+    let stream = CudaStream::new_non_blocking()?;
+    let mut cache = new_qwen36_sequence_cache(model, 1, max_tokens)?;
+    let mut sequence = Qwen36Sequence::admit(model, &mut cache, max_tokens, &stream)?;
+    let mut prefill_workspace = model.new_prefill_batch_workspace(
+        1,
+        max_tokens.clamp(1, SM12X_KV_PAGE_TOKENS),
+        max_tokens,
+    )?;
+    let mut decode_workspace = model.new_decode_batch_workspace(1, max_tokens)?;
     let counters_before = runtime_counters();
     let total_start = Instant::now();
-    let mut decode_profile = QwenDecodeProfile::default();
 
     let prefill_start = Instant::now();
-    let mut next_token = 0;
-    for &token_id in prompt_ids {
-        next_token = model.decode_one_token(&mut state, token_id)?.id;
+    for chunk in prompt_ids[..prompt_ids.len() - 1].chunks(SM12X_KV_PAGE_TOKENS) {
+        let mut rows = [Qwen36PrefillRow {
+            token_ids: chunk,
+            sequence: &mut sequence,
+        }];
+        model.prefill_batch(&mut prefill_workspace, &mut rows, &mut cache)?;
     }
+    let mut rows = [Qwen36DecodeRow {
+        token_id: *prompt_ids.last().expect("non-empty prompt"),
+        sequence: &mut sequence,
+    }];
+    let mut next_token = model
+        .decode_batch(&mut decode_workspace, &mut rows, &mut cache)?
+        .top1()?
+        .into_iter()
+        .next()
+        .expect("one decode row")
+        .id;
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
 
     let decode_start = Instant::now();
     for _ in 0..decode_tokens {
-        next_token = if profile_decode {
-            model
-                .decode_one_token_profiled(&mut state, next_token, &mut decode_profile)?
-                .id
-        } else {
-            model.decode_one_token(&mut state, next_token)?.id
-        };
+        let mut rows = [Qwen36DecodeRow {
+            token_id: next_token,
+            sequence: &mut sequence,
+        }];
+        next_token = model
+            .decode_batch(&mut decode_workspace, &mut rows, &mut cache)?
+            .top1()?
+            .into_iter()
+            .next()
+            .expect("one decode row")
+            .id;
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
     let total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
@@ -436,7 +469,40 @@ fn run_qwen36_once(
         decode_ms,
         total_ms,
         counters,
-        decode_profile: profile_decode.then_some(decode_profile),
+        decode_profile: None,
+    })
+}
+
+fn run_qwen36_reference_once(
+    model: &mut Qwen36TextModel,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<BenchRun> {
+    let mut state = model.new_reference_decode_state(prompt_ids.len() + decode_tokens)?;
+    let counters_before = runtime_counters();
+    let total_start = Instant::now();
+    let mut decode_profile = QwenDecodeProfile::default();
+    let prefill_start = Instant::now();
+    let mut next_token = 0;
+    for &token_id in prompt_ids {
+        next_token = model.decode_reference_token(&mut state, token_id)?.id;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
+    let decode_start = Instant::now();
+    for _ in 0..decode_tokens {
+        next_token = model
+            .decode_reference_token_profiled(&mut state, next_token, &mut decode_profile)?
+            .id;
+    }
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
+    let total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+    let counters = runtime_counters().saturating_sub(counters_before);
+    Ok(BenchRun {
+        prefill_ms,
+        decode_ms,
+        total_ms,
+        counters,
+        decode_profile: Some(decode_profile),
     })
 }
 
@@ -446,18 +512,18 @@ fn run_qwen36_once_with_gpu_counter_probe(
     decode_tokens: usize,
     probe: &mut Qwen36GpuCounterProbe<'_>,
 ) -> Result<()> {
-    let mut state = model.new_decode_state(prompt_ids.len() + decode_tokens)?;
+    let mut state = model.new_reference_decode_state(prompt_ids.len() + decode_tokens)?;
     let mut next_token = 0;
     for &token_id in prompt_ids {
-        next_token = model.decode_one_token(&mut state, token_id)?.id;
+        next_token = model.decode_reference_token(&mut state, token_id)?.id;
     }
     for token_idx in 0..decode_tokens {
         next_token = if token_idx == 0 {
             model
-                .decode_one_token_with_gpu_counter_probe(&mut state, next_token, probe)?
+                .decode_reference_token_with_gpu_counter_probe(&mut state, next_token, probe)?
                 .id
         } else {
-            model.decode_one_token(&mut state, next_token)?.id
+            model.decode_reference_token(&mut state, next_token)?.id
         };
     }
     if !probe.captured() {

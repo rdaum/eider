@@ -363,6 +363,29 @@ fn longest_prefix_selects_nested_entry_and_rejects_divergence() {
 }
 
 #[test]
+fn longest_prefix_handles_keys_beyond_inline_storage() {
+    let mut cache = cache(4_000);
+    let mut context = FakeContext::default();
+    let retained = (0..20).collect::<Vec<_>>();
+    let sequence = admit(&mut cache, 24, &mut context);
+    append(&mut cache, sequence, &retained, &mut context);
+    cache
+        .retain_prefix(sequence, &retained, Snapshot(0), &mut context)
+        .expect("long prefix");
+
+    let mut query = retained;
+    query.extend(20..24);
+    assert_eq!(
+        cache
+            .lookup_prefix(&query)
+            .expect("overflow-key prefix hit")
+            .position(),
+        20
+    );
+    cache.validate().expect("valid overflow-key prefix state");
+}
+
+#[test]
 fn lookup_miss_does_not_intern_and_eviction_collects_blocks() {
     let mut cache = cache(1_000);
     let mut context = FakeContext::default();

@@ -1,9 +1,8 @@
 use crate::RetainedSnapshot;
 use crate::backend::PageBackend;
 use crate::error::{CacheError, ConfigError, Result};
-use crate::index::PrefixIndex;
+use crate::index::{PrefixIndex, PrefixKey};
 use crate::metrics::CacheMetrics;
-use rart::VectorKey;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -208,7 +207,7 @@ struct SequenceRecord {
 }
 
 struct PrefixEntry<S> {
-    key: VectorKey,
+    key: PrefixKey,
     blocks: Vec<TokenBlockId>,
     pages: Vec<PageId>,
     position: usize,
@@ -1769,7 +1768,7 @@ mod tests {
         cache.prefixes.insert(
             older,
             PrefixEntry {
-                key: VectorKey::new_from_vec(vec![0]),
+                key: PrefixKey::new_from_array([0]),
                 blocks: Vec::new(),
                 pages: Vec::new(),
                 position: 4,
@@ -1781,7 +1780,7 @@ mod tests {
         cache.prefixes.insert(
             newer,
             PrefixEntry {
-                key: VectorKey::new_from_vec(vec![1]),
+                key: PrefixKey::new_from_array([1]),
                 blocks: Vec::new(),
                 pages: Vec::new(),
                 position: 4,

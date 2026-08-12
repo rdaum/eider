@@ -1,30 +1,29 @@
 use super::{
-    Fp8Linear, Qwen36Attention, Qwen36AttentionState, Qwen36DownStorage,
-    Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock, Qwen36Linear,
-    Qwen36LinearAttentionState, Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights,
-    Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage,
-    Qwen36TextModel, maybe_round_device_f32_to_bf16,
+    Fp8Linear, Qwen36Attention, Qwen36DownStorage, Qwen36FullAttentionWeights, Qwen36GateUpStorage,
+    Qwen36LayerBlock, Qwen36Linear, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
+    Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState,
+    Qwen36SharedExpertStorage, Qwen36TextModel, maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
-use std::mem::size_of;
 
-use crate::runtime::qwen36_sequence_cache::{Qwen36PagedAppend, Qwen36SequenceCache};
+use crate::runtime::qwen36_sequence_cache::{
+    Qwen36Append, Qwen36CacheContext, Qwen36Sequence, Qwen36SequenceCache, cache_error,
+};
 
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
-    Nvfp4TnInputs, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    Nvfp4TnInputs, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
-    causal_window_softmax_f32_to_bf16_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
-    pack_token_heads_bf16_at_offset_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
@@ -34,29 +33,25 @@ use crate::nvfp4::{
     rope_imrope_text_batch_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream, scatter_f32_pointer_rows_on_stream,
     sigmoid_mul_f32_prefix_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
-    unpack_heads_f32_at_offset_into_on_stream,
 };
 
-const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
-const ATTENTION_SCORE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
-const ATTENTION_QUERY_TILE_ROWS: usize = 256;
 const GDN_HEADS: usize = 32;
 const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
 const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
 
-struct Qwen36PagedBatch<'cache, 'table> {
-    cache: &'cache mut Qwen36SequenceCache,
-    appends: &'cache [Qwen36PagedAppend<'table>],
-}
-
 /// One scheduler-selected prompt chunk for batched prefill.
-pub struct Qwen36PrefillRow<'tokens, 'state> {
+pub struct Qwen36PrefillRow<'tokens, 'sequence> {
     /// Non-empty contiguous prompt tokens consumed by this operation.
     pub token_ids: &'tokens [u32],
     /// Persistent state advanced by every token in `token_ids`.
-    pub state: &'state mut Qwen36SequenceState,
+    pub sequence: &'sequence mut Qwen36Sequence,
+}
+
+struct Qwen36PrefillStateRow<'tokens, 'state> {
+    token_ids: &'tokens [u32],
+    state: &'state mut Qwen36SequenceState,
 }
 
 /// One scheduler-selected sequence row for a decode tick.
@@ -64,7 +59,12 @@ pub struct Qwen36DecodeRow<'a> {
     /// Token consumed by this decode step.
     pub token_id: u32,
     /// Persistent state advanced by this decode step.
-    pub state: &'a mut Qwen36SequenceState,
+    pub sequence: &'a mut Qwen36Sequence,
+}
+
+struct Qwen36DecodeStateRow<'a> {
+    token_id: u32,
+    state: &'a mut Qwen36SequenceState,
 }
 
 /// Device-resident output of one decode batch.
@@ -845,7 +845,7 @@ impl BatchLinearAttentionWorkspace {
 
     fn update_state_tables(
         &mut self,
-        rows: &mut [Qwen36DecodeRow<'_>],
+        rows: &mut [Qwen36DecodeStateRow<'_>],
         layer_count: usize,
         capacity: usize,
     ) -> Result<()> {
@@ -853,14 +853,12 @@ impl BatchLinearAttentionWorkspace {
             for row_idx in 0..capacity {
                 let table_idx = layer_idx * capacity + row_idx;
                 let state = if let Some(row) = rows.get_mut(row_idx) {
-                    match &mut row.state.layer_states[layer_idx].attention {
-                        Qwen36AttentionState::LinearAttention(state) => state,
-                        Qwen36AttentionState::FullAttention(_) => {
-                            self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
-                            self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
-                            continue;
-                        }
-                    }
+                    let Some(state) = row.state.linear_states[layer_idx].as_mut() else {
+                        self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
+                        self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                        continue;
+                    };
+                    state
                 } else {
                     &mut self.padding_states[row_idx]
                 };
@@ -881,7 +879,7 @@ impl BatchLinearAttentionWorkspace {
 
     fn update_prefill_state_tables(
         &mut self,
-        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        rows: &mut [Qwen36PrefillStateRow<'_, '_>],
         layer_count: usize,
         state_capacity: usize,
     ) -> Result<()> {
@@ -889,14 +887,12 @@ impl BatchLinearAttentionWorkspace {
             for row_idx in 0..state_capacity {
                 let table_idx = layer_idx * state_capacity + row_idx;
                 let state = if let Some(row) = rows.get_mut(row_idx) {
-                    match &mut row.state.layer_states[layer_idx].attention {
-                        Qwen36AttentionState::LinearAttention(state) => state,
-                        Qwen36AttentionState::FullAttention(_) => {
-                            self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
-                            self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
-                            continue;
-                        }
-                    }
+                    let Some(state) = row.state.linear_states[layer_idx].as_mut() else {
+                        self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
+                        self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                        continue;
+                    };
+                    state
                 } else {
                     &mut self.padding_states[row_idx]
                 };
@@ -958,230 +954,6 @@ impl BatchLinearAttentionWorkspace {
     }
 }
 
-struct BatchTensorCoreAttentionWorkspace {
-    qk_plans: HashMap<(usize, usize), Bf16TnMatmulPlan>,
-    pv_plans: HashMap<(usize, usize, usize), Bf16TnMatmulPlan>,
-    packed_query: DeviceBuffer<u16>,
-    packed_key: DeviceBuffer<u16>,
-    packed_value: DeviceBuffer<u16>,
-    scores: DeviceBuffer<f32>,
-    packed_probabilities: DeviceBuffer<u16>,
-    packed_output: DeviceBuffer<f32>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-}
-
-impl BatchTensorCoreAttentionWorkspace {
-    fn new(rows: usize, q_heads: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
-        let q_values = rows * q_heads * head_dim;
-        let kv_values = rows * kv_heads * head_dim;
-        Ok(Self {
-            qk_plans: HashMap::new(),
-            pv_plans: HashMap::new(),
-            packed_query: DeviceBuffer::zeroed(q_values)?,
-            packed_key: DeviceBuffer::zeroed(kv_values)?,
-            packed_value: DeviceBuffer::zeroed(kv_values)?,
-            scores: DeviceBuffer::zeroed(rows * q_heads * rows)?,
-            packed_probabilities: DeviceBuffer::zeroed(rows * q_heads * rows)?,
-            packed_output: DeviceBuffer::zeroed(q_values)?,
-            q_heads,
-            kv_heads,
-            head_dim,
-        })
-    }
-
-    fn tile_rows(&self, requested: usize, key_tokens: usize) -> usize {
-        let values_per_row = self.q_heads.saturating_mul(key_tokens).max(1);
-        let budget_rows = (ATTENTION_SCORE_BUDGET_BYTES / size_of::<f32>())
-            .checked_div(values_per_row)
-            .unwrap_or(0)
-            .max(1);
-        let rows = requested.min(budget_rows).min(ATTENTION_QUERY_TILE_ROWS);
-        if rows >= 16 { rows / 16 * 16 } else { rows }
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        query_rows: usize,
-        cache_tokens: usize,
-        score_key_tokens: usize,
-    ) -> Result<()> {
-        grow_device_buffer(
-            &mut self.packed_query,
-            query_rows * self.q_heads * self.head_dim,
-        )?;
-        let kv_values = cache_tokens * self.kv_heads * self.head_dim;
-        grow_device_buffer(&mut self.packed_key, kv_values)?;
-        grow_device_buffer(&mut self.packed_value, kv_values)?;
-        let score_values = query_rows * self.q_heads * score_key_tokens;
-        grow_device_buffer(&mut self.scores, score_values)?;
-        grow_device_buffer(&mut self.packed_probabilities, score_values)?;
-        grow_device_buffer(
-            &mut self.packed_output,
-            query_rows * self.q_heads * self.head_dim,
-        )
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.packed_query.device_bytes()
-            + self.packed_key.device_bytes()
-            + self.packed_value.device_bytes()
-            + self.scores.device_bytes()
-            + self.packed_probabilities.device_bytes()
-            + self.packed_output.device_bytes()
-            + self
-                .qk_plans
-                .values()
-                .map(Bf16TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self
-                .pv_plans
-                .values()
-                .map(Bf16TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_sequence(
-        &mut self,
-        model: &Qwen36TextModel,
-        cache: &mut Sm12xKvCache,
-        query: &DeviceBuffer<f32>,
-        key: &DeviceBuffer<f32>,
-        value: &DeviceBuffer<f32>,
-        input_row_offset: usize,
-        rows: usize,
-        output: &mut DeviceBuffer<f32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let start_position = cache.len();
-        let cache_tokens = start_position + rows;
-        let cache_values = cache_tokens * self.kv_heads * self.head_dim;
-        grow_device_buffer(&mut self.packed_key, cache_values)?;
-        grow_device_buffer(&mut self.packed_value, cache_values)?;
-        if start_position == 0 {
-            cache.append_initial_rows_and_stage_bf16_on_stream(
-                key,
-                value,
-                input_row_offset,
-                rows,
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        } else {
-            cache.append_rows_at_offset_on_stream(key, value, input_row_offset, rows, stream)?;
-            cache.unpack_bf16_on_stream(
-                self.packed_key.output(),
-                self.packed_value.output(),
-                stream,
-            )?;
-        }
-
-        let queries_per_kv = self.q_heads / self.kv_heads;
-        let mut query_offset = 0;
-        while query_offset < rows {
-            let requested = rows - query_offset;
-            let absolute_query_start = start_position + query_offset;
-            let query_rows = self.tile_rows(requested, absolute_query_start + requested);
-            let key_tokens = absolute_query_start + query_rows;
-            self.ensure_capacity(query_rows, cache_tokens, key_tokens)?;
-            pack_token_heads_bf16_at_offset_into_on_stream(
-                query,
-                self.packed_query.output(),
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset + query_offset,
-                stream,
-            )?;
-
-            let qk_key = (key_tokens, query_rows);
-            if !self.qk_plans.contains_key(&qk_key) {
-                self.qk_plans.insert(
-                    qk_key,
-                    Bf16TnMatmulPlan::new_strided_batch(
-                        &model.lt,
-                        GemmShape::new(key_tokens, query_rows * queries_per_kv, self.head_dim),
-                        self.kv_heads,
-                        cache_tokens * self.head_dim,
-                        queries_per_kv * query_rows * self.head_dim,
-                        queries_per_kv * query_rows * key_tokens,
-                        PREFILL_GEMM_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            self.qk_plans[&qk_key].run_offsets_on_stream(
-                &model.lt,
-                &self.packed_key,
-                0,
-                &self.packed_query,
-                0,
-                self.scores.output(),
-                0,
-                stream,
-            )?;
-            causal_window_softmax_f32_to_bf16_on_stream(
-                &self.scores,
-                self.packed_probabilities.output(),
-                query_rows,
-                key_tokens,
-                absolute_query_start,
-                self.q_heads,
-                self.head_dim,
-                None,
-                stream,
-            )?;
-
-            let pv_key = (key_tokens, query_rows, cache_tokens);
-            if !self.pv_plans.contains_key(&pv_key) {
-                self.pv_plans.insert(
-                    pv_key,
-                    Bf16TnMatmulPlan::new_strided_batch_with_a_leading_dimension(
-                        &model.lt,
-                        GemmShape::new(self.head_dim, query_rows * queries_per_kv, key_tokens),
-                        cache_tokens,
-                        self.kv_heads,
-                        self.head_dim * cache_tokens,
-                        queries_per_kv * query_rows * key_tokens,
-                        queries_per_kv * query_rows * self.head_dim,
-                        PREFILL_GEMM_WORKSPACE_LIMIT,
-                    )?,
-                );
-            }
-            self.pv_plans[&pv_key].run_offsets_on_stream(
-                &model.lt,
-                &self.packed_value,
-                0,
-                &self.packed_probabilities,
-                0,
-                self.packed_output.output(),
-                0,
-                stream,
-            )?;
-            unpack_heads_f32_at_offset_into_on_stream(
-                &self.packed_output,
-                output.output(),
-                query_rows,
-                self.q_heads,
-                self.head_dim,
-                input_row_offset + query_offset,
-                stream,
-            )?;
-            query_offset += query_rows;
-        }
-        Ok(())
-    }
-}
-
-fn grow_device_buffer<T: Copy>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
-    if buffer.len() < required {
-        *buffer = DeviceBuffer::zeroed(required)?;
-    }
-    Ok(())
-}
-
 struct BatchFullAttentionWorkspace {
     hidden_quantized: DeviceBuffer<u8>,
     hidden_scale: DeviceBuffer<f32>,
@@ -1199,7 +971,6 @@ struct BatchFullAttentionWorkspace {
     gated_attention: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
     compact_attention: Sm12xKvAttentionWorkspace,
-    tensor_core_attention: BatchTensorCoreAttentionWorkspace,
     q_plan: Option<BatchLinearPlan>,
     k_plan: Option<BatchLinearPlan>,
     v_plan: Option<BatchLinearPlan>,
@@ -1239,12 +1010,6 @@ impl BatchFullAttentionWorkspace {
             gated_attention: DeviceBuffer::zeroed(capacity * q_width)?,
             output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
             compact_attention,
-            tensor_core_attention: BatchTensorCoreAttentionWorkspace::new(
-                capacity,
-                model.manifest.q_heads,
-                model.manifest.kv_heads,
-                model.manifest.head_dim,
-            )?,
             q_plan: new_batch_linear_plan(model, &weights.q, capacity)?,
             k_plan: new_batch_linear_plan(model, &weights.k, capacity)?,
             v_plan: new_batch_linear_plan(model, &weights.v, capacity)?,
@@ -1269,7 +1034,6 @@ impl BatchFullAttentionWorkspace {
             + self.gated_attention.device_bytes()
             + self.output.device_bytes()
             + self.compact_attention.device_bytes()
-            + self.tensor_core_attention.device_bytes()
             + self
                 .q_plan
                 .as_ref()
@@ -1738,29 +1502,87 @@ impl Qwen36TextModel {
         &self,
         workspace: &mut Qwen36PrefillBatchWorkspace,
         rows: &mut [Qwen36PrefillRow<'_, '_>],
-    ) -> Result<()> {
-        self.prefill_batch_impl(workspace, rows, None)
-    }
-
-    /// Advances prompt chunks through scheduler-owned shared KV pages.
-    ///
-    /// Every row must fit within the writable page described by its append
-    /// target. The scheduler therefore stops chunks at physical page borders.
-    pub fn prefill_batch_paged(
-        &self,
-        workspace: &mut Qwen36PrefillBatchWorkspace,
-        rows: &mut [Qwen36PrefillRow<'_, '_>],
         cache: &mut Qwen36SequenceCache,
-        appends: &[Qwen36PagedAppend<'_>],
     ) -> Result<()> {
-        self.prefill_batch_impl(workspace, rows, Some(Qwen36PagedBatch { cache, appends }))
+        let mut targets = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let target = match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Qwen36CacheContext {
+                    stream: workspace.stream(),
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    for target in targets.drain(..) {
+                        cache.abort_append(target).map_err(cache_error)?;
+                    }
+                    return Err(cache_error(error));
+                }
+            };
+            if target.max_rows() != row.token_ids.len() {
+                cache.abort_append(target).map_err(cache_error)?;
+                for target in targets.drain(..) {
+                    cache.abort_append(target).map_err(cache_error)?;
+                }
+                return Err(crate::nvfp4::Error::Shape {
+                    label: "Qwen3.6 prefill chunk",
+                    expected: format!(
+                        "each row to fit within its current {}-token cache page",
+                        crate::nvfp4::SM12X_KV_PAGE_TOKENS
+                    ),
+                    actual: format!("{} tokens", row.token_ids.len()),
+                });
+            }
+            targets.push(target);
+        }
+        let result = {
+            let mut state_rows = Vec::with_capacity(rows.len());
+            let mut appends = Vec::with_capacity(rows.len());
+            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+                let sequence = &mut *row.sequence;
+                state_rows.push(Qwen36PrefillStateRow {
+                    token_ids: row.token_ids,
+                    state: &mut sequence.state,
+                });
+                appends.push(Qwen36Append {
+                    target,
+                    page_table: sequence.page_table.device(),
+                });
+            }
+            self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
+        };
+        if let Err(error) = result {
+            for target in targets {
+                cache.abort_append(target).map_err(cache_error)?;
+            }
+            return Err(error);
+        }
+        for (row, target) in rows.iter_mut().zip(targets) {
+            let tokens = row.token_ids.len();
+            cache
+                .commit_append(
+                    target,
+                    tokens,
+                    &mut Qwen36CacheContext {
+                        stream: workspace.stream(),
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(cache_error)?;
+            row.sequence.state.position += tokens;
+        }
+        Ok(())
     }
 
     fn prefill_batch_impl(
         &self,
         workspace: &mut Qwen36PrefillBatchWorkspace,
-        rows: &mut [Qwen36PrefillRow<'_, '_>],
-        mut paged: Option<Qwen36PagedBatch<'_, '_>>,
+        rows: &mut [Qwen36PrefillStateRow<'_, '_>],
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
         if workspace.model_id != self.model_id {
             return Err(crate::nvfp4::Error::Format {
@@ -1775,17 +1597,11 @@ impl Qwen36TextModel {
                 actual: rows.len().to_string(),
             });
         }
-        if paged
-            .as_ref()
-            .is_some_and(|paged| paged.appends.len() != rows.len())
-        {
+        if appends.len() != rows.len() {
             return Err(crate::nvfp4::Error::Shape {
-                label: "Qwen3.6 paged prefill rows",
+                label: "Qwen3.6 prefill append rows",
                 expected: format!("{} append descriptors", rows.len()),
-                actual: paged
-                    .as_ref()
-                    .map_or(0, |paged| paged.appends.len())
-                    .to_string(),
+                actual: appends.len().to_string(),
             });
         }
         let total_tokens = rows.iter().try_fold(0usize, |total, row| {
@@ -1851,26 +1667,6 @@ impl Qwen36TextModel {
                     ),
                     actual: format!("end={end} max_tokens={}", row.state.max_tokens),
                 });
-            }
-            for layer in &row.state.layer_states {
-                if let Qwen36AttentionState::FullAttention(state) = &layer.attention
-                    && (state.cache_capacity != row.state.max_tokens
-                        || match &state.compact_cache {
-                            Some(cache) => paged.is_some() || cache.len() != row.state.position,
-                            None => paged.is_none(),
-                        })
-                {
-                    return Err(crate::nvfp4::Error::Format {
-                        label: "Qwen3.6 prefill sequence state",
-                        detail: format!(
-                            "full-attention cache length/capacity {:?}/{} does not match sequence {}/{}",
-                            state.compact_cache.as_ref().map(Sm12xKvCache::len),
-                            state.cache_capacity,
-                            row.state.position,
-                            row.state.max_tokens
-                        ),
-                    });
-                }
             }
         }
 
@@ -1959,27 +1755,16 @@ impl Qwen36TextModel {
                         total_tokens,
                         stream,
                     )?;
-                    if let Some(paged) = paged.as_mut() {
-                        weights.enqueue_prefill_cache_paged(
-                            self,
-                            &mut workspace.full,
-                            rows,
-                            &workspace.host_sequence_offsets,
-                            layer_idx,
-                            stream,
-                            paged.cache,
-                            paged.appends,
-                        )?;
-                    } else {
-                        weights.enqueue_prefill_cache(
-                            self,
-                            &mut workspace.full,
-                            rows,
-                            &workspace.host_sequence_offsets,
-                            layer_idx,
-                            stream,
-                        )?;
-                    }
+                    weights.enqueue_prefill_cache(
+                        self,
+                        &mut workspace.full,
+                        rows,
+                        &workspace.host_sequence_offsets,
+                        layer_idx,
+                        stream,
+                        cache,
+                        appends,
+                    )?;
                     weights.enqueue_batch_post(self, &mut workspace.full, total_tokens, stream)?;
                     &workspace.full.output
                 }
@@ -2007,9 +1792,6 @@ impl Qwen36TextModel {
             std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
         }
         stream.synchronize()?;
-        for row in rows {
-            row.state.position += row.token_ids.len();
-        }
         Ok(())
     }
 
@@ -2285,24 +2067,15 @@ impl Qwen36TextModel {
         &self,
         workspace: &'w mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
-    ) -> Result<Qwen36DecodedBatch<'w>> {
-        self.decode_batch_impl(workspace, rows, None, None)
-    }
-
-    /// Decodes rows whose full-attention history lives in shared CUDA pages.
-    pub fn decode_batch_paged<'w>(
-        &self,
-        workspace: &'w mut Qwen36DecodeBatchWorkspace,
-        rows: &mut [Qwen36DecodeRow<'_>],
         cache: &mut Qwen36SequenceCache,
-        appends: &[Qwen36PagedAppend<'_>],
     ) -> Result<Qwen36DecodedBatch<'w>> {
-        self.decode_batch_impl(
+        let active_rows = rows.len();
+        self.execute_decode_batch(workspace, rows, cache, None)?;
+        Ok(Qwen36DecodedBatch {
             workspace,
-            rows,
-            Some(Qwen36PagedBatch { cache, appends }),
-            None,
-        )
+            rows: active_rows,
+            vocab: self.manifest.vocab,
+        })
     }
 
     /// Runs one diagnostic decode and copies each post-layer hidden row to the host.
@@ -2310,22 +2083,95 @@ impl Qwen36TextModel {
         &self,
         workspace: &mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
+        cache: &mut Qwen36SequenceCache,
     ) -> Result<Qwen36DecodeBatchTrace> {
         let mut layers = Vec::with_capacity(self.layers.len());
-        let decoded = self.decode_batch_impl(workspace, rows, None, Some(&mut layers))?;
+        let active_rows = rows.len();
+        self.execute_decode_batch(workspace, rows, cache, Some(&mut layers))?;
+        let decoded = Qwen36DecodedBatch {
+            workspace,
+            rows: active_rows,
+            vocab: self.manifest.vocab,
+        };
         Ok(Qwen36DecodeBatchTrace {
             logits: decoded.copy_logits()?,
             layers,
         })
     }
 
-    fn decode_batch_impl<'w>(
+    fn execute_decode_batch(
         &self,
-        workspace: &'w mut Qwen36DecodeBatchWorkspace,
+        workspace: &mut Qwen36DecodeBatchWorkspace,
         rows: &mut [Qwen36DecodeRow<'_>],
-        mut paged: Option<Qwen36PagedBatch<'_, '_>>,
+        cache: &mut Qwen36SequenceCache,
+        trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
+    ) -> Result<()> {
+        let mut targets = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let target = match cache.reserve_append(
+                row.sequence.cache_id,
+                1,
+                &mut Qwen36CacheContext {
+                    stream: workspace.stream(),
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    for target in targets.drain(..) {
+                        cache.abort_append(target).map_err(cache_error)?;
+                    }
+                    return Err(cache_error(error));
+                }
+            };
+            targets.push(target);
+        }
+        let result = {
+            let mut state_rows = Vec::with_capacity(rows.len());
+            let mut appends = Vec::with_capacity(rows.len());
+            for (row, target) in rows.iter_mut().zip(targets.iter().copied()) {
+                let sequence = &mut *row.sequence;
+                state_rows.push(Qwen36DecodeStateRow {
+                    token_id: row.token_id,
+                    state: &mut sequence.state,
+                });
+                appends.push(Qwen36Append {
+                    target,
+                    page_table: sequence.page_table.device(),
+                });
+            }
+            self.decode_batch_impl(workspace, &mut state_rows, cache, &appends, trace)
+        };
+        if let Err(error) = result {
+            for target in targets {
+                cache.abort_append(target).map_err(cache_error)?;
+            }
+            return Err(error);
+        }
+        for (row, target) in rows.iter_mut().zip(targets) {
+            cache
+                .commit_append(
+                    target,
+                    1,
+                    &mut Qwen36CacheContext {
+                        stream: workspace.stream(),
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(cache_error)?;
+            row.sequence.state.position += 1;
+        }
+        Ok(())
+    }
+
+    fn decode_batch_impl(
+        &self,
+        workspace: &mut Qwen36DecodeBatchWorkspace,
+        rows: &mut [Qwen36DecodeStateRow<'_>],
+        cache: &mut Qwen36SequenceCache,
+        appends: &[Qwen36Append<'_>],
         mut trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
-    ) -> Result<Qwen36DecodedBatch<'w>> {
+    ) -> Result<()> {
         if workspace.model_id != self.model_id {
             return Err(crate::nvfp4::Error::Format {
                 label: "Qwen3.6 decode batch workspace",
@@ -2339,17 +2185,11 @@ impl Qwen36TextModel {
                 actual: rows.len().to_string(),
             });
         }
-        if paged
-            .as_ref()
-            .is_some_and(|paged| paged.appends.len() != rows.len())
-        {
+        if appends.len() != rows.len() {
             return Err(crate::nvfp4::Error::Shape {
-                label: "Qwen3.6 paged decode rows",
+                label: "Qwen3.6 decode append rows",
                 expected: format!("{} append descriptors", rows.len()),
-                actual: paged
-                    .as_ref()
-                    .map_or(0, |paged| paged.appends.len())
-                    .to_string(),
+                actual: appends.len().to_string(),
             });
         }
         for row in rows.iter() {
@@ -2380,26 +2220,6 @@ impl Qwen36TextModel {
                         row.state.position, row.state.max_tokens
                     ),
                 });
-            }
-            for layer in &row.state.layer_states {
-                if let Qwen36AttentionState::FullAttention(state) = &layer.attention
-                    && (state.cache_capacity != row.state.max_tokens
-                        || match &state.compact_cache {
-                            Some(cache) => paged.is_some() || cache.len() != row.state.position,
-                            None => paged.is_none(),
-                        })
-                {
-                    return Err(crate::nvfp4::Error::Format {
-                        label: "Qwen3.6 sequence state",
-                        detail: format!(
-                            "full-attention cache mode/capacity {:?}/{} does not match sequence {}/{}",
-                            state.compact_cache.as_ref().map(Sm12xKvCache::len),
-                            state.cache_capacity,
-                            row.state.position,
-                            row.state.max_tokens
-                        ),
-                    });
-                }
             }
         }
 
@@ -2447,27 +2267,16 @@ impl Qwen36TextModel {
                             unreachable!("full-attention graph matches its layer")
                         };
                         pre_attention.launch(stream)?;
-                        if let Some(paged) = paged.as_mut() {
-                            weights.enqueue_batch_cache_paged(
-                                self,
-                                &mut workspace.full,
-                                rows,
-                                layer_idx,
-                                active_rows,
-                                stream,
-                                paged.cache,
-                                paged.appends,
-                            )?;
-                        } else {
-                            weights.enqueue_batch_cache(
-                                self,
-                                &mut workspace.full,
-                                rows,
-                                layer_idx,
-                                active_rows,
-                                stream,
-                            )?;
-                        }
+                        weights.enqueue_batch_cache(
+                            self,
+                            &mut workspace.full,
+                            rows,
+                            layer_idx,
+                            active_rows,
+                            stream,
+                            cache,
+                            appends,
+                        )?;
                         post_attention.launch(stream)?;
                     }
                 }
@@ -2513,27 +2322,16 @@ impl Qwen36TextModel {
                         workspace.capacity,
                         stream,
                     )?;
-                    if let Some(paged) = paged.as_mut() {
-                        weights.enqueue_batch_cache_paged(
-                            self,
-                            &mut workspace.full,
-                            rows,
-                            layer_idx,
-                            active_rows,
-                            stream,
-                            paged.cache,
-                            paged.appends,
-                        )?;
-                    } else {
-                        weights.enqueue_batch_cache(
-                            self,
-                            &mut workspace.full,
-                            rows,
-                            layer_idx,
-                            active_rows,
-                            stream,
-                        )?;
-                    }
+                    weights.enqueue_batch_cache(
+                        self,
+                        &mut workspace.full,
+                        rows,
+                        layer_idx,
+                        active_rows,
+                        stream,
+                        cache,
+                        appends,
+                    )?;
                     weights.enqueue_batch_post(
                         self,
                         &mut workspace.full,
@@ -2645,14 +2443,7 @@ impl Qwen36TextModel {
                 )?;
             }
         }
-        for row in rows.iter_mut() {
-            row.state.position += 1;
-        }
-        Ok(Qwen36DecodedBatch {
-            workspace,
-            rows: active_rows,
-            vocab: self.manifest.vocab,
-        })
+        Ok(())
     }
 }
 
@@ -3158,62 +2949,12 @@ impl Qwen36FullAttentionWeights {
         &self,
         model: &Qwen36TextModel,
         workspace: &mut BatchFullAttentionWorkspace,
-        rows: &mut [Qwen36DecodeRow<'_>],
-        layer_idx: usize,
-        active_rows: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
-        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
-        for (row, decode_row) in rows.iter_mut().enumerate().take(active_rows) {
-            let state = match &mut decode_row.state.layer_states[layer_idx].attention {
-                Qwen36AttentionState::FullAttention(state) => state,
-                Qwen36AttentionState::LinearAttention(_) => {
-                    unreachable!("layer kind validated when sequence state was created")
-                }
-            };
-            let compact_cache =
-                state
-                    .compact_cache
-                    .as_mut()
-                    .ok_or_else(|| crate::nvfp4::Error::Format {
-                        label: "Qwen3.6 contiguous decode cache",
-                        detail: "paged state requires decode_batch_paged".to_string(),
-                    })?;
-            let position = compact_cache.len();
-            compact_cache.append_at_offsets_on_stream(
-                &workspace.k_rope,
-                row * kv_width,
-                &workspace.v,
-                row * kv_width,
-                position,
-                stream,
-            )?;
-            workspace
-                .compact_attention
-                .attention_offsets_into_on_stream(
-                    compact_cache,
-                    &workspace.q_rope,
-                    row * q_width,
-                    workspace.attention.output(),
-                    row * q_width,
-                    stream,
-                )?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn enqueue_batch_cache_paged(
-        &self,
-        model: &Qwen36TextModel,
-        workspace: &mut BatchFullAttentionWorkspace,
-        rows: &mut [Qwen36DecodeRow<'_>],
+        rows: &mut [Qwen36DecodeStateRow<'_>],
         layer_idx: usize,
         active_rows: usize,
         stream: &CudaStream,
         cache: &mut Qwen36SequenceCache,
-        appends: &[Qwen36PagedAppend<'_>],
+        appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
         let q_width = model.manifest.q_heads * model.manifest.head_dim;
         let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
@@ -3225,7 +2966,7 @@ impl Qwen36FullAttentionWeights {
                 || append.target.max_rows() == 0
             {
                 return Err(crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 paged decode append",
+                    label: "Qwen3.6 decode append",
                     detail: format!(
                         "target offset/max rows {}/{} does not match position {position}",
                         append.target.page_offset(),
@@ -3259,7 +3000,7 @@ impl Qwen36FullAttentionWeights {
                         )
                 })
                 .map_err(|error| crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 paged decode cache",
+                    label: "Qwen3.6 decode cache",
                     detail: error.to_string(),
                 })?;
         }
@@ -3271,93 +3012,12 @@ impl Qwen36FullAttentionWeights {
         &self,
         model: &Qwen36TextModel,
         workspace: &mut BatchFullAttentionWorkspace,
-        rows: &mut [Qwen36PrefillRow<'_, '_>],
-        row_offsets: &[u32],
-        layer_idx: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        for (sequence, row) in rows.iter_mut().enumerate() {
-            let state = match &mut row.state.layer_states[layer_idx].attention {
-                Qwen36AttentionState::FullAttention(state) => state,
-                Qwen36AttentionState::LinearAttention(_) => {
-                    unreachable!("layer kind validated when sequence state was created")
-                }
-            };
-            let compact_cache =
-                state
-                    .compact_cache
-                    .as_mut()
-                    .ok_or_else(|| crate::nvfp4::Error::Format {
-                        label: "Qwen3.6 contiguous prefill cache",
-                        detail: "paged state requires prefill_batch_paged".to_string(),
-                    })?;
-            let row_offset = row_offsets[sequence] as usize;
-            if row.token_ids.len() < 32 {
-                let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
-                let q_width = model.manifest.q_heads * model.manifest.head_dim;
-                if row.token_ids.len() == 1 {
-                    let position = compact_cache.len();
-                    compact_cache.append_at_offsets_on_stream(
-                        &workspace.k_rope,
-                        row_offset * kv_width,
-                        &workspace.v,
-                        row_offset * kv_width,
-                        position,
-                        stream,
-                    )?;
-                    workspace
-                        .compact_attention
-                        .attention_offsets_into_on_stream(
-                            compact_cache,
-                            &workspace.q_rope,
-                            row_offset * q_width,
-                            workspace.attention.output(),
-                            row_offset * q_width,
-                            stream,
-                        )?;
-                } else {
-                    workspace
-                        .compact_attention
-                        .append_causal_rows_at_offset_into_on_stream(
-                            compact_cache,
-                            &workspace.q_rope,
-                            &workspace.k_rope,
-                            &workspace.v,
-                            row_offset,
-                            row.token_ids.len(),
-                            None,
-                            workspace.attention.output(),
-                            stream,
-                        )?;
-                }
-            } else {
-                workspace.tensor_core_attention.run_sequence(
-                    model,
-                    compact_cache,
-                    &workspace.q_rope,
-                    &workspace.k_rope,
-                    &workspace.v,
-                    row_offset,
-                    row.token_ids.len(),
-                    &mut workspace.attention,
-                    stream,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn enqueue_prefill_cache_paged(
-        &self,
-        model: &Qwen36TextModel,
-        workspace: &mut BatchFullAttentionWorkspace,
-        rows: &mut [Qwen36PrefillRow<'_, '_>],
+        rows: &mut [Qwen36PrefillStateRow<'_, '_>],
         row_offsets: &[u32],
         layer_idx: usize,
         stream: &CudaStream,
         cache: &mut Qwen36SequenceCache,
-        appends: &[Qwen36PagedAppend<'_>],
+        appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
         let q_width = model.manifest.q_heads * model.manifest.head_dim;
         let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
@@ -3367,7 +3027,7 @@ impl Qwen36FullAttentionWeights {
                 || row.token_ids.len() > append.target.max_rows()
             {
                 return Err(crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 paged prefill append",
+                    label: "Qwen3.6 prefill append",
                     detail: format!(
                         "target offset/max rows {}/{} does not cover position {} and {} rows",
                         append.target.page_offset(),
@@ -3407,7 +3067,7 @@ impl Qwen36FullAttentionWeights {
                     Ok(())
                 })
                 .map_err(|error| crate::nvfp4::Error::Format {
-                    label: "Qwen3.6 paged prefill cache",
+                    label: "Qwen3.6 prefill cache",
                     detail: error.to_string(),
                 })?;
         }

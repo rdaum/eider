@@ -148,7 +148,7 @@ pub struct Qwen36FullAttentionWorkspace {
 
 /// Persistent full-attention state owned by one generated sequence.
 pub struct Qwen36FullAttentionState {
-    compact_cache: Option<Sm12xKvCache>,
+    compact_cache: Sm12xKvCache,
     cache_capacity: usize,
 }
 
@@ -805,13 +805,14 @@ impl Qwen36FullAttentionWeights {
         }
 
         self.prepare_qkv_one_token(workspace, state, manifest, hidden, position, stream)?;
-        let compact_cache = state.compact_cache.as_mut().ok_or_else(|| Error::Format {
-            label: "Qwen3.6 full-attention cache",
-            detail: "paged sequence used with contiguous single-row execution".to_string(),
-        })?;
-        compact_cache.append_at_on_stream(&workspace.k_rope, &workspace.v, position, stream)?;
+        state.compact_cache.append_at_on_stream(
+            &workspace.k_rope,
+            &workspace.v,
+            position,
+            stream,
+        )?;
         workspace.compact_attention.attention_into_on_stream(
-            compact_cache,
+            &state.compact_cache,
             &workspace.q_rope,
             workspace.attn.output(),
             stream,
@@ -880,11 +881,7 @@ impl Qwen36FullAttentionWeights {
             position,
             stream,
         )?;
-        let compact_cache = state.compact_cache.as_mut().ok_or_else(|| Error::Format {
-            label: "Qwen3.6 indexed full-attention cache",
-            detail: "paged sequence used with contiguous indexed execution".to_string(),
-        })?;
-        compact_cache.append_indexed_on_stream(
+        state.compact_cache.append_indexed_on_stream(
             &workspace.k_rope,
             &workspace.v,
             position,
@@ -893,7 +890,7 @@ impl Qwen36FullAttentionWeights {
         workspace
             .compact_attention
             .attention_indexed_into_on_stream(
-                compact_cache,
+                &state.compact_cache,
                 &workspace.q_rope,
                 cache_len,
                 workspace.attn.output(),
@@ -1493,26 +1490,9 @@ impl Qwen36FullAttentionState {
             });
         }
         Ok(Self {
-            compact_cache: Some(Sm12xKvCache::new(
-                cache_capacity,
-                manifest.kv_heads,
-                manifest.head_dim,
-            )?),
+            compact_cache: Sm12xKvCache::new(cache_capacity, manifest.kv_heads, manifest.head_dim)?,
             cache_capacity,
         })
-    }
-
-    fn paged(cache_capacity: usize) -> Self {
-        Self {
-            compact_cache: None,
-            cache_capacity,
-        }
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.compact_cache
-            .as_ref()
-            .map_or(0, Sm12xKvCache::device_bytes)
     }
 }
 
@@ -5283,32 +5263,6 @@ impl Qwen36LayerBlock {
         })
     }
 
-    fn paged_sequence_state(
-        &self,
-        model: &Qwen36Model,
-        cache_capacity: usize,
-    ) -> Result<Qwen36LayerSequenceState> {
-        let manifest = model.manifest();
-        let attention = match &self.attention {
-            Qwen36Attention::LinearAttention(weights) => {
-                let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
-                    label: "Qwen3.6 linear-attention state",
-                    detail: "manifest has no linear-attention configuration".to_string(),
-                })?;
-                Qwen36AttentionState::LinearAttention(Qwen36LinearAttentionState::new(
-                    linear, weights,
-                )?)
-            }
-            Qwen36Attention::FullAttention(_) => {
-                Qwen36AttentionState::FullAttention(Qwen36FullAttentionState::paged(cache_capacity))
-            }
-        };
-        Ok(Qwen36LayerSequenceState {
-            kind: self.kind,
-            attention,
-        })
-    }
-
     fn enqueue_linear_pre_gdn(
         &self,
         workspace: &mut Qwen36LayerBlockWorkspace,
@@ -5825,22 +5779,6 @@ impl Qwen36LmHead {
         }
     }
 
-    fn run_logits(
-        &self,
-        lt: &CublasLt,
-        input: &DeviceBuffer<f32>,
-        workspace: &mut Qwen36LmHeadWorkspace,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        match self {
-            Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
-            Self::Bf16(linear) => linear.run_into(input, &mut workspace.logits, stream),
-            Self::Fp8 { linear, plan } => {
-                Self::run_fp8_logits(lt, linear, plan.as_deref(), input, workspace, stream)
-            }
-        }
-    }
-
     fn run_top1(
         &self,
         lt: &CublasLt,
@@ -5961,20 +5899,11 @@ struct Qwen36MoeGraphSync {
 }
 
 /// Mutable decode state for [`Qwen36TextModel`].
-pub struct Qwen36SequenceState {
+pub(crate) struct Qwen36SequenceState {
     model_id: u64,
-    layer_states: Vec<Qwen36LayerSequenceState>,
+    linear_states: Vec<Option<Qwen36LinearAttentionState>>,
     position: usize,
     max_tokens: usize,
-}
-
-/// Immutable, 128-token-aligned hybrid sequence checkpoint.
-///
-/// Linear-attention state is copied in full. Full-attention state retains only
-/// compact K/V storage through the checkpoint position, independent of the
-/// source request's allocated context capacity.
-pub struct Qwen36SequenceCheckpoint {
-    sequence: Qwen36SequenceState,
 }
 
 /// Immutable page-aligned snapshot of Qwen3.6's non-pageable recurrent state.
@@ -5996,146 +5925,22 @@ impl sequence_cache::RetainedSnapshot for Qwen36SequenceSnapshot {
 
 impl Qwen36SequenceState {
     /// Returns the next position that will be written by decode.
-    pub fn position(&self) -> usize {
+    pub(crate) fn position(&self) -> usize {
         self.position
     }
 
     /// Returns the allocated context capacity.
-    pub fn max_tokens(&self) -> usize {
+    pub(crate) fn max_tokens(&self) -> usize {
         self.max_tokens
     }
 
     /// Returns the number of device bytes owned by this sequence state.
-    pub fn device_bytes(&self) -> usize {
-        self.layer_states
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.linear_states
             .iter()
-            .map(|layer| match &layer.attention {
-                Qwen36AttentionState::LinearAttention(state) => state.device_bytes(),
-                Qwen36AttentionState::FullAttention(state) => state.device_bytes(),
-            })
+            .flatten()
+            .map(Qwen36LinearAttentionState::device_bytes)
             .sum()
-    }
-
-    /// Returns the device bytes needed to retain the current aligned prefix.
-    pub fn checkpoint_device_bytes(&self) -> Result<usize> {
-        if self.position == 0 || !self.position.is_multiple_of(128) {
-            return Err(Error::Shape {
-                label: "Qwen3.6 sequence checkpoint byte estimate",
-                expected: "nonzero 128-token-aligned sequence position".to_string(),
-                actual: self.position.to_string(),
-            });
-        }
-        self.layer_states.iter().try_fold(0usize, |total, layer| {
-            let layer_bytes = match &layer.attention {
-                Qwen36AttentionState::LinearAttention(state) => state.device_bytes(),
-                Qwen36AttentionState::FullAttention(state) => state
-                    .compact_cache
-                    .as_ref()
-                    .ok_or_else(|| Error::Format {
-                        label: "Qwen3.6 sequence checkpoint byte estimate",
-                        detail: "paged sequence KV is owned by the shared cache".to_string(),
-                    })?
-                    .device_bytes_for_capacity(self.position)?,
-            };
-            total.checked_add(layer_bytes).ok_or_else(|| Error::Shape {
-                label: "Qwen3.6 sequence checkpoint byte estimate",
-                expected: "device-byte total without overflow".to_string(),
-                actual: format!("position={}", self.position),
-            })
-        })
-    }
-
-    fn copy_aligned_prefix_from_on_stream(
-        &mut self,
-        source: &Self,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let prefix_tokens = source.position;
-        if self.model_id != source.model_id
-            || self.position != 0
-            || prefix_tokens == 0
-            || !prefix_tokens.is_multiple_of(128)
-            || prefix_tokens > self.max_tokens
-            || self.layer_states.len() != source.layer_states.len()
-        {
-            return Err(Error::Shape {
-                label: "Qwen3.6 sequence prefix copy",
-                expected: format!(
-                    "empty matching-model destination with capacity >= a nonzero 128-token source position {}",
-                    source.position
-                ),
-                actual: format!(
-                    "source_model={} destination_model={} destination_position={} destination_capacity={} source_layers={} destination_layers={}",
-                    source.model_id,
-                    self.model_id,
-                    self.position,
-                    self.max_tokens,
-                    source.layer_states.len(),
-                    self.layer_states.len()
-                ),
-            });
-        }
-        for (destination, source) in self.layer_states.iter_mut().zip(&source.layer_states) {
-            match (&mut destination.attention, &source.attention) {
-                (
-                    Qwen36AttentionState::LinearAttention(destination),
-                    Qwen36AttentionState::LinearAttention(source),
-                ) => {
-                    destination.conv_state.copy_prefix_from_device_on_stream(
-                        &source.conv_state,
-                        source.conv_state.len(),
-                        stream,
-                    )?;
-                    destination
-                        .recurrent_state
-                        .copy_prefix_from_device_on_stream(
-                            &source.recurrent_state,
-                            source.recurrent_state.len(),
-                            stream,
-                        )?;
-                }
-                (
-                    Qwen36AttentionState::FullAttention(destination),
-                    Qwen36AttentionState::FullAttention(source),
-                ) => {
-                    let (Some(destination), Some(source)) = (
-                        destination.compact_cache.as_mut(),
-                        source.compact_cache.as_ref(),
-                    ) else {
-                        return Err(Error::Format {
-                            label: "Qwen3.6 sequence prefix copy",
-                            detail: "contiguous checkpoint copy requires contiguous KV state"
-                                .to_string(),
-                        });
-                    };
-                    destination.copy_aligned_prefix_from_on_stream(
-                        source,
-                        prefix_tokens,
-                        stream,
-                    )?;
-                }
-                _ => {
-                    return Err(Error::Format {
-                        label: "Qwen3.6 sequence prefix copy",
-                        detail: "source and destination layer kinds differ".to_string(),
-                    });
-                }
-            }
-        }
-        self.position = prefix_tokens;
-        Ok(())
-    }
-}
-
-impl Qwen36SequenceCheckpoint {
-    /// Returns the number of prompt tokens represented by this checkpoint.
-    pub fn position(&self) -> usize {
-        self.sequence.position()
-    }
-
-    /// Returns the exact device bytes retained by this checkpoint.
-    pub fn device_bytes(&self) -> usize {
-        self.sequence.device_bytes()
     }
 }
 
@@ -6151,11 +5956,16 @@ impl Qwen36SequenceSnapshot {
     }
 }
 
-/// Legacy single-row execution state.
+struct Qwen36ReferenceSequenceState {
+    layer_states: Vec<Qwen36LayerSequenceState>,
+    position: usize,
+    max_tokens: usize,
+}
+
+/// Single-row reference execution state for profiling and GPU diagnostics.
 ///
-/// Persistent sequence state is kept separately from reusable execution
-/// scratch so the canonical batched decoder can regroup sequences freely.
-pub struct Qwen36DecodeState {
+/// Serving and ordinary generation use the shared paged batch API instead.
+pub struct Qwen36ReferenceDecodeState {
     stream: CudaStream,
     parallel_moe_stream: Option<CudaStream>,
     parallel_moe_sync: Vec<Qwen36MoeGraphSync>,
@@ -6163,7 +5973,7 @@ pub struct Qwen36DecodeState {
     position_device: DeviceBuffer<u32>,
     cache_len_device: DeviceBuffer<u32>,
     hidden: DeviceBuffer<f32>,
-    sequence: Qwen36SequenceState,
+    sequence: Qwen36ReferenceSequenceState,
     layer_workspaces: Vec<Qwen36LayerBlockWorkspace>,
     final_hidden: DeviceBuffer<f32>,
     lm_head: Qwen36LmHeadWorkspace,
@@ -6176,12 +5986,6 @@ pub struct Qwen36NextToken {
     pub id: u32,
     /// Winning logit value.
     pub value: f32,
-}
-
-/// CPU-visible lm-head logits produced by one Qwen3.6 decode step.
-pub struct Qwen36NextTokenLogits {
-    /// One logit for every vocabulary entry.
-    pub logits: Vec<f32>,
 }
 
 /// Qwen3.6 decode stage that can be wrapped by GPU counter collection.
@@ -6422,8 +6226,10 @@ impl Qwen36TextModel {
         &self.embedding
     }
 
-    /// Allocates a decode state capable of storing `max_tokens` positions.
-    pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Qwen36SequenceState> {
+    /// Allocates request-private recurrent state for `max_tokens` positions.
+    ///
+    /// Full-attention K/V is owned by the shared sequence cache.
+    pub(crate) fn new_sequence_state(&self, max_tokens: usize) -> Result<Qwen36SequenceState> {
         if max_tokens == 0 {
             return Err(Error::Shape {
                 label: "Qwen3.6 sequence state",
@@ -6431,56 +6237,33 @@ impl Qwen36TextModel {
                 actual: "0".to_string(),
             });
         }
-        let model = Qwen36Model {
-            manifest: self.manifest.clone(),
-            checkpoint: self.checkpoint.clone(),
-            artifact_dir: self.artifact_dir.clone(),
-            bf16_storage: self.bf16_storage,
-            fp8_attention_storage: self.fp8_attention_storage,
-        };
-        let mut layer_states = Vec::with_capacity(self.layers.len());
+        let mut linear_states = Vec::with_capacity(self.layers.len());
         for block in &self.layers {
-            layer_states.push(block.sequence_state(&model, max_tokens)?);
+            let state = match &block.attention {
+                Qwen36Attention::LinearAttention(weights) => {
+                    let linear = self
+                        .manifest
+                        .linear_attention
+                        .ok_or_else(|| Error::Format {
+                            label: "Qwen3.6 linear-attention state",
+                            detail: "manifest has no linear-attention configuration".to_string(),
+                        })?;
+                    Some(Qwen36LinearAttentionState::new(linear, weights)?)
+                }
+                Qwen36Attention::FullAttention(_) => None,
+            };
+            linear_states.push(state);
         }
         Ok(Qwen36SequenceState {
             model_id: self.model_id,
-            layer_states,
-            position: 0,
-            max_tokens,
-        })
-    }
-
-    /// Allocates only request-private recurrent state; full-attention KV is
-    /// supplied by the scheduler-owned shared page cache.
-    pub fn new_paged_sequence_state(&self, max_tokens: usize) -> Result<Qwen36SequenceState> {
-        if max_tokens == 0 {
-            return Err(Error::Shape {
-                label: "Qwen3.6 paged sequence state",
-                expected: "max_tokens > 0".to_string(),
-                actual: "0".to_string(),
-            });
-        }
-        let model = Qwen36Model {
-            manifest: self.manifest.clone(),
-            checkpoint: self.checkpoint.clone(),
-            artifact_dir: self.artifact_dir.clone(),
-            bf16_storage: self.bf16_storage,
-            fp8_attention_storage: self.fp8_attention_storage,
-        };
-        let mut layer_states = Vec::with_capacity(self.layers.len());
-        for block in &self.layers {
-            layer_states.push(block.paged_sequence_state(&model, max_tokens)?);
-        }
-        Ok(Qwen36SequenceState {
-            model_id: self.model_id,
-            layer_states,
+            linear_states,
             position: 0,
             max_tokens,
         })
     }
 
     /// Copies only Qwen3.6's fixed-size recurrent state for prefix retention.
-    pub fn snapshot_paged_sequence(
+    pub(crate) fn snapshot_sequence(
         &self,
         source: &Qwen36SequenceState,
     ) -> Result<Qwen36SequenceSnapshot> {
@@ -6489,7 +6272,7 @@ impl Qwen36TextModel {
             || !source.position.is_multiple_of(128)
         {
             return Err(Error::Shape {
-                label: "Qwen3.6 paged sequence snapshot",
+                label: "Qwen3.6 sequence snapshot",
                 expected: "matching model and nonzero 128-token-aligned position".to_string(),
                 actual: format!(
                     "model={} expected_model={} position={}",
@@ -6498,11 +6281,11 @@ impl Qwen36TextModel {
             });
         }
         let stream = CudaStream::new_non_blocking()?;
-        let mut linear_states = Vec::with_capacity(source.layer_states.len());
+        let mut linear_states = Vec::with_capacity(source.linear_states.len());
         let mut device_bytes = 0usize;
-        for layer in &source.layer_states {
-            match &layer.attention {
-                Qwen36AttentionState::LinearAttention(source) => {
+        for state in &source.linear_states {
+            match state {
+                Some(source) => {
                     let mut destination = Qwen36LinearAttentionState {
                         conv_state: DeviceBuffer::zeroed(source.conv_state.len())?,
                         recurrent_state: DeviceBuffer::zeroed(source.recurrent_state.len())?,
@@ -6522,13 +6305,13 @@ impl Qwen36TextModel {
                     device_bytes = device_bytes
                         .checked_add(destination.device_bytes())
                         .ok_or_else(|| Error::Shape {
-                            label: "Qwen3.6 paged snapshot bytes",
+                            label: "Qwen3.6 snapshot bytes",
                             expected: "byte total without overflow".to_string(),
                             actual: source.device_bytes().to_string(),
                         })?;
                     linear_states.push(Some(destination));
                 }
-                Qwen36AttentionState::FullAttention(_) => linear_states.push(None),
+                None => linear_states.push(None),
             }
         }
         stream.synchronize()?;
@@ -6540,8 +6323,8 @@ impl Qwen36TextModel {
         })
     }
 
-    /// Restores a retained recurrent snapshot into an empty paged sequence.
-    pub fn restore_paged_sequence_snapshot(
+    /// Restores a retained recurrent snapshot into an empty sequence.
+    pub(crate) fn restore_sequence_snapshot(
         &self,
         snapshot: &Qwen36SequenceSnapshot,
         destination: &mut Qwen36SequenceState,
@@ -6550,10 +6333,10 @@ impl Qwen36TextModel {
             || destination.model_id != self.model_id
             || destination.position != 0
             || snapshot.position > destination.max_tokens
-            || snapshot.linear_states.len() != destination.layer_states.len()
+            || snapshot.linear_states.len() != destination.linear_states.len()
         {
             return Err(Error::Format {
-                label: "Qwen3.6 paged sequence snapshot restore",
+                label: "Qwen3.6 sequence snapshot restore",
                 detail: "snapshot and empty destination are incompatible".to_string(),
             });
         }
@@ -6561,10 +6344,10 @@ impl Qwen36TextModel {
         for (snapshot, destination) in snapshot
             .linear_states
             .iter()
-            .zip(&mut destination.layer_states)
+            .zip(&mut destination.linear_states)
         {
-            match (snapshot, &mut destination.attention) {
-                (Some(source), Qwen36AttentionState::LinearAttention(destination)) => {
+            match (snapshot, destination) {
+                (Some(source), Some(destination)) => {
                     destination.conv_state.copy_prefix_from_device_on_stream(
                         &source.conv_state,
                         source.conv_state.len(),
@@ -6578,11 +6361,10 @@ impl Qwen36TextModel {
                             &stream,
                         )?;
                 }
-                (None, Qwen36AttentionState::FullAttention(state))
-                    if state.compact_cache.is_none() => {}
+                (None, None) => {}
                 _ => {
                     return Err(Error::Format {
-                        label: "Qwen3.6 paged sequence snapshot restore",
+                        label: "Qwen3.6 sequence snapshot restore",
                         detail: "snapshot layer kinds differ from destination".to_string(),
                     });
                 }
@@ -6593,56 +6375,14 @@ impl Qwen36TextModel {
         Ok(())
     }
 
-    /// Copies a sequence's current aligned prefix into an immutable checkpoint.
-    pub fn checkpoint_sequence(
+    /// Allocates single-row reference state for profiling and GPU diagnostics.
+    pub fn new_reference_decode_state(
         &self,
-        source: &Qwen36SequenceState,
-    ) -> Result<Qwen36SequenceCheckpoint> {
-        if source.model_id != self.model_id {
-            return Err(Error::Format {
-                label: "Qwen3.6 sequence checkpoint",
-                detail: "sequence was created by a different model instance".to_string(),
-            });
-        }
-        source.checkpoint_device_bytes()?;
-        let mut sequence = self.new_sequence_state(source.position)?;
-        let stream = CudaStream::new_non_blocking()?;
-        sequence.copy_aligned_prefix_from_on_stream(source, &stream)?;
-        stream.synchronize()?;
-        Ok(Qwen36SequenceCheckpoint { sequence })
-    }
-
-    /// Creates active sequence state from a cached aligned checkpoint.
-    pub fn restore_sequence_checkpoint(
-        &self,
-        checkpoint: &Qwen36SequenceCheckpoint,
         max_tokens: usize,
-    ) -> Result<Qwen36SequenceState> {
-        if checkpoint.sequence.model_id != self.model_id {
-            return Err(Error::Format {
-                label: "Qwen3.6 sequence checkpoint restore",
-                detail: "checkpoint was created by a different model instance".to_string(),
-            });
-        }
-        if max_tokens < checkpoint.position() {
-            return Err(Error::Shape {
-                label: "Qwen3.6 sequence checkpoint restore",
-                expected: format!("max_tokens >= {}", checkpoint.position()),
-                actual: max_tokens.to_string(),
-            });
-        }
-        let mut sequence = self.new_sequence_state(max_tokens)?;
-        let stream = CudaStream::new_non_blocking()?;
-        sequence.copy_aligned_prefix_from_on_stream(&checkpoint.sequence, &stream)?;
-        stream.synchronize()?;
-        Ok(sequence)
-    }
-
-    /// Allocates the legacy single-row decode state.
-    pub fn new_decode_state(&self, max_tokens: usize) -> Result<Qwen36DecodeState> {
-        let sequence = self.new_sequence_state(max_tokens)?;
+    ) -> Result<Qwen36ReferenceDecodeState> {
         let stream = CudaStream::new_blocking()?;
         let mut layer_workspaces = Vec::with_capacity(self.layers.len());
+        let mut layer_states = Vec::with_capacity(self.layers.len());
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
@@ -6652,7 +6392,13 @@ impl Qwen36TextModel {
         };
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);
+            layer_states.push(block.sequence_state(&model, max_tokens)?);
         }
+        let sequence = Qwen36ReferenceSequenceState {
+            layer_states,
+            position: 0,
+            max_tokens,
+        };
         let enable_segmented_graphs = !self.expert_paging
             && !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
@@ -6669,7 +6415,7 @@ impl Qwen36TextModel {
                 });
             }
         }
-        let mut state = Qwen36DecodeState {
+        let mut state = Qwen36ReferenceDecodeState {
             stream,
             parallel_moe_stream,
             parallel_moe_sync,
@@ -6699,7 +6445,7 @@ impl Qwen36TextModel {
 
     fn capture_segmented_graphs(
         &self,
-        state: &mut Qwen36DecodeState,
+        state: &mut Qwen36ReferenceDecodeState,
     ) -> Result<Vec<Qwen36LayerGraphs>> {
         let mut graphs = Vec::with_capacity(self.layers.len());
         for (layer_idx, block) in self.layers.iter().enumerate() {
@@ -6764,63 +6510,43 @@ impl Qwen36TextModel {
         Ok(graphs)
     }
 
-    /// Decodes one token: embedding lookup -> 40 layer blocks -> final norm ->
-    /// lm_head -> argmax. Advances the decode position by one.
-    pub fn decode_one_token(
+    /// Runs one single-row reference token for profiling and diagnostics.
+    pub fn decode_reference_token(
         &self,
-        state: &mut Qwen36DecodeState,
+        state: &mut Qwen36ReferenceDecodeState,
         token_id: u32,
     ) -> Result<Qwen36NextToken> {
-        self.decode_one_token_impl(state, token_id, None, None, false)
-            .map(|(next, _)| next)
+        self.decode_reference_token_impl(state, token_id, None, None)
     }
 
-    /// Decodes one token and returns the complete lm-head logits on the CPU.
-    ///
-    /// This is intended for sampling and is slower than the GPU top-1 path
-    /// because it copies one `vocab`-sized vector to the host per token.
-    pub fn decode_one_token_logits(
+    /// Runs one single-row reference token with coarse CUDA-event timings.
+    pub fn decode_reference_token_profiled(
         &self,
-        state: &mut Qwen36DecodeState,
-        token_id: u32,
-    ) -> Result<Qwen36NextTokenLogits> {
-        let (_, logits) = self.decode_one_token_impl(state, token_id, None, None, true)?;
-        Ok(Qwen36NextTokenLogits {
-            logits: logits.expect("full-logit decode requested"),
-        })
-    }
-
-    /// Decodes one token and accumulates coarse CUDA-event timings.
-    pub fn decode_one_token_profiled(
-        &self,
-        state: &mut Qwen36DecodeState,
+        state: &mut Qwen36ReferenceDecodeState,
         token_id: u32,
         profile: &mut QwenDecodeProfile,
     ) -> Result<Qwen36NextToken> {
-        self.decode_one_token_impl(state, token_id, Some(profile), None, false)
-            .map(|(next, _)| next)
+        self.decode_reference_token_impl(state, token_id, Some(profile), None)
     }
 
-    /// Decodes one token while wrapping one selected stage in a GPU counter range.
-    pub fn decode_one_token_with_gpu_counter_probe(
+    /// Runs one reference token while wrapping a selected GPU counter range.
+    pub fn decode_reference_token_with_gpu_counter_probe(
         &self,
-        state: &mut Qwen36DecodeState,
+        state: &mut Qwen36ReferenceDecodeState,
         token_id: u32,
         probe: &mut Qwen36GpuCounterProbe<'_>,
     ) -> Result<Qwen36NextToken> {
-        self.decode_one_token_impl(state, token_id, None, Some(probe), false)
-            .map(|(next, _)| next)
+        self.decode_reference_token_impl(state, token_id, None, Some(probe))
     }
 
     #[allow(clippy::needless_option_as_deref)]
-    fn decode_one_token_impl(
+    fn decode_reference_token_impl(
         &self,
-        state: &mut Qwen36DecodeState,
+        state: &mut Qwen36ReferenceDecodeState,
         token_id: u32,
         mut profile: Option<&mut QwenDecodeProfile>,
         mut gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
-        return_logits: bool,
-    ) -> Result<(Qwen36NextToken, Option<Vec<f32>>)> {
+    ) -> Result<Qwen36NextToken> {
         if state.sequence.position >= state.sequence.max_tokens {
             return Err(Error::Shape {
                 label: "Qwen3.6 decode position",
@@ -6938,19 +6664,7 @@ impl Qwen36TextModel {
 
         round_f32_to_bf16_in_place_on_stream(state.final_hidden.inout(), stream)?;
 
-        let (id, value, logits) = if return_logits {
-            self.lm_head
-                .run_logits(&self.lt, &state.final_hidden, &mut state.lm_head, stream)?;
-            let logits = state.lm_head.logits.copy_to_host(stream)?.into_vec();
-            let (id, value) = logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                .map(|(id, value)| (id as u32, value))
-                .expect("Qwen3.6 vocabulary is non-empty");
-            (id, value, Some(logits))
-        } else if let Some(profile) = profile.as_deref_mut() {
+        let (id, value) = if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
                 self.lm_head
                     .run_top1(&self.lt, &state.final_hidden, &mut state.lm_head, stream)
@@ -6958,16 +6672,16 @@ impl Qwen36TextModel {
             profile.lm_head_argmax_ms += ms;
             let id = state.lm_head.next_index.copy_to_host(stream)?[0];
             let value = state.lm_head.next_value.copy_to_host(stream)?[0];
-            (id, value, None)
+            (id, value)
         } else {
             self.lm_head
                 .run_top1(&self.lt, &state.final_hidden, &mut state.lm_head, stream)?;
             let id = state.lm_head.next_index.copy_to_host(stream)?[0];
             let value = state.lm_head.next_value.copy_to_host(stream)?[0];
-            (id, value, None)
+            (id, value)
         };
         state.sequence.position += 1;
-        Ok((Qwen36NextToken { id, value }, logits))
+        Ok(Qwen36NextToken { id, value })
     }
 }
 

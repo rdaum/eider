@@ -1,6 +1,10 @@
+use infer::nvfp4::CudaStream;
 use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
-    Qwen36Fp8AttentionStorage, Qwen36SequenceState, Qwen36TextModel,
+    Qwen36Fp8AttentionStorage, Qwen36TextModel,
+};
+use infer::runtime::qwen36_sequence_cache::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -28,7 +32,8 @@ struct LogitParity {
 struct DecodeCase {
     model: Rc<Qwen36TextModel>,
     workspace: Qwen36DecodeBatchWorkspace,
-    states: Vec<Qwen36SequenceState>,
+    sequences: Vec<Qwen36Sequence>,
+    cache: Qwen36SequenceCache,
     tokens: Vec<u32>,
 }
 
@@ -52,18 +57,21 @@ impl DecodeCase {
         let workspace = model
             .new_decode_batch_workspace(capacity, MAX_CONTEXT_TOKENS)
             .expect("capacity-parity decode workspace");
-        let states = tokens
+        let stream = CudaStream::new_non_blocking().expect("capacity-parity stream");
+        let mut cache = new_qwen36_sequence_cache(&model, tokens.len(), MAX_CONTEXT_TOKENS)
+            .expect("capacity-parity sequence cache");
+        let sequences = tokens
             .iter()
             .map(|_| {
-                model
-                    .new_sequence_state(MAX_CONTEXT_TOKENS)
-                    .expect("capacity-parity sequence state")
+                Qwen36Sequence::admit(&model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+                    .expect("capacity-parity sequence")
             })
             .collect();
         Self {
             model,
             workspace,
-            states,
+            sequences,
+            cache,
             tokens,
         }
     }
@@ -73,12 +81,12 @@ impl DecodeCase {
             .tokens
             .iter()
             .copied()
-            .zip(self.states.iter_mut())
-            .map(|(token_id, state)| Qwen36DecodeRow { token_id, state })
+            .zip(self.sequences.iter_mut())
+            .map(|(token_id, sequence)| Qwen36DecodeRow { token_id, sequence })
             .collect::<Vec<_>>();
         let next = self
             .model
-            .decode_batch(&mut self.workspace, &mut rows)
+            .decode_batch(&mut self.workspace, &mut rows, &mut self.cache)
             .and_then(|mut decoded| decoded.top1())
             .expect("capacity-parity decode");
         for (token, next) in self.tokens.iter_mut().zip(next) {
@@ -112,22 +120,24 @@ fn decode_first_row(
     let mut workspace = model
         .new_decode_batch_workspace(capacity, MAX_CONTEXT_TOKENS)
         .expect("capacity-parity validation workspace");
-    let mut states = tokens
+    let stream = CudaStream::new_non_blocking().expect("capacity-parity validation stream");
+    let mut cache = new_qwen36_sequence_cache(model, tokens.len(), MAX_CONTEXT_TOKENS)
+        .expect("capacity-parity validation cache");
+    let mut sequences = tokens
         .iter()
         .map(|_| {
-            model
-                .new_sequence_state(MAX_CONTEXT_TOKENS)
-                .expect("capacity-parity validation state")
+            Qwen36Sequence::admit(model, &mut cache, MAX_CONTEXT_TOKENS, &stream)
+                .expect("capacity-parity validation sequence")
         })
         .collect::<Vec<_>>();
     let mut rows = tokens
         .iter()
         .copied()
-        .zip(states.iter_mut())
-        .map(|(token_id, state)| Qwen36DecodeRow { token_id, state })
+        .zip(sequences.iter_mut())
+        .map(|(token_id, sequence)| Qwen36DecodeRow { token_id, sequence })
         .collect::<Vec<_>>();
     let mut trace = model
-        .trace_decode_batch(&mut workspace, &mut rows)
+        .trace_decode_batch(&mut workspace, &mut rows, &mut cache)
         .expect("capacity-parity validation decode");
     trace.logits.truncate(model.manifest().vocab);
     trace

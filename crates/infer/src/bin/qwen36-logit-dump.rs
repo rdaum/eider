@@ -1,5 +1,6 @@
-use infer::nvfp4::{Error, Result};
-use infer::qwen3::qwen36::Qwen36TextModel;
+use infer::nvfp4::{CudaStream, Error, Result};
+use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
+use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -27,19 +28,23 @@ fn main() -> Result<()> {
     }
 
     let model = Qwen36TextModel::open(&model_dir)?;
-    let mut state = model.new_decode_state(prompt_ids.len() + 1)?;
-    for &token in &prompt_ids[..prompt_ids.len() - 1] {
-        model.decode_one_token(&mut state, token)?;
+    let max_tokens = prompt_ids.len() + 1;
+    let stream = CudaStream::new_non_blocking()?;
+    let mut cache = new_qwen36_sequence_cache(&model, 1, max_tokens)?;
+    let mut sequence = Qwen36Sequence::admit(&model, &mut cache, max_tokens, &stream)?;
+    let mut workspace = model.new_decode_batch_workspace(1, max_tokens)?;
+    let mut logits = Vec::new();
+    for &token_id in prompt_ids {
+        let mut rows = [Qwen36DecodeRow {
+            token_id,
+            sequence: &mut sequence,
+        }];
+        logits = model
+            .decode_batch(&mut workspace, &mut rows, &mut cache)?
+            .copy_logits()?;
     }
-    let last = *prompt_ids.last().expect("non-empty prompt");
-    let output = model.decode_one_token_logits(&mut state, last)?;
 
-    let mut ranked = output
-        .logits
-        .iter()
-        .copied()
-        .enumerate()
-        .collect::<Vec<_>>();
+    let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();
     ranked.select_nth_unstable_by(20, |left, right| right.1.total_cmp(&left.1));
     ranked.truncate(20);
     ranked.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));

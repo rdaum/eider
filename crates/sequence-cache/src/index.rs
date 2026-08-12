@@ -1,7 +1,9 @@
 use crate::error::{CacheError, Result};
 use crate::manager::{PrefixEntryId, TokenBlockId};
-use rart::{AdaptiveRadixTree, VectorKey};
+use rart::{AdaptiveRadixTree, OverflowKey};
 use std::collections::{BTreeMap, HashMap};
+
+pub(crate) type PrefixKey = OverflowKey<32, 8>;
 
 #[derive(Debug)]
 struct BlockRecord {
@@ -10,12 +12,12 @@ struct BlockRecord {
 }
 
 pub(crate) struct PreparedKey {
-    pub key: VectorKey,
+    pub key: PrefixKey,
     pub blocks: Vec<TokenBlockId>,
 }
 
 pub(crate) struct PrefixIndex {
-    tree: AdaptiveRadixTree<VectorKey, PrefixEntryId>,
+    tree: AdaptiveRadixTree<PrefixKey, PrefixEntryId>,
     by_tokens: HashMap<Box<[u32]>, TokenBlockId>,
     blocks: BTreeMap<TokenBlockId, BlockRecord>,
     next_block_id: u64,
@@ -36,19 +38,19 @@ impl PrefixIndex {
     }
 
     /// Builds a lookup key without interning unknown query blocks.
-    pub fn lookup_key(&self, tokens: &[u32], page_tokens: usize) -> Option<VectorKey> {
+    pub fn lookup_key(&self, tokens: &[u32], page_tokens: usize) -> Option<PrefixKey> {
         debug_assert!(tokens.len().is_multiple_of(page_tokens));
-        let mut bytes = Vec::with_capacity(tokens.len() / page_tokens * 8);
+        let mut key = PrefixKey::builder();
         for block in tokens.chunks_exact(page_tokens) {
             let Some(id) = self.by_tokens.get(block) else {
                 break;
             };
-            bytes.extend_from_slice(&id.raw().to_be_bytes());
+            key.extend_from_slice(&id.raw().to_be_bytes());
         }
-        (!bytes.is_empty()).then(|| VectorKey::new_from_vec(bytes))
+        (!key.is_empty()).then(|| key.finish())
     }
 
-    pub fn longest(&self, key: &VectorKey) -> Option<PrefixEntryId> {
+    pub fn longest(&self, key: &PrefixKey) -> Option<PrefixEntryId> {
         let mut found = None;
         self.tree
             .with_longest_prefix_match_view_k(key, |_key, id| found = Some(*id));
@@ -65,7 +67,7 @@ impl PrefixIndex {
 
     pub fn prepare_key<E>(&mut self, tokens: &[u32], page_tokens: usize) -> Result<PreparedKey, E> {
         debug_assert!(tokens.len().is_multiple_of(page_tokens));
-        let mut bytes = Vec::with_capacity(tokens.len() / page_tokens * 8);
+        let mut key = PrefixKey::builder();
         let mut blocks = Vec::with_capacity(tokens.len() / page_tokens);
 
         for block in tokens.chunks_exact(page_tokens) {
@@ -99,12 +101,12 @@ impl PrefixIndex {
                 );
                 id
             };
-            bytes.extend_from_slice(&id.raw().to_be_bytes());
+            key.extend_from_slice(&id.raw().to_be_bytes());
             blocks.push(id);
         }
 
         Ok(PreparedKey {
-            key: VectorKey::new_from_vec(bytes),
+            key: key.finish(),
             blocks,
         })
     }
@@ -135,7 +137,7 @@ impl PrefixIndex {
         debug_assert!(replaced.is_none());
     }
 
-    pub fn remove(&mut self, key: &VectorKey, blocks: &[TokenBlockId]) {
+    pub fn remove(&mut self, key: &PrefixKey, blocks: &[TokenBlockId]) {
         self.tree.remove_k(key);
         for id in blocks {
             let remove = {

@@ -1,10 +1,14 @@
 //! Reusable request-scoped generation sessions.
 
+use super::prefix_cache::PrefixCacheConfig;
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use super::scheduler::{
+    Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, SchedulerConfig,
+};
 use super::stop::StopBuffer;
 use crate::nemotron3::{Nemotron3DecodeState, Nemotron3Model};
-use crate::qwen3::qwen36::{Qwen36DecodeState, Qwen36TextModel};
-use nvfp4::{Error, Result};
+use crate::qwen3::qwen36::Qwen36TextModel;
+use nvfp4::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -243,16 +247,11 @@ pub struct GeneratedToken {
 
 /// One Qwen3.6 generation request with isolated decode and sampling state.
 pub struct Qwen36GenerationSession<'a> {
-    model: &'a Qwen36TextModel,
-    state: Qwen36DecodeState,
-    sampler: Sampler,
+    scheduler: Qwen36Scheduler<'a>,
+    request_id: Qwen36RequestId,
     decode_stream: TokenizerDecodeStream<'a>,
-    config: GenerationConfig,
-    prompt_tokens: Vec<u32>,
     history: TokenHistory,
     stop_buffer: StopBuffer,
-    prefilled: bool,
-    last_token: Option<u32>,
     generated_tokens: usize,
     finish_reason: Option<GenerationFinishReason>,
 }
@@ -291,20 +290,35 @@ impl<'a> Qwen36GenerationSession<'a> {
                 actual: format!("{} + {}", prompt_tokens.len(), config.max_new_tokens),
             })?
             .max(1);
-        let state = model.new_decode_state(max_tokens)?;
-        let sampler = Sampler::new(config.sampling)?;
+        let scheduler_config = SchedulerConfig {
+            decode_capacity: 1,
+            prefill_sequence_capacity: 1,
+            prefill_token_capacity: max_tokens.min(SM12X_KV_PAGE_TOKENS),
+            max_active_sequences: 1,
+            max_context_tokens: max_tokens,
+        };
+        let mut scheduler = Qwen36Scheduler::new_with_prefix_cache(
+            model,
+            scheduler_config,
+            PrefixCacheConfig {
+                max_device_bytes: 0,
+            },
+        )?;
+        let request_id = scheduler.add_request(
+            prompt_tokens.to_vec(),
+            RequestConfig {
+                sampling: config.sampling,
+                max_new_tokens: config.max_new_tokens,
+                eos_token_ids: config.eos_token_ids.clone(),
+            },
+        )?;
         let finish_reason = (config.max_new_tokens == 0).then_some(GenerationFinishReason::Length);
         Ok(Self {
-            model,
-            state,
-            sampler,
+            scheduler,
+            request_id,
             decode_stream: tokenizer.decode_stream(true),
-            prompt_tokens: prompt_tokens.to_vec(),
             history: TokenHistory::from_tokens(prompt_tokens.iter().copied()),
             stop_buffer: StopBuffer::new(config.stop_sequences.clone()),
-            config,
-            prefilled: false,
-            last_token: None,
             generated_tokens: 0,
             finish_reason,
         })
@@ -315,17 +329,26 @@ impl<'a> Qwen36GenerationSession<'a> {
         if self.finish_reason.is_some() {
             return Ok(None);
         }
-        let input = self.next_input_token()?;
-        let sampled = self.decode_and_select(input)?;
+        let sampled = loop {
+            let tick = self.scheduler.tick()?;
+            if let Some(token) = tick
+                .generated
+                .into_iter()
+                .find(|token| token.request_id == self.request_id)
+            {
+                break token;
+            }
+        };
         self.generated_tokens += 1;
-        self.last_token = Some(sampled.id);
         self.history.push(sampled.id);
 
-        let mut finish_reason = None;
+        let mut finish_reason = sampled.finish_reason.map(|reason| match reason {
+            RequestFinishReason::Eos => GenerationFinishReason::Eos,
+            RequestFinishReason::Length => GenerationFinishReason::Length,
+        });
         let mut text = String::new();
-        if self.config.eos_token_ids.contains(&sampled.id) {
+        if finish_reason == Some(GenerationFinishReason::Eos) {
             text.push_str(&self.stop_buffer.finish());
-            finish_reason = Some(GenerationFinishReason::Eos);
         } else if let Some(chunk) =
             self.decode_stream
                 .step(sampled.id)
@@ -339,12 +362,14 @@ impl<'a> Qwen36GenerationSession<'a> {
             finish_reason = output.matched.map(GenerationFinishReason::StopSequence);
         }
 
-        if finish_reason.is_none() && self.generated_tokens == self.config.max_new_tokens {
+        if finish_reason == Some(GenerationFinishReason::Length) {
             text.push_str(&self.stop_buffer.finish());
-            finish_reason = Some(GenerationFinishReason::Length);
         }
         if let Some(reason) = &finish_reason {
             self.finish_reason = Some(reason.clone());
+            if sampled.finish_reason.is_none() {
+                self.scheduler.cancel_request(self.request_id);
+            }
         }
         Ok(Some(GeneratedToken {
             id: sampled.id,
@@ -367,37 +392,6 @@ impl<'a> Qwen36GenerationSession<'a> {
     /// Returns prompt and generated token history used by penalties.
     pub fn history(&self) -> &TokenHistory {
         &self.history
-    }
-
-    fn next_input_token(&mut self) -> Result<u32> {
-        if self.prefilled {
-            return self.last_token.ok_or_else(|| Error::Format {
-                label: "generation session",
-                detail: "prefilled session has no generated token".to_string(),
-            });
-        }
-        for index in 0..self.prompt_tokens.len() - 1 {
-            self.model
-                .decode_one_token(&mut self.state, self.prompt_tokens[index])?;
-        }
-        self.prefilled = true;
-        Ok(*self.prompt_tokens.last().expect("non-empty prompt"))
-    }
-
-    fn decode_and_select(&mut self, input: u32) -> Result<SampledToken> {
-        if self.sampler.config().uses_fast_argmax() {
-            let token = self.model.decode_one_token(&mut self.state, input)?;
-            return Ok(SampledToken {
-                id: token.id,
-                logit: token.value,
-                adjusted_logit: token.value,
-            });
-        }
-        let logits = self
-            .model
-            .decode_one_token_logits(&mut self.state, input)?
-            .logits;
-        self.sampler.sample(&logits, &self.history)
     }
 }
 

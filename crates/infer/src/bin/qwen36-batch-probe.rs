@@ -1,5 +1,6 @@
-use infer::nvfp4::{Error, Result};
-use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36SequenceState, Qwen36TextModel};
+use infer::nvfp4::{CudaStream, Error, Result};
+use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
+use infer::runtime::qwen36_sequence_cache::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 
@@ -8,6 +9,8 @@ fn main() -> Result<()> {
     let model = Qwen36TextModel::open(&model_dir)?;
     let mut workspace = model.new_decode_batch_workspace(start_tokens.len(), max_tokens)?;
     let mut reference_workspace = model.new_decode_batch_workspace(1, max_tokens)?;
+    let stream = CudaStream::new_non_blocking()?;
+    let mut cache = new_qwen36_sequence_cache(&model, start_tokens.len() * 2, max_tokens)?;
     let mut slots = start_tokens
         .into_iter()
         .enumerate()
@@ -15,8 +18,8 @@ fn main() -> Result<()> {
             Ok(SequenceSlot {
                 id,
                 token,
-                state: model.new_sequence_state(max_tokens)?,
-                reference_state: model.new_sequence_state(max_tokens)?,
+                sequence: Qwen36Sequence::admit(&model, &mut cache, max_tokens, &stream)?,
+                reference_sequence: Qwen36Sequence::admit(&model, &mut cache, max_tokens, &stream)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -31,17 +34,17 @@ fn main() -> Result<()> {
         };
         let scheduled = slots[..active_rows]
             .iter()
-            .map(|slot| (slot.id, slot.token, slot.state.position()))
+            .map(|slot| (slot.id, slot.token, slot.sequence.position()))
             .collect::<Vec<_>>();
         let (logits, next, vocab) = {
             let mut rows = slots[..active_rows]
                 .iter_mut()
                 .map(|slot| Qwen36DecodeRow {
                     token_id: slot.token,
-                    state: &mut slot.state,
+                    sequence: &mut slot.sequence,
                 })
                 .collect::<Vec<_>>();
-            let mut decoded = model.decode_batch(&mut workspace, &mut rows)?;
+            let mut decoded = model.decode_batch(&mut workspace, &mut rows, &mut cache)?;
             let logits = decoded.copy_logits()?;
             let next = decoded.top1()?;
             (logits, next, decoded.vocab())
@@ -66,10 +69,10 @@ fn main() -> Result<()> {
             let slot = &mut slots[row];
             let mut reference_rows = [Qwen36DecodeRow {
                 token_id: slot.token,
-                state: &mut slot.reference_state,
+                sequence: &mut slot.reference_sequence,
             }];
             let mut reference =
-                model.decode_batch(&mut reference_workspace, &mut reference_rows)?;
+                model.decode_batch(&mut reference_workspace, &mut reference_rows, &mut cache)?;
             let reference_logits = reference.copy_logits()?;
             let reference_token = reference
                 .top1()?
@@ -120,8 +123,8 @@ fn main() -> Result<()> {
 struct SequenceSlot {
     id: usize,
     token: u32,
-    state: Qwen36SequenceState,
-    reference_state: Qwen36SequenceState,
+    sequence: Qwen36Sequence,
+    reference_sequence: Qwen36Sequence,
 }
 
 fn parse_args() -> Result<(PathBuf, Vec<u32>, usize, usize)> {
