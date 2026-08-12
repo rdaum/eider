@@ -1,4 +1,5 @@
 use super::*;
+use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::runtime::gemma4_sequence_cache::{
     Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error,
 };
@@ -22,6 +23,17 @@ use nvfp4::{
 use std::collections::HashMap;
 
 const PREFILL_GEMM_WORKSPACE_LIMIT: u64 = 4 * 1024 * 1024;
+const COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY: usize = 16;
+
+fn use_compact_prefill_attention(
+    window: Option<usize>,
+    start_position: usize,
+    query_rows: usize,
+) -> bool {
+    window.is_some()
+        && start_position != 0
+        && start_position >= query_rows.saturating_mul(COMPACT_LOCAL_ATTENTION_MIN_PREFIX_PER_QUERY)
+}
 /// One scheduler-selected Gemma prompt chunk and its persistent sequence state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Gemma4PrefillOutput {
@@ -236,6 +248,7 @@ impl Gemma4BatchLinearWorkspace {
 
 struct Gemma4BatchAttentionWorkspace {
     compact: Sm12xKvAttentionWorkspace,
+    tensor_core: PagedTensorCorePrefillAttention,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -258,6 +271,12 @@ impl Gemma4BatchAttentionWorkspace {
                 attention.head_dim,
                 16,
             )?,
+            tensor_core: PagedTensorCorePrefillAttention::new(
+                rows,
+                attention.q_heads,
+                attention.kv_heads,
+                attention.head_dim,
+            )?,
             q: DeviceBuffer::zeroed(rows * q_width)?,
             k: DeviceBuffer::zeroed(rows * kv_width)?,
             v: DeviceBuffer::zeroed(rows * kv_width)?,
@@ -271,6 +290,7 @@ impl Gemma4BatchAttentionWorkspace {
 
     fn device_bytes(&self) -> usize {
         self.compact.device_bytes()
+            + self.tensor_core.device_bytes()
             + self.q.device_bytes()
             + self.k.device_bytes()
             + self.v.device_bytes()
@@ -990,39 +1010,62 @@ fn run_attention_prefill_body(
         cache
             .with_append_pages(append.reservation, |backend, pages| {
                 let pool = backend.pool_mut(layer_index)?;
-                let q_width = attention.q_heads * attention.head_dim;
-                let kv_width = attention.kv_heads * attention.head_dim;
                 for page in pages.iter() {
                     let segment = page.segment();
-                    for local_row in 0..segment.rows() {
-                        let token = segment.input_offset() + local_row;
-                        pool.append_at_offsets_on_stream(
+                    let mut processed = 0;
+                    while processed < segment.rows() {
+                        let token = segment.input_offset() + processed;
+                        let query_position = position + token;
+                        let chunk_rows = (segment.rows() - processed).min(16 - query_position % 16);
+                        pool.append_rows_at_offset_on_stream(
                             page.page().slot(),
-                            segment.page_offset() + local_row,
+                            segment.page_offset() + processed,
                             &workspace.k_rope,
-                            (offset + token) * kv_width,
                             &workspace.v_normed,
-                            (offset + token) * kv_width,
+                            offset + token,
+                            chunk_rows,
                             stream,
                         )?;
-                        let cache_len = position + token + 1;
-                        let window_start = attention
-                            .window
-                            .map_or(0, |window| cache_len.saturating_sub(window));
-                        workspace
-                            .compact
-                            .attention_paged_window_offsets_into_on_stream(
-                                pool,
-                                append.page_table,
-                                cache_len,
-                                &workspace.q_rope,
-                                (offset + token) * q_width,
-                                workspace.attended.output(),
-                                (offset + token) * q_width,
-                                window_start,
-                                stream,
-                            )?;
+                        processed += chunk_rows;
                     }
+                }
+                if use_compact_prefill_attention(attention.window, position, row.token_ids.len()) {
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        let mut processed = 0;
+                        while processed < segment.rows() {
+                            let token = segment.input_offset() + processed;
+                            let query_position = position + token;
+                            let chunk_rows =
+                                (segment.rows() - processed).min(16 - query_position % 16);
+                            workspace
+                                .compact
+                                .attention_paged_causal_rows_at_offset_into_on_stream(
+                                    pool,
+                                    append.page_table,
+                                    query_position,
+                                    &workspace.q_rope,
+                                    offset + token,
+                                    chunk_rows,
+                                    attention.window,
+                                    workspace.attended.output(),
+                                    stream,
+                                )?;
+                            processed += chunk_rows;
+                        }
+                    }
+                } else {
+                    workspace.tensor_core.run(
+                        pool,
+                        append.page_table,
+                        position,
+                        &workspace.q_rope,
+                        offset,
+                        row.token_ids.len(),
+                        attention.window,
+                        &mut workspace.attended,
+                        stream,
+                    )?;
                 }
                 Ok(())
             })

@@ -8,8 +8,10 @@ use crate::runtime::ling3_sequence_cache::{
 };
 use nvfp4::{
     CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    add_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    add_f32_into_on_stream, add_f32_prefix_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    copy_row_f32_into_on_stream, rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    silu_mul_f32_prefix_into_on_stream,
 };
 use std::path::Path;
 
@@ -71,11 +73,15 @@ impl DenseMlp {
     }
 
     fn new_workspace(&self) -> Result<DenseMlpWorkspace> {
+        self.new_workspace_for_rows(1)
+    }
+
+    fn new_workspace_for_rows(&self, rows: usize) -> Result<DenseMlpWorkspace> {
         Ok(DenseMlpWorkspace {
-            gate: DeviceBuffer::zeroed(self.intermediate)?,
-            up: DeviceBuffer::zeroed(self.intermediate)?,
-            activated: DeviceBuffer::zeroed(self.intermediate)?,
-            output: DeviceBuffer::zeroed(self.hidden)?,
+            gate: DeviceBuffer::zeroed(rows * self.intermediate)?,
+            up: DeviceBuffer::zeroed(rows * self.intermediate)?,
+            activated: DeviceBuffer::zeroed(rows * self.intermediate)?,
+            output: DeviceBuffer::zeroed(rows * self.hidden)?,
         })
     }
 
@@ -95,6 +101,27 @@ impl DenseMlp {
         )?;
         self.down
             .run(&workspace.activated, &mut workspace.output, stream)
+    }
+
+    fn run_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut DenseMlpWorkspace,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.gate
+            .run_batch(input, &mut workspace.gate, rows, stream)?;
+        self.up.run_batch(input, &mut workspace.up, rows, stream)?;
+        silu_mul_f32_prefix_into_on_stream(
+            &workspace.gate,
+            &workspace.up,
+            workspace.activated.output(),
+            rows * self.intermediate,
+            stream,
+        )?;
+        self.down
+            .run_batch(&workspace.activated, &mut workspace.output, rows, stream)
     }
 
     fn device_bytes(&self) -> usize {
@@ -343,6 +370,8 @@ pub struct Ling3Model {
 
 pub(crate) struct Ling3ModelState {
     layers: Vec<AttentionState>,
+    rollback_position: usize,
+    append_pending: bool,
     position: usize,
     capacity: usize,
 }
@@ -351,6 +380,25 @@ pub(crate) struct Ling3ModelWorkspace {
     current: DeviceBuffer<f32>,
     layer: Vec<DecoderLayerWorkspace>,
     layer_graphs: Vec<Option<CudaGraphExec>>,
+    final_normed: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+}
+
+/// Shared scratch for one multi-token Ling prefill operation.
+pub struct Ling3PrefillWorkspace {
+    capacity: usize,
+    host_token_ids: Vec<u32>,
+    token_ids: DeviceBuffer<u32>,
+    current: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    post_attention: DeviceBuffer<f32>,
+    ffn_input: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+    kda: Ling3KdaAttentionWorkspace,
+    mla: Ling3MlaWorkspace,
+    dense: DenseMlpWorkspace,
+    moe: Ling3MoeWorkspace,
+    last_hidden: DeviceBuffer<f32>,
     final_normed: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
 }
@@ -398,6 +446,8 @@ impl Ling3Model {
                 .iter()
                 .map(|layer| layer.new_state())
                 .collect::<Result<Vec<_>>>()?,
+            rollback_position: 0,
+            append_pending: false,
             position: 0,
             capacity,
         })
@@ -412,6 +462,65 @@ impl Ling3Model {
                 .map(DecoderLayer::new_workspace)
                 .collect::<Result<Vec<_>>>()?,
             layer_graphs: (0..self.layers.len()).map(|_| None).collect(),
+            final_normed: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
+            logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
+        })
+    }
+
+    pub fn new_prefill_workspace(&self, capacity: usize) -> Result<Ling3PrefillWorkspace> {
+        if capacity == 0 {
+            return Err(Error::Shape {
+                label: "Ling 3 prefill workspace",
+                expected: "positive token capacity".to_string(),
+                actual: capacity.to_string(),
+            });
+        }
+        let kda = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Attention::Kda(attention) => Some(attention.new_workspace_for_rows(capacity)),
+                Attention::Mla(_) => None,
+            })
+            .expect("Ling 3 has KDA layers")?;
+        let mla = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Attention::Mla(attention) => Some(attention.new_workspace_for_rows(capacity)),
+                Attention::Kda(_) => None,
+            })
+            .expect("Ling 3 has MLA layers")?;
+        let dense = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.ffn {
+                Ffn::Dense(ffn) => Some(ffn.new_workspace_for_rows(capacity)),
+                Ffn::Moe(_) => None,
+            })
+            .expect("Ling 3 has dense FFN layers")?;
+        let moe = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.ffn {
+                Ffn::Moe(ffn) => Some(ffn.new_workspace_for_rows(capacity)),
+                Ffn::Dense(_) => None,
+            })
+            .expect("Ling 3 has MoE layers")?;
+        Ok(Ling3PrefillWorkspace {
+            capacity,
+            host_token_ids: vec![0; capacity],
+            token_ids: DeviceBuffer::zeroed(capacity)?,
+            current: DeviceBuffer::zeroed(capacity * self.manifest.hidden_size)?,
+            normed: DeviceBuffer::zeroed(capacity * self.manifest.hidden_size)?,
+            post_attention: DeviceBuffer::zeroed(capacity * self.manifest.hidden_size)?,
+            ffn_input: DeviceBuffer::zeroed(capacity * self.manifest.hidden_size)?,
+            output: DeviceBuffer::zeroed(capacity * self.manifest.hidden_size)?,
+            kda,
+            mla,
+            dense,
+            moe,
+            last_hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             final_normed: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
         })
@@ -450,10 +559,28 @@ impl Ling3Model {
         cache: &mut Ling3SequenceCache,
         stream: &CudaStream,
     ) -> Result<()> {
-        self.prefill(sequence, cache, std::slice::from_ref(&token), stream)
+        self.prefill_sequential(sequence, cache, std::slice::from_ref(&token), stream)
     }
 
     pub fn prefill(
+        &self,
+        workspace: &mut Ling3PrefillWorkspace,
+        sequence: &mut Ling3Sequence,
+        cache: &mut Ling3SequenceCache,
+        tokens: &[u32],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if tokens.len() > workspace.capacity {
+            return Err(Error::Shape {
+                label: "Ling 3 prefill workspace",
+                expected: format!("at most {} tokens", workspace.capacity),
+                actual: tokens.len().to_string(),
+            });
+        }
+        self.prefill_rows(workspace, sequence, cache, tokens, stream)
+    }
+
+    fn prefill_sequential(
         &self,
         sequence: &mut Ling3Sequence,
         cache: &mut Ling3SequenceCache,
@@ -477,6 +604,18 @@ impl Ling3Model {
                 },
             )
             .map_err(ling3_cache_error)?;
+        if let Err(error) = sequence.state.begin_append(stream) {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Ling3CacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(ling3_cache_error)?;
+            return Err(error);
+        }
         for (offset, &token) in tokens.iter().enumerate() {
             if let Err(error) = self.decode_token_reserved(
                 token,
@@ -488,28 +627,271 @@ impl Ling3Model {
                 offset,
                 stream,
             ) {
+                let state_error = sequence.state.abort_append(stream).err();
                 cache
                     .abort_append(
-                        reservation,
+                        reservation.clone(),
                         &mut Ling3CacheContext {
                             stream,
                             page_table: &mut sequence.page_table,
                         },
                     )
                     .map_err(ling3_cache_error)?;
-                return Err(error);
+                return Err(state_error.unwrap_or(error));
             }
         }
-        cache
-            .commit_append(
-                reservation,
+        if let Err(error) = cache.commit_append(
+            reservation.clone(),
+            tokens.len(),
+            &mut Ling3CacheContext {
+                stream,
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            let state_error = sequence.state.abort_append(stream).err();
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Ling3CacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(ling3_cache_error)?;
+            return Err(state_error.unwrap_or_else(|| ling3_cache_error(error)));
+        }
+        sequence.state.commit_append();
+        Ok(())
+    }
+
+    fn prefill_rows(
+        &self,
+        workspace: &mut Ling3PrefillWorkspace,
+        sequence: &mut Ling3Sequence,
+        cache: &mut Ling3SequenceCache,
+        tokens: &[u32],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::Shape {
+                label: "Ling 3 prefill",
+                expected: "at least one token".to_string(),
+                actual: "0 tokens".to_string(),
+            });
+        }
+        if sequence.state.position + tokens.len() > sequence.state.capacity {
+            return Err(Error::Shape {
+                label: "Ling 3 prefill capacity",
+                expected: format!("position at most {}", sequence.state.capacity),
+                actual: format!("{} + {}", sequence.state.position, tokens.len()),
+            });
+        }
+        for (destination, &token) in workspace.host_token_ids[..tokens.len()]
+            .iter_mut()
+            .zip(tokens)
+        {
+            if token as usize >= self.manifest.vocab_size {
+                return Err(Error::Shape {
+                    label: "Ling 3 prefill token",
+                    expected: format!("token below {}", self.manifest.vocab_size),
+                    actual: token.to_string(),
+                });
+            }
+            *destination = token;
+        }
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
                 tokens.len(),
                 &mut Ling3CacheContext {
                     stream,
                     page_table: &mut sequence.page_table,
                 },
             )
-            .map_err(ling3_cache_error)
+            .map_err(ling3_cache_error)?;
+        if let Err(error) = sequence.state.begin_append(stream) {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Ling3CacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(ling3_cache_error)?;
+            return Err(error);
+        }
+        let rows = tokens.len();
+        let start_position = sequence.state.position;
+        let execution = (|| {
+            workspace
+                .token_ids
+                .copy_prefix_from_host(&workspace.host_token_ids[..rows])?;
+            copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+                self.manifest.vocab_size,
+                self.manifest.hidden_size,
+                &self.embedding,
+                &workspace.token_ids,
+                workspace.current.output(),
+                rows,
+                stream,
+            )?;
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                rms_norm_f32_into_on_stream(
+                    rows,
+                    layer.hidden,
+                    &workspace.current,
+                    &layer.input_norm,
+                    workspace.normed.output(),
+                    layer.rms_eps,
+                    stream,
+                )?;
+                match (&layer.attention, &mut sequence.state.layers[layer_index]) {
+                    (Attention::Kda(attention), AttentionState::Kda(state)) => {
+                        attention.run_rows(
+                            &workspace.normed,
+                            &mut workspace.kda,
+                            state,
+                            rows,
+                            stream,
+                        )?;
+                        add_f32_prefix_into_on_stream(
+                            &workspace.current,
+                            attention.output(&workspace.kda),
+                            workspace.post_attention.output(),
+                            rows * layer.hidden,
+                            stream,
+                        )?;
+                    }
+                    (Attention::Mla(attention), AttentionState::Mla) => {
+                        cache
+                            .with_append_pages(&reservation, |backend, pages| {
+                                attention.run_rows_paged(
+                                    &workspace.normed,
+                                    &mut workspace.mla,
+                                    backend.pool_mut(layer_index)?,
+                                    pages,
+                                    sequence.page_table.device(),
+                                    start_position,
+                                    rows,
+                                    stream,
+                                )
+                            })
+                            .map_err(ling3_cache_error)?;
+                        add_f32_prefix_into_on_stream(
+                            &workspace.current,
+                            attention.output(&workspace.mla),
+                            workspace.post_attention.output(),
+                            rows * layer.hidden,
+                            stream,
+                        )?;
+                    }
+                    _ => unreachable!("Ling attention state variant mismatch"),
+                }
+                rms_norm_f32_into_on_stream(
+                    rows,
+                    layer.hidden,
+                    &workspace.post_attention,
+                    &layer.post_attention_norm,
+                    workspace.ffn_input.output(),
+                    layer.rms_eps,
+                    stream,
+                )?;
+                let ffn_output = match &layer.ffn {
+                    Ffn::Dense(ffn) => {
+                        ffn.run_rows(&workspace.ffn_input, &mut workspace.dense, rows, stream)?;
+                        &workspace.dense.output
+                    }
+                    Ffn::Moe(ffn) => {
+                        ffn.run_rows(&workspace.ffn_input, &mut workspace.moe, rows, stream)?;
+                        ffn.output(&workspace.moe)
+                    }
+                };
+                add_f32_prefix_into_on_stream(
+                    &workspace.post_attention,
+                    ffn_output,
+                    workspace.output.output(),
+                    rows * layer.hidden,
+                    stream,
+                )?;
+                workspace.current.copy_prefix_from_device_on_stream(
+                    &workspace.output,
+                    rows * self.manifest.hidden_size,
+                    stream,
+                )?;
+            }
+            copy_row_f32_into_on_stream(
+                rows,
+                self.manifest.hidden_size,
+                rows - 1,
+                &workspace.current,
+                workspace.last_hidden.output(),
+                stream,
+            )?;
+            rms_norm_f32_into_on_stream(
+                1,
+                self.manifest.hidden_size,
+                &workspace.last_hidden,
+                &self.final_norm,
+                workspace.final_normed.output(),
+                self.manifest.rms_norm_eps,
+                stream,
+            )?;
+            bf16_linear_logits_f32_into_on_stream(
+                &workspace.final_normed,
+                &self.lm_head,
+                workspace.logits.output(),
+                self.manifest.vocab_size,
+                self.manifest.hidden_size,
+                stream,
+            )?;
+            sequence
+                .workspace
+                .logits
+                .copy_prefix_from_device_on_stream(
+                    &workspace.logits,
+                    self.manifest.vocab_size,
+                    stream,
+                )?;
+            stream.synchronize()?;
+            Ok(())
+        })();
+        if let Err(error) = execution {
+            let state_error = sequence.state.abort_append(stream).err();
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Ling3CacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(ling3_cache_error)?;
+            return Err(state_error.unwrap_or(error));
+        }
+        if let Err(error) = cache.commit_append(
+            reservation.clone(),
+            rows,
+            &mut Ling3CacheContext {
+                stream,
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            let state_error = sequence.state.abort_append(stream).err();
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Ling3CacheContext {
+                        stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(ling3_cache_error)?;
+            return Err(state_error.unwrap_or_else(|| ling3_cache_error(error)));
+        }
+        sequence.state.position += rows;
+        sequence.state.commit_append();
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -680,6 +1062,45 @@ impl Ling3ModelState {
     pub(crate) fn device_bytes(&self) -> usize {
         self.layers.iter().map(AttentionState::device_bytes).sum()
     }
+
+    pub(crate) fn begin_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.append_pending {
+            return Err(Error::Format {
+                label: "Ling 3 recurrent transaction",
+                detail: "an append transaction is already pending".to_string(),
+            });
+        }
+        for layer in &mut self.layers {
+            if let AttentionState::Kda(state) = layer {
+                state.begin_append(stream)?;
+            }
+        }
+        self.rollback_position = self.position;
+        self.append_pending = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_append(&mut self) {
+        assert!(self.append_pending, "Ling recurrent append is pending");
+        self.append_pending = false;
+    }
+
+    pub(crate) fn abort_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if !self.append_pending {
+            return Err(Error::Format {
+                label: "Ling 3 recurrent transaction",
+                detail: "no append transaction is pending".to_string(),
+            });
+        }
+        for layer in &mut self.layers {
+            if let AttentionState::Kda(state) = layer {
+                state.abort_append(stream)?;
+            }
+        }
+        self.position = self.rollback_position;
+        self.append_pending = false;
+        Ok(())
+    }
 }
 
 impl Ling3ModelWorkspace {
@@ -692,5 +1113,104 @@ impl Ling3ModelWorkspace {
                 .sum::<usize>()
             + self.final_normed.device_bytes()
             + self.logits.device_bytes()
+    }
+}
+
+impl Ling3PrefillWorkspace {
+    /// Exact bytes of shared device scratch owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.token_ids.device_bytes()
+            + self.current.device_bytes()
+            + self.normed.device_bytes()
+            + self.post_attention.device_bytes()
+            + self.ffn_input.device_bytes()
+            + self.output.device_bytes()
+            + self.kda.device_bytes()
+            + self.mla.device_bytes()
+            + self.dense.device_bytes()
+            + self.moe.device_bytes()
+            + self.last_hidden.device_bytes()
+            + self.final_normed.device_bytes()
+            + self.logits.device_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ling3Model;
+    use crate::runtime::ling3_sequence_cache::{admit_ling3_sequence, new_ling3_sequence_cache};
+    use nvfp4::{CudaStream, Result};
+
+    #[test]
+    #[ignore = "requires EIDER_LING3_MODEL_DIR with the local Ling 3 Tiny FP8 checkpoint"]
+    fn real_batched_prefill_matches_serial_state_and_logits() -> Result<()> {
+        let model_dir = std::env::var("EIDER_LING3_MODEL_DIR")
+            .expect("EIDER_LING3_MODEL_DIR points to the Ling 3 Tiny FP8 checkpoint");
+        let model = Ling3Model::load(model_dir)?;
+        let stream = CudaStream::new_non_blocking()?;
+        let tokens = [1, 2, 3, 4];
+        let mut cache = new_ling3_sequence_cache(&model, 4, tokens.len() + 1)?;
+        let mut serial = admit_ling3_sequence(&model, &mut cache, tokens.len() + 1, &stream)?
+            .expect("serial sequence admitted");
+        let mut batched = admit_ling3_sequence(&model, &mut cache, tokens.len() + 1, &stream)?
+            .expect("batched sequence admitted");
+        for &token in &tokens {
+            model.decode_token(token, &mut serial, &mut cache, &stream)?;
+        }
+        let serial_logits = model
+            .sequence_logits(&serial)
+            .copy_to_host(&stream)?
+            .into_vec();
+        let mut workspace = model.new_prefill_workspace(tokens.len())?;
+        model.prefill(&mut workspace, &mut batched, &mut cache, &tokens, &stream)?;
+        let batched_logits = model
+            .sequence_logits(&batched)
+            .copy_to_host(&stream)?
+            .into_vec();
+        assert_logits_close(&batched_logits, &serial_logits, "batched prefill logits");
+        model.decode_token(5, &mut serial, &mut cache, &stream)?;
+        model.decode_token(5, &mut batched, &mut cache, &stream)?;
+        assert_logits_close(
+            &model.sequence_logits(&serial).copy_to_host(&stream)?,
+            &model.sequence_logits(&batched).copy_to_host(&stream)?,
+            "next-token logits",
+        );
+        Ok(())
+    }
+
+    fn assert_logits_close(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        let cosine = cosine(actual, expected);
+        assert!(cosine >= 0.999, "{label} cosine {cosine}");
+        assert_eq!(
+            actual
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index),
+            expected
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, _)| index),
+            "{label} argmax",
+        );
+    }
+
+    fn cosine(actual: &[f32], expected: &[f32]) -> f64 {
+        let dot = actual
+            .iter()
+            .zip(expected)
+            .map(|(&left, &right)| left as f64 * right as f64)
+            .sum::<f64>();
+        let left_norm = actual
+            .iter()
+            .map(|&value| (value as f64).powi(2))
+            .sum::<f64>();
+        let right_norm = expected
+            .iter()
+            .map(|&value| (value as f64).powi(2))
+            .sum::<f64>();
+        dot / (left_norm * right_norm).sqrt()
     }
 }

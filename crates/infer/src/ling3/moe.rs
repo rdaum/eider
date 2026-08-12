@@ -2,9 +2,13 @@ use super::Ling3Manifest;
 use super::layer::{Ling3Linear, load_float_as_f32};
 use nvfp4::{
     CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
+    moe_weighted_accumulate_slots_f32_batch_prefix_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
+    nemotron3_sigmoid_topk_f32_into_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, repeat_row_pointer_table_f32_into_on_stream,
+    silu_mul_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
 };
 
 struct Expert {
@@ -93,6 +97,7 @@ struct ExpertTables {
 
 /// Reusable one-token buffers for a Ling MoE layer.
 pub struct Ling3MoeWorkspace {
+    capacity: usize,
     logits: DeviceBuffer<f32>,
     indices: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
@@ -100,6 +105,7 @@ pub struct Ling3MoeWorkspace {
     expert_up: DeviceBuffer<f32>,
     expert_activated: DeviceBuffer<f32>,
     expert_output: DeviceBuffer<f32>,
+    input_table: DeviceBuffer<*const f32>,
     gate_output_table: DeviceBuffer<*mut f32>,
     up_output_table: DeviceBuffer<*mut f32>,
     down_input_table: DeviceBuffer<*const f32>,
@@ -163,7 +169,11 @@ impl Ling3Moe {
     }
 
     pub fn new_workspace(&self) -> Result<Ling3MoeWorkspace> {
-        let routes = self.experts_per_token;
+        self.new_workspace_for_rows(1)
+    }
+
+    pub(crate) fn new_workspace_for_rows(&self, rows: usize) -> Result<Ling3MoeWorkspace> {
+        let routes = rows * self.experts_per_token;
         let expert_gate = DeviceBuffer::zeroed(routes * self.intermediate)?;
         let expert_up = DeviceBuffer::zeroed(routes * self.intermediate)?;
         let expert_activated = DeviceBuffer::zeroed(routes * self.intermediate)?;
@@ -174,25 +184,147 @@ impl Ling3Moe {
         let down_output_table = mutable_pointer_table(&expert_output, routes, self.hidden)?;
         let down_result_table = const_pointer_table(&expert_output, routes, self.hidden)?;
         Ok(Ling3MoeWorkspace {
-            logits: DeviceBuffer::zeroed(self.experts.len())?,
+            capacity: rows,
+            logits: DeviceBuffer::zeroed(rows * self.experts.len())?,
             indices: DeviceBuffer::zeroed(routes)?,
             weights: DeviceBuffer::zeroed(routes)?,
             expert_gate,
             expert_up,
             expert_activated,
             expert_output,
+            input_table: DeviceBuffer::zeroed(routes)?,
             gate_output_table,
             up_output_table,
             down_input_table,
             down_output_table,
             down_result_table,
-            routed_output: DeviceBuffer::zeroed(self.hidden)?,
-            shared_gate: DeviceBuffer::zeroed(self.shared_intermediate)?,
-            shared_up: DeviceBuffer::zeroed(self.shared_intermediate)?,
-            shared_activated: DeviceBuffer::zeroed(self.shared_intermediate)?,
-            shared_output: DeviceBuffer::zeroed(self.hidden)?,
-            output: DeviceBuffer::zeroed(self.hidden)?,
+            routed_output: DeviceBuffer::zeroed(rows * self.hidden)?,
+            shared_gate: DeviceBuffer::zeroed(rows * self.shared_intermediate)?,
+            shared_up: DeviceBuffer::zeroed(rows * self.shared_intermediate)?,
+            shared_activated: DeviceBuffer::zeroed(rows * self.shared_intermediate)?,
+            shared_output: DeviceBuffer::zeroed(rows * self.hidden)?,
+            output: DeviceBuffer::zeroed(rows * self.hidden)?,
         })
+    }
+
+    pub(crate) fn run_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Ling3MoeWorkspace,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0 || rows > workspace.capacity || input.len() < rows * self.hidden {
+            return Err(nvfp4::Error::Shape {
+                label: "Ling 3 MoE batch",
+                expected: format!("1..={} rows with matching input", workspace.capacity),
+                actual: format!("rows={rows} input={}", input.len()),
+            });
+        }
+        let routes = rows * self.experts_per_token;
+        self.router
+            .run_batch(input, &mut workspace.logits, rows, stream)?;
+        nemotron3_sigmoid_topk_f32_batch_into_on_stream(
+            &workspace.logits,
+            &self.router_bias,
+            workspace.indices.output(),
+            workspace.weights.output(),
+            rows,
+            self.experts_per_token,
+            self.groups,
+            self.selected_groups,
+            true,
+            self.scaling_factor,
+            stream,
+        )?;
+        repeat_row_pointer_table_f32_into_on_stream(
+            input,
+            workspace.input_table.output(),
+            routes,
+            self.experts_per_token,
+            self.hidden,
+            stream,
+        )?;
+        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+            &workspace.indices,
+            &workspace.input_table,
+            &self.expert_tables.gate_packed,
+            &self.expert_tables.gate_scales,
+            &self.expert_tables.gate_scale_2,
+            &workspace.gate_output_table,
+            routes,
+            self.intermediate,
+            self.hidden,
+            stream,
+        )?;
+        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+            &workspace.indices,
+            &workspace.input_table,
+            &self.expert_tables.up_packed,
+            &self.expert_tables.up_scales,
+            &self.expert_tables.up_scale_2,
+            &workspace.up_output_table,
+            routes,
+            self.intermediate,
+            self.hidden,
+            stream,
+        )?;
+        silu_mul_f32_prefix_into_on_stream(
+            &workspace.expert_gate,
+            &workspace.expert_up,
+            workspace.expert_activated.output(),
+            routes * self.intermediate,
+            stream,
+        )?;
+        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+            &workspace.indices,
+            &workspace.down_input_table,
+            &self.expert_tables.down_packed,
+            &self.expert_tables.down_scales,
+            &self.expert_tables.down_scale_2,
+            &workspace.down_output_table,
+            routes,
+            self.hidden,
+            self.intermediate,
+            stream,
+        )?;
+        moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
+            &workspace.indices,
+            &workspace.weights,
+            &workspace.down_result_table,
+            &self.expert_tables.expert_alpha,
+            workspace.routed_output.inout(),
+            rows,
+            self.experts_per_token,
+            self.hidden,
+            stream,
+        )?;
+        self.shared
+            .gate
+            .run_batch(input, &mut workspace.shared_gate, rows, stream)?;
+        self.shared
+            .up
+            .run_batch(input, &mut workspace.shared_up, rows, stream)?;
+        silu_mul_f32_prefix_into_on_stream(
+            &workspace.shared_gate,
+            &workspace.shared_up,
+            workspace.shared_activated.output(),
+            rows * self.shared_intermediate,
+            stream,
+        )?;
+        self.shared.down.run_batch(
+            &workspace.shared_activated,
+            &mut workspace.shared_output,
+            rows,
+            stream,
+        )?;
+        nvfp4::add_f32_prefix_into_on_stream(
+            &workspace.routed_output,
+            &workspace.shared_output,
+            workspace.output.output(),
+            rows * self.hidden,
+            stream,
+        )
     }
 
     pub fn run_one_token(
@@ -386,6 +518,7 @@ impl Ling3MoeWorkspace {
             + self.expert_up.device_bytes()
             + self.expert_activated.device_bytes()
             + self.expert_output.device_bytes()
+            + self.input_table.device_bytes()
             + self.gate_output_table.device_bytes()
             + self.up_output_table.device_bytes()
             + self.down_input_table.device_bytes()

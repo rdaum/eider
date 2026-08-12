@@ -1,10 +1,12 @@
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, add_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    block_fp8_linear_f32_into_on_stream, ling3_kda_128_f32_into_on_stream,
-    ling3_kda_gate_f32_into_on_stream, ling3_kda_prep_into_on_stream,
-    ling3_sigmoid_gated_rms_norm_f32_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    ModelOptNvfp4Linear, Result, add_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    block_fp8_linear_f32_batch_into_on_stream, block_fp8_linear_f32_into_on_stream,
+    ling3_kda_128_f32_into_on_stream, ling3_kda_gate_f32_into_on_stream,
+    ling3_kda_prep_into_on_stream, ling3_sigmoid_gated_rms_norm_f32_into_on_stream,
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
     rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
 
@@ -67,6 +69,24 @@ impl Bf16Linear {
         )
     }
 
+    fn run_batch(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        bf16_linear_logits_f32_batch_into_on_stream(
+            input,
+            &self.weight,
+            output.output(),
+            rows,
+            self.rows,
+            self.cols,
+            stream,
+        )
+    }
+
     fn device_bytes(&self) -> usize {
         self.weight.device_bytes()
     }
@@ -100,6 +120,25 @@ impl BlockFp8Linear {
             &self.weight,
             &self.weight_scale,
             output.output(),
+            self.rows,
+            self.cols,
+            stream,
+        )
+    }
+
+    fn run_batch(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        block_fp8_linear_f32_batch_into_on_stream(
+            input,
+            &self.weight,
+            &self.weight_scale,
+            output.output(),
+            rows,
             self.rows,
             self.cols,
             stream,
@@ -141,6 +180,26 @@ impl Nvfp4Linear {
             &self.packed_weight,
             &self.weight_scale,
             output.output(),
+            self.rows,
+            self.cols,
+            self.weight_scale_2,
+            stream,
+        )
+    }
+
+    fn run_batch(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+            input,
+            &self.packed_weight,
+            &self.weight_scale,
+            output.output(),
+            rows,
             self.rows,
             self.cols,
             self.weight_scale_2,
@@ -303,6 +362,20 @@ impl Ling3Linear {
             Self::Bf16(linear) => linear.run(input, output, stream),
             Self::BlockFp8(linear) => linear.run(input, output, stream),
             Self::Nvfp4(linear) => linear.run(input, output, stream),
+        }
+    }
+
+    pub(super) fn run_batch(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Bf16(linear) => linear.run_batch(input, output, rows, stream),
+            Self::BlockFp8(linear) => linear.run_batch(input, output, rows, stream),
+            Self::Nvfp4(linear) => linear.run_batch(input, output, rows, stream),
         }
     }
 

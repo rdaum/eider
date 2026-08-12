@@ -40,6 +40,9 @@ enum Deepseek4LayerCompressionState {
 /// Complete persistent sequence state shared by prefill and decode.
 pub struct Deepseek4SequenceState {
     layers: Vec<Deepseek4LayerSequenceState>,
+    rollback_layers: Vec<Deepseek4LayerSequenceState>,
+    rollback_position: usize,
+    append_pending: bool,
     position: usize,
     max_tokens: usize,
     device_bytes: usize,
@@ -496,6 +499,14 @@ impl Deepseek4LayerSequenceState {
 
 impl Deepseek4SequenceState {
     pub fn new(config: &Deepseek4ModelConfig, max_tokens: usize) -> Result<Self> {
+        Self::new_impl(config, max_tokens, true)
+    }
+
+    fn new_impl(
+        config: &Deepseek4ModelConfig,
+        max_tokens: usize,
+        transactional: bool,
+    ) -> Result<Self> {
         if max_tokens == 0 || max_tokens > config.max_position_embeddings {
             return Err(Error::Shape {
                 label: "DeepSeek V4 sequence capacity",
@@ -504,14 +515,23 @@ impl Deepseek4SequenceState {
             });
         }
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let mut rollback_layers = Vec::with_capacity(config.num_hidden_layers);
         let mut device_bytes = 0usize;
         for layer in 0..config.num_hidden_layers {
             let state = Deepseek4LayerSequenceState::new(config, layer, max_tokens)?;
             device_bytes = device_bytes.saturating_add(state.device_bytes());
             layers.push(state);
+            if transactional {
+                let rollback = Deepseek4LayerSequenceState::new(config, layer, max_tokens)?;
+                device_bytes = device_bytes.saturating_add(rollback.device_bytes());
+                rollback_layers.push(rollback);
+            }
         }
         Ok(Self {
             layers,
+            rollback_layers,
+            rollback_position: 0,
+            append_pending: false,
             position: 0,
             max_tokens,
             device_bytes,
@@ -559,6 +579,46 @@ impl Deepseek4SequenceState {
         Ok(())
     }
 
+    pub(crate) fn begin_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.append_pending || self.rollback_layers.len() != self.layers.len() {
+            return Err(Error::Format {
+                label: "DeepSeek V4 state transaction",
+                detail: if self.append_pending {
+                    "an append transaction is already pending".to_string()
+                } else {
+                    "state was created without transaction storage".to_string()
+                },
+            });
+        }
+        for (rollback, active) in self.rollback_layers.iter_mut().zip(&self.layers) {
+            rollback.copy_from_on_stream(active, stream)?;
+        }
+        self.rollback_position = self.position;
+        self.append_pending = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_append(&mut self, rows: usize) {
+        assert!(self.append_pending, "DeepSeek state append is pending");
+        self.position = self.rollback_position + rows;
+        self.append_pending = false;
+    }
+
+    pub(crate) fn abort_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if !self.append_pending {
+            return Err(Error::Format {
+                label: "DeepSeek V4 state transaction",
+                detail: "no append transaction is pending".to_string(),
+            });
+        }
+        for (active, rollback) in self.layers.iter_mut().zip(&self.rollback_layers) {
+            active.copy_from_on_stream(rollback, stream)?;
+        }
+        self.position = self.rollback_position;
+        self.append_pending = false;
+        Ok(())
+    }
+
     pub fn device_bytes(&self) -> usize {
         self.device_bytes
     }
@@ -571,13 +631,16 @@ impl Deepseek4SequenceState {
                 actual: max_tokens.to_string(),
             });
         }
-        (0..config.num_hidden_layers).try_fold(0usize, |total, layer| {
+        let active = (0..config.num_hidden_layers).try_fold(0usize, |total, layer| {
             total
                 .checked_add(Deepseek4LayerSequenceState::device_bytes_for(
                     config, layer, max_tokens,
                 )?)
                 .ok_or_else(|| state_overflow("sequence state bytes", total, layer))
-        })
+        })?;
+        active
+            .checked_mul(2)
+            .ok_or_else(|| state_overflow("transactional sequence state bytes", active, 2))
     }
 
     pub(crate) fn checkpoint_on_stream(
@@ -592,7 +655,7 @@ impl Deepseek4SequenceState {
                 actual: "position=0".to_string(),
             });
         }
-        let mut sequence = Self::new(config, self.position)?;
+        let mut sequence = Self::new_impl(config, self.position, false)?;
         sequence.copy_from_on_stream(self, stream)?;
         Ok(Deepseek4SequenceCheckpoint { sequence })
     }
@@ -661,7 +724,10 @@ fn state_overflow(label: &'static str, left: usize, right: usize) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Deepseek4CompressionState;
+    use super::{
+        Deepseek4CompressionState, Deepseek4LayerCompressionState, Deepseek4LayerSequenceState,
+        Deepseek4SequenceState,
+    };
     use crate::nvfp4::CudaStream;
 
     #[test]
@@ -752,6 +818,77 @@ mod tests {
                 .expect("overlap read")
                 .as_slice(),
             &[13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn sequence_append_transaction_restores_compression_state_and_position() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let active = Deepseek4LayerSequenceState {
+            compression: Deepseek4LayerCompressionState::HeavilyCompressed {
+                compressor: Deepseek4CompressionState::new(4, 2, false, 16)
+                    .expect("active compressor"),
+            },
+        };
+        let rollback = Deepseek4LayerSequenceState {
+            compression: Deepseek4LayerCompressionState::HeavilyCompressed {
+                compressor: Deepseek4CompressionState::new(4, 2, false, 16)
+                    .expect("rollback compressor"),
+            },
+        };
+        let device_bytes = active.device_bytes() + rollback.device_bytes();
+        let mut state = Deepseek4SequenceState {
+            layers: vec![active],
+            rollback_layers: vec![rollback],
+            rollback_position: 0,
+            append_pending: false,
+            position: 3,
+            max_tokens: 16,
+            device_bytes,
+        };
+        let Deepseek4LayerCompressionState::HeavilyCompressed { compressor } =
+            &mut state.layers[0].compression
+        else {
+            unreachable!()
+        };
+        compressor
+            .pending_kv
+            .copy_from_host(&[1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .expect("initial pending values");
+        compressor
+            .set_pending_len(1)
+            .expect("initial pending length");
+        state.begin_append(&stream).expect("begin append");
+        let Deepseek4LayerCompressionState::HeavilyCompressed { compressor } =
+            &mut state.layers[0].compression
+        else {
+            unreachable!()
+        };
+        let mutated =
+            crate::nvfp4::DeviceBuffer::from_host(&[9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .expect("mutated values");
+        compressor
+            .pending_kv
+            .copy_prefix_from_device_on_stream(&mutated, mutated.len(), &stream)
+            .expect("mutated pending values");
+        compressor
+            .set_pending_len(2)
+            .expect("mutated pending length");
+        state.position = 5;
+        state.abort_append(&stream).expect("abort append");
+        let Deepseek4LayerCompressionState::HeavilyCompressed { compressor } =
+            &state.layers[0].compression
+        else {
+            unreachable!()
+        };
+        assert_eq!(state.position(), 3);
+        assert_eq!(compressor.pending_len(), 1);
+        assert_eq!(
+            &compressor
+                .pending_kv
+                .copy_to_host(&stream)
+                .expect("pending read")[..2],
+            &[1.0, 2.0]
         );
     }
 }

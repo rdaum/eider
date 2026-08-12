@@ -7,6 +7,8 @@
 
 pub use nvfp4;
 
+mod paged_prefill_attention;
+
 /// Runtime state and device-resident KV cache storage.
 pub mod runtime;
 pub use runtime::kv_cache;

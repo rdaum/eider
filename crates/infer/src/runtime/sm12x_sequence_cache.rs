@@ -2,9 +2,13 @@
 
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
-    Sm12xKvPagePool,
+    Sm12xKvPagePool, Sm12xKvTailSnapshot,
 };
-use sequence_cache::{PageAllocation, PageBackend, RetireError, RetireOutcome};
+use sequence_cache::{
+    BackendAppendCommit, BackendAppendPage, PageAllocation, PageBackend, RetireError, RetireOutcome,
+};
+
+const COMPACT_TAIL_ROWS: usize = 16;
 
 /// Stable physical slot shared across every full-attention layer pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,10 +155,23 @@ pub struct Sm12xCacheContext<'a> {
 /// Preallocated CUDA slabs for every paged attention layer.
 pub struct Sm12xPageBackend {
     pools: Vec<Option<Sm12xKvPagePool>>,
+    tail_snapshot_reuse: Vec<Vec<Sm12xKvTailSnapshot>>,
     free_slots: Vec<u32>,
     used_slots: Vec<bool>,
     ever_used_slots: Vec<bool>,
     page_bytes: usize,
+}
+
+/// Backend-owned journal for an append touching an existing compact tail.
+pub struct Sm12xAppendTransaction {
+    existing_tail: Option<Sm12xExistingTail>,
+    reserved_rows: usize,
+}
+
+struct Sm12xExistingTail {
+    slot: usize,
+    rows: usize,
+    snapshots: Vec<Option<Sm12xKvTailSnapshot>>,
 }
 
 impl Sm12xPageBackend {
@@ -205,6 +222,7 @@ impl Sm12xPageBackend {
         }
         let free_slots = (0..page_slots as u32).rev().collect();
         Ok(Self {
+            tail_snapshot_reuse: (0..pools.len()).map(|_| Vec::new()).collect(),
             pools,
             free_slots,
             used_slots: vec![false; page_slots],
@@ -257,11 +275,23 @@ impl Sm12xPageBackend {
         }
         Ok(())
     }
+
+    fn recycle_transaction(&mut self, transaction: &mut Sm12xAppendTransaction) {
+        let Some(tail) = transaction.existing_tail.take() else {
+            return;
+        };
+        for (reusable, snapshot) in self.tail_snapshot_reuse.iter_mut().zip(tail.snapshots) {
+            if let Some(snapshot) = snapshot {
+                reusable.push(snapshot);
+            }
+        }
+    }
 }
 
 impl PageBackend for Sm12xPageBackend {
     type Page = Sm12xPage;
     type Context<'a> = Sm12xCacheContext<'a>;
+    type AppendTransaction = Sm12xAppendTransaction;
     type Error = Error;
 
     fn page_bytes(&self) -> usize {
@@ -296,20 +326,89 @@ impl PageBackend for Sm12xPageBackend {
         self.free_slots.push(page.slot);
     }
 
+    fn prepare_append(
+        &mut self,
+        pages: &[BackendAppendPage<'_, Self::Page>],
+        _start_position: usize,
+        context: &mut Self::Context<'_>,
+    ) -> Result<Self::AppendTransaction> {
+        let reserved_rows = pages.iter().try_fold(0usize, |rows, page| {
+            rows.checked_add(page.rows()).ok_or_else(|| Error::Shape {
+                label: "SM12x append transaction",
+                expected: "row count without overflow".to_string(),
+                actual: format!("rows={rows} next={}", page.rows()),
+            })
+        })?;
+        let Some(page) = pages.iter().find(|page| page.existed_before_reservation()) else {
+            return Ok(Sm12xAppendTransaction {
+                existing_tail: None,
+                reserved_rows,
+            });
+        };
+        self.validate_page(*page.page())?;
+        let rows = page.page_offset() % COMPACT_TAIL_ROWS;
+        if rows == 0 {
+            return Ok(Sm12xAppendTransaction {
+                existing_tail: None,
+                reserved_rows,
+            });
+        }
+        let mut snapshots = Vec::with_capacity(self.pools.len());
+        for (layer, pool) in self.pools.iter().enumerate() {
+            let snapshot = if let Some(pool) = pool {
+                let mut snapshot = self.tail_snapshot_reuse[layer]
+                    .pop()
+                    .map_or_else(|| pool.tail_snapshot(), Ok)?;
+                pool.snapshot_tail_on_stream(page.page().slot(), &mut snapshot, context.stream)?;
+                Some(snapshot)
+            } else {
+                None
+            };
+            snapshots.push(snapshot);
+        }
+        Ok(Sm12xAppendTransaction {
+            existing_tail: Some(Sm12xExistingTail {
+                slot: page.page().slot(),
+                rows,
+                snapshots,
+            }),
+            reserved_rows,
+        })
+    }
+
     fn abort_append(
         &mut self,
-        pages: &[&Self::Page],
+        transaction: &mut Self::AppendTransaction,
+        restored_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
+        restored_position: usize,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in pages {
+        for page in restored_pages.iter().chain(released_pages) {
             self.validate_page(**page)?;
         }
+        if let Some(tail) = &transaction.existing_tail {
+            for (pool, snapshot) in self.pools.iter_mut().zip(&tail.snapshots) {
+                if let (Some(pool), Some(snapshot)) = (pool, snapshot) {
+                    pool.restore_tail_prefix_on_stream(
+                        tail.slot,
+                        snapshot,
+                        tail.rows,
+                        context.stream,
+                    )?;
+                }
+            }
+        }
         context.stream.synchronize()?;
-        for page in pages {
+        context
+            .page_table
+            .update(restored_pages, restored_position, context.stream)?;
+        for page in released_pages {
             let slot = page.slot();
             self.used_slots[slot] = false;
             self.free_slots.push(slot as u32);
         }
+        self.recycle_transaction(transaction);
         Ok(())
     }
 
@@ -341,30 +440,47 @@ impl PageBackend for Sm12xPageBackend {
 
     fn commit_append(
         &mut self,
-        committed_pages: &[&Self::Page],
-        sealed_pages: &[&Self::Page],
-        released_pages: &[&Self::Page],
-        new_position: usize,
+        transaction: &mut Self::AppendTransaction,
+        commit: BackendAppendCommit<'_, Self::Page>,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in committed_pages
+        for page in commit
+            .committed_pages()
             .iter()
-            .chain(sealed_pages)
-            .chain(released_pages)
+            .chain(commit.sealed_pages())
+            .chain(commit.released_pages())
         {
             self.validate_page(**page)?;
         }
+        if commit.rows() < transaction.reserved_rows
+            && let Some(tail) = &transaction.existing_tail
+            && tail.rows + commit.rows() <= COMPACT_TAIL_ROWS
+        {
+            for (pool, snapshot) in self.pools.iter_mut().zip(&tail.snapshots) {
+                if let (Some(pool), Some(snapshot)) = (pool, snapshot) {
+                    pool.restore_tail_prefix_on_stream(
+                        tail.slot,
+                        snapshot,
+                        tail.rows,
+                        context.stream,
+                    )?;
+                }
+            }
+        }
+        if !commit.released_pages().is_empty() {
+            context.stream.synchronize()?;
+        }
         context
             .page_table
-            .update(committed_pages, new_position, context.stream)?;
-        if !released_pages.is_empty() {
-            context.stream.synchronize()?;
-            for page in released_pages {
+            .update(commit.committed_pages(), commit.position(), context.stream)?;
+        if !commit.released_pages().is_empty() {
+            for page in commit.released_pages() {
                 let slot = page.slot();
                 self.used_slots[slot] = false;
                 self.free_slots.push(slot as u32);
             }
         }
+        self.recycle_transaction(transaction);
         Ok(())
     }
 
@@ -410,7 +526,12 @@ impl PageBackend for Sm12xPageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nvfp4::Sm12xKvAttentionWorkspace;
     use sequence_cache::{AdmissionOutcome, AdmissionRequest, CacheConfig, SequenceCache};
+
+    const TEST_KV_HEADS: usize = 1;
+    const TEST_Q_HEADS: usize = 8;
+    const TEST_HEAD_DIM: usize = 64;
 
     fn request(max_position: usize, page_table_bytes: usize) -> AdmissionRequest {
         AdmissionRequest {
@@ -426,6 +547,268 @@ mod tests {
             AdmissionOutcome::Admitted(sequence) => sequence,
             AdmissionOutcome::WouldBlock => panic!("unexpected admission pressure"),
         }
+    }
+
+    fn compact_cache() -> SequenceCache<Sm12xPageBackend, ()> {
+        let backend = Sm12xPageBackend::new([true], 8, TEST_KV_HEADS, TEST_HEAD_DIM)
+            .expect("compact page pool");
+        let page_bytes = backend.page_bytes();
+        SequenceCache::new(
+            CacheConfig {
+                page_tokens: SM12X_KV_PAGE_TOKENS,
+                max_managed_bytes: page_bytes * 8 + 4096,
+                max_snapshot_bytes: 0,
+                max_prefix_entries: None,
+                emergency_bytes: 0,
+            },
+            backend,
+        )
+        .expect("sequence cache")
+    }
+
+    fn test_rows(rows: usize, seed: usize) -> Vec<f32> {
+        (0..rows * TEST_KV_HEADS * TEST_HEAD_DIM)
+            .map(|index| ((index * 19 + seed) % 251) as f32 / 96.0 - 1.25)
+            .collect()
+    }
+
+    fn write_compact_rows(
+        cache: &mut SequenceCache<Sm12xPageBackend, ()>,
+        reservation: &sequence_cache::AppendReservation,
+        key: &[f32],
+        value: &[f32],
+        stream: &CudaStream,
+    ) {
+        let key = DeviceBuffer::from_host(key).expect("device key rows");
+        let value = DeviceBuffer::from_host(value).expect("device value rows");
+        cache
+            .with_append_pages(reservation, |backend, pages| {
+                let pool = backend.pool_mut(0)?;
+                for page in pages.iter() {
+                    let segment = page.segment();
+                    pool.append_rows_at_offset_on_stream(
+                        page.page().slot(),
+                        segment.page_offset(),
+                        &key,
+                        &value,
+                        segment.input_offset(),
+                        segment.rows(),
+                        stream,
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("write compact rows");
+    }
+
+    fn append_compact_rows(
+        cache: &mut SequenceCache<Sm12xPageBackend, ()>,
+        sequence: sequence_cache::SequenceId,
+        table: &mut Sm12xPageTable,
+        key: &[f32],
+        value: &[f32],
+        stream: &CudaStream,
+    ) {
+        let rows = key.len() / (TEST_KV_HEADS * TEST_HEAD_DIM);
+        let mut context = Sm12xCacheContext {
+            stream,
+            page_table: table,
+        };
+        let reservation = cache
+            .reserve_append(sequence, rows, &mut context)
+            .expect("reserve compact rows");
+        write_compact_rows(cache, &reservation, key, value, stream);
+        cache
+            .commit_append(reservation, rows, &mut context)
+            .expect("commit compact rows");
+    }
+
+    fn compact_attention(
+        cache: &SequenceCache<Sm12xPageBackend, ()>,
+        table: &Sm12xPageTable,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Vec<f32> {
+        let q_width = TEST_Q_HEADS * TEST_HEAD_DIM;
+        let query = DeviceBuffer::from_host(
+            &(0..q_width)
+                .map(|index| ((index * 31 + 5) % 263) as f32 / 128.0 - 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("query");
+        let mut output = DeviceBuffer::zeroed(q_width).expect("attention output");
+        let mut workspace = Sm12xKvAttentionWorkspace::new_gqa(
+            table.page_capacity() * SM12X_KV_PAGE_TOKENS,
+            TEST_Q_HEADS,
+            TEST_KV_HEADS,
+            TEST_HEAD_DIM,
+        )
+        .expect("attention workspace");
+        workspace
+            .attention_paged_offsets_into_on_stream(
+                cache.backend().pool(0).expect("compact pool"),
+                table.device(),
+                position,
+                &query,
+                0,
+                output.output(),
+                0,
+                stream,
+            )
+            .expect("paged attention");
+        output
+            .copy_to_host(stream)
+            .expect("attention readback")
+            .into_vec()
+    }
+
+    fn exercise_compact_transaction(start: usize, accepted: usize, retry_rows: usize) {
+        const MAX_POSITION: usize = 256;
+        const SPECULATIVE_ROWS: usize = 16;
+        let stream = CudaStream::new_non_blocking().expect("CUDA stream");
+        let mut cache = compact_cache();
+        let mut table = Sm12xPageTable::new(MAX_POSITION).expect("page table");
+        let sequence = admitted(
+            cache
+                .admit(
+                    None,
+                    request(MAX_POSITION, table.managed_bytes()),
+                    &mut Sm12xCacheContext {
+                        stream: &stream,
+                        page_table: &mut table,
+                    },
+                    |_, position| {
+                        assert_eq!(position, 0);
+                        Ok(())
+                    },
+                )
+                .expect("admission"),
+        );
+        let prefix_key = test_rows(start, 3);
+        let prefix_value = test_rows(start, 7);
+        append_compact_rows(
+            &mut cache,
+            sequence,
+            &mut table,
+            &prefix_key,
+            &prefix_value,
+            &stream,
+        );
+
+        let speculative_key = test_rows(SPECULATIVE_ROWS, 11);
+        let speculative_value = test_rows(SPECULATIVE_ROWS, 13);
+        let reservation = cache
+            .reserve_append(
+                sequence,
+                SPECULATIVE_ROWS,
+                &mut Sm12xCacheContext {
+                    stream: &stream,
+                    page_table: &mut table,
+                },
+            )
+            .expect("speculative reservation");
+        write_compact_rows(
+            &mut cache,
+            &reservation,
+            &speculative_key,
+            &speculative_value,
+            &stream,
+        );
+        if accepted == 0 {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &stream,
+                        page_table: &mut table,
+                    },
+                )
+                .expect("zero-acceptance abort");
+        } else {
+            cache
+                .commit_append(
+                    reservation,
+                    accepted,
+                    &mut Sm12xCacheContext {
+                        stream: &stream,
+                        page_table: &mut table,
+                    },
+                )
+                .expect("partial speculative commit");
+        }
+
+        let retry_key = test_rows(retry_rows, 17);
+        let retry_value = test_rows(retry_rows, 23);
+        append_compact_rows(
+            &mut cache,
+            sequence,
+            &mut table,
+            &retry_key,
+            &retry_value,
+            &stream,
+        );
+
+        let mut reference = compact_cache();
+        let mut reference_table = Sm12xPageTable::new(MAX_POSITION).expect("reference table");
+        let reference_sequence = admitted(
+            reference
+                .admit(
+                    None,
+                    request(MAX_POSITION, reference_table.managed_bytes()),
+                    &mut Sm12xCacheContext {
+                        stream: &stream,
+                        page_table: &mut reference_table,
+                    },
+                    |_, _| Ok(()),
+                )
+                .expect("reference admission"),
+        );
+        append_compact_rows(
+            &mut reference,
+            reference_sequence,
+            &mut reference_table,
+            &prefix_key,
+            &prefix_value,
+            &stream,
+        );
+        if accepted != 0 {
+            let width = TEST_KV_HEADS * TEST_HEAD_DIM;
+            append_compact_rows(
+                &mut reference,
+                reference_sequence,
+                &mut reference_table,
+                &speculative_key[..accepted * width],
+                &speculative_value[..accepted * width],
+                &stream,
+            );
+        }
+        append_compact_rows(
+            &mut reference,
+            reference_sequence,
+            &mut reference_table,
+            &retry_key,
+            &retry_value,
+            &stream,
+        );
+
+        let position = start + accepted + retry_rows;
+        assert_eq!(
+            cache.page_table(sequence).expect("table").position(),
+            position
+        );
+        assert_eq!(table.position(), position);
+        assert_eq!(
+            compact_attention(&cache, &table, position, &stream),
+            compact_attention(&reference, &reference_table, position, &stream)
+        );
+        cache.validate().expect("valid compact transaction");
+    }
+
+    #[test]
+    fn compact_transactions_restore_modulo_tail_positions_and_page_crossings() {
+        exercise_compact_transaction(13, 0, 3);
+        exercise_compact_transaction(14, 1, 2);
+        exercise_compact_transaction(127, 2, 3);
     }
 
     #[test]

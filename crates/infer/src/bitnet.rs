@@ -1012,31 +1012,35 @@ impl BitNetPrefillWorkspace {
             stream,
         )?;
         let q_width = config.q_width();
-        let kv_width = config.kv_width();
         for page in pages.iter() {
             let segment = page.segment();
-            for local_row in 0..segment.rows() {
-                let token = segment.input_offset() + local_row;
-                pool.append_at_offsets_on_stream(
+            let mut processed = 0;
+            while processed < segment.rows() {
+                let token = segment.input_offset() + processed;
+                let position = start_position + token;
+                let chunk_rows = (segment.rows() - processed).min(16 - position % 16);
+                pool.append_rows_at_offset_on_stream(
                     page.page().slot(),
-                    segment.page_offset() + local_row,
+                    segment.page_offset() + processed,
                     &self.k_rope,
-                    token * kv_width,
                     &self.v,
-                    token * kv_width,
+                    token,
+                    chunk_rows,
                     stream,
                 )?;
                 self.compact_attention
-                    .attention_paged_offsets_into_on_stream(
+                    .attention_paged_causal_rows_at_offset_into_on_stream(
                         pool,
                         page_table,
-                        start_position + token + 1,
+                        position,
                         &self.q_rope,
-                        token * q_width,
+                        token,
+                        chunk_rows,
+                        None,
                         self.attention.output(),
-                        token * q_width,
                         stream,
                     )?;
+                processed += chunk_rows;
             }
         }
         rms_norm_f32_into_on_stream(

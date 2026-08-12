@@ -24,6 +24,114 @@ pub struct PageAllocation<P> {
     pub recycled: bool,
 }
 
+/// One physical page segment covered by a pending append transaction.
+///
+/// The manager supplies these in logical input order before publishing the
+/// reservation's complete page table. Backends may use the geometry to prepare
+/// rollback state for storage which already contains committed rows.
+pub struct BackendAppendPage<'a, P> {
+    page: &'a P,
+    page_offset: usize,
+    input_offset: usize,
+    rows: usize,
+    existing: bool,
+}
+
+/// Backend-visible result of committing a reserved append prefix.
+pub struct BackendAppendCommit<'a, P> {
+    committed_pages: &'a [&'a P],
+    sealed_pages: &'a [&'a P],
+    released_pages: &'a [&'a P],
+    rows: usize,
+    position: usize,
+}
+
+impl<'a, P> BackendAppendCommit<'a, P> {
+    pub(crate) fn new(
+        committed_pages: &'a [&'a P],
+        sealed_pages: &'a [&'a P],
+        released_pages: &'a [&'a P],
+        rows: usize,
+        position: usize,
+    ) -> Self {
+        Self {
+            committed_pages,
+            sealed_pages,
+            released_pages,
+            rows,
+            position,
+        }
+    }
+
+    /// Complete logical page table after commit.
+    pub fn committed_pages(&self) -> &[&P] {
+        self.committed_pages
+    }
+
+    /// Ordered committed pages which became full.
+    pub fn sealed_pages(&self) -> &[&P] {
+        self.sealed_pages
+    }
+
+    /// Uncommitted reserved suffix pages to reclaim.
+    pub fn released_pages(&self) -> &[&P] {
+        self.released_pages
+    }
+
+    /// Number of source rows committed from the reservation.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// New logical sequence position.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+impl<'a, P> BackendAppendPage<'a, P> {
+    pub(crate) fn new(
+        page: &'a P,
+        page_offset: usize,
+        input_offset: usize,
+        rows: usize,
+        existing: bool,
+    ) -> Self {
+        Self {
+            page,
+            page_offset,
+            input_offset,
+            rows,
+            existing,
+        }
+    }
+
+    /// Physical page receiving this segment.
+    pub fn page(&self) -> &P {
+        self.page
+    }
+
+    /// First writable row in the physical page.
+    pub fn page_offset(&self) -> usize {
+        self.page_offset
+    }
+
+    /// First source row in the caller's compute span.
+    pub fn input_offset(&self) -> usize {
+        self.input_offset
+    }
+
+    /// Number of consecutive rows in this segment.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether this page was already part of the committed sequence.
+    pub fn existed_before_reservation(&self) -> bool {
+        self.existing
+    }
+}
+
 /// Successful ownership transfer for a retirement batch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetireOutcome {
@@ -57,6 +165,8 @@ pub trait PageBackend {
     /// cache call so the backend can enrol page updates and retirement into its
     /// own synchronization discipline.
     type Context<'a>;
+    /// Backend-owned rollback state for one pending append.
+    type AppendTransaction;
     /// Backend-specific error.
     type Error;
 
@@ -84,15 +194,26 @@ pub trait PageBackend {
     /// be infallible and need not follow normal asynchronous retirement.
     fn rollback_page(&mut self, page: Self::Page, context: &mut Self::Context<'_>);
 
-    /// Reclaim all pages from an aborted reservation after its old table is
-    /// republished.
+    /// Prepare rollback state before publishing an append span.
+    fn prepare_append(
+        &mut self,
+        pages: &[BackendAppendPage<'_, Self::Page>],
+        start_position: usize,
+        context: &mut Self::Context<'_>,
+    ) -> core::result::Result<Self::AppendTransaction, Self::Error>;
+
+    /// Restore backend-owned contents, republish the old table, and reclaim all
+    /// pages from an aborted reservation as one transaction.
     ///
     /// Implementations must ensure that earlier work using these pages has
     /// completed before making them reusable. On failure every page must
     /// remain allocated and unchanged.
     fn abort_append(
         &mut self,
-        pages: &[&Self::Page],
+        transaction: &mut Self::AppendTransaction,
+        restored_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
+        restored_position: usize,
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<(), Self::Error>;
 
@@ -114,10 +235,8 @@ pub trait PageBackend {
     /// on error the reservation remains writable and may be retried or aborted.
     fn commit_append(
         &mut self,
-        committed_pages: &[&Self::Page],
-        sealed_pages: &[&Self::Page],
-        released_pages: &[&Self::Page],
-        new_position: usize,
+        transaction: &mut Self::AppendTransaction,
+        commit: BackendAppendCommit<'_, Self::Page>,
         context: &mut Self::Context<'_>,
     ) -> core::result::Result<(), Self::Error>;
 

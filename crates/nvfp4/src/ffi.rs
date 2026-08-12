@@ -707,6 +707,23 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_sm12x_kv_cache_unpack_paged_bf16_on_stream(
+        key_values: *const u8,
+        key_scales: *const u8,
+        value_values: *const u8,
+        value_scales: *const u8,
+        key_tail: *const f32,
+        value_tail: *const f32,
+        page_table: *const u32,
+        key_output: *mut u16,
+        value_output: *mut u16,
+        cache_len: u32,
+        page_tokens: u32,
+        page_stride: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sm12x_kv_cache_copy_aligned_prefix_on_stream(
         source_key_values: *const u8,
         source_key_scales: *const u8,
@@ -1500,6 +1517,14 @@ unsafe extern "C" {
         in_features: u32,
         out_features: u32,
         scale_stride: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_repeat_row_pointer_table_f32_on_stream(
+        input: *const f32,
+        table: *mut *const f32,
+        routes: u32,
+        repeats: u32,
+        row_stride: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_remap_expert_indices_on_stream(
@@ -2894,6 +2919,18 @@ unsafe extern "C" {
         lower_bound: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_gate_f32_batch_on_stream(
+        raw_gate: *const f32,
+        beta_input: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        gate: *mut f32,
+        beta: *mut f32,
+        rows: u32,
+        heads: u32,
+        lower_bound: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_ling3_kda_prep_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
@@ -2901,6 +2938,31 @@ unsafe extern "C" {
         k: *mut f32,
         v: *mut f32,
         conv_state: *mut f32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_prep_chunks_on_stream(
+        qkv: *const f32,
+        conv_weight_bf16: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        conv_state_table: *const *mut f32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        sequence_count: u32,
+        total_tokens: u32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_prep_rows_on_stream(
+        qkv: *const f32,
+        conv_weight_bf16: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        conv_state: *mut f32,
+        rows: u32,
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -2912,6 +2974,18 @@ unsafe extern "C" {
         beta: *const f32,
         state: *mut f32,
         output: *mut f32,
+        heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_kda_128_f32_chunks_on_stream(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        state: *mut f32,
+        output: *mut f32,
+        rows: u32,
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -2938,6 +3012,29 @@ unsafe extern "C" {
         value_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_split_kv_a_f32_on_stream(
+        input: *const f32,
+        compressed: *mut f32,
+        rope: *mut f32,
+        rows: u32,
+        compressed_dim: u32,
+        rope_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_pack_f32_batch_on_stream(
+        query_projection: *const f32,
+        kv_projection: *const f32,
+        shared_rope_key: *const f32,
+        query: *mut f32,
+        key: *mut f32,
+        value: *mut f32,
+        rows: u32,
+        heads: u32,
+        qk_nope_dim: u32,
+        rope_dim: u32,
+        value_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_ling3_mla_attention_f32_on_stream(
         query: *const f32,
         key_cache: *const f32,
@@ -2957,6 +3054,21 @@ unsafe extern "C" {
         page_table: *const u32,
         output: *mut f32,
         cache_len: u32,
+        page_tokens: u32,
+        heads: u32,
+        qk_dim: u32,
+        value_dim: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ling3_mla_paged_causal_rows_f32_on_stream(
+        query: *const f32,
+        key_pool: *const f32,
+        value_pool: *const f32,
+        page_table: *const u32,
+        output: *mut f32,
+        start_position: u32,
+        rows: u32,
         page_tokens: u32,
         heads: u32,
         qk_dim: u32,

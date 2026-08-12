@@ -1013,6 +1013,11 @@ impl Sm12xKvPagePool {
         self.storage.device_bytes()
     }
 
+    /// Allocates rollback storage matching this pool's circular f32 tail.
+    pub fn tail_snapshot(&self) -> Result<Sm12xKvTailSnapshot> {
+        Sm12xKvTailSnapshot::new(self.kv_heads, self.head_dim)
+    }
+
     fn check_slot(&self, slot: usize) -> Result<()> {
         if slot >= self.page_slots {
             return Err(Error::Shape {
@@ -1287,6 +1292,68 @@ impl Sm12xKvPagePool {
                     start_position as u32,
                     rows as u32,
                     SM12X_KV_PAGE_TOKENS as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Dequantizes a logical paged cache into the BF16 tensor-core layouts.
+    ///
+    /// Keys are written as `[kv_heads, tokens, head_dim]`; values are written
+    /// as `[kv_heads, head_dim, tokens]`. The page table must contain every
+    /// logical page intersecting `cache_len` in logical order.
+    pub fn unpack_paged_bf16_on_stream(
+        &self,
+        page_table: &DeviceBuffer<u32>,
+        cache_len: usize,
+        mut key_output: DeviceOutput<'_, u16>,
+        mut value_output: DeviceOutput<'_, u16>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_pages = cache_len.div_ceil(SM12X_KV_PAGE_TOKENS);
+        let values = checked_product(
+            "SM12x paged KV BF16 unpack",
+            &[cache_len, self.kv_heads, self.head_dim],
+        )?;
+        if cache_len == 0
+            || cache_len > u32::MAX as usize
+            || page_table.len() < logical_pages
+            || key_output.len() < values
+            || value_output.len() < values
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged KV BF16 unpack",
+                expected: format!(
+                    "non-empty cache, page table >= {logical_pages}, and K/V outputs >= {values} values"
+                ),
+                actual: format!(
+                    "cache_len={cache_len} page_table={} key={} value={}",
+                    page_table.len(),
+                    key_output.len(),
+                    value_output.len()
+                ),
+            });
+        }
+        let layout = &self.layout;
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_cache_unpack_paged_bf16_on_stream",
+                crate::ffi::infer_sm12x_kv_cache_unpack_paged_bf16_on_stream(
+                    self.component_ptr(layout.key_values),
+                    self.component_ptr(layout.key_scales),
+                    self.component_ptr(layout.value_values),
+                    self.component_ptr(layout.value_scales),
+                    self.component_ptr(layout.key_tail).cast(),
+                    self.component_ptr(layout.value_tail).cast(),
+                    page_table.as_const_ptr().cast(),
+                    key_output.as_mut_ptr().cast(),
+                    value_output.as_mut_ptr().cast(),
+                    cache_len as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    layout.total_bytes as u32,
                     self.kv_heads as u32,
                     self.head_dim as u32,
                     stream.as_raw(),
@@ -3812,5 +3879,74 @@ mod tests {
         }
         assert!(max_key_error < 0.20, "key max error {max_key_error}");
         assert!(max_value_error < 0.20, "value max error {max_value_error}");
+    }
+
+    #[test]
+    fn paged_compact_cache_unpack_matches_contiguous_across_page_boundary() {
+        const TOKENS: usize = SM12X_KV_PAGE_TOKENS + 13;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 128;
+        let width = KV_HEADS * HEAD_DIM;
+        let key = DeviceBuffer::from_host(
+            &(0..TOKENS * width)
+                .map(|index| ((index * 19 + 3) % 251) as f32 / 96.0 - 1.25)
+                .collect::<Vec<_>>(),
+        )
+        .expect("keys");
+        let value = DeviceBuffer::from_host(
+            &(0..TOKENS * width)
+                .map(|index| ((index * 29 + 7) % 257) as f32 / 112.0 - 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("values");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut contiguous = Sm12xKvCache::new(TOKENS, KV_HEADS, HEAD_DIM).expect("cache");
+        contiguous
+            .append_rows_at_offset_on_stream(&key, &value, 0, TOKENS, &stream)
+            .expect("contiguous append");
+        let mut pool = Sm12xKvPagePool::new(4, KV_HEADS, HEAD_DIM).expect("pool");
+        pool.append_rows_at_offset_on_stream(3, 0, &key, &value, 0, SM12X_KV_PAGE_TOKENS, &stream)
+            .expect("first paged append");
+        pool.append_rows_at_offset_on_stream(
+            1,
+            0,
+            &key,
+            &value,
+            SM12X_KV_PAGE_TOKENS,
+            TOKENS - SM12X_KV_PAGE_TOKENS,
+            &stream,
+        )
+        .expect("second paged append");
+        let page_table = DeviceBuffer::from_host(&[3_u32, 1]).expect("page table");
+        let values = TOKENS * width;
+        let mut contiguous_key = DeviceBuffer::zeroed(values).expect("contiguous K output");
+        let mut contiguous_value = DeviceBuffer::zeroed(values).expect("contiguous V output");
+        contiguous
+            .unpack_bf16_on_stream(contiguous_key.output(), contiguous_value.output(), &stream)
+            .expect("contiguous unpack");
+        let mut paged_key = DeviceBuffer::zeroed(values).expect("paged K output");
+        let mut paged_value = DeviceBuffer::zeroed(values).expect("paged V output");
+        pool.unpack_paged_bf16_on_stream(
+            &page_table,
+            TOKENS,
+            paged_key.output(),
+            paged_value.output(),
+            &stream,
+        )
+        .expect("paged unpack");
+
+        assert_eq!(
+            paged_key.copy_to_host(&stream).expect("paged K read"),
+            contiguous_key
+                .copy_to_host(&stream)
+                .expect("contiguous K read")
+        );
+        assert_eq!(
+            paged_value.copy_to_host(&stream).expect("paged V read"),
+            contiguous_value
+                .copy_to_host(&stream)
+                .expect("contiguous V read")
+        );
     }
 }

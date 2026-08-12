@@ -5,7 +5,7 @@
 //! configured backend; index bookkeeping lives in the crate's index module.
 
 use crate::RetainedSnapshot;
-use crate::backend::PageBackend;
+use crate::backend::{BackendAppendPage, PageBackend};
 use crate::error::{CacheError, ConfigError, Result};
 use crate::index::{PrefixIndex, PrefixKey};
 use crate::metrics::CacheMetrics;
@@ -414,17 +414,17 @@ struct PageRecord<P> {
 }
 
 /// In-flight exact append spanning one or more pages.
-#[derive(Clone)]
-struct PendingAppend {
+struct PendingAppend<T> {
     start_position: usize,
     rows: usize,
     segments: Box<[AppendSegment]>,
     new_pages: Box<[PageId]>,
     nonce: u64,
+    transaction: T,
 }
 
 /// Ownership state of one admitted sequence.
-struct SequenceRecord {
+struct SequenceRecord<T> {
     /// Logical pages in token order.
     pages: Vec<PageId>,
     /// Committed token position.
@@ -438,7 +438,7 @@ struct SequenceRecord {
     /// Exact declared page-table bytes.
     page_table_bytes: usize,
     /// Pending append, if any.
-    pending: Option<PendingAppend>,
+    pending: Option<PendingAppend<T>>,
 }
 
 /// One retained prefix checkpoint.
@@ -480,7 +480,7 @@ pub struct SequenceCache<B: PageBackend, S: RetainedSnapshot> {
     index: PrefixIndex,
     pages: Vec<Slot<PageRecord<B::Page>>>,
     free_page_slots: Vec<usize>,
-    sequences: Vec<Slot<SequenceRecord>>,
+    sequences: Vec<Slot<SequenceRecord<B::AppendTransaction>>>,
     free_sequence_slots: Vec<usize>,
     prefixes: BTreeMap<PrefixEntryId, PrefixEntry<S>>,
     next_prefix_id: u64,
@@ -783,6 +783,50 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 }
             }
         }
+        let transaction = {
+            let (backend, page_slots) = (&mut self.backend, &self.pages);
+            let mut prepared = Vec::with_capacity(new_page_count.saturating_add(1));
+            let mut input_offset = 0usize;
+            if let Some(tail) = tail.filter(|_| !position.is_multiple_of(self.config.page_tokens)) {
+                let page_offset = position % self.config.page_tokens;
+                let segment_rows = rows.min(self.config.page_tokens - page_offset);
+                let physical = page_slots
+                    .get(tail.slot())
+                    .filter(|slot| slot.generation == tail.generation)
+                    .and_then(|slot| slot.value.as_ref())
+                    .and_then(|record| record.physical.as_ref())
+                    .ok_or(CacheError::StalePage)?;
+                prepared.push(BackendAppendPage::new(
+                    physical,
+                    page_offset,
+                    input_offset,
+                    segment_rows,
+                    true,
+                ));
+                input_offset += segment_rows;
+            }
+            for allocation in &allocations {
+                let segment_rows = (rows - input_offset).min(self.config.page_tokens);
+                prepared.push(BackendAppendPage::new(
+                    &allocation.page,
+                    0,
+                    input_offset,
+                    segment_rows,
+                    false,
+                ));
+                input_offset += segment_rows;
+            }
+            match backend.prepare_append(&prepared, position, context) {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    for allocation in allocations.drain(..).rev() {
+                        backend.rollback_page(allocation.page, context);
+                    }
+                    self.metrics.backend_failures.inc();
+                    return Err(CacheError::Backend(error));
+                }
+            }
+        };
         if !allocations.is_empty() {
             let old_pages = self.sequence_record(sequence)?.pages.clone();
             let (backend, page_slots) = (&mut self.backend, &self.pages);
@@ -850,6 +894,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             segments: segments.clone(),
             new_pages: new_pages.clone().into_boxed_slice(),
             nonce,
+            transaction,
         };
         let record = self.sequence_record_mut(sequence)?;
         record.reserved_pages -= new_page_count;
@@ -972,17 +1017,39 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 sealed_ids.push(segment.page);
             }
         }
-        {
+        let mut pending = self
+            .sequence_record_mut(reservation.sequence)?
+            .pending
+            .take()
+            .ok_or(CacheError::NoAppendPending)?;
+        let finalize = {
             let (backend, slots) = (&mut self.backend, &self.pages);
-            let committed = physical_refs_from::<B>(slots, &committed_pages)?;
-            let sealed = physical_refs_from::<B>(slots, &sealed_ids)?;
-            let released = physical_refs_from::<B>(slots, released_pages)?;
-            if let Err(error) =
-                backend.commit_append(&committed, &sealed, &released, new_position, context)
-            {
+            let mut operation = || -> Result<(), B::Error> {
+                let committed = physical_refs_from::<B>(slots, &committed_pages)?;
+                let sealed = physical_refs_from::<B>(slots, &sealed_ids)?;
+                let released = physical_refs_from::<B>(slots, released_pages)?;
+                backend
+                    .commit_append(
+                        &mut pending.transaction,
+                        crate::BackendAppendCommit::new(
+                            &committed,
+                            &sealed,
+                            &released,
+                            committed_rows,
+                            new_position,
+                        ),
+                        context,
+                    )
+                    .map_err(CacheError::Backend)
+            };
+            operation()
+        };
+        if let Err(error) = finalize {
+            self.sequence_record_mut(reservation.sequence)?.pending = Some(pending);
+            if matches!(error, CacheError::Backend(_)) {
                 self.metrics.backend_failures.inc();
-                return Err(CacheError::Backend(error));
             }
+            return Err(error);
         }
         let page_tokens = self.config.page_tokens;
         for segment in committed_segments {
@@ -1004,7 +1071,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .checked_add(released_pages.len())
             .ok_or(CacheError::ArithmeticOverflow)?;
         sequence.position = new_position;
-        sequence.pending = None;
+        debug_assert!(sequence.pending.is_none());
         self.metrics
             .pages_sealed
             .add(sealed_ids.len().min(isize::MAX as usize) as isize);
@@ -1034,21 +1101,34 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 sequence.position,
             )
         };
-        if !new_pages.is_empty() {
+        let mut pending = self
+            .sequence_record_mut(reservation.sequence)?
+            .pending
+            .take()
+            .ok_or(CacheError::NoAppendPending)?;
+        let finalize = {
             let (backend, slots) = (&mut self.backend, &self.pages);
-            let table = physical_refs_from::<B>(slots, &old_pages)?;
-            if let Err(error) = backend.update_page_table(&table, old_position, context) {
+            let mut operation = || -> Result<(), B::Error> {
+                let restored = physical_refs_from::<B>(slots, &old_pages)?;
+                let released = physical_refs_from::<B>(slots, &new_pages)?;
+                backend
+                    .abort_append(
+                        &mut pending.transaction,
+                        &restored,
+                        &released,
+                        old_position,
+                        context,
+                    )
+                    .map_err(CacheError::Backend)
+            };
+            operation()
+        };
+        if let Err(error) = finalize {
+            self.sequence_record_mut(reservation.sequence)?.pending = Some(pending);
+            if matches!(error, CacheError::Backend(_)) {
                 self.metrics.backend_failures.inc();
-                return Err(CacheError::Backend(error));
             }
-        }
-        {
-            let (backend, slots) = (&mut self.backend, &self.pages);
-            let physical_pages = physical_refs_from::<B>(slots, &new_pages)?;
-            if let Err(error) = backend.abort_append(&physical_pages, context) {
-                self.metrics.backend_failures.inc();
-                return Err(CacheError::Backend(error));
-            }
+            return Err(error);
         }
         for page in &new_pages {
             self.page_record_mut(*page)?
@@ -1062,7 +1142,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .reserved_pages
             .checked_add(new_pages.len())
             .ok_or(CacheError::ArithmeticOverflow)?;
-        sequence.pending = None;
+        debug_assert!(sequence.pending.is_none());
         self.refresh_stats()?;
         Ok(())
     }
@@ -1805,7 +1885,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .ok_or(CacheError::StalePage)
     }
 
-    fn sequence_record(&self, id: SequenceId) -> Result<&SequenceRecord, B::Error> {
+    fn sequence_record(
+        &self,
+        id: SequenceId,
+    ) -> Result<&SequenceRecord<B::AppendTransaction>, B::Error> {
         self.sequences
             .get(id.slot())
             .filter(|slot| slot.generation == id.generation)
@@ -1813,7 +1896,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .ok_or(CacheError::StaleSequence)
     }
 
-    fn sequence_record_mut(&mut self, id: SequenceId) -> Result<&mut SequenceRecord, B::Error> {
+    fn sequence_record_mut(
+        &mut self,
+        id: SequenceId,
+    ) -> Result<&mut SequenceRecord<B::AppendTransaction>, B::Error> {
         self.sequences
             .get_mut(id.slot())
             .filter(|slot| slot.generation == id.generation)
@@ -1904,7 +1990,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(())
     }
 
-    fn insert_sequence(&mut self, value: SequenceRecord) -> Result<SequenceId, B::Error> {
+    fn insert_sequence(
+        &mut self,
+        value: SequenceRecord<B::AppendTransaction>,
+    ) -> Result<SequenceId, B::Error> {
         if let Some(slot) = self.free_sequence_slots.pop() {
             let id = SequenceId::new(slot, self.sequences[slot].generation);
             self.sequences[slot].value = Some(value);
@@ -2175,6 +2264,7 @@ mod tests {
     impl PageBackend for NoopBackend {
         type Page = ();
         type Context<'a> = ();
+        type AppendTransaction = ();
         type Error = Infallible;
 
         fn page_bytes(&self) -> usize {
@@ -2193,9 +2283,21 @@ mod tests {
 
         fn rollback_page(&mut self, _page: Self::Page, _context: &mut Self::Context<'_>) {}
 
+        fn prepare_append(
+            &mut self,
+            _pages: &[BackendAppendPage<'_, Self::Page>],
+            _start_position: usize,
+            _context: &mut Self::Context<'_>,
+        ) -> core::result::Result<Self::AppendTransaction, Self::Error> {
+            Ok(())
+        }
+
         fn abort_append(
             &mut self,
-            _pages: &[&Self::Page],
+            _transaction: &mut Self::AppendTransaction,
+            _restored_pages: &[&Self::Page],
+            _released_pages: &[&Self::Page],
+            _restored_position: usize,
             _context: &mut Self::Context<'_>,
         ) -> core::result::Result<(), Self::Error> {
             Ok(())
@@ -2215,10 +2317,8 @@ mod tests {
 
         fn commit_append(
             &mut self,
-            _committed_pages: &[&Self::Page],
-            _sealed_pages: &[&Self::Page],
-            _released_pages: &[&Self::Page],
-            _new_position: usize,
+            _transaction: &mut Self::AppendTransaction,
+            _commit: crate::BackendAppendCommit<'_, Self::Page>,
             _context: &mut Self::Context<'_>,
         ) -> core::result::Result<(), Self::Error> {
             Ok(())

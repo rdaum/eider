@@ -4,8 +4,8 @@ use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::deepseek4::{Deepseek4SequenceCheckpoint, Deepseek4SequenceState, Deepseek4TextModel};
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use sequence_cache::{
-    CacheConfig, CacheError, PageAllocation, PageBackend, RetireError, RetireOutcome,
-    SequenceCache, SequenceId,
+    BackendAppendCommit, BackendAppendPage, CacheConfig, CacheError, PageAllocation, PageBackend,
+    RetireError, RetireOutcome, SequenceCache, SequenceId,
 };
 use std::mem::size_of;
 
@@ -306,6 +306,7 @@ impl Deepseek4PageBackend {
 impl PageBackend for Deepseek4PageBackend {
     type Page = Deepseek4Page;
     type Context<'a> = Deepseek4CacheContext<'a>;
+    type AppendTransaction = ();
     type Error = Error;
 
     fn page_bytes(&self) -> usize {
@@ -339,14 +340,34 @@ impl PageBackend for Deepseek4PageBackend {
         self.free_slots.push(page.slot);
     }
 
+    fn prepare_append(
+        &mut self,
+        _pages: &[BackendAppendPage<'_, Self::Page>],
+        _start_position: usize,
+        _context: &mut Self::Context<'_>,
+    ) -> Result<Self::AppendTransaction> {
+        Ok(())
+    }
+
     fn abort_append(
         &mut self,
-        pages: &[&Self::Page],
+        _transaction: &mut Self::AppendTransaction,
+        restored: &[&Self::Page],
+        released: &[&Self::Page],
+        restored_position: usize,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        context.stream.synchronize()?;
-        for page in pages {
+        for page in restored.iter().chain(released) {
             self.validate(**page)?;
+        }
+        context.stream.synchronize()?;
+        context.page_table.update_slots(
+            restored.iter().map(|page| page.slot),
+            restored.len(),
+            restored_position,
+            context.stream,
+        )?;
+        for page in released {
             self.used_slots[page.slot()] = false;
             self.free_slots.push(page.slot);
         }
@@ -382,24 +403,29 @@ impl PageBackend for Deepseek4PageBackend {
 
     fn commit_append(
         &mut self,
-        committed: &[&Self::Page],
-        sealed: &[&Self::Page],
-        released: &[&Self::Page],
-        position: usize,
+        _transaction: &mut Self::AppendTransaction,
+        commit: BackendAppendCommit<'_, Self::Page>,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in committed.iter().chain(sealed).chain(released) {
+        for page in commit
+            .committed_pages()
+            .iter()
+            .chain(commit.sealed_pages())
+            .chain(commit.released_pages())
+        {
             self.validate(**page)?;
         }
+        if !commit.released_pages().is_empty() {
+            context.stream.synchronize()?;
+        }
         context.page_table.update_slots(
-            committed.iter().map(|page| page.slot),
-            committed.len(),
-            position,
+            commit.committed_pages().iter().map(|page| page.slot),
+            commit.committed_pages().len(),
+            commit.position(),
             context.stream,
         )?;
-        if !released.is_empty() {
-            context.stream.synchronize()?;
-            for page in released {
+        if !commit.released_pages().is_empty() {
+            for page in commit.released_pages() {
                 self.used_slots[page.slot()] = false;
                 self.free_slots.push(page.slot);
             }

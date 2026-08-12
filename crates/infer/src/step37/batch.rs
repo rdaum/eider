@@ -655,38 +655,38 @@ fn run_attention_prefill(
         cache
             .with_append_pages(append.reservation, |backend, pages| {
                 let pool = backend.pool_mut(layer_index)?;
-                let q_width = attention.q_heads * HEAD_DIM;
-                let kv_width = KV_HEADS * HEAD_DIM;
                 for page in pages.iter() {
                     let segment = page.segment();
-                    for local_row in 0..segment.rows() {
-                        let token = segment.input_offset() + local_row;
-                        pool.append_at_offsets_on_stream(
+                    let mut processed = 0;
+                    while processed < segment.rows() {
+                        let token = segment.input_offset() + processed;
+                        let query_position = position + token;
+                        let chunk_rows = (segment.rows() - processed)
+                            .min(16 - query_position % 16)
+                            .min(8);
+                        pool.append_rows_at_offset_on_stream(
                             page.page().slot(),
-                            segment.page_offset() + local_row,
+                            segment.page_offset() + processed,
                             &workspace.k_rope,
-                            (row_offset + token) * kv_width,
                             &workspace.v,
-                            (row_offset + token) * kv_width,
+                            row_offset + token,
+                            chunk_rows,
                             stream,
                         )?;
-                        let cache_len = position + token + 1;
-                        let window_start = attention
-                            .window
-                            .map_or(0, |window| cache_len.saturating_sub(window));
                         workspace
                             .compact
-                            .attention_paged_window_offsets_into_on_stream(
+                            .attention_paged_causal_rows_at_offset_into_on_stream(
                                 pool,
                                 append.page_table,
-                                cache_len,
+                                query_position,
                                 &workspace.q_rope,
-                                (row_offset + token) * q_width,
+                                row_offset + token,
+                                chunk_rows,
+                                attention.window,
                                 workspace.attended.output(),
-                                (row_offset + token) * q_width,
-                                window_start,
                                 stream,
                             )?;
+                        processed += chunk_rows;
                     }
                 }
                 Ok(())

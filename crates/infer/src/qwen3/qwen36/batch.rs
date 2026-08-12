@@ -1536,6 +1536,25 @@ impl Qwen36TextModel {
                 }
             }
         }
+        for index in 0..rows.len() {
+            if let Err(error) = rows[index].sequence.state.begin_append(workspace.stream()) {
+                for row in &mut rows[..index] {
+                    let _ = row.sequence.state.abort_append(workspace.stream());
+                }
+                for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: workspace.stream(),
+                                page_table: &mut row.sequence.page_table,
+                            },
+                        )
+                        .map_err(cache_error)?;
+                }
+                return Err(error);
+            }
+        }
         let result = {
             let mut state_rows = Vec::with_capacity(rows.len());
             let mut appends = Vec::with_capacity(rows.len());
@@ -1553,7 +1572,13 @@ impl Qwen36TextModel {
             self.prefill_batch_impl(workspace, &mut state_rows, cache, &appends)
         };
         if let Err(error) = result {
-            for (row, reservation) in rows.iter_mut().zip(reservations) {
+            let mut rollback_error = None;
+            for row in rows.iter_mut() {
+                if let Err(error) = row.sequence.state.abort_append(workspace.stream()) {
+                    rollback_error.get_or_insert(error);
+                }
+            }
+            for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
                 cache
                     .abort_append(
                         reservation,
@@ -1564,21 +1589,48 @@ impl Qwen36TextModel {
                     )
                     .map_err(cache_error)?;
             }
-            return Err(error);
+            return Err(rollback_error.unwrap_or(error));
         }
-        for (row, reservation) in rows.iter_mut().zip(reservations) {
+        for index in 0..rows.len() {
+            let row = &mut rows[index];
             let tokens = row.token_ids.len();
-            cache
-                .commit_append(
-                    reservation,
-                    tokens,
-                    &mut Sm12xCacheContext {
-                        stream: workspace.stream(),
-                        page_table: &mut row.sequence.page_table,
-                    },
-                )
-                .map_err(cache_error)?;
-            row.sequence.state.position += tokens;
+            if let Err(error) = cache.commit_append(
+                reservations[index].clone(),
+                tokens,
+                &mut Sm12xCacheContext {
+                    stream: workspace.stream(),
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                let mut rollback_error = row.sequence.state.abort_append(workspace.stream()).err();
+                cache
+                    .abort_append(
+                        reservations[index].clone(),
+                        &mut Sm12xCacheContext {
+                            stream: workspace.stream(),
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(cache_error)?;
+                for pending in index + 1..rows.len() {
+                    let pending_row = &mut rows[pending];
+                    if let Err(error) = pending_row.sequence.state.abort_append(workspace.stream())
+                    {
+                        rollback_error.get_or_insert(error);
+                    }
+                    cache
+                        .abort_append(
+                            reservations[pending].clone(),
+                            &mut Sm12xCacheContext {
+                                stream: workspace.stream(),
+                                page_table: &mut pending_row.sequence.page_table,
+                            },
+                        )
+                        .map_err(cache_error)?;
+                }
+                return Err(rollback_error.unwrap_or_else(|| cache_error(error)));
+            }
+            row.sequence.state.commit_append(tokens);
         }
         Ok(())
     }
@@ -1762,7 +1814,6 @@ impl Qwen36TextModel {
                         stream,
                     )?;
                     weights.enqueue_prefill_cache(
-                        self,
                         &mut workspace.full,
                         rows,
                         &workspace.host_sequence_offsets,
@@ -2143,6 +2194,25 @@ impl Qwen36TextModel {
                 }
             }
         }
+        for index in 0..rows.len() {
+            if let Err(error) = rows[index].sequence.state.begin_append(workspace.stream()) {
+                for row in &mut rows[..index] {
+                    let _ = row.sequence.state.abort_append(workspace.stream());
+                }
+                for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: workspace.stream(),
+                                page_table: &mut row.sequence.page_table,
+                            },
+                        )
+                        .map_err(cache_error)?;
+                }
+                return Err(error);
+            }
+        }
         let result = {
             let mut state_rows = Vec::with_capacity(rows.len());
             let mut appends = Vec::with_capacity(rows.len());
@@ -2160,7 +2230,13 @@ impl Qwen36TextModel {
             self.decode_batch_impl(workspace, &mut state_rows, cache, &appends, trace)
         };
         if let Err(error) = result {
-            for (row, reservation) in rows.iter_mut().zip(reservations) {
+            let mut rollback_error = None;
+            for row in rows.iter_mut() {
+                if let Err(error) = row.sequence.state.abort_append(workspace.stream()) {
+                    rollback_error.get_or_insert(error);
+                }
+            }
+            for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
                 cache
                     .abort_append(
                         reservation,
@@ -2171,20 +2247,47 @@ impl Qwen36TextModel {
                     )
                     .map_err(cache_error)?;
             }
-            return Err(error);
+            return Err(rollback_error.unwrap_or(error));
         }
-        for (row, reservation) in rows.iter_mut().zip(reservations) {
-            cache
-                .commit_append(
-                    reservation,
-                    1,
-                    &mut Sm12xCacheContext {
-                        stream: workspace.stream(),
-                        page_table: &mut row.sequence.page_table,
-                    },
-                )
-                .map_err(cache_error)?;
-            row.sequence.state.position += 1;
+        for index in 0..rows.len() {
+            let row = &mut rows[index];
+            if let Err(error) = cache.commit_append(
+                reservations[index].clone(),
+                1,
+                &mut Sm12xCacheContext {
+                    stream: workspace.stream(),
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                let mut rollback_error = row.sequence.state.abort_append(workspace.stream()).err();
+                cache
+                    .abort_append(
+                        reservations[index].clone(),
+                        &mut Sm12xCacheContext {
+                            stream: workspace.stream(),
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(cache_error)?;
+                for pending in index + 1..rows.len() {
+                    let pending_row = &mut rows[pending];
+                    if let Err(error) = pending_row.sequence.state.abort_append(workspace.stream())
+                    {
+                        rollback_error.get_or_insert(error);
+                    }
+                    cache
+                        .abort_append(
+                            reservations[pending].clone(),
+                            &mut Sm12xCacheContext {
+                                stream: workspace.stream(),
+                                page_table: &mut pending_row.sequence.page_table,
+                            },
+                        )
+                        .map_err(cache_error)?;
+                }
+                return Err(rollback_error.unwrap_or_else(|| cache_error(error)));
+            }
+            row.sequence.state.commit_append(1);
         }
         Ok(())
     }
@@ -3035,7 +3138,6 @@ impl Qwen36FullAttentionWeights {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_prefill_cache(
         &self,
-        model: &Qwen36TextModel,
         workspace: &mut BatchFullAttentionWorkspace,
         rows: &mut [Qwen36PrefillStateRow<'_, '_>],
         row_offsets: &[u32],
@@ -3044,8 +3146,6 @@ impl Qwen36FullAttentionWeights {
         cache: &mut Qwen36SequenceCache,
         appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
-        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
         for (sequence, (row, append)) in rows.iter_mut().zip(appends).enumerate() {
             if append.reservation.start_position() != row.state.position
                 || append.reservation.rows() != row.token_ids.len()
@@ -3067,29 +3167,35 @@ impl Qwen36FullAttentionWeights {
                     let pool = backend.pool_mut(layer_idx)?;
                     for page in pages.iter() {
                         let segment = page.segment();
-                        for local_row in 0..segment.rows() {
-                            let token = segment.input_offset() + local_row;
-                            pool.append_at_offsets_on_stream(
+                        let mut processed = 0;
+                        while processed < segment.rows() {
+                            let token = segment.input_offset() + processed;
+                            let position = row.state.position + token;
+                            let chunk_rows =
+                                (segment.rows() - processed).min(16 - position % 16).min(8);
+                            pool.append_rows_at_offset_on_stream(
                                 page.page().slot(),
-                                segment.page_offset() + local_row,
+                                segment.page_offset() + processed,
                                 &workspace.k_rope,
-                                (input_row + token) * kv_width,
                                 &workspace.v,
-                                (input_row + token) * kv_width,
+                                input_row + token,
+                                chunk_rows,
                                 stream,
                             )?;
                             workspace
                                 .compact_attention
-                                .attention_paged_offsets_into_on_stream(
+                                .attention_paged_causal_rows_at_offset_into_on_stream(
                                     pool,
                                     append.page_table,
-                                    row.state.position + token + 1,
+                                    position,
                                     &workspace.q_rope,
-                                    (input_row + token) * q_width,
+                                    input_row + token,
+                                    chunk_rows,
+                                    None,
                                     workspace.attention.output(),
-                                    (input_row + token) * q_width,
                                     stream,
                                 )?;
+                            processed += chunk_rows;
                         }
                     }
                     Ok(())

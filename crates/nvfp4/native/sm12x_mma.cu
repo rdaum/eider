@@ -1600,6 +1600,129 @@ extern "C" cudaError_t infer_sm12x_kv_cache_unpack_bf16_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_sm12x_kv_cache_unpack_paged_bf16_kernel(
+    const std::uint8_t* __restrict__ key_values,
+    const std::uint8_t* __restrict__ key_scales,
+    const std::uint8_t* __restrict__ value_values,
+    const std::uint8_t* __restrict__ value_scales,
+    const float* __restrict__ key_tail,
+    const float* __restrict__ value_tail,
+    const std::uint32_t* __restrict__ page_table,
+    std::uint16_t* __restrict__ key_output,
+    std::uint16_t* __restrict__ value_output,
+    std::uint32_t cache_len,
+    std::uint32_t page_tokens,
+    std::uint32_t page_stride,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim)
+{
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t width = kv_heads * head_dim;
+    const std::uint32_t total = cache_len * width;
+    if (index >= total) return;
+    const std::uint32_t dim = index % head_dim;
+    const std::uint32_t head = (index / head_dim) % kv_heads;
+    const std::uint32_t token = index / width;
+    const std::uint32_t logical_page = token / page_tokens;
+    const std::uint32_t page_token = token % page_tokens;
+    const std::uint32_t page_slot = page_table[logical_page];
+    const std::uint64_t page_offset =
+        static_cast<std::uint64_t>(page_slot) * page_stride;
+    const std::uint32_t page_start = logical_page * page_tokens;
+    const std::uint32_t page_len = min(page_tokens, cache_len - page_start);
+
+    const std::uint8_t* page_key_values = key_values + page_offset;
+    const std::uint8_t* page_key_scales = key_scales + page_offset;
+    const std::uint8_t* page_value_values = value_values + page_offset;
+    const std::uint8_t* page_value_scales = value_scales + page_offset;
+    const float* page_key_tail = reinterpret_cast<const float*>(
+        reinterpret_cast<const std::uint8_t*>(key_tail) + page_offset);
+    const float* page_value_tail = reinterpret_cast<const float*>(
+        reinterpret_cast<const std::uint8_t*>(value_tail) + page_offset);
+
+    float key;
+    const std::uint32_t compact_key_tokens = page_len / 8 * 8;
+    if (page_token < compact_key_tokens) {
+        const std::uint32_t token_tiles = (page_tokens + 7) / 8;
+        const std::uint32_t k_tiles = head_dim / 64;
+        const std::uint32_t token_tile = page_token / 8;
+        const std::uint32_t token_in_tile = page_token & 7u;
+        const std::uint32_t k_tile = dim / 64;
+        const std::uint32_t dim_in_tile = dim & 63u;
+        const std::uint32_t tile =
+            (head * token_tiles + token_tile) * k_tiles + k_tile;
+        const std::uint8_t code = infer_get_packed_nibble(
+            page_key_values + tile * 256, token_in_tile * 64 + dim_in_tile);
+        const std::uint8_t scale_code =
+            page_key_scales[(tile * 8 + token_in_tile) * 4 + dim_in_tile / 16];
+        key = infer_e2m1_value(code) * infer_e4m3_value(scale_code);
+    } else {
+        key = page_key_tail[(page_token & 15u) * width + head * head_dim + dim];
+    }
+
+    float value;
+    const std::uint32_t compact_value_tokens = page_len / 16 * 16;
+    if (page_token < compact_value_tokens) {
+        const std::uint32_t context_tiles = (page_tokens + 63) / 64;
+        const std::uint32_t dim_tile = dim / 8;
+        const std::uint32_t dim_in_tile = dim & 7u;
+        const std::uint32_t token_tile = page_token / 64;
+        const std::uint32_t token_in_tile = page_token & 63u;
+        const std::uint32_t tile =
+            (head * (head_dim / 8) + dim_tile) * context_tiles + token_tile;
+        const std::uint8_t code = infer_get_packed_nibble(
+            page_value_values + tile * 256, dim_in_tile * 64 + token_in_tile);
+        const std::uint8_t scale_code =
+            page_value_scales[(tile * 8 + dim_in_tile) * 4 + token_in_tile / 16];
+        value = infer_e2m1_value(code) * infer_e4m3_value(scale_code);
+    } else {
+        value = page_value_tail[(page_token & 15u) * width + head * head_dim + dim];
+    }
+
+    const __nv_bfloat16 key_bf16 = __float2bfloat16_rn(key);
+    const __nv_bfloat16 value_bf16 = __float2bfloat16_rn(value);
+    key_output[(head * cache_len + token) * head_dim + dim] =
+        *reinterpret_cast<const std::uint16_t*>(&key_bf16);
+    value_output[(head * head_dim + dim) * cache_len + token] =
+        *reinterpret_cast<const std::uint16_t*>(&value_bf16);
+}
+
+extern "C" cudaError_t infer_sm12x_kv_cache_unpack_paged_bf16_on_stream(
+    const std::uint8_t* key_values,
+    const std::uint8_t* key_scales,
+    const std::uint8_t* value_values,
+    const std::uint8_t* value_scales,
+    const float* key_tail,
+    const float* value_tail,
+    const std::uint32_t* page_table,
+    std::uint16_t* key_output,
+    std::uint16_t* value_output,
+    std::uint32_t cache_len,
+    std::uint32_t page_tokens,
+    std::uint32_t page_stride,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    cudaStream_t stream)
+{
+    if (key_values == nullptr || key_scales == nullptr || value_values == nullptr ||
+        value_scales == nullptr || key_tail == nullptr || value_tail == nullptr ||
+        page_table == nullptr || key_output == nullptr || value_output == nullptr ||
+        cache_len == 0 || page_tokens == 0 || page_stride == 0 || kv_heads == 0 ||
+        head_dim == 0 || (head_dim % 64) != 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(cache_len) * kv_heads * head_dim;
+    if (total > 0xffffffffu) return cudaErrorInvalidValue;
+    const int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    infer_sm12x_kv_cache_unpack_paged_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        key_values, key_scales, value_values, value_scales, key_tail, value_tail,
+        page_table, key_output, value_output, cache_len, page_tokens, page_stride,
+        kv_heads, head_dim);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_sm12x_kv_cache_append_indexed_on_stream(
     const float* key,
     const float* value,

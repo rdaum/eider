@@ -5902,6 +5902,9 @@ struct Qwen36MoeGraphSync {
 pub(crate) struct Qwen36SequenceState {
     model_id: u64,
     linear_states: Vec<Option<Qwen36LinearAttentionState>>,
+    rollback_linear_states: Vec<Option<Qwen36LinearAttentionState>>,
+    rollback_position: usize,
+    append_pending: bool,
     position: usize,
     max_tokens: usize,
 }
@@ -5938,9 +5941,88 @@ impl Qwen36SequenceState {
     pub(crate) fn device_bytes(&self) -> usize {
         self.linear_states
             .iter()
+            .chain(&self.rollback_linear_states)
             .flatten()
             .map(Qwen36LinearAttentionState::device_bytes)
             .sum()
+    }
+
+    pub(crate) fn begin_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.append_pending {
+            return Err(Error::Format {
+                label: "Qwen3.6 recurrent transaction",
+                detail: "an append transaction is already pending".to_string(),
+            });
+        }
+        for (source, destination) in self
+            .linear_states
+            .iter()
+            .zip(&mut self.rollback_linear_states)
+        {
+            match (source, destination) {
+                (Some(source), Some(destination)) => {
+                    destination.conv_state.copy_prefix_from_device_on_stream(
+                        &source.conv_state,
+                        source.conv_state.len(),
+                        stream,
+                    )?;
+                    destination
+                        .recurrent_state
+                        .copy_prefix_from_device_on_stream(
+                            &source.recurrent_state,
+                            source.recurrent_state.len(),
+                            stream,
+                        )?;
+                }
+                (None, None) => {}
+                _ => unreachable!("Qwen recurrent rollback topology matches active state"),
+            }
+        }
+        self.rollback_position = self.position;
+        self.append_pending = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_append(&mut self, rows: usize) {
+        assert!(self.append_pending, "Qwen recurrent append is pending");
+        self.position = self.rollback_position + rows;
+        self.append_pending = false;
+    }
+
+    pub(crate) fn abort_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if !self.append_pending {
+            return Err(Error::Format {
+                label: "Qwen3.6 recurrent transaction",
+                detail: "no append transaction is pending".to_string(),
+            });
+        }
+        for (source, destination) in self
+            .rollback_linear_states
+            .iter()
+            .zip(&mut self.linear_states)
+        {
+            match (source, destination) {
+                (Some(source), Some(destination)) => {
+                    destination.conv_state.copy_prefix_from_device_on_stream(
+                        &source.conv_state,
+                        source.conv_state.len(),
+                        stream,
+                    )?;
+                    destination
+                        .recurrent_state
+                        .copy_prefix_from_device_on_stream(
+                            &source.recurrent_state,
+                            source.recurrent_state.len(),
+                            stream,
+                        )?;
+                }
+                (None, None) => {}
+                _ => unreachable!("Qwen recurrent rollback topology matches active state"),
+            }
+        }
+        self.position = self.rollback_position;
+        self.append_pending = false;
+        Ok(())
     }
 }
 
@@ -6238,8 +6320,9 @@ impl Qwen36TextModel {
             });
         }
         let mut linear_states = Vec::with_capacity(self.layers.len());
+        let mut rollback_linear_states = Vec::with_capacity(self.layers.len());
         for block in &self.layers {
-            let state = match &block.attention {
+            let (state, rollback) = match &block.attention {
                 Qwen36Attention::LinearAttention(weights) => {
                     let linear = self
                         .manifest
@@ -6248,15 +6331,22 @@ impl Qwen36TextModel {
                             label: "Qwen3.6 linear-attention state",
                             detail: "manifest has no linear-attention configuration".to_string(),
                         })?;
-                    Some(Qwen36LinearAttentionState::new(linear, weights)?)
+                    (
+                        Some(Qwen36LinearAttentionState::new(linear, weights)?),
+                        Some(Qwen36LinearAttentionState::new(linear, weights)?),
+                    )
                 }
-                Qwen36Attention::FullAttention(_) => None,
+                Qwen36Attention::FullAttention(_) => (None, None),
             };
             linear_states.push(state);
+            rollback_linear_states.push(rollback);
         }
         Ok(Qwen36SequenceState {
             model_id: self.model_id,
             linear_states,
+            rollback_linear_states,
+            rollback_position: 0,
+            append_pending: false,
             position: 0,
             max_tokens,
         })
@@ -6687,8 +6777,79 @@ impl Qwen36TextModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{reorder_bf16_v_cols, reorder_bf16_v_rows, reorder_fp8_v_rows};
-    use crate::nvfp4::ModelOptFp8Linear;
+    use super::{
+        Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
+        reorder_fp8_v_rows,
+    };
+    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptFp8Linear};
+
+    #[test]
+    fn recurrent_append_transaction_restores_and_commits_explicitly() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut state = Qwen36SequenceState {
+            model_id: 1,
+            linear_states: vec![Some(Qwen36LinearAttentionState {
+                conv_state: DeviceBuffer::from_host(&[1.0, 2.0]).expect("conv"),
+                recurrent_state: DeviceBuffer::from_host(&[3.0, 4.0]).expect("recurrent"),
+            })],
+            rollback_linear_states: vec![Some(Qwen36LinearAttentionState {
+                conv_state: DeviceBuffer::zeroed(2).expect("rollback conv"),
+                recurrent_state: DeviceBuffer::zeroed(2).expect("rollback recurrent"),
+            })],
+            rollback_position: 0,
+            append_pending: false,
+            position: 0,
+            max_tokens: 8,
+        };
+        state.begin_append(&stream).expect("begin append");
+        let active = state.linear_states[0].as_mut().expect("active state");
+        active
+            .conv_state
+            .copy_from_host(&[9.0, 10.0])
+            .expect("mutate conv");
+        active
+            .recurrent_state
+            .copy_from_host(&[11.0, 12.0])
+            .expect("mutate recurrent");
+        state.abort_append(&stream).expect("abort append");
+        let active = state.linear_states[0].as_ref().expect("active state");
+        assert_eq!(
+            active
+                .conv_state
+                .copy_to_host(&stream)
+                .expect("conv read")
+                .as_ref(),
+            &[1.0, 2.0]
+        );
+        assert_eq!(
+            active
+                .recurrent_state
+                .copy_to_host(&stream)
+                .expect("recurrent read")
+                .as_ref(),
+            &[3.0, 4.0]
+        );
+
+        state.begin_append(&stream).expect("begin retry");
+        state.linear_states[0]
+            .as_mut()
+            .expect("active state")
+            .conv_state
+            .copy_from_host(&[9.0, 10.0])
+            .expect("mutate retry");
+        state.commit_append(2);
+        assert_eq!(state.position(), 2);
+        assert_eq!(
+            state.linear_states[0]
+                .as_ref()
+                .expect("active state")
+                .conv_state
+                .copy_to_host(&stream)
+                .expect("committed read")
+                .as_ref(),
+            &[9.0, 10.0]
+        );
+    }
 
     #[test]
     fn reorder_fp8_v_rows_keeps_channel_scales_with_weights() {

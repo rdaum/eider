@@ -1,6 +1,7 @@
 use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, PageAllocation, PageBackend,
-    RetainOutcome, RetainedSnapshot, RetireError, RetireOutcome, SequenceCache, SequenceId,
+    AdmissionOutcome, AdmissionRequest, BackendAppendPage, CacheConfig, CacheError, PageAllocation,
+    PageBackend, RetainOutcome, RetainedSnapshot, RetireError, RetireOutcome, SequenceCache,
+    SequenceId,
 };
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -15,6 +16,7 @@ struct FakePage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
     Allocate,
+    Prepare,
     Abort,
     Copy,
     Update,
@@ -37,6 +39,11 @@ impl std::error::Error for FakeError {}
 struct FakeContext {
     table: Vec<u64>,
     position: usize,
+}
+
+struct FakeAppendTransaction {
+    existing: Vec<(u64, Vec<u32>)>,
+    pages: Vec<(u64, usize, usize, usize)>,
 }
 
 struct FakeBackend {
@@ -107,6 +114,7 @@ impl FakeBackend {
 impl PageBackend for FakeBackend {
     type Page = FakePage;
     type Context<'a> = FakeContext;
+    type AppendTransaction = FakeAppendTransaction;
     type Error = FakeError;
 
     fn page_bytes(&self) -> usize {
@@ -151,15 +159,55 @@ impl PageBackend for FakeBackend {
         self.recycled_pages.push(page);
     }
 
+    fn prepare_append(
+        &mut self,
+        pages: &[BackendAppendPage<'_, Self::Page>],
+        _start_position: usize,
+        _context: &mut Self::Context<'_>,
+    ) -> Result<Self::AppendTransaction, Self::Error> {
+        self.take_failure(Operation::Prepare)?;
+        Ok(FakeAppendTransaction {
+            existing: pages
+                .iter()
+                .filter(|page| page.existed_before_reservation())
+                .map(|page| (page.page().id, page.page().rows.borrow().clone()))
+                .collect(),
+            pages: pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.page().id,
+                        page.page_offset(),
+                        page.input_offset(),
+                        page.rows(),
+                    )
+                })
+                .collect(),
+        })
+    }
+
     fn abort_append(
         &mut self,
-        pages: &[&Self::Page],
-        _context: &mut Self::Context<'_>,
+        transaction: &mut Self::AppendTransaction,
+        restored_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
+        restored_position: usize,
+        context: &mut Self::Context<'_>,
     ) -> Result<(), Self::Error> {
+        self.take_failure(Operation::Update)?;
         self.take_failure(Operation::Abort)?;
-        self.rollbacks += pages.len();
+        for (id, rows) in &transaction.existing {
+            let page = restored_pages
+                .iter()
+                .find(|page| page.id == *id)
+                .expect("prepared existing page remains in restored table");
+            page.rows.replace(rows.clone());
+        }
+        context.table = restored_pages.iter().map(|page| page.id).collect();
+        context.position = restored_position;
+        self.rollbacks += released_pages.len();
         self.recycled_pages
-            .extend(pages.iter().map(|page| (*page).clone()));
+            .extend(released_pages.iter().map(|page| (*page).clone()));
         Ok(())
     }
 
@@ -185,21 +233,31 @@ impl PageBackend for FakeBackend {
 
     fn commit_append(
         &mut self,
-        committed_pages: &[&Self::Page],
-        sealed_pages: &[&Self::Page],
-        released_pages: &[&Self::Page],
-        new_position: usize,
+        transaction: &mut Self::AppendTransaction,
+        commit: sequence_cache::BackendAppendCommit<'_, Self::Page>,
         context: &mut Self::Context<'_>,
     ) -> Result<(), Self::Error> {
         self.take_failure(Operation::Commit)?;
+        let committed_rows = commit.rows();
+        let committed_pages = commit.committed_pages();
+        for (id, page_offset, input_offset, rows) in &transaction.pages {
+            if *input_offset >= committed_rows {
+                continue;
+            }
+            let committed = (*rows).min(committed_rows - *input_offset);
+            let Some(page) = committed_pages.iter().find(|page| page.id == *id) else {
+                continue;
+            };
+            page.rows.borrow_mut().truncate(page_offset + committed);
+        }
         context.table = committed_pages.iter().map(|page| page.id).collect();
-        context.position = new_position;
-        for page in sealed_pages {
+        context.position = commit.position();
+        for page in commit.sealed_pages() {
             page.sealed.set(true);
         }
-        self.rollbacks += released_pages.len();
+        self.rollbacks += commit.released_pages().len();
         self.recycled_pages
-            .extend(released_pages.iter().map(|page| (*page).clone()));
+            .extend(commit.released_pages().iter().map(|page| (*page).clone()));
         Ok(())
     }
 
@@ -594,6 +652,19 @@ fn multi_page_allocation_and_publication_failures_roll_back_every_page() {
         .validate()
         .expect("valid after partial allocation failure");
 
+    cache.with_backend(|backend| backend.fail(Operation::Prepare));
+    let error = cache
+        .reserve_append(sequence, 12, &mut context)
+        .expect_err("append preparation fails");
+    assert!(matches!(
+        error,
+        CacheError::Backend(FakeError(Operation::Prepare))
+    ));
+    assert_eq!(cache.backend().rollbacks, 5);
+    assert_eq!(cache.stats(), before);
+    assert!(context.table.is_empty());
+    cache.validate().expect("valid after preparation failure");
+
     cache.with_backend(|backend| backend.fail(Operation::Update));
     let error = cache
         .reserve_append(sequence, 12, &mut context)
@@ -602,7 +673,7 @@ fn multi_page_allocation_and_publication_failures_roll_back_every_page() {
         error,
         CacheError::Backend(FakeError(Operation::Update))
     ));
-    assert_eq!(cache.backend().rollbacks, 5);
+    assert_eq!(cache.backend().rollbacks, 8);
     assert_eq!(cache.stats(), before);
     assert!(context.table.is_empty());
     cache.validate().expect("valid after publication failure");
@@ -671,6 +742,7 @@ fn failed_abort_reclamation_preserves_every_reserved_page_for_retry() {
         .reserve_append(sequence, 10, &mut context)
         .expect("reserve three pages");
     let reserved = cache.stats();
+    let published_table = context.table.clone();
 
     cache.with_backend(|backend| backend.fail(Operation::Abort));
     let error = cache
@@ -681,7 +753,7 @@ fn failed_abort_reclamation_preserves_every_reserved_page_for_retry() {
         CacheError::Backend(FakeError(Operation::Abort))
     ));
     assert_eq!(cache.stats(), reserved);
-    assert!(context.table.is_empty());
+    assert_eq!(context.table, published_table);
     cache.validate().expect("all pending pages were restored");
 
     cache

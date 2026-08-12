@@ -586,7 +586,6 @@ impl Nemotron3AttentionLayer {
                             .sum::<usize>()
                     );
                 }
-                let q_width = self.manifest.attention_heads * self.manifest.attention_head_dim;
                 for (((pages, &row_offset), &length), sequence) in reservations
                     .iter()
                     .zip(sequence_offsets_host)
@@ -595,19 +594,25 @@ impl Nemotron3AttentionLayer {
                 {
                     for page in pages.iter() {
                         let segment = page.segment();
-                        for local in 0..segment.rows() {
-                            let token = segment.input_offset() + local;
+                        let mut processed = 0;
+                        while processed < segment.rows() {
+                            let token = segment.input_offset() + processed;
                             let flat_row = row_offset as usize + token;
-                            compact.attention_paged_offsets_into_on_stream(
+                            let position = start_positions_host[sequence] as usize + token;
+                            let chunk_rows =
+                                (segment.rows() - processed).min(16 - position % 16).min(8);
+                            compact.attention_paged_causal_rows_at_offset_into_on_stream(
                                 pool,
                                 page_table_devices[sequence],
-                                start_positions_host[sequence] as usize + token + 1,
+                                position,
                                 &workspace.query,
-                                flat_row * q_width,
+                                flat_row,
+                                chunk_rows,
+                                None,
                                 workspace.attended.output(),
-                                flat_row * q_width,
                                 stream,
                             )?;
+                            processed += chunk_rows;
                         }
                     }
                     debug_assert_eq!(

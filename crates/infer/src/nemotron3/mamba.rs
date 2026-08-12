@@ -589,3 +589,35 @@ impl Nemotron3MambaWorkspace {
             + self.output.device_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Nemotron3MambaState;
+    use nvfp4::{CudaStream, DeviceBuffer};
+
+    #[test]
+    fn mamba_checkpoint_restores_recurrent_state_after_failure() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut state = Nemotron3MambaState {
+            conv: DeviceBuffer::from_host(&[1_u16, 2]).expect("conv"),
+            ssm: DeviceBuffer::from_host(&[3_u16, 4]).expect("ssm"),
+        };
+        let checkpoint = state.checkpoint_on_stream(&stream).expect("checkpoint");
+        state
+            .conv
+            .copy_from_host(&[9_u16, 10])
+            .expect("mutate conv");
+        state.ssm.copy_from_host(&[11_u16, 12]).expect("mutate ssm");
+        state
+            .restore_checkpoint_on_stream(&checkpoint, &stream)
+            .expect("restore");
+        assert_eq!(
+            &*state.conv.copy_to_host(&stream).expect("conv read"),
+            &[1_u16, 2]
+        );
+        assert_eq!(
+            &*state.ssm.copy_to_host(&stream).expect("ssm read"),
+            &[3_u16, 4]
+        );
+    }
+}

@@ -9,7 +9,7 @@ use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::ling3::Ling3Model;
+use crate::ling3::{Ling3Model, Ling3PrefillWorkspace};
 use nvfp4::{CudaStream, Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -101,6 +101,7 @@ pub struct Ling3ChatService<'model, 'template> {
     config: SchedulerConfig,
     stream: CudaStream,
     sequence_cache: Ling3SequenceCache,
+    prefill_workspace: Ling3PrefillWorkspace,
     next_id: u64,
     waiting: VecDeque<Ling3RequestId>,
     requests: BTreeMap<Ling3RequestId, ActiveRequest<'template>>,
@@ -127,12 +128,14 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             config.max_active_sequences,
             config.max_context_tokens,
         )?;
+        let prefill_workspace = model.new_prefill_workspace(config.prefill_token_capacity)?;
         Ok(Self {
             model,
             template,
             config,
             stream,
             sequence_cache,
+            prefill_workspace,
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
@@ -352,6 +355,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             let sequence = request.sequence.as_mut().expect("request is admitted");
             self.model.prefill(
+                &mut self.prefill_workspace,
                 sequence,
                 &mut self.sequence_cache,
                 &request.prompt[start..end],

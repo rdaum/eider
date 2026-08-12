@@ -147,9 +147,21 @@ impl Nemotron3Model {
         for layer in &self.layers {
             layers.push(layer.sequence_state()?);
         }
+        let mut rollback_mamba = Vec::with_capacity(layers.len());
+        for layer in &layers {
+            rollback_mamba.push(match layer {
+                Nemotron3LayerState::Mamba { state, .. } => {
+                    Some(state.checkpoint_on_stream(&self.stream)?)
+                }
+                _ => None,
+            });
+        }
         Ok(Nemotron3DecodeState {
             hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             layers,
+            rollback_mamba,
+            rollback_tokens: 0,
+            append_pending: false,
             final_hidden: DeviceBuffer::zeroed(self.manifest.hidden_size)?,
             logits: DeviceBuffer::zeroed(self.manifest.vocab_size)?,
             next_token: DeviceBuffer::zeroed(1)?,
@@ -659,6 +671,25 @@ impl Nemotron3Model {
                 }
             }
         }
+        for index in 0..sequences.len() {
+            if let Err(error) = sequences[index].state.begin_append(&self.stream) {
+                for sequence in &mut sequences[..index] {
+                    let _ = sequence.state.abort_append(&self.stream);
+                }
+                for (sequence, reservation) in sequences.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Nemotron3CacheContext {
+                                stream: &self.stream,
+                                page_table: &mut sequence.page_table,
+                            },
+                        )
+                        .map_err(nemotron3_cache_error)?;
+                }
+                return Err(error);
+            }
+        }
         let result = {
             let mut states = Vec::with_capacity(sequences.len());
             let mut page_tables = Vec::with_capacity(sequences.len());
@@ -677,7 +708,13 @@ impl Nemotron3Model {
             )
         };
         if let Err(error) = result {
-            for (sequence, reservation) in sequences.iter_mut().zip(reservations) {
+            let mut rollback_error = None;
+            for sequence in sequences.iter_mut() {
+                if let Err(error) = sequence.state.abort_append(&self.stream) {
+                    rollback_error.get_or_insert(error);
+                }
+            }
+            for (sequence, reservation) in sequences.iter_mut().zip(reservations.drain(..)) {
                 cache
                     .abort_append(
                         reservation,
@@ -688,22 +725,47 @@ impl Nemotron3Model {
                     )
                     .map_err(nemotron3_cache_error)?;
             }
-            return Err(error);
+            return Err(rollback_error.unwrap_or(error));
         }
-        for ((sequence, reservation), chunk) in
-            sequences.iter_mut().zip(reservations).zip(token_chunks)
-        {
-            cache
-                .commit_append(
-                    reservation,
-                    chunk.len(),
-                    &mut Nemotron3CacheContext {
-                        stream: &self.stream,
-                        page_table: &mut sequence.page_table,
-                    },
-                )
-                .map_err(nemotron3_cache_error)?;
-            sequence.state.tokens += chunk.len();
+        for index in 0..sequences.len() {
+            let sequence = &mut sequences[index];
+            let rows = token_chunks[index].len();
+            if let Err(error) = cache.commit_append(
+                reservations[index].clone(),
+                rows,
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                let mut rollback_error = sequence.state.abort_append(&self.stream).err();
+                cache
+                    .abort_append(
+                        reservations[index].clone(),
+                        &mut Nemotron3CacheContext {
+                            stream: &self.stream,
+                            page_table: &mut sequence.page_table,
+                        },
+                    )
+                    .map_err(nemotron3_cache_error)?;
+                for pending in index + 1..sequences.len() {
+                    let pending_sequence = &mut sequences[pending];
+                    if let Err(error) = pending_sequence.state.abort_append(&self.stream) {
+                        rollback_error.get_or_insert(error);
+                    }
+                    cache
+                        .abort_append(
+                            reservations[pending].clone(),
+                            &mut Nemotron3CacheContext {
+                                stream: &self.stream,
+                                page_table: &mut pending_sequence.page_table,
+                            },
+                        )
+                        .map_err(nemotron3_cache_error)?;
+                }
+                return Err(rollback_error.unwrap_or_else(|| nemotron3_cache_error(error)));
+            }
+            sequence.state.commit_append(rows);
         }
         Ok(())
     }
@@ -975,7 +1037,26 @@ impl Nemotron3Model {
                 }
             }
         }
-        let result = {
+        for index in 0..sequences.len() {
+            if let Err(error) = sequences[index].state.begin_append(&self.stream) {
+                for sequence in &mut sequences[..index] {
+                    let _ = sequence.state.abort_append(&self.stream);
+                }
+                for (sequence, reservation) in sequences.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Nemotron3CacheContext {
+                                stream: &self.stream,
+                                page_table: &mut sequence.page_table,
+                            },
+                        )
+                        .map_err(nemotron3_cache_error)?;
+                }
+                return Err(error);
+            }
+        }
+        let result = (|| -> Result<Nemotron3SpeculativeResult> {
             let previous_logits = sequences
                 .iter()
                 .map(|sequence| sequence.state.logits.as_const_ptr().cast::<f32>())
@@ -999,7 +1080,7 @@ impl Nemotron3Model {
                 &page_tables,
             )?;
             self.accept_speculative_argmax(&mut states, workspace, draft_count)
-        };
+        })();
         self.finish_speculative_reservations(sequences, reservations, cache, result)
     }
 
@@ -1101,7 +1182,20 @@ impl Nemotron3Model {
                 }
             }
         }
-        let result = {
+        for index in 0..sequences.len() {
+            if let Err(error) = sequences[index].state.begin_append(&self.stream) {
+                let rollback_error = self.abort_speculative_reservations_from(
+                    sequences,
+                    &reservations,
+                    cache,
+                    0,
+                    index,
+                    reservations.len(),
+                );
+                return Err(rollback_error.unwrap_or(error));
+            }
+        }
+        let result = (|| -> Result<Nemotron3SpeculativeResult> {
             let mut states = Vec::with_capacity(sequence_count);
             let mut page_tables = Vec::with_capacity(sequence_count);
             for sequence in sequences.iter_mut() {
@@ -1119,8 +1213,39 @@ impl Nemotron3Model {
                 &page_tables,
             )?;
             self.accept_speculative_argmax(&mut states, workspace, draft_count)
-        };
+        })();
         self.finish_speculative_reservations(sequences, reservations, cache, result)
+    }
+
+    fn abort_speculative_reservations_from(
+        &self,
+        sequences: &mut [&mut Nemotron3Sequence],
+        reservations: &[sequence_cache::AppendReservation],
+        cache: &mut Nemotron3SequenceCache,
+        start: usize,
+        state_end: usize,
+        end: usize,
+    ) -> Option<Error> {
+        let mut first_error = None;
+        for index in start..end {
+            let sequence = &mut sequences[index];
+            if index < state_end
+                && sequence.state.append_pending
+                && let Err(error) = sequence.state.abort_append(&self.stream)
+            {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = cache.abort_append(
+                reservations[index].clone(),
+                &mut Nemotron3CacheContext {
+                    stream: &self.stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                first_error.get_or_insert_with(|| nemotron3_cache_error(error));
+            }
+        }
+        first_error
     }
 
     fn finish_speculative_reservations(
@@ -1133,47 +1258,63 @@ impl Nemotron3Model {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                for (sequence, reservation) in sequences.iter_mut().zip(reservations) {
-                    cache
-                        .abort_append(
-                            reservation,
-                            &mut Nemotron3CacheContext {
-                                stream: &self.stream,
-                                page_table: &mut sequence.page_table,
-                            },
-                        )
-                        .map_err(nemotron3_cache_error)?;
-                }
-                return Err(error);
+                let rollback_error = self.abort_speculative_reservations_from(
+                    sequences,
+                    &reservations,
+                    cache,
+                    0,
+                    sequences.len(),
+                    reservations.len(),
+                );
+                return Err(rollback_error.unwrap_or(error));
             }
         };
-        for ((sequence, reservation), &accepted) in sequences
-            .iter_mut()
-            .zip(reservations)
-            .zip(result.accepted_counts())
-        {
+        for index in 0..sequences.len() {
+            let accepted = result.accepted_counts()[index];
             if accepted == 0 {
-                cache
-                    .abort_append(
-                        reservation,
-                        &mut Nemotron3CacheContext {
-                            stream: &self.stream,
-                            page_table: &mut sequence.page_table,
-                        },
-                    )
-                    .map_err(nemotron3_cache_error)?;
+                if let Some(error) = self.abort_speculative_reservations_from(
+                    sequences,
+                    &reservations,
+                    cache,
+                    index,
+                    index + 1,
+                    index + 1,
+                ) {
+                    let _ = self.abort_speculative_reservations_from(
+                        sequences,
+                        &reservations,
+                        cache,
+                        index + 1,
+                        sequences.len(),
+                        reservations.len(),
+                    );
+                    return Err(error);
+                }
             } else {
-                cache
-                    .commit_append(
-                        reservation,
-                        accepted as usize,
-                        &mut Nemotron3CacheContext {
-                            stream: &self.stream,
-                            page_table: &mut sequence.page_table,
-                        },
-                    )
-                    .map_err(nemotron3_cache_error)?;
-                sequence.state.tokens += accepted as usize;
+                let sequence = &mut sequences[index];
+                let reservation = &reservations[index];
+                if let Err(error) = cache.commit_append(
+                    reservation.clone(),
+                    accepted as usize,
+                    &mut Nemotron3CacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                ) {
+                    let state_error = sequence.state.abort_append(&self.stream).err();
+                    let rollback_error = self.abort_speculative_reservations_from(
+                        sequences,
+                        &reservations,
+                        cache,
+                        index,
+                        sequences.len(),
+                        reservations.len(),
+                    );
+                    return Err(state_error
+                        .or(rollback_error)
+                        .unwrap_or_else(|| nemotron3_cache_error(error)));
+                }
+                sequence.state.commit_append(accepted as usize);
             }
         }
         Ok(result)
@@ -1575,14 +1716,7 @@ impl Nemotron3Model {
                 },
             )
             .map_err(nemotron3_cache_error)?;
-        let result = self.forward_one_reserved(
-            &mut sequence.state,
-            cache,
-            &reservation,
-            sequence.page_table.device(),
-            token,
-        );
-        if let Err(error) = result {
+        if let Err(error) = sequence.state.begin_append(&self.stream) {
             cache
                 .abort_append(
                     reservation,
@@ -1594,17 +1728,47 @@ impl Nemotron3Model {
                 .map_err(nemotron3_cache_error)?;
             return Err(error);
         }
-        cache
-            .commit_append(
-                reservation,
-                1,
-                &mut Nemotron3CacheContext {
-                    stream: &self.stream,
-                    page_table: &mut sequence.page_table,
-                },
-            )
-            .map_err(nemotron3_cache_error)?;
-        sequence.state.tokens += 1;
+        let result = self.forward_one_reserved(
+            &mut sequence.state,
+            cache,
+            &reservation,
+            sequence.page_table.device(),
+            token,
+        );
+        if let Err(error) = result {
+            let state_error = sequence.state.abort_append(&self.stream).err();
+            cache
+                .abort_append(
+                    reservation.clone(),
+                    &mut Nemotron3CacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(nemotron3_cache_error)?;
+            return Err(state_error.unwrap_or(error));
+        }
+        if let Err(error) = cache.commit_append(
+            reservation.clone(),
+            1,
+            &mut Nemotron3CacheContext {
+                stream: &self.stream,
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            let state_error = sequence.state.abort_append(&self.stream).err();
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Nemotron3CacheContext {
+                        stream: &self.stream,
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(nemotron3_cache_error)?;
+            return Err(state_error.unwrap_or_else(|| nemotron3_cache_error(error)));
+        }
+        sequence.state.commit_append(1);
         Ok(())
     }
 
@@ -2230,6 +2394,9 @@ impl sequence_cache::RetainedSnapshot for Nemotron3SequenceSnapshot {
 pub(crate) struct Nemotron3DecodeState {
     hidden: DeviceBuffer<f32>,
     layers: Vec<Nemotron3LayerState>,
+    rollback_mamba: Vec<Option<Nemotron3MambaState>>,
+    rollback_tokens: usize,
+    append_pending: bool,
     final_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     next_token: DeviceBuffer<u32>,
@@ -2254,6 +2421,12 @@ impl Nemotron3DecodeState {
                 .iter()
                 .map(Nemotron3LayerState::device_bytes)
                 .sum::<usize>()
+            + self
+                .rollback_mamba
+                .iter()
+                .flatten()
+                .map(Nemotron3MambaState::device_bytes)
+                .sum::<usize>()
             + self.final_hidden.device_bytes()
             + self.logits.device_bytes()
             + self.next_token.device_bytes()
@@ -2267,5 +2440,55 @@ impl Nemotron3DecodeState {
 
     fn max_tokens(&self) -> Result<usize> {
         Ok(self.max_tokens)
+    }
+
+    fn begin_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.append_pending {
+            return Err(Error::Format {
+                label: "Nemotron 3 recurrent transaction",
+                detail: "an append transaction is already pending".to_string(),
+            });
+        }
+        for (layer, rollback) in self.layers.iter().zip(&mut self.rollback_mamba) {
+            match (layer, rollback) {
+                (Nemotron3LayerState::Mamba { state, .. }, Some(rollback)) => {
+                    rollback.restore_checkpoint_on_stream(state, stream)?;
+                }
+                (Nemotron3LayerState::Moe(_), None)
+                | (Nemotron3LayerState::Attention { .. }, None) => {}
+                _ => unreachable!("Nemotron recurrent rollback topology matches active state"),
+            }
+        }
+        self.rollback_tokens = self.tokens;
+        self.append_pending = true;
+        Ok(())
+    }
+
+    fn commit_append(&mut self, rows: usize) {
+        assert!(self.append_pending, "Nemotron recurrent append is pending");
+        self.tokens = self.rollback_tokens + rows;
+        self.append_pending = false;
+    }
+
+    fn abort_append(&mut self, stream: &CudaStream) -> Result<()> {
+        if !self.append_pending {
+            return Err(Error::Format {
+                label: "Nemotron 3 recurrent transaction",
+                detail: "no append transaction is pending".to_string(),
+            });
+        }
+        for (layer, rollback) in self.layers.iter_mut().zip(&self.rollback_mamba) {
+            match (layer, rollback) {
+                (Nemotron3LayerState::Mamba { state, .. }, Some(rollback)) => {
+                    state.restore_checkpoint_on_stream(rollback, stream)?;
+                }
+                (Nemotron3LayerState::Moe(_), None)
+                | (Nemotron3LayerState::Attention { .. }, None) => {}
+                _ => unreachable!("Nemotron recurrent rollback topology matches active state"),
+            }
+        }
+        self.tokens = self.rollback_tokens;
+        self.append_pending = false;
+        Ok(())
     }
 }

@@ -3200,6 +3200,25 @@ fn reserve_model_rows(
             }
         }
     }
+    for index in 0..rows.len() {
+        if let Err(error) = rows[index].sequence.state.begin_append(stream) {
+            for row in &mut rows[..index] {
+                let _ = row.sequence.state.abort_append(stream);
+            }
+            for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Deepseek4CacheContext {
+                            stream,
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(deepseek4_cache_error)?;
+            }
+            return Err(error);
+        }
+    }
     Ok(reservations)
 }
 
@@ -3209,6 +3228,12 @@ fn abort_model_rows(
     cache: &mut Deepseek4SequenceCache,
     stream: &CudaStream,
 ) -> Result<()> {
+    let mut rollback_error = None;
+    for row in rows.iter_mut() {
+        if let Err(error) = row.sequence.state.abort_append(stream) {
+            rollback_error.get_or_insert(error);
+        }
+    }
     for (row, reservation) in rows.iter_mut().zip(reservations) {
         cache
             .abort_append(
@@ -3220,7 +3245,7 @@ fn abort_model_rows(
             )
             .map_err(deepseek4_cache_error)?;
     }
-    Ok(())
+    rollback_error.map_or(Ok(()), Err)
 }
 
 fn commit_model_rows(
@@ -3229,19 +3254,45 @@ fn commit_model_rows(
     cache: &mut Deepseek4SequenceCache,
     stream: &CudaStream,
 ) -> Result<()> {
-    for (row, reservation) in rows.iter_mut().zip(reservations) {
+    for index in 0..rows.len() {
+        let row = &mut rows[index];
         let appended = row.token_ids.len();
-        cache
-            .commit_append(
-                reservation,
-                appended,
-                &mut Deepseek4CacheContext {
-                    stream,
-                    page_table: &mut row.sequence.page_table,
-                },
-            )
-            .map_err(deepseek4_cache_error)?;
-        row.sequence.state.advance(appended)?;
+        if let Err(error) = cache.commit_append(
+            reservations[index].clone(),
+            appended,
+            &mut Deepseek4CacheContext {
+                stream,
+                page_table: &mut row.sequence.page_table,
+            },
+        ) {
+            let mut rollback_error = row.sequence.state.abort_append(stream).err();
+            cache
+                .abort_append(
+                    reservations[index].clone(),
+                    &mut Deepseek4CacheContext {
+                        stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(deepseek4_cache_error)?;
+            for pending in index + 1..rows.len() {
+                let pending_row = &mut rows[pending];
+                if let Err(error) = pending_row.sequence.state.abort_append(stream) {
+                    rollback_error.get_or_insert(error);
+                }
+                cache
+                    .abort_append(
+                        reservations[pending].clone(),
+                        &mut Deepseek4CacheContext {
+                            stream,
+                            page_table: &mut pending_row.sequence.page_table,
+                        },
+                    )
+                    .map_err(deepseek4_cache_error)?;
+            }
+            return Err(rollback_error.unwrap_or_else(|| deepseek4_cache_error(error)));
+        }
+        row.sequence.state.commit_append(appended);
     }
     Ok(())
 }

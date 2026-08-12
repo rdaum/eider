@@ -51,7 +51,9 @@ mod index;
 mod manager;
 mod metrics;
 
-pub use backend::{PageAllocation, PageBackend, RetireError, RetireOutcome};
+pub use backend::{
+    BackendAppendCommit, BackendAppendPage, PageAllocation, PageBackend, RetireError, RetireOutcome,
+};
 pub use error::{CacheError, ConfigError, Result};
 pub use manager::{
     AdmissionOutcome, AdmissionRequest, AppendPage, AppendPages, AppendReservation,

@@ -1,6 +1,7 @@
 //! Ternary Bonsai dense Qwen3 inference from mainline `Q2_0_g64` GGUF files.
 
 use crate::gguf::{GgufIndex, GgufValue};
+use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::runtime::bonsai_sequence_cache::{
     BonsaiSequence, BonsaiSequenceCache, bonsai_cache_error,
 };
@@ -216,6 +217,7 @@ pub struct BonsaiPrefillWorkspace {
     gate_up_activation: TernaryG64ActivationWorkspace,
     down_activation: TernaryG64ActivationWorkspace,
     compact_attention: Sm12xKvAttentionWorkspace,
+    tensor_attention: Option<PagedTensorCorePrefillAttention>,
     tensor_prefill: Option<BonsaiTensorPrefillWorkspace>,
 }
 
@@ -971,6 +973,16 @@ impl BonsaiPrefillWorkspace {
                 config.head_dim,
                 16,
             )?,
+            tensor_attention: (rows >= 64)
+                .then(|| {
+                    PagedTensorCorePrefillAttention::new(
+                        rows,
+                        config.q_heads,
+                        config.kv_heads,
+                        config.head_dim,
+                    )
+                })
+                .transpose()?,
             tensor_prefill,
         })
     }
@@ -1087,32 +1099,59 @@ impl BonsaiPrefillWorkspace {
             rope_attention_scale,
             stream,
         )?;
-        let q_width = config.q_width();
-        let kv_width = config.kv_width();
         for page in pages.iter() {
             let segment = page.segment();
-            for local_row in 0..segment.rows() {
-                let token = segment.input_offset() + local_row;
-                pool.append_at_offsets_on_stream(
+            let mut processed = 0;
+            while processed < segment.rows() {
+                let token = segment.input_offset() + processed;
+                let position = start_position + token;
+                let chunk_rows = (segment.rows() - processed).min(16 - position % 16);
+                pool.append_rows_at_offset_on_stream(
                     page.page().slot(),
-                    segment.page_offset() + local_row,
+                    segment.page_offset() + processed,
                     &self.k,
-                    token * kv_width,
                     &self.v,
-                    token * kv_width,
+                    token,
+                    chunk_rows,
                     stream,
                 )?;
-                self.compact_attention
-                    .attention_paged_offsets_into_on_stream(
-                        pool,
-                        page_table,
-                        start_position + token + 1,
-                        &self.q,
-                        token * q_width,
-                        self.attention.output(),
-                        token * q_width,
-                        stream,
-                    )?;
+                processed += chunk_rows;
+            }
+        }
+        if let Some(tensor_attention) = &mut self.tensor_attention {
+            tensor_attention.run(
+                pool,
+                page_table,
+                start_position,
+                &self.q,
+                0,
+                self.rows,
+                None,
+                &mut self.attention,
+                stream,
+            )?;
+        } else {
+            for page in pages.iter() {
+                let segment = page.segment();
+                let mut processed = 0;
+                while processed < segment.rows() {
+                    let token = segment.input_offset() + processed;
+                    let position = start_position + token;
+                    let chunk_rows = (segment.rows() - processed).min(16 - position % 16);
+                    self.compact_attention
+                        .attention_paged_causal_rows_at_offset_into_on_stream(
+                            pool,
+                            page_table,
+                            position,
+                            &self.q,
+                            token,
+                            chunk_rows,
+                            None,
+                            self.attention.output(),
+                            stream,
+                        )?;
+                    processed += chunk_rows;
+                }
             }
         }
         if let Some(prefill) = &mut self.tensor_prefill {
@@ -1278,6 +1317,10 @@ impl BonsaiPrefillWorkspace {
             + self.gate_up_activation.device_bytes()
             + self.down_activation.device_bytes()
             + self.compact_attention.device_bytes()
+            + self
+                .tensor_attention
+                .as_ref()
+                .map_or(0, PagedTensorCorePrefillAttention::device_bytes)
             + self
                 .tensor_prefill
                 .as_ref()

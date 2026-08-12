@@ -11,6 +11,58 @@ use crate::format;
 use crate::matrix::{Bf16Matrix, Nvfp4Matrix};
 use std::mem::size_of;
 
+/// Builds a pointer table in stream order, repeating each input row `repeats` times.
+pub fn repeat_row_pointer_table_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut table: DeviceOutput<'_, *const f32>,
+    routes: usize,
+    repeats: usize,
+    row_stride: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let rows = routes
+        .checked_div(repeats)
+        .filter(|_| routes.checked_rem(repeats) == Some(0));
+    if routes == 0
+        || repeats == 0
+        || row_stride == 0
+        || routes > u32::MAX as usize
+        || repeats > u32::MAX as usize
+        || row_stride > u32::MAX as usize
+        || rows.is_none_or(|rows| input.len() < rows.saturating_mul(row_stride))
+        || table.len() < routes
+    {
+        return Err(Error::Shape {
+            label: "repeated row pointer table",
+            expected: format!(
+                "routes divisible by repeats, input>={} and table>={routes}",
+                routes
+                    .checked_div(repeats)
+                    .unwrap_or_default()
+                    .saturating_mul(row_stride)
+            ),
+            actual: format!(
+                "routes={routes} repeats={repeats} row_stride={row_stride} input={} table={}",
+                input.len(),
+                table.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_repeat_row_pointer_table_f32_on_stream",
+            ffi::infer_repeat_row_pointer_table_f32_on_stream(
+                input.ptr,
+                table.buffer_mut().ptr,
+                routes as u32,
+                repeats as u32,
+                row_stride as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues row-wise RMSNorm into an existing output buffer on `stream`.
 pub fn rms_norm_f32_into_on_stream(
     rows: usize,
@@ -959,22 +1011,37 @@ pub fn sigmoid_mul_f32_prefix_into_on_stream(
 pub fn sigmoid_scale_heads_f32_into_on_stream(
     gate: &DeviceBuffer<f32>,
     input: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
+    output: DeviceOutput<'_, f32>,
     head_dim: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    sigmoid_scale_heads_f32_prefix_into_on_stream(gate, input, output, gate.len(), head_dim, stream)
+}
+
+/// Broadcasts an active prefix of sigmoid head gates across their head dimension.
+pub fn sigmoid_scale_heads_f32_prefix_into_on_stream(
+    gate: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    heads: usize,
+    head_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = heads.saturating_mul(head_dim);
     if gate.is_empty()
+        || heads == 0
         || head_dim == 0
-        || input.len() != gate.len() * head_dim
-        || output.len() != input.len()
-        || gate.len() > u32::MAX as usize
+        || gate.len() < heads
+        || input.len() < len
+        || output.len() < len
+        || heads > u32::MAX as usize
         || head_dim > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "sigmoid head-gate buffers",
-            expected: "input/output=heads*head_dim with one gate per head".to_string(),
+            expected: format!("gate>={heads} input/output>={len}"),
             actual: format!(
-                "gate={} input={} output={} head_dim={head_dim}",
+                "gate={} input={} output={} heads={heads} head_dim={head_dim}",
                 gate.len(),
                 input.len(),
                 output.len()
@@ -988,7 +1055,7 @@ pub fn sigmoid_scale_heads_f32_into_on_stream(
                 gate.ptr,
                 input.ptr,
                 output.buffer_mut().ptr,
-                gate.len() as u32,
+                heads as u32,
                 head_dim as u32,
                 stream.as_raw(),
             ),
@@ -2800,25 +2867,52 @@ pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
     route_weights: &DeviceBuffer<f32>,
     inputs: &DeviceBuffer<*const f32>,
     alpha_table: &DeviceBuffer<f32>,
-    mut output: DeviceInOut<'_, f32>,
+    output: DeviceInOut<'_, f32>,
     rows: usize,
     groups: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    let routes = rows.saturating_mul(groups);
     let len = output.len().checked_div(rows).unwrap_or(0);
+    moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        len,
+        stream,
+    )
+}
+
+/// Writes a weighted sum for an active prefix of dense rows.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<*const f32>,
+    alpha_table: &DeviceBuffer<f32>,
+    mut output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = rows.saturating_mul(groups);
+    let output_len = rows.saturating_mul(len);
     if rows == 0
         || groups == 0
         || len == 0
-        || output.len() != rows.saturating_mul(len)
-        || indices.len() != routes
-        || route_weights.len() != routes
-        || inputs.len() != routes
+        || output.len() < output_len
+        || indices.len() < routes
+        || route_weights.len() < routes
+        || inputs.len() < routes
         || alpha_table.is_empty()
         || rows > u32::MAX as usize
         || len > u32::MAX as usize
         || groups > u32::MAX as usize
-        || output.len() > u32::MAX as usize
+        || output_len > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "batched MoE weighted slot accumulate",
@@ -9663,7 +9757,34 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
     in_features: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    let groups = indices.len();
+    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+        indices,
+        input_table,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        indices.len(),
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
+/// Enqueues an active prefix of device-routed grouped W4A16 matvecs.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input_table: &DeviceBuffer<*const f32>,
+    packed_weight_table: &DeviceBuffer<*const u8>,
+    weight_scale_table: &DeviceBuffer<*const u8>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<*mut f32>,
+    groups: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let table_len = packed_weight_table.len();
     let shared_memory_bytes = in_features
         .checked_mul(std::mem::size_of::<f32>())
@@ -9674,10 +9795,11 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
         })?;
     if groups == 0
         || table_len == 0
-        || input_table.len() != groups
+        || indices.len() < groups
+        || input_table.len() < groups
         || weight_scale_table.len() != table_len
         || weight_scale_2_table.len() != table_len
-        || output_table.len() != groups
+        || output_table.len() < groups
         || out_features == 0
         || in_features == 0
         || !in_features.is_multiple_of(16)
@@ -9997,6 +10119,146 @@ pub fn ling3_kda_prep_into_on_stream(
 
 /// Applies Qwen3.6 convolution/GDN preparation to a changing sequence batch.
 /// `state_table_offset` selects the first row from a larger state-pointer table.
+/// Applies Ling 3 convolution and Q/K normalization to ragged prompt chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_prep_chunks_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    conv_state_table: &DeviceBuffer<*mut f32>,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    sequence_count: usize,
+    total_tokens: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let width = heads.saturating_mul(128);
+    let conv_width = width.saturating_mul(3);
+    let values = total_tokens.saturating_mul(width);
+    if sequence_count == 0
+        || total_tokens == 0
+        || heads == 0
+        || [sequence_count, total_tokens, heads]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || qkv.len() != total_tokens.saturating_mul(conv_width)
+        || conv_weight_bf16.len() != conv_width.saturating_mul(4)
+        || q.len() != values
+        || k.len() != values
+        || v.len() != values
+        || conv_state_table.len() < sequence_count
+        || sequence_offsets.len() < sequence_count
+        || sequence_lengths.len() < sequence_count
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 chunked KDA preparation buffers",
+            expected: format!(
+                "qkv={} weight={} q/k/v={values} state/metadata>={sequence_count}",
+                total_tokens.saturating_mul(conv_width),
+                conv_width.saturating_mul(4)
+            ),
+            actual: format!(
+                "qkv={} weight={} q={} k={} v={} states={} offsets={} lengths={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_prep_chunks_on_stream",
+            ffi::infer_ling3_kda_prep_chunks_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state_table.ptr,
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                sequence_count as u32,
+                total_tokens as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies Ling 3 convolution and Q/K normalisation to one contiguous prompt.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_prep_rows_into_on_stream(
+    qkv: &DeviceBuffer<f32>,
+    conv_weight_bf16: &DeviceBuffer<u16>,
+    mut q: DeviceOutput<'_, f32>,
+    mut k: DeviceOutput<'_, f32>,
+    mut v: DeviceOutput<'_, f32>,
+    mut conv_state: DeviceInOut<'_, f32>,
+    rows: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let projection = heads.saturating_mul(128);
+    let conv_width = projection.saturating_mul(3);
+    let values = rows.saturating_mul(projection);
+    if rows == 0
+        || heads == 0
+        || rows > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || qkv.len() != rows.saturating_mul(conv_width)
+        || conv_weight_bf16.len() != conv_width.saturating_mul(4)
+        || q.len() != values
+        || k.len() != values
+        || v.len() != values
+        || conv_state.len() != conv_width.saturating_mul(3)
+    {
+        return Err(Error::Shape {
+            label: "Ling 3 contiguous KDA preparation buffers",
+            expected: format!(
+                "qkv={} weight={} q/k/v={values} state={}",
+                rows.saturating_mul(conv_width),
+                conv_width.saturating_mul(4),
+                conv_width.saturating_mul(3)
+            ),
+            actual: format!(
+                "qkv={} weight={} q={} k={} v={} state={}",
+                qkv.len(),
+                conv_weight_bf16.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                conv_state.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_prep_rows_on_stream",
+            ffi::infer_ling3_kda_prep_rows_on_stream(
+                qkv.ptr,
+                conv_weight_bf16.ptr,
+                q.buffer_mut().ptr,
+                k.buffer_mut().ptr,
+                v.buffer_mut().ptr,
+                conv_state.buffer_mut().ptr,
+                rows as u32,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies one-token Qwen3.6 GDN preparation to a changing decode batch.
 #[allow(clippy::too_many_arguments)]
 pub fn qwen36_gdn_prep_batch_into_on_stream(
     qkv: &DeviceBuffer<f32>,
@@ -10431,6 +10693,69 @@ pub fn ling3_kda_gate_f32_into_on_stream(
     }
 }
 
+/// Computes Ling 3 KDA gates for a dense prompt block.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_gate_f32_batch_into_on_stream(
+    raw_gate: &DeviceBuffer<f32>,
+    beta_input: &DeviceBuffer<f32>,
+    a_log: &DeviceBuffer<f32>,
+    dt_bias: &DeviceBuffer<f32>,
+    mut gate: DeviceOutput<'_, f32>,
+    mut beta: DeviceOutput<'_, f32>,
+    rows: usize,
+    heads: usize,
+    lower_bound: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let width = heads.saturating_mul(128);
+    let vectors = rows.saturating_mul(width);
+    let scalars = rows.saturating_mul(heads);
+    if rows == 0
+        || heads == 0
+        || rows > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || raw_gate.len() != vectors
+        || beta_input.len() != scalars
+        || a_log.len() != heads
+        || dt_bias.len() != width
+        || gate.len() != vectors
+        || beta.len() != scalars
+        || !lower_bound.is_finite()
+        || lower_bound >= 0.0
+    {
+        return Err(Error::Shape {
+            label: "batched Ling 3 KDA gate buffers",
+            expected: format!("vectors={vectors} scalars={scalars} heads={heads}"),
+            actual: format!(
+                "raw_gate={} beta_input={} a_log={} dt_bias={} gate={} beta={} rows={rows} heads={heads}",
+                raw_gate.len(),
+                beta_input.len(),
+                a_log.len(),
+                dt_bias.len(),
+                gate.len(),
+                beta.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_gate_f32_batch_on_stream",
+            ffi::infer_ling3_kda_gate_f32_batch_on_stream(
+                raw_gate.ptr,
+                beta_input.ptr,
+                a_log.ptr,
+                dt_bias.ptr,
+                gate.buffer_mut().ptr,
+                beta.buffer_mut().ptr,
+                rows as u32,
+                heads as u32,
+                lower_bound,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Advances one Ling 3 KDA token with `[head,key,value]` FP32 state.
 #[allow(clippy::too_many_arguments)]
 pub fn ling3_kda_128_f32_into_on_stream(
@@ -10482,6 +10807,69 @@ pub fn ling3_kda_128_f32_into_on_stream(
                 beta.ptr,
                 state.buffer_mut().ptr,
                 output.buffer_mut().ptr,
+                heads as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Advances one Ling 3 KDA state through a dense prompt block in token order.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_kda_128_f32_chunks_into_on_stream(
+    q: &DeviceBuffer<f32>,
+    k: &DeviceBuffer<f32>,
+    v: &DeviceBuffer<f32>,
+    gate: &DeviceBuffer<f32>,
+    beta: &DeviceBuffer<f32>,
+    mut state: DeviceInOut<'_, f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    heads: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let width = heads.saturating_mul(128);
+    let vectors = rows.saturating_mul(width);
+    let state_len = width.saturating_mul(128);
+    if rows == 0
+        || heads == 0
+        || rows > u32::MAX as usize
+        || heads > u32::MAX as usize
+        || q.len() != vectors
+        || k.len() != vectors
+        || v.len() != vectors
+        || gate.len() != vectors
+        || beta.len() != rows.saturating_mul(heads)
+        || state.len() != state_len
+        || output.len() != vectors
+    {
+        return Err(Error::Shape {
+            label: "chunked Ling 3 KDA buffers",
+            expected: format!("q/k/v/gate/output={vectors} state={state_len}"),
+            actual: format!(
+                "q={} k={} v={} gate={} beta={} state={} output={} rows={rows} heads={heads}",
+                q.len(),
+                k.len(),
+                v.len(),
+                gate.len(),
+                beta.len(),
+                state.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_kda_128_f32_chunks_on_stream",
+            ffi::infer_ling3_kda_128_f32_chunks_on_stream(
+                q.ptr,
+                k.ptr,
+                v.ptr,
+                gate.ptr,
+                beta.ptr,
+                state.buffer_mut().ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
                 heads as u32,
                 stream.as_raw(),
             ),
@@ -10601,6 +10989,131 @@ pub fn ling3_mla_pack_f32_into_on_stream(
                 query.buffer_mut().ptr,
                 key.buffer_mut().ptr,
                 value.buffer_mut().ptr,
+                heads as u32,
+                qk_nope_dim as u32,
+                rope_dim as u32,
+                value_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Splits batched Ling MLA compressed-KV and shared-RoPE projections.
+pub fn ling3_mla_split_kv_a_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut compressed: DeviceOutput<'_, f32>,
+    mut rope: DeviceOutput<'_, f32>,
+    rows: usize,
+    compressed_dim: usize,
+    rope_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = rows.saturating_mul(compressed_dim.saturating_add(rope_dim));
+    let compressed_len = rows.saturating_mul(compressed_dim);
+    let rope_len = rows.saturating_mul(rope_dim);
+    if rows == 0
+        || compressed_dim == 0
+        || rope_dim == 0
+        || [rows, compressed_dim, rope_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || input.len() < input_len
+        || compressed.len() < compressed_len
+        || rope.len() < rope_len
+    {
+        return Err(Error::Shape {
+            label: "batched Ling 3 MLA KV-A split",
+            expected: format!("input>={input_len} compressed>={compressed_len} rope>={rope_len}"),
+            actual: format!(
+                "input={} compressed={} rope={} rows={rows}",
+                input.len(),
+                compressed.len(),
+                rope.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_split_kv_a_f32_on_stream",
+            ffi::infer_ling3_mla_split_kv_a_f32_on_stream(
+                input.ptr,
+                compressed.buffer_mut().ptr,
+                rope.buffer_mut().ptr,
+                rows as u32,
+                compressed_dim as u32,
+                rope_dim as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Packs batched Ling MLA projections into per-head query, key, and value rows.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_mla_pack_f32_batch_into_on_stream(
+    query_projection: &DeviceBuffer<f32>,
+    kv_projection: &DeviceBuffer<f32>,
+    shared_rope_key: &DeviceBuffer<f32>,
+    mut query: DeviceOutput<'_, f32>,
+    mut key: DeviceOutput<'_, f32>,
+    mut value: DeviceOutput<'_, f32>,
+    rows: usize,
+    heads: usize,
+    qk_nope_dim: usize,
+    rope_dim: usize,
+    value_dim: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let qk_dim = qk_nope_dim.saturating_add(rope_dim);
+    let qk_len = rows.saturating_mul(heads).saturating_mul(qk_dim);
+    let value_len = rows.saturating_mul(heads).saturating_mul(value_dim);
+    let kv_len = rows
+        .saturating_mul(heads)
+        .saturating_mul(qk_nope_dim.saturating_add(value_dim));
+    let rope_len = rows.saturating_mul(rope_dim);
+    if rows == 0
+        || heads == 0
+        || qk_nope_dim == 0
+        || rope_dim == 0
+        || value_dim == 0
+        || [rows, heads, qk_nope_dim, rope_dim, value_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query_projection.len() < qk_len
+        || kv_projection.len() < kv_len
+        || shared_rope_key.len() < rope_len
+        || query.len() < qk_len
+        || key.len() < qk_len
+        || value.len() < value_len
+    {
+        return Err(Error::Shape {
+            label: "batched Ling 3 MLA projection packing",
+            expected: format!(
+                "query>={qk_len} kv>={kv_len} rope>={rope_len} key>={qk_len} value>={value_len}"
+            ),
+            actual: format!(
+                "query_projection={} kv_projection={} rope={} query={} key={} value={} rows={rows} heads={heads}",
+                query_projection.len(),
+                kv_projection.len(),
+                shared_rope_key.len(),
+                query.len(),
+                key.len(),
+                value.len(),
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_pack_f32_batch_on_stream",
+            ffi::infer_ling3_mla_pack_f32_batch_on_stream(
+                query_projection.ptr,
+                kv_projection.ptr,
+                shared_rope_key.ptr,
+                query.buffer_mut().ptr,
+                key.buffer_mut().ptr,
+                value.buffer_mut().ptr,
+                rows as u32,
                 heads as u32,
                 qk_nope_dim as u32,
                 rope_dim as u32,
@@ -10738,6 +11251,84 @@ pub fn ling3_mla_paged_attention_f32_into_on_stream(
                 page_table.ptr,
                 output.buffer_mut().ptr,
                 cache_len as u32,
+                page_tokens as u32,
+                heads as u32,
+                qk_dim as u32,
+                value_dim as u32,
+                scale,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Computes causal Ling MLA attention for a row chunk over physical F32 KV pages.
+#[allow(clippy::too_many_arguments)]
+pub fn ling3_mla_paged_causal_rows_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    key_pool: &DeviceBuffer<f32>,
+    value_pool: &DeviceBuffer<f32>,
+    page_table: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    start_position: usize,
+    rows: usize,
+    page_tokens: usize,
+    heads: usize,
+    qk_dim: usize,
+    value_dim: usize,
+    scale: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let qk_width = heads.saturating_mul(qk_dim);
+    let value_width = heads.saturating_mul(value_dim);
+    let query_len = rows.saturating_mul(qk_width);
+    let output_len = rows.saturating_mul(value_width);
+    let cache_len = start_position.saturating_add(rows);
+    let pages = cache_len.div_ceil(page_tokens.max(1));
+    if rows == 0
+        || page_tokens == 0
+        || heads == 0
+        || qk_dim == 0
+        || qk_dim > 512
+        || value_dim == 0
+        || value_dim > 256
+        || [start_position, rows, page_tokens, heads, qk_dim, value_dim]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || query.len() < query_len
+        || !key_pool.len().is_multiple_of(page_tokens * qk_width)
+        || !value_pool.len().is_multiple_of(page_tokens * value_width)
+        || page_table.len() < pages
+        || output.len() < output_len
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "batched causal Ling 3 paged MLA attention",
+            expected: format!(
+                "query>={query_len} aligned pools table>={pages} output>={output_len}"
+            ),
+            actual: format!(
+                "query={} keys={} values={} table={} output={} start={start_position} rows={rows} page={page_tokens}",
+                query.len(),
+                key_pool.len(),
+                value_pool.len(),
+                page_table.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_ling3_mla_paged_causal_rows_f32_on_stream",
+            ffi::infer_ling3_mla_paged_causal_rows_f32_on_stream(
+                query.ptr,
+                key_pool.ptr,
+                value_pool.ptr,
+                page_table.ptr,
+                output.buffer_mut().ptr,
+                start_position as u32,
+                rows as u32,
                 page_tokens as u32,
                 heads as u32,
                 qk_dim as u32,
@@ -16640,6 +17231,177 @@ mod tests {
     }
 
     #[test]
+    fn ling3_chunked_gate_and_recurrence_match_repeated_tokens() {
+        const ROWS: usize = 3;
+        const HEADS: usize = 2;
+        let width = HEADS * 128;
+        let state_len = width * 128;
+        let q = (0..ROWS * width)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.003)
+            .collect::<Vec<_>>();
+        let k = (0..ROWS * width)
+            .map(|index| ((index * 13 % 103) as f32 - 51.0) * 0.0025)
+            .collect::<Vec<_>>();
+        let v = (0..ROWS * width)
+            .map(|index| ((index * 19 % 107) as f32 - 53.0) * 0.004)
+            .collect::<Vec<_>>();
+        let raw_gate = (0..ROWS * width)
+            .map(|index| ((index * 23 % 109) as f32 - 54.0) * 0.006)
+            .collect::<Vec<_>>();
+        let beta_input = (0..ROWS * HEADS)
+            .map(|index| index as f32 * 0.25 - 0.5)
+            .collect::<Vec<_>>();
+        let a_log = vec![-0.5f32, 0.35];
+        let dt_bias = (0..width)
+            .map(|index| ((index * 29 % 113) as f32 - 56.0) * 0.005)
+            .collect::<Vec<_>>();
+        let initial_state = (0..state_len)
+            .map(|index| ((index * 31 % 127) as f32 - 63.0) * 0.0005)
+            .collect::<Vec<_>>();
+        let lower_bound = -5.0f32;
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let q = DeviceBuffer::from_host(&q).expect("Q");
+        let k = DeviceBuffer::from_host(&k).expect("K");
+        let v = DeviceBuffer::from_host(&v).expect("V");
+        let raw_gate = DeviceBuffer::from_host(&raw_gate).expect("raw gate");
+        let beta_input = DeviceBuffer::from_host(&beta_input).expect("beta input");
+        let a_log = DeviceBuffer::from_host(&a_log).expect("A log");
+        let dt_bias = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
+
+        let mut chunk_gate = DeviceBuffer::zeroed(ROWS * width).expect("chunk gate");
+        let mut chunk_beta = DeviceBuffer::zeroed(ROWS * HEADS).expect("chunk beta");
+        ling3_kda_gate_f32_batch_into_on_stream(
+            &raw_gate,
+            &beta_input,
+            &a_log,
+            &dt_bias,
+            chunk_gate.output(),
+            chunk_beta.output(),
+            ROWS,
+            HEADS,
+            lower_bound,
+            &stream,
+        )
+        .expect("chunk gate");
+        let mut chunk_state = DeviceBuffer::from_host(&initial_state).expect("chunk state");
+        let mut chunk_output = DeviceBuffer::zeroed(ROWS * width).expect("chunk output");
+        ling3_kda_128_f32_chunks_into_on_stream(
+            &q,
+            &k,
+            &v,
+            &chunk_gate,
+            &chunk_beta,
+            chunk_state.inout(),
+            chunk_output.output(),
+            ROWS,
+            HEADS,
+            &stream,
+        )
+        .expect("chunk recurrence");
+
+        let gate_host = chunk_gate.copy_to_host(&stream).expect("gate read");
+        let beta_host = chunk_beta.copy_to_host(&stream).expect("beta read");
+        let q_host = q.copy_to_host(&stream).expect("Q read");
+        let k_host = k.copy_to_host(&stream).expect("K read");
+        let v_host = v.copy_to_host(&stream).expect("V read");
+        let mut expected_state = initial_state;
+        let mut expected_output = Vec::with_capacity(ROWS * width);
+        let mut repeated_state = DeviceBuffer::from_host(&expected_state).expect("repeated state");
+        let mut repeated_output = Vec::with_capacity(ROWS * width);
+        for row in 0..ROWS {
+            let raw_gate_row = DeviceBuffer::from_host(
+                &raw_gate.copy_to_host(&stream).unwrap()[row * width..(row + 1) * width],
+            )
+            .expect("raw gate row");
+            let beta_input_row = DeviceBuffer::from_host(
+                &beta_input.copy_to_host(&stream).unwrap()[row * HEADS..(row + 1) * HEADS],
+            )
+            .expect("beta input row");
+            let mut scalar_gate = DeviceBuffer::zeroed(width).expect("scalar gate");
+            let mut scalar_beta = DeviceBuffer::zeroed(HEADS).expect("scalar beta");
+            ling3_kda_gate_f32_into_on_stream(
+                &raw_gate_row,
+                &beta_input_row,
+                &a_log,
+                &dt_bias,
+                scalar_gate.output(),
+                scalar_beta.output(),
+                HEADS,
+                lower_bound,
+                &stream,
+            )
+            .expect("scalar gate");
+            assert_close(
+                &gate_host[row * width..(row + 1) * width],
+                &scalar_gate.copy_to_host(&stream).unwrap(),
+                0.0,
+                "batched Ling gate",
+            );
+            assert_close(
+                &beta_host[row * HEADS..(row + 1) * HEADS],
+                &scalar_beta.copy_to_host(&stream).unwrap(),
+                0.0,
+                "batched Ling beta",
+            );
+            let q_row =
+                DeviceBuffer::from_host(&q_host[row * width..(row + 1) * width]).expect("Q row");
+            let k_row =
+                DeviceBuffer::from_host(&k_host[row * width..(row + 1) * width]).expect("K row");
+            let v_row =
+                DeviceBuffer::from_host(&v_host[row * width..(row + 1) * width]).expect("V row");
+            let mut output_row = DeviceBuffer::zeroed(width).expect("output row");
+            ling3_kda_128_f32_into_on_stream(
+                &q_row,
+                &k_row,
+                &v_row,
+                &scalar_gate,
+                &scalar_beta,
+                repeated_state.inout(),
+                output_row.output(),
+                HEADS,
+                &stream,
+            )
+            .expect("scalar recurrence");
+            repeated_output.extend(output_row.copy_to_host(&stream).unwrap().iter().copied());
+            expected_output.extend(cpu_ling3_kda_128(
+                &q_host[row * width..(row + 1) * width],
+                &k_host[row * width..(row + 1) * width],
+                &v_host[row * width..(row + 1) * width],
+                &gate_host[row * width..(row + 1) * width],
+                &beta_host[row * HEADS..(row + 1) * HEADS],
+                &mut expected_state,
+                HEADS,
+            ));
+        }
+        assert_close(
+            &chunk_output.copy_to_host(&stream).expect("output read"),
+            &expected_output,
+            5.0e-6,
+            "chunked Ling KDA output",
+        );
+        assert_close(
+            &chunk_output.copy_to_host(&stream).expect("output read"),
+            &repeated_output,
+            0.0,
+            "chunked versus scalar Ling KDA output",
+        );
+        assert_close(
+            &chunk_state.copy_to_host(&stream).expect("state read"),
+            &repeated_state
+                .copy_to_host(&stream)
+                .expect("repeated state read"),
+            0.0,
+            "chunked versus scalar Ling KDA state",
+        );
+        assert_close(
+            &chunk_state.copy_to_host(&stream).expect("state read"),
+            &expected_state,
+            5.0e-6,
+            "chunked Ling KDA state",
+        );
+    }
+
+    #[test]
     fn ling3_kda_prep_matches_causal_convolution_reference() {
         let heads = 2usize;
         let projection = heads * 128;
@@ -16700,6 +17462,83 @@ mod tests {
             &expected_state,
             0.0,
             "Ling convolution state",
+        );
+    }
+
+    #[test]
+    fn ling3_contiguous_prep_matches_repeated_causal_convolution() {
+        const ROWS: usize = 5;
+        const HEADS: usize = 2;
+        let projection = HEADS * 128;
+        let conv_width = projection * 3;
+        let qkv = (0..ROWS * conv_width)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.00625)
+            .collect::<Vec<_>>();
+        let conv_weight = (0..conv_width * 4)
+            .map(|index| f32_to_bf16(((index * 13 % 97) as f32 - 48.0) * 0.01))
+            .collect::<Vec<_>>();
+        let initial_state = (0..conv_width * 3)
+            .map(|index| ((index * 19 % 103) as f32 - 51.0) * 0.0025)
+            .collect::<Vec<_>>();
+        let mut expected_state = initial_state.clone();
+        let mut expected_q = Vec::with_capacity(ROWS * projection);
+        let mut expected_k = Vec::with_capacity(ROWS * projection);
+        let mut expected_v = Vec::with_capacity(ROWS * projection);
+        for row in 0..ROWS {
+            let (q, k, v, state) = cpu_ling3_kda_prep(
+                &qkv[row * conv_width..(row + 1) * conv_width],
+                &conv_weight,
+                &expected_state,
+                HEADS,
+            );
+            expected_q.extend(q);
+            expected_k.extend(k);
+            expected_v.extend(v);
+            expected_state = state;
+        }
+
+        let qkv = DeviceBuffer::from_host(&qkv).expect("QKV");
+        let conv_weight = DeviceBuffer::from_host(&conv_weight).expect("weights");
+        let mut state = DeviceBuffer::from_host(&initial_state).expect("state");
+        let mut q = DeviceBuffer::zeroed(ROWS * projection).expect("Q");
+        let mut k = DeviceBuffer::zeroed(ROWS * projection).expect("K");
+        let mut v = DeviceBuffer::zeroed(ROWS * projection).expect("V");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        ling3_kda_prep_rows_into_on_stream(
+            &qkv,
+            &conv_weight,
+            q.output(),
+            k.output(),
+            v.output(),
+            state.inout(),
+            ROWS,
+            HEADS,
+            &stream,
+        )
+        .expect("contiguous prep");
+        assert_close(
+            &q.copy_to_host(&stream).expect("Q read"),
+            &expected_q,
+            2.0e-6,
+            "contiguous Ling normalized Q",
+        );
+        assert_close(
+            &k.copy_to_host(&stream).expect("K read"),
+            &expected_k,
+            2.0e-6,
+            "contiguous Ling normalized K",
+        );
+        assert_close(
+            &v.copy_to_host(&stream).expect("V read"),
+            &expected_v,
+            2.0e-6,
+            "contiguous Ling convolved V",
+        );
+        assert_close(
+            &state.copy_to_host(&stream).expect("state read"),
+            &expected_state,
+            0.0,
+            "contiguous Ling convolution state",
         );
     }
 
@@ -16766,6 +17605,59 @@ mod tests {
         assert_eq!(
             value.copy_to_host(&stream).expect("value download"),
             expected_value
+        );
+
+        let rows = 2usize;
+        let query_projection_rows = [expected_query.clone(), expected_query.clone()].concat();
+        let kv_projection_rows = [
+            kv_projection.copy_to_host(&stream).unwrap().into_vec(),
+            kv_projection.copy_to_host(&stream).unwrap().into_vec(),
+        ]
+        .concat();
+        let shared_rope_rows = [
+            shared_rope.copy_to_host(&stream).unwrap().into_vec(),
+            vec![0.25, 0.5],
+        ]
+        .concat();
+        let mut expected_key_row_1 = expected_key.clone();
+        for head in 0..heads {
+            expected_key_row_1[head * qk_dim + qk_nope..(head + 1) * qk_dim]
+                .copy_from_slice(&[0.25, 0.5]);
+        }
+        let expected_query_rows = query_projection_rows.clone();
+        let expected_key_rows = [expected_key.clone(), expected_key_row_1].concat();
+        let expected_value_rows = [expected_value.clone(), expected_value.clone()].concat();
+        let query_projection_rows =
+            DeviceBuffer::from_host(&query_projection_rows).expect("query projection rows");
+        let kv_projection_rows =
+            DeviceBuffer::from_host(&kv_projection_rows).expect("KV projection rows");
+        let shared_rope_rows = DeviceBuffer::from_host(&shared_rope_rows).expect("rope rows");
+        let mut query_rows = DeviceBuffer::zeroed(rows * heads * qk_dim).expect("query rows");
+        let mut key_rows = DeviceBuffer::zeroed(rows * heads * qk_dim).expect("key rows");
+        let mut value_rows = DeviceBuffer::zeroed(rows * heads * value_dim).expect("value rows");
+        ling3_mla_pack_f32_batch_into_on_stream(
+            &query_projection_rows,
+            &kv_projection_rows,
+            &shared_rope_rows,
+            query_rows.output(),
+            key_rows.output(),
+            value_rows.output(),
+            rows,
+            heads,
+            qk_nope,
+            rope,
+            value_dim,
+            &stream,
+        )
+        .expect("batched MLA pack");
+        assert_eq!(
+            query_rows.copy_to_host(&stream).unwrap(),
+            expected_query_rows
+        );
+        assert_eq!(key_rows.copy_to_host(&stream).unwrap(), expected_key_rows);
+        assert_eq!(
+            value_rows.copy_to_host(&stream).unwrap(),
+            expected_value_rows
         );
 
         let cache_len = 3usize;
@@ -16854,6 +17746,48 @@ mod tests {
             &expected,
             2.0e-6,
             "Ling paged MLA attention",
+        );
+
+        let query_rows = [expected_query.clone(), expected_query.clone()].concat();
+        let expected_rows = [
+            cpu_ling3_mla_attention(
+                &expected_query,
+                &key_cache.copy_to_host(&stream).unwrap(),
+                &value_cache.copy_to_host(&stream).unwrap(),
+                2,
+                heads,
+                qk_dim,
+                value_dim,
+                scale,
+            ),
+            expected.clone(),
+        ]
+        .concat();
+        let query_rows = DeviceBuffer::from_host(&query_rows).expect("query rows");
+        let mut causal_rows = DeviceBuffer::zeroed(2 * heads * value_dim).expect("causal rows");
+        ling3_mla_paged_causal_rows_f32_into_on_stream(
+            &query_rows,
+            &paged_keys,
+            &paged_values,
+            &page_table,
+            causal_rows.output(),
+            1,
+            2,
+            page_tokens,
+            heads,
+            qk_dim,
+            value_dim,
+            scale,
+            &stream,
+        )
+        .expect("causal paged MLA rows");
+        assert_close(
+            &causal_rows
+                .copy_to_host(&stream)
+                .expect("causal rows download"),
+            &expected_rows,
+            2.0e-6,
+            "Ling causal paged MLA rows",
         );
     }
 

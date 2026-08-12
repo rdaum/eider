@@ -5,11 +5,16 @@ use crate::nemotron3::{
     Nemotron3DecodeState, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3Model,
     Nemotron3SequenceSnapshot,
 };
-use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS, Sm12xKvPagePool};
-use sequence_cache::{
-    AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, PageAllocation, PageBackend,
-    RetireError, RetireOutcome, SequenceCache, SequenceId,
+use nvfp4::{
+    CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS, Sm12xKvPagePool,
+    Sm12xKvTailSnapshot,
 };
+use sequence_cache::{
+    AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
+    CacheError, PageAllocation, PageBackend, RetireError, RetireOutcome, SequenceCache, SequenceId,
+};
+
+const COMPACT_TAIL_ROWS: usize = 16;
 
 pub type Nemotron3SequenceCache = SequenceCache<Nemotron3PageBackend, Nemotron3SequenceSnapshot>;
 
@@ -294,11 +299,23 @@ enum Nemotron3LayerPool {
 
 pub struct Nemotron3PageBackend {
     pools: Vec<Option<Nemotron3LayerPool>>,
+    tail_snapshot_reuse: Vec<Vec<Sm12xKvTailSnapshot>>,
     free_slots: Vec<u32>,
     used_slots: Vec<bool>,
     ever_used_slots: Vec<bool>,
     page_bytes: usize,
     storage: Nemotron3KvCacheStorage,
+}
+
+pub struct Nemotron3AppendTransaction {
+    existing_tail: Option<Nemotron3ExistingTail>,
+    reserved_rows: usize,
+}
+
+struct Nemotron3ExistingTail {
+    slot: usize,
+    rows: usize,
+    snapshots: Vec<Option<Sm12xKvTailSnapshot>>,
 }
 
 impl Nemotron3PageBackend {
@@ -345,6 +362,7 @@ impl Nemotron3PageBackend {
             pools.push(pool);
         }
         Ok(Self {
+            tail_snapshot_reuse: (0..pools.len()).map(|_| Vec::new()).collect(),
             pools,
             free_slots: (0..page_slots as u32).rev().collect(),
             used_slots: vec![false; page_slots],
@@ -391,11 +409,23 @@ impl Nemotron3PageBackend {
         }
         Ok(())
     }
+
+    fn recycle_transaction(&mut self, transaction: &mut Nemotron3AppendTransaction) {
+        let Some(tail) = transaction.existing_tail.take() else {
+            return;
+        };
+        for (reusable, snapshot) in self.tail_snapshot_reuse.iter_mut().zip(tail.snapshots) {
+            if let Some(snapshot) = snapshot {
+                reusable.push(snapshot);
+            }
+        }
+    }
 }
 
 impl PageBackend for Nemotron3PageBackend {
     type Page = Nemotron3Page;
     type Context<'a> = Nemotron3CacheContext<'a>;
+    type AppendTransaction = Nemotron3AppendTransaction;
     type Error = Error;
 
     fn page_bytes(&self) -> usize {
@@ -430,19 +460,96 @@ impl PageBackend for Nemotron3PageBackend {
         self.free_slots.push(page.slot);
     }
 
+    fn prepare_append(
+        &mut self,
+        pages: &[BackendAppendPage<'_, Self::Page>],
+        _start_position: usize,
+        context: &mut Self::Context<'_>,
+    ) -> Result<Self::AppendTransaction> {
+        let reserved_rows = pages.iter().try_fold(0usize, |rows, page| {
+            rows.checked_add(page.rows()).ok_or_else(|| Error::Shape {
+                label: "Nemotron 3 append transaction",
+                expected: "row count without overflow".to_string(),
+                actual: format!("rows={rows} next={}", page.rows()),
+            })
+        })?;
+        let Some(page) = pages.iter().find(|page| page.existed_before_reservation()) else {
+            return Ok(Nemotron3AppendTransaction {
+                existing_tail: None,
+                reserved_rows,
+            });
+        };
+        self.validate_page(*page.page())?;
+        let rows = page.page_offset() % COMPACT_TAIL_ROWS;
+        if rows == 0 {
+            return Ok(Nemotron3AppendTransaction {
+                existing_tail: None,
+                reserved_rows,
+            });
+        }
+        let mut snapshots = Vec::with_capacity(self.pools.len());
+        for (layer, pool) in self.pools.iter().enumerate() {
+            let snapshot = match pool {
+                Some(Nemotron3LayerPool::Nvfp4(pool)) => {
+                    let mut snapshot = self.tail_snapshot_reuse[layer]
+                        .pop()
+                        .map_or_else(|| pool.tail_snapshot(), Ok)?;
+                    pool.snapshot_tail_on_stream(
+                        page.page().slot(),
+                        &mut snapshot,
+                        context.stream,
+                    )?;
+                    Some(snapshot)
+                }
+                _ => None,
+            };
+            snapshots.push(snapshot);
+        }
+        Ok(Nemotron3AppendTransaction {
+            existing_tail: Some(Nemotron3ExistingTail {
+                slot: page.page().slot(),
+                rows,
+                snapshots,
+            }),
+            reserved_rows,
+        })
+    }
+
     fn abort_append(
         &mut self,
-        pages: &[&Self::Page],
+        transaction: &mut Self::AppendTransaction,
+        restored_pages: &[&Self::Page],
+        released_pages: &[&Self::Page],
+        restored_position: usize,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in pages {
+        for page in restored_pages.iter().chain(released_pages) {
             self.validate_page(**page)?;
         }
+        if let Some(tail) = &transaction.existing_tail {
+            for (pool, snapshot) in self.pools.iter_mut().zip(&tail.snapshots) {
+                if let (Some(Nemotron3LayerPool::Nvfp4(pool)), Some(snapshot)) = (pool, snapshot) {
+                    pool.restore_tail_prefix_on_stream(
+                        tail.slot,
+                        snapshot,
+                        tail.rows,
+                        context.stream,
+                    )?;
+                }
+            }
+        }
         context.stream.synchronize()?;
-        for page in pages {
+        context.page_table.update_slots(
+            restored_pages.iter().map(|page| page.slot),
+            restored_pages.len(),
+            restored_position,
+            context.stream,
+        )?;
+        for page in released_pages {
             self.used_slots[page.slot()] = false;
             self.free_slots.push(page.slot);
         }
+        self.recycle_transaction(transaction);
         Ok(())
     }
 
@@ -481,32 +588,49 @@ impl PageBackend for Nemotron3PageBackend {
 
     fn commit_append(
         &mut self,
-        committed_pages: &[&Self::Page],
-        sealed_pages: &[&Self::Page],
-        released_pages: &[&Self::Page],
-        new_position: usize,
+        transaction: &mut Self::AppendTransaction,
+        commit: BackendAppendCommit<'_, Self::Page>,
         context: &mut Self::Context<'_>,
     ) -> Result<()> {
-        for page in committed_pages
+        for page in commit
+            .committed_pages()
             .iter()
-            .chain(sealed_pages)
-            .chain(released_pages)
+            .chain(commit.sealed_pages())
+            .chain(commit.released_pages())
         {
             self.validate_page(**page)?;
         }
+        if commit.rows() < transaction.reserved_rows
+            && let Some(tail) = &transaction.existing_tail
+            && tail.rows + commit.rows() <= COMPACT_TAIL_ROWS
+        {
+            for (pool, snapshot) in self.pools.iter_mut().zip(&tail.snapshots) {
+                if let (Some(Nemotron3LayerPool::Nvfp4(pool)), Some(snapshot)) = (pool, snapshot) {
+                    pool.restore_tail_prefix_on_stream(
+                        tail.slot,
+                        snapshot,
+                        tail.rows,
+                        context.stream,
+                    )?;
+                }
+            }
+        }
+        if !commit.released_pages().is_empty() {
+            context.stream.synchronize()?;
+        }
         context.page_table.update_slots(
-            committed_pages.iter().map(|page| page.slot),
-            committed_pages.len(),
-            new_position,
+            commit.committed_pages().iter().map(|page| page.slot),
+            commit.committed_pages().len(),
+            commit.position(),
             context.stream,
         )?;
-        if !released_pages.is_empty() {
-            context.stream.synchronize()?;
-            for page in released_pages {
+        if !commit.released_pages().is_empty() {
+            for page in commit.released_pages() {
                 self.used_slots[page.slot()] = false;
                 self.free_slots.push(page.slot);
             }
         }
+        self.recycle_transaction(transaction);
         Ok(())
     }
 

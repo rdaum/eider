@@ -1,5 +1,6 @@
 use super::*;
 use crate::metrics::metrics;
+use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::runtime::laguna_sequence_cache::{
     LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_cache_error,
 };
@@ -18,7 +19,12 @@ use nvfp4::{
 use std::collections::HashMap;
 
 const CUBLAS_WORKSPACE_LIMIT: u64 = 32 << 20;
+const TENSOR_CORE_ATTENTION_MIN_ROWS: usize = 32;
 const MAX_Q_HEADS: usize = 72;
+
+fn use_compact_prefill_attention(start_position: usize, query_rows: usize) -> bool {
+    start_position != 0 || query_rows < TENSOR_CORE_ATTENTION_MIN_ROWS
+}
 
 /// One ragged Laguna prompt chunk and its persistent sequence state.
 pub struct LagunaPrefillRow<'tokens, 'state> {
@@ -114,6 +120,7 @@ impl LagunaBatchLinearWorkspace {
 struct LagunaBatchAttentionWorkspace {
     q_heads: usize,
     compact: Sm12xKvAttentionWorkspace,
+    tensor_core: PagedTensorCorePrefillAttention,
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
@@ -139,6 +146,12 @@ impl LagunaBatchAttentionWorkspace {
                 KV_HEADS,
                 HEAD_DIM,
                 16,
+            )?,
+            tensor_core: PagedTensorCorePrefillAttention::new(
+                token_capacity,
+                q_heads,
+                KV_HEADS,
+                HEAD_DIM,
             )?,
             q: DeviceBuffer::zeroed(q_values)?,
             k: DeviceBuffer::zeroed(kv_values)?,
@@ -678,46 +691,71 @@ fn run_attention_prefill(
         cache
             .with_append_pages(append.reservation, |backend, pages| {
                 let pool = backend.pool_mut(layer_index)?;
-                let q_width = attention.q_heads * HEAD_DIM;
-                let kv_width = KV_HEADS * HEAD_DIM;
                 for page in pages.iter() {
                     let segment = page.segment();
-                    for local_row in 0..segment.rows() {
-                        let token = segment.input_offset() + local_row;
-                        pool.append_at_offsets_on_stream(
+                    let mut processed = 0;
+                    while processed < segment.rows() {
+                        let token = segment.input_offset() + processed;
+                        let query_position = position + token;
+                        let chunk_rows = (segment.rows() - processed).min(16 - query_position % 16);
+                        pool.append_rows_at_offset_on_stream(
                             page.page().slot(),
-                            segment.page_offset() + local_row,
+                            segment.page_offset() + processed,
                             &workspace.k_rope,
-                            (row_offset + token) * kv_width,
                             &workspace.v,
-                            (row_offset + token) * kv_width,
+                            row_offset + token,
+                            chunk_rows,
                             stream,
                         )?;
-                        let cache_len = position + token + 1;
-                        let window_start = attention
-                            .window
-                            .map_or(0, |window| cache_len.saturating_sub(window));
-                        workspace
-                            .compact
-                            .attention_paged_window_offsets_into_on_stream(
-                                pool,
-                                append.page_table,
-                                cache_len,
-                                &workspace.q_rope,
-                                (row_offset + token) * q_width,
-                                workspace.attended.output(),
-                                (row_offset + token) * q_width,
-                                window_start,
-                                stream,
-                            )?;
+                        processed += chunk_rows;
                     }
+                }
+                if use_compact_prefill_attention(position, row.token_ids.len()) {
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        let mut processed = 0;
+                        while processed < segment.rows() {
+                            let token = segment.input_offset() + processed;
+                            let query_position = position + token;
+                            let chunk_rows =
+                                (segment.rows() - processed).min(16 - query_position % 16);
+                            workspace
+                                .compact
+                                .attention_paged_causal_rows_at_offset_into_on_stream(
+                                    pool,
+                                    append.page_table,
+                                    query_position,
+                                    &workspace.q_rope,
+                                    row_offset + token,
+                                    chunk_rows,
+                                    attention.window,
+                                    workspace.attended.output(),
+                                    stream,
+                                )?;
+                            processed += chunk_rows;
+                        }
+                    }
+                } else {
+                    workspace.tensor_core.run(
+                        pool,
+                        append.page_table,
+                        position,
+                        &workspace.q_rope,
+                        row_offset,
+                        row.token_ids.len(),
+                        attention.window,
+                        &mut workspace.attended,
+                        stream,
+                    )?;
                 }
                 Ok(())
             })
             .map_err(laguna_cache_error)?;
-        metrics()
-            .laguna_compact_prefill_attention_rows
-            .add(row.token_ids.len().min(isize::MAX as usize) as isize);
+        if use_compact_prefill_attention(position, row.token_ids.len()) {
+            metrics()
+                .laguna_compact_prefill_attention_rows
+                .add(row.token_ids.len().min(isize::MAX as usize) as isize);
+        }
         row_offset += row.token_ids.len();
     }
     linear.run_bf16(
@@ -886,4 +924,17 @@ fn run_moe_prefill(
         capacity * HIDDEN,
         stream,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_compact_prefill_attention;
+
+    #[test]
+    fn tensor_core_attention_is_reserved_for_large_initial_chunks() {
+        assert!(!use_compact_prefill_attention(0, 32));
+        assert!(!use_compact_prefill_attention(0, 2_048));
+        assert!(use_compact_prefill_attention(0, 31));
+        assert!(use_compact_prefill_attention(128, 2_048));
+    }
 }

@@ -3,11 +3,14 @@ use super::{Ling3AttentionKind, Ling3Manifest};
 use crate::runtime::ling3_sequence_cache::{Ling3MlaPagePool, Ling3Page};
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    ling3_mla_attention_f32_into_on_stream, ling3_mla_pack_f32_into_on_stream,
-    ling3_mla_paged_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    arithmetic_positions_u32_into_on_stream, ling3_mla_attention_f32_into_on_stream,
+    ling3_mla_pack_f32_batch_into_on_stream, ling3_mla_pack_f32_into_on_stream,
+    ling3_mla_paged_attention_f32_into_on_stream, ling3_mla_paged_causal_rows_f32_into_on_stream,
+    ling3_mla_split_kv_a_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
     rope_interleaved_trailing_f32_indexed_in_place_on_stream,
-    sigmoid_scale_heads_f32_into_on_stream,
+    sigmoid_scale_heads_f32_into_on_stream, sigmoid_scale_heads_f32_prefix_into_on_stream,
 };
+use sequence_cache::AppendPages;
 
 /// One checkpoint-backed Ling 3 multi-head latent attention layer.
 pub struct Ling3MlaAttention {
@@ -42,6 +45,7 @@ pub struct Ling3MlaState {
 
 /// Reusable one-token MLA activation buffers.
 pub struct Ling3MlaWorkspace {
+    capacity: usize,
     q_a: DeviceBuffer<f32>,
     q_a_normed: DeviceBuffer<f32>,
     query_projection: DeviceBuffer<f32>,
@@ -173,24 +177,203 @@ impl Ling3MlaAttention {
     }
 
     pub fn new_workspace(&self) -> Result<Ling3MlaWorkspace> {
+        self.new_workspace_for_rows(1)
+    }
+
+    pub(crate) fn new_workspace_for_rows(&self, rows: usize) -> Result<Ling3MlaWorkspace> {
+        if rows == 0 {
+            return Err(Error::Shape {
+                label: "Ling 3 MLA workspace",
+                expected: "positive row capacity".to_string(),
+                actual: rows.to_string(),
+            });
+        }
         Ok(Ling3MlaWorkspace {
-            q_a: DeviceBuffer::zeroed(self.q_rank)?,
-            q_a_normed: DeviceBuffer::zeroed(self.q_rank)?,
-            query_projection: DeviceBuffer::zeroed(self.heads * self.qk_dim)?,
-            kv_a: DeviceBuffer::zeroed(self.kv_rank + self.rope_dim)?,
-            compressed_kv: DeviceBuffer::zeroed(self.kv_rank)?,
-            shared_rope_key: DeviceBuffer::zeroed(self.rope_dim)?,
-            compressed_kv_normed: DeviceBuffer::zeroed(self.kv_rank)?,
-            kv_projection: DeviceBuffer::zeroed(self.heads * (self.qk_nope_dim + self.value_dim))?,
-            query: DeviceBuffer::zeroed(self.heads * self.qk_dim)?,
-            key: DeviceBuffer::zeroed(self.heads * self.qk_dim)?,
-            value: DeviceBuffer::zeroed(self.heads * self.value_dim)?,
-            position: DeviceBuffer::zeroed(1)?,
-            attention: DeviceBuffer::zeroed(self.heads * self.value_dim)?,
-            head_gate: DeviceBuffer::zeroed(self.heads)?,
-            gated_attention: DeviceBuffer::zeroed(self.heads * self.value_dim)?,
-            output: DeviceBuffer::zeroed(self.hidden)?,
+            capacity: rows,
+            q_a: DeviceBuffer::zeroed(rows * self.q_rank)?,
+            q_a_normed: DeviceBuffer::zeroed(rows * self.q_rank)?,
+            query_projection: DeviceBuffer::zeroed(rows * self.heads * self.qk_dim)?,
+            kv_a: DeviceBuffer::zeroed(rows * (self.kv_rank + self.rope_dim))?,
+            compressed_kv: DeviceBuffer::zeroed(rows * self.kv_rank)?,
+            shared_rope_key: DeviceBuffer::zeroed(rows * self.rope_dim)?,
+            compressed_kv_normed: DeviceBuffer::zeroed(rows * self.kv_rank)?,
+            kv_projection: DeviceBuffer::zeroed(
+                rows * self.heads * (self.qk_nope_dim + self.value_dim),
+            )?,
+            query: DeviceBuffer::zeroed(rows * self.heads * self.qk_dim)?,
+            key: DeviceBuffer::zeroed(rows * self.heads * self.qk_dim)?,
+            value: DeviceBuffer::zeroed(rows * self.heads * self.value_dim)?,
+            position: DeviceBuffer::zeroed(rows)?,
+            attention: DeviceBuffer::zeroed(rows * self.heads * self.value_dim)?,
+            head_gate: DeviceBuffer::zeroed(rows * self.heads)?,
+            gated_attention: DeviceBuffer::zeroed(rows * self.heads * self.value_dim)?,
+            output: DeviceBuffer::zeroed(rows * self.hidden)?,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_rows_paged(
+        &self,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Ling3MlaWorkspace,
+        pool: &mut Ling3MlaPagePool,
+        pages: AppendPages<'_, Ling3Page>,
+        page_table: &DeviceBuffer<u32>,
+        start_position: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0 || rows > workspace.capacity || input.len() < rows * self.hidden {
+            return Err(Error::Shape {
+                label: "Ling 3 paged MLA prefill",
+                expected: format!(
+                    "1..={} rows and at least {} input values",
+                    workspace.capacity,
+                    rows * self.hidden
+                ),
+                actual: format!("rows={rows} input={}", input.len()),
+            });
+        }
+        self.q_a
+            .run_batch(input, &mut workspace.q_a, rows, stream)?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.q_rank,
+            &workspace.q_a,
+            &self.q_a_norm,
+            workspace.q_a_normed.output(),
+            self.rms_eps,
+            stream,
+        )?;
+        self.q_b.run_batch(
+            &workspace.q_a_normed,
+            &mut workspace.query_projection,
+            rows,
+            stream,
+        )?;
+        self.kv_a
+            .run_batch(input, &mut workspace.kv_a, rows, stream)?;
+        ling3_mla_split_kv_a_f32_batch_into_on_stream(
+            &workspace.kv_a,
+            workspace.compressed_kv.output(),
+            workspace.shared_rope_key.output(),
+            rows,
+            self.kv_rank,
+            self.rope_dim,
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            rows,
+            self.kv_rank,
+            &workspace.compressed_kv,
+            &self.kv_a_norm,
+            workspace.compressed_kv_normed.output(),
+            self.rms_eps,
+            stream,
+        )?;
+        self.kv_b.run_batch(
+            &workspace.compressed_kv_normed,
+            &mut workspace.kv_projection,
+            rows,
+            stream,
+        )?;
+        ling3_mla_pack_f32_batch_into_on_stream(
+            &workspace.query_projection,
+            &workspace.kv_projection,
+            &workspace.shared_rope_key,
+            workspace.query.output(),
+            workspace.key.output(),
+            workspace.value.output(),
+            rows,
+            self.heads,
+            self.qk_nope_dim,
+            self.rope_dim,
+            self.value_dim,
+            stream,
+        )?;
+        arithmetic_positions_u32_into_on_stream(
+            workspace.position.output(),
+            rows,
+            start_position,
+            1,
+            stream,
+        )?;
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.query.inout(),
+            &self.inverse_frequencies,
+            &workspace.position,
+            rows,
+            self.heads,
+            self.qk_dim,
+            self.rope_dim,
+            1.0,
+            stream,
+        )?;
+        rope_interleaved_trailing_f32_indexed_in_place_on_stream(
+            workspace.key.inout(),
+            &self.inverse_frequencies,
+            &workspace.position,
+            rows,
+            self.heads,
+            self.qk_dim,
+            self.rope_dim,
+            1.0,
+            stream,
+        )?;
+        let key_width = self.heads * self.qk_dim;
+        let value_width = self.heads * self.value_dim;
+        let (key_pool, value_pool) = pool.buffers_mut();
+        for page in pages.iter() {
+            let segment = page.segment();
+            let physical_row =
+                page.page().slot() * nvfp4::SM12X_KV_PAGE_TOKENS + segment.page_offset();
+            key_pool.copy_range_from_device_on_stream(
+                physical_row * key_width,
+                &workspace.key,
+                segment.input_offset() * key_width,
+                segment.rows() * key_width,
+                stream,
+            )?;
+            value_pool.copy_range_from_device_on_stream(
+                physical_row * value_width,
+                &workspace.value,
+                segment.input_offset() * value_width,
+                segment.rows() * value_width,
+                stream,
+            )?;
+        }
+        let (key_pool, value_pool) = pool.buffers();
+        ling3_mla_paged_causal_rows_f32_into_on_stream(
+            &workspace.query,
+            key_pool,
+            value_pool,
+            page_table,
+            workspace.attention.output(),
+            start_position,
+            rows,
+            nvfp4::SM12X_KV_PAGE_TOKENS,
+            self.heads,
+            self.qk_dim,
+            self.value_dim,
+            self.scale,
+            stream,
+        )?;
+        self.head_gate
+            .run_batch(input, &mut workspace.head_gate, rows, stream)?;
+        sigmoid_scale_heads_f32_prefix_into_on_stream(
+            &workspace.head_gate,
+            &workspace.attention,
+            workspace.gated_attention.output(),
+            rows * self.heads,
+            self.value_dim,
+            stream,
+        )?;
+        self.dense.run_batch(
+            &workspace.gated_attention,
+            &mut workspace.output,
+            rows,
+            stream,
+        )
     }
 
     pub fn run_one_token(
@@ -264,7 +447,13 @@ impl Ling3MlaAttention {
             self.value_dim,
             stream,
         )?;
-        workspace.position.copy_from_host(&[state.len as u32])?;
+        arithmetic_positions_u32_into_on_stream(
+            workspace.position.output(),
+            1,
+            state.len,
+            1,
+            stream,
+        )?;
         rope_interleaved_trailing_f32_indexed_in_place_on_stream(
             workspace.query.inout(),
             &self.inverse_frequencies,
@@ -406,7 +595,13 @@ impl Ling3MlaAttention {
             self.value_dim,
             stream,
         )?;
-        workspace.position.copy_from_host(&[position as u32])?;
+        arithmetic_positions_u32_into_on_stream(
+            workspace.position.output(),
+            1,
+            position,
+            1,
+            stream,
+        )?;
         rope_interleaved_trailing_f32_indexed_in_place_on_stream(
             workspace.query.inout(),
             &self.inverse_frequencies,
