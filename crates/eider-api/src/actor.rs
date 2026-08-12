@@ -648,7 +648,7 @@ fn actor_main(
                 device_weights_gib = model.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                 "loaded DeepSeek V4 text model"
             );
-            let service = match Deepseek4ChatService::new_with_prefix_cache(
+            let service = match Deepseek4ChatService::new_with_cache_config(
                 model,
                 &template,
                 scheduler,

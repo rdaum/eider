@@ -23,7 +23,6 @@ struct Deepseek4OverlapState {
 
 /// Persistent cache for one DeepSeek decoder layer.
 pub struct Deepseek4LayerSequenceState {
-    sliding: Deepseek4SlidingState,
     compression: Deepseek4LayerCompressionState,
 }
 
@@ -49,14 +48,6 @@ pub struct Deepseek4SequenceState {
 /// Compact device checkpoint retained by the shared prompt-prefix cache.
 pub struct Deepseek4SequenceCheckpoint {
     sequence: Deepseek4SequenceState,
-}
-
-struct Deepseek4SlidingState {
-    values: DeviceBuffer<f32>,
-    capacity: usize,
-    width: usize,
-    len: usize,
-    start: usize,
 }
 
 impl Deepseek4CompressionState {
@@ -348,125 +339,8 @@ impl Deepseek4CompressionState {
     }
 }
 
-impl Deepseek4SlidingState {
-    fn new(capacity: usize, width: usize) -> Result<Self> {
-        if capacity == 0 || width == 0 {
-            return Err(Error::Shape {
-                label: "DeepSeek V4 sliding state",
-                expected: "positive capacity and width".to_string(),
-                actual: format!("capacity={capacity} width={width}"),
-            });
-        }
-        let values = capacity
-            .checked_mul(width)
-            .ok_or_else(|| state_overflow("sliding cache", capacity, width))?;
-        Ok(Self {
-            values: DeviceBuffer::zeroed(values)?,
-            capacity,
-            width,
-            len: 0,
-            start: 0,
-        })
-    }
-
-    fn append(
-        &mut self,
-        source: &DeviceBuffer<f32>,
-        source_row: usize,
-        rows: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let source_end = source_row
-            .checked_add(rows)
-            .and_then(|value| value.checked_mul(self.width))
-            .ok_or_else(|| {
-                state_overflow("sliding append source", source_row + rows, self.width)
-            })?;
-        if rows == 0 || source_end > source.len() {
-            return Err(Error::Shape {
-                label: "DeepSeek V4 sliding append",
-                expected: format!(
-                    "positive rows within {} source values at width {}",
-                    source.len(),
-                    self.width
-                ),
-                actual: format!("source_row={source_row} rows={rows}"),
-            });
-        }
-        if rows >= self.capacity {
-            let source_offset = (source_row + rows - self.capacity) * self.width;
-            self.values.copy_range_from_device_on_stream(
-                0,
-                source,
-                source_offset,
-                self.capacity * self.width,
-                stream,
-            )?;
-            self.len = self.capacity;
-            self.start = 0;
-            return Ok(());
-        }
-
-        let write = (self.start + self.len) % self.capacity;
-        let first_rows = rows.min(self.capacity - write);
-        self.values.copy_range_from_device_on_stream(
-            write * self.width,
-            source,
-            source_row * self.width,
-            first_rows * self.width,
-            stream,
-        )?;
-        if first_rows < rows {
-            self.values.copy_range_from_device_on_stream(
-                0,
-                source,
-                (source_row + first_rows) * self.width,
-                (rows - first_rows) * self.width,
-                stream,
-            )?;
-        }
-        let overflow = self.len.saturating_add(rows).saturating_sub(self.capacity);
-        if overflow != 0 {
-            self.start = (self.start + overflow) % self.capacity;
-        }
-        self.len = self.len.saturating_add(rows).min(self.capacity);
-        Ok(())
-    }
-
-    fn device_bytes(&self) -> usize {
-        self.values.device_bytes()
-    }
-
-    fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
-        if self.capacity != source.capacity || self.width != source.width {
-            return Err(Error::Shape {
-                label: "DeepSeek V4 sliding checkpoint",
-                expected: format!("capacity={} width={}", source.capacity, source.width),
-                actual: format!("capacity={} width={}", self.capacity, self.width),
-            });
-        }
-        self.values.copy_prefix_from_device_on_stream(
-            &source.values,
-            source.values.len(),
-            stream,
-        )?;
-        self.len = source.len;
-        self.start = source.start;
-        Ok(())
-    }
-}
-
 impl Deepseek4LayerSequenceState {
     fn new(config: &Deepseek4ModelConfig, layer: usize, max_tokens: usize) -> Result<Self> {
-        let sliding_capacity =
-            config
-                .sliding_window
-                .checked_sub(1)
-                .ok_or_else(|| Error::Shape {
-                    label: "DeepSeek V4 sliding window",
-                    expected: "at least two tokens".to_string(),
-                    actual: config.sliding_window.to_string(),
-                })?;
         let compression = match config.attention_kind(layer)? {
             Deepseek4AttentionKind::Sliding => Deepseek4LayerCompressionState::Sliding,
             Deepseek4AttentionKind::CompressedSparse => {
@@ -497,36 +371,7 @@ impl Deepseek4LayerSequenceState {
                 }
             }
         };
-        Ok(Self {
-            sliding: Deepseek4SlidingState::new(sliding_capacity, config.head_dim)?,
-            compression,
-        })
-    }
-
-    pub fn sliding(&self) -> &DeviceBuffer<f32> {
-        &self.sliding.values
-    }
-
-    pub fn sliding_len(&self) -> usize {
-        self.sliding.len
-    }
-
-    pub fn sliding_start(&self) -> usize {
-        self.sliding.start
-    }
-
-    pub fn sliding_capacity(&self) -> usize {
-        self.sliding.capacity
-    }
-
-    pub fn append_sliding(
-        &mut self,
-        source: &DeviceBuffer<f32>,
-        source_row: usize,
-        rows: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        self.sliding.append(source, source_row, rows, stream)
+        Ok(Self { compression })
     }
 
     pub fn compressor(&self) -> Option<&Deepseek4CompressionState> {
@@ -562,19 +407,18 @@ impl Deepseek4LayerSequenceState {
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.sliding.device_bytes()
-            + match &self.compression {
-                Deepseek4LayerCompressionState::Sliding => 0,
-                Deepseek4LayerCompressionState::CompressedSparse {
-                    compressor,
-                    indexer,
-                } => compressor
-                    .device_bytes()
-                    .saturating_add(indexer.device_bytes()),
-                Deepseek4LayerCompressionState::HeavilyCompressed { compressor } => {
-                    compressor.device_bytes()
-                }
+        match &self.compression {
+            Deepseek4LayerCompressionState::Sliding => 0,
+            Deepseek4LayerCompressionState::CompressedSparse {
+                compressor,
+                indexer,
+            } => compressor
+                .device_bytes()
+                .saturating_add(indexer.device_bytes()),
+            Deepseek4LayerCompressionState::HeavilyCompressed { compressor } => {
+                compressor.device_bytes()
             }
+        }
     }
 
     fn device_bytes_for(
@@ -582,21 +426,6 @@ impl Deepseek4LayerSequenceState {
         layer: usize,
         max_tokens: usize,
     ) -> Result<usize> {
-        let sliding_capacity =
-            config
-                .sliding_window
-                .checked_sub(1)
-                .ok_or_else(|| Error::Shape {
-                    label: "DeepSeek V4 sliding window",
-                    expected: "at least two tokens".to_string(),
-                    actual: config.sliding_window.to_string(),
-                })?;
-        let sliding = sliding_capacity
-            .checked_mul(config.head_dim)
-            .and_then(|values| values.checked_mul(size_of::<f32>()))
-            .ok_or_else(|| {
-                state_overflow("sliding cache bytes", sliding_capacity, config.head_dim)
-            })?;
         let compression = match config.attention_kind(layer)? {
             Deepseek4AttentionKind::Sliding => 0,
             Deepseek4AttentionKind::CompressedSparse => {
@@ -630,13 +459,10 @@ impl Deepseek4LayerSequenceState {
                 )?
             }
         };
-        sliding
-            .checked_add(compression)
-            .ok_or_else(|| state_overflow("layer sequence state bytes", sliding, compression))
+        Ok(compression)
     }
 
     fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
-        self.sliding.copy_from_on_stream(&source.sliding, stream)?;
         match (&mut self.compression, &source.compression) {
             (Deepseek4LayerCompressionState::Sliding, Deepseek4LayerCompressionState::Sliding) => {
                 Ok(())
@@ -819,6 +645,12 @@ impl Deepseek4SequenceCheckpoint {
     }
 }
 
+impl sequence_cache::RetainedSnapshot for Deepseek4SequenceCheckpoint {
+    fn retained_bytes(&self) -> usize {
+        self.device_bytes()
+    }
+}
+
 fn state_overflow(label: &'static str, left: usize, right: usize) -> Error {
     Error::Shape {
         label,
@@ -829,39 +661,8 @@ fn state_overflow(label: &'static str, left: usize, right: usize) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{Deepseek4CompressionState, Deepseek4SlidingState};
-    use crate::nvfp4::{CudaStream, DeviceBuffer};
-
-    #[test]
-    fn sliding_state_preserves_the_latest_rows_across_wraps() {
-        const WIDTH: usize = 2;
-        let stream = CudaStream::new_non_blocking().expect("stream");
-        let source =
-            DeviceBuffer::from_host(&[1.0f32, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5])
-                .expect("source");
-        let mut state = Deepseek4SlidingState::new(3, WIDTH).expect("state");
-        state.append(&source, 0, 2, &stream).expect("first append");
-        state
-            .append(&source, 2, 2, &stream)
-            .expect("wrapped append");
-        assert_eq!(state.len, 3);
-        assert_eq!(state.start, 1);
-        let physical = state.values.copy_to_host(&stream).expect("physical");
-        let chronological = (0..state.len)
-            .flat_map(|logical| {
-                let slot = (state.start + logical) % state.capacity;
-                physical[slot * WIDTH..(slot + 1) * WIDTH].to_vec()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(chronological, vec![2.0, 2.5, 3.0, 3.5, 4.0, 4.5]);
-
-        state
-            .append(&source, 1, 4, &stream)
-            .expect("oversized append");
-        assert_eq!(state.start, 0);
-        let physical = state.values.copy_to_host(&stream).expect("latest");
-        assert_eq!(physical.as_slice(), &[3.0, 3.5, 4.0, 4.5, 5.0, 5.5]);
-    }
+    use super::Deepseek4CompressionState;
+    use crate::nvfp4::CudaStream;
 
     #[test]
     fn compression_state_sizes_pending_overlap_and_completed_entries() {

@@ -561,10 +561,11 @@ __global__ void attention_f32_kernel(
 }
 
 __device__ __forceinline__ const float* causal_attention_entry(
-    const float* sliding,
-    std::uint32_t sliding_length,
-    std::uint32_t sliding_start,
+    const float* sliding_pool,
+    const std::uint32_t* page_table,
+    std::uint32_t position,
     std::uint32_t sliding_capacity,
+    std::uint32_t page_tokens,
     const float* current,
     std::uint32_t current_start,
     std::uint32_t query_offset,
@@ -575,6 +576,7 @@ __device__ __forceinline__ const float* causal_attention_entry(
     std::uint32_t causal_compressed_length,
     std::uint32_t entry,
     std::uint32_t head_dim) {
+    const std::uint32_t sliding_length = min(position, sliding_capacity);
     const std::uint32_t current_visible = query_offset + 1;
     const std::uint32_t window = sliding_capacity + 1;
     const std::uint32_t total_visible = sliding_length + current_visible;
@@ -586,10 +588,13 @@ __device__ __forceinline__ const float* causal_attention_entry(
     const std::uint32_t current_skipped = skipped - prior_skipped;
     const std::uint32_t current_kept = current_visible - current_skipped;
     if (entry < prior_visible) {
-        const std::uint32_t logical = prior_skipped + entry;
-        const std::uint32_t slot =
-            (sliding_start + logical) % sliding_capacity;
-        return sliding + static_cast<std::size_t>(slot) * head_dim;
+        const std::uint32_t logical =
+            position - sliding_length + prior_skipped + entry;
+        const std::uint32_t physical_page = page_table[logical / page_tokens];
+        const std::uint32_t page_offset = logical % page_tokens;
+        return sliding_pool
+            + (static_cast<std::size_t>(physical_page) * page_tokens + page_offset)
+                * head_dim;
     }
     entry -= prior_visible;
     if (entry < current_kept) {
@@ -613,9 +618,8 @@ __device__ __forceinline__ const float* causal_attention_entry(
 
 __global__ void causal_attention_f32_kernel(
     const float* __restrict__ query,
-    const float* const* __restrict__ sliding_tables,
-    const std::uint32_t* __restrict__ sliding_lengths,
-    const std::uint32_t* __restrict__ sliding_starts,
+    const float* __restrict__ sliding_pool,
+    const std::uint32_t* const* __restrict__ page_tables,
     const float* __restrict__ current_kv,
     const std::uint32_t* __restrict__ current_sequence_starts,
     const std::uint32_t* __restrict__ query_offsets,
@@ -630,6 +634,7 @@ __global__ void causal_attention_f32_kernel(
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t sliding_capacity,
+    std::uint32_t page_tokens,
     std::uint32_t compression_ratio,
     std::uint32_t selected_count,
     float scaling) {
@@ -646,8 +651,10 @@ __global__ void causal_attention_f32_kernel(
     }
     const float* q =
         query + (static_cast<std::size_t>(batch) * heads + head) * head_dim;
-    const float* sliding = sliding_tables[batch];
-    const std::uint32_t sliding_length = sliding_lengths[batch];
+    const std::uint32_t* page_table = page_tables[batch];
+    const std::uint32_t position = positions[batch];
+    const std::uint32_t prior_position = position - query_offset;
+    const std::uint32_t sliding_length = min(prior_position, sliding_capacity);
     const float* compressed = compressed_tables[batch];
     const std::uint32_t compressed_length = compressed_lengths[batch];
     const std::int32_t* selected =
@@ -681,10 +688,11 @@ __global__ void causal_attention_f32_kernel(
     __syncthreads();
     for (std::uint32_t entry = 0; entry < entries; ++entry) {
         const float* kv = causal_attention_entry(
-            sliding,
-            sliding_length,
-            sliding_starts[batch],
+            sliding_pool,
+            page_table,
+            prior_position,
             sliding_capacity,
+            page_tokens,
             current_kv,
             current_start,
             query_offset,
@@ -1342,9 +1350,8 @@ extern "C" cudaError_t infer_deepseek4_attention_f32_on_stream(
 
 extern "C" cudaError_t infer_deepseek4_causal_attention_f32_on_stream(
     const float* query,
-    const float* const* sliding_tables,
-    const std::uint32_t* sliding_lengths,
-    const std::uint32_t* sliding_starts,
+    const float* sliding_pool,
+    const std::uint32_t* const* page_tables,
     const float* current_kv,
     const std::uint32_t* current_sequence_starts,
     const std::uint32_t* query_offsets,
@@ -1359,18 +1366,18 @@ extern "C" cudaError_t infer_deepseek4_causal_attention_f32_on_stream(
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t sliding_capacity,
+    std::uint32_t page_tokens,
     std::uint32_t compression_ratio,
     std::uint32_t selected_count,
     float scaling,
     cudaStream_t stream) {
-    if (query == nullptr || sliding_tables == nullptr
-        || sliding_lengths == nullptr || sliding_starts == nullptr
+    if (query == nullptr || sliding_pool == nullptr || page_tables == nullptr
         || current_kv == nullptr || current_sequence_starts == nullptr
         || query_offsets == nullptr || positions == nullptr
         || compressed_tables == nullptr || compressed_lengths == nullptr
         || sinks == nullptr || output == nullptr || batch_rows == 0
         || current_rows == 0 || heads == 0 || head_dim == 0
-        || head_dim > 2 * kThreads || sliding_capacity == 0
+        || head_dim > 2 * kThreads || sliding_capacity == 0 || page_tokens == 0
         || (selected_count != 0 && selected_indices == nullptr)
         || !isfinite(scaling) || scaling <= 0.0f) {
         return cudaErrorInvalidValue;
@@ -1378,9 +1385,8 @@ extern "C" cudaError_t infer_deepseek4_causal_attention_f32_on_stream(
     const dim3 grid(heads, batch_rows);
     causal_attention_f32_kernel<<<grid, kThreads, 0, stream>>>(
         query,
-        sliding_tables,
-        sliding_lengths,
-        sliding_starts,
+        sliding_pool,
+        page_tables,
         current_kv,
         current_sequence_starts,
         query_offsets,
@@ -1395,6 +1401,7 @@ extern "C" cudaError_t infer_deepseek4_causal_attention_f32_on_stream(
         heads,
         head_dim,
         sliding_capacity,
+        page_tokens,
         compression_ratio,
         selected_count,
         scaling);

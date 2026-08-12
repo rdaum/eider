@@ -27,12 +27,10 @@ pub struct Deepseek4AttentionBatch<'a> {
 
 /// Prior cache and current-chunk metadata for causal prefill or decode.
 pub struct Deepseek4CausalAttentionBatch<'a> {
-    /// Per-query pointers to `[sliding_capacity, head_dim]` prior ring storage.
-    pub sliding_tables: &'a DeviceBuffer<*const f32>,
-    /// Number of valid prior entries for each query.
-    pub sliding_lengths: &'a DeviceBuffer<u32>,
-    /// Oldest valid physical prior slot for each query.
-    pub sliding_starts: &'a DeviceBuffer<u32>,
+    /// Physical `[page_slots, page_tokens, head_dim]` latent-cache pool.
+    pub sliding_pool: &'a DeviceBuffer<f32>,
+    /// Per-query pointers to logical-to-physical page-slot tables.
+    pub page_tables: &'a DeviceBuffer<*const u32>,
     /// Current chunks concatenated as `[current_rows, head_dim]`.
     pub current_kv: &'a DeviceBuffer<f32>,
     /// Row at which each query's current sequence chunk begins.
@@ -47,6 +45,8 @@ pub struct Deepseek4CausalAttentionBatch<'a> {
     pub compressed_lengths: &'a DeviceBuffer<u32>,
     /// CSA selections and their logical per-row width.
     pub selected_indices: Option<(&'a DeviceBuffer<i32>, usize)>,
+    /// Number of token rows in every physical page.
+    pub page_tokens: usize,
 }
 
 /// Applies a row-major block-scaled E4M3 weight to F32 activation rows.
@@ -625,9 +625,7 @@ pub fn causal_attention_f32_batch_into_on_stream(
         None => 0,
     };
     let metadata_lengths = [
-        state.sliding_tables.len(),
-        state.sliding_lengths.len(),
-        state.sliding_starts.len(),
+        state.page_tables.len(),
         state.current_sequence_starts.len(),
         state.query_offsets.len(),
         state.positions.len(),
@@ -646,11 +644,14 @@ pub fn causal_attention_f32_batch_into_on_stream(
             heads,
             head_dim,
             sliding_capacity,
+            state.page_tokens,
             compression_ratio,
             selected_count,
         ]
         .into_iter()
         .any(|value| value > u32::MAX as usize)
+        || state.page_tokens == 0
+        || state.sliding_pool.is_empty()
         || query.len() < values_len
         || output.len() < values_len
         || sinks.len() != heads
@@ -662,7 +663,9 @@ pub fn causal_attention_f32_batch_into_on_stream(
                 "query/output>={values_len} current rows>0 head_dim<=512 sinks={heads} metadata>={batch_rows}"
             ),
             actual: format!(
-                "batch={batch_rows} current_rows={current_rows} heads={heads} head_dim={head_dim} sliding_capacity={sliding_capacity} compression_ratio={compression_ratio} query={} output={} sinks={} metadata={metadata_lengths:?} selected={selected_count}",
+                "batch={batch_rows} current_rows={current_rows} heads={heads} head_dim={head_dim} sliding_capacity={sliding_capacity} page_tokens={} compression_ratio={compression_ratio} pool={} query={} output={} sinks={} metadata={metadata_lengths:?} selected={selected_count}",
+                state.page_tokens,
+                state.sliding_pool.len(),
                 query.len(),
                 output.len(),
                 sinks.len(),
@@ -679,9 +682,8 @@ pub fn causal_attention_f32_batch_into_on_stream(
             "infer_deepseek4_causal_attention_f32_on_stream",
             ffi::infer_deepseek4_causal_attention_f32_on_stream(
                 query.as_const_ptr().cast(),
-                state.sliding_tables.as_const_ptr().cast(),
-                state.sliding_lengths.as_const_ptr().cast(),
-                state.sliding_starts.as_const_ptr().cast(),
+                state.sliding_pool.as_const_ptr().cast(),
+                state.page_tables.as_const_ptr().cast(),
                 state.current_kv.as_const_ptr().cast(),
                 state.current_sequence_starts.as_const_ptr().cast(),
                 state.query_offsets.as_const_ptr().cast(),
@@ -696,6 +698,7 @@ pub fn causal_attention_f32_batch_into_on_stream(
                 heads as u32,
                 head_dim as u32,
                 sliding_capacity as u32,
+                state.page_tokens as u32,
                 compression_ratio as u32,
                 selected_count as u32,
                 1.0 / (head_dim as f32).sqrt(),
@@ -1872,10 +1875,11 @@ mod tests {
         const RATIO: usize = 4;
         let query = test_rows(ROWS, DIM, -0.15);
         let prior_chronological = test_rows(PRIOR_CAPACITY, DIM, 0.1);
-        let mut prior_physical = vec![0.0; PRIOR_CAPACITY * DIM];
+        const PAGE_TOKENS: usize = 2;
+        let mut prior_physical = vec![0.0; 4 * PAGE_TOKENS * DIM];
         for logical in 0..PRIOR_CAPACITY {
-            let slot = (1 + logical) % PRIOR_CAPACITY;
-            prior_physical[slot * DIM..(slot + 1) * DIM]
+            let position = 2 + logical;
+            prior_physical[position * DIM..(position + 1) * DIM]
                 .copy_from_slice(&prior_chronological[logical * DIM..(logical + 1) * DIM]);
         }
         let current = test_rows(ROWS, DIM, 0.55);
@@ -1922,14 +1926,13 @@ mod tests {
         let prior = DeviceBuffer::from_host(&prior_physical).expect("prior");
         let current = DeviceBuffer::from_host(&current).expect("current");
         let compressed = DeviceBuffer::from_host(&compressed).expect("compressed");
-        let prior_pointer = prior.input().as_const_ptr().cast::<f32>();
+        let page_table = DeviceBuffer::from_host(&[0u32, 1, 2, 3]).expect("page table");
+        let page_table_pointer = page_table.input().as_const_ptr().cast::<u32>();
         let compressed_pointer = compressed.input().as_const_ptr().cast::<f32>();
-        let prior_tables = DeviceBuffer::from_host(&[prior_pointer; ROWS]).expect("prior pointers");
+        let page_tables =
+            DeviceBuffer::from_host(&[page_table_pointer; ROWS]).expect("page-table pointers");
         let compressed_tables =
             DeviceBuffer::from_host(&[compressed_pointer; ROWS]).expect("compressed pointers");
-        let prior_lengths =
-            DeviceBuffer::from_host(&[PRIOR_CAPACITY as u32; ROWS]).expect("prior lengths");
-        let prior_starts = DeviceBuffer::from_host(&[1u32; ROWS]).expect("prior starts");
         let current_starts = DeviceBuffer::from_host(&[0u32; ROWS]).expect("current starts");
         let query_offsets = DeviceBuffer::from_host(&[0u32, 1, 2]).expect("query offsets");
         let positions = DeviceBuffer::from_host(&positions).expect("positions");
@@ -1941,9 +1944,8 @@ mod tests {
         causal_attention_f32_batch_into_on_stream(
             &query,
             Deepseek4CausalAttentionBatch {
-                sliding_tables: &prior_tables,
-                sliding_lengths: &prior_lengths,
-                sliding_starts: &prior_starts,
+                sliding_pool: &prior,
+                page_tables: &page_tables,
                 current_kv: &current,
                 current_sequence_starts: &current_starts,
                 query_offsets: &query_offsets,
@@ -1951,6 +1953,7 @@ mod tests {
                 compressed_tables: &compressed_tables,
                 compressed_lengths: &compressed_lengths,
                 selected_indices: None,
+                page_tokens: PAGE_TOKENS,
             },
             &sinks,
             output.output(),

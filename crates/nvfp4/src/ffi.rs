@@ -252,9 +252,8 @@ unsafe extern "C" {
     ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_causal_attention_f32_on_stream(
         query: *const f32,
-        sliding_tables: *const *const f32,
-        sliding_lengths: *const u32,
-        sliding_starts: *const u32,
+        sliding_pool: *const f32,
+        page_tables: *const *const u32,
         current_kv: *const f32,
         current_sequence_starts: *const u32,
         query_offsets: *const u32,
@@ -269,6 +268,7 @@ unsafe extern "C" {
         heads: u32,
         head_dim: u32,
         sliding_capacity: u32,
+        page_tokens: u32,
         compression_ratio: u32,
         selected_count: u32,
         scaling: f32,

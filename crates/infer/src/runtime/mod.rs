@@ -6,6 +6,7 @@ pub mod bonsai_sequence_cache;
 pub mod bonsai_serving;
 pub mod chat;
 pub mod chat_output;
+pub mod deepseek4_sequence_cache;
 pub mod deepseek4_serving;
 pub mod expert_cache;
 pub mod expert_hotset;

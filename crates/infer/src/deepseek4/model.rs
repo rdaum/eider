@@ -18,6 +18,10 @@ use crate::nvfp4::{
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
     store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
 };
+use crate::runtime::deepseek4_sequence_cache::{
+    Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
+    deepseek4_cache_error,
+};
 use std::path::Path;
 use tracing::info;
 
@@ -1132,6 +1136,7 @@ impl Deepseek4CompressedAttentionWeights {
 /// One contiguous sequence chunk participating in a ragged attention batch.
 pub struct Deepseek4AttentionRow<'a> {
     pub state: &'a mut Deepseek4LayerSequenceState,
+    pub page_table: &'a DeviceBuffer<u32>,
     pub rows: usize,
     pub position: usize,
 }
@@ -1175,9 +1180,7 @@ enum Deepseek4SingleAttentionCompressionWorkspace {
 }
 
 struct Deepseek4AttentionMetadata {
-    sliding_tables: StagedMetadata<*const f32>,
-    sliding_lengths: StagedMetadata<u32>,
-    sliding_starts: StagedMetadata<u32>,
+    page_tables: StagedMetadata<*const u32>,
     current_starts: StagedMetadata<u32>,
     query_offsets: StagedMetadata<u32>,
     positions: StagedMetadata<u32>,
@@ -1235,9 +1238,7 @@ impl Deepseek4CompressedMetadata {
 impl Deepseek4AttentionMetadata {
     fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
-            sliding_tables: StagedMetadata::new(capacity)?,
-            sliding_lengths: StagedMetadata::new(capacity)?,
-            sliding_starts: StagedMetadata::new(capacity)?,
+            page_tables: StagedMetadata::new(capacity)?,
             current_starts: StagedMetadata::new(capacity)?,
             query_offsets: StagedMetadata::new(capacity)?,
             positions: StagedMetadata::new(capacity)?,
@@ -1246,19 +1247,15 @@ impl Deepseek4AttentionMetadata {
     }
 
     fn upload_prior(&mut self, stream: &CudaStream) -> Result<()> {
-        self.sliding_tables.upload(stream)?;
-        self.sliding_lengths.upload(stream)?;
-        self.sliding_starts.upload(stream)?;
+        self.page_tables.upload(stream)?;
         self.current_starts.upload(stream)?;
         self.query_offsets.upload(stream)?;
         self.positions.upload(stream)
     }
 
     fn device_bytes(&self) -> usize {
-        self.sliding_tables
+        self.page_tables
             .device_bytes()
-            .saturating_add(self.sliding_lengths.device_bytes())
-            .saturating_add(self.sliding_starts.device_bytes())
             .saturating_add(self.current_starts.device_bytes())
             .saturating_add(self.query_offsets.device_bytes())
             .saturating_add(self.positions.device_bytes())
@@ -1369,6 +1366,12 @@ impl Deepseek4AttentionWeights {
         compressed_weights: &Deepseek4CompressedAttentionWeights,
         workspace: &'a mut Deepseek4AttentionWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
+        backend: &mut Deepseek4PageBackend,
+        append_pages: sequence_cache::AppendReservations<
+            '_,
+            crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
+        >,
+        layer: usize,
         hidden: &DeviceBuffer<f32>,
         rope_inv_freq: &DeviceBuffer<f32>,
         config: &Deepseek4ModelConfig,
@@ -1445,7 +1448,7 @@ impl Deepseek4AttentionWeights {
                 )
                 | Deepseek4AttentionCompressionWorkspace::All { .. },
             ) => {
-                fill_sliding_compressed_metadata(compressed_metadata, rows)?;
+                fill_empty_compressed_metadata(compressed_metadata, rows)?;
                 0
             }
             (
@@ -1560,12 +1563,12 @@ impl Deepseek4AttentionWeights {
             )
             | Deepseek4AttentionCompressionWorkspace::All { .. } => None,
         };
+        let pool = backend.pool_mut(layer)?;
         causal_attention_f32_batch_into_on_stream(
             &workspace.query,
             Deepseek4CausalAttentionBatch {
-                sliding_tables: &workspace.metadata.sliding_tables.device,
-                sliding_lengths: &workspace.metadata.sliding_lengths.device,
-                sliding_starts: &workspace.metadata.sliding_starts.device,
+                sliding_pool: pool.values(),
+                page_tables: &workspace.metadata.page_tables.device,
                 current_kv: &workspace.kv,
                 current_sequence_starts: &workspace.metadata.current_starts.device,
                 query_offsets: &workspace.metadata.query_offsets.device,
@@ -1573,6 +1576,7 @@ impl Deepseek4AttentionWeights {
                 compressed_tables: &workspace.metadata.compressed.tables.device,
                 compressed_lengths: &workspace.metadata.compressed.lengths.device,
                 selected_indices: selected.map(|indices| (indices, config.index_topk)),
+                page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
             },
             &self.sink,
             workspace.attended.output(),
@@ -1607,11 +1611,20 @@ impl Deepseek4AttentionWeights {
             batch_rows,
             stream,
         )?;
-        let mut source_row = 0;
-        for row in rows {
-            row.state
-                .append_sliding(&workspace.kv, source_row, row.rows, stream)?;
-            source_row += row.rows;
+        let mut source_start = 0;
+        for (row, pages) in rows.iter().zip(append_pages.iter()) {
+            for page in pages.iter() {
+                let segment = page.segment();
+                pool.append_segment(
+                    page.page().slot(),
+                    segment.page_offset(),
+                    &workspace.kv,
+                    source_start + segment.input_offset(),
+                    segment.rows(),
+                    stream,
+                )?;
+            }
+            source_start += row.rows;
         }
         Ok(&workspace.output)
     }
@@ -1704,14 +1717,10 @@ fn fill_prior_attention_metadata(
 ) -> Result<()> {
     let mut output_row = 0;
     for row in rows {
-        let sliding_pointer = row.state.sliding().input().as_const_ptr().cast::<f32>();
-        let sliding_len = u32_value("sliding length", row.state.sliding_len())?;
-        let sliding_start = u32_value("sliding start", row.state.sliding_start())?;
+        let page_table = row.page_table.as_const_ptr().cast::<u32>();
         let current_start = u32_value("current start", output_row)?;
         for offset in 0..row.rows {
-            metadata.sliding_tables.host.as_mut_slice()[output_row + offset] = sliding_pointer;
-            metadata.sliding_lengths.host.as_mut_slice()[output_row + offset] = sliding_len;
-            metadata.sliding_starts.host.as_mut_slice()[output_row + offset] = sliding_start;
+            metadata.page_tables.host.as_mut_slice()[output_row + offset] = page_table;
             metadata.current_starts.host.as_mut_slice()[output_row + offset] = current_start;
             metadata.query_offsets.host.as_mut_slice()[output_row + offset] =
                 u32_value("query offset", offset)?;
@@ -1723,15 +1732,14 @@ fn fill_prior_attention_metadata(
     Ok(())
 }
 
-fn fill_sliding_compressed_metadata(
+fn fill_empty_compressed_metadata(
     metadata: &mut Deepseek4CompressedMetadata,
     rows: &[Deepseek4AttentionRow<'_>],
 ) -> Result<()> {
     let mut output_row = 0;
     for row in rows {
-        let pointer = row.state.sliding().input().as_const_ptr().cast::<f32>();
         for offset in 0..row.rows {
-            metadata.tables.host.as_mut_slice()[output_row + offset] = pointer;
+            metadata.tables.host.as_mut_slice()[output_row + offset] = std::ptr::null();
             metadata.lengths.host.as_mut_slice()[output_row + offset] = 0;
         }
         output_row += row.rows;
@@ -2419,6 +2427,12 @@ impl Deepseek4ResidentLayer {
         routed_experts: &mut Deepseek4RoutedExpertLayer,
         workspace: &mut Deepseek4LayerWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
+        backend: &mut Deepseek4PageBackend,
+        append_pages: sequence_cache::AppendReservations<
+            '_,
+            crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
+        >,
+        layer: usize,
         streams: &DeviceBuffer<f32>,
         token_ids: &DeviceBuffer<u32>,
         rope_inv_freq: &DeviceBuffer<f32>,
@@ -2454,6 +2468,9 @@ impl Deepseek4ResidentLayer {
             &self.compressed_attention,
             &mut workspace.attention,
             rows,
+            backend,
+            append_pages,
+            layer,
             &workspace.normalized,
             rope_inv_freq,
             config,
@@ -2691,8 +2708,8 @@ impl Deepseek4ModelWeights {
 pub struct Deepseek4BatchRow<'tokens, 'state> {
     /// Tokens appended to this sequence.
     pub token_ids: &'tokens [u32],
-    /// Persistent attention and compression state updated by the step.
-    pub state: &'state mut Deepseek4SequenceState,
+    /// Admitted paged sequence updated by the step.
+    pub sequence: &'state mut Deepseek4Sequence,
 }
 
 /// Device-resident final-token logits in the same order as the input rows.
@@ -2762,6 +2779,10 @@ impl Deepseek4BatchWorkspace {
             .saturating_add(self.final_normed.device_bytes())
             .saturating_add(self.logits.device_bytes())
             .saturating_add(self.layer.device_bytes())
+    }
+
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
     }
 }
 
@@ -2970,10 +2991,17 @@ impl Deepseek4TextModel {
         &mut self,
         workspace: &mut Deepseek4BatchWorkspace,
         rows: &mut [Deepseek4BatchRow<'_, '_>],
+        cache: &mut Deepseek4SequenceCache,
     ) -> Result<()> {
-        self.run_decoder_batch(workspace, rows)?;
-        workspace.stream.synchronize()?;
-        advance_model_rows(rows)
+        let reservations = reserve_model_rows(rows, cache, &workspace.stream)?;
+        let result = self
+            .run_decoder_batch(workspace, rows, cache, &reservations)
+            .and_then(|()| workspace.stream.synchronize());
+        if let Err(error) = result {
+            abort_model_rows(rows, reservations, cache, &workspace.stream)?;
+            return Err(error);
+        }
+        commit_model_rows(rows, reservations, cache, &workspace.stream)
     }
 
     /// Executes the embedding, decoder, hyper-head, norm, and LM-head path.
@@ -2983,8 +3011,13 @@ impl Deepseek4TextModel {
         &mut self,
         workspace: &'a mut Deepseek4BatchWorkspace,
         rows: &mut [Deepseek4BatchRow<'_, '_>],
+        cache: &mut Deepseek4SequenceCache,
     ) -> Result<Deepseek4LogitsBatch<'a>> {
-        self.run_decoder_batch(workspace, rows)?;
+        let reservations = reserve_model_rows(rows, cache, &workspace.stream)?;
+        if let Err(error) = self.run_decoder_batch(workspace, rows, cache, &reservations) {
+            abort_model_rows(rows, reservations, cache, &workspace.stream)?;
+            return Err(error);
+        }
         let sequence_count = rows.len();
         let final_width = HYPER_STREAMS * self.weights.config.hidden_size;
         let mut source_row = 0;
@@ -3017,8 +3050,11 @@ impl Deepseek4TextModel {
             rows.len(),
             &workspace.stream,
         )?;
-        workspace.stream.synchronize()?;
-        advance_model_rows(rows)?;
+        if let Err(error) = workspace.stream.synchronize() {
+            abort_model_rows(rows, reservations, cache, &workspace.stream)?;
+            return Err(error);
+        }
+        commit_model_rows(rows, reservations, cache, &workspace.stream)?;
         Ok(Deepseek4LogitsBatch {
             logits: &workspace.logits,
             stream: &workspace.stream,
@@ -3031,6 +3067,8 @@ impl Deepseek4TextModel {
         &mut self,
         workspace: &mut Deepseek4BatchWorkspace,
         rows: &mut [Deepseek4BatchRow<'_, '_>],
+        cache: &mut Deepseek4SequenceCache,
+        reservations: &[sequence_cache::AppendReservation],
     ) -> Result<()> {
         let total_tokens = validate_model_rows(&self.weights.config, workspace, rows)?;
         let mut token_offset = 0;
@@ -3063,10 +3101,11 @@ impl Deepseek4TextModel {
             let mut attention_rows = rows
                 .iter_mut()
                 .map(|row| {
-                    let position = row.state.position();
+                    let position = row.sequence.state.position();
                     let row_count = row.token_ids.len();
                     Ok(Deepseek4AttentionRow {
-                        state: row.state.layer_mut(layer_index)?,
+                        state: row.sequence.state.layer_mut(layer_index)?,
+                        page_table: row.sequence.page_table.device(),
                         rows: row_count,
                         position,
                     })
@@ -3079,17 +3118,24 @@ impl Deepseek4TextModel {
                     &self.weights.compressed_rope_inv_freq
                 }
             };
-            self.weights.layers[layer_index].run_layer_rows(
-                &mut self.routed_experts[layer_index],
-                &mut workspace.layer,
-                &mut attention_rows,
-                &workspace.streams,
-                &workspace.token_ids,
-                rope_inv_freq,
-                &mut workspace.next_streams,
-                &self.weights.config,
-                &workspace.stream,
-            )?;
+            cache
+                .with_append_reservations(reservations, |backend, pages| {
+                    self.weights.layers[layer_index].run_layer_rows(
+                        &mut self.routed_experts[layer_index],
+                        &mut workspace.layer,
+                        &mut attention_rows,
+                        backend,
+                        pages,
+                        layer_index,
+                        &workspace.streams,
+                        &workspace.token_ids,
+                        rope_inv_freq,
+                        &mut workspace.next_streams,
+                        &self.weights.config,
+                        &workspace.stream,
+                    )
+                })
+                .map_err(deepseek4_cache_error)?;
             std::mem::swap(&mut workspace.streams, &mut workspace.next_streams);
         }
         Ok(())
@@ -3121,9 +3167,81 @@ impl Deepseek4TextModel {
     }
 }
 
-fn advance_model_rows(rows: &mut [Deepseek4BatchRow<'_, '_>]) -> Result<()> {
-    for row in rows {
-        row.state.advance(row.token_ids.len())?;
+fn reserve_model_rows(
+    rows: &mut [Deepseek4BatchRow<'_, '_>],
+    cache: &mut Deepseek4SequenceCache,
+    stream: &CudaStream,
+) -> Result<Vec<sequence_cache::AppendReservation>> {
+    let mut reservations = Vec::with_capacity(rows.len());
+    for index in 0..rows.len() {
+        let row = &mut rows[index];
+        match cache.reserve_append(
+            row.sequence.cache_id,
+            row.token_ids.len(),
+            &mut Deepseek4CacheContext {
+                stream,
+                page_table: &mut row.sequence.page_table,
+            },
+        ) {
+            Ok(reservation) => reservations.push(reservation),
+            Err(error) => {
+                for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Deepseek4CacheContext {
+                                stream,
+                                page_table: &mut row.sequence.page_table,
+                            },
+                        )
+                        .map_err(deepseek4_cache_error)?;
+                }
+                return Err(deepseek4_cache_error(error));
+            }
+        }
+    }
+    Ok(reservations)
+}
+
+fn abort_model_rows(
+    rows: &mut [Deepseek4BatchRow<'_, '_>],
+    reservations: Vec<sequence_cache::AppendReservation>,
+    cache: &mut Deepseek4SequenceCache,
+    stream: &CudaStream,
+) -> Result<()> {
+    for (row, reservation) in rows.iter_mut().zip(reservations) {
+        cache
+            .abort_append(
+                reservation,
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)?;
+    }
+    Ok(())
+}
+
+fn commit_model_rows(
+    rows: &mut [Deepseek4BatchRow<'_, '_>],
+    reservations: Vec<sequence_cache::AppendReservation>,
+    cache: &mut Deepseek4SequenceCache,
+    stream: &CudaStream,
+) -> Result<()> {
+    for (row, reservation) in rows.iter_mut().zip(reservations) {
+        let appended = row.token_ids.len();
+        cache
+            .commit_append(
+                reservation,
+                appended,
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)?;
+        row.sequence.state.advance(appended)?;
     }
     Ok(())
 }
@@ -3160,6 +3278,7 @@ fn validate_model_rows(
             });
         }
         let end = row
+            .sequence
             .state
             .position()
             .checked_add(row.token_ids.len())
@@ -3168,15 +3287,17 @@ fn validate_model_rows(
                 expected: "position plus row length without overflow".to_string(),
                 actual: format!(
                     "position={} rows={}",
-                    row.state.position(),
+                    row.sequence.state.position(),
                     row.token_ids.len()
                 ),
             })?;
-        if end > row.state.max_tokens() || row.state.max_tokens() > workspace.max_context_tokens {
+        if end > row.sequence.state.max_tokens()
+            || row.sequence.state.max_tokens() > workspace.max_context_tokens
+        {
             return Err(Error::Shape {
                 label: "DeepSeek V4 sequence capacity",
                 expected: format!("end <= state capacity <= {}", workspace.max_context_tokens),
-                actual: format!("end={end} capacity={}", row.state.max_tokens()),
+                actual: format!("end={end} capacity={}", row.sequence.state.max_tokens()),
             });
         }
         total
@@ -3300,6 +3421,14 @@ mod tests {
         copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, format,
         repeat_hyper_streams_f32_into_on_stream,
     };
+    use crate::runtime::deepseek4_sequence_cache::{
+        Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
+        deepseek4_cache_error,
+    };
+    use crate::runtime::sm12x_sequence_cache::Sm12xPageTable;
+    use sequence_cache::{
+        AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache,
+    };
 
     const CONFIG: &str = r#"{
         "architectures":["DeepseekV4ForCausalLM"],
@@ -3338,6 +3467,133 @@ mod tests {
         "hc_eps":1e-6,
         "num_nextn_predict_layers":0
     }"#;
+
+    fn test_sequence_cache(
+        config: &Deepseek4ModelConfig,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> (Deepseek4SequenceCache, Deepseek4Sequence) {
+        let slots = max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS);
+        let backend = Deepseek4PageBackend::new(config.num_hidden_layers, config.head_dim, slots)
+            .expect("page backend");
+        let state = Deepseek4SequenceState::new(config, max_tokens).expect("sequence state");
+        let mut page_table = Sm12xPageTable::new(max_tokens).expect("page table");
+        let managed =
+            slots * backend.page_bytes() + state.device_bytes() + page_table.managed_bytes();
+        let mut cache: Deepseek4SequenceCache = SequenceCache::new(
+            CacheConfig {
+                page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+                max_managed_bytes: managed,
+                max_snapshot_bytes: 0,
+                max_prefix_entries: Some(0),
+                emergency_bytes: 0,
+            },
+            backend,
+        )
+        .map_err(deepseek4_cache_error)
+        .expect("sequence cache");
+        let outcome = cache
+            .admit(
+                None,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+                |snapshot, position| {
+                    assert!(snapshot.is_none());
+                    assert_eq!(position, 0);
+                    Ok(())
+                },
+            )
+            .map_err(deepseek4_cache_error)
+            .expect("admit sequence");
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            panic!("dedicated cache must admit");
+        };
+        (
+            cache,
+            Deepseek4Sequence::from_admission(cache_id, page_table, state),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_chunk(
+        attention: &Deepseek4AttentionWeights,
+        compressed: &Deepseek4CompressedAttentionWeights,
+        workspace: &mut super::Deepseek4AttentionWorkspace,
+        sequence: &mut Deepseek4Sequence,
+        cache: &mut Deepseek4SequenceCache,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        rope: &DeviceBuffer<f32>,
+        config: &Deepseek4ModelConfig,
+        stream: &CudaStream,
+    ) -> Vec<f32> {
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                rows,
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)
+            .expect("reserve append");
+        let output = {
+            let position = sequence.state.position();
+            let page_table = sequence.page_table.device();
+            let state = sequence.state.layer_mut(0).expect("layer state");
+            let mut attention_rows = [Deepseek4AttentionRow {
+                state,
+                page_table,
+                rows,
+                position,
+            }];
+            cache
+                .with_append_reservations(std::slice::from_ref(&reservation), |backend, pages| {
+                    attention
+                        .run_rows(
+                            compressed,
+                            workspace,
+                            &mut attention_rows,
+                            backend,
+                            pages,
+                            0,
+                            input,
+                            rope,
+                            config,
+                            stream,
+                        )?
+                        .copy_prefix_to_host(
+                            rows * config.num_attention_heads * config.head_dim,
+                            stream,
+                        )
+                        .map(|values| values.into_vec())
+                })
+                .map_err(deepseek4_cache_error)
+                .expect("paged attention")
+        };
+        cache
+            .commit_append(
+                reservation,
+                rows,
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)
+            .expect("commit append");
+        sequence.state.advance(rows).expect("advance state");
+        output
+    }
 
     fn read_f32_reference(path: impl AsRef<std::path::Path>) -> Vec<f32> {
         let bytes = std::fs::read(path).expect("read layer reference");
@@ -3443,27 +3699,46 @@ mod tests {
             DeviceBuffer::from_host(&config.compressed_rope_inv_freq()).expect("compressed RoPE");
         let stream = CudaStream::new_non_blocking().expect("stream");
         let mut output = DeviceBuffer::zeroed(input.len()).expect("layer output");
-        let mut state = Deepseek4SequenceState::new(&config, 16).expect("sequence state");
+        let (mut cache, mut sequence) = test_sequence_cache(&config, 16, &stream);
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                token_count,
+                &mut Deepseek4CacheContext {
+                    stream: &stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)
+            .expect("reserve layer rows");
         let mut workspace = resident
             .allocate_layer_workspace(&config, token_count)
             .expect("layer workspace");
+        let page_table = sequence.page_table.device();
         let mut rows = [Deepseek4AttentionRow {
-            state: state.layer_mut(layer).expect("layer state"),
+            state: sequence.state.layer_mut(layer).expect("layer state"),
+            page_table,
             rows: token_count,
             position: 0,
         }];
-        resident
-            .run_layer_rows(
-                &mut routed,
-                &mut workspace,
-                &mut rows,
-                &streams,
-                &token_ids,
-                &rope,
-                &mut output,
-                &config,
-                &stream,
-            )
+        cache
+            .with_append_reservations(std::slice::from_ref(&reservation), |backend, pages| {
+                resident.run_layer_rows(
+                    &mut routed,
+                    &mut workspace,
+                    &mut rows,
+                    backend,
+                    pages,
+                    layer,
+                    &streams,
+                    &token_ids,
+                    &rope,
+                    &mut output,
+                    &config,
+                    &stream,
+                )
+            })
+            .map_err(deepseek4_cache_error)
             .expect("run layer three");
         (
             output
@@ -3595,7 +3870,18 @@ mod tests {
             &stream,
         )
         .expect("repeat streams");
-        let mut state = Deepseek4SequenceState::new(&config, 16).expect("sequence state");
+        let (mut cache, mut sequence) = test_sequence_cache(&config, 16, &stream);
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                token_count,
+                &mut Deepseek4CacheContext {
+                    stream: &stream,
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)
+            .expect("reserve layer rows");
         for (layer, reference_path) in reference_paths.iter().enumerate() {
             let rope = if layer < 2 {
                 &sliding_rope
@@ -3615,23 +3901,31 @@ mod tests {
             let mut workspace = resident
                 .allocate_layer_workspace(&config, token_count)
                 .expect("layer workspace");
+            let page_table = sequence.page_table.device();
             let mut rows = [Deepseek4AttentionRow {
-                state: state.layer_mut(layer).expect("layer state"),
+                state: sequence.state.layer_mut(layer).expect("layer state"),
+                page_table,
                 rows: token_count,
                 position: 0,
             }];
-            resident
-                .run_layer_rows(
-                    &mut routed,
-                    &mut workspace,
-                    &mut rows,
-                    &streams,
-                    &token_ids_device,
-                    rope,
-                    &mut output,
-                    &config,
-                    &stream,
-                )
+            cache
+                .with_append_reservations(std::slice::from_ref(&reservation), |backend, pages| {
+                    resident.run_layer_rows(
+                        &mut routed,
+                        &mut workspace,
+                        &mut rows,
+                        backend,
+                        pages,
+                        layer,
+                        &streams,
+                        &token_ids_device,
+                        rope,
+                        &mut output,
+                        &config,
+                        &stream,
+                    )
+                })
+                .map_err(deepseek4_cache_error)
                 .expect("run layer");
 
             let actual = output.copy_to_host(&stream).expect("read layer output");
@@ -3808,95 +4102,88 @@ mod tests {
     #[test]
     fn sliding_attention_matches_across_prefill_chunk_boundaries() {
         const WIDTH: usize = 128;
-        let config = Deepseek4ModelConfig::from_json(CONFIG.as_bytes()).expect("config");
+        const ROWS: usize = 130;
+        const FIRST_CHUNK: usize = 127;
+        let config_json = CONFIG.replace(
+            "\"max_position_embeddings\":64",
+            "\"max_position_embeddings\":256",
+        );
+        let config = Deepseek4ModelConfig::from_json(config_json.as_bytes()).expect("config");
         let attention = test_attention(&config);
         let compressed = Deepseek4CompressedAttentionWeights::Sliding;
-        let input = (0..5 * WIDTH)
+        let input = (0..ROWS * WIDTH)
             .map(|index| (index % 29) as f32 / 17.0 - 0.7)
             .collect::<Vec<_>>();
         let input_device = DeviceBuffer::from_host(&input).expect("input");
-        let second_device = DeviceBuffer::from_host(&input[3 * WIDTH..]).expect("second input");
+        let second_device =
+            DeviceBuffer::from_host(&input[FIRST_CHUNK * WIDTH..]).expect("second input");
         let rope = DeviceBuffer::from_host(&config.sliding_rope_inv_freq()).expect("rope");
         let stream = CudaStream::new_non_blocking().expect("stream");
 
-        let mut full_state = Deepseek4SequenceState::new(&config, 8).expect("full state");
+        let (mut full_cache, mut full_sequence) = test_sequence_cache(&config, 256, &stream);
         let mut full_workspace = attention
-            .allocate_workspace(&compressed, &config, 5)
+            .allocate_workspace(&compressed, &config, ROWS)
             .expect("full workspace");
-        let full_output = {
-            let layer = full_state.layer_mut(0).expect("full layer");
-            let mut rows = [Deepseek4AttentionRow {
-                state: layer,
-                rows: 5,
-                position: 0,
-            }];
-            attention
-                .run_rows(
-                    &compressed,
-                    &mut full_workspace,
-                    &mut rows,
-                    &input_device,
-                    &rope,
-                    &config,
-                    &stream,
-                )
-                .expect("full attention")
-                .copy_prefix_to_host(5 * WIDTH, &stream)
-                .expect("full output")
-                .into_vec()
-        };
+        let full_output = run_attention_chunk(
+            &attention,
+            &compressed,
+            &mut full_workspace,
+            &mut full_sequence,
+            &mut full_cache,
+            &input_device,
+            ROWS,
+            &rope,
+            &config,
+            &stream,
+        );
 
-        let mut split_state = Deepseek4SequenceState::new(&config, 8).expect("split state");
+        let (mut split_cache, mut split_sequence) = test_sequence_cache(&config, 256, &stream);
         let mut split_workspace = attention
-            .allocate_workspace(&compressed, &config, 3)
+            .allocate_workspace(&compressed, &config, FIRST_CHUNK)
             .expect("split workspace");
-        {
-            let layer = split_state.layer_mut(0).expect("first layer");
-            let mut rows = [Deepseek4AttentionRow {
-                state: layer,
-                rows: 3,
-                position: 0,
-            }];
-            attention
-                .run_rows(
-                    &compressed,
-                    &mut split_workspace,
-                    &mut rows,
-                    &input_device,
-                    &rope,
-                    &config,
-                    &stream,
-                )
-                .expect("first attention");
-        }
-        let split_output = {
-            let layer = split_state.layer_mut(0).expect("second layer");
-            let mut rows = [Deepseek4AttentionRow {
-                state: layer,
-                rows: 2,
-                position: 3,
-            }];
-            attention
-                .run_rows(
-                    &compressed,
-                    &mut split_workspace,
-                    &mut rows,
-                    &second_device,
-                    &rope,
-                    &config,
-                    &stream,
-                )
-                .expect("second attention")
-                .copy_prefix_to_host(2 * WIDTH, &stream)
-                .expect("split output")
-                .into_vec()
-        };
-        for (&full, &split) in full_output[3 * WIDTH..].iter().zip(&split_output) {
+        run_attention_chunk(
+            &attention,
+            &compressed,
+            &mut split_workspace,
+            &mut split_sequence,
+            &mut split_cache,
+            &input_device,
+            FIRST_CHUNK,
+            &rope,
+            &config,
+            &stream,
+        );
+        let split_output = run_attention_chunk(
+            &attention,
+            &compressed,
+            &mut split_workspace,
+            &mut split_sequence,
+            &mut split_cache,
+            &second_device,
+            ROWS - FIRST_CHUNK,
+            &rope,
+            &config,
+            &stream,
+        );
+        for (&full, &split) in full_output[FIRST_CHUNK * WIDTH..].iter().zip(&split_output) {
             assert!((full - split).abs() < 2.0e-4, "full={full} split={split}");
         }
-        let layer = split_state.layer(0).expect("split layer");
-        assert_eq!(layer.sliding_len(), 3);
-        assert_eq!(layer.sliding_start(), 2);
+        assert_eq!(split_sequence.position(), ROWS);
+        assert_eq!(
+            split_cache
+                .page_table(split_sequence.cache_id)
+                .unwrap()
+                .position(),
+            ROWS
+        );
+        assert_eq!(
+            split_cache
+                .page_table(split_sequence.cache_id)
+                .unwrap()
+                .pages()
+                .len(),
+            2
+        );
     }
 
     #[test]
