@@ -13,6 +13,7 @@ pub type MuseGlimmerSequenceCache = SequenceCache<Sm12xPageBackend, MuseGlimmerS
 pub(crate) struct MuseGlimmerAppend<'a> {
     pub(crate) reservation: &'a sequence_cache::AppendReservation,
     pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
+    pub(crate) snapshot_tails: bool,
 }
 
 pub struct MuseGlimmerSequence {

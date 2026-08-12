@@ -1033,6 +1033,104 @@ impl Sm12xKvPagePool {
         unsafe { self.storage.as_mut_ptr().cast::<u8>().add(byte) }
     }
 
+    /// Captures one physical page's circular f32 tail before a speculative append.
+    pub fn snapshot_tail_on_stream(
+        &self,
+        slot: usize,
+        snapshot: &mut Sm12xKvTailSnapshot,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.check_slot(slot)?;
+        self.validate_tail_snapshot(snapshot)?;
+        let bytes = V_TOKEN_BLOCK * self.kv_heads * self.head_dim * size_of::<f32>();
+        let page_offset = slot * self.layout.total_bytes;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D paged KV key tail snapshot)",
+                crate::ffi::cudaMemcpyAsync(
+                    snapshot.key.ptr.cast(),
+                    self.component_ptr(page_offset + self.layout.key_tail)
+                        .cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )?;
+            check_cuda(
+                "cudaMemcpyAsync(D2D paged KV value tail snapshot)",
+                crate::ffi::cudaMemcpyAsync(
+                    snapshot.value.ptr.cast(),
+                    self.component_ptr(page_offset + self.layout.value_tail)
+                        .cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Restores valid rows overwritten when a speculative append wrapped a page tail.
+    pub fn restore_tail_prefix_on_stream(
+        &mut self,
+        slot: usize,
+        snapshot: &Sm12xKvTailSnapshot,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.check_slot(slot)?;
+        self.validate_tail_snapshot(snapshot)?;
+        if rows > V_TOKEN_BLOCK {
+            return Err(Error::Shape {
+                label: "SM12x paged KV tail restore",
+                expected: format!("at most {V_TOKEN_BLOCK} rows"),
+                actual: format!("{rows} rows"),
+            });
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let bytes = rows * self.kv_heads * self.head_dim * size_of::<f32>();
+        let key_tail_offset = self.layout.key_tail;
+        let value_tail_offset = self.layout.value_tail;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D paged KV key tail restore)",
+                crate::ffi::cudaMemcpyAsync(
+                    self.component_mut_ptr(slot, key_tail_offset).cast(),
+                    snapshot.key.ptr.cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )?;
+            check_cuda(
+                "cudaMemcpyAsync(D2D paged KV value tail restore)",
+                crate::ffi::cudaMemcpyAsync(
+                    self.component_mut_ptr(slot, value_tail_offset).cast(),
+                    snapshot.value.ptr.cast(),
+                    bytes,
+                    crate::ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    fn validate_tail_snapshot(&self, snapshot: &Sm12xKvTailSnapshot) -> Result<()> {
+        if snapshot.kv_heads != self.kv_heads || snapshot.head_dim != self.head_dim {
+            return Err(Error::Shape {
+                label: "SM12x paged KV tail snapshot shape",
+                expected: format!("kv_heads={} head_dim={}", self.kv_heads, self.head_dim),
+                actual: format!(
+                    "kv_heads={} head_dim={}",
+                    snapshot.kv_heads, snapshot.head_dim
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Copies one physical page slot on the explicit stream.
     pub fn copy_page_on_stream(
         &mut self,
@@ -1609,6 +1707,133 @@ impl Sm12xKvAttentionWorkspace {
         }
         cache.len = cache_end;
         Ok(())
+    }
+
+    /// Computes causal attention for a row chunk already appended to paged storage.
+    ///
+    /// The rows must not cross the compact cache's 16-token tail boundary. Query
+    /// and output buffers are row-major and use the same row offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_causal_rows_at_offset_into_on_stream(
+        &mut self,
+        pool: &Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        start_position: usize,
+        query: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        window_tokens: Option<usize>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_capacity = page_table
+            .len()
+            .checked_mul(SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged causal row capacity",
+                expected: "page-table capacity without overflow".to_string(),
+                actual: page_table.len().to_string(),
+            })?;
+        if logical_capacity > self.max_tokens
+            || pool.kv_heads != self.kv_heads
+            || pool.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged causal row attention cache",
+                expected: format!(
+                    "workspace max >= {logical_capacity}, kv_heads={}, head_dim={}",
+                    self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "workspace_max={} pool_shape={}/{}",
+                    self.max_tokens, pool.kv_heads, pool.head_dim
+                ),
+            });
+        }
+        let q_width = self.q_heads * self.head_dim;
+        let row_end = input_row_offset
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged causal row attention",
+                expected: "input row range without overflow".to_string(),
+                actual: format!("input_row_offset={input_row_offset} rows={rows}"),
+            })?;
+        let q_end = row_end.checked_mul(q_width).ok_or_else(|| Error::Shape {
+            label: "SM12x paged causal row attention",
+            expected: "query row range without overflow".to_string(),
+            actual: format!("row_end={row_end} q_width={q_width}"),
+        })?;
+        let cache_end = start_position
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged causal row attention",
+                expected: "cache row range without overflow".to_string(),
+                actual: format!("start={start_position} rows={rows}"),
+            })?;
+        if rows == 0
+            || rows > u32::MAX as usize
+            || input_row_offset > u32::MAX as usize
+            || start_position > u32::MAX as usize
+            || rows > self.causal_row_capacity
+            || rows > V_TOKEN_BLOCK - start_position % V_TOKEN_BLOCK
+            || q_end > query.len()
+            || q_end > output.len()
+            || cache_end > logical_capacity
+            || window_tokens.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged causal row attention buffers",
+                expected: format!(
+                    "rows within one 16-token tail through logical capacity {logical_capacity}, q/output >= {q_end}"
+                ),
+                actual: format!(
+                    "start={start_position} rows={rows} query={} output={}",
+                    query.len(),
+                    output.len()
+                ),
+            });
+        }
+        let layout = &pool.layout;
+        let key_values = layout.key_values;
+        let key_scales = layout.key_scales;
+        let value_values = layout.value_values;
+        let value_scales = layout.value_scales;
+        let key_tail = layout.key_tail;
+        let value_tail = layout.value_tail;
+        let page_stride = layout.total_bytes;
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_paged_causal_attention_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_paged_causal_attention_rows_on_stream(
+                    query.as_const_ptr().cast(),
+                    pool.component_ptr(key_values),
+                    pool.component_ptr(key_scales),
+                    pool.component_ptr(value_values),
+                    pool.component_ptr(value_scales),
+                    pool.component_ptr(key_tail).cast(),
+                    pool.component_ptr(value_tail).cast(),
+                    page_table.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    input_row_offset as u32,
+                    start_position as u32,
+                    rows as u32,
+                    logical_capacity as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    page_stride as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    window_tokens.unwrap_or(0) as u32,
+                    self.causal_row_capacity as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
     }
 
     /// Computes non-causal attention for several query rows over one fixed
@@ -2652,6 +2877,262 @@ mod tests {
             reference
                 .value_scales_to_host(&stream)
                 .expect("reference V scales")
+        );
+    }
+
+    #[test]
+    fn paged_speculative_tail_snapshot_restores_muse_shaped_attention() {
+        const PREFIX: usize = 3;
+        const SPECULATIVE: usize = 16;
+        const REPLACEMENT: usize = 13;
+        const KV_HEADS: usize = 2;
+        const Q_HEADS: usize = 32;
+        const HEAD_DIM: usize = 128;
+        const SLOT: usize = 2;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let host_rows = |count: usize, seed: usize| {
+            (0..count * kv_width)
+                .map(|index| ((index * 19 + seed) % 251) as f32 / 96.0 - 1.25)
+                .collect::<Vec<_>>()
+        };
+        let prefix_key = host_rows(PREFIX, 3);
+        let prefix_value = host_rows(PREFIX, 7);
+        let speculative_key = host_rows(SPECULATIVE, 11);
+        let speculative_value = host_rows(SPECULATIVE, 13);
+        let replacement_key = host_rows(REPLACEMENT, 17);
+        let replacement_value = host_rows(REPLACEMENT, 23);
+        let prefix_key_device = DeviceBuffer::from_host(&prefix_key).expect("prefix K");
+        let prefix_value_device = DeviceBuffer::from_host(&prefix_value).expect("prefix V");
+        let speculative_key_device =
+            DeviceBuffer::from_host(&speculative_key).expect("speculative K");
+        let speculative_value_device =
+            DeviceBuffer::from_host(&speculative_value).expect("speculative V");
+        let replacement_key_device =
+            DeviceBuffer::from_host(&replacement_key).expect("replacement K");
+        let replacement_value_device =
+            DeviceBuffer::from_host(&replacement_value).expect("replacement V");
+        let query = DeviceBuffer::from_host(
+            &(0..q_width)
+                .map(|index| ((index * 31 + 5) % 263) as f32 / 128.0 - 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("query");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut pool = Sm12xKvPagePool::new(3, KV_HEADS, HEAD_DIM).expect("page pool");
+        pool.append_rows_at_offset_on_stream(
+            SLOT,
+            0,
+            &prefix_key_device,
+            &prefix_value_device,
+            0,
+            PREFIX,
+            &stream,
+        )
+        .expect("prefix append");
+        let mut snapshot = Sm12xKvTailSnapshot::new(KV_HEADS, HEAD_DIM).expect("snapshot");
+        pool.snapshot_tail_on_stream(SLOT, &mut snapshot, &stream)
+            .expect("snapshot tail");
+        pool.append_rows_at_offset_on_stream(
+            SLOT,
+            PREFIX,
+            &speculative_key_device,
+            &speculative_value_device,
+            0,
+            SPECULATIVE,
+            &stream,
+        )
+        .expect("speculative append");
+        pool.restore_tail_prefix_on_stream(SLOT, &snapshot, PREFIX, &stream)
+            .expect("restore prefix");
+        pool.append_rows_at_offset_on_stream(
+            SLOT,
+            PREFIX,
+            &replacement_key_device,
+            &replacement_value_device,
+            0,
+            REPLACEMENT,
+            &stream,
+        )
+        .expect("replacement append");
+
+        let mut reference_key = prefix_key;
+        reference_key.extend_from_slice(&replacement_key);
+        let mut reference_value = prefix_value;
+        reference_value.extend_from_slice(&replacement_value);
+        let reference_key = DeviceBuffer::from_host(&reference_key).expect("reference K");
+        let reference_value = DeviceBuffer::from_host(&reference_value).expect("reference V");
+        let mut reference =
+            Sm12xKvCache::new(SM12X_KV_PAGE_TOKENS, KV_HEADS, HEAD_DIM).expect("reference cache");
+        reference
+            .append_rows_at_offset_on_stream(
+                &reference_key,
+                &reference_value,
+                0,
+                PREFIX + REPLACEMENT,
+                &stream,
+            )
+            .expect("reference append");
+
+        let page_table = DeviceBuffer::from_host(&[SLOT as u32]).expect("page table");
+        let mut workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(SM12X_KV_PAGE_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("workspace");
+        let mut paged_output = DeviceBuffer::zeroed(q_width).expect("paged output");
+        workspace
+            .attention_paged_offsets_into_on_stream(
+                &pool,
+                &page_table,
+                PREFIX + REPLACEMENT,
+                &query,
+                0,
+                paged_output.output(),
+                0,
+                &stream,
+            )
+            .expect("paged attention");
+        let mut reference_output = DeviceBuffer::zeroed(q_width).expect("reference output");
+        workspace
+            .attention_into_on_stream(&reference, &query, reference_output.output(), &stream)
+            .expect("reference attention");
+        assert_eq!(
+            paged_output.copy_to_host(&stream).expect("paged read"),
+            reference_output
+                .copy_to_host(&stream)
+                .expect("reference read")
+        );
+    }
+
+    #[test]
+    fn paged_causal_rows_match_repeated_muse_shaped_attention_across_pages() {
+        const PREFIX: usize = 123;
+        const ROWS: usize = 16;
+        const CAPACITY: usize = 2 * SM12X_KV_PAGE_TOKENS;
+        const WINDOW: usize = 64;
+        const KV_HEADS: usize = 2;
+        const Q_HEADS: usize = 32;
+        const HEAD_DIM: usize = 128;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let prefix_key = DeviceBuffer::from_host(
+            &(0..PREFIX * kv_width)
+                .map(|index| ((index * 17 + 3) % 251) as f32 / 96.0 - 1.25)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefix K");
+        let prefix_value = DeviceBuffer::from_host(
+            &(0..PREFIX * kv_width)
+                .map(|index| ((index * 29 + 7) % 257) as f32 / 112.0 - 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefix V");
+        let key = DeviceBuffer::from_host(
+            &(0..ROWS * kv_width)
+                .map(|index| ((index * 19 + 11) % 263) as f32 / 128.0 - 0.75)
+                .collect::<Vec<_>>(),
+        )
+        .expect("K rows");
+        let value = DeviceBuffer::from_host(
+            &(0..ROWS * kv_width)
+                .map(|index| ((index * 31 + 13) % 269) as f32 / 144.0 - 0.625)
+                .collect::<Vec<_>>(),
+        )
+        .expect("V rows");
+        let query = DeviceBuffer::from_host(
+            &(0..ROWS * q_width)
+                .map(|index| ((index * 37 + 5) % 271) as f32 / 160.0 - 0.75)
+                .collect::<Vec<_>>(),
+        )
+        .expect("query rows");
+        let page_table = DeviceBuffer::from_host(&[2_u32, 0]).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut batched_pool = Sm12xKvPagePool::new(3, KV_HEADS, HEAD_DIM).expect("batched pool");
+        let mut repeated_pool = Sm12xKvPagePool::new(3, KV_HEADS, HEAD_DIM).expect("repeated pool");
+        batched_pool
+            .append_rows_at_offset_on_stream(2, 0, &prefix_key, &prefix_value, 0, PREFIX, &stream)
+            .expect("batched prefix");
+        repeated_pool
+            .append_rows_at_offset_on_stream(2, 0, &prefix_key, &prefix_value, 0, PREFIX, &stream)
+            .expect("repeated prefix");
+
+        let mut batched_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa_batched(CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM, ROWS)
+                .expect("batched workspace");
+        let mut batched_output = DeviceBuffer::zeroed(ROWS * q_width).expect("batched output");
+        let mut processed = 0;
+        while processed < ROWS {
+            let position = PREFIX + processed;
+            let local_position = position % SM12X_KV_PAGE_TOKENS;
+            let rows = (ROWS - processed)
+                .min(SM12X_KV_PAGE_TOKENS - local_position)
+                .min(V_TOKEN_BLOCK - position % V_TOKEN_BLOCK);
+            let slot = [2, 0][position / SM12X_KV_PAGE_TOKENS];
+            batched_pool
+                .append_rows_at_offset_on_stream(
+                    slot,
+                    local_position,
+                    &key,
+                    &value,
+                    processed,
+                    rows,
+                    &stream,
+                )
+                .expect("batched append");
+            batched_workspace
+                .attention_paged_causal_rows_at_offset_into_on_stream(
+                    &batched_pool,
+                    &page_table,
+                    position,
+                    &query,
+                    processed,
+                    rows,
+                    Some(WINDOW),
+                    batched_output.output(),
+                    &stream,
+                )
+                .expect("batched causal attention");
+            processed += rows;
+        }
+
+        let mut repeated_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("repeated workspace");
+        let mut repeated_output = DeviceBuffer::zeroed(ROWS * q_width).expect("repeated output");
+        for row in 0..ROWS {
+            let position = PREFIX + row;
+            let slot = [2, 0][position / SM12X_KV_PAGE_TOKENS];
+            repeated_pool
+                .append_at_offsets_on_stream(
+                    slot,
+                    position % SM12X_KV_PAGE_TOKENS,
+                    &key,
+                    row * kv_width,
+                    &value,
+                    row * kv_width,
+                    &stream,
+                )
+                .expect("repeated append");
+            let cache_len = position + 1;
+            repeated_workspace
+                .attention_paged_window_offsets_into_on_stream(
+                    &repeated_pool,
+                    &page_table,
+                    cache_len,
+                    &query,
+                    row * q_width,
+                    repeated_output.output(),
+                    row * q_width,
+                    cache_len.saturating_sub(WINDOW),
+                    &stream,
+                )
+                .expect("repeated attention");
+        }
+        assert_eq!(
+            batched_output.copy_to_host(&stream).expect("batched read"),
+            repeated_output
+                .copy_to_host(&stream)
+                .expect("repeated read")
         );
     }
 

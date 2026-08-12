@@ -909,6 +909,16 @@ impl MuseGlimmerModel {
             .count();
         let committed_rows = 1 + accepted;
         let retained_position = start_position + 1 + accepted;
+        if retained_position / super::batch::DFLASH_BLOCK_SIZE
+            == start_position / super::batch::DFLASH_BLOCK_SIZE
+        {
+            self.restore_verification_tail_prefix(
+                sequence,
+                &reservation,
+                start_position % super::batch::DFLASH_BLOCK_SIZE,
+                cache,
+            )?;
+        }
         cache
             .commit_append(
                 reservation,
