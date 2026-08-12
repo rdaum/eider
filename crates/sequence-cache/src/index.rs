@@ -51,10 +51,7 @@ impl PrefixIndex {
     }
 
     pub fn longest(&self, key: &PrefixKey) -> Option<PrefixEntryId> {
-        let mut found = None;
-        self.tree
-            .with_longest_prefix_match_view_k(key, |_key, id| found = Some(*id));
-        found
+        self.tree.longest_prefix_value_bytes(key.as_ref()).copied()
     }
 
     pub fn exact(&self, tokens: &[u32], page_tokens: usize) -> Option<PrefixEntryId> {
@@ -62,7 +59,7 @@ impl PrefixIndex {
         if key.as_ref().len() != tokens.len() / page_tokens * 8 {
             return None;
         }
-        self.tree.get_k(&key).copied()
+        self.tree.get_bytes(key.as_ref()).copied()
     }
 
     pub fn prepare_key<E>(&mut self, tokens: &[u32], page_tokens: usize) -> Result<PreparedKey, E> {

@@ -115,10 +115,7 @@ impl<V> PrefixCache<V> {
         restore: impl FnOnce(&V) -> Result<R>,
     ) -> Result<Option<R>> {
         let started = Instant::now();
-        let mut entry_id = None;
-        self.index
-            .with_longest_prefix_match_view_k(key, |_matched, &id| entry_id = Some(id));
-        let Some(entry_id) = entry_id else {
+        let Some(entry_id) = self.index.longest_prefix_value_bytes(key.as_ref()).copied() else {
             self.metric_handle.record_miss();
             return Ok(None);
         };
@@ -135,7 +132,7 @@ impl<V> PrefixCache<V> {
     }
 
     pub(crate) fn contains(&self, key: &PrefixCacheKey) -> bool {
-        self.index.get_k(key).is_some()
+        self.index.get_bytes(key.as_ref()).is_some()
     }
 
     pub(crate) fn prepare_insert(&mut self, device_bytes: usize) -> bool {
@@ -170,7 +167,7 @@ impl<V> PrefixCache<V> {
         value: V,
         device_bytes: usize,
     ) -> Result<()> {
-        if !self.prepare_insert(device_bytes) || self.contains(&key) {
+        if self.contains(&key) || !self.prepare_insert(device_bytes) {
             return Ok(());
         }
         self.clock = self.clock.wrapping_add(1);
@@ -260,5 +257,43 @@ mod tests {
         assert_eq!(cacheable_prompt_prefix_tokens(129), 128);
         assert_eq!(cacheable_prompt_prefix_tokens(256), 128);
         assert_eq!(cacheable_prompt_prefix_tokens(257), 256);
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_evict_existing_entries() {
+        let mut cache = PrefixCache::new(2);
+        let first = vec![1; PREFIX_CACHE_BLOCK_TOKENS];
+        let second = vec![2; PREFIX_CACHE_BLOCK_TOKENS];
+        let first_key = cache
+            .prompt_key(&first, first.len())
+            .expect("first prefix key");
+        let second_key = cache
+            .prompt_key(&second, second.len())
+            .expect("second prefix key");
+
+        cache
+            .insert(first_key.clone(), 11, 1)
+            .expect("first insert");
+        cache
+            .insert(second_key.clone(), 22, 1)
+            .expect("second insert");
+        cache
+            .insert(first_key.clone(), 99, 2)
+            .expect("duplicate insert");
+
+        assert_eq!(cache.device_bytes, 2);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(
+            cache
+                .restore(&first_key, |_| 1, |value| Ok(*value))
+                .expect("restore first"),
+            Some(11)
+        );
+        assert_eq!(
+            cache
+                .restore(&second_key, |_| 1, |value| Ok(*value))
+                .expect("restore second"),
+            Some(22)
+        );
     }
 }
