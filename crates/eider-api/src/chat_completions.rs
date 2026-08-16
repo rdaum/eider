@@ -2,8 +2,8 @@
 
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished, OneOrMany};
 use infer::runtime::chat::{
-    ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatReasoningEffort, ChatRole,
-    ChatTemplateOptions, ChatTool, ChatToolCall,
+    ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatReasoningEffort, ChatRole, ChatTool,
+    ChatToolCall,
 };
 use infer::runtime::generation::GenerationConfig;
 use infer::runtime::sampling::SamplingConfig;
@@ -147,23 +147,29 @@ impl ChatCompletionRequest {
             .validate()
             .map_err(|error| ApiError::invalid("sampling", error.to_string()))?;
 
-        let enable_thinking =
-            self.reasoning_effort.as_deref() != Some("none") && self.reasoning_effort.is_some();
-        let reasoning_effort = self
-            .reasoning_effort
-            .as_deref()
-            .filter(|effort| *effort != "none")
-            .map(parse_reasoning_effort)
-            .transpose()?;
+        let mut template = defaults.chat_template;
+        if self.reasoning_effort.is_some() {
+            template.enable_thinking = self.reasoning_effort.as_deref() != Some("none");
+            template.reasoning_effort = self
+                .reasoning_effort
+                .as_deref()
+                .filter(|effort| *effort != "none")
+                .map(parse_reasoning_effort)
+                .transpose()?;
+            if defaults.chat_template.reasoning_effort == Some(ChatReasoningEffort::XHigh)
+                && template.reasoning_effort == Some(ChatReasoningEffort::High)
+            {
+                template.reasoning_effort = Some(ChatReasoningEffort::XHigh);
+            }
+            if !template.enable_thinking {
+                template.reasoning_effort = None;
+            }
+        }
 
         Ok(ChatRequest {
             messages,
             tools,
-            template: ChatTemplateOptions {
-                enable_thinking,
-                reasoning_effort,
-                ..ChatTemplateOptions::default()
-            },
+            template,
             generation,
             stop_sequences: self.stop.map(OneOrMany::into_vec).unwrap_or_default(),
         })
@@ -618,6 +624,24 @@ mod tests {
             Some(ChatReasoningEffort::Low)
         );
         assert!(chat.template.enable_thinking);
+    }
+
+    #[test]
+    fn omitted_reasoning_effort_uses_checkpoint_template_default() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"eider-qwen3.8",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let mut defaults = defaults();
+        defaults.chat_template.enable_thinking = true;
+        defaults.chat_template.reasoning_effort = Some(ChatReasoningEffort::XHigh);
+        let chat = request.into_chat_request(&defaults).unwrap();
+        assert!(chat.template.enable_thinking);
+        assert_eq!(
+            chat.template.reasoning_effort,
+            Some(ChatReasoningEffort::XHigh)
+        );
     }
 
     #[test]

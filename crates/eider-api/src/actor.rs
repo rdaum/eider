@@ -456,7 +456,7 @@ fn actor_main(
                 retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 bf16_storage = ?qwen_bf16_storage,
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
-                "loading Qwen3.6 model"
+                "loading Qwen hybrid model"
             );
             let model = match Qwen36TextModel::open_with_storage_and_artifact_dir(
                 &model_dir,
@@ -696,7 +696,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
         "bailing_hybrid" => Ok(CheckpointArchitecture::Ling3),
         "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
         "bonsai" => Ok(CheckpointArchitecture::Bonsai),
-        "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
+        "qwen3_5" | "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
         "step3p7" => Ok(CheckpointArchitecture::Step37),
         "nemotron_h" | "nemotron_h_puzzle" => Ok(CheckpointArchitecture::Nemotron3),
         "gemma4" => Ok(CheckpointArchitecture::Gemma4),
@@ -2930,6 +2930,12 @@ mod tests {
             r#"{"model_type":"qwen3_5_moe"}"#,
         )
         .expect("write Qwen config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Qwen36
+        );
+        fs::write(directory.join("config.json"), r#"{"model_type":"qwen3_5"}"#)
+            .expect("write dense Qwen config");
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Qwen36

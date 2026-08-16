@@ -105,6 +105,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "qwen3.8-27b",
+        repository: "Inferact/Qwen3.8-27B-NVFP4",
+        revision: "6128240ebaf4eaa7bad2b3d1c72c37d677c5f462",
+        model_type: "qwen3_5",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-qwen3.8",
+            max_context_tokens: 32_768,
+            prefill_token_capacity: 1_024,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "agents-a1",
         repository: "r0b0tlab/Agents-A1-NVFP4",
         revision: "68a7ff18c006927cbf3a97f76f293452ca14e016",
@@ -553,6 +567,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             | "bailing_hybrid"
             | "muse_glimmer"
             | "bonsai"
+            | "qwen3_5"
             | "qwen3_5_moe"
             | "step3p7"
             | "nemotron_h"
@@ -805,6 +820,18 @@ mod tests {
         assert_eq!(model.repository, "Inferact/Muse-Glimmer-30B-NVFP4-W4A4");
         assert_eq!(model.revision, "d35cb79050f419c457611b1cee5c5d15b176f285");
         assert_eq!(model.defaults.max_context_tokens, 131_072);
+    }
+
+    #[test]
+    fn catalogue_pins_qwen38_nvfp4_checkpoint() {
+        let model = catalogue_model("qwen3.8-27b").unwrap();
+        assert_eq!(model.model_type, "qwen3_5");
+        assert_eq!(model.repository, "Inferact/Qwen3.8-27B-NVFP4");
+        assert_eq!(model.revision, "6128240ebaf4eaa7bad2b3d1c72c37d677c5f462");
+        assert_eq!(model.artifact_kind, ArtifactKind::None);
+        assert_eq!(model.defaults.served_model_name, "eider-qwen3.8");
+        assert_eq!(model.defaults.max_context_tokens, 32_768);
+        assert_eq!(model.defaults.prefill_token_capacity, 1_024);
     }
 
     #[test]

@@ -54,6 +54,7 @@ catalogue:
 
 ```sh
 eider-serve agents-a1
+eider-serve qwen3.8-27b
 eider-serve step-3.7-flash --step-expert-capacity 192
 eider-serve gemma-4-26b-a4b-nvfp4
 eider-serve muse-glimmer-30b-nvfp4
@@ -97,7 +98,8 @@ eider model fetch step-3.7-flash --prepare
 ```
 
 This command is not a prerequisite for serving. `--prepare` currently builds
-the Step-3.7 expert records; Qwen preparation remains part of model startup.
+the Step-3.7 expert records; Qwen3.6 expert preparation remains part of model
+startup. Dense Qwen3.8 requires no derived expert artifacts.
 
 ## Supported model catalogue
 
@@ -111,9 +113,9 @@ Each Eider release contains a small, reviewed catalogue. A model entry includes:
 - Preparation strategy and prepared-format version.
 - Default served model name, context limit, and paging settings.
 
-The current catalogue includes Qwen3.6 35B-A3B, Agents-A1, Step-3.7-Flash,
-Muse Glimmer 30B, Nemotron 3 Puzzle 75B-A9B, and both supported Gemma 4
-26B-A4B weight formats:
+The current catalogue includes Qwen3.6 35B-A3B, dense Qwen3.8 27B,
+Agents-A1, Step-3.7-Flash, Muse Glimmer 30B, Nemotron 3 Puzzle 75B-A9B, and
+both supported Gemma 4 26B-A4B weight formats:
 the NVIDIA ModelOpt NVFP4 checkpoint (`gemma-4-26b-a4b-nvfp4`) and Google's
 upstream BF16 instruction-tuned checkpoint (`gemma-4-26b-a4b-it`). Both Gemma
 entries use the Gemma 4 text runtime; image, video, and audio inputs remain

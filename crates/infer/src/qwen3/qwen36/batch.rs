@@ -1,8 +1,9 @@
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36DownStorage, Qwen36FullAttentionWeights, Qwen36GateUpStorage,
-    Qwen36LayerBlock, Qwen36Linear, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
-    Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState,
-    Qwen36SharedExpertStorage, Qwen36TextModel, maybe_round_device_f32_to_bf16,
+    Qwen36LayerBlock, Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState,
+    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken,
+    Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage, Qwen36TextModel,
+    maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
 
@@ -107,6 +108,8 @@ pub struct Qwen36DecodeLayerTrace {
     pub shared_moe: Vec<f32>,
     /// Scalar shared-expert gate for each active row.
     pub shared_gate: Vec<f32>,
+    /// Dense feed-forward rows before the residual update, when applicable.
+    pub dense_ffn: Vec<f32>,
     /// Active row-major hidden values after the layer residual update.
     pub hidden: Vec<f32>,
 }
@@ -838,7 +841,10 @@ impl BatchLinearAttentionWorkspace {
             z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
             out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
             alpha_beta_plan: BatchBf16LinearPlan::new(model, &weights.alpha_beta, row_capacity)?,
-            chunked_gdn: chunked_prefill
+            // The optimised chunked kernel is specialised to Qwen3.6's 32
+            // value heads. Other Qwen3.5-family shapes use the generic ragged
+            // GDN kernel below.
+            chunked_gdn: (chunked_prefill && linear.value_heads == GDN_HEADS)
                 .then(|| BatchChunkedGdnWorkspace::new(row_capacity, state_capacity))
                 .transpose()?,
         })
@@ -1070,6 +1076,20 @@ struct BatchMoeWorkspace {
     output: DeviceBuffer<f32>,
 }
 
+struct BatchDenseMlpWorkspace {
+    gate_up_plan: BatchNvfp4LinearPlan,
+    down_plan: BatchNvfp4LinearPlan,
+    gate_up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+}
+
+enum BatchFfnWorkspace {
+    Moe(Box<BatchMoeWorkspace>),
+    Dense(Box<BatchDenseMlpWorkspace>),
+}
+
 struct BatchGroupedMoeWorkspace {
     capacity_rows: usize,
     routes_per_row: usize,
@@ -1188,7 +1208,7 @@ pub struct Qwen36PrefillBatchWorkspace {
     ffn_norm: DeviceBuffer<f32>,
     linear: BatchLinearAttentionWorkspace,
     full: BatchFullAttentionWorkspace,
-    moe: BatchMoeWorkspace,
+    moe: BatchFfnWorkspace,
 }
 
 impl Qwen36PrefillBatchWorkspace {
@@ -1302,6 +1322,76 @@ impl BatchMoeWorkspace {
     }
 }
 
+impl BatchDenseMlpWorkspace {
+    fn new(
+        model: &Qwen36TextModel,
+        weights: &super::Qwen36DenseMlpWeights,
+        capacity: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_up_plan: new_nvfp4_batch_linear_plan(model, &weights.gate_up, capacity)?,
+            down_plan: new_nvfp4_batch_linear_plan(model, &weights.down, capacity)?,
+            gate_up: DeviceBuffer::zeroed(capacity * weights.gate_up.out_features)?,
+            activated: DeviceBuffer::zeroed(capacity * weights.down.in_features)?,
+            down: DeviceBuffer::zeroed(capacity * weights.down.out_features)?,
+            output: DeviceBuffer::zeroed(capacity * weights.down.out_features)?,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.gate_up_plan
+            .plans
+            .values()
+            .map(Fp4TnMatmulPlan::workspace_bytes)
+            .sum::<usize>()
+            + self.gate_up_plan.activation.device_bytes()
+            + self
+                .down_plan
+                .plans
+                .values()
+                .map(Fp4TnMatmulPlan::workspace_bytes)
+                .sum::<usize>()
+            + self.down_plan.activation.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.down.device_bytes()
+            + self.output.device_bytes()
+    }
+}
+
+impl BatchFfnWorkspace {
+    fn new(
+        model: &Qwen36TextModel,
+        weights: &Qwen36LayerFfnWeights,
+        capacity: usize,
+    ) -> Result<Self> {
+        match weights {
+            Qwen36LayerFfnWeights::Moe(weights) => BatchMoeWorkspace::new(model, weights, capacity)
+                .map(Box::new)
+                .map(Self::Moe),
+            Qwen36LayerFfnWeights::Dense(weights) => {
+                BatchDenseMlpWorkspace::new(model, weights, capacity)
+                    .map(Box::new)
+                    .map(Self::Dense)
+            }
+        }
+    }
+
+    fn output_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        match self {
+            Self::Moe(workspace) => &mut workspace.output,
+            Self::Dense(workspace) => &mut workspace.output,
+        }
+    }
+
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Moe(workspace) => workspace.device_bytes(),
+            Self::Dense(workspace) => workspace.device_bytes(),
+        }
+    }
+}
+
 /// Reusable execution storage for a changing set of decode sequences.
 pub struct Qwen36DecodeBatchWorkspace {
     model_id: u64,
@@ -1322,7 +1412,7 @@ pub struct Qwen36DecodeBatchWorkspace {
     final_hidden: DeviceBuffer<f32>,
     linear: BatchLinearAttentionWorkspace,
     full: BatchFullAttentionWorkspace,
-    moe: BatchMoeWorkspace,
+    moe: BatchFfnWorkspace,
     lm_head_plan: Option<BatchLinearPlan>,
     lm_head_quantized: DeviceBuffer<u8>,
     lm_head_scale: DeviceBuffer<f32>,
@@ -1377,7 +1467,7 @@ impl Qwen36LayerBlock {
     fn enqueue_batch_tail(
         &self,
         model: &Qwen36TextModel,
-        moe: &mut BatchMoeWorkspace,
+        ffn: &mut BatchFfnWorkspace,
         hidden: &DeviceBuffer<f32>,
         attention_output: &DeviceBuffer<f32>,
         attn_residual: &mut DeviceBuffer<f32>,
@@ -1405,7 +1495,7 @@ impl Qwen36LayerBlock {
         )?;
         self.moe.run_batch(
             model,
-            moe,
+            ffn,
             ffn_norm,
             attn_residual,
             capacity,
@@ -1490,7 +1580,7 @@ impl Qwen36TextModel {
                 token_capacity,
                 max_context_tokens,
             )?,
-            moe: BatchMoeWorkspace::new(self, first_moe, token_capacity)?,
+            moe: BatchFfnWorkspace::new(self, first_moe, token_capacity)?,
         })
     }
 
@@ -1760,12 +1850,9 @@ impl Qwen36TextModel {
             self.layers.len(),
             workspace.sequence_capacity,
         )?;
-        workspace
-            .linear
-            .chunked_gdn
-            .as_mut()
-            .expect("prefill workspace has chunked GDN storage")
-            .prepare(&workspace.host_sequence_lengths[..rows.len()])?;
+        if let Some(chunked_gdn) = workspace.linear.chunked_gdn.as_mut() {
+            chunked_gdn.prepare(&workspace.host_sequence_lengths[..rows.len()])?;
+        }
 
         let stream = &workspace.stream;
         copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
@@ -1843,10 +1930,10 @@ impl Qwen36TextModel {
                     join: &sync.join,
                 }),
             )?;
-            std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+            std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
         }
         if !self.layers.len().is_multiple_of(2) {
-            std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+            std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
         }
         stream.synchronize()?;
         Ok(())
@@ -1920,7 +2007,7 @@ impl Qwen36TextModel {
                 false,
             )?,
             full: BatchFullAttentionWorkspace::new(self, first_full, capacity, max_context_tokens)?,
-            moe: BatchMoeWorkspace::new(self, first_moe, capacity)?,
+            moe: BatchFfnWorkspace::new(self, first_moe, capacity)?,
             lm_head_plan,
             lm_head_quantized: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
             lm_head_scale: DeviceBuffer::zeroed(capacity)?,
@@ -2041,10 +2128,10 @@ impl Qwen36TextModel {
                 }
             };
             graphs.push(graph);
-            std::mem::swap(hidden, &mut moe.output);
+            std::mem::swap(hidden, moe.output_mut());
         }
         if !self.layers.len().is_multiple_of(2) {
-            std::mem::swap(hidden, &mut moe.output);
+            std::mem::swap(hidden, moe.output_mut());
         }
         Ok(graphs)
     }
@@ -2062,6 +2149,62 @@ impl Qwen36TextModel {
             Qwen36Attention::LinearAttention(_) => &workspace.linear.output,
             Qwen36Attention::FullAttention(_) => &workspace.full.output,
         };
+        let (
+            router_logits,
+            route_indices,
+            route_weights,
+            routed_moe,
+            shared_moe,
+            shared_gate,
+            dense_ffn,
+        ) = match (&workspace.moe, &block.moe) {
+            (BatchFfnWorkspace::Moe(workspace), Qwen36LayerFfnWeights::Moe(weights)) => (
+                workspace
+                    .router_logits
+                    .copy_prefix_to_host(active_rows * weights.num_experts, stream)?
+                    .into_vec(),
+                workspace
+                    .route_indices
+                    .copy_prefix_to_host(active_rows * weights.experts_per_token, stream)?
+                    .into_vec(),
+                workspace
+                    .route_weights
+                    .copy_prefix_to_host(active_rows * weights.experts_per_token, stream)?
+                    .into_vec(),
+                workspace
+                    .grouped
+                    .routed_output
+                    .copy_prefix_to_host(values, stream)?
+                    .into_vec(),
+                workspace
+                    .shared_output
+                    .copy_prefix_to_host(values, stream)?
+                    .into_vec(),
+                workspace
+                    .shared_gate
+                    .copy_prefix_to_host(active_rows, stream)?
+                    .into_vec(),
+                Vec::new(),
+            ),
+            (BatchFfnWorkspace::Dense(workspace), Qwen36LayerFfnWeights::Dense(_)) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                workspace
+                    .down
+                    .copy_prefix_to_host(values, stream)?
+                    .into_vec(),
+            ),
+            _ => {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen decode trace feed-forward workspace",
+                    detail: "weights and workspace variants do not match".to_string(),
+                });
+            }
+        };
         Ok(Qwen36DecodeLayerTrace {
             layer_index,
             input_norm: workspace
@@ -2077,37 +2220,13 @@ impl Qwen36TextModel {
                 .ffn_norm
                 .copy_prefix_to_host(values, stream)?
                 .into_vec(),
-            router_logits: workspace
-                .moe
-                .router_logits
-                .copy_prefix_to_host(active_rows * block.moe.num_experts, stream)?
-                .into_vec(),
-            route_indices: workspace
-                .moe
-                .route_indices
-                .copy_prefix_to_host(active_rows * block.moe.experts_per_token, stream)?
-                .into_vec(),
-            route_weights: workspace
-                .moe
-                .route_weights
-                .copy_prefix_to_host(active_rows * block.moe.experts_per_token, stream)?
-                .into_vec(),
-            routed_moe: workspace
-                .moe
-                .grouped
-                .routed_output
-                .copy_prefix_to_host(values, stream)?
-                .into_vec(),
-            shared_moe: workspace
-                .moe
-                .shared_output
-                .copy_prefix_to_host(values, stream)?
-                .into_vec(),
-            shared_gate: workspace
-                .moe
-                .shared_gate
-                .copy_prefix_to_host(active_rows, stream)?
-                .into_vec(),
+            router_logits,
+            route_indices,
+            route_weights,
+            routed_moe,
+            shared_moe,
+            shared_gate,
+            dense_ffn,
             hidden: workspace
                 .hidden
                 .copy_prefix_to_host(values, stream)?
@@ -2408,7 +2527,7 @@ impl Qwen36TextModel {
                         post_attention.launch(stream)?;
                     }
                 }
-                std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+                std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(self.capture_decode_layer_trace(
                         workspace,
@@ -2486,7 +2605,7 @@ impl Qwen36TextModel {
                     join: &moe_sync.join,
                 }),
             )?;
-            std::mem::swap(&mut workspace.hidden, &mut workspace.moe.output);
+            std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
             if let Some(trace) = trace.as_deref_mut() {
                 trace.push(self.capture_decode_layer_trace(
                     workspace,
@@ -2794,7 +2913,7 @@ impl Qwen36LinearAttentionWeights {
             row_capacity,
             stream,
         )?;
-        let use_chunked_gdn = total_tokens >= GDN_CHUNK_TOKENS;
+        let use_chunked_gdn = total_tokens >= GDN_CHUNK_TOKENS && workspace.chunked_gdn.is_some();
         if use_chunked_gdn {
             let chunked = workspace
                 .chunked_gdn
@@ -3245,6 +3364,73 @@ impl Qwen36FullAttentionWeights {
             256,
             stream,
         )
+    }
+}
+
+impl Qwen36LayerFfnWeights {
+    #[allow(clippy::too_many_arguments)]
+    fn run_batch(
+        &self,
+        model: &Qwen36TextModel,
+        workspace: &mut BatchFfnWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        residual: &DeviceBuffer<f32>,
+        capacity: usize,
+        stabilise_router_logits: bool,
+        stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
+    ) -> Result<()> {
+        match (self, workspace) {
+            (Self::Moe(weights), BatchFfnWorkspace::Moe(workspace)) => weights.run_batch(
+                model,
+                workspace,
+                ffn_norm,
+                residual,
+                capacity,
+                stabilise_router_logits,
+                stream,
+                parallel_moe,
+            ),
+            (Self::Dense(weights), BatchFfnWorkspace::Dense(workspace)) => {
+                run_nvfp4_batch(
+                    model,
+                    &weights.gate_up,
+                    &mut workspace.gate_up_plan,
+                    ffn_norm,
+                    &mut workspace.gate_up,
+                    capacity,
+                    stream,
+                )?;
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &workspace.gate_up,
+                    workspace.activated.output(),
+                    capacity,
+                    weights.down.in_features,
+                    stream,
+                )?;
+                run_nvfp4_batch(
+                    model,
+                    &weights.down,
+                    &mut workspace.down_plan,
+                    &workspace.activated,
+                    &mut workspace.down,
+                    capacity,
+                    stream,
+                )?;
+                add_f32_prefix_into_on_stream(
+                    residual,
+                    &workspace.down,
+                    workspace.output.output(),
+                    capacity * model.manifest.hidden,
+                    stream,
+                )?;
+                round_f32_to_bf16_in_place_on_stream(workspace.output.inout(), stream)
+            }
+            _ => Err(crate::nvfp4::Error::Format {
+                label: "Qwen batched feed-forward workspace",
+                detail: "weights and workspace variants do not match".to_string(),
+            }),
+        }
     }
 }
 

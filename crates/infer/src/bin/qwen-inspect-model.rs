@@ -87,7 +87,7 @@ fn parse_model_dir() -> Result<PathBuf> {
 fn arch_label(architecture: QwenArchitecture) -> &'static str {
     match architecture {
         QwenArchitecture::Qwen3 => "qwen3",
-        QwenArchitecture::Qwen35Moe => "qwen3_5_moe",
+        QwenArchitecture::Qwen35Hybrid => "qwen3_5 hybrid",
     }
 }
 

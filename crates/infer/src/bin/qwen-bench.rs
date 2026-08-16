@@ -45,8 +45,8 @@ struct BenchRun {
 }
 
 enum BenchModel {
-    Qwen3(Qwen3Model),
-    Qwen36(Qwen36TextModel),
+    Qwen3(Box<Qwen3Model>),
+    Qwen36(Box<Qwen36TextModel>),
 }
 
 #[derive(ExportMetrics)]
@@ -294,8 +294,8 @@ impl BenchModel {
     ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir)?;
         match manifest.architecture {
-            QwenArchitecture::Qwen3 => Qwen3Model::load(model_dir).map(Self::Qwen3),
-            QwenArchitecture::Qwen35Moe => {
+            QwenArchitecture::Qwen3 => Qwen3Model::load(model_dir).map(Box::new).map(Self::Qwen3),
+            QwenArchitecture::Qwen35Hybrid => {
                 let checkpoint = if let Some(artifact_dir) = artifact_dir {
                     Qwen36Model::open_with_storage_and_artifact_dir(
                         model_dir,
@@ -313,7 +313,7 @@ impl BenchModel {
                 } else {
                     Qwen36TextModel::from_qwen36_model(checkpoint)?
                 };
-                Ok(Self::Qwen36(model))
+                Ok(Self::Qwen36(Box::new(model)))
             }
         }
     }

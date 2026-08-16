@@ -3,8 +3,8 @@
 CUDA inference and serving for NVFP4 and mixed-precision models on NVIDIA DGX
 Spark / GB10 (`sm_121`). The workspace contains the `eider-api` server, the
 multi-model `infer` runtime, and the `nvfp4` CUDA kernel crate. Supported model
-families currently include Qwen3.5/3.6 MoE, Step-3.7, Laguna-S-2.1, Gemma 4,
-Nemotron 3, and DeepSeek V4 Flash.
+families currently include Qwen3.5/3.6 MoE, dense Qwen3.8, Step-3.7,
+Laguna-S-2.1, Gemma 4, Nemotron 3, and DeepSeek V4 Flash.
 Muse Glimmer 30B is supported through the Inferact ModelOpt NVFP4 checkpoint's
 text path; its image and video towers are not served.
 

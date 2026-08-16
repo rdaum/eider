@@ -1,6 +1,7 @@
 //! Reusable request-scoped generation sessions.
 
 use super::cache_config::SequenceCacheConfig;
+use super::chat::{ChatReasoningEffort, ChatTemplateOptions};
 use super::nemotron3_sequence_cache::{
     Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
 };
@@ -42,6 +43,8 @@ pub struct GenerationConfig {
     pub eos_token_ids: BTreeSet<u32>,
     /// Text sequences that terminate generation without being emitted.
     pub stop_sequences: Vec<String>,
+    /// Checkpoint-native chat-template defaults.
+    pub chat_template: ChatTemplateOptions,
 }
 
 impl Default for GenerationConfig {
@@ -51,6 +54,10 @@ impl Default for GenerationConfig {
             max_new_tokens: 64,
             eos_token_ids: BTreeSet::new(),
             stop_sequences: Vec::new(),
+            chat_template: ChatTemplateOptions {
+                enable_thinking: false,
+                ..ChatTemplateOptions::default()
+            },
         }
     }
 }
@@ -112,6 +119,7 @@ impl GenerationConfig {
                     .map_or(0.0, |value| value as f32),
             },
             eos_token_ids,
+            chat_template: checkpoint_chat_template_defaults(model_dir)?,
             ..Self::default()
         };
         config.validate()?;
@@ -128,6 +136,41 @@ impl GenerationConfig {
             });
         }
         Ok(())
+    }
+}
+
+fn checkpoint_chat_template_defaults(model_dir: &Path) -> Result<ChatTemplateOptions> {
+    let path = model_dir.join("config.json");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ChatTemplateOptions {
+                enable_thinking: false,
+                ..ChatTemplateOptions::default()
+            });
+        }
+        Err(error) => {
+            return Err(Error::Format {
+                label: "config.json",
+                detail: format!("{}: {error}", path.display()),
+            });
+        }
+    };
+    let config: Value = serde_json::from_str(&contents).map_err(|error| Error::Format {
+        label: "config.json",
+        detail: error.to_string(),
+    })?;
+    if config["model_type"].as_str() == Some("qwen3_5") {
+        Ok(ChatTemplateOptions {
+            enable_thinking: true,
+            reasoning_effort: Some(ChatReasoningEffort::XHigh),
+            ..ChatTemplateOptions::default()
+        })
+    } else {
+        Ok(ChatTemplateOptions {
+            enable_thinking: false,
+            ..ChatTemplateOptions::default()
+        })
     }
 }
 
@@ -562,6 +605,7 @@ impl<'a> Nemotron3GenerationSession<'a> {
 #[cfg(test)]
 mod tests {
     use super::GenerationConfig;
+    use crate::runtime::chat::ChatReasoningEffort;
     use std::fs;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::{AddedToken, Tokenizer};
@@ -613,6 +657,32 @@ mod tests {
         assert_eq!(
             config.eos_token_ids.into_iter().collect::<Vec<_>>(),
             [1, 2, 128007]
+        );
+
+        fs::remove_dir_all(directory).expect("remove config directory");
+    }
+
+    #[test]
+    fn qwen35_dense_uses_checkpoint_thinking_default() {
+        let directory = std::env::temp_dir().join(format!(
+            "eider-qwen38-chat-default-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).expect("create config directory");
+        fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id":[248046,248044]}"#,
+        )
+        .expect("write generation config");
+        fs::write(directory.join("config.json"), r#"{"model_type":"qwen3_5"}"#)
+            .expect("write model config");
+
+        let config = GenerationConfig::from_model_dir(&directory).expect("generation config");
+        assert!(config.chat_template.enable_thinking);
+        assert_eq!(
+            config.chat_template.reasoning_effort,
+            Some(ChatReasoningEffort::XHigh)
         );
 
         fs::remove_dir_all(directory).expect("remove config directory");

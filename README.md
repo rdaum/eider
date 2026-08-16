@@ -53,6 +53,7 @@ name in the second column.
 | [`bitnet-b1.58-2b-4t`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | `eider-bitnet-b1.58-2b` | Native BitNet b1.58 weights |
 | [`muse-glimmer-30b-nvfp4`](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | `eider-muse-glimmer-30b` | Dense W4A4 target, official DFlash drafter, ATEM tools, compact FP4 KV |
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE, compact FP4 KV |
+| [`qwen3.8-27b`](https://huggingface.co/Inferact/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense 27B hybrid, native ModelOpt NVFP4 MLPs, compact FP4 KV, text path |
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agentic fine-tune, 262K context |
 | [`step-3.7-flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | `eider-step3.7` | 198B MoE with disk-backed expert paging |
 | [`laguna-s-2.1`](https://huggingface.co/poolside/Laguna-S-2.1-NVFP4) | `eider-laguna-s-2.1` | 256-expert MoE, compact FP4 KV |
@@ -132,9 +133,15 @@ Start a catalogue model directly:
 
 ```sh
 eider-serve qwen3.6-35b-a3b
+eider-serve qwen3.8-27b
 eider-serve muse-glimmer-30b-nvfp4
 eider-serve step-3.7-flash --offline
 ```
+
+For a repository-local Qwen3.8 start, use `scripts/run-eider-qwen38.sh`. The
+launcher retains the checkpoint's BF16 attention projections and LM head by
+default; pass the corresponding `--qwen-bf16-*` storage flags explicitly to
+test faster NVFP4 conversion.
 
 The first online start resolves an immutable Hugging Face revision and prepares
 any derived weights below `$XDG_CACHE_HOME/eider/models/`. `--model-dir` is for
@@ -157,6 +164,7 @@ The launchers use the repository's `pi/agent/models.json` without changing the
 user's global Pi configuration:
 
 ```sh
+scripts/run-pi-eider-qwen38.sh
 scripts/run-pi-eider-qwen.sh
 scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
@@ -166,6 +174,10 @@ scripts/run-pi-eider-gemma4.sh
 scripts/run-pi-eider-nemotron3-super.sh
 scripts/run-pi-eider-deepseek4.sh
 ```
+
+The Qwen3.8 launcher defaults to `medium` reasoning so agent turns reach tool
+calls within Pi's output budget. Set `PI_EIDER_THINKING=xhigh` for tasks that
+benefit from the model's full reasoning depth.
 
 They use the Responses API by default. Set `PI_EIDER_PROVIDER=eider-chat` to
 exercise Chat Completions instead.

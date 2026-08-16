@@ -50,6 +50,7 @@ use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertUploadCoordinator, read_expert_misses,
 };
 
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -359,11 +360,11 @@ impl Qwen36Model {
         fp8_attention_storage: Qwen36Fp8AttentionStorage,
     ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir.as_ref())?;
-        if manifest.architecture != QwenArchitecture::Qwen35Moe {
+        if manifest.architecture != QwenArchitecture::Qwen35Hybrid {
             return Err(Error::Format {
-                label: "Qwen3.6 model",
+                label: "Qwen3.5 hybrid model",
                 detail: format!(
-                    "expected qwen3_5_moe architecture, got {:?}",
+                    "expected qwen3_5 or qwen3_5_moe architecture, got {:?}",
                     manifest.architecture
                 ),
             });
@@ -1700,7 +1701,11 @@ impl Qwen36Linear {
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
-        let linear = if info.dtype == "BF16" {
+        let linear = if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
+            || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
+        {
+            Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, prefix)?)
+        } else if info.dtype == "BF16" {
             match bf16_storage {
                 Qwen36Bf16Storage::Bf16 => {
                     Self::Bf16(Bf16Linear::load(checkpoint, &weight_name, rows, cols)?)
@@ -1741,6 +1746,17 @@ impl Qwen36Linear {
         let rows = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
+        if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
+            || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
+        {
+            let host = reorder_nvfp4_v_rows(
+                checkpoint.load_nvfp4_linear(prefix)?,
+                key_heads,
+                value_heads,
+                head_dim,
+            );
+            return Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_host(&host)?));
+        }
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_rows(host, key_heads, value_heads, head_dim);
@@ -1782,6 +1798,17 @@ impl Qwen36Linear {
         let cols = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
+        if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
+            || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
+        {
+            let host = reorder_nvfp4_v_cols(
+                checkpoint.load_nvfp4_linear(prefix)?,
+                key_heads,
+                value_heads,
+                head_dim,
+            );
+            return Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_host(&host)?));
+        }
         if info.dtype == "BF16" {
             let host = read_bf16_matrix_host(checkpoint, &weight_name, rows, cols)?;
             let host = reorder_bf16_v_cols(host, rows, key_heads, value_heads, head_dim);
@@ -2094,6 +2121,41 @@ fn reorder_fp8_v_rows(
     host
 }
 
+/// Reorders V-head output rows in a ModelOpt NVFP4 weight.
+fn reorder_nvfp4_v_rows(
+    mut host: ModelOptNvfp4Linear,
+    key_heads: usize,
+    value_heads: usize,
+    head_v_dim: usize,
+) -> ModelOptNvfp4Linear {
+    if key_heads == value_heads || host.out_features != value_heads * head_v_dim {
+        return host;
+    }
+    let v_per_k = value_heads / key_heads;
+    let packed_row_bytes = host.in_features / 2;
+    let scale_row_bytes = host.in_features / 16;
+    let mut packed = vec![0u8; host.packed_weight.len()];
+    let mut scales = vec![0u8; host.weight_scale.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let dst_head = v_sub * key_heads + k_head;
+        let src_packed = v_k_head * head_v_dim * packed_row_bytes;
+        let dst_packed = dst_head * head_v_dim * packed_row_bytes;
+        let packed_len = head_v_dim * packed_row_bytes;
+        packed[dst_packed..dst_packed + packed_len]
+            .copy_from_slice(&host.packed_weight[src_packed..src_packed + packed_len]);
+        let src_scale = v_k_head * head_v_dim * scale_row_bytes;
+        let dst_scale = dst_head * head_v_dim * scale_row_bytes;
+        let scale_len = head_v_dim * scale_row_bytes;
+        scales[dst_scale..dst_scale + scale_len]
+            .copy_from_slice(&host.weight_scale[src_scale..src_scale + scale_len]);
+    }
+    host.packed_weight = packed;
+    host.weight_scale = scales;
+    host
+}
+
 /// Reorders V columns in the out_proj FP8 weight `[hidden, value_dim]`.
 fn reorder_fp8_v_cols(
     mut host: ModelOptFp8Linear,
@@ -2118,6 +2180,43 @@ fn reorder_fp8_v_cols(
         }
     }
     host.weight = reordered;
+    host
+}
+
+/// Reorders V-head input columns in a ModelOpt NVFP4 output projection.
+fn reorder_nvfp4_v_cols(
+    mut host: ModelOptNvfp4Linear,
+    key_heads: usize,
+    value_heads: usize,
+    head_v_dim: usize,
+) -> ModelOptNvfp4Linear {
+    if key_heads == value_heads || host.in_features != value_heads * head_v_dim {
+        return host;
+    }
+    let v_per_k = value_heads / key_heads;
+    let packed_row_bytes = host.in_features / 2;
+    let scale_row_bytes = host.in_features / 16;
+    let packed_head_bytes = head_v_dim / 2;
+    let scale_head_bytes = head_v_dim / 16;
+    let mut packed = vec![0u8; host.packed_weight.len()];
+    let mut scales = vec![0u8; host.weight_scale.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let dst_head = v_sub * key_heads + k_head;
+        for row in 0..host.out_features {
+            let src = row * packed_row_bytes + v_k_head * packed_head_bytes;
+            let dst = row * packed_row_bytes + dst_head * packed_head_bytes;
+            packed[dst..dst + packed_head_bytes]
+                .copy_from_slice(&host.packed_weight[src..src + packed_head_bytes]);
+            let src = row * scale_row_bytes + v_k_head * scale_head_bytes;
+            let dst = row * scale_row_bytes + dst_head * scale_head_bytes;
+            scales[dst..dst + scale_head_bytes]
+                .copy_from_slice(&host.weight_scale[src..src + scale_head_bytes]);
+        }
+    }
+    host.packed_weight = packed;
+    host.weight_scale = scales;
     host
 }
 
@@ -2537,6 +2636,85 @@ pub struct Qwen36MoeWorkspace {
     pub moe_out: DeviceBuffer<f32>,
     pub ffn_out: DeviceBuffer<f32>,
     pub ffn_residual: DeviceBuffer<f32>,
+}
+
+/// Device-ready dense SwiGLU feed-forward weights used by Qwen3.8.
+pub struct Qwen36DenseMlpWeights {
+    gate_up: Nvfp4DeviceLinear,
+    down: Nvfp4DeviceLinear,
+}
+
+/// Mutable one-token workspace for a dense SwiGLU feed-forward block.
+pub struct Qwen36DenseMlpWorkspace {
+    gate_up: DeviceBuffer<f32>,
+    activated: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+}
+
+/// Feed-forward weights for a Qwen3.5-family layer.
+pub enum Qwen36LayerFfnWeights {
+    /// Routed and shared experts used by Qwen3.5/3.6 MoE checkpoints.
+    Moe(Box<Qwen36MoeWeights>),
+    /// Dense SwiGLU used by Qwen3.8 dense checkpoints.
+    Dense(Box<Qwen36DenseMlpWeights>),
+}
+
+/// Mutable one-token feed-forward workspace for a Qwen3.5-family layer.
+pub enum Qwen36LayerFfnWorkspace {
+    /// Routed and shared-expert workspace.
+    Moe(Box<Qwen36MoeWorkspace>),
+    /// Dense SwiGLU workspace.
+    Dense(Qwen36DenseMlpWorkspace),
+}
+
+impl Deref for Qwen36LayerFfnWeights {
+    type Target = Qwen36MoeWeights;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Moe(weights) => weights,
+            Self::Dense(_) => panic!("MoE diagnostics are unavailable for a dense Qwen FFN"),
+        }
+    }
+}
+
+impl DerefMut for Qwen36LayerFfnWeights {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Moe(weights) => weights,
+            Self::Dense(_) => panic!("MoE diagnostics are unavailable for a dense Qwen FFN"),
+        }
+    }
+}
+
+impl Deref for Qwen36LayerFfnWorkspace {
+    type Target = Qwen36MoeWorkspace;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Moe(workspace) => workspace,
+            Self::Dense(_) => panic!("MoE diagnostics are unavailable for a dense Qwen FFN"),
+        }
+    }
+}
+
+impl DerefMut for Qwen36LayerFfnWorkspace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Moe(workspace) => workspace,
+            Self::Dense(_) => panic!("MoE diagnostics are unavailable for a dense Qwen FFN"),
+        }
+    }
+}
+
+impl Qwen36LayerFfnWorkspace {
+    fn output(&self) -> &DeviceBuffer<f32> {
+        match self {
+            Self::Moe(workspace) => &workspace.ffn_out,
+            Self::Dense(workspace) => &workspace.output,
+        }
+    }
 }
 
 struct Sm12xGateUpWorkspace {
@@ -5029,6 +5207,134 @@ fn load_concat_gate_up(
     ModelOptNvfp4Linear::concat_out_features(format!("{gate_prefix}.gate_up_proj"), &gate, &up)
 }
 
+impl Qwen36DenseMlpWeights {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        layer: usize,
+    ) -> Result<Self> {
+        let prefix = format!("{}.layers.{layer}.mlp", manifest.tensor_prefix);
+        let gate_up = Nvfp4DeviceLinear::from_host(&load_concat_gate_up(
+            checkpoint,
+            &format!("{prefix}.gate_proj"),
+            &format!("{prefix}.up_proj"),
+            "Qwen dense gate/up",
+        )?)?;
+        let down = Nvfp4DeviceLinear::load(checkpoint, &format!("{prefix}.down_proj"))?;
+        if gate_up.out_features != manifest.intermediate * 2
+            || gate_up.in_features != manifest.hidden
+            || down.out_features != manifest.hidden
+            || down.in_features != manifest.intermediate
+        {
+            return Err(Error::Shape {
+                label: "Qwen dense FFN",
+                expected: format!(
+                    "gate_up=[{}, {}] down=[{}, {}]",
+                    manifest.intermediate * 2,
+                    manifest.hidden,
+                    manifest.hidden,
+                    manifest.intermediate
+                ),
+                actual: format!(
+                    "gate_up=[{}, {}] down=[{}, {}]",
+                    gate_up.out_features, gate_up.in_features, down.out_features, down.in_features
+                ),
+            });
+        }
+        Ok(Self { gate_up, down })
+    }
+
+    fn workspace(&self) -> Result<Qwen36DenseMlpWorkspace> {
+        Ok(Qwen36DenseMlpWorkspace {
+            gate_up: DeviceBuffer::zeroed(self.gate_up.out_features)?,
+            activated: DeviceBuffer::zeroed(self.down.in_features)?,
+            down: DeviceBuffer::zeroed(self.down.out_features)?,
+            output: DeviceBuffer::zeroed(self.down.out_features)?,
+        })
+    }
+
+    fn run_one_token<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36DenseMlpWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        residual: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        if ffn_norm.len() != self.gate_up.in_features || residual.len() != self.down.out_features {
+            return Err(Error::Shape {
+                label: "Qwen dense FFN inputs",
+                expected: format!(
+                    "ffn_norm={} residual={}",
+                    self.gate_up.in_features, self.down.out_features
+                ),
+                actual: format!("ffn_norm={} residual={}", ffn_norm.len(), residual.len()),
+            });
+        }
+        self.gate_up
+            .run_f32_into(ffn_norm, &mut workspace.gate_up, stream)?;
+        silu_mul_halves_f32_into_on_stream(
+            &workspace.gate_up,
+            workspace.activated.output(),
+            self.down.in_features,
+            stream,
+        )?;
+        self.down
+            .run_f32_into(&workspace.activated, &mut workspace.down, stream)?;
+        add_f32_into_on_stream(residual, &workspace.down, workspace.output.output(), stream)?;
+        round_f32_to_bf16_in_place_on_stream(workspace.output.inout(), stream)?;
+        Ok(&workspace.output)
+    }
+}
+
+impl Qwen36LayerFfnWeights {
+    fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36LayerFfnWorkspace> {
+        match self {
+            Self::Moe(weights) => weights
+                .workspace(manifest)
+                .map(Box::new)
+                .map(Qwen36LayerFfnWorkspace::Moe),
+            Self::Dense(weights) => weights.workspace().map(Qwen36LayerFfnWorkspace::Dense),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_one_token<'a>(
+        &'a self,
+        lt: &CublasLt,
+        workspace: &'a mut Qwen36LayerFfnWorkspace,
+        manifest: &QwenModelManifest,
+        ffn_norm: &DeviceBuffer<f32>,
+        residual: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+        parallel_moe: Option<Qwen36ParallelMoe<'_>>,
+        profile: Option<&mut QwenDecodeProfile>,
+        gpu_probe: Option<&mut Qwen36GpuCounterProbe<'_>>,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        match (self, workspace) {
+            (Self::Moe(weights), Qwen36LayerFfnWorkspace::Moe(workspace)) => weights
+                .run_one_token_impl(
+                    lt,
+                    workspace,
+                    manifest,
+                    ffn_norm,
+                    residual,
+                    stream,
+                    parallel_moe,
+                    profile,
+                    gpu_probe,
+                )
+                .map(|step| step.ffn_out),
+            (Self::Dense(weights), Qwen36LayerFfnWorkspace::Dense(workspace)) => {
+                weights.run_one_token(workspace, ffn_norm, residual, stream)
+            }
+            _ => Err(Error::Format {
+                label: "Qwen feed-forward workspace",
+                detail: "weights and workspace variants do not match".to_string(),
+            }),
+        }
+    }
+}
+
 fn concat_fp8_out_features(
     first: ModelOptFp8Linear,
     second: ModelOptFp8Linear,
@@ -5081,14 +5387,14 @@ fn concat_fp8_out_features(
 /// Device-ready weights for one Qwen3.6 text layer block.
 ///
 /// A block owns its input/post-attention RMSNorm weights, the scheduled
-/// attention weights (linear or full), and the shared MoE FFN.
+/// attention weights (linear or full), and the configured feed-forward block.
 pub struct Qwen36LayerBlock {
     pub layer: usize,
     pub kind: QwenLayerKind,
     pub input_norm: DeviceBuffer<f32>,
     pub post_attn_norm: DeviceBuffer<f32>,
     pub attention: Qwen36Attention,
-    pub moe: Qwen36MoeWeights,
+    pub moe: Qwen36LayerFfnWeights,
 }
 
 /// Attention variant held by a layer block.
@@ -5104,7 +5410,7 @@ pub struct Qwen36LayerBlockWorkspace {
     pub attn_residual: DeviceBuffer<f32>,
     pub ffn_norm: DeviceBuffer<f32>,
     pub attention: Qwen36AttentionWorkspace,
-    pub moe: Qwen36MoeWorkspace,
+    pub moe: Qwen36LayerFfnWorkspace,
 }
 
 /// Attention workspace variant held by a layer block.
@@ -5191,12 +5497,20 @@ impl Qwen36LayerBlock {
                 )?)
             }
         };
-        let moe = if let Some(capacity) = expert_cache_capacity {
-            model.load_moe_from_prepared_cache_paged(layer, capacity)?
-        } else if cache_prepared {
-            model.load_moe_from_prepared_cache(layer)?
-        } else {
-            model.load_moe(layer)?
+        let moe = match model.manifest.ffn {
+            QwenFfnConfig::Moe { .. } => {
+                let weights = if let Some(capacity) = expert_cache_capacity {
+                    model.load_moe_from_prepared_cache_paged(layer, capacity)?
+                } else if cache_prepared {
+                    model.load_moe_from_prepared_cache(layer)?
+                } else {
+                    model.load_moe(layer)?
+                };
+                Qwen36LayerFfnWeights::Moe(Box::new(weights))
+            }
+            QwenFfnConfig::Dense => Qwen36LayerFfnWeights::Dense(Box::new(
+                Qwen36DenseMlpWeights::load(&model.checkpoint, &model.manifest, layer)?,
+            )),
         };
         Ok(Self {
             layer,
@@ -5364,7 +5678,7 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        self.moe.run_one_token_impl(
+        self.moe.run_one_token(
             lt,
             &mut workspace.moe,
             manifest,
@@ -5444,7 +5758,7 @@ impl Qwen36LayerBlock {
             manifest.rms_eps,
             stream,
         )?;
-        self.moe.run_one_token_impl(
+        self.moe.run_one_token(
             lt,
             &mut workspace.moe,
             manifest,
@@ -5462,7 +5776,7 @@ impl Qwen36LayerBlock {
     ///
     /// `hidden` is the input hidden vector; the block writes its output into
     /// `workspace.ffn_norm`-adjacent storage and returns a borrow of the
-    /// final buffer (the MoE `ffn_out`, which already includes the residual).
+    /// final feed-forward buffer, which already includes the residual.
     #[allow(clippy::needless_option_as_deref, clippy::too_many_arguments)]
     pub fn run_one_token<'a>(
         &'a self,
@@ -5579,7 +5893,7 @@ impl Qwen36LayerBlock {
             )?;
         }
 
-        let moe_step = if let Some(profile) = profile.as_deref_mut() {
+        let ffn_output = if let Some(profile) = profile.as_deref_mut() {
             let wall_start = Instant::now();
             let (step, ms) = timed_cuda(stream, || {
                 self.moe.run_one_token(
@@ -5589,6 +5903,7 @@ impl Qwen36LayerBlock {
                     &workspace.ffn_norm,
                     &workspace.attn_residual,
                     stream,
+                    None,
                     Some(&mut *profile),
                     gpu_probe.as_deref_mut(),
                 )
@@ -5605,12 +5920,11 @@ impl Qwen36LayerBlock {
                 &workspace.attn_residual,
                 stream,
                 None,
+                None,
                 gpu_probe.as_deref_mut(),
             )?
         };
-        Ok(Qwen36LayerBlockStep {
-            output: moe_step.ffn_out,
-        })
+        Ok(Qwen36LayerBlockStep { output: ffn_output })
     }
 }
 
@@ -6196,7 +6510,10 @@ impl Qwen36TextModel {
         let artifact_dir = model.artifact_dir.clone();
         let bf16_storage = model.bf16_storage;
         let fp8_attention_storage = model.fp8_attention_storage;
-        ensure_model_cache(&checkpoint, &manifest, &artifact_dir)?;
+        let is_moe = matches!(manifest.ffn, QwenFfnConfig::Moe { .. });
+        if is_moe {
+            ensure_model_cache(&checkpoint, &manifest, &artifact_dir)?;
+        }
         let lt = CublasLt::new()?;
         let linear_fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             &checkpoint,
@@ -6248,7 +6565,7 @@ impl Qwen36TextModel {
             embedding,
             final_norm,
             lm_head,
-            expert_paging: capacity_per_layer.is_some(),
+            expert_paging: is_moe && capacity_per_layer.is_some(),
             bf16_storage,
             fp8_attention_storage,
         })
@@ -6260,6 +6577,12 @@ impl Qwen36TextModel {
     /// directly with the established path. Decode graphs are disabled because
     /// route readback and slot replacement are host-controlled.
     pub fn enable_expert_paging(&mut self, capacity_per_layer: usize) -> Result<()> {
+        if !matches!(self.manifest.ffn, QwenFfnConfig::Moe { .. }) {
+            return Err(Error::Format {
+                label: "Qwen expert paging",
+                detail: "expert paging requires a MoE checkpoint".to_string(),
+            });
+        }
         let model = Qwen36Model {
             manifest: self.manifest.clone(),
             checkpoint: self.checkpoint.clone(),
@@ -6553,7 +6876,7 @@ impl Qwen36TextModel {
             let hidden = if layer_idx == 0 {
                 &state.hidden
             } else {
-                &previous[layer_idx - 1].moe.ffn_out
+                previous[layer_idx - 1].moe.output()
             };
             let workspace = &mut current[0];
             let sequence = &mut current_state[0];
@@ -6705,7 +7028,7 @@ impl Qwen36TextModel {
                 let hidden = if layer_idx == 0 {
                     &state.hidden
                 } else {
-                    &previous[layer_idx - 1].moe.ffn_out
+                    previous[layer_idx - 1].moe.output()
                 };
                 block.run_one_token(
                     &self.lt,
@@ -6720,12 +7043,12 @@ impl Qwen36TextModel {
                 )?;
             }
         }
-        let hidden = &state
+        let hidden = state
             .layer_workspaces
             .last()
             .expect("Qwen3.6 has at least one layer")
             .moe
-            .ffn_out;
+            .output();
 
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
@@ -6779,9 +7102,9 @@ impl Qwen36TextModel {
 mod tests {
     use super::{
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
-        reorder_fp8_v_rows,
+        reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
-    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptFp8Linear};
+    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
     #[test]
     fn recurrent_append_transaction_restores_and_commits_explicitly() {
@@ -6869,6 +7192,63 @@ mod tests {
             reordered.channel_weight_scale,
             Some(vec![100.0, 101.0, 104.0, 105.0, 102.0, 103.0, 106.0, 107.0])
         );
+    }
+
+    #[test]
+    fn reorder_nvfp4_v_rows_moves_packed_values_and_scales_together() {
+        let mut packed_weight = Vec::new();
+        let mut weight_scale = Vec::new();
+        for head in 0..4u8 {
+            for _ in 0..16 {
+                packed_weight.extend_from_slice(&[head; 8]);
+                weight_scale.push(head + 10);
+            }
+        }
+        let reordered = reorder_nvfp4_v_rows(
+            ModelOptNvfp4Linear {
+                prefix: "z".to_string(),
+                out_features: 64,
+                in_features: 16,
+                packed_weight,
+                weight_scale,
+                weight_scale_2: 1.0,
+                input_scale: 1.0,
+            },
+            2,
+            4,
+            16,
+        );
+        assert_eq!(
+            [0, 16, 32, 48].map(|row| reordered.packed_weight[row * 8]),
+            [0, 2, 1, 3]
+        );
+        assert_eq!(
+            [0, 16, 32, 48].map(|row| reordered.weight_scale[row]),
+            [10, 12, 11, 13]
+        );
+    }
+
+    #[test]
+    fn reorder_nvfp4_v_cols_moves_packed_values_and_scales_together() {
+        let reordered = reorder_nvfp4_v_cols(
+            ModelOptNvfp4Linear {
+                prefix: "out".to_string(),
+                out_features: 1,
+                in_features: 64,
+                packed_weight: [vec![0; 8], vec![1; 8], vec![2; 8], vec![3; 8]].concat(),
+                weight_scale: vec![10, 11, 12, 13],
+                weight_scale_2: 1.0,
+                input_scale: 1.0,
+            },
+            2,
+            4,
+            16,
+        );
+        assert_eq!(
+            [0, 8, 16, 24].map(|offset| reordered.packed_weight[offset]),
+            [0, 2, 1, 3]
+        );
+        assert_eq!(reordered.weight_scale, [10, 12, 11, 13]);
     }
 
     #[test]

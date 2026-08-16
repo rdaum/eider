@@ -61,8 +61,8 @@ pub enum QwenFfnConfig {
 pub enum QwenArchitecture {
     /// Existing dense/MoE Qwen3 decoder path with full attention in every layer.
     Qwen3,
-    /// Hybrid Qwen3.5/Qwen3.6 text architecture with Gated Delta Net layers.
-    Qwen35Moe,
+    /// Hybrid Qwen3.5-family text architecture with Gated Delta Net layers.
+    Qwen35Hybrid,
 }
 
 /// Per-layer attention implementation used by the text stack.
@@ -228,23 +228,28 @@ impl QwenModelManifest {
     /// Parses a Qwen config without loading tensor payloads.
     pub fn load(model_dir: &Path) -> Result<Self> {
         let json = read_config_json(model_dir)?;
+        Self::from_config_value(&json)
+    }
+
+    fn from_config_value(json: &Value) -> Result<Self> {
         let root_model_type = json
             .get("model_type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (architecture, text, tensor_prefix) = if root_model_type == "qwen3_5_moe" {
-            let text = json.get("text_config").ok_or_else(|| Error::Format {
-                label: "Qwen config",
-                detail: "qwen3_5_moe config missing text_config".to_string(),
-            })?;
-            (
-                QwenArchitecture::Qwen35Moe,
-                text,
-                "model.language_model".to_string(),
-            )
-        } else {
-            (QwenArchitecture::Qwen3, &json, "model".to_string())
-        };
+        let (architecture, text, tensor_prefix) =
+            if matches!(root_model_type, "qwen3_5" | "qwen3_5_moe") {
+                let text = json.get("text_config").ok_or_else(|| Error::Format {
+                    label: "Qwen config",
+                    detail: format!("{root_model_type} config missing text_config"),
+                })?;
+                (
+                    QwenArchitecture::Qwen35Hybrid,
+                    text,
+                    "model.language_model".to_string(),
+                )
+            } else {
+                (QwenArchitecture::Qwen3, json, "model".to_string())
+            };
 
         let hidden = required_usize(text, "hidden_size")?;
         let layers = required_usize(text, "num_hidden_layers")?;
@@ -461,25 +466,40 @@ impl QwenModelManifest {
                 )?;
             }
         }
-        if let QwenFfnConfig::Moe { .. } = manifest.ffn {
-            for suffix in [
-                "mlp.gate.weight",
-                "mlp.experts.0.gate_proj.weight",
-                "mlp.experts.0.up_proj.weight",
-                "mlp.experts.0.down_proj.weight",
-            ] {
-                push_tensor_check(
-                    &checkpoint,
-                    &mut tensors,
-                    format!("{prefix}.layers.0.{suffix}"),
-                )?;
-            }
-            if manifest.shared_expert_intermediate.is_some() {
+        match manifest.ffn {
+            QwenFfnConfig::Moe { .. } => {
                 for suffix in [
-                    "mlp.shared_expert.gate_proj.weight",
-                    "mlp.shared_expert.up_proj.weight",
-                    "mlp.shared_expert.down_proj.weight",
-                    "mlp.shared_expert_gate.weight",
+                    "mlp.gate.weight",
+                    "mlp.experts.0.gate_proj.weight",
+                    "mlp.experts.0.up_proj.weight",
+                    "mlp.experts.0.down_proj.weight",
+                ] {
+                    push_tensor_check(
+                        &checkpoint,
+                        &mut tensors,
+                        format!("{prefix}.layers.0.{suffix}"),
+                    )?;
+                }
+                if manifest.shared_expert_intermediate.is_some() {
+                    for suffix in [
+                        "mlp.shared_expert.gate_proj.weight",
+                        "mlp.shared_expert.up_proj.weight",
+                        "mlp.shared_expert.down_proj.weight",
+                        "mlp.shared_expert_gate.weight",
+                    ] {
+                        push_tensor_check(
+                            &checkpoint,
+                            &mut tensors,
+                            format!("{prefix}.layers.0.{suffix}"),
+                        )?;
+                    }
+                }
+            }
+            QwenFfnConfig::Dense => {
+                for suffix in [
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp.down_proj.weight",
                 ] {
                     push_tensor_check(
                         &checkpoint,
@@ -541,7 +561,7 @@ fn parse_layer_kinds(
             })
             .collect();
     }
-    if architecture == QwenArchitecture::Qwen35Moe {
+    if architecture == QwenArchitecture::Qwen35Hybrid {
         let interval = optional_usize(text, "full_attention_interval")?.unwrap_or(4);
         Ok((0..layers)
             .map(|idx| {
@@ -1201,7 +1221,7 @@ enum LayerFfnDecodeWorkspace {
         gate_up_input: Nvfp4Matrix,
         expert_ptrs: MoeExpertPointerTables,
         grouped_gate_up: Option<GroupedGemvWorkspace>,
-        grouped_down: Option<MoeGroupedDownWorkspace>,
+        grouped_down: Box<Option<MoeGroupedDownWorkspace>>,
         ffn_out: DeviceBuffer<f32>,
     },
 }
@@ -2422,11 +2442,11 @@ impl LayerFfnDecodeWorkspace {
                         config.hidden,
                         experts_per_token,
                     )?,
-                    grouped_down: MoeGroupedDownWorkspace::new(
+                    grouped_down: Box::new(MoeGroupedDownWorkspace::new(
                         config.hidden,
                         expert_intermediate,
                         experts_per_token,
-                    )?,
+                    )?),
                     ffn_out: DeviceBuffer::zeroed(config.hidden)?,
                 })
             }
@@ -2513,7 +2533,7 @@ impl LayerFfnDecodeWorkspace {
                 gate_up_input,
                 expert_ptrs,
                 grouped_gate_up.as_mut(),
-                grouped_down.as_mut(),
+                grouped_down.as_mut().as_mut(),
                 expert_weights,
                 expert_intermediate,
                 experts_per_token,
@@ -4048,9 +4068,54 @@ fn read_bf16_matrix_device(
 #[cfg(test)]
 mod tests {
     use super::{
+        QwenArchitecture, QwenFfnConfig, QwenLayerKind, QwenModelManifest,
         qwen35_reorder_qkv_rows_grouped_to_tiled, qwen35_reorder_rows_grouped_to_tiled,
         qwen35_v_head_tiled_permutation, select_moe_experts,
     };
+    use serde_json::json;
+
+    #[test]
+    fn qwen38_dense_hybrid_manifest_uses_nested_text_config() {
+        let config = json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "hidden_size": 5120,
+                "intermediate_size": 17408,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "rms_norm_eps": 1.0e-6,
+                "rope_parameters": {
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_section": [11, 11, 10]
+                },
+                "full_attention_interval": 4,
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "mtp_num_hidden_layers": 1
+            }
+        });
+        let manifest = QwenModelManifest::from_config_value(&config).unwrap();
+        assert_eq!(manifest.architecture, QwenArchitecture::Qwen35Hybrid);
+        assert_eq!(manifest.tensor_prefix, "model.language_model");
+        assert!(matches!(manifest.ffn, QwenFfnConfig::Dense));
+        assert_eq!(manifest.hidden, 5120);
+        assert_eq!(manifest.intermediate, 17408);
+        assert_eq!(manifest.rotary_dim, 64);
+        assert_eq!(manifest.mtp_layers, 1);
+        assert_eq!(manifest.layer_kinds.len(), 64);
+        assert_eq!(manifest.layer_kinds[0], QwenLayerKind::LinearAttention);
+        assert_eq!(manifest.layer_kinds[3], QwenLayerKind::FullAttention);
+        let linear = manifest.linear_attention.unwrap();
+        assert_eq!(linear.key_heads, 16);
+        assert_eq!(linear.value_heads, 48);
+    }
 
     #[test]
     fn moe_topk_normalizes_selected_probabilities() {
