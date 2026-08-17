@@ -24,8 +24,8 @@ use crate::nvfp4::{
     fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
-    gather_f32_pointer_rows_into_on_stream, moe_topk_f32_batch_into_on_stream,
-    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
+    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
@@ -34,7 +34,8 @@ use crate::nvfp4::{
     qwen36_gdn_prep_chunks_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_text_batch_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream, scatter_f32_pointer_rows_on_stream,
-    sigmoid_mul_f32_prefix_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    scatter_f32_pointer_rows_range_on_stream, sigmoid_mul_f32_prefix_into_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream,
 };
 
 const GDN_HEADS: usize = 32;
@@ -723,6 +724,7 @@ struct BatchLinearAttentionWorkspace {
     conv_state_ptrs: Vec<*mut f32>,
     recurrent_state_ptrs: Vec<*mut f32>,
     padding_states: Vec<Qwen36LinearAttentionState>,
+    state_snapshots: Option<BatchLinearAttentionStateSnapshots>,
     gdn_output: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
@@ -731,6 +733,161 @@ struct BatchLinearAttentionWorkspace {
     out_plan: Option<BatchLinearPlan>,
     alpha_beta_plan: BatchBf16LinearPlan,
     chunked_gdn: Option<BatchChunkedGdnWorkspace>,
+}
+
+struct BatchLinearAttentionStateSnapshots {
+    slots: usize,
+    state_table_stride: usize,
+    layer_slots: Vec<Option<usize>>,
+    conv_values: usize,
+    recurrent_values: usize,
+    conv: DeviceBuffer<f32>,
+    recurrent: DeviceBuffer<f32>,
+}
+
+impl BatchLinearAttentionStateSnapshots {
+    fn new(
+        model: &Qwen36TextModel,
+        state_table_stride: usize,
+        slots: usize,
+        conv_values: usize,
+        recurrent_values: usize,
+    ) -> Result<Self> {
+        let mut layer_slots = Vec::with_capacity(model.layers.len());
+        let mut linear_layers = 0usize;
+        for block in &model.layers {
+            match &block.attention {
+                Qwen36Attention::LinearAttention(_) => {
+                    layer_slots.push(Some(linear_layers));
+                    linear_layers += 1;
+                }
+                Qwen36Attention::FullAttention(_) => layer_slots.push(None),
+            }
+        }
+        let state_rows =
+            linear_layers
+                .checked_mul(slots)
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.8 speculative state snapshots",
+                    expected: "linear layers * snapshot slots without overflow".to_string(),
+                    actual: format!("linear_layers={linear_layers} slots={slots}"),
+                })?;
+        let conv_len =
+            state_rows
+                .checked_mul(conv_values)
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.8 speculative conv snapshots",
+                    expected: "snapshot rows * conv values without overflow".to_string(),
+                    actual: format!("rows={state_rows} values={conv_values}"),
+                })?;
+        let recurrent_len =
+            state_rows
+                .checked_mul(recurrent_values)
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen3.8 speculative recurrent snapshots",
+                    expected: "snapshot rows * recurrent values without overflow".to_string(),
+                    actual: format!("rows={state_rows} values={recurrent_values}"),
+                })?;
+        Ok(Self {
+            slots,
+            state_table_stride,
+            layer_slots,
+            conv_values,
+            recurrent_values,
+            conv: DeviceBuffer::zeroed(conv_len)?,
+            recurrent: DeviceBuffer::zeroed(recurrent_len)?,
+        })
+    }
+
+    fn offset(&self, layer_idx: usize, slot: usize, values: usize) -> Option<usize> {
+        if slot >= self.slots {
+            return None;
+        }
+        self.layer_slots[layer_idx].map(|layer_slot| (layer_slot * self.slots + slot) * values)
+    }
+
+    fn capture_conv(
+        &mut self,
+        state_table: &DeviceBuffer<*mut f32>,
+        layer_idx: usize,
+        sequence: usize,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(output_offset) = self.offset(layer_idx, slot, self.conv_values) else {
+            return Ok(());
+        };
+        gather_f32_pointer_rows_range_into_on_stream(
+            state_table,
+            layer_idx * self.state_table_stride + sequence,
+            &mut self.conv,
+            output_offset,
+            1,
+            self.conv_values,
+            stream,
+        )
+    }
+
+    fn capture_recurrent(
+        &mut self,
+        state_table: &DeviceBuffer<*mut f32>,
+        layer_idx: usize,
+        sequence: usize,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Some(output_offset) = self.offset(layer_idx, slot, self.recurrent_values) else {
+            return Ok(());
+        };
+        gather_f32_pointer_rows_range_into_on_stream(
+            state_table,
+            layer_idx * self.state_table_stride + sequence,
+            &mut self.recurrent,
+            output_offset,
+            1,
+            self.recurrent_values,
+            stream,
+        )
+    }
+
+    fn restore(
+        &self,
+        conv_state_table: &DeviceBuffer<*mut f32>,
+        recurrent_state_table: &DeviceBuffer<*mut f32>,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for (layer_idx, layer_slot) in self.layer_slots.iter().copied().enumerate() {
+            let Some(layer_slot) = layer_slot else {
+                continue;
+            };
+            let state_table_offset = layer_idx * self.state_table_stride;
+            let snapshot_row = layer_slot * self.slots + slot;
+            scatter_f32_pointer_rows_range_on_stream(
+                &self.conv,
+                snapshot_row * self.conv_values,
+                conv_state_table,
+                state_table_offset,
+                1,
+                self.conv_values,
+                stream,
+            )?;
+            scatter_f32_pointer_rows_range_on_stream(
+                &self.recurrent,
+                snapshot_row * self.recurrent_values,
+                recurrent_state_table,
+                state_table_offset,
+                1,
+                self.recurrent_values,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.conv.device_bytes() + self.recurrent.device_bytes()
+    }
 }
 
 struct BatchChunkedGdnWorkspace {
@@ -947,6 +1104,7 @@ impl BatchLinearAttentionWorkspace {
             conv_state_ptrs: nulls.clone(),
             recurrent_state_ptrs: nulls,
             padding_states,
+            state_snapshots: None,
             gdn_output: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             normed: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             output: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
@@ -995,6 +1153,34 @@ impl BatchLinearAttentionWorkspace {
             .copy_from_host(&self.conv_state_ptrs)?;
         self.recurrent_state_table
             .copy_from_host(&self.recurrent_state_ptrs)
+    }
+
+    fn enable_state_snapshots(&mut self, model: &Qwen36TextModel, slots: usize) -> Result<()> {
+        let state = self
+            .padding_states
+            .first()
+            .expect("Qwen prefill workspace has padding state");
+        self.state_snapshots = Some(BatchLinearAttentionStateSnapshots::new(
+            model,
+            self.padding_states.len(),
+            slots,
+            state.conv_state.len(),
+            state.recurrent_state.len(),
+        )?);
+        Ok(())
+    }
+
+    fn restore_state_snapshot(&self, slot: usize, stream: &CudaStream) -> Result<()> {
+        let snapshots = self
+            .state_snapshots
+            .as_ref()
+            .expect("Qwen speculative workspace has state snapshots");
+        snapshots.restore(
+            &self.conv_state_table,
+            &self.recurrent_state_table,
+            slot,
+            stream,
+        )
     }
 
     fn update_prefill_state_tables(
@@ -1058,6 +1244,10 @@ impl BatchLinearAttentionWorkspace {
                 .iter()
                 .map(Qwen36LinearAttentionState::device_bytes)
                 .sum::<usize>()
+            + self
+                .state_snapshots
+                .as_ref()
+                .map_or(0, BatchLinearAttentionStateSnapshots::device_bytes)
             + self.gdn_output.device_bytes()
             + self.normed.device_bytes()
             + self.output.device_bytes()
@@ -1619,9 +1809,6 @@ pub struct Qwen36SpeculativeCycleOutcome {
     pub committed_logits: Vec<f32>,
     /// Number of accepted drafts, equal to `committed.len() - 1`.
     pub accepted_drafts: usize,
-    /// Whether a partial acceptance forced the committed prefix to be replayed
-    /// through the ordinary prefill path.
-    pub replayed: bool,
     /// Whether the MTP state and next frontier are ready for another cycle.
     /// A false value leaves the committed target result valid but requires the
     /// caller to continue with ordinary decoding.
@@ -3089,6 +3276,7 @@ impl Qwen36TextModel {
         let mut verify = self.new_prefill_batch_workspace(1, rows, max_context_tokens)?;
         verify.serial_linear_attention_projections = true;
         verify.serial_linear_attention_recurrence = true;
+        verify.linear.enable_state_snapshots(self, drafts)?;
         verify.layer_graphs = Some(self.capture_speculative_prefill_layer_graphs(&mut verify)?);
         let mtp = self.new_mtp_draft_workspace(max_context_tokens)?;
         Ok(Qwen36SpeculativeCycleWorkspace {
@@ -3109,11 +3297,10 @@ impl Qwen36TextModel {
     /// The cycle drafts `drafts` chained MTP tokens from `frontier`, verifies
     /// `[frontier, drafts..]` in a single batched forward pass, accepts the
     /// longest prefix where each draft matches the target argmax, and commits
-    /// `accepted + 1` tokens. On partial acceptance the target's recurrent
-    /// GDN state is rolled back and the committed prefix is replayed through
-    /// [`Self::prefill_batch`]; a full acceptance commits the verify pass
-    /// directly. `frontier` is advanced to the target's argmax for the last
-    /// committed position, and the accepted drafter K/V slots are rewritten.
+    /// `accepted + 1` tokens. Partial acceptance restores the exact
+    /// intermediate GDN snapshot and commits only the accepted cache rows.
+    /// `frontier` is advanced to the target's argmax for the last committed
+    /// position, and the accepted drafter K/V slots are rewritten.
     pub fn speculative_cycle_argmax(
         &self,
         workspace: &mut Qwen36SpeculativeCycleWorkspace,
@@ -3293,50 +3480,37 @@ impl Qwen36TextModel {
                 }
             };
 
-            let replayed = if accepted == drafts {
-                if let Err(error) = cache
-                    .commit_append(
-                        reservation,
-                        rows,
-                        &mut Sm12xCacheContext {
-                            stream: verify.stream(),
-                            page_table: &mut sequence.page_table,
-                        },
-                    )
-                    .map_err(cache_error)
-                {
-                    let _ = sequence.state.abort_append(verify.stream());
-                    return Err(error);
-                }
-                sequence.state.commit_append(rows);
-                false
-            } else {
-                if let Err(error) = sequence.state.abort_append(verify.stream()) {
-                    let _ = cache.abort_append(
-                        reservation,
-                        &mut Sm12xCacheContext {
-                            stream: verify.stream(),
-                            page_table: &mut sequence.page_table,
-                        },
-                    );
-                    return Err(error);
-                }
-                cache
-                    .abort_append(
-                        reservation,
-                        &mut Sm12xCacheContext {
-                            stream: verify.stream(),
-                            page_table: &mut sequence.page_table,
-                        },
-                    )
-                    .map_err(cache_error)?;
-                let mut replay_rows = [Qwen36PrefillRow {
-                    token_ids: &host_verify_tokens[..accepted + 1],
-                    sequence,
-                }];
-                self.prefill_batch(verify, &mut replay_rows, cache)?;
-                true
-            };
+            let committed_rows = accepted + 1;
+            if accepted < drafts
+                && let Err(error) = verify
+                    .linear
+                    .restore_state_snapshot(accepted, verify.stream())
+            {
+                let _ = sequence.state.abort_append(verify.stream());
+                let _ = cache.abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: verify.stream(),
+                        page_table: &mut sequence.page_table,
+                    },
+                );
+                return Err(error);
+            }
+            if let Err(error) = cache
+                .commit_append(
+                    reservation,
+                    committed_rows,
+                    &mut Sm12xCacheContext {
+                        stream: verify.stream(),
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(cache_error)
+            {
+                let _ = sequence.state.abort_append(verify.stream());
+                return Err(error);
+            }
+            sequence.state.commit_append(committed_rows);
 
             frontier.token = verify_argmax[accepted];
             frontier.logit = next_logits[accepted];
@@ -3375,7 +3549,6 @@ impl Qwen36TextModel {
                 committed: host_verify_tokens[..accepted + 1].to_vec(),
                 committed_logits,
                 accepted_drafts: accepted,
-                replayed,
                 speculation_ready,
             })
         })();
@@ -3661,6 +3834,15 @@ impl Qwen36LinearAttentionWeights {
                         linear.value_head_dim,
                         stream,
                     )?;
+                    if let Some(snapshots) = workspace.state_snapshots.as_mut() {
+                        snapshots.capture_conv(
+                            &workspace.conv_state_table,
+                            layer_idx,
+                            sequence,
+                            row,
+                            stream,
+                        )?;
+                    }
                     workspace.q.copy_range_from_device_on_stream(
                         row * value_dim,
                         &workspace.row_q,
@@ -3821,6 +4003,15 @@ impl Qwen36LinearAttentionWeights {
                         linear.value_heads,
                         stream,
                     )?;
+                    if let Some(snapshots) = workspace.state_snapshots.as_mut() {
+                        snapshots.capture_recurrent(
+                            &workspace.recurrent_state_table,
+                            layer_idx,
+                            sequence,
+                            row,
+                            stream,
+                        )?;
+                    }
                     workspace.gdn_output.copy_range_from_device_on_stream(
                         row * value_dim,
                         &workspace.row_gdn_output,

@@ -43,9 +43,6 @@ pub struct InferMetrics {
     #[help = "Qwen3.8 MTP drafts accepted by speculative verification"]
     pub qwen38_speculative_accepted_drafts: Counter,
 
-    #[help = "Qwen3.8 speculative cycles that replayed a partial commit"]
-    pub qwen38_speculative_replayed_cycles: Counter,
-
     #[help = "Requests admitted by the scheduler"]
     pub requests_admitted: Counter,
 
@@ -122,7 +119,6 @@ impl InferMetrics {
             generated_tokens: Counter::new(shard_count),
             qwen38_speculative_cycles: Counter::new(shard_count),
             qwen38_speculative_accepted_drafts: Counter::new(shard_count),
-            qwen38_speculative_replayed_cycles: Counter::new(shard_count),
             requests_admitted: Counter::new(shard_count),
             requests_completed: Counter::new(shard_count),
             requests_cancelled: Counter::new(shard_count),

@@ -899,9 +899,6 @@ impl<'model> Qwen36Scheduler<'model> {
         infer
             .qwen38_speculative_accepted_drafts
             .add(outcome.accepted_drafts as isize);
-        if outcome.replayed {
-            infer.qwen38_speculative_replayed_cycles.add(1);
-        }
         Ok(outcome
             .committed
             .iter()
@@ -1632,7 +1629,7 @@ mod tests {
                     prefill_sequence_capacity: 1,
                     prefill_token_capacity: 16,
                     max_active_sequences: 1,
-                    max_context_tokens: 32,
+                    max_context_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
                     speculative_drafts,
                 },
                 SequenceCacheConfig {

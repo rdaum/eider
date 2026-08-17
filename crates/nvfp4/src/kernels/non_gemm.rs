@@ -8150,6 +8150,28 @@ pub fn gather_f32_pointer_rows_into_on_stream(
     row_values: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    gather_f32_pointer_rows_range_into_on_stream(
+        input_table,
+        table_offset,
+        output.buffer_mut(),
+        0,
+        rows,
+        row_values,
+        stream,
+    )
+}
+
+/// Gathers equally sized f32 rows into a contiguous output range.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_f32_pointer_rows_range_into_on_stream(
+    input_table: &DeviceBuffer<*mut f32>,
+    table_offset: usize,
+    output: &mut DeviceBuffer<f32>,
+    output_offset: usize,
+    rows: usize,
+    row_values: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let values = rows.checked_mul(row_values).ok_or_else(|| Error::Shape {
         label: "gathered pointer rows",
         expected: "rows * row_values without overflow".to_string(),
@@ -8162,13 +8184,17 @@ pub fn gather_f32_pointer_rows_into_on_stream(
         || table_offset
             .checked_add(rows)
             .is_none_or(|end| end > input_table.len())
-        || output.len() < values
+        || output_offset
+            .checked_add(values)
+            .is_none_or(|end| end > output.len())
     {
         return Err(Error::Shape {
             label: "gathered pointer row buffers",
             expected: format!(
-                "table>={} output>={values}",
-                table_offset.saturating_add(rows)
+                "table>={} output range {}..{}",
+                table_offset.saturating_add(rows),
+                output_offset,
+                output_offset.saturating_add(values)
             ),
             actual: format!("table={} output={}", input_table.len(), output.len()),
         });
@@ -8178,7 +8204,7 @@ pub fn gather_f32_pointer_rows_into_on_stream(
             "infer_gather_f32_pointer_rows_on_stream",
             ffi::infer_gather_f32_pointer_rows_on_stream(
                 input_table.ptr.add(table_offset),
-                output.buffer_mut().ptr,
+                output.ptr.add(output_offset),
                 rows as u32,
                 row_values as u32,
                 stream.as_raw(),
@@ -8196,6 +8222,28 @@ pub fn scatter_f32_pointer_rows_on_stream(
     row_values: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    scatter_f32_pointer_rows_range_on_stream(
+        input,
+        0,
+        output_table,
+        table_offset,
+        rows,
+        row_values,
+        stream,
+    )
+}
+
+/// Scatters equally sized f32 rows from a contiguous input range.
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_f32_pointer_rows_range_on_stream(
+    input: &DeviceBuffer<f32>,
+    input_offset: usize,
+    output_table: &DeviceBuffer<*mut f32>,
+    table_offset: usize,
+    rows: usize,
+    row_values: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let values = rows.checked_mul(row_values).ok_or_else(|| Error::Shape {
         label: "scattered pointer rows",
         expected: "rows * row_values without overflow".to_string(),
@@ -8205,7 +8253,9 @@ pub fn scatter_f32_pointer_rows_on_stream(
         || rows > u32::MAX as usize
         || row_values == 0
         || row_values > u32::MAX as usize
-        || input.len() < values
+        || input_offset
+            .checked_add(values)
+            .is_none_or(|end| end > input.len())
         || table_offset
             .checked_add(rows)
             .is_none_or(|end| end > output_table.len())
@@ -8213,7 +8263,9 @@ pub fn scatter_f32_pointer_rows_on_stream(
         return Err(Error::Shape {
             label: "scattered pointer row buffers",
             expected: format!(
-                "input>={values} table>={}",
+                "input range {}..{} table>={}",
+                input_offset,
+                input_offset.saturating_add(values),
                 table_offset.saturating_add(rows)
             ),
             actual: format!("input={} table={}", input.len(), output_table.len()),
@@ -8223,7 +8275,7 @@ pub fn scatter_f32_pointer_rows_on_stream(
         check_cuda(
             "infer_scatter_f32_pointer_rows_on_stream",
             ffi::infer_scatter_f32_pointer_rows_on_stream(
-                input.ptr,
+                input.ptr.add(input_offset),
                 output_table.ptr.add(table_offset),
                 rows as u32,
                 row_values as u32,

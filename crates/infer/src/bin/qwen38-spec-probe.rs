@@ -30,7 +30,6 @@ struct SpecReport {
     tokens: Vec<u32>,
     elapsed: f64,
     cycles: usize,
-    replayed: usize,
     total_accepted: usize,
 }
 
@@ -99,9 +98,8 @@ fn main() -> Result<()> {
         spec.elapsed
     );
     println!(
-        "  cycles={} replayed={} accepted_drafts={} (avg {:.3}/cycle)",
+        "  cycles={} accepted_drafts={} (avg {:.3}/cycle)",
         spec.cycles,
-        spec.replayed,
         spec.total_accepted,
         spec.total_accepted as f64 / spec.cycles.max(1) as f64
     );
@@ -208,7 +206,6 @@ fn run_speculative(
 
     let mut emitted = Vec::with_capacity(tokens);
     let mut cycles = 0usize;
-    let mut replayed = 0usize;
     let mut total_accepted = 0usize;
     let mut first = true;
     let start = Instant::now();
@@ -235,16 +232,12 @@ fn run_speculative(
         emitted.extend_from_slice(&outcome.committed[skip..]);
         cycles += 1;
         total_accepted += outcome.accepted_drafts;
-        if outcome.replayed {
-            replayed += 1;
-        }
         first = false;
     }
     Ok(SpecReport {
         tokens: emitted,
         elapsed: start.elapsed().as_secs_f64(),
         cycles,
-        replayed,
         total_accepted,
     })
 }
