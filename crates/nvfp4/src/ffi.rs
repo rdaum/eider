@@ -2288,6 +2288,19 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_lm_head_top1_f32_batch_on_stream(
+        input: *const f32,
+        weight: *const u16,
+        scratch_value: *mut f32,
+        scratch_index: *mut u32,
+        scratch_len: u32,
+        out_index: *mut u32,
+        out_value: *mut f32,
+        batch_size: u32,
+        rows: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_bf16_to_f32_on_stream(
         input: *const u16,
         output: *mut f32,

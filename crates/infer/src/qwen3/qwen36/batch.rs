@@ -25,7 +25,8 @@ use crate::nvfp4::{
     gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
-    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    lm_head_top1_f32_batch_into_on_stream, moe_topk_f32_batch_into_on_stream,
+    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
@@ -1822,6 +1823,7 @@ pub struct Qwen36SpeculativeCycleWorkspace {
     mtp: Qwen36MtpDraftWorkspace,
     normed_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
+    top1_scratch_indices: DeviceBuffer<u32>,
     argmax_indices: DeviceBuffer<u32>,
     argmax_values: DeviceBuffer<f32>,
     catchup_hidden: DeviceBuffer<f32>,
@@ -1853,6 +1855,7 @@ impl Qwen36SpeculativeCycleWorkspace {
             + self.mtp.device_bytes()
             + self.normed_hidden.device_bytes()
             + self.logits.device_bytes()
+            + self.top1_scratch_indices.device_bytes()
             + self.argmax_indices.device_bytes()
             + self.argmax_values.device_bytes()
             + self.catchup_hidden.device_bytes()
@@ -3285,6 +3288,7 @@ impl Qwen36TextModel {
             mtp,
             normed_hidden: DeviceBuffer::zeroed(rows * self.manifest.hidden)?,
             logits: DeviceBuffer::zeroed(rows * self.manifest.vocab)?,
+            top1_scratch_indices: DeviceBuffer::zeroed(rows * self.manifest.vocab.div_ceil(8))?,
             argmax_indices: DeviceBuffer::zeroed(rows)?,
             argmax_values: DeviceBuffer::zeroed(rows)?,
             catchup_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
@@ -3316,6 +3320,7 @@ impl Qwen36TextModel {
             mtp,
             normed_hidden,
             logits,
+            top1_scratch_indices,
             argmax_indices,
             argmax_values,
             catchup_hidden,
@@ -3412,13 +3417,24 @@ impl Qwen36TextModel {
                 round_f32_to_bf16_in_place_on_stream(normed_hidden.inout(), verify.stream())?;
                 match &self.lm_head {
                     Qwen36LmHead::Nvfp4(linear) => {
-                        linear.run_f32_batch_into(normed_hidden, logits, rows, verify.stream())?
+                        linear.run_f32_batch_into(normed_hidden, logits, rows, verify.stream())?;
+                        argmax_f32_batch_into_on_stream(
+                            logits,
+                            argmax_indices.output(),
+                            argmax_values.output(),
+                            row_capacity,
+                            self.manifest.vocab,
+                            verify.stream(),
+                        )?;
                     }
                     Qwen36LmHead::Bf16(linear) => {
-                        bf16_linear_logits_f32_batch_into_on_stream(
+                        lm_head_top1_f32_batch_into_on_stream(
                             normed_hidden,
                             &linear.weight,
-                            logits.output(),
+                            logits,
+                            top1_scratch_indices,
+                            argmax_indices,
+                            argmax_values,
                             rows,
                             linear.rows,
                             linear.cols,
@@ -3433,14 +3449,6 @@ impl Qwen36TextModel {
                         });
                     }
                 }
-                argmax_f32_batch_into_on_stream(
-                    logits,
-                    argmax_indices.output(),
-                    argmax_values.output(),
-                    row_capacity,
-                    self.manifest.vocab,
-                    verify.stream(),
-                )?;
                 let verify_argmax = argmax_indices
                     .copy_prefix_to_host(rows, verify.stream())?
                     .into_vec();

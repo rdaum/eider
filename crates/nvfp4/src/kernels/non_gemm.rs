@@ -7041,6 +7041,101 @@ pub fn lm_head_top1_f32_into_on_stream(
     }
 }
 
+/// Enqueues an exact batched BF16 lm-head projection and direct top-1
+/// reduction on `stream`.
+///
+/// The projection reuses each weight row across up to four input rows and
+/// reduces every eight vocabulary rows to one scratch candidate. This avoids
+/// materializing `[batch_size, rows]` logits while preserving the accumulation
+/// order of [`bf16_linear_logits_f32_batch_into_on_stream`].
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_top1_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
+    scratch_value: &DeviceBuffer<f32>,
+    scratch_index: &DeviceBuffer<u32>,
+    out_index: &DeviceBuffer<u32>,
+    out_value: &DeviceBuffer<f32>,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    const WARPS_PER_BLOCK: usize = 8;
+    let input_len = batch_size.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "batched lm-head top1 input",
+        expected: "batch_size * cols without overflow".to_string(),
+        actual: format!("batch_size={batch_size} cols={cols}"),
+    })?;
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "batched lm-head top1 weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let scratch_len = batch_size
+        .checked_mul(rows.div_ceil(WARPS_PER_BLOCK))
+        .ok_or_else(|| Error::Shape {
+            label: "batched lm-head top1 scratch",
+            expected: "batch_size * ceil(rows / 8) without overflow".to_string(),
+            actual: format!("batch_size={batch_size} rows={rows}"),
+        })?;
+    if batch_size == 0
+        || rows == 0
+        || cols == 0
+        || batch_size > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || scratch_len > u32::MAX as usize
+        || input.len() < input_len
+        || weight.len() != weight_len
+        || scratch_value.len() < scratch_len
+        || scratch_index.len() < scratch_len
+        || out_index.len() < batch_size
+        || out_value.len() < batch_size
+    {
+        return Err(Error::Shape {
+            label: "batched lm-head top1 buffers",
+            expected: format!(
+                "input>={input_len} weight={weight_len} scratch>={scratch_len} output>={batch_size}"
+            ),
+            actual: format!(
+                "input={} weight={} scratch_value={} scratch_index={} out_index={} out_value={}",
+                input.len(),
+                weight.len(),
+                scratch_value.len(),
+                scratch_index.len(),
+                out_index.len(),
+                out_value.len()
+            ),
+        });
+    }
+    if !cols.is_multiple_of(4) {
+        return Err(Error::Shape {
+            label: "batched lm-head top1 cols alignment",
+            expected: "cols divisible by 4 (vectorized bf16x2 loads)".to_string(),
+            actual: format!("cols={cols}"),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_lm_head_top1_f32_batch_on_stream",
+            ffi::infer_lm_head_top1_f32_batch_on_stream(
+                input.ptr,
+                weight.ptr,
+                scratch_value.ptr,
+                scratch_index.ptr,
+                scratch_len as u32,
+                out_index.ptr,
+                out_value.ptr,
+                batch_size as u32,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 ///
 /// `input` has `cols` f32 values. `weight` is row-major BF16 with shape
 /// `[rows, cols]`. The returned device buffer contains `rows` f32 logits.
@@ -16982,6 +17077,84 @@ mod tests {
                 "batched BF16 linear",
             );
         }
+    }
+
+    #[test]
+    fn lm_head_top1_f32_batch_matches_materialized_logits_exactly() {
+        let batch_size = 3usize;
+        let rows = 19usize;
+        let cols = 20usize;
+        let input = (0..batch_size * cols)
+            .map(|idx| 1.0 + (idx * 7 % 31) as f32 * 0.015625)
+            .collect::<Vec<_>>();
+        let mut weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 41) as f32 - 20.0) * 0.03125))
+            .collect::<Vec<_>>();
+        for col in 0..cols {
+            let tied = format::f32_to_bf16(16.0 + col as f32 * 0.125);
+            weight[2 * cols + col] = tied;
+            weight[7 * cols + col] = tied;
+        }
+
+        let input = DeviceBuffer::from_host(&input).expect("input");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut logits = DeviceBuffer::<f32>::zeroed(batch_size * rows).expect("logits");
+        let mut expected_index = DeviceBuffer::<u32>::zeroed(batch_size).expect("expected index");
+        let mut expected_value = DeviceBuffer::<f32>::zeroed(batch_size).expect("expected value");
+        let scratch_len = batch_size * rows.div_ceil(8);
+        let scratch_value = DeviceBuffer::<f32>::zeroed(scratch_len).expect("scratch value");
+        let scratch_index = DeviceBuffer::<u32>::zeroed(scratch_len).expect("scratch index");
+        let actual_index = DeviceBuffer::<u32>::zeroed(batch_size).expect("actual index");
+        let actual_value = DeviceBuffer::<f32>::zeroed(batch_size).expect("actual value");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        bf16_linear_logits_f32_batch_into_on_stream(
+            &input,
+            &weight,
+            logits.output(),
+            batch_size,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("materialized logits");
+        argmax_f32_batch_into_on_stream(
+            &logits,
+            expected_index.output(),
+            expected_value.output(),
+            batch_size,
+            rows,
+            &stream,
+        )
+        .expect("materialized argmax");
+        lm_head_top1_f32_batch_into_on_stream(
+            &input,
+            &weight,
+            &scratch_value,
+            &scratch_index,
+            &actual_index,
+            &actual_value,
+            batch_size,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("direct top1");
+
+        let expected_index = expected_index
+            .copy_to_host(&stream)
+            .expect("expected indices");
+        assert_eq!(expected_index, vec![2; batch_size]);
+        assert_eq!(
+            actual_index.copy_to_host(&stream).expect("actual indices"),
+            expected_index
+        );
+        assert_eq!(
+            actual_value.copy_to_host(&stream).expect("actual values"),
+            expected_value
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
     }
 
     #[test]

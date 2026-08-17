@@ -6982,6 +6982,142 @@ __global__ void infer_bf16_matvec_logits_reuse_weights_batch_kernel(
     }
 }
 
+// Reuses each BF16 weight row across a small input batch, then reduces the
+// eight vocabulary rows owned by a block before writing one candidate per
+// batch row to global memory. The dot-product loop intentionally matches
+// infer_bf16_matvec_logits_reuse_weights_batch_kernel so target decisions stay
+// bit-for-bit identical to materializing logits and reducing them afterwards.
+__global__ void infer_bf16_lm_head_top1_batch_pass1_kernel(
+    const float* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    float* __restrict__ scratch_value,
+    std::uint32_t* __restrict__ scratch_index,
+    std::uint32_t batch_size,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    constexpr std::uint32_t kBatchTile = 4;
+    constexpr std::uint32_t kWarpsPerBlock = 8;
+    __shared__ float block_values[kBatchTile * kWarpsPerBlock];
+    __shared__ std::uint32_t block_indices[kBatchTile * kWarpsPerBlock];
+
+    const std::uint32_t warp = threadIdx.x >> 5u;
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t row = blockIdx.x * kWarpsPerBlock + warp;
+    const std::uint32_t batch_base = blockIdx.y * kBatchTile;
+    const std::uint32_t active = min(kBatchTile, batch_size - batch_base);
+    float acc[kBatchTile] = {};
+
+    if (row < rows) {
+        const std::uint16_t* row_weight =
+            weight + static_cast<std::size_t>(row) * cols;
+        for (std::uint32_t col = lane * 4; col < cols; col += 32 * 4) {
+            const __nv_bfloat162 w0 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col);
+            const __nv_bfloat162 w1 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col + 2);
+            const float w0x = __bfloat162float(__low2bfloat16(w0));
+            const float w0y = __bfloat162float(__high2bfloat16(w0));
+            const float w1x = __bfloat162float(__low2bfloat16(w1));
+            const float w1y = __bfloat162float(__high2bfloat16(w1));
+#pragma unroll
+            for (std::uint32_t batch = 0; batch < kBatchTile; ++batch) {
+                if (batch >= active) continue;
+                const float* input_row =
+                    input + static_cast<std::size_t>(batch_base + batch) * cols;
+                acc[batch] = __fmaf_rn(w0x, input_row[col], acc[batch]);
+                acc[batch] = __fmaf_rn(w0y, input_row[col + 1], acc[batch]);
+                acc[batch] = __fmaf_rn(w1x, input_row[col + 2], acc[batch]);
+                acc[batch] = __fmaf_rn(w1y, input_row[col + 3], acc[batch]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t batch = 0; batch < kBatchTile; ++batch) {
+        if (batch >= active) continue;
+        if (row < rows) {
+            acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 16);
+            acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 8);
+            acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 4);
+            acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 2);
+            acc[batch] += __shfl_xor_sync(0xffffffffu, acc[batch], 1);
+        }
+        if (lane == 0) {
+            const std::uint32_t offset = batch * kWarpsPerBlock + warp;
+            block_values[offset] = row < rows ? acc[batch] : -INFINITY;
+            block_indices[offset] = row < rows ? row : 0;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < active) {
+        const std::uint32_t batch = threadIdx.x;
+        float best_value = -INFINITY;
+        std::uint32_t best_index = 0;
+#pragma unroll
+        for (std::uint32_t candidate = 0; candidate < kWarpsPerBlock; ++candidate) {
+            const std::uint32_t offset = batch * kWarpsPerBlock + candidate;
+            const float value = block_values[offset];
+            const std::uint32_t index = block_indices[offset];
+            if (value > best_value || (value == best_value && index < best_index)) {
+                best_value = value;
+                best_index = index;
+            }
+        }
+        const std::uint32_t scratch_stride = gridDim.x;
+        const std::size_t scratch_offset =
+            static_cast<std::size_t>(batch_base + batch) * scratch_stride + blockIdx.x;
+        scratch_value[scratch_offset] = best_value;
+        scratch_index[scratch_offset] = best_index;
+    }
+}
+
+__global__ void infer_lm_head_top1_batch_final_kernel(
+    const float* __restrict__ scratch_value,
+    const std::uint32_t* __restrict__ scratch_index,
+    std::uint32_t* __restrict__ out_index,
+    float* __restrict__ out_value,
+    std::uint32_t scratch_stride) {
+    extern __shared__ unsigned char sh_raw[];
+    float* values = reinterpret_cast<float*>(sh_raw);
+    std::uint32_t* indices =
+        reinterpret_cast<std::uint32_t*>(values + blockDim.x);
+    const std::size_t batch_offset =
+        static_cast<std::size_t>(blockIdx.x) * scratch_stride;
+
+    float best_value = -INFINITY;
+    std::uint32_t best_index = 0;
+    for (std::uint32_t candidate = threadIdx.x; candidate < scratch_stride;
+         candidate += blockDim.x) {
+        const float value = scratch_value[batch_offset + candidate];
+        const std::uint32_t index = scratch_index[batch_offset + candidate];
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    values[threadIdx.x] = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other_value = values[threadIdx.x + stride];
+            const std::uint32_t other_index = indices[threadIdx.x + stride];
+            if (other_value > values[threadIdx.x] ||
+                (other_value == values[threadIdx.x] && other_index < indices[threadIdx.x])) {
+                values[threadIdx.x] = other_value;
+                indices[threadIdx.x] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        out_index[blockIdx.x] = indices[0];
+        out_value[blockIdx.x] = values[0];
+    }
+}
+
 __global__ void infer_lm_head_top1_pass1_kernel(
     const float* __restrict__ input,
     const std::uint16_t* __restrict__ weight,
@@ -11513,6 +11649,53 @@ extern "C" cudaError_t infer_lm_head_top1_f32_on_stream(
     infer_lm_head_top1_final_kernel<<<1, kFinalThreads, final_shmem, stream>>>(
         scratch_value, scratch_index, out_index, out_value,
         grid * warps_per_block);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_lm_head_top1_f32_batch_on_stream(
+    const float* input,
+    const std::uint16_t* weight,
+    float* scratch_value,
+    std::uint32_t* scratch_index,
+    std::uint32_t scratch_len,
+    std::uint32_t* out_index,
+    float* out_value,
+    std::uint32_t batch_size,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || scratch_value == nullptr ||
+        scratch_index == nullptr || out_index == nullptr || out_value == nullptr ||
+        batch_size == 0 || rows == 0 || cols == 0 || (cols & 3u) != 0u) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr std::uint32_t kWarpsPerBlock = 8;
+    constexpr std::uint32_t kBatchTile = 4;
+    constexpr std::uint32_t kThreads = kWarpsPerBlock * 32;
+    const std::uint32_t scratch_stride =
+        (rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const std::uint64_t required_scratch =
+        static_cast<std::uint64_t>(batch_size) * scratch_stride;
+    if (required_scratch > scratch_len) {
+        return cudaErrorInvalidValue;
+    }
+
+    infer_bf16_lm_head_top1_batch_pass1_kernel<<<
+        dim3(scratch_stride, (batch_size + kBatchTile - 1) / kBatchTile),
+        kThreads, 0, stream>>>(
+            input, weight, scratch_value, scratch_index, batch_size, rows, cols);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    constexpr std::uint32_t kFinalThreads = 256;
+    const std::size_t final_shmem =
+        kFinalThreads * (sizeof(float) + sizeof(std::uint32_t));
+    infer_lm_head_top1_batch_final_kernel<<<
+        batch_size, kFinalThreads, final_shmem, stream>>>(
+            scratch_value, scratch_index, out_index, out_value, scratch_stride);
     return cudaGetLastError();
 }
 
