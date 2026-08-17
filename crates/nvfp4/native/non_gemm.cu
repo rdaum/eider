@@ -8042,59 +8042,59 @@ __global__ void infer_gated_delta_net_128_f32_chunks_warp_kernel(
     const std::uint32_t sequence = blockIdx.x / heads;
     const std::uint32_t head = blockIdx.x % heads;
     const std::uint32_t col = blockIdx.y;
-    const std::uint32_t lane = threadIdx.x;
-    if (col >= kState || lane >= 32) return;
+    const std::uint32_t row = threadIdx.x;
+    if (col >= kState || row >= kState) return;
 
     const std::uint32_t offset = sequence_offsets[sequence];
     const std::uint32_t length = sequence_lengths[sequence];
     const std::uint32_t state_base = head * kState * kState + col * kState;
     float* state = state_table[sequence];
-    float state_value[4];
-#pragma unroll
-    for (std::uint32_t item = 0; item < 4; ++item) {
-        state_value[item] = state[state_base + lane + item * 32];
-    }
+
+    const std::uint32_t lane = row & 31U;
+    const std::uint32_t warp = row >> 5;
+    __shared__ float warp_sums[4];
+    __shared__ float reduced;
+
+    float state_value = state[state_base + row];
 
     for (std::uint32_t token = 0; token < length; ++token) {
         const std::uint32_t vector_base = ((offset + token) * heads + head) * kState;
-        float q_value[4];
-        float k_value[4];
-        float state_dot_k = 0.0f;
-#pragma unroll
-        for (std::uint32_t item = 0; item < 4; ++item) {
-            const std::uint32_t row = lane + item * 32;
-            q_value[item] = q[vector_base + row];
-            k_value[item] = k[vector_base + row];
-            state_dot_k = fmaf(state_value[item], k_value[item], state_dot_k);
-        }
-        state_dot_k = infer_warp_reduce_sum(state_dot_k);
-        state_dot_k = __shfl_sync(0xffffffffu, state_dot_k, 0);
+        const float q_value = q[vector_base + row];
+        const float k_value = k[vector_base + row];
 
-        float decay = 0.0f;
-        float delta = 0.0f;
+        float state_dot_k = infer_warp_reduce_sum(state_value * k_value);
         if (lane == 0) {
-            decay = expf(gate[(offset + token) * heads + head]);
-            delta = (v[vector_base + col] - decay * state_dot_k) *
-                beta[(offset + token) * heads + head];
+            warp_sums[warp] = state_dot_k;
         }
-        decay = __shfl_sync(0xffffffffu, decay, 0);
-        delta = __shfl_sync(0xffffffffu, delta, 0);
+        __syncthreads();
+        if (warp == 0) {
+            state_dot_k = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+            if (lane == 0) {
+                reduced = state_dot_k;
+            }
+        }
+        __syncthreads();
 
-        float output_value = 0.0f;
-#pragma unroll
-        for (std::uint32_t item = 0; item < 4; ++item) {
-            state_value[item] = fmaf(k_value[item], delta, decay * state_value[item]);
-            output_value = fmaf(state_value[item], q_value[item], output_value);
-        }
-        output_value = infer_warp_reduce_sum(output_value);
+        const float decay = expf(gate[(offset + token) * heads + head]);
+        const float delta = (v[vector_base + col] - decay * reduced) *
+            beta[(offset + token) * heads + head];
+        state_value = decay * state_value + k_value * delta;
+
+        float output_value = infer_warp_reduce_sum(state_value * q_value);
         if (lane == 0) {
-            output[vector_base + col] = output_value * 0.08838834764831845f;
+            warp_sums[warp] = output_value;
         }
+        __syncthreads();
+        if (warp == 0) {
+            output_value = infer_warp_reduce_sum(lane < 4 ? warp_sums[lane] : 0.0f);
+            if (lane == 0) {
+                output[vector_base + col] = output_value * 0.08838834764831845f;
+            }
+        }
+        __syncthreads();
     }
-#pragma unroll
-    for (std::uint32_t item = 0; item < 4; ++item) {
-        state[state_base + lane + item * 32] = state_value[item];
-    }
+
+    state[state_base + row] = state_value;
 }
 
 __global__ void infer_gated_delta_net_128_f32_chunks_multiwarp_kernel(
@@ -8203,7 +8203,7 @@ extern "C" cudaError_t infer_gated_delta_net_128_f32_chunks_on_stream(
             q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
     } else {
         dim3 grid(sequence_count * heads, 128, 1);
-        infer_gated_delta_net_128_f32_chunks_warp_kernel<<<grid, 32, 0, stream>>>(
+        infer_gated_delta_net_128_f32_chunks_warp_kernel<<<grid, 128, 0, stream>>>(
             q, k, v, gate, beta, state_table, sequence_offsets, sequence_lengths, output, heads);
     }
     return cudaGetLastError();

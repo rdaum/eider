@@ -1,9 +1,9 @@
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36DownStorage, Qwen36FullAttentionWeights, Qwen36GateUpStorage,
     Qwen36LayerBlock, Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState,
-    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36NextToken,
-    Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage, Qwen36TextModel,
-    maybe_round_device_f32_to_bf16,
+    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36MtpDraftWorkspace,
+    Qwen36MtpSequenceState, Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState,
+    Qwen36SharedExpertStorage, Qwen36TextModel, maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
 
@@ -129,6 +129,13 @@ impl Qwen36DecodedBatch<'_> {
     /// values belong to this result; the remainder is workspace padding.
     pub fn logits(&self) -> &DeviceBuffer<f32> {
         &self.workspace.logits
+    }
+
+    /// Returns the row-major pre-final-norm hidden states; row `i` is the
+    /// residual stream after the last layer for decoded row `i`. Only the
+    /// first `len() * hidden` values belong to this result.
+    pub fn hidden(&self) -> &DeviceBuffer<f32> {
+        &self.workspace.hidden
     }
 
     /// Returns the number of logits per decoded row.
@@ -407,8 +414,74 @@ fn run_fp8_batch(
     output: &mut DeviceBuffer<f32>,
     rows: usize,
     _w8a16_threads: usize,
+    byte_identical: bool,
     stream: &CudaStream,
 ) -> Result<()> {
+    if matches!(input_quantization, BatchFp8InputQuantization::Unused) {
+        return Err(crate::nvfp4::Error::Format {
+            label: "Qwen3.6 FP8 batch input",
+            detail: "FP8 projection was given no prepared activation".to_string(),
+        });
+    }
+    let static_alpha = match input_quantization {
+        BatchFp8InputQuantization::Static(input_scale) => {
+            if linear.channel_weight_scale.is_some()
+                || linear.input_scale.map(f32::to_bits) != Some(input_scale.to_bits())
+            {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 static FP8 batch input",
+                    detail: "projection does not match the prepared static activation scale"
+                        .to_string(),
+                });
+            }
+            Some(linear.weight_scale * input_scale)
+        }
+        BatchFp8InputQuantization::Dynamic => None,
+        BatchFp8InputQuantization::Unused => unreachable!("FP8 input quantization is used"),
+    };
+
+    if byte_identical && rows > 1 {
+        if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(1) {
+            entry.insert(Fp8TnMatmulPlan::new(
+                &model.lt,
+                GemmShape::new(linear.rows, 1, linear.cols),
+                8 << 20,
+            )?);
+        }
+        let alpha = static_alpha.unwrap_or(1.0);
+        let plan1 = &plan.plans[&1];
+        for row in 0..rows {
+            plan1.run_with_alpha_offsets_on_stream(
+                &model.lt,
+                &linear.weight,
+                input,
+                row * linear.cols,
+                output.output(),
+                row * linear.rows,
+                alpha,
+                stream,
+            )?;
+        }
+        if static_alpha.is_none() {
+            let channel_scale = if let Some(channel_scale) = &linear.channel_weight_scale {
+                channel_scale
+            } else {
+                let channel_scale = &mut plan.scalar_channel_scale;
+                fill_f32_into_on_stream(channel_scale.output(), linear.weight_scale, stream)?;
+                &*channel_scale
+            };
+            scale_channel_f32_device_row_scalar_in_place_on_stream(
+                output.inout(),
+                channel_scale,
+                input_scale,
+                rows,
+                linear.rows,
+                stream,
+            )?;
+        }
+        return maybe_round_device_f32_to_bf16(output, stream);
+    }
+
     if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(rows) {
         entry.insert(Fp8TnMatmulPlan::new(
             &model.lt,
@@ -416,31 +489,16 @@ fn run_fp8_batch(
             8 << 20,
         )?);
     }
-    if let BatchFp8InputQuantization::Static(input_scale) = input_quantization {
-        if linear.channel_weight_scale.is_some()
-            || linear.input_scale.map(f32::to_bits) != Some(input_scale.to_bits())
-        {
-            return Err(crate::nvfp4::Error::Format {
-                label: "Qwen3.6 static FP8 batch input",
-                detail: "projection does not match the prepared static activation scale"
-                    .to_string(),
-            });
-        }
+    if let Some(alpha) = static_alpha {
         plan.plans[&rows].run_with_alpha_on_stream(
             &model.lt,
             &linear.weight,
             input,
             output.output(),
-            linear.weight_scale * input_scale,
+            alpha,
             stream,
         )?;
         return maybe_round_device_f32_to_bf16(output, stream);
-    }
-    if matches!(input_quantization, BatchFp8InputQuantization::Unused) {
-        return Err(crate::nvfp4::Error::Format {
-            label: "Qwen3.6 FP8 batch input",
-            detail: "FP8 projection was given no prepared activation".to_string(),
-        });
     }
     plan.plans[&rows].run_with_alpha_on_stream(
         &model.lt,
@@ -520,6 +578,7 @@ fn run_nvfp4_batch_quantized(
     maybe_round_device_f32_to_bf16(output, stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bf16_batch(
     model: &Qwen36TextModel,
     linear: &super::Bf16Linear,
@@ -527,8 +586,33 @@ fn run_bf16_batch(
     input: &DeviceBuffer<f32>,
     output: &mut DeviceBuffer<f32>,
     rows: usize,
+    byte_identical: bool,
     stream: &CudaStream,
 ) -> Result<()> {
+    f32_to_bf16_prefix_into_on_stream(input, plan.input.output(), rows * linear.cols, stream)?;
+    if byte_identical && rows > 1 {
+        if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(1) {
+            entry.insert(Bf16TnMatmulPlan::new(
+                &model.lt,
+                GemmShape::new(linear.rows, 1, linear.cols),
+                8 << 20,
+            )?);
+        }
+        let plan1 = &plan.plans[&1];
+        for row in 0..rows {
+            plan1.run_offsets_on_stream(
+                &model.lt,
+                &linear.weight,
+                0,
+                &plan.input,
+                row * linear.cols,
+                output.output(),
+                row * linear.rows,
+                stream,
+            )?;
+        }
+        return maybe_round_device_f32_to_bf16(output, stream);
+    }
     if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(rows) {
         entry.insert(Bf16TnMatmulPlan::new(
             &model.lt,
@@ -536,7 +620,6 @@ fn run_bf16_batch(
             8 << 20,
         )?);
     }
-    f32_to_bf16_prefix_into_on_stream(input, plan.input.output(), rows * linear.cols, stream)?;
     plan.plans[&rows].run_on_stream(
         &model.lt,
         &linear.weight,
@@ -559,6 +642,7 @@ fn run_linear_batch(
     output: &mut DeviceBuffer<f32>,
     rows: usize,
     w8a16_threads: usize,
+    byte_identical: bool,
     stream: &CudaStream,
 ) -> Result<()> {
     match linear {
@@ -586,6 +670,7 @@ fn run_linear_batch(
             output,
             rows,
             w8a16_threads,
+            byte_identical,
             stream,
         ),
         Qwen36Linear::Bf16(linear) => {
@@ -594,7 +679,16 @@ fn run_linear_batch(
             else {
                 unreachable!("BF16 projection has a BF16 plan")
             };
-            run_bf16_batch(model, linear, plan, raw_input, output, rows, stream)
+            run_bf16_batch(
+                model,
+                linear,
+                plan,
+                raw_input,
+                output,
+                rows,
+                byte_identical,
+                stream,
+            )
         }
     }
 }
@@ -612,6 +706,13 @@ struct BatchLinearAttentionWorkspace {
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
+    row_qkv: DeviceBuffer<f32>,
+    row_q: DeviceBuffer<f32>,
+    row_k: DeviceBuffer<f32>,
+    row_v: DeviceBuffer<f32>,
+    row_gate: DeviceBuffer<f32>,
+    row_beta: DeviceBuffer<f32>,
+    row_gdn_output: DeviceBuffer<f32>,
     conv_state_table: DeviceBuffer<*mut f32>,
     recurrent_state_table: DeviceBuffer<*mut f32>,
     conv_state_ptrs: Vec<*mut f32>,
@@ -829,6 +930,13 @@ impl BatchLinearAttentionWorkspace {
             q: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             k: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             v: DeviceBuffer::zeroed(row_capacity * value_dim)?,
+            row_qkv: DeviceBuffer::zeroed(weights.qkv.rows())?,
+            row_q: DeviceBuffer::zeroed(value_dim)?,
+            row_k: DeviceBuffer::zeroed(value_dim)?,
+            row_v: DeviceBuffer::zeroed(value_dim)?,
+            row_gate: DeviceBuffer::zeroed(linear.value_heads)?,
+            row_beta: DeviceBuffer::zeroed(linear.value_heads)?,
+            row_gdn_output: DeviceBuffer::zeroed(value_dim)?,
             conv_state_table: DeviceBuffer::from_host(&nulls)?,
             recurrent_state_table: DeviceBuffer::from_host(&nulls)?,
             conv_state_ptrs: nulls.clone(),
@@ -931,6 +1039,13 @@ impl BatchLinearAttentionWorkspace {
             + self.q.device_bytes()
             + self.k.device_bytes()
             + self.v.device_bytes()
+            + self.row_qkv.device_bytes()
+            + self.row_q.device_bytes()
+            + self.row_k.device_bytes()
+            + self.row_v.device_bytes()
+            + self.row_gate.device_bytes()
+            + self.row_beta.device_bytes()
+            + self.row_gdn_output.device_bytes()
             + self.conv_state_table.device_bytes()
             + self.recurrent_state_table.device_bytes()
             + self
@@ -1191,6 +1306,7 @@ pub struct Qwen36PrefillBatchWorkspace {
     sequence_capacity: usize,
     token_capacity: usize,
     max_context_tokens: usize,
+    byte_identical: bool,
     stream: CudaStream,
     shared_moe_stream: CudaStream,
     moe_stream_sync: Vec<BatchMoeStreamSync>,
@@ -1229,6 +1345,13 @@ impl Qwen36PrefillBatchWorkspace {
     /// Returns the largest sequence context accepted by this workspace.
     pub fn max_context_tokens(&self) -> usize {
         self.max_context_tokens
+    }
+
+    /// Returns the row-major pre-final-norm hidden rows produced by the last
+    /// prefill call; row `i` is the residual stream after the last layer for
+    /// the i-th prefilled token.
+    pub fn prompt_hidden(&self) -> &DeviceBuffer<f32> {
+        &self.hidden
     }
 
     /// Returns the exact device bytes owned by the prefill workspace.
@@ -1462,6 +1585,45 @@ impl Qwen36DecodeBatchWorkspace {
     }
 }
 
+/// One generated sequence's committed-but-unverified frontier token.
+///
+/// The frontier is the next token the target will process: its position is
+/// the sequence's current length, and `prev_hidden` is the pre-final-norm
+/// target hidden produced while processing the token immediately before it.
+/// A speculative cycle verifies the frontier together with a chain of MTP
+/// drafts, then leaves this value at the target's prediction for the position
+/// after the committed prefix.
+pub struct Qwen36SpeculativeFrontier {
+    pub token: u32,
+    pub prev_hidden: DeviceBuffer<f32>,
+}
+
+/// Committed result of one Qwen3.8 speculative cycle.
+pub struct Qwen36SpeculativeCycleOutcome {
+    /// Tokens committed by the target: the frontier followed by every accepted
+    /// draft. The first entry is the cycle's frontier token, already known to
+    /// the caller before the cycle began.
+    pub committed: Vec<u32>,
+    /// Number of accepted drafts, equal to `committed.len() - 1`.
+    pub accepted_drafts: usize,
+    /// Whether a partial acceptance forced the committed prefix to be replayed
+    /// through the ordinary prefill path.
+    pub replayed: bool,
+}
+
+/// Reusable scratch for one Qwen3.8 speculative cycle.
+pub struct Qwen36SpeculativeCycleWorkspace {
+    drafts: usize,
+    verify: Qwen36PrefillBatchWorkspace,
+    mtp: Qwen36MtpDraftWorkspace,
+    normed_hidden: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    argmax_indices: DeviceBuffer<u32>,
+    argmax_values: DeviceBuffer<f32>,
+    catchup_hidden: DeviceBuffer<f32>,
+    host_verify_tokens: Vec<u32>,
+}
+
 impl Qwen36LayerBlock {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_batch_tail(
@@ -1552,6 +1714,7 @@ impl Qwen36TextModel {
             sequence_capacity,
             token_capacity,
             max_context_tokens,
+            byte_identical: false,
             stream: CudaStream::new_blocking()?,
             shared_moe_stream: CudaStream::new_non_blocking()?,
             moe_stream_sync,
@@ -1882,11 +2045,13 @@ impl Qwen36TextModel {
                         &workspace.normed_hidden,
                         &workspace.sequence_offsets,
                         &workspace.sequence_lengths,
+                        &workspace.host_sequence_lengths[..rows.len()],
                         layer_idx,
                         workspace.sequence_capacity,
                         rows.len(),
                         total_tokens,
                         total_tokens,
+                        workspace.byte_identical,
                         stream,
                     )?;
                     &workspace.linear.output
@@ -1905,6 +2070,7 @@ impl Qwen36TextModel {
                         rows,
                         &workspace.host_sequence_offsets,
                         layer_idx,
+                        workspace.byte_identical,
                         stream,
                         cache,
                         appends,
@@ -2686,11 +2852,246 @@ impl Qwen36TextModel {
                     &mut workspace.logits,
                     workspace.capacity,
                     256,
+                    false,
                     stream,
                 )?;
             }
         }
         Ok(())
+    }
+
+    /// Allocates scratch for one Qwen3.8 speculative cycle with `drafts`
+    /// chained MTP tokens per target pass.
+    pub fn new_speculative_cycle_workspace(
+        &self,
+        drafts: usize,
+        max_context_tokens: usize,
+    ) -> Result<Qwen36SpeculativeCycleWorkspace> {
+        if drafts == 0 {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.8 speculative cycle",
+                expected: "at least one draft per cycle".to_string(),
+                actual: "0 drafts".to_string(),
+            });
+        }
+        let rows = drafts + 1;
+        let mut verify = self.new_prefill_batch_workspace(1, rows, max_context_tokens)?;
+        verify.byte_identical = true;
+        let mtp = self.new_mtp_draft_workspace(max_context_tokens)?;
+        Ok(Qwen36SpeculativeCycleWorkspace {
+            drafts,
+            verify,
+            mtp,
+            normed_hidden: DeviceBuffer::zeroed(rows * self.manifest.hidden)?,
+            logits: DeviceBuffer::zeroed(rows * self.manifest.vocab)?,
+            argmax_indices: DeviceBuffer::zeroed(rows)?,
+            argmax_values: DeviceBuffer::zeroed(rows)?,
+            catchup_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
+            host_verify_tokens: Vec::with_capacity(rows),
+        })
+    }
+
+    /// Runs one greedy (argmax-verified) speculative decoding cycle.
+    ///
+    /// The cycle drafts `drafts` chained MTP tokens from `frontier`, verifies
+    /// `[frontier, drafts..]` in a single batched forward pass, accepts the
+    /// longest prefix where each draft matches the target argmax, and commits
+    /// `accepted + 1` tokens. On partial acceptance the target's recurrent
+    /// GDN state is rolled back and the committed prefix is replayed through
+    /// [`Self::prefill_batch`]; a full acceptance commits the verify pass
+    /// directly. `frontier` is advanced to the target's argmax for the last
+    /// committed position, and the accepted drafter K/V slots are rewritten.
+    pub fn speculative_cycle_argmax(
+        &self,
+        workspace: &mut Qwen36SpeculativeCycleWorkspace,
+        frontier: &mut Qwen36SpeculativeFrontier,
+        sequence: &mut Qwen36Sequence,
+        mtp_state: &mut Qwen36MtpSequenceState,
+        cache: &mut Qwen36SequenceCache,
+    ) -> Result<Qwen36SpeculativeCycleOutcome> {
+        let Qwen36SpeculativeCycleWorkspace {
+            drafts,
+            verify,
+            mtp,
+            normed_hidden,
+            logits,
+            argmax_indices,
+            argmax_values,
+            catchup_hidden,
+            host_verify_tokens,
+        } = workspace;
+        let drafts = *drafts;
+        let hidden = self.manifest.hidden;
+        let rows = drafts + 1;
+
+        let drafted = self.mtp_draft_chain_argmax(
+            mtp_state,
+            mtp,
+            frontier.token,
+            &frontier.prev_hidden,
+            drafts,
+            verify.stream(),
+        )?;
+
+        host_verify_tokens.clear();
+        host_verify_tokens.push(frontier.token);
+        host_verify_tokens.extend_from_slice(&drafted);
+
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(cache_error)?;
+        if let Err(error) = sequence.state.begin_append(verify.stream()) {
+            let _ = cache.abort_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            );
+            return Err(error);
+        }
+
+        let forward = {
+            let mut state_rows = [Qwen36PrefillStateRow {
+                token_ids: host_verify_tokens,
+                state: &mut sequence.state,
+            }];
+            let appends = [Qwen36Append {
+                reservation: &reservation,
+                page_table: sequence.page_table.device(),
+            }];
+            self.prefill_batch_impl(verify, &mut state_rows, cache, &appends)
+        };
+        if let Err(error) = forward {
+            let _ = sequence.state.abort_append(verify.stream());
+            let _ = cache.abort_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            );
+            return Err(error);
+        }
+
+        rms_norm_f32_into_on_stream(
+            rows,
+            hidden,
+            verify.prompt_hidden(),
+            &self.final_norm,
+            normed_hidden.output(),
+            self.manifest.rms_eps,
+            verify.stream(),
+        )?;
+        round_f32_to_bf16_in_place_on_stream(normed_hidden.inout(), verify.stream())?;
+        match &self.lm_head {
+            Qwen36LmHead::Nvfp4(linear) => {
+                linear.run_f32_batch_into(normed_hidden, logits, rows, verify.stream())?
+            }
+            Qwen36LmHead::Bf16(linear) => {
+                bf16_linear_logits_f32_batch_into_on_stream(
+                    normed_hidden,
+                    &linear.weight,
+                    logits.output(),
+                    rows,
+                    linear.rows,
+                    linear.cols,
+                    verify.stream(),
+                )?;
+            }
+            Qwen36LmHead::Fp8 { .. } => {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.8 speculative lm_head",
+                    detail: "FP8 lm_head storage is unsupported for speculative decode".to_string(),
+                });
+            }
+        }
+        argmax_f32_batch_into_on_stream(
+            logits,
+            argmax_indices.output(),
+            argmax_values.output(),
+            rows,
+            self.manifest.vocab,
+            verify.stream(),
+        )?;
+        let verify_argmax = argmax_indices
+            .copy_prefix_to_host(rows, verify.stream())?
+            .into_vec();
+
+        let mut accepted = 0usize;
+        while accepted < drafts && drafted[accepted] == verify_argmax[accepted] {
+            accepted += 1;
+        }
+
+        let replayed = if accepted == drafts {
+            if let Err(error) = cache
+                .commit_append(
+                    reservation,
+                    rows,
+                    &mut Sm12xCacheContext {
+                        stream: verify.stream(),
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(cache_error)
+            {
+                let _ = sequence.state.abort_append(verify.stream());
+                return Err(error);
+            }
+            sequence.state.commit_append(rows);
+            false
+        } else {
+            sequence.state.abort_append(verify.stream())?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: verify.stream(),
+                        page_table: &mut sequence.page_table,
+                    },
+                )
+                .map_err(cache_error)?;
+            let mut replay_rows = [Qwen36PrefillRow {
+                token_ids: &host_verify_tokens[..accepted + 1],
+                sequence,
+            }];
+            self.prefill_batch(verify, &mut replay_rows, cache)?;
+            true
+        };
+
+        mtp_state.truncate(mtp_state.len() - drafts + 1)?;
+        for (accepted_draft, &draft_token) in drafted.iter().take(accepted).enumerate() {
+            catchup_hidden.copy_range_from_device_on_stream(
+                0,
+                verify.prompt_hidden(),
+                accepted_draft * hidden,
+                hidden,
+                verify.stream(),
+            )?;
+            self.mtp_append_kv(mtp_state, mtp, draft_token, catchup_hidden, verify.stream())?;
+        }
+
+        frontier.token = verify_argmax[accepted];
+        frontier.prev_hidden.copy_range_from_device_on_stream(
+            0,
+            verify.prompt_hidden(),
+            accepted * hidden,
+            hidden,
+            verify.stream(),
+        )?;
+
+        Ok(Qwen36SpeculativeCycleOutcome {
+            committed: host_verify_tokens[..accepted + 1].to_vec(),
+            accepted_drafts: accepted,
+            replayed,
+        })
     }
 }
 
@@ -2729,6 +3130,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.qkv_output,
             capacity,
             128,
+            false,
             stream,
         )?;
         run_linear_batch(
@@ -2742,6 +3144,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.z_output,
             capacity,
             128,
+            false,
             stream,
         )?;
         run_bf16_batch(
@@ -2751,6 +3154,7 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &mut workspace.alpha_beta,
             capacity,
+            false,
             stream,
         )?;
         qwen36_gdn_prep_batch_into_on_stream(
@@ -2845,6 +3249,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.output,
             capacity,
             256,
+            false,
             stream,
         )
     }
@@ -2857,11 +3262,13 @@ impl Qwen36LinearAttentionWeights {
         hidden: &DeviceBuffer<f32>,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
+        host_sequence_lengths: &[u32],
         layer_idx: usize,
         sequence_capacity: usize,
         sequence_count: usize,
         total_tokens: usize,
         row_capacity: usize,
+        byte_identical: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         let linear = model
@@ -2889,6 +3296,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.qkv_output,
             row_capacity,
             128,
+            byte_identical,
             stream,
         )?;
         run_linear_batch(
@@ -2902,6 +3310,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.z_output,
             row_capacity,
             128,
+            byte_identical,
             stream,
         )?;
         run_bf16_batch(
@@ -2911,10 +3320,63 @@ impl Qwen36LinearAttentionWeights {
             hidden,
             &mut workspace.alpha_beta,
             row_capacity,
+            byte_identical,
             stream,
         )?;
-        let use_chunked_gdn = total_tokens >= GDN_CHUNK_TOKENS && workspace.chunked_gdn.is_some();
-        if use_chunked_gdn {
+        let use_chunked_gdn =
+            !byte_identical && total_tokens >= GDN_CHUNK_TOKENS && workspace.chunked_gdn.is_some();
+        if byte_identical && total_tokens > sequence_count {
+            let qkv_width = self.qkv.rows();
+            let mut row = 0;
+            for (sequence, &length) in host_sequence_lengths.iter().enumerate() {
+                for _ in 0..length {
+                    workspace.row_qkv.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.qkv_output,
+                        row * qkv_width,
+                        qkv_width,
+                        stream,
+                    )?;
+                    qwen36_gdn_prep_batch_into_on_stream(
+                        &workspace.row_qkv,
+                        &self.conv_weight,
+                        workspace.row_q.output(),
+                        workspace.row_k.output(),
+                        workspace.row_v.output(),
+                        &workspace.conv_state_table,
+                        layer_idx * sequence_capacity + sequence,
+                        1,
+                        linear.key_heads,
+                        linear.value_heads,
+                        linear.value_head_dim,
+                        stream,
+                    )?;
+                    workspace.q.copy_range_from_device_on_stream(
+                        row * value_dim,
+                        &workspace.row_q,
+                        0,
+                        value_dim,
+                        stream,
+                    )?;
+                    workspace.k.copy_range_from_device_on_stream(
+                        row * value_dim,
+                        &workspace.row_k,
+                        0,
+                        value_dim,
+                        stream,
+                    )?;
+                    workspace.v.copy_range_from_device_on_stream(
+                        row * value_dim,
+                        &workspace.row_v,
+                        0,
+                        value_dim,
+                        stream,
+                    )?;
+                    row += 1;
+                }
+            }
+            debug_assert_eq!(row, total_tokens);
+        } else if use_chunked_gdn {
             let chunked = workspace
                 .chunked_gdn
                 .as_mut()
@@ -2997,7 +3459,70 @@ impl Qwen36LinearAttentionWeights {
                 stream,
             )?;
         }
-        if use_chunked_gdn {
+        if byte_identical && total_tokens > sequence_count {
+            let mut row = 0;
+            for (sequence, &length) in host_sequence_lengths.iter().enumerate() {
+                for _ in 0..length {
+                    workspace.row_q.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.q,
+                        row * value_dim,
+                        value_dim,
+                        stream,
+                    )?;
+                    workspace.row_k.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.k,
+                        row * value_dim,
+                        value_dim,
+                        stream,
+                    )?;
+                    workspace.row_v.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.v,
+                        row * value_dim,
+                        value_dim,
+                        stream,
+                    )?;
+                    workspace.row_gate.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.gate,
+                        row * linear.value_heads,
+                        linear.value_heads,
+                        stream,
+                    )?;
+                    workspace.row_beta.copy_range_from_device_on_stream(
+                        0,
+                        &workspace.beta,
+                        row * linear.value_heads,
+                        linear.value_heads,
+                        stream,
+                    )?;
+                    gated_delta_net_128_f32_batch_into_on_stream(
+                        &workspace.row_q,
+                        &workspace.row_k,
+                        &workspace.row_v,
+                        &workspace.row_gate,
+                        &workspace.row_beta,
+                        &workspace.recurrent_state_table,
+                        workspace.row_gdn_output.output(),
+                        layer_idx * sequence_capacity + sequence,
+                        1,
+                        linear.value_heads,
+                        stream,
+                    )?;
+                    workspace.gdn_output.copy_range_from_device_on_stream(
+                        row * value_dim,
+                        &workspace.row_gdn_output,
+                        0,
+                        value_dim,
+                        stream,
+                    )?;
+                    row += 1;
+                }
+            }
+            debug_assert_eq!(row, total_tokens);
+        } else if use_chunked_gdn {
             workspace
                 .chunked_gdn
                 .as_mut()
@@ -3072,6 +3597,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.output,
             row_capacity,
             256,
+            false,
             stream,
         )
     }
@@ -3108,6 +3634,7 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.q_proj,
             capacity,
             128,
+            false,
             stream,
         )?;
         run_linear_batch(
@@ -3121,6 +3648,7 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.k_raw,
             capacity,
             128,
+            false,
             stream,
         )?;
         run_linear_batch(
@@ -3134,6 +3662,7 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.v,
             capacity,
             128,
+            false,
             stream,
         )?;
         qwen36_full_attn_prep_f32_batch_into_on_stream(
@@ -3261,6 +3790,7 @@ impl Qwen36FullAttentionWeights {
         rows: &mut [Qwen36PrefillStateRow<'_, '_>],
         row_offsets: &[u32],
         layer_idx: usize,
+        byte_identical: bool,
         stream: &CudaStream,
         cache: &mut Qwen36SequenceCache,
         appends: &[Qwen36Append<'_>],
@@ -3290,8 +3820,11 @@ impl Qwen36FullAttentionWeights {
                         while processed < segment.rows() {
                             let token = segment.input_offset() + processed;
                             let position = row.state.position + token;
-                            let chunk_rows =
-                                (segment.rows() - processed).min(16 - position % 16).min(8);
+                            let chunk_rows = if byte_identical {
+                                1
+                            } else {
+                                (segment.rows() - processed).min(16 - position % 16).min(8)
+                            };
                             pool.append_rows_at_offset_on_stream(
                                 page.page().slot(),
                                 segment.page_offset() + processed,
@@ -3362,6 +3895,7 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.output,
             capacity,
             256,
+            false,
             stream,
         )
     }
@@ -3485,6 +4019,7 @@ impl Qwen36MoeWeights {
             ffn_norm,
             &mut workspace.shared_gate,
             capacity,
+            false,
             stream,
         )
     }
@@ -3520,6 +4055,7 @@ impl Qwen36MoeWeights {
             ffn_norm,
             &mut workspace.router_logits,
             capacity,
+            false,
             stream,
         )?;
         if stabilise_router_logits {

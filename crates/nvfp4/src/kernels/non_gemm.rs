@@ -18401,6 +18401,114 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_short_chunk_recurrence_is_bit_exact_to_single_token_batch() {
+        let tokens = 3usize;
+        let heads = 2usize;
+        let vector_dim = heads * 128;
+        let state_len = heads * 128 * 128;
+        let vectors = tokens * vector_dim;
+        let scalars = tokens * heads;
+        let values = |multiplier: usize, modulus: usize, offset: f32, scale: f32| {
+            (0..vectors)
+                .map(|index| ((index * multiplier % modulus) as f32 - offset) * scale)
+                .collect::<Vec<_>>()
+        };
+        let q_host = values(17, 103, 49.3, 0.0073);
+        let k_host = values(29, 107, 51.7, 0.0061);
+        let v_host = values(43, 109, 53.2, 0.0059);
+        let gate_host = (0..scalars)
+            .map(|index| -0.0137 - index as f32 * 0.0043)
+            .collect::<Vec<_>>();
+        let beta_host = (0..scalars)
+            .map(|index| 0.173 + index as f32 * 0.031)
+            .collect::<Vec<_>>();
+        let state_host = (0..state_len)
+            .map(|index| ((index * 31 % 113) as f32 - 55.4) * 0.00017)
+            .collect::<Vec<_>>();
+        let q = DeviceBuffer::from_host(&q_host).expect("q upload");
+        let k = DeviceBuffer::from_host(&k_host).expect("k upload");
+        let v = DeviceBuffer::from_host(&v_host).expect("v upload");
+        let gate = DeviceBuffer::from_host(&gate_host).expect("gate upload");
+        let beta = DeviceBuffer::from_host(&beta_host).expect("beta upload");
+        let offsets = DeviceBuffer::from_host(&[0u32]).expect("offset upload");
+        let lengths = DeviceBuffer::from_host(&[tokens as u32]).expect("length upload");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut chunk_state = DeviceBuffer::from_host(&state_host).expect("chunk state upload");
+        let chunk_table = DeviceBuffer::from_host(&[chunk_state.as_mut_ptr().cast::<f32>()])
+            .expect("chunk table");
+        let mut chunk_output = DeviceBuffer::zeroed(vectors).expect("chunk output");
+        gated_delta_net_128_f32_chunks_into_on_stream(
+            &q,
+            &k,
+            &v,
+            &gate,
+            &beta,
+            &chunk_table,
+            0,
+            &offsets,
+            &lengths,
+            chunk_output.output(),
+            1,
+            tokens,
+            heads,
+            &stream,
+        )
+        .expect("chunk recurrence");
+
+        let mut repeated_state =
+            DeviceBuffer::from_host(&state_host).expect("repeated state upload");
+        let repeated_table = DeviceBuffer::from_host(&[repeated_state.as_mut_ptr().cast::<f32>()])
+            .expect("repeated table");
+        let mut repeated_output = Vec::with_capacity(vectors);
+        for token in 0..tokens {
+            let range = token * vector_dim..(token + 1) * vector_dim;
+            let scalar_range = token * heads..(token + 1) * heads;
+            let q_row = DeviceBuffer::from_host(&q_host[range.clone()]).expect("q row upload");
+            let k_row = DeviceBuffer::from_host(&k_host[range.clone()]).expect("k row upload");
+            let v_row = DeviceBuffer::from_host(&v_host[range]).expect("v row upload");
+            let gate_row =
+                DeviceBuffer::from_host(&gate_host[scalar_range.clone()]).expect("gate row upload");
+            let beta_row =
+                DeviceBuffer::from_host(&beta_host[scalar_range]).expect("beta row upload");
+            let mut output = DeviceBuffer::zeroed(vector_dim).expect("row output");
+            gated_delta_net_128_f32_batch_into_on_stream(
+                &q_row,
+                &k_row,
+                &v_row,
+                &gate_row,
+                &beta_row,
+                &repeated_table,
+                output.output(),
+                0,
+                1,
+                heads,
+                &stream,
+            )
+            .expect("single-token recurrence");
+            repeated_output.extend(output.copy_to_host(&stream).expect("row output download"));
+        }
+
+        assert_eq!(
+            chunk_output
+                .copy_to_host(&stream)
+                .expect("chunk output download")
+                .as_slice(),
+            repeated_output,
+        );
+        assert_eq!(
+            chunk_state
+                .copy_to_host(&stream)
+                .expect("chunk state download")
+                .as_slice(),
+            repeated_state
+                .copy_to_host(&stream)
+                .expect("repeated state download")
+                .as_slice(),
+        );
+    }
+
+    #[test]
     fn channel_scaled_bf16_to_fp8_quantization_uses_row_scales() {
         let rows = 2usize;
         let cols = 4usize;

@@ -1,11 +1,14 @@
 //! Qwen3.6 / Qwen3.5-MoE hybrid execution pieces.
 
 mod batch;
+mod mtp;
 
 pub use batch::{
     Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow,
     Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
+    Qwen36SpeculativeCycleOutcome, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
 };
+pub use mtp::{Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36MtpWeights};
 
 use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
@@ -1468,8 +1471,9 @@ impl Qwen36FullAttentionWorkspace {
             v: DeviceBuffer::zeroed(kv_width)?,
             q_rope: DeviceBuffer::zeroed(q_width)?,
             k_rope: DeviceBuffer::zeroed(kv_width)?,
-            compact_attention: Sm12xKvAttentionWorkspace::new(
+            compact_attention: Sm12xKvAttentionWorkspace::new_gqa(
                 cache_capacity,
+                manifest.q_heads,
                 manifest.kv_heads,
                 manifest.head_dim,
             )?,
@@ -6024,6 +6028,7 @@ pub struct Qwen36TextModel {
     embedding: DeviceBuffer<u16>,
     final_norm: DeviceBuffer<f32>,
     lm_head: Qwen36LmHead,
+    mtp: Option<Qwen36MtpWeights>,
     expert_paging: bool,
     bf16_storage: Qwen36Bf16StorageConfig,
     fp8_attention_storage: Qwen36Fp8AttentionStorage,
@@ -6555,6 +6560,11 @@ impl Qwen36TextModel {
                 actual: format!("[{}, {}]", lm_head_shape.0, lm_head_shape.1),
             });
         }
+        let mtp = if manifest.mtp_layers > 0 && checkpoint.contains_tensor("mtp.fc.weight") {
+            Some(Qwen36MtpWeights::load(&checkpoint, &manifest)?)
+        } else {
+            None
+        };
         Ok(Self {
             model_id: NEXT_QWEN36_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             manifest,
@@ -6565,6 +6575,7 @@ impl Qwen36TextModel {
             embedding,
             final_norm,
             lm_head,
+            mtp,
             expert_paging: is_moe && capacity_per_layer.is_some(),
             bf16_storage,
             fp8_attention_storage,

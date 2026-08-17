@@ -183,6 +183,110 @@ impl Fp8TnMatmulPlan {
             )
         }
     }
+
+    /// Enqueues the planned matmul over contiguous submatrices of B and D.
+    ///
+    /// `b_offset` and `output_offset` select a single N column from larger
+    /// batched buffers, letting an M=1 plan reproduce its reduction on one row
+    /// of an M>1 batch without a staging copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_alpha_offsets_on_stream(
+        &self,
+        lt: &CublasLt,
+        a_kxm: &DeviceBuffer<u8>,
+        b_kxn: &DeviceBuffer<u8>,
+        b_offset: usize,
+        mut output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        alpha: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let a_len = self
+            .shape
+            .k
+            .checked_mul(self.shape.m)
+            .ok_or_else(|| Error::Shape {
+                label: "FP8 TN A length",
+                expected: "K * M without overflow".to_string(),
+                actual: format!("K={} M={}", self.shape.k, self.shape.m),
+            })?;
+        let b_len = self
+            .shape
+            .k
+            .checked_mul(self.shape.n)
+            .ok_or_else(|| Error::Shape {
+                label: "FP8 TN B length",
+                expected: "K * N without overflow".to_string(),
+                actual: format!("K={} N={}", self.shape.k, self.shape.n),
+            })?;
+        let d_len = self
+            .shape
+            .m
+            .checked_mul(self.shape.n)
+            .ok_or_else(|| Error::Shape {
+                label: "FP8 TN output length",
+                expected: "M * N without overflow".to_string(),
+                actual: format!("M={} N={}", self.shape.m, self.shape.n),
+            })?;
+        let b_end = b_offset.checked_add(b_len).ok_or_else(|| Error::Shape {
+            label: "FP8 TN B offset",
+            expected: "offset + length without overflow".to_string(),
+            actual: format!("offset={b_offset} length={b_len}"),
+        })?;
+        let d_end = output_offset
+            .checked_add(d_len)
+            .ok_or_else(|| Error::Shape {
+                label: "FP8 TN output offset",
+                expected: "offset + length without overflow".to_string(),
+                actual: format!("offset={output_offset} length={d_len}"),
+            })?;
+        if a_kxm.len() != a_len || b_end > b_kxn.len() || d_end > output.len() {
+            return Err(Error::Shape {
+                label: "FP8 TN buffers",
+                expected: format!("A={a_len} B<={} output<={}", b_kxn.len(), output.len()),
+                actual: format!("A={} B end={b_end} output end={d_end}", a_kxm.len()),
+            });
+        }
+        if !alpha.is_finite() {
+            return Err(Error::Format {
+                label: "FP8 TN alpha",
+                detail: format!("expected finite alpha, got {alpha}"),
+            });
+        }
+
+        let beta = 0.0f32;
+        let workspace_ptr = self
+            .workspace
+            .as_ref()
+            .map(|buffer| buffer.ptr.cast())
+            .unwrap_or(null_mut());
+        let b_ptr = unsafe { b_kxn.ptr.add(b_offset) };
+        let output_ptr = output.buffer_mut().ptr;
+        let d_ptr = unsafe { output_ptr.add(output_offset) };
+        unsafe {
+            check_cublas(
+                "cublasLtMatmul(FP8 E4M3 -> F32)",
+                ffi::cublasLtMatmul(
+                    lt.handle,
+                    self.desc.0,
+                    (&alpha as *const f32).cast(),
+                    a_kxm.ptr.cast(),
+                    self.a_layout.0,
+                    b_ptr.cast(),
+                    self.b_layout.0,
+                    (&beta as *const f32).cast(),
+                    d_ptr.cast(),
+                    self.d_layout.0,
+                    d_ptr.cast(),
+                    self.d_layout.0,
+                    &self.algo,
+                    workspace_ptr,
+                    self.workspace_size,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
 }
 
 #[cfg(test)]
