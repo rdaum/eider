@@ -42,8 +42,8 @@ use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
 };
 use infer::runtime::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, RequestLifecycleEvent,
-    SchedulerConfig,
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen38SpeculativeProgress,
+    RequestLifecycleEvent, SchedulerConfig,
 };
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage, Qwen36ChatService};
 use infer::runtime::step37_scheduler::{
@@ -156,6 +156,8 @@ struct SessionMetrics {
     last_report_at: Option<Instant>,
     last_report_tokens: usize,
     generated_tokens: usize,
+    qwen38_speculative_cycles: usize,
+    qwen38_accepted_drafts: usize,
     dflash: Option<DFlashSessionMetrics>,
 }
 
@@ -769,6 +771,16 @@ fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmission
     }
 }
 
+fn qwen38_speculative_progress(
+    progress: Qwen38SpeculativeProgress,
+) -> EngineQwen38SpeculativeProgress {
+    EngineQwen38SpeculativeProgress {
+        request_id: progress.request_id.get(),
+        cycles: progress.cycles,
+        accepted_drafts: progress.accepted_drafts,
+    }
+}
+
 fn bitnet_admission_progress(progress: BitNetAdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
@@ -902,10 +914,17 @@ struct EngineDFlashProgress {
     stats: MuseGlimmerDFlashStats,
 }
 
+struct EngineQwen38SpeculativeProgress {
+    request_id: u64,
+    cycles: usize,
+    accepted_drafts: usize,
+}
+
 #[derive(Default)]
 struct EngineTick {
     prefilled: Vec<EnginePrefillProgress>,
     generated: Vec<u64>,
+    qwen38_speculative: Vec<EngineQwen38SpeculativeProgress>,
     dflash: Vec<EngineDFlashProgress>,
     output: Vec<EngineDelta>,
     finished: Vec<EngineFinished>,
@@ -993,6 +1012,11 @@ impl ActorService for QwenActorService<'_, '_> {
                 .generated
                 .into_iter()
                 .map(Qwen36RequestId::get)
+                .collect(),
+            qwen38_speculative: tick
+                .speculative
+                .into_iter()
+                .map(qwen38_speculative_progress)
                 .collect(),
             dflash: Vec::new(),
             output: tick
@@ -1100,6 +1124,7 @@ impl ActorService for StepActorService<'_> {
                 .into_iter()
                 .map(Step37RequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1208,6 +1233,7 @@ impl ActorService for NemotronActorService<'_, '_> {
                 .into_iter()
                 .map(Nemotron3RequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1315,6 +1341,7 @@ impl ActorService for GemmaActorService<'_, '_> {
                 .into_iter()
                 .map(Gemma4RequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1420,6 +1447,7 @@ impl ActorService for BitNetActorService<'_, '_> {
                 .into_iter()
                 .map(BitNetRequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1525,6 +1553,7 @@ impl ActorService for Ling3ActorService<'_, '_> {
                 .into_iter()
                 .map(Ling3RequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1632,6 +1661,7 @@ impl ActorService for MuseGlimmerActorService<'_, '_> {
                 .into_iter()
                 .map(MuseGlimmerRequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: tick.dflash.into_iter().map(muse_dflash_progress).collect(),
             output: tick
                 .output
@@ -1737,6 +1767,7 @@ impl ActorService for BonsaiActorService<'_, '_> {
                 .into_iter()
                 .map(BonsaiRequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1844,6 +1875,7 @@ impl ActorService for LagunaActorService<'_, '_> {
                 .into_iter()
                 .map(LagunaRequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1953,6 +1985,7 @@ impl ActorService for DeepseekActorService<'_> {
                 .into_iter()
                 .map(Deepseek4RequestId::get)
                 .collect(),
+            qwen38_speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -2136,6 +2169,11 @@ fn run_actor_loop(
                 }
             }
         }
+        for progress in &tick.qwen38_speculative {
+            if let Some(request) = active.get_mut(&progress.request_id) {
+                request.metrics.record_qwen38_speculative(progress);
+            }
+        }
         for request_id in &tick.generated {
             if let Some(request) = active.get_mut(request_id) {
                 let starting = request.metrics.first_token_at.is_none();
@@ -2177,6 +2215,12 @@ fn run_actor_loop(
                         output_tokens = snapshot.output_tokens,
                         interval_tok_s = snapshot.interval_tokens_per_second,
                         decode_tok_s = snapshot.decode_tokens_per_second,
+                        speculative_cycles = request.metrics.qwen38_speculative_cycles,
+                        accepted_drafts = request.metrics.qwen38_accepted_drafts,
+                        accepted_drafts_per_cycle = ratio(
+                            request.metrics.qwen38_accepted_drafts,
+                            request.metrics.qwen38_speculative_cycles
+                        ),
                         "decode progress"
                     );
                 }
@@ -2396,6 +2440,8 @@ impl SessionMetrics {
             last_report_at: None,
             last_report_tokens: 0,
             generated_tokens: 0,
+            qwen38_speculative_cycles: 0,
+            qwen38_accepted_drafts: 0,
             dflash: None,
         }
     }
@@ -2474,6 +2520,11 @@ impl SessionMetrics {
         Some(snapshot)
     }
 
+    fn record_qwen38_speculative(&mut self, progress: &EngineQwen38SpeculativeProgress) {
+        self.qwen38_speculative_cycles += progress.cycles;
+        self.qwen38_accepted_drafts += progress.accepted_drafts;
+    }
+
     fn record_dflash(
         &mut self,
         now: Instant,
@@ -2530,6 +2581,12 @@ impl SessionMetrics {
             prefill_compute_tok_s = self.prefill_compute_tokens_per_second(now),
             effective_prefill_tok_s = self.effective_prefill_tokens_per_second(now),
             decode_tok_s = self.decode_tokens_per_second(),
+            speculative_cycles = self.qwen38_speculative_cycles,
+            accepted_drafts = self.qwen38_accepted_drafts,
+            accepted_drafts_per_cycle = ratio(
+                self.qwen38_accepted_drafts,
+                self.qwen38_speculative_cycles
+            ),
             total_tok_s = rate(
                 finished.usage.completion_tokens,
                 now.duration_since(self.submitted_at)
@@ -2762,6 +2819,31 @@ mod tests {
         assert_eq!(snapshot.output_tokens, 11);
         assert_eq!(snapshot.interval_tokens_per_second, 1.0);
         assert_eq!(snapshot.decode_tokens_per_second, 1.0);
+    }
+
+    #[test]
+    fn session_metrics_accumulate_qwen38_speculative_acceptance() {
+        let mut metrics = SessionMetrics::new(Instant::now(), 8);
+        metrics.record_qwen38_speculative(&EngineQwen38SpeculativeProgress {
+            request_id: 7,
+            cycles: 1,
+            accepted_drafts: 2,
+        });
+        metrics.record_qwen38_speculative(&EngineQwen38SpeculativeProgress {
+            request_id: 7,
+            cycles: 1,
+            accepted_drafts: 1,
+        });
+
+        assert_eq!(metrics.qwen38_speculative_cycles, 2);
+        assert_eq!(metrics.qwen38_accepted_drafts, 3);
+        assert_eq!(
+            ratio(
+                metrics.qwen38_accepted_drafts,
+                metrics.qwen38_speculative_cycles
+            ),
+            1.5
+        );
     }
 
     #[test]

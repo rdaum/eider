@@ -5,8 +5,8 @@ use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemp
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
-    Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState,
-    SchedulerConfig,
+    Qwen36Scheduler, Qwen38SpeculativeProgress, RequestConfig, RequestFinishReason,
+    RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
 use super::stop::StopBuffer;
 use crate::qwen3::qwen36::Qwen36TextModel;
@@ -118,6 +118,8 @@ pub struct Qwen36ChatTick {
     pub prefilled: Vec<Qwen36PrefillProgress>,
     /// One entry for each completion token selected during the tick.
     pub generated: Vec<Qwen36RequestId>,
+    /// Qwen3.8 MTP acceptance observed during the tick.
+    pub speculative: Vec<Qwen38SpeculativeProgress>,
     /// Structured output safe to stream to API clients.
     pub output: Vec<Qwen36ChatDelta>,
     /// Requests reaching a serving-level terminal state.
@@ -230,6 +232,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
             admitted: scheduled.admitted,
             scheduled: scheduled.scheduled,
             prefilled: scheduled.prefilled,
+            speculative: scheduled.speculative,
             ..Qwen36ChatTick::default()
         };
         let mut terminal = BTreeMap::new();

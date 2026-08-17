@@ -206,10 +206,23 @@ pub struct Qwen36SchedulerTick {
     pub prefilled: Vec<Qwen36PrefillProgress>,
     /// Completion tokens produced after prompt consumption.
     pub generated: Vec<Qwen36ScheduledToken>,
+    /// Qwen3.8 MTP speculation completed during the tick.
+    pub speculative: Vec<Qwen38SpeculativeProgress>,
     /// Requests that finished during this tick.
     pub finished: Vec<Qwen36RequestId>,
     /// Device-resident sequences remaining after the tick.
     pub active_sequences: usize,
+}
+
+/// Request-scoped Qwen3.8 MTP acceptance observed during one scheduler tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen38SpeculativeProgress {
+    /// Request whose target model verified the drafts.
+    pub request_id: Qwen36RequestId,
+    /// Number of completed target-verification cycles.
+    pub cycles: usize,
+    /// Draft tokens accepted by the target model.
+    pub accepted_drafts: usize,
 }
 
 /// Result removed from the scheduler after a request finishes.
@@ -787,8 +800,16 @@ impl<'model> Qwen36Scheduler<'model> {
         tick.scheduled
             .extend(selected.iter().map(|request| request.id));
         let samples_per_request = if selected.len() == 1 && self.spec_eligible(&selected[0]) {
+            let request_id = selected[0].id;
             match self.execute_speculative(&mut selected[0]) {
-                Ok(samples) => vec![samples],
+                Ok((samples, accepted_drafts)) => {
+                    tick.speculative.push(Qwen38SpeculativeProgress {
+                        request_id,
+                        cycles: 1,
+                        accepted_drafts,
+                    });
+                    vec![samples]
+                }
                 Err(error) => {
                     self.requeue_selected(selected);
                     return Err(error);
@@ -850,7 +871,10 @@ impl<'model> Qwen36Scheduler<'model> {
             && request.active_speculative_drafts(self.config.speculative_drafts) > 0
     }
 
-    fn execute_speculative(&mut self, request: &mut Qwen36Request) -> Result<Vec<SampledToken>> {
+    fn execute_speculative(
+        &mut self,
+        request: &mut Qwen36Request,
+    ) -> Result<(Vec<SampledToken>, usize)> {
         let drafts = request.active_speculative_drafts(self.config.speculative_drafts);
         if self.spec_workspace.is_none() {
             self.spec_workspace = Some(self.model.new_speculative_cycle_workspace(
@@ -899,7 +923,7 @@ impl<'model> Qwen36Scheduler<'model> {
         infer
             .qwen38_speculative_accepted_drafts
             .add(outcome.accepted_drafts as isize);
-        Ok(outcome
+        let samples = outcome
             .committed
             .iter()
             .skip(skip)
@@ -909,7 +933,8 @@ impl<'model> Qwen36Scheduler<'model> {
                 logit,
                 adjusted_logit: logit,
             })
-            .collect())
+            .collect();
+        Ok((samples, outcome.accepted_drafts))
     }
 
     fn execute_decode(&mut self, selected: &mut [Box<Qwen36Request>]) -> Result<Vec<SampledToken>> {

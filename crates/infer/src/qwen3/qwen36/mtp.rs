@@ -28,8 +28,8 @@ use super::{
 };
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    argmax_f32_into_on_stream, concat_f32_rows_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, lm_head_top1_f32_into_on_stream,
     rms_norm_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     silu_mul_halves_f32_into_on_stream,
 };
@@ -415,6 +415,7 @@ impl Qwen36TextModel {
             label: "Qwen3.8 MTP drafter workspace",
             detail: "model has no MTP weights".to_string(),
         })?;
+        let top1_scratch_len = self.manifest.vocab.div_ceil(8) * 8;
         Ok(Qwen36MtpDraftWorkspace {
             tokens: DeviceBuffer::zeroed(1)?,
             draft_tokens: DeviceBuffer::zeroed(max_tokens)?,
@@ -440,8 +441,8 @@ impl Qwen36TextModel {
                 logits: DeviceBuffer::zeroed(self.manifest.vocab)?,
                 dynamic_input: DeviceBuffer::zeroed(self.manifest.hidden)?,
                 dynamic_input_scale: DeviceBuffer::zeroed(1)?,
-                scratch_value: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
-                scratch_index: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
+                scratch_value: DeviceBuffer::zeroed(top1_scratch_len)?,
+                scratch_index: DeviceBuffer::zeroed(top1_scratch_len)?,
                 next_index: DeviceBuffer::zeroed(1)?,
                 next_value: DeviceBuffer::zeroed(1)?,
             },
@@ -602,10 +603,13 @@ impl Qwen36TextModel {
             }
             match &self.lm_head {
                 Qwen36LmHead::Bf16(linear) => {
-                    bf16_linear_logits_f32_into_on_stream(
+                    lm_head_top1_f32_into_on_stream(
                         &workspace.final_hidden,
                         &linear.weight,
-                        workspace.lm_head.logits.output(),
+                        &workspace.lm_head.scratch_value,
+                        &workspace.lm_head.scratch_index,
+                        &workspace.lm_head.next_index,
+                        &workspace.lm_head.next_value,
                         linear.rows,
                         linear.cols,
                         stream,
@@ -617,6 +621,12 @@ impl Qwen36TextModel {
                         &mut workspace.lm_head.logits,
                         stream,
                     )?;
+                    argmax_f32_into_on_stream(
+                        &workspace.lm_head.logits,
+                        workspace.lm_head.next_index.output(),
+                        workspace.lm_head.next_value.output(),
+                        stream,
+                    )?;
                 }
                 Qwen36LmHead::Fp8 { .. } => {
                     return Err(Error::Format {
@@ -625,12 +635,6 @@ impl Qwen36TextModel {
                     });
                 }
             }
-            argmax_f32_into_on_stream(
-                &workspace.lm_head.logits,
-                workspace.lm_head.next_index.output(),
-                workspace.lm_head.next_value.output(),
-                stream,
-            )?;
             workspace.draft_tokens.copy_range_from_device_on_stream(
                 step,
                 &workspace.lm_head.next_index,
