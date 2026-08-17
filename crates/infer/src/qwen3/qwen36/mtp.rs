@@ -17,21 +17,21 @@
 //!   the same post-norm vector chains into the next draft step.
 //!
 //! Draft quality only affects speculative acceptance rates; the target model
-//! decides which tokens commit. MTP tensors are always retained in BF16
-//! regardless of the model's attention/lm-head storage configuration, matching
-//! the checkpoint's own quantization exclude list.
+//! decides which tokens commit. The MTP attention Q/K/V/O weights remain BF16,
+//! while its private fusion, feed-forward, and LM-head projections use NVFP4
+//! because they propose tokens only; target verification still uses the
+//! configured serving precision.
 
 use super::{
-    Bf16Linear, Qwen36FullAttentionState, Qwen36FullAttentionWeights, Qwen36FullAttentionWorkspace,
-    Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36TextModel, read_bf16_matrix_host,
+    Nvfp4DeviceLinear, Qwen36FullAttentionState, Qwen36FullAttentionWeights,
+    Qwen36FullAttentionWorkspace, Qwen36LmHeadWorkspace, Qwen36TextModel, read_bf16_matrix_host,
     read_bf16_vector_delta_as_f32_device,
 };
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    argmax_f32_into_on_stream, concat_f32_rows_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, lm_head_top1_f32_into_on_stream,
-    rms_norm_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    silu_mul_halves_f32_into_on_stream,
+    concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    nvfp4_w4a16_top1_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, silu_mul_halves_f32_into_on_stream,
 };
 use crate::qwen3::infer::QwenModelManifest;
 
@@ -39,18 +39,46 @@ use crate::qwen3::infer::QwenModelManifest;
 pub struct Qwen36MtpWeights {
     pre_fc_norm_embedding: DeviceBuffer<f32>,
     pre_fc_norm_hidden: DeviceBuffer<f32>,
-    fc: Bf16Linear,
+    fc: Nvfp4DeviceLinear,
     input_norm: DeviceBuffer<f32>,
     attention: Qwen36FullAttentionWeights,
     post_attn_norm: DeviceBuffer<f32>,
-    gate_up: Bf16Linear,
-    down: Bf16Linear,
+    gate_up: Nvfp4DeviceLinear,
+    down: Nvfp4DeviceLinear,
     final_norm: DeviceBuffer<f32>,
+    draft_lm_head: Nvfp4DeviceLinear,
 }
 
 /// Persistent MTP drafter state owned by one generated sequence.
 pub struct Qwen36MtpSequenceState {
     attention: Qwen36FullAttentionState,
+}
+
+fn load_draft_lm_head(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+) -> Result<Nvfp4DeviceLinear> {
+    if checkpoint.contains_tensor("lm_head.weight_scale_2") {
+        return Nvfp4DeviceLinear::load(checkpoint, "lm_head");
+    }
+    load_nvfp4_bf16_linear(
+        checkpoint,
+        "lm_head.weight",
+        "mtp.draft_lm_head",
+        manifest.vocab,
+        manifest.hidden,
+    )
+}
+
+fn load_nvfp4_bf16_linear(
+    checkpoint: &ModelOptCheckpoint,
+    tensor: &str,
+    prefix: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<Nvfp4DeviceLinear> {
+    let host = read_bf16_matrix_host(checkpoint, tensor, rows, cols)?;
+    Nvfp4DeviceLinear::from_bf16_host(prefix, &host, rows, cols)
 }
 
 impl Qwen36MtpSequenceState {
@@ -171,19 +199,34 @@ impl Qwen36MtpWeights {
         };
         // The dense SwiGLU halves concatenate so the fused silu-mul kernel sees
         // [gate | up], exactly like the NVFP4 dense feed-forward path.
-        let mut gate_up_rows = read_bf16_matrix_host(
+        let gate_up = {
+            let mut gate_up_rows = read_bf16_matrix_host(
+                checkpoint,
+                &format!("{layer}.mlp.gate_proj.weight"),
+                intermediate,
+                hidden,
+            )?;
+            let up_rows = read_bf16_matrix_host(
+                checkpoint,
+                &format!("{layer}.mlp.up_proj.weight"),
+                intermediate,
+                hidden,
+            )?;
+            gate_up_rows.extend_from_slice(&up_rows);
+            Nvfp4DeviceLinear::from_bf16_host(
+                &format!("{layer}.mlp.gate_up_proj"),
+                &gate_up_rows,
+                2 * intermediate,
+                hidden,
+            )?
+        };
+        let down = load_nvfp4_bf16_linear(
             checkpoint,
-            &format!("{layer}.mlp.gate_proj.weight"),
-            intermediate,
+            &format!("{layer}.mlp.down_proj.weight"),
+            &format!("{layer}.mlp.down_proj"),
             hidden,
-        )?;
-        let up_rows = read_bf16_matrix_host(
-            checkpoint,
-            &format!("{layer}.mlp.up_proj.weight"),
             intermediate,
-            hidden,
         )?;
-        gate_up_rows.extend_from_slice(&up_rows);
         Ok(Self {
             pre_fc_norm_embedding: read_bf16_vector_delta_as_f32_device(
                 checkpoint,
@@ -195,7 +238,7 @@ impl Qwen36MtpWeights {
                 "mtp.pre_fc_norm_hidden.weight",
                 hidden,
             )?,
-            fc: Bf16Linear::load(checkpoint, "mtp.fc.weight", hidden, 2 * hidden)?,
+            fc: load_nvfp4_bf16_linear(checkpoint, "mtp.fc.weight", "mtp.fc", hidden, 2 * hidden)?,
             input_norm: read_bf16_vector_delta_as_f32_device(
                 checkpoint,
                 &format!("{layer}.input_layernorm.weight"),
@@ -207,18 +250,14 @@ impl Qwen36MtpWeights {
                 &format!("{layer}.post_attention_layernorm.weight"),
                 hidden,
             )?,
-            gate_up: Bf16Linear::from_host(&gate_up_rows, 2 * intermediate, hidden)?,
-            down: Bf16Linear::load(
-                checkpoint,
-                &format!("{layer}.mlp.down_proj.weight"),
-                hidden,
-                intermediate,
-            )?,
+            gate_up,
+            down,
             final_norm: read_bf16_vector_delta_as_f32_device(
                 checkpoint,
                 "mtp.norm.weight",
                 hidden,
             )?,
+            draft_lm_head: load_draft_lm_head(checkpoint, manifest)?,
         })
     }
 
@@ -269,7 +308,7 @@ impl Qwen36MtpWeights {
             stream,
         )?;
         self.fc
-            .run_into(&workspace.fused, &mut workspace.projected, stream)
+            .run_f32_into(&workspace.fused, &mut workspace.projected, stream)
     }
 
     /// Computes this token's attention K/V and appends them to the drafter
@@ -361,15 +400,15 @@ impl Qwen36MtpWeights {
             stream,
         )?;
         self.gate_up
-            .run_into(&workspace.ffn_norm, &mut workspace.gate_up, stream)?;
+            .run_f32_into(&workspace.ffn_norm, &mut workspace.gate_up, stream)?;
         silu_mul_halves_f32_into_on_stream(
             &workspace.gate_up,
             workspace.activated.output(),
-            self.down.cols,
+            self.down.in_features,
             stream,
         )?;
         self.down
-            .run_into(&workspace.activated, &mut workspace.down, stream)?;
+            .run_f32_into(&workspace.activated, &mut workspace.down, stream)?;
         add_f32_into_on_stream(
             &workspace.attention_residual,
             &workspace.down,
@@ -415,7 +454,6 @@ impl Qwen36TextModel {
             label: "Qwen3.8 MTP drafter workspace",
             detail: "model has no MTP weights".to_string(),
         })?;
-        let top1_scratch_len = self.manifest.vocab.div_ceil(8) * 8;
         Ok(Qwen36MtpDraftWorkspace {
             tokens: DeviceBuffer::zeroed(1)?,
             draft_tokens: DeviceBuffer::zeroed(max_tokens)?,
@@ -441,8 +479,8 @@ impl Qwen36TextModel {
                 logits: DeviceBuffer::zeroed(self.manifest.vocab)?,
                 dynamic_input: DeviceBuffer::zeroed(self.manifest.hidden)?,
                 dynamic_input_scale: DeviceBuffer::zeroed(1)?,
-                scratch_value: DeviceBuffer::zeroed(top1_scratch_len)?,
-                scratch_index: DeviceBuffer::zeroed(top1_scratch_len)?,
+                scratch_value: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
+                scratch_index: DeviceBuffer::zeroed(self.manifest.vocab.div_ceil(8))?,
                 next_index: DeviceBuffer::zeroed(1)?,
                 next_value: DeviceBuffer::zeroed(1)?,
             },
@@ -601,40 +639,20 @@ impl Qwen36TextModel {
                 )?;
                 mtp.draft_step(self, workspace, state, chained, stream)?;
             }
-            match &self.lm_head {
-                Qwen36LmHead::Bf16(linear) => {
-                    lm_head_top1_f32_into_on_stream(
-                        &workspace.final_hidden,
-                        &linear.weight,
-                        &workspace.lm_head.scratch_value,
-                        &workspace.lm_head.scratch_index,
-                        &workspace.lm_head.next_index,
-                        &workspace.lm_head.next_value,
-                        linear.rows,
-                        linear.cols,
-                        stream,
-                    )?;
-                }
-                Qwen36LmHead::Nvfp4(linear) => {
-                    linear.run_f32_into(
-                        &workspace.final_hidden,
-                        &mut workspace.lm_head.logits,
-                        stream,
-                    )?;
-                    argmax_f32_into_on_stream(
-                        &workspace.lm_head.logits,
-                        workspace.lm_head.next_index.output(),
-                        workspace.lm_head.next_value.output(),
-                        stream,
-                    )?;
-                }
-                Qwen36LmHead::Fp8 { .. } => {
-                    return Err(Error::Format {
-                        label: "Qwen3.8 MTP draft lm_head",
-                        detail: "FP8 lm_head storage is unsupported for drafting".to_string(),
-                    });
-                }
-            }
+            let linear = &mtp.draft_lm_head;
+            nvfp4_w4a16_top1_f32_into_on_stream(
+                &workspace.final_hidden,
+                &linear.packed_weight,
+                &linear.weight_scale,
+                &workspace.lm_head.scratch_value,
+                &workspace.lm_head.scratch_index,
+                &workspace.lm_head.next_index,
+                &workspace.lm_head.next_value,
+                linear.out_features,
+                linear.in_features,
+                linear.weight_scale_2,
+                stream,
+            )?;
             workspace.draft_tokens.copy_range_from_device_on_stream(
                 step,
                 &workspace.lm_head.next_index,
