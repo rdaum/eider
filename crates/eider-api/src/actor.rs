@@ -310,6 +310,7 @@ fn actor_main(
         prefill_token_capacity = scheduler.prefill_token_capacity,
         max_active_sequences = scheduler.max_active_sequences,
         max_context_tokens = scheduler.max_context_tokens,
+        speculative_drafts = scheduler.speculative_drafts,
         "allocating scheduler workspaces"
     );
 
@@ -451,6 +452,7 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Qwen36 => {
+            let mut defaults = defaults;
             info!(
                 model_dir = %model_dir.display(),
                 retained_prefix_bytes = sequence_cache.max_retained_bytes,
@@ -470,6 +472,12 @@ fn actor_main(
                     return;
                 }
             };
+            if model.mtp_weights().is_some() && scheduler.speculative_drafts > 0 {
+                // Qwen3.8 MTP verification is exact only for greedy decoding.
+                // Enabling speculative drafts opts omitted request sampling
+                // into that path; explicit API sampling still takes priority.
+                defaults.sampling.temperature = 0.0;
+            }
             let service = match Qwen36ChatService::new_with_cache_config(
                 &model,
                 &template,

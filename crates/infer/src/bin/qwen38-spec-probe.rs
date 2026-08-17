@@ -177,18 +177,24 @@ fn run_speculative(
     }
     {
         let mut mtp_workspace = model.new_mtp_draft_workspace(max_tokens)?;
+        let mut warmup_scratch = DeviceBuffer::zeroed(hidden)?;
+        let zeros = DeviceBuffer::zeroed(hidden)?;
         model.mtp_warmup_kv(
             &mut mtp_state,
             &mut mtp_workspace,
+            &mut warmup_scratch,
             &prompt_ids[..prompt_ids.len() - 1],
             prefill.prompt_hidden(),
-            &stream,
+            0,
+            &zeros,
+            prefill.stream(),
         )?;
     }
-    stream.synchronize()?;
+    prefill.stream().synchronize()?;
 
     let mut frontier = Qwen36SpeculativeFrontier {
         token: *prompt_ids.last().expect("non-empty prompt"),
+        logit: 0.0,
         prev_hidden: DeviceBuffer::zeroed(hidden)?,
     };
     frontier.prev_hidden.copy_range_from_device_on_stream(
@@ -207,8 +213,19 @@ fn run_speculative(
     let mut first = true;
     let start = Instant::now();
     while emitted.len() < tokens {
+        let remaining = tokens - emitted.len();
+        if !first && remaining == 1 {
+            emitted.push(frontier.token);
+            break;
+        }
+        let active_drafts = if first {
+            drafts.min(remaining)
+        } else {
+            drafts.min(remaining - 1)
+        };
         let outcome = model.speculative_cycle_argmax(
             &mut spec_workspace,
+            active_drafts,
             &mut frontier,
             &mut sequence,
             &mut mtp_state,

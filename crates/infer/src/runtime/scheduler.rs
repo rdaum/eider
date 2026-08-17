@@ -4,9 +4,11 @@ use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::qwen36_sequence::{Qwen36Sequence, Qwen36SequenceCache};
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
+use crate::metrics::metrics;
 use crate::qwen3::qwen36::{
-    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36NextToken, Qwen36PrefillBatchWorkspace,
-    Qwen36PrefillRow, Qwen36TextModel,
+    Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
+    Qwen36NextToken, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
+    Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier, Qwen36TextModel,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
@@ -16,6 +18,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+const MAX_SPECULATIVE_DRAFTS: usize = 4;
 
 /// Stable scheduler identity for one request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -59,6 +63,8 @@ pub struct SchedulerConfig {
     pub max_active_sequences: usize,
     /// Maximum prompt plus completion tokens for any request.
     pub max_context_tokens: usize,
+    /// MTP drafts verified per speculative cycle; zero disables speculation.
+    pub speculative_drafts: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -69,6 +75,7 @@ impl Default for SchedulerConfig {
             prefill_token_capacity: 2_048,
             max_active_sequences: 8,
             max_context_tokens: 32_768,
+            speculative_drafts: 0,
         }
     }
 }
@@ -92,6 +99,13 @@ impl SchedulerConfig {
                     self.max_active_sequences,
                     self.max_context_tokens
                 ),
+            });
+        }
+        if self.speculative_drafts > MAX_SPECULATIVE_DRAFTS {
+            return Err(Error::Shape {
+                label: "scheduler speculative drafts",
+                expected: format!("at most {MAX_SPECULATIVE_DRAFTS} drafts"),
+                actual: format!("{} drafts", self.speculative_drafts),
             });
         }
         Ok(())
@@ -253,6 +267,10 @@ struct Qwen36Request {
     last_token: Option<u32>,
     generated_tokens: Vec<Qwen36ScheduledToken>,
     finish_reason: Option<RequestFinishReason>,
+    mtp_state: Option<Qwen36MtpSequenceState>,
+    spec_frontier: Option<Qwen36SpeculativeFrontier>,
+    spec_ready: bool,
+    spec_started: bool,
 }
 
 impl Qwen36Request {
@@ -272,10 +290,29 @@ impl Qwen36Request {
         if self.remaining_prompt_tokens() == 1 {
             return Ok(self.prompt_tokens[self.prompt_position]);
         }
+        if self.spec_ready {
+            return self
+                .spec_frontier
+                .as_ref()
+                .map(|frontier| frontier.token)
+                .ok_or_else(|| Error::Format {
+                    label: "Qwen3.8 speculative request",
+                    detail: format!("request {} is ready without a frontier", self.id.get()),
+                });
+        }
         self.last_token.ok_or_else(|| Error::Format {
             label: "Qwen3.6 scheduled request",
             detail: format!("request {} has no decode input token", self.id.get()),
         })
+    }
+
+    fn active_speculative_drafts(&self, configured: usize) -> usize {
+        speculative_draft_count(
+            configured,
+            self.config.max_new_tokens,
+            self.generated_tokens.len(),
+            self.spec_started,
+        )
     }
 
     fn apply_sample(&mut self, sampled: SampledToken) -> Qwen36ScheduledToken {
@@ -321,6 +358,9 @@ pub struct Qwen36Scheduler<'model> {
     decoding: VecDeque<Qwen36RequestId>,
     sequence_cache: Qwen36SequenceCache,
     cache_stream: CudaStream,
+    spec_workspace: Option<Qwen36SpeculativeCycleWorkspace>,
+    mtp_workspace: Option<Qwen36MtpDraftWorkspace>,
+    mtp_hidden_scratch: Option<DeviceBuffer<f32>>,
     next_id: u64,
 }
 
@@ -475,6 +515,9 @@ impl<'model> Qwen36Scheduler<'model> {
             decoding: VecDeque::new(),
             sequence_cache,
             cache_stream: CudaStream::new_blocking()?,
+            spec_workspace: None,
+            mtp_workspace: None,
+            mtp_hidden_scratch: None,
             next_id: 0,
         })
     }
@@ -549,6 +592,10 @@ impl<'model> Qwen36Scheduler<'model> {
                 last_token: None,
                 generated_tokens: Vec::new(),
                 finish_reason,
+                mtp_state: None,
+                spec_frontier: None,
+                spec_ready: false,
+                spec_started: false,
             }),
         );
         if lifecycle == RequestState::Waiting {
@@ -661,6 +708,36 @@ impl<'model> Qwen36Scheduler<'model> {
                     .map_or(0, DeviceBuffer::device_bytes);
             request.sequence = Some(Box::new(sequence));
             request.device_token_counts = device_token_counts;
+            if self.model.mtp_weights().is_some()
+                && self.config.speculative_drafts > 0
+                && request.sampler.config().uses_fast_argmax()
+                && cached_prompt_tokens == 0
+            {
+                let speculative_state = self
+                    .model
+                    .new_mtp_sequence_state(request.max_tokens())
+                    .and_then(|state| {
+                        Ok((
+                            state,
+                            Qwen36SpeculativeFrontier {
+                                token: 0,
+                                logit: 0.0,
+                                prev_hidden: DeviceBuffer::zeroed(self.model.manifest().hidden)?,
+                            },
+                        ))
+                    });
+                match speculative_state {
+                    Ok((state, frontier)) => {
+                        request.mtp_state = Some(state);
+                        request.spec_frontier = Some(frontier);
+                    }
+                    Err(error) => warn!(
+                        request = request.id.get(),
+                        %error,
+                        "continuing without Qwen3.8 speculation after state allocation failed"
+                    ),
+                }
+            }
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
             let progress = Qwen36AdmissionProgress {
@@ -709,24 +786,31 @@ impl<'model> Qwen36Scheduler<'model> {
         }
         tick.scheduled
             .extend(selected.iter().map(|request| request.id));
-        let samples = match self.execute_decode(&mut selected) {
-            Ok(samples) => samples,
-            Err(error) => {
-                for request in selected.into_iter().rev() {
-                    let queue = if request.lifecycle == RequestState::Decoding {
-                        &mut self.decoding
-                    } else {
-                        &mut self.prefilling
-                    };
-                    queue.push_front(request.id);
-                    self.requests.insert(request.id, request);
+        let samples_per_request = if selected.len() == 1 && self.spec_eligible(&selected[0]) {
+            match self.execute_speculative(&mut selected[0]) {
+                Ok(samples) => vec![samples],
+                Err(error) => {
+                    self.requeue_selected(selected);
+                    return Err(error);
                 }
-                return Err(error);
+            }
+        } else {
+            match self.execute_decode(&mut selected) {
+                Ok(samples) => samples.into_iter().map(|sample| vec![sample]).collect(),
+                Err(error) => {
+                    self.requeue_selected(selected);
+                    return Err(error);
+                }
             }
         };
-        for (mut request, sample) in selected.into_iter().zip(samples) {
-            let token = request.apply_sample(sample);
-            tick.generated.push(token);
+        for (mut request, samples) in selected.into_iter().zip(samples_per_request) {
+            for sample in samples {
+                let token = request.apply_sample(sample);
+                tick.generated.push(token);
+                if request.lifecycle == RequestState::Finished {
+                    break;
+                }
+            }
             if request.lifecycle == RequestState::Finished {
                 let sequence = request
                     .sequence
@@ -743,6 +827,94 @@ impl<'model> Qwen36Scheduler<'model> {
         Ok(())
     }
 
+    #[allow(clippy::vec_box)]
+    fn requeue_selected(&mut self, selected: Vec<Box<Qwen36Request>>) {
+        for request in selected.into_iter().rev() {
+            let queue = if request.lifecycle == RequestState::Decoding {
+                &mut self.decoding
+            } else {
+                &mut self.prefilling
+            };
+            queue.push_front(request.id);
+            self.requests.insert(request.id, request);
+        }
+    }
+
+    fn spec_eligible(&self, request: &Qwen36Request) -> bool {
+        self.model.mtp_weights().is_some()
+            && self.config.speculative_drafts > 0
+            && request.spec_ready
+            && request.spec_frontier.is_some()
+            && request.mtp_state.is_some()
+            && request.sampler.config().uses_fast_argmax()
+            && request.active_speculative_drafts(self.config.speculative_drafts) > 0
+    }
+
+    fn execute_speculative(&mut self, request: &mut Qwen36Request) -> Result<Vec<SampledToken>> {
+        let drafts = request.active_speculative_drafts(self.config.speculative_drafts);
+        if self.spec_workspace.is_none() {
+            self.spec_workspace = Some(self.model.new_speculative_cycle_workspace(
+                self.config.speculative_drafts,
+                self.config.max_context_tokens,
+            )?);
+        }
+        let workspace = self
+            .spec_workspace
+            .as_mut()
+            .expect("speculative workspace was allocated");
+        let mut frontier = request
+            .spec_frontier
+            .take()
+            .expect("speculative request has a frontier");
+        let sequence = request
+            .sequence
+            .as_deref_mut()
+            .expect("speculative request has a sequence");
+        let mtp_state = request
+            .mtp_state
+            .as_mut()
+            .expect("speculative request has MTP state");
+        let outcome = self.model.speculative_cycle_argmax(
+            workspace,
+            drafts,
+            &mut frontier,
+            sequence,
+            mtp_state,
+            &mut self.sequence_cache,
+        );
+        request.spec_frontier = Some(frontier);
+        let outcome = outcome?;
+        if !outcome.speculation_ready {
+            warn!(
+                request = request.id.get(),
+                "continuing with ordinary decode after Qwen3.8 MTP catch-up failed"
+            );
+            request.mtp_state = None;
+            request.spec_ready = true;
+        }
+        let skip = if request.spec_started { 0 } else { 1 };
+        request.spec_started = true;
+        let infer = metrics();
+        infer.qwen38_speculative_cycles.add(1);
+        infer
+            .qwen38_speculative_accepted_drafts
+            .add(outcome.accepted_drafts as isize);
+        if outcome.replayed {
+            infer.qwen38_speculative_replayed_cycles.add(1);
+        }
+        Ok(outcome
+            .committed
+            .iter()
+            .skip(skip)
+            .zip(outcome.committed_logits.iter().skip(skip))
+            .map(|(&id, &logit)| SampledToken {
+                id,
+                logit,
+                adjusted_logit: logit,
+            })
+            .collect())
+    }
+
     fn execute_decode(&mut self, selected: &mut [Box<Qwen36Request>]) -> Result<Vec<SampledToken>> {
         let needs_host_logits = selected
             .iter()
@@ -750,14 +922,35 @@ impl<'model> Qwen36Scheduler<'model> {
         let all_fast_argmax = selected
             .iter()
             .all(|request| request.sampler.config().uses_fast_argmax());
+        let tracked_frontier_rows = selected
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request.spec_frontier.is_some()
+                    && (request.mtp_state.is_some() || request.spec_ready)
+                    && request.sampler.config().uses_fast_argmax()
+            })
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        let needs_mtp_catchup = tracked_frontier_rows
+            .iter()
+            .any(|&row| selected[row].mtp_state.is_some());
+        if needs_mtp_catchup && self.mtp_workspace.is_none() {
+            self.mtp_workspace = Some(
+                self.model
+                    .new_mtp_draft_workspace(self.config.max_context_tokens)?,
+            );
+        }
         let workspace = self
             .decode_workspaces
             .iter_mut()
             .find(|workspace| workspace.capacity() >= selected.len())
             .expect("decode capacity classes cover the configured maximum");
         let mut rows = Vec::with_capacity(selected.len());
+        let mut input_tokens = Vec::with_capacity(selected.len());
         for request in selected.iter_mut() {
             let token_id = request.decode_input_token()?;
+            input_tokens.push(token_id);
             let sequence = request
                 .sequence
                 .as_deref_mut()
@@ -772,12 +965,14 @@ impl<'model> Qwen36Scheduler<'model> {
             .decode_batch(workspace, &mut rows, &mut self.sequence_cache);
         drop(rows);
         let mut decoded = decoded?;
-        if all_fast_argmax {
-            return decoded
-                .top1()
-                .map(|tokens| tokens.into_iter().map(sampled_top1).collect());
-        }
-        if !needs_host_logits {
+        let hidden = self.model.manifest().hidden;
+        let mut samples = if all_fast_argmax {
+            decoded
+                .top1()?
+                .into_iter()
+                .map(sampled_top1)
+                .collect::<Vec<_>>()
+        } else if !needs_host_logits {
             let mut sampling_rows = selected
                 .iter_mut()
                 .map(|request| {
@@ -798,37 +993,94 @@ impl<'model> Qwen36Scheduler<'model> {
                     }
                 })
                 .collect::<Vec<_>>();
-            return decoded.sample_topk_topp(&mut sampling_rows).map(|samples| {
-                samples
-                    .into_iter()
-                    .map(|sample| SampledToken {
-                        id: sample.id,
-                        logit: sample.logit,
-                        adjusted_logit: sample.adjusted_logit,
-                    })
-                    .collect()
-            });
-        }
-        let vocab = decoded.vocab();
-        let logits = decoded.copy_logits()?;
-        let samples = selected
-            .iter_mut()
-            .enumerate()
-            .map(|(row, request)| {
-                let row_logits = &logits[row * vocab..(row + 1) * vocab];
-                if request.sampler.config().uses_fast_argmax() {
-                    return argmax_logits(row_logits);
-                }
-                request.sampler.sample(row_logits, &request.history)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (request, sample) in selected.iter_mut().zip(&samples) {
-            let Some(counts) = request.device_token_counts.as_mut() else {
-                continue;
+            decoded
+                .sample_topk_topp(&mut sampling_rows)?
+                .into_iter()
+                .map(|sample| SampledToken {
+                    id: sample.id,
+                    logit: sample.logit,
+                    adjusted_logit: sample.adjusted_logit,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let vocab = decoded.vocab();
+            let logits = decoded.copy_logits()?;
+            let samples = selected
+                .iter_mut()
+                .enumerate()
+                .map(|(row, request)| {
+                    let row_logits = &logits[row * vocab..(row + 1) * vocab];
+                    if request.sampler.config().uses_fast_argmax() {
+                        return argmax_logits(row_logits);
+                    }
+                    request.sampler.sample(row_logits, &request.history)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (request, sample) in selected.iter_mut().zip(&samples) {
+                let Some(counts) = request.device_token_counts.as_mut() else {
+                    continue;
+                };
+                let mut dense = request.history.dense_counts(vocab);
+                dense[sample.id as usize] += 1;
+                counts.copy_from_host(&dense)?;
+            }
+            samples
+        };
+        let mut copied_hidden = false;
+        for &row in &tracked_frontier_rows {
+            let request = &mut selected[row];
+            let mut frontier = request
+                .spec_frontier
+                .take()
+                .expect("speculative request has a frontier");
+            let mut mtp_state = request.mtp_state.take();
+            let emit_frontier = request.spec_ready && request.spec_started;
+            let emitted_frontier = SampledToken {
+                id: frontier.token,
+                logit: frontier.logit,
+                adjusted_logit: frontier.logit,
             };
-            let mut dense = request.history.dense_counts(vocab);
-            dense[sample.id as usize] += 1;
-            counts.copy_from_host(&dense)?;
+            let canonical_sample = samples[row];
+            samples[row] =
+                ordinary_decode_emission(emit_frontier, emitted_frontier, canonical_sample);
+            if let Some(state) = mtp_state.as_mut() {
+                let catchup = self.model.mtp_append_kv(
+                    state,
+                    self.mtp_workspace
+                        .as_mut()
+                        .expect("speculative scheduler has an MTP workspace"),
+                    input_tokens[row],
+                    &frontier.prev_hidden,
+                    decoded.stream(),
+                );
+                let catchup = catchup.and_then(|()| {
+                    frontier.prev_hidden.copy_range_from_device_on_stream(
+                        0,
+                        decoded.hidden(),
+                        row * hidden,
+                        hidden,
+                        decoded.stream(),
+                    )
+                });
+                if let Err(error) = catchup {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "disabling Qwen3.8 speculation after MTP catch-up failed"
+                    );
+                    mtp_state = None;
+                } else {
+                    copied_hidden = true;
+                }
+            }
+            frontier.token = canonical_sample.id;
+            frontier.logit = canonical_sample.logit;
+            request.spec_frontier = Some(frontier);
+            request.mtp_state = mtp_state;
+            request.spec_ready = true;
+        }
+        if copied_hidden {
+            decoded.stream().synchronize()?;
         }
         Ok(samples)
     }
@@ -941,6 +1193,36 @@ impl<'model> Qwen36Scheduler<'model> {
         }
         tick.scheduled
             .extend(selected.iter().map(|request| request.id));
+        let hidden = self.model.manifest().hidden;
+        let mut needs_mtp_warmup = selected
+            .iter()
+            .any(|request| request.mtp_state.is_some() && request.spec_frontier.is_some());
+        if needs_mtp_warmup {
+            let allocation = (|| -> Result<()> {
+                if self.mtp_workspace.is_none() {
+                    self.mtp_workspace = Some(
+                        self.model
+                            .new_mtp_draft_workspace(self.config.max_context_tokens)?,
+                    );
+                }
+                if self.mtp_hidden_scratch.is_none() {
+                    self.mtp_hidden_scratch = Some(DeviceBuffer::zeroed(hidden)?);
+                }
+                Ok(())
+            })();
+            if let Err(error) = allocation {
+                warn!(
+                    %error,
+                    "continuing without Qwen3.8 speculation after warmup allocation failed"
+                );
+                for request in &mut selected {
+                    request.mtp_state = None;
+                    request.spec_frontier = None;
+                    request.spec_ready = false;
+                }
+                needs_mtp_warmup = false;
+            }
+        }
         let prefill_ids = selected
             .iter()
             .map(|request| request.id)
@@ -973,6 +1255,56 @@ impl<'model> Qwen36Scheduler<'model> {
                 self.requests.insert(request.id, request);
             }
             return Err(error);
+        }
+        let mut row_offset = 0usize;
+        for (request, &chunk) in selected.iter_mut().zip(&chunk_lengths) {
+            let start = request.prompt_position;
+            let end = start + chunk;
+            if let (Some(mtp_state), Some(frontier)) =
+                (&mut request.mtp_state, &mut request.spec_frontier)
+            {
+                let mtp_workspace = self
+                    .mtp_workspace
+                    .as_mut()
+                    .expect("speculative scheduler has an MTP workspace");
+                let mtp_hidden_scratch = self
+                    .mtp_hidden_scratch
+                    .as_mut()
+                    .expect("speculative scheduler has MTP hidden scratch");
+                let warmup = self.model.mtp_warmup_kv(
+                    mtp_state,
+                    mtp_workspace,
+                    mtp_hidden_scratch,
+                    &request.prompt_tokens[start..end],
+                    self.prefill_workspace.prompt_hidden(),
+                    row_offset * hidden,
+                    &frontier.prev_hidden,
+                    self.prefill_workspace.stream(),
+                );
+                let warmup = warmup.and_then(|()| {
+                    frontier.prev_hidden.copy_range_from_device_on_stream(
+                        0,
+                        self.prefill_workspace.prompt_hidden(),
+                        (row_offset + chunk - 1) * hidden,
+                        hidden,
+                        self.prefill_workspace.stream(),
+                    )
+                });
+                if let Err(error) = warmup {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "disabling Qwen3.8 speculation after MTP prompt warmup failed"
+                    );
+                    request.mtp_state = None;
+                    request.spec_frontier = None;
+                    request.spec_ready = false;
+                }
+            }
+            row_offset += chunk;
+        }
+        if needs_mtp_warmup {
+            self.prefill_workspace.stream().synchronize()?;
         }
         for (mut request, chunk) in selected.into_iter().zip(chunk_lengths) {
             request.prompt_position += chunk;
@@ -1033,6 +1365,18 @@ impl<'model> Qwen36Scheduler<'model> {
             .map(Qwen36DecodeBatchWorkspace::device_bytes)
             .sum::<usize>()
             + self.prefill_workspace.device_bytes()
+            + self
+                .spec_workspace
+                .as_ref()
+                .map_or(0, Qwen36SpeculativeCycleWorkspace::device_bytes)
+            + self
+                .mtp_workspace
+                .as_ref()
+                .map_or(0, Qwen36MtpDraftWorkspace::device_bytes)
+            + self
+                .mtp_hidden_scratch
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes)
     }
 
     /// Returns exact logical ownership and reservation state for shared KV.
@@ -1116,6 +1460,33 @@ fn decode_capacity_classes(max_capacity: usize) -> Vec<usize> {
     classes
 }
 
+fn speculative_draft_count(
+    configured: usize,
+    max_new_tokens: usize,
+    generated_tokens: usize,
+    spec_started: bool,
+) -> usize {
+    let remaining = max_new_tokens.saturating_sub(generated_tokens);
+    let draft_budget = if spec_started {
+        remaining.saturating_sub(1)
+    } else {
+        remaining
+    };
+    configured.min(draft_budget)
+}
+
+fn ordinary_decode_emission(
+    emit_frontier: bool,
+    frontier: SampledToken,
+    target_sample: SampledToken,
+) -> SampledToken {
+    if emit_frontier {
+        frontier
+    } else {
+        target_sample
+    }
+}
+
 fn sampled_top1(token: Qwen36NextToken) -> SampledToken {
     SampledToken {
         id: token.id,
@@ -1174,11 +1545,13 @@ fn prefill_chunk_tokens(
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig, RequestFinishReason, RequestState,
-        SchedulerConfig, argmax_logits, decode_capacity_classes, prefill_chunk_tokens,
+        MAX_SPECULATIVE_DRAFTS, Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig,
+        RequestFinishReason, RequestState, SchedulerConfig, argmax_logits, decode_capacity_classes,
+        ordinary_decode_emission, prefill_chunk_tokens, speculative_draft_count,
     };
     use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
-    use crate::runtime::sampling::SamplingConfig;
+    use crate::runtime::cache_config::SequenceCacheConfig;
+    use crate::runtime::sampling::{SampledToken, SamplingConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -1202,6 +1575,100 @@ mod tests {
         assert_eq!(prefill_chunk_tokens(2_048, 2_048, 0, 0, true), 2_048);
         assert_eq!(prefill_chunk_tokens(2_048, 2_048, 64, 0, true), 2_048);
         assert_eq!(prefill_chunk_tokens(2_048, 2_048, 64, 384, false), 320);
+    }
+
+    #[test]
+    fn speculative_draft_budget_reserves_an_unemitted_frontier() {
+        assert_eq!(speculative_draft_count(2, 8, 0, false), 2);
+        assert_eq!(speculative_draft_count(2, 8, 6, false), 2);
+        assert_eq!(speculative_draft_count(2, 8, 6, true), 1);
+        assert_eq!(speculative_draft_count(2, 8, 7, true), 0);
+        assert_eq!(speculative_draft_count(2, 8, 8, true), 0);
+    }
+
+    #[test]
+    fn ordinary_decode_emits_pending_frontier_after_speculation() {
+        let frontier = SampledToken {
+            id: 11,
+            logit: 1.5,
+            adjusted_logit: 1.5,
+        };
+        let target_sample = SampledToken {
+            id: 12,
+            logit: 2.5,
+            adjusted_logit: 2.5,
+        };
+        assert_eq!(
+            ordinary_decode_emission(false, frontier, target_sample),
+            target_sample
+        );
+        assert_eq!(
+            ordinary_decode_emission(true, frontier, target_sample),
+            frontier
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_unbounded_speculative_workspaces() {
+        let config = SchedulerConfig {
+            speculative_drafts: MAX_SPECULATIVE_DRAFTS + 1,
+            ..SchedulerConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.8 checkpoint"]
+    fn qwen38_scheduler_speculation_matches_greedy_decode_through_tail() {
+        let model_dir = std::env::var_os("QWEN38_MODEL")
+            .map(PathBuf::from)
+            .expect("set QWEN38_MODEL to a Qwen3.8 checkpoint");
+        let model = Qwen36TextModel::open(model_dir).expect("load Qwen3.8 model");
+        let run = |speculative_drafts| {
+            let mut scheduler = Qwen36Scheduler::new_with_cache_config(
+                &model,
+                SchedulerConfig {
+                    decode_capacity: 1,
+                    prefill_sequence_capacity: 1,
+                    prefill_token_capacity: 16,
+                    max_active_sequences: 1,
+                    max_context_tokens: 32,
+                    speculative_drafts,
+                },
+                SequenceCacheConfig {
+                    max_retained_bytes: 0,
+                },
+            )
+            .expect("scheduler");
+            let request = scheduler
+                .add_request(
+                    vec![1, 2, 3, 4],
+                    RequestConfig {
+                        sampling: SamplingConfig {
+                            temperature: 0.0,
+                            ..SamplingConfig::default()
+                        },
+                        max_new_tokens: 7,
+                        ..RequestConfig::default()
+                    },
+                )
+                .expect("request");
+            for _ in 0..32 {
+                if scheduler.request_state(request) == Some(RequestState::Finished) {
+                    break;
+                }
+                scheduler.tick().expect("scheduler tick");
+            }
+            scheduler
+                .remove_finished(request)
+                .expect("request finished")
+                .generated_tokens
+                .into_iter()
+                .map(|token| token.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(2), run(0));
     }
 
     #[test]
@@ -1243,6 +1710,7 @@ mod tests {
                 prefill_token_capacity: 384,
                 max_active_sequences: 1,
                 max_context_tokens: 386,
+                speculative_drafts: 0,
             },
         )
         .expect("scheduler");
@@ -1284,6 +1752,7 @@ mod tests {
                 prefill_token_capacity: 4,
                 max_active_sequences: 2,
                 max_context_tokens: 8,
+                speculative_drafts: 0,
             },
         )
         .expect("scheduler");
@@ -1401,6 +1870,7 @@ mod tests {
                 prefill_token_capacity: 128,
                 max_active_sequences: 2,
                 max_context_tokens: 257,
+                speculative_drafts: 0,
             },
         )
         .expect("scheduler");

@@ -1482,6 +1482,24 @@ impl Qwen36FullAttentionWorkspace {
             output: DeviceBuffer::zeroed(manifest.hidden)?,
         })
     }
+
+    /// Returns the exact device bytes owned by the full-attention workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.fp8_dynamic_input.device_bytes()
+            + self.fp8_dynamic_input_scale.device_bytes()
+            + self.q_proj_output.device_bytes()
+            + self.q_normed.device_bytes()
+            + self.gate.device_bytes()
+            + self.k.device_bytes()
+            + self.k_normed.device_bytes()
+            + self.v.device_bytes()
+            + self.q_rope.device_bytes()
+            + self.k_rope.device_bytes()
+            + self.compact_attention.device_bytes()
+            + self.attn.device_bytes()
+            + self.gated_attn.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 impl Qwen36FullAttentionState {
@@ -6201,6 +6219,18 @@ struct Qwen36LmHeadWorkspace {
     scratch_index: DeviceBuffer<u32>,
     next_index: DeviceBuffer<u32>,
     next_value: DeviceBuffer<f32>,
+}
+
+impl Qwen36LmHeadWorkspace {
+    fn device_bytes(&self) -> usize {
+        self.logits.device_bytes()
+            + self.dynamic_input.device_bytes()
+            + self.dynamic_input_scale.device_bytes()
+            + self.scratch_value.device_bytes()
+            + self.scratch_index.device_bytes()
+            + self.next_index.device_bytes()
+            + self.next_value.device_bytes()
+    }
 }
 
 struct Qwen36LinearLayerGraphs {

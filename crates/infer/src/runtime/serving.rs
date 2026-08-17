@@ -504,6 +504,7 @@ mod tests {
                 prefill_token_capacity: 8,
                 max_active_sequences: 2,
                 max_context_tokens: 128,
+                speculative_drafts: 0,
             },
         )
         .expect("chat service");

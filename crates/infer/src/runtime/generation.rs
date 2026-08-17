@@ -343,6 +343,7 @@ impl<'a> Qwen36GenerationSession<'a> {
                 .min(SchedulerConfig::default().prefill_token_capacity),
             max_active_sequences: 1,
             max_context_tokens: max_tokens,
+            speculative_drafts: 0,
         };
         let mut scheduler = Qwen36Scheduler::new_with_cache_config(
             model,

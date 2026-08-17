@@ -836,6 +836,7 @@ mod tests {
                 prefill_token_capacity: 128,
                 max_active_sequences: 1,
                 max_context_tokens: 257,
+                speculative_drafts: 0,
             },
         )
         .expect("scheduler");

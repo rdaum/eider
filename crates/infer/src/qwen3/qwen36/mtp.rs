@@ -74,6 +74,7 @@ impl Qwen36MtpSequenceState {
 /// Reusable single-token scratch for the MTP drafter block.
 pub struct Qwen36MtpDraftWorkspace {
     tokens: DeviceBuffer<u32>,
+    draft_tokens: DeviceBuffer<u32>,
     embedded: DeviceBuffer<f32>,
     normed_embedding: DeviceBuffer<f32>,
     normed_hidden: DeviceBuffer<f32>,
@@ -89,6 +90,29 @@ pub struct Qwen36MtpDraftWorkspace {
     block: DeviceBuffer<f32>,
     final_hidden: DeviceBuffer<f32>,
     lm_head: Qwen36LmHeadWorkspace,
+}
+
+impl Qwen36MtpDraftWorkspace {
+    /// Returns the exact device bytes owned by the drafter workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.tokens.device_bytes()
+            + self.draft_tokens.device_bytes()
+            + self.embedded.device_bytes()
+            + self.normed_embedding.device_bytes()
+            + self.normed_hidden.device_bytes()
+            + self.fused.device_bytes()
+            + self.projected.device_bytes()
+            + self.pre_attention.device_bytes()
+            + self.attention.device_bytes()
+            + self.attention_residual.device_bytes()
+            + self.ffn_norm.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.activated.device_bytes()
+            + self.down.device_bytes()
+            + self.block.device_bytes()
+            + self.final_hidden.device_bytes()
+            + self.lm_head.device_bytes()
+    }
 }
 
 impl Qwen36MtpWeights {
@@ -393,6 +417,7 @@ impl Qwen36TextModel {
         })?;
         Ok(Qwen36MtpDraftWorkspace {
             tokens: DeviceBuffer::zeroed(1)?,
+            draft_tokens: DeviceBuffer::zeroed(max_tokens)?,
             embedded: DeviceBuffer::zeroed(self.manifest.hidden)?,
             normed_embedding: DeviceBuffer::zeroed(self.manifest.hidden)?,
             normed_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
@@ -427,15 +452,21 @@ impl Qwen36TextModel {
     ///
     /// `tokens` are the sequence's token ids over rows `0..tokens.len()`, and
     /// `prev_hiddens` row `j` is the target's final hidden state for position
-    /// `j`; warmup pairs token j+1 with row j and token 0 with zeros, so the
-    /// buffer must hold at least `tokens.len() - 1` hidden rows. Rows append
+    /// `j` within the chunk, starting at element offset `hidden_offset`. Warmup
+    /// pairs token j+1 with row j and token 0 with `initial_hidden`, so the
+    /// buffer must hold at least `tokens.len() - 1` hidden rows after the
+    /// offset. Rows append
     /// contiguously from the state's current cache length.
+    #[allow(clippy::too_many_arguments)]
     pub fn mtp_warmup_kv(
         &self,
         state: &mut Qwen36MtpSequenceState,
         workspace: &mut Qwen36MtpDraftWorkspace,
+        prev_row: &mut DeviceBuffer<f32>,
         tokens: &[u32],
         prev_hiddens: &DeviceBuffer<f32>,
+        hidden_offset: usize,
+        initial_hidden: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
         let mtp = self.mtp.as_ref().ok_or_else(|| Error::Format {
@@ -443,31 +474,46 @@ impl Qwen36TextModel {
             detail: "model has no MTP weights".to_string(),
         })?;
         let hidden = self.manifest.hidden;
-        if prev_hiddens.len() < tokens.len().saturating_sub(1) * hidden {
+        let required = hidden_offset
+            .checked_add(tokens.len().saturating_sub(1) * hidden)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 MTP warmup hiddens",
+                expected: "offset + rows without overflow".to_string(),
+                actual: format!("offset={hidden_offset} rows={}", tokens.len()),
+            })?;
+        if prev_hiddens.len() < required {
             return Err(Error::Shape {
                 label: "Qwen3.8 MTP warmup hiddens",
                 expected: format!(
-                    "at least {} rows of {hidden}",
-                    tokens.len().saturating_sub(1)
+                    "at least {} values after offset {hidden_offset}",
+                    tokens.len().saturating_sub(1) * hidden
                 ),
                 actual: format!("{} values", prev_hiddens.len()),
             });
         }
-        let mut prev_row = DeviceBuffer::zeroed(hidden)?;
+        if prev_row.len() < hidden {
+            return Err(Error::Shape {
+                label: "Qwen3.8 MTP warmup scratch",
+                expected: format!("at least {hidden} values"),
+                actual: format!("{} values", prev_row.len()),
+            });
+        }
         for (row, &token) in tokens.iter().enumerate() {
             workspace
                 .tokens
                 .copy_from_host(std::slice::from_ref(&token))?;
-            if row > 0 {
+            if row == 0 {
+                prev_row.copy_prefix_from_device_on_stream(initial_hidden, hidden, stream)?;
+            } else {
                 prev_row.copy_range_from_device_on_stream(
                     0,
                     prev_hiddens,
-                    (row - 1) * hidden,
+                    hidden_offset + (row - 1) * hidden,
                     hidden,
                     stream,
                 )?;
             }
-            mtp.append_kv(self, workspace, state, &prev_row, stream)?;
+            mtp.append_kv(self, workspace, state, prev_row, stream)?;
         }
         Ok(())
     }
@@ -503,10 +549,12 @@ impl Qwen36TextModel {
     /// The chain advances the drafter K/V cache; rejected draft K/V rows are
     /// overwritten by the next catch-up pass, so no rollback is required
     /// between speculative cycles.
+    #[allow(clippy::too_many_arguments)]
     pub fn mtp_draft_chain_argmax(
         &self,
         state: &mut Qwen36MtpSequenceState,
         workspace: &mut Qwen36MtpDraftWorkspace,
+        chained: &mut DeviceBuffer<f32>,
         initial_token: u32,
         target_hidden: &DeviceBuffer<f32>,
         drafts: usize,
@@ -519,11 +567,23 @@ impl Qwen36TextModel {
         if drafts == 0 {
             return Ok(Vec::new());
         }
+        if chained.len() < self.manifest.hidden {
+            return Err(Error::Shape {
+                label: "Qwen3.8 MTP draft scratch",
+                expected: format!("at least {} values", self.manifest.hidden),
+                actual: format!("{} values", chained.len()),
+            });
+        }
+        if workspace.draft_tokens.len() < drafts {
+            return Err(Error::Shape {
+                label: "Qwen3.8 MTP draft token scratch",
+                expected: format!("at least {drafts} tokens"),
+                actual: format!("{} tokens", workspace.draft_tokens.len()),
+            });
+        }
         workspace
             .tokens
             .copy_from_host(std::slice::from_ref(&initial_token))?;
-        let mut drafted = Vec::with_capacity(drafts);
-        let mut chained = DeviceBuffer::zeroed(self.manifest.hidden)?;
         for step in 0..drafts {
             if step == 0 {
                 mtp.draft_step(self, workspace, state, target_hidden, stream)?;
@@ -538,7 +598,7 @@ impl Qwen36TextModel {
                     1,
                     stream,
                 )?;
-                mtp.draft_step(self, workspace, state, &chained, stream)?;
+                mtp.draft_step(self, workspace, state, chained, stream)?;
             }
             match &self.lm_head {
                 Qwen36LmHead::Bf16(linear) => {
@@ -571,13 +631,17 @@ impl Qwen36TextModel {
                 workspace.lm_head.next_value.output(),
                 stream,
             )?;
-            let token = workspace
-                .lm_head
-                .next_index
-                .copy_to_host(stream)?
-                .into_vec();
-            drafted.push(token[0]);
+            workspace.draft_tokens.copy_range_from_device_on_stream(
+                step,
+                &workspace.lm_head.next_index,
+                0,
+                1,
+                stream,
+            )?;
         }
-        Ok(drafted)
+        Ok(workspace
+            .draft_tokens
+            .copy_prefix_to_host(drafts, stream)?
+            .into_vec())
     }
 }

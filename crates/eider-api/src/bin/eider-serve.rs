@@ -169,6 +169,10 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_active_sequences: usize,
 
+    /// Greedy-only MTP drafts per Qwen3.8 speculative cycle; zero disables it.
+    #[arg(long, default_value_t = 0)]
+    speculative_drafts: usize,
+
     /// Maximum prompt plus generated tokens per request.
     #[arg(long)]
     max_context_tokens: Option<usize>,
@@ -310,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefill_token_capacity,
         max_active_sequences: args.max_active_sequences,
         max_context_tokens,
+        speculative_drafts: args.speculative_drafts,
     };
     actor_config.sequence_cache.max_retained_bytes = args
         .retained_prefix_gib

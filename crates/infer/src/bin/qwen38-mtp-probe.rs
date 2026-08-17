@@ -115,6 +115,7 @@ fn run_pass(
     let mut decode = model.new_decode_batch_workspace(1, max_tokens)?;
     let mut mtp_state = model.new_mtp_sequence_state(max_tokens)?;
     let mut mtp_workspace = model.new_mtp_draft_workspace(max_tokens)?;
+    let mut mtp_hidden_scratch = DeviceBuffer::zeroed(hidden)?;
     let mut history = TokenHistory::from_tokens(prompt_ids.iter().copied());
     let mut sampler = sampling
         .map(|config| Sampler::new(config).map(|sampler| (sampler, Vec::new())))
@@ -136,10 +137,14 @@ fn run_pass(
     model.mtp_warmup_kv(
         &mut mtp_state,
         &mut mtp_workspace,
+        &mut mtp_hidden_scratch,
         &prompt_ids[..prompt_ids.len() - 1],
         prefill.prompt_hidden(),
-        &stream,
+        0,
+        &DeviceBuffer::zeroed(model.manifest().hidden)?,
+        prefill.stream(),
     )?;
+    prefill.stream().synchronize()?;
 
     let mut committed = 0usize;
     let mut cycles = 0usize;
@@ -163,6 +168,7 @@ fn run_pass(
         let drafts = model.mtp_draft_chain_argmax(
             &mut mtp_state,
             &mut mtp_workspace,
+            &mut mtp_hidden_scratch,
             frontier_token,
             &frontier_prev_hidden,
             args.drafts,
