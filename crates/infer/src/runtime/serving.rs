@@ -118,7 +118,7 @@ pub struct Qwen36ChatTick {
     pub prefilled: Vec<Qwen36PrefillProgress>,
     /// One entry for each completion token selected during the tick.
     pub generated: Vec<Qwen36RequestId>,
-    /// Qwen3.8 MTP acceptance observed during the tick.
+    /// Qwen3.8 draft acceptance observed during the tick.
     pub speculative: Vec<Qwen38SpeculativeProgress>,
     /// Structured output safe to stream to API clients.
     pub output: Vec<Qwen36ChatDelta>,

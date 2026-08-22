@@ -20,10 +20,10 @@ use crate::nvfp4::{
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_into_on_stream, gated_delta_net_128_f32_batch_into_on_stream,
-    gated_delta_net_128_f32_chunks_into_on_stream, gated_rms_norm_f32_into_on_stream,
-    gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, dflash2_capture_f32_into_on_stream,
+    f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
+    gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
+    gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
     lm_head_top1_f32_batch_into_on_stream, moe_topk_f32_batch_into_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
@@ -1496,6 +1496,53 @@ enum BatchLayerGraph {
     },
 }
 
+struct DFlash2TargetCapture {
+    layers: Vec<usize>,
+    hidden: DeviceBuffer<f32>,
+}
+
+impl DFlash2TargetCapture {
+    fn new(layers: &[usize], rows: usize, hidden: usize) -> Result<Self> {
+        if layers.is_empty()
+            || layers.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows == 0
+            || hidden == 0
+        {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "DFlash2 target capture",
+                expected: "ordered target layers and positive row/hidden sizes".to_string(),
+                actual: format!("layers={layers:?} rows={rows} hidden={hidden}"),
+            });
+        }
+        Ok(Self {
+            layers: layers.to_vec(),
+            hidden: DeviceBuffer::zeroed(rows * layers.len() * hidden)?,
+        })
+    }
+
+    fn enqueue(
+        &mut self,
+        layer: usize,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        hidden: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Ok(tap) = self.layers.binary_search(&layer) else {
+            return Ok(());
+        };
+        dflash2_capture_f32_into_on_stream(
+            input,
+            self.hidden.output(),
+            rows,
+            hidden,
+            self.layers.len(),
+            tap,
+            stream,
+        )
+    }
+}
+
 /// Reusable execution storage for ragged Qwen3.6 prompt chunks.
 pub struct Qwen36PrefillBatchWorkspace {
     model_id: u64,
@@ -1524,6 +1571,7 @@ pub struct Qwen36PrefillBatchWorkspace {
     linear: BatchLinearAttentionWorkspace,
     full: BatchFullAttentionWorkspace,
     moe: BatchFfnWorkspace,
+    dflash2_capture: Option<DFlash2TargetCapture>,
 }
 
 impl Qwen36PrefillBatchWorkspace {
@@ -1554,6 +1602,19 @@ impl Qwen36PrefillBatchWorkspace {
         &self.hidden
     }
 
+    pub(crate) fn enable_dflash2_capture(&mut self, layers: &[usize], hidden: usize) -> Result<()> {
+        self.dflash2_capture = Some(DFlash2TargetCapture::new(
+            layers,
+            self.token_capacity,
+            hidden,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn dflash2_hidden(&self) -> Option<&DeviceBuffer<f32>> {
+        self.dflash2_capture.as_ref().map(|capture| &capture.hidden)
+    }
+
     /// Returns the exact device bytes owned by the prefill workspace.
     pub fn device_bytes(&self) -> usize {
         self.token_ids.device_bytes()
@@ -1567,6 +1628,10 @@ impl Qwen36PrefillBatchWorkspace {
             + self.linear.device_bytes()
             + self.full.device_bytes()
             + self.moe.device_bytes()
+            + self
+                .dflash2_capture
+                .as_ref()
+                .map_or(0, |capture| capture.hidden.device_bytes())
     }
 }
 
@@ -1743,6 +1808,7 @@ pub struct Qwen36DecodeBatchWorkspace {
     next_indices: DeviceBuffer<u32>,
     next_values: DeviceBuffer<f32>,
     sampler: GpuTokenSampler,
+    dflash2_capture: Option<DFlash2TargetCapture>,
 }
 
 impl Qwen36DecodeBatchWorkspace {
@@ -1758,6 +1824,15 @@ impl Qwen36DecodeBatchWorkspace {
     /// Returns the largest sequence context accepted by this workspace.
     pub fn max_context_tokens(&self) -> usize {
         self.max_context_tokens
+    }
+
+    pub(crate) fn enable_dflash2_capture(&mut self, layers: &[usize], hidden: usize) -> Result<()> {
+        self.dflash2_capture = Some(DFlash2TargetCapture::new(layers, self.capacity, hidden)?);
+        Ok(())
+    }
+
+    pub(crate) fn dflash2_hidden(&self) -> Option<&DeviceBuffer<f32>> {
+        self.dflash2_capture.as_ref().map(|capture| &capture.hidden)
     }
 
     /// Returns the number of device bytes owned by this workspace.
@@ -1782,6 +1857,10 @@ impl Qwen36DecodeBatchWorkspace {
             + self.next_indices.device_bytes()
             + self.next_values.device_bytes()
             + self.sampler.device_bytes()
+            + self
+                .dflash2_capture
+                .as_ref()
+                .map_or(0, |capture| capture.hidden.device_bytes())
     }
 }
 
@@ -1790,8 +1869,8 @@ impl Qwen36DecodeBatchWorkspace {
 /// The frontier is the next token the target will process: its position is
 /// the sequence's current length, and `prev_hidden` is the pre-final-norm
 /// target hidden produced while processing the token immediately before it.
-/// A speculative cycle verifies the frontier together with a chain of MTP
-/// drafts, then leaves this value at the target's prediction for the position
+/// A speculative cycle verifies the frontier with a chain of draft tokens.
+/// It then leaves this value at the target's prediction for the position
 /// after the committed prefix.
 pub struct Qwen36SpeculativeFrontier {
     pub token: u32,
@@ -1810,7 +1889,7 @@ pub struct Qwen36SpeculativeCycleOutcome {
     pub committed_logits: Vec<f32>,
     /// Number of accepted drafts, equal to `committed.len() - 1`.
     pub accepted_drafts: usize,
-    /// Whether the MTP state and next frontier are ready for another cycle.
+    /// Whether the drafter state and next frontier are ready for another cycle.
     /// A false value leaves the committed target result valid but requires the
     /// caller to continue with ordinary decoding.
     pub speculation_ready: bool,
@@ -1820,7 +1899,7 @@ pub struct Qwen36SpeculativeCycleOutcome {
 pub struct Qwen36SpeculativeCycleWorkspace {
     drafts: usize,
     verify: Qwen36PrefillBatchWorkspace,
-    mtp: Qwen36MtpDraftWorkspace,
+    mtp: Option<Qwen36MtpDraftWorkspace>,
     normed_hidden: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     top1_scratch_indices: DeviceBuffer<u32>,
@@ -1852,13 +1931,28 @@ impl Qwen36SpeculativeCycleWorkspace {
     /// Returns the exact device bytes owned by the speculative workspace.
     pub fn device_bytes(&self) -> usize {
         self.verify.device_bytes()
-            + self.mtp.device_bytes()
+            + self
+                .mtp
+                .as_ref()
+                .map_or(0, Qwen36MtpDraftWorkspace::device_bytes)
             + self.normed_hidden.device_bytes()
             + self.logits.device_bytes()
             + self.top1_scratch_indices.device_bytes()
             + self.argmax_indices.device_bytes()
             + self.argmax_values.device_bytes()
             + self.catchup_hidden.device_bytes()
+    }
+
+    pub(crate) fn enable_dflash2_capture(&mut self, layers: &[usize], hidden: usize) -> Result<()> {
+        self.verify.enable_dflash2_capture(layers, hidden)
+    }
+
+    pub(crate) fn stream(&self) -> &CudaStream {
+        self.verify.stream()
+    }
+
+    pub(crate) fn dflash2_hidden(&self) -> Option<&DeviceBuffer<f32>> {
+        self.verify.dflash2_hidden()
     }
 }
 
@@ -1985,6 +2079,7 @@ impl Qwen36TextModel {
                 max_context_tokens,
             )?,
             moe: BatchFfnWorkspace::new(self, first_moe, token_capacity)?,
+            dflash2_capture: None,
         })
     }
 
@@ -2300,6 +2395,15 @@ impl Qwen36TextModel {
                     }
                 }
                 std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
+                if let Some(capture) = workspace.dflash2_capture.as_mut() {
+                    capture.enqueue(
+                        layer_idx,
+                        &workspace.hidden,
+                        total_tokens,
+                        self.manifest.hidden,
+                        stream,
+                    )?;
+                }
                 continue;
             }
             rms_norm_f32_into_on_stream(
@@ -2372,6 +2476,15 @@ impl Qwen36TextModel {
                 }),
             )?;
             std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
+            if let Some(capture) = workspace.dflash2_capture.as_mut() {
+                capture.enqueue(
+                    layer_idx,
+                    &workspace.hidden,
+                    total_tokens,
+                    self.manifest.hidden,
+                    stream,
+                )?;
+            }
         }
         if !self.layers.len().is_multiple_of(2) {
             std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
@@ -2582,6 +2695,7 @@ impl Qwen36TextModel {
             next_indices: DeviceBuffer::zeroed(capacity)?,
             next_values: DeviceBuffer::zeroed(capacity)?,
             sampler: GpuTokenSampler::new(capacity, self.manifest.vocab)?,
+            dflash2_capture: None,
         };
         let enable_segmented_graphs = !std::env::var("EIDER_DISABLE_DECODE_GRAPHS")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
@@ -3095,6 +3209,15 @@ impl Qwen36TextModel {
                     }
                 }
                 std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
+                if let Some(capture) = workspace.dflash2_capture.as_mut() {
+                    capture.enqueue(
+                        layer_idx,
+                        &workspace.hidden,
+                        active_rows,
+                        self.manifest.hidden,
+                        stream,
+                    )?;
+                }
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.push(self.capture_decode_layer_trace(
                         workspace,
@@ -3173,6 +3296,15 @@ impl Qwen36TextModel {
                 }),
             )?;
             std::mem::swap(&mut workspace.hidden, workspace.moe.output_mut());
+            if let Some(capture) = workspace.dflash2_capture.as_mut() {
+                capture.enqueue(
+                    layer_idx,
+                    &workspace.hidden,
+                    active_rows,
+                    self.manifest.hidden,
+                    stream,
+                )?;
+            }
             if let Some(trace) = trace.as_deref_mut() {
                 trace.push(self.capture_decode_layer_trace(
                     workspace,
@@ -3268,6 +3400,23 @@ impl Qwen36TextModel {
         drafts: usize,
         max_context_tokens: usize,
     ) -> Result<Qwen36SpeculativeCycleWorkspace> {
+        self.new_speculative_verification_workspace(drafts, max_context_tokens, true)
+    }
+
+    pub(crate) fn new_external_speculative_cycle_workspace(
+        &self,
+        drafts: usize,
+        max_context_tokens: usize,
+    ) -> Result<Qwen36SpeculativeCycleWorkspace> {
+        self.new_speculative_verification_workspace(drafts, max_context_tokens, false)
+    }
+
+    fn new_speculative_verification_workspace(
+        &self,
+        drafts: usize,
+        max_context_tokens: usize,
+        include_mtp: bool,
+    ) -> Result<Qwen36SpeculativeCycleWorkspace> {
         if drafts == 0 {
             return Err(crate::nvfp4::Error::Shape {
                 label: "Qwen3.8 speculative cycle",
@@ -3281,7 +3430,9 @@ impl Qwen36TextModel {
         verify.serial_linear_attention_recurrence = true;
         verify.linear.enable_state_snapshots(self, drafts)?;
         verify.layer_graphs = Some(self.capture_speculative_prefill_layer_graphs(&mut verify)?);
-        let mtp = self.new_mtp_draft_workspace(max_context_tokens)?;
+        let mtp = include_mtp
+            .then(|| self.new_mtp_draft_workspace(max_context_tokens))
+            .transpose()?;
         Ok(Qwen36SpeculativeCycleWorkspace {
             drafts,
             verify,
@@ -3293,6 +3444,209 @@ impl Qwen36TextModel {
             argmax_values: DeviceBuffer::zeroed(rows)?,
             catchup_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             host_verify_tokens: Vec::with_capacity(rows),
+        })
+    }
+
+    /// Verifies a proposal supplied by an external drafter and commits its
+    /// accepted prefix. The target remains the sole source of committed tokens.
+    pub(crate) fn verify_external_speculative_argmax(
+        &self,
+        workspace: &mut Qwen36SpeculativeCycleWorkspace,
+        drafted: &[u32],
+        frontier: &mut Qwen36SpeculativeFrontier,
+        sequence: &mut Qwen36Sequence,
+        cache: &mut Qwen36SequenceCache,
+    ) -> Result<Qwen36SpeculativeCycleOutcome> {
+        if drafted.is_empty() || drafted.len() > workspace.drafts {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen3.8 external speculative proposal",
+                expected: format!("1..={} draft tokens", workspace.drafts),
+                actual: format!("{} draft tokens", drafted.len()),
+            });
+        }
+        let rows = drafted.len() + 1;
+        let row_capacity = workspace.drafts + 1;
+        let hidden = self.manifest.hidden;
+        let verify = &mut workspace.verify;
+        workspace.host_verify_tokens.clear();
+        workspace.host_verify_tokens.push(frontier.token);
+        workspace.host_verify_tokens.extend_from_slice(drafted);
+
+        let reservation = cache
+            .reserve_append(
+                sequence.cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(cache_error)?;
+        if let Err(error) = sequence.state.begin_append(verify.stream()) {
+            let _ = cache.abort_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            );
+            return Err(error);
+        }
+        let forward = {
+            let mut state_rows = [Qwen36PrefillStateRow {
+                token_ids: &workspace.host_verify_tokens,
+                state: &mut sequence.state,
+            }];
+            let appends = [Qwen36Append {
+                reservation: &reservation,
+                page_table: sequence.page_table.device(),
+            }];
+            self.prefill_batch_impl(verify, &mut state_rows, cache, &appends)
+        };
+        if let Err(error) = forward {
+            let _ = sequence.state.abort_append(verify.stream());
+            let _ = cache.abort_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            );
+            return Err(error);
+        }
+
+        let verification = (|| -> Result<Qwen36SpeculativeVerification> {
+            rms_norm_f32_into_on_stream(
+                rows,
+                hidden,
+                verify.prompt_hidden(),
+                &self.final_norm,
+                workspace.normed_hidden.output(),
+                self.manifest.rms_eps,
+                verify.stream(),
+            )?;
+            round_f32_to_bf16_in_place_on_stream(workspace.normed_hidden.inout(), verify.stream())?;
+            match &self.lm_head {
+                Qwen36LmHead::Nvfp4(linear) => {
+                    linear.run_f32_batch_into(
+                        &workspace.normed_hidden,
+                        &mut workspace.logits,
+                        rows,
+                        verify.stream(),
+                    )?;
+                    argmax_f32_batch_into_on_stream(
+                        &workspace.logits,
+                        workspace.argmax_indices.output(),
+                        workspace.argmax_values.output(),
+                        row_capacity,
+                        self.manifest.vocab,
+                        verify.stream(),
+                    )?;
+                }
+                Qwen36LmHead::Bf16(linear) => {
+                    lm_head_top1_f32_batch_into_on_stream(
+                        &workspace.normed_hidden,
+                        &linear.weight,
+                        &workspace.logits,
+                        &workspace.top1_scratch_indices,
+                        &workspace.argmax_indices,
+                        &workspace.argmax_values,
+                        rows,
+                        linear.rows,
+                        linear.cols,
+                        verify.stream(),
+                    )?;
+                }
+                Qwen36LmHead::Fp8 { .. } => {
+                    return Err(crate::nvfp4::Error::Format {
+                        label: "Qwen3.8 speculative lm_head",
+                        detail: "FP8 lm_head storage is unsupported for speculative decode"
+                            .to_string(),
+                    });
+                }
+            }
+            let argmax = workspace
+                .argmax_indices
+                .copy_prefix_to_host(rows, verify.stream())?
+                .into_vec();
+            let mut accepted = 0;
+            while accepted < drafted.len() && drafted[accepted] == argmax[accepted] {
+                accepted += 1;
+            }
+            let next_logits = workspace
+                .argmax_values
+                .copy_prefix_to_host(accepted + 1, verify.stream())?
+                .into_vec();
+            Ok(Qwen36SpeculativeVerification {
+                committed_logits: align_speculative_committed_logits(
+                    frontier.logit,
+                    &next_logits,
+                    accepted,
+                ),
+                argmax,
+                accepted,
+                next_logits,
+            })
+        })();
+        let verification = match verification {
+            Ok(verification) => verification,
+            Err(error) => {
+                let _ = sequence.state.abort_append(verify.stream());
+                let _ = cache.abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: verify.stream(),
+                        page_table: &mut sequence.page_table,
+                    },
+                );
+                return Err(error);
+            }
+        };
+        let committed_rows = verification.accepted + 1;
+        if verification.accepted < drafted.len()
+            && let Err(error) = verify
+                .linear
+                .restore_state_snapshot(verification.accepted, verify.stream())
+        {
+            let _ = sequence.state.abort_append(verify.stream());
+            let _ = cache.abort_append(
+                reservation,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            );
+            return Err(error);
+        }
+        if let Err(error) = cache
+            .commit_append(
+                reservation,
+                committed_rows,
+                &mut Sm12xCacheContext {
+                    stream: verify.stream(),
+                    page_table: &mut sequence.page_table,
+                },
+            )
+            .map_err(cache_error)
+        {
+            let _ = sequence.state.abort_append(verify.stream());
+            return Err(error);
+        }
+        sequence.state.commit_append(committed_rows);
+        frontier.token = verification.argmax[verification.accepted];
+        frontier.logit = verification.next_logits[verification.accepted];
+        frontier.prev_hidden.copy_range_from_device_on_stream(
+            0,
+            verify.prompt_hidden(),
+            verification.accepted * hidden,
+            hidden,
+            verify.stream(),
+        )?;
+        Ok(Qwen36SpeculativeCycleOutcome {
+            committed: workspace.host_verify_tokens[..committed_rows].to_vec(),
+            committed_logits: verification.committed_logits,
+            accepted_drafts: verification.accepted,
+            speculation_ready: true,
         })
     }
 
@@ -3326,6 +3680,10 @@ impl Qwen36TextModel {
             catchup_hidden,
             host_verify_tokens,
         } = workspace;
+        let mtp = mtp.as_mut().ok_or_else(|| crate::nvfp4::Error::Format {
+            label: "Qwen3.8 MTP speculative workspace",
+            detail: "MTP scratch was not allocated for this external-drafter workspace".to_string(),
+        })?;
         if active_drafts == 0 || active_drafts > *drafts {
             return Err(crate::nvfp4::Error::Shape {
                 label: "Qwen3.8 speculative active drafts",

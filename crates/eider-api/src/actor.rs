@@ -69,6 +69,7 @@ pub struct InferenceActorConfig {
     pub model_dir: PathBuf,
     pub artifact_dir: PathBuf,
     pub dflash_gguf: Option<PathBuf>,
+    pub dflash2_dir: Option<PathBuf>,
     pub scheduler: SchedulerConfig,
     pub sequence_cache: SequenceCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
@@ -86,6 +87,7 @@ impl InferenceActorConfig {
         Self {
             artifact_dir: model_dir.join(".eider-cache"),
             dflash_gguf: None,
+            dflash2_dir: None,
             model_dir,
             scheduler: SchedulerConfig::default(),
             sequence_cache: SequenceCacheConfig::default(),
@@ -271,6 +273,7 @@ fn actor_main(
         model_dir,
         artifact_dir,
         dflash_gguf,
+        dflash2_dir,
         scheduler,
         sequence_cache,
         qwen_bf16_storage,
@@ -462,7 +465,7 @@ fn actor_main(
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
                 "loading Qwen hybrid model"
             );
-            let model = match Qwen36TextModel::open_with_storage_and_artifact_dir(
+            let mut model = match Qwen36TextModel::open_with_storage_and_artifact_dir(
                 &model_dir,
                 &artifact_dir,
                 qwen_bf16_storage,
@@ -474,8 +477,17 @@ fn actor_main(
                     return;
                 }
             };
-            if model.mtp_weights().is_some() && scheduler.speculative_drafts > 0 {
-                // Qwen3.8 MTP verification is exact only for greedy decoding.
+            if scheduler.speculative_drafts > 0
+                && let Some(dflash2_dir) = dflash2_dir
+                && let Err(error) = model.enable_dflash2(&dflash2_dir)
+            {
+                let _ = ready.send(Err(error.to_string()));
+                return;
+            }
+            if (model.dflash2_enabled() || model.mtp_weights().is_some())
+                && scheduler.speculative_drafts > 0
+            {
+                // Qwen3.8 speculative verification is exact only for greedy decoding.
                 // Enabling speculative drafts opts omitted request sampling
                 // into that path; explicit API sampling still takes priority.
                 defaults.sampling.temperature = 0.0;

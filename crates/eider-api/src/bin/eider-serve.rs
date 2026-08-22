@@ -141,6 +141,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     dflash_gguf: Option<PathBuf>,
 
+    /// Official DFlash2 companion directory for a local Qwen3.8 checkpoint.
+    #[arg(long, value_name = "DIR", requires = "model_dir")]
+    dflash2_dir: Option<PathBuf>,
+
     /// Prohibit network access while resolving a catalogue model.
     #[arg(long)]
     offline: bool,
@@ -169,7 +173,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_active_sequences: usize,
 
-    /// Greedy-only MTP drafts per Qwen3.8 speculative cycle; zero disables it.
+    /// Greedy-only drafts per Qwen3.8 speculative cycle. Zero disables speculation.
     #[arg(long, default_value_t = 0)]
     speculative_drafts: usize,
 
@@ -287,6 +291,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dflash_gguf) = args.dflash_gguf {
         resolved.dflash_gguf = Some(dflash_gguf);
     }
+    if let Some(dflash2_dir) = args.dflash2_dir {
+        resolved.dflash2_dir = Some(dflash2_dir);
+    }
     if resolved.preparation == ArtifactKind::Step37Experts {
         server_metrics().model_preparations.inc();
         info!(artifact_dir = %resolved.artifact_dir.display(), "preparing Step-3.7 expert artifacts");
@@ -308,6 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
     actor_config.artifact_dir = resolved.artifact_dir.clone();
     actor_config.dflash_gguf = resolved.dflash_gguf.clone();
+    actor_config.dflash2_dir = resolved.dflash2_dir.clone();
     actor_config.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,

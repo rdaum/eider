@@ -5477,6 +5477,248 @@ extern "C" cudaError_t infer_cached_gqa_attention_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_dflash2_capture_f32_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t hidden,
+    std::uint32_t taps,
+    std::uint32_t tap) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t values = rows * hidden;
+    if (index >= values) return;
+    const std::uint32_t row = index / hidden;
+    const std::uint32_t col = index - row * hidden;
+    output[(static_cast<std::size_t>(row) * taps + tap) * hidden + col] = input[index];
+}
+
+extern "C" cudaError_t infer_dflash2_capture_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t hidden,
+    std::uint32_t taps,
+    std::uint32_t tap,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || rows == 0 || hidden == 0 ||
+        taps == 0 || tap >= taps) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t values = rows * hidden;
+    const std::uint32_t blocks = (values + kThreads - 1) / kThreads;
+    infer_dflash2_capture_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, rows, hidden, taps, tap);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dflash2_grouped_conv_f32_kernel(
+    const float* input,
+    const float* coefficients,
+    const float* base,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t hidden,
+    std::uint32_t groups,
+    std::uint32_t taps,
+    std::uint32_t block_size,
+    std::uint32_t side) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t values = rows * hidden;
+    if (index >= values) return;
+    const std::uint32_t row = index / hidden;
+    const std::uint32_t channel = index - row * hidden;
+    const std::uint32_t group_size = hidden / groups;
+    const std::uint32_t group = channel / group_size;
+    const std::uint32_t available = min(taps, row % block_size + 1);
+    float value = 0.0f;
+    for (std::uint32_t tap = 0; tap < available; ++tap) {
+        const std::size_t base_index =
+            (static_cast<std::size_t>(side) * taps + tap) * hidden + channel;
+        const std::size_t coefficient_index =
+            static_cast<std::size_t>(row) * 2 * taps * groups +
+            (side * taps + tap) * groups + group;
+        value = __fmaf_rn(
+            base[base_index] + coefficients[coefficient_index],
+            input[static_cast<std::size_t>(row - tap) * hidden + channel],
+            value);
+    }
+    output[index] = value;
+}
+
+extern "C" cudaError_t infer_dflash2_grouped_conv_f32_on_stream(
+    const float* input,
+    const float* coefficients,
+    const float* base,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t hidden,
+    std::uint32_t groups,
+    std::uint32_t taps,
+    std::uint32_t block_size,
+    std::uint32_t side,
+    cudaStream_t stream) {
+    if (input == nullptr || coefficients == nullptr || base == nullptr || output == nullptr ||
+        rows == 0 || hidden == 0 || groups == 0 || (hidden % groups) != 0 || taps == 0 ||
+        block_size == 0 || side >= 2) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const std::uint32_t values = rows * hidden;
+    const std::uint32_t blocks = (values + kThreads - 1) / kThreads;
+    infer_dflash2_grouped_conv_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, coefficients, base, output, rows, hidden, groups, taps, block_size, side);
+    return cudaGetLastError();
+}
+
+__global__ void infer_dflash2_noncausal_attention_f32_kernel(
+    const float* __restrict__ query,
+    const float* __restrict__ context_key,
+    const float* __restrict__ context_value,
+    const float* __restrict__ block_key,
+    const float* __restrict__ block_value,
+    float* __restrict__ output,
+    std::uint32_t context_end,
+    std::uint32_t context_len,
+    std::uint32_t rows,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    std::uint32_t window) {
+    extern __shared__ float shmem[];
+    float* q_sh = shmem;
+    float* scores = shmem + head_dim;
+    float* reduction = scores + blockDim.x;
+    const std::uint32_t query_row = blockIdx.y;
+    const std::uint32_t q_head = blockIdx.x;
+    if (query_row >= rows || q_head >= q_heads) return;
+
+    const std::uint32_t groups_per_kv = q_heads / kv_heads;
+    const std::uint32_t kv_head = q_head / groups_per_kv;
+    const std::uint32_t kv_width = kv_heads * head_dim;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const float* q = query +
+        (static_cast<std::size_t>(query_row) * q_heads + q_head) * head_dim;
+    for (std::uint32_t dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+        q_sh[dim] = q[dim];
+    }
+    __syncthreads();
+
+    const std::uint32_t sequence_end = context_end + rows;
+    const std::uint32_t first_key = sequence_end > window ? sequence_end - window : 0;
+    const std::uint32_t retained_start = context_end - context_len;
+    const std::uint32_t context_start = max(retained_start, first_key);
+    const std::uint32_t context_rows = context_end - context_start;
+    const std::uint32_t key_count = context_rows + rows;
+    const std::uint32_t tid = threadIdx.x;
+    float running_max = -INFINITY;
+    float running_total = 0.0f;
+    float accumulator = 0.0f;
+
+    for (std::uint32_t tile_start = 0; tile_start < key_count; tile_start += blockDim.x) {
+        const std::uint32_t key_index = tile_start + tid;
+        float score = -INFINITY;
+        if (key_index < key_count) {
+            const bool from_context = key_index < context_rows;
+            const std::uint32_t logical_position = context_start + key_index;
+            const std::uint32_t row = from_context
+                ? logical_position % window
+                : key_index - context_rows;
+            const float* key_base = from_context ? context_key : block_key;
+            const float* key = key_base +
+                (static_cast<std::size_t>(row) * kv_heads + kv_head) * head_dim;
+            float dot = 0.0f;
+            for (std::uint32_t dim = 0; dim < head_dim; ++dim) {
+                dot = __fmaf_rn(q_sh[dim], key[dim], dot);
+            }
+            score = dot * scale;
+        }
+        scores[tid] = score;
+        reduction[tid] = score;
+        __syncthreads();
+        for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+            __syncthreads();
+        }
+        const float tile_max = reduction[0];
+        const float weight = key_index < key_count ? expf(score - tile_max) : 0.0f;
+        scores[tid] = weight;
+        reduction[tid] = weight;
+        __syncthreads();
+        for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) reduction[tid] += reduction[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float merged_max = fmaxf(running_max, tile_max);
+            reduction[1] = isfinite(running_max) ? expf(running_max - merged_max) : 0.0f;
+            reduction[2] = expf(tile_max - merged_max);
+            reduction[3] = running_total * reduction[1] + reduction[0] * reduction[2];
+            reduction[4] = merged_max;
+        }
+        __syncthreads();
+        if (tid < head_dim) {
+            float tile_accumulator = 0.0f;
+            const std::uint32_t tile_rows = min(blockDim.x, key_count - tile_start);
+            for (std::uint32_t index = 0; index < tile_rows; ++index) {
+                const std::uint32_t absolute_index = tile_start + index;
+                const bool from_context = absolute_index < context_rows;
+                const std::uint32_t logical_position = context_start + absolute_index;
+                const std::uint32_t row = from_context
+                    ? logical_position % window
+                    : absolute_index - context_rows;
+                const float* value_base = from_context ? context_value : block_value;
+                const float* value = value_base +
+                    (static_cast<std::size_t>(row) * kv_heads + kv_head) * head_dim;
+                tile_accumulator = __fmaf_rn(scores[index], value[tid], tile_accumulator);
+            }
+            accumulator = accumulator * reduction[1] + tile_accumulator * reduction[2];
+        }
+        if (tid == 0) {
+            running_total = reduction[3];
+            running_max = reduction[4];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) reduction[0] = running_total;
+    __syncthreads();
+    if (tid < head_dim) {
+        output[(static_cast<std::size_t>(query_row) * q_heads + q_head) * head_dim + tid] =
+            accumulator / reduction[0];
+    }
+}
+
+extern "C" cudaError_t infer_dflash2_noncausal_attention_f32_on_stream(
+    const float* query,
+    const float* context_key,
+    const float* context_value,
+    const float* block_key,
+    const float* block_value,
+    float* output,
+    std::uint32_t context_end,
+    std::uint32_t context_len,
+    std::uint32_t rows,
+    std::uint32_t q_heads,
+    std::uint32_t kv_heads,
+    std::uint32_t head_dim,
+    std::uint32_t window,
+    cudaStream_t stream) {
+    constexpr std::uint32_t kThreads = 256;
+    if (query == nullptr || context_key == nullptr || context_value == nullptr ||
+        block_key == nullptr || block_value == nullptr || output == nullptr || rows == 0 ||
+        q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0 || head_dim == 0 ||
+        head_dim > kThreads || window == 0 || rows > window || context_len > window ||
+        context_len > context_end) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 grid(q_heads, rows);
+    const std::size_t shared = (head_dim + 2 * kThreads) * sizeof(float);
+    infer_dflash2_noncausal_attention_f32_kernel<<<grid, kThreads, shared, stream>>>(
+        query, context_key, context_value, block_key, block_value, output,
+        context_end, context_len, rows, q_heads, kv_heads, head_dim, window);
+    return cudaGetLastError();
+}
+
 // NVFP4 KV-cache viability probe. K/V values are packed E2M1 (two values per
 // byte) with one UE4M3 scale per contiguous 16-value block. Q and the
 // online-softmax accumulator remain f32. This measures whether cache traffic

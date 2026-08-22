@@ -9,6 +9,7 @@ use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
     Qwen36NextToken, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
     Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier, Qwen36TextModel,
+    Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
@@ -19,7 +20,7 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-const MAX_SPECULATIVE_DRAFTS: usize = 4;
+const MAX_SPECULATIVE_DRAFTS: usize = 7;
 
 /// Stable scheduler identity for one request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -63,7 +64,7 @@ pub struct SchedulerConfig {
     pub max_active_sequences: usize,
     /// Maximum prompt plus completion tokens for any request.
     pub max_context_tokens: usize,
-    /// MTP drafts verified per speculative cycle; zero disables speculation.
+    /// Draft tokens verified per speculative cycle; zero disables speculation.
     pub speculative_drafts: usize,
 }
 
@@ -206,7 +207,7 @@ pub struct Qwen36SchedulerTick {
     pub prefilled: Vec<Qwen36PrefillProgress>,
     /// Completion tokens produced after prompt consumption.
     pub generated: Vec<Qwen36ScheduledToken>,
-    /// Qwen3.8 MTP speculation completed during the tick.
+    /// Qwen3.8 speculation completed during the tick.
     pub speculative: Vec<Qwen38SpeculativeProgress>,
     /// Requests that finished during this tick.
     pub finished: Vec<Qwen36RequestId>,
@@ -214,7 +215,7 @@ pub struct Qwen36SchedulerTick {
     pub active_sequences: usize,
 }
 
-/// Request-scoped Qwen3.8 MTP acceptance observed during one scheduler tick.
+/// Request-scoped Qwen3.8 draft acceptance observed during one scheduler tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen38SpeculativeProgress {
     /// Request whose target model verified the drafts.
@@ -281,6 +282,7 @@ struct Qwen36Request {
     generated_tokens: Vec<Qwen36ScheduledToken>,
     finish_reason: Option<RequestFinishReason>,
     mtp_state: Option<Qwen36MtpSequenceState>,
+    dflash2_state: Option<Qwen38DFlash2SequenceState>,
     spec_frontier: Option<Qwen36SpeculativeFrontier>,
     spec_ready: bool,
     spec_started: bool,
@@ -374,6 +376,7 @@ pub struct Qwen36Scheduler<'model> {
     spec_workspace: Option<Qwen36SpeculativeCycleWorkspace>,
     mtp_workspace: Option<Qwen36MtpDraftWorkspace>,
     mtp_hidden_scratch: Option<DeviceBuffer<f32>>,
+    dflash2_workspace: Option<Qwen38DFlash2Workspace>,
     next_id: u64,
 }
 
@@ -390,10 +393,21 @@ impl<'model> Qwen36Scheduler<'model> {
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
-        let decode_workspaces = decode_capacity_classes(config.decode_capacity)
+        let mut decode_workspaces = decode_capacity_classes(config.decode_capacity)
             .into_iter()
             .map(|capacity| model.new_decode_batch_workspace(capacity, config.max_context_tokens))
             .collect::<Result<Vec<_>>>()?;
+        let mut prefill_workspace = model.new_prefill_batch_workspace(
+            config.prefill_sequence_capacity,
+            config.prefill_token_capacity,
+            config.max_context_tokens,
+        )?;
+        if model.dflash2_enabled() && config.speculative_drafts > 0 {
+            for workspace in &mut decode_workspaces {
+                model.enable_dflash2_decode_capture(workspace)?;
+            }
+            model.enable_dflash2_prefill_capture(&mut prefill_workspace)?;
+        }
         let probe_backend = Sm12xPageBackend::new(
             model
                 .manifest()
@@ -517,11 +531,7 @@ impl<'model> Qwen36Scheduler<'model> {
             model,
             config,
             decode_workspaces,
-            prefill_workspace: model.new_prefill_batch_workspace(
-                config.prefill_sequence_capacity,
-                config.prefill_token_capacity,
-                config.max_context_tokens,
-            )?,
+            prefill_workspace,
             requests: BTreeMap::new(),
             waiting: VecDeque::new(),
             prefilling: VecDeque::new(),
@@ -531,6 +541,7 @@ impl<'model> Qwen36Scheduler<'model> {
             spec_workspace: None,
             mtp_workspace: None,
             mtp_hidden_scratch: None,
+            dflash2_workspace: None,
             next_id: 0,
         })
     }
@@ -606,6 +617,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 generated_tokens: Vec::new(),
                 finish_reason,
                 mtp_state: None,
+                dflash2_state: None,
                 spec_frontier: None,
                 spec_ready: false,
                 spec_started: false,
@@ -721,27 +733,38 @@ impl<'model> Qwen36Scheduler<'model> {
                     .map_or(0, DeviceBuffer::device_bytes);
             request.sequence = Some(Box::new(sequence));
             request.device_token_counts = device_token_counts;
-            if self.model.mtp_weights().is_some()
+            if (self.model.dflash2_enabled() || self.model.mtp_weights().is_some())
                 && self.config.speculative_drafts > 0
                 && request.sampler.config().uses_fast_argmax()
                 && cached_prompt_tokens == 0
             {
-                let speculative_state = self
-                    .model
-                    .new_mtp_sequence_state(request.max_tokens())
-                    .and_then(|state| {
-                        Ok((
-                            state,
-                            Qwen36SpeculativeFrontier {
-                                token: 0,
-                                logit: 0.0,
-                                prev_hidden: DeviceBuffer::zeroed(self.model.manifest().hidden)?,
-                            },
-                        ))
-                    });
+                let speculative_state = (|| {
+                    let dflash2_state = self
+                        .model
+                        .dflash2_enabled()
+                        .then(|| self.model.new_dflash2_sequence_state())
+                        .transpose()?;
+                    let mtp_state = if dflash2_state.is_none() {
+                        self.model
+                            .new_mtp_sequence_state(request.max_tokens())
+                            .map(Some)?
+                    } else {
+                        None
+                    };
+                    Ok::<_, Error>((
+                        dflash2_state,
+                        mtp_state,
+                        Qwen36SpeculativeFrontier {
+                            token: 0,
+                            logit: 0.0,
+                            prev_hidden: DeviceBuffer::zeroed(self.model.manifest().hidden)?,
+                        },
+                    ))
+                })();
                 match speculative_state {
-                    Ok((state, frontier)) => {
-                        request.mtp_state = Some(state);
+                    Ok((dflash2_state, mtp_state, frontier)) => {
+                        request.dflash2_state = dflash2_state;
+                        request.mtp_state = mtp_state;
                         request.spec_frontier = Some(frontier);
                     }
                     Err(error) => warn!(
@@ -862,11 +885,11 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 
     fn spec_eligible(&self, request: &Qwen36Request) -> bool {
-        self.model.mtp_weights().is_some()
+        (request.dflash2_state.is_some() || self.model.mtp_weights().is_some())
             && self.config.speculative_drafts > 0
             && request.spec_ready
             && request.spec_frontier.is_some()
-            && request.mtp_state.is_some()
+            && (request.dflash2_state.is_some() || request.mtp_state.is_some())
             && request.sampler.config().uses_fast_argmax()
             && request.active_speculative_drafts(self.config.speculative_drafts) > 0
     }
@@ -877,10 +900,22 @@ impl<'model> Qwen36Scheduler<'model> {
     ) -> Result<(Vec<SampledToken>, usize)> {
         let drafts = request.active_speculative_drafts(self.config.speculative_drafts);
         if self.spec_workspace.is_none() {
-            self.spec_workspace = Some(self.model.new_speculative_cycle_workspace(
-                self.config.speculative_drafts,
-                self.config.max_context_tokens,
-            )?);
+            let mut workspace = if self.model.dflash2_enabled() {
+                self.model.new_external_speculative_cycle_workspace(
+                    self.config.speculative_drafts,
+                    self.config.max_context_tokens,
+                )?
+            } else {
+                self.model.new_speculative_cycle_workspace(
+                    self.config.speculative_drafts,
+                    self.config.max_context_tokens,
+                )?
+            };
+            if self.model.dflash2_enabled() {
+                self.model
+                    .enable_dflash2_speculative_capture(&mut workspace)?;
+            }
+            self.spec_workspace = Some(workspace);
         }
         let workspace = self
             .spec_workspace
@@ -894,19 +929,66 @@ impl<'model> Qwen36Scheduler<'model> {
             .sequence
             .as_deref_mut()
             .expect("speculative request has a sequence");
-        let mtp_state = request
-            .mtp_state
-            .as_mut()
-            .expect("speculative request has MTP state");
-        let outcome = self.model.speculative_cycle_argmax(
-            workspace,
-            drafts,
-            &mut frontier,
-            sequence,
-            mtp_state,
-            &mut self.sequence_cache,
-        );
+        let mut disable_dflash2 = false;
+        let outcome = if let Some(dflash2_state) = request.dflash2_state.as_mut() {
+            if self.dflash2_workspace.is_none() {
+                self.dflash2_workspace = Some(self.model.new_dflash2_workspace()?);
+            }
+            let dflash2_workspace = self
+                .dflash2_workspace
+                .as_mut()
+                .expect("DFlash2 workspace was allocated");
+            (|| {
+                let proposals = self.model.dflash2_propose(
+                    dflash2_state,
+                    frontier.token,
+                    drafts,
+                    dflash2_workspace,
+                    workspace.stream(),
+                )?;
+                let outcome = self.model.verify_external_speculative_argmax(
+                    workspace,
+                    &proposals,
+                    &mut frontier,
+                    sequence,
+                    &mut self.sequence_cache,
+                )?;
+                if let Err(error) = self.model.dflash2_append_speculative(
+                    dflash2_state,
+                    workspace,
+                    0,
+                    outcome.accepted_drafts + 1,
+                    dflash2_workspace,
+                ) {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "disabling DFlash2 after accepted-context append failed"
+                    );
+                    disable_dflash2 = true;
+                } else {
+                    debug_assert_eq!(dflash2_state.position(), sequence.position());
+                }
+                Ok(outcome)
+            })()
+        } else {
+            let mtp_state = request
+                .mtp_state
+                .as_mut()
+                .expect("speculative request has MTP state");
+            self.model.speculative_cycle_argmax(
+                workspace,
+                drafts,
+                &mut frontier,
+                sequence,
+                mtp_state,
+                &mut self.sequence_cache,
+            )
+        };
         request.spec_frontier = Some(frontier);
+        if disable_dflash2 || outcome.is_err() && request.dflash2_state.is_some() {
+            request.dflash2_state = None;
+        }
         let outcome = outcome?;
         if !outcome.speculation_ready {
             warn!(
@@ -949,7 +1031,9 @@ impl<'model> Qwen36Scheduler<'model> {
             .enumerate()
             .filter(|(_, request)| {
                 request.spec_frontier.is_some()
-                    && (request.mtp_state.is_some() || request.spec_ready)
+                    && (request.dflash2_state.is_some()
+                        || request.mtp_state.is_some()
+                        || request.spec_ready)
                     && request.sampler.config().uses_fast_argmax()
             })
             .map(|(row, _)| row)
@@ -962,6 +1046,12 @@ impl<'model> Qwen36Scheduler<'model> {
                 self.model
                     .new_mtp_draft_workspace(self.config.max_context_tokens)?,
             );
+        }
+        let needs_dflash2_append = selected
+            .iter()
+            .any(|request| request.dflash2_state.is_some());
+        if needs_dflash2_append && self.dflash2_workspace.is_none() {
+            self.dflash2_workspace = Some(self.model.new_dflash2_workspace()?);
         }
         let workspace = self
             .decode_workspaces
@@ -986,123 +1076,149 @@ impl<'model> Qwen36Scheduler<'model> {
             .model
             .decode_batch(workspace, &mut rows, &mut self.sequence_cache);
         drop(rows);
-        let mut decoded = decoded?;
-        let hidden = self.model.manifest().hidden;
-        let mut samples = if all_fast_argmax {
-            decoded
-                .top1()?
-                .into_iter()
-                .map(sampled_top1)
-                .collect::<Vec<_>>()
-        } else if !needs_host_logits {
-            let mut sampling_rows = selected
-                .iter_mut()
-                .map(|request| {
-                    let config = request.sampler.config();
-                    let draw = if config.temperature == 0.0 || config.top_k == 1 {
-                        0.0
-                    } else {
-                        request.sampler.next_gpu_draw()
+        let samples = {
+            let mut decoded = decoded?;
+            let hidden = self.model.manifest().hidden;
+            let mut samples = if all_fast_argmax {
+                decoded
+                    .top1()?
+                    .into_iter()
+                    .map(sampled_top1)
+                    .collect::<Vec<_>>()
+            } else if !needs_host_logits {
+                let mut sampling_rows = selected
+                    .iter_mut()
+                    .map(|request| {
+                        let config = request.sampler.config();
+                        let draw = if config.temperature == 0.0 || config.top_k == 1 {
+                            0.0
+                        } else {
+                            request.sampler.next_gpu_draw()
+                        };
+                        GpuSamplingRow {
+                            temperature: config.temperature,
+                            top_k: config.top_k,
+                            top_p: config.top_p,
+                            presence_penalty: config.presence_penalty,
+                            frequency_penalty: config.frequency_penalty,
+                            draw,
+                            token_counts: request.device_token_counts.as_mut(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                decoded
+                    .sample_topk_topp(&mut sampling_rows)?
+                    .into_iter()
+                    .map(|sample| SampledToken {
+                        id: sample.id,
+                        logit: sample.logit,
+                        adjusted_logit: sample.adjusted_logit,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let vocab = decoded.vocab();
+                let logits = decoded.copy_logits()?;
+                let samples = selected
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(row, request)| {
+                        let row_logits = &logits[row * vocab..(row + 1) * vocab];
+                        if request.sampler.config().uses_fast_argmax() {
+                            return argmax_logits(row_logits);
+                        }
+                        request.sampler.sample(row_logits, &request.history)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (request, sample) in selected.iter_mut().zip(&samples) {
+                    let Some(counts) = request.device_token_counts.as_mut() else {
+                        continue;
                     };
-                    GpuSamplingRow {
-                        temperature: config.temperature,
-                        top_k: config.top_k,
-                        top_p: config.top_p,
-                        presence_penalty: config.presence_penalty,
-                        frequency_penalty: config.frequency_penalty,
-                        draw,
-                        token_counts: request.device_token_counts.as_mut(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            decoded
-                .sample_topk_topp(&mut sampling_rows)?
-                .into_iter()
-                .map(|sample| SampledToken {
-                    id: sample.id,
-                    logit: sample.logit,
-                    adjusted_logit: sample.adjusted_logit,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            let vocab = decoded.vocab();
-            let logits = decoded.copy_logits()?;
-            let samples = selected
-                .iter_mut()
-                .enumerate()
-                .map(|(row, request)| {
-                    let row_logits = &logits[row * vocab..(row + 1) * vocab];
-                    if request.sampler.config().uses_fast_argmax() {
-                        return argmax_logits(row_logits);
-                    }
-                    request.sampler.sample(row_logits, &request.history)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (request, sample) in selected.iter_mut().zip(&samples) {
-                let Some(counts) = request.device_token_counts.as_mut() else {
-                    continue;
+                    let mut dense = request.history.dense_counts(vocab);
+                    dense[sample.id as usize] += 1;
+                    counts.copy_from_host(&dense)?;
+                }
+                samples
+            };
+            let mut copied_hidden = false;
+            for &row in &tracked_frontier_rows {
+                let request = &mut selected[row];
+                let mut frontier = request
+                    .spec_frontier
+                    .take()
+                    .expect("speculative request has a frontier");
+                let mut mtp_state = request.mtp_state.take();
+                let emit_frontier = request.spec_ready && request.spec_started;
+                let emitted_frontier = SampledToken {
+                    id: frontier.token,
+                    logit: frontier.logit,
+                    adjusted_logit: frontier.logit,
                 };
-                let mut dense = request.history.dense_counts(vocab);
-                dense[sample.id as usize] += 1;
-                counts.copy_from_host(&dense)?;
+                let canonical_sample = samples[row];
+                samples[row] =
+                    ordinary_decode_emission(emit_frontier, emitted_frontier, canonical_sample);
+                if let Some(state) = mtp_state.as_mut() {
+                    let catchup = self.model.mtp_append_kv(
+                        state,
+                        self.mtp_workspace
+                            .as_mut()
+                            .expect("speculative scheduler has an MTP workspace"),
+                        input_tokens[row],
+                        &frontier.prev_hidden,
+                        decoded.stream(),
+                    );
+                    let catchup = catchup.and_then(|()| {
+                        frontier.prev_hidden.copy_range_from_device_on_stream(
+                            0,
+                            decoded.hidden(),
+                            row * hidden,
+                            hidden,
+                            decoded.stream(),
+                        )
+                    });
+                    if let Err(error) = catchup {
+                        warn!(
+                            request = request.id.get(),
+                            %error,
+                            "disabling Qwen3.8 speculation after MTP catch-up failed"
+                        );
+                        mtp_state = None;
+                    } else {
+                        copied_hidden = true;
+                    }
+                }
+                frontier.token = canonical_sample.id;
+                frontier.logit = canonical_sample.logit;
+                request.spec_frontier = Some(frontier);
+                request.mtp_state = mtp_state;
+                request.spec_ready = true;
+            }
+            if copied_hidden {
+                decoded.stream().synchronize()?;
             }
             samples
         };
-        let mut copied_hidden = false;
-        for &row in &tracked_frontier_rows {
-            let request = &mut selected[row];
-            let mut frontier = request
-                .spec_frontier
-                .take()
-                .expect("speculative request has a frontier");
-            let mut mtp_state = request.mtp_state.take();
-            let emit_frontier = request.spec_ready && request.spec_started;
-            let emitted_frontier = SampledToken {
-                id: frontier.token,
-                logit: frontier.logit,
-                adjusted_logit: frontier.logit,
-            };
-            let canonical_sample = samples[row];
-            samples[row] =
-                ordinary_decode_emission(emit_frontier, emitted_frontier, canonical_sample);
-            if let Some(state) = mtp_state.as_mut() {
-                let catchup = self.model.mtp_append_kv(
-                    state,
-                    self.mtp_workspace
-                        .as_mut()
-                        .expect("speculative scheduler has an MTP workspace"),
-                    input_tokens[row],
-                    &frontier.prev_hidden,
-                    decoded.stream(),
-                );
-                let catchup = catchup.and_then(|()| {
-                    frontier.prev_hidden.copy_range_from_device_on_stream(
-                        0,
-                        decoded.hidden(),
-                        row * hidden,
-                        hidden,
-                        decoded.stream(),
-                    )
-                });
-                if let Err(error) = catchup {
+        if needs_dflash2_append {
+            let dflash2_workspace = self
+                .dflash2_workspace
+                .as_mut()
+                .expect("DFlash2 workspace was allocated");
+            for (row, request) in selected.iter_mut().enumerate() {
+                let Some(state) = request.dflash2_state.as_mut() else {
+                    continue;
+                };
+                if let Err(error) =
+                    self.model
+                        .dflash2_append_decode(state, workspace, row, 1, dflash2_workspace)
+                {
                     warn!(
                         request = request.id.get(),
                         %error,
-                        "disabling Qwen3.8 speculation after MTP catch-up failed"
+                        "disabling DFlash2 after decode-context append failed"
                     );
-                    mtp_state = None;
-                } else {
-                    copied_hidden = true;
+                    request.dflash2_state = None;
                 }
             }
-            frontier.token = canonical_sample.id;
-            frontier.logit = canonical_sample.logit;
-            request.spec_frontier = Some(frontier);
-            request.mtp_state = mtp_state;
-            request.spec_ready = true;
-        }
-        if copied_hidden {
-            decoded.stream().synchronize()?;
+            workspace.stream().synchronize()?;
         }
         Ok(samples)
     }
@@ -1245,6 +1361,12 @@ impl<'model> Qwen36Scheduler<'model> {
                 needs_mtp_warmup = false;
             }
         }
+        let needs_dflash2_warmup = selected
+            .iter()
+            .any(|request| request.dflash2_state.is_some());
+        if needs_dflash2_warmup && self.dflash2_workspace.is_none() {
+            self.dflash2_workspace = Some(self.model.new_dflash2_workspace()?);
+        }
         let prefill_ids = selected
             .iter()
             .map(|request| request.id)
@@ -1282,6 +1404,26 @@ impl<'model> Qwen36Scheduler<'model> {
         for (request, &chunk) in selected.iter_mut().zip(&chunk_lengths) {
             let start = request.prompt_position;
             let end = start + chunk;
+            if let Some(state) = request.dflash2_state.as_mut()
+                && let Err(error) = self.model.dflash2_append_prefill(
+                    state,
+                    &self.prefill_workspace,
+                    row_offset,
+                    chunk,
+                    self.dflash2_workspace
+                        .as_mut()
+                        .expect("DFlash2 workspace was allocated"),
+                )
+            {
+                warn!(
+                    request = request.id.get(),
+                    %error,
+                    "disabling DFlash2 after prompt-context append failed"
+                );
+                request.dflash2_state = None;
+                request.spec_frontier = None;
+                request.spec_ready = false;
+            }
             if let (Some(mtp_state), Some(frontier)) =
                 (&mut request.mtp_state, &mut request.spec_frontier)
             {
@@ -1325,7 +1467,7 @@ impl<'model> Qwen36Scheduler<'model> {
             }
             row_offset += chunk;
         }
-        if needs_mtp_warmup {
+        if needs_mtp_warmup || needs_dflash2_warmup {
             self.prefill_workspace.stream().synchronize()?;
         }
         for (mut request, chunk) in selected.into_iter().zip(chunk_lengths) {
@@ -1645,7 +1787,12 @@ mod tests {
         let model_dir = std::env::var_os("QWEN38_MODEL")
             .map(PathBuf::from)
             .expect("set QWEN38_MODEL to a Qwen3.8 checkpoint");
-        let model = Qwen36TextModel::open(model_dir).expect("load Qwen3.8 model");
+        let mut model = Qwen36TextModel::open(model_dir).expect("load Qwen3.8 model");
+        if let Some(dflash2_dir) = std::env::var_os("QWEN38_DFLASH2").map(PathBuf::from) {
+            model
+                .enable_dflash2(dflash2_dir)
+                .expect("load Qwen3.8 DFlash2 companion");
+        }
         let run = |speculative_drafts| {
             let mut scheduler = Qwen36Scheduler::new_with_cache_config(
                 &model,

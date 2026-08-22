@@ -718,6 +718,34 @@ impl<T: Copy> DeviceBuffer<T> {
         })
     }
 
+    /// Enqueues a device prefix copy into reusable page-locked host memory.
+    pub fn copy_prefix_to_pinned_on_stream(
+        &self,
+        output: &mut PinnedHostBuffer<T>,
+        len: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if len > self.len || len > output.len {
+            return Err(Error::Shape {
+                label: "device prefix copy to pinned host memory",
+                expected: format!("at most {} values", self.len.min(output.len)),
+                actual: format!("{len} values"),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2H pinned prefix)",
+                ffi::cudaMemcpyAsync(
+                    output.ptr.cast(),
+                    self.ptr.cast(),
+                    len * size_of::<T>(),
+                    ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Copies host values into this existing device allocation.
     pub fn copy_from_host(&mut self, values: &[T]) -> Result<()> {
         if values.len() != self.len {
@@ -1119,7 +1147,7 @@ impl<T> Drop for DeviceBuffer<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaStream, DeviceBuffer};
+    use super::{CudaStream, DeviceBuffer, PinnedHostBuffer};
     use crate::fill_f32_into_on_stream;
 
     #[test]
@@ -1151,6 +1179,21 @@ mod tests {
             .copy_prefix_to_host(5, &stream)
             .expect_err("oversized prefix must fail");
         assert!(error.to_string().contains("at most 4 values"));
+    }
+
+    #[test]
+    fn device_prefix_copy_reuses_pinned_host_memory() {
+        let stream = CudaStream::new_non_blocking().expect("CUDA stream");
+        let device = DeviceBuffer::from_host(&[1u32, 2, 3, 4]).expect("device buffer");
+        let mut host = PinnedHostBuffer::zeroed(4).expect("pinned host buffer");
+
+        device
+            .copy_prefix_to_pinned_on_stream(&mut host, 2, &stream)
+            .expect("pinned prefix copy");
+        stream.synchronize().expect("pinned prefix copy completion");
+
+        assert_eq!(&host.as_slice()[..2], [1, 2]);
+        assert_eq!(&host.as_slice()[2..], [0, 0]);
     }
 
     #[test]

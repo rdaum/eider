@@ -40,7 +40,7 @@ pub struct InferMetrics {
     #[help = "Qwen3.8 speculative verification cycles run"]
     pub qwen38_speculative_cycles: Counter,
 
-    #[help = "Qwen3.8 MTP drafts accepted by speculative verification"]
+    #[help = "Qwen3.8 drafts accepted by speculative verification"]
     pub qwen38_speculative_accepted_drafts: Counter,
 
     #[help = "Requests admitted by the scheduler"]

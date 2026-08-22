@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "muse_glimmer_dflash"
 harness = false
+
+[[bench]]
+name = "qwen38_dflash2"
+harness = false

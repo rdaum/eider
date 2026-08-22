@@ -5831,6 +5831,246 @@ pub fn cached_gqa_attention_f32_into_on_stream(
     }
 }
 
+/// Captures one target residual tap into row-major `[row, tap, hidden]` storage.
+pub fn dflash2_capture_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    hidden: usize,
+    taps: usize,
+    tap: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_values = rows.checked_mul(hidden).ok_or_else(|| Error::Shape {
+        label: "DFlash2 target capture",
+        expected: "rows * hidden without overflow".to_string(),
+        actual: format!("rows={rows} hidden={hidden}"),
+    })?;
+    let output_values = input_values.checked_mul(taps).ok_or_else(|| Error::Shape {
+        label: "DFlash2 target capture",
+        expected: "rows * hidden * taps without overflow".to_string(),
+        actual: format!("rows={rows} hidden={hidden} taps={taps}"),
+    })?;
+    if rows == 0
+        || hidden == 0
+        || taps == 0
+        || tap >= taps
+        || input.len() < input_values
+        || output.len() < output_values
+        || [rows, hidden, taps, tap]
+            .iter()
+            .any(|&value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "DFlash2 target capture",
+            expected: format!("input>={input_values}, output>={output_values}, and tap < {taps}"),
+            actual: format!(
+                "input={} output={} rows={rows} hidden={hidden} taps={taps} tap={tap}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dflash2_capture_f32_on_stream",
+            ffi::infer_dflash2_capture_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                hidden as u32,
+                taps as u32,
+                tap as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies one side of DFlash2's dynamic grouped convolution.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash2_grouped_conv_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    coefficients: &DeviceBuffer<f32>,
+    base: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    hidden: usize,
+    groups: usize,
+    taps: usize,
+    block_size: usize,
+    side: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.checked_mul(hidden).ok_or_else(|| Error::Shape {
+        label: "DFlash2 grouped convolution",
+        expected: "rows * hidden without overflow".to_string(),
+        actual: format!("rows={rows} hidden={hidden}"),
+    })?;
+    let coefficient_values = rows
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(taps))
+        .and_then(|value| value.checked_mul(groups))
+        .ok_or_else(|| Error::Shape {
+            label: "DFlash2 grouped convolution coefficients",
+            expected: "rows * 2 * taps * groups without overflow".to_string(),
+            actual: format!("rows={rows} taps={taps} groups={groups}"),
+        })?;
+    let base_values = 2usize
+        .checked_mul(taps)
+        .and_then(|value| value.checked_mul(hidden))
+        .ok_or_else(|| Error::Shape {
+            label: "DFlash2 grouped convolution base",
+            expected: "2 * taps * hidden without overflow".to_string(),
+            actual: format!("taps={taps} hidden={hidden}"),
+        })?;
+    if rows == 0
+        || hidden == 0
+        || groups == 0
+        || !hidden.is_multiple_of(groups)
+        || taps == 0
+        || block_size == 0
+        || side >= 2
+        || input.len() < values
+        || output.len() < values
+        || coefficients.len() < coefficient_values
+        || base.len() < base_values
+        || [rows, hidden, groups, taps, block_size, side]
+            .iter()
+            .any(|&value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "DFlash2 grouped convolution",
+            expected: format!(
+                "input/output>={values}, coefficients>={coefficient_values}, base>={base_values}, side < 2"
+            ),
+            actual: format!(
+                "input={} output={} coefficients={} base={} rows={rows} hidden={hidden} groups={groups} taps={taps} block={block_size} side={side}",
+                input.len(),
+                output.len(),
+                coefficients.len(),
+                base.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dflash2_grouped_conv_f32_on_stream",
+            ffi::infer_dflash2_grouped_conv_f32_on_stream(
+                input.ptr,
+                coefficients.ptr,
+                base.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                hidden as u32,
+                groups as u32,
+                taps as u32,
+                block_size as u32,
+                side as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Evaluates DFlash2's non-causal proposal-block attention over a ring cache.
+#[allow(clippy::too_many_arguments)]
+pub fn dflash2_noncausal_attention_f32_into_on_stream(
+    query: &DeviceBuffer<f32>,
+    context_key: &DeviceBuffer<f32>,
+    context_value: &DeviceBuffer<f32>,
+    block_key: &DeviceBuffer<f32>,
+    block_value: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    context_end: usize,
+    context_len: usize,
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let q_width = q_heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "DFlash2 attention query width",
+        expected: "q_heads * head_dim without overflow".to_string(),
+        actual: format!("q_heads={q_heads} head_dim={head_dim}"),
+    })?;
+    let kv_width = kv_heads.checked_mul(head_dim).ok_or_else(|| Error::Shape {
+        label: "DFlash2 attention KV width",
+        expected: "kv_heads * head_dim without overflow".to_string(),
+        actual: format!("kv_heads={kv_heads} head_dim={head_dim}"),
+    })?;
+    let query_values = rows * q_width;
+    let block_values = rows * kv_width;
+    let context_values = window * kv_width;
+    if rows == 0
+        || rows > window
+        || q_heads == 0
+        || kv_heads == 0
+        || !q_heads.is_multiple_of(kv_heads)
+        || head_dim == 0
+        || head_dim > 256
+        || window == 0
+        || context_len > window
+        || context_len > context_end
+        || query.len() < query_values
+        || output.len() < query_values
+        || block_key.len() < block_values
+        || block_value.len() < block_values
+        || context_key.len() < context_values
+        || context_value.len() < context_values
+        || [
+            context_end,
+            context_len,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
+        ]
+        .iter()
+        .any(|&value| value > u32::MAX as usize)
+    {
+        return Err(Error::Shape {
+            label: "DFlash2 non-causal attention",
+            expected: format!(
+                "query/output>={query_values}, block KV>={block_values}, context KV>={context_values}"
+            ),
+            actual: format!(
+                "query={} output={} block_key={} block_value={} context_key={} context_value={} context_end={context_end} context_len={context_len} rows={rows}",
+                query.len(),
+                output.len(),
+                block_key.len(),
+                block_value.len(),
+                context_key.len(),
+                context_value.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dflash2_noncausal_attention_f32_on_stream",
+            ffi::infer_dflash2_noncausal_attention_f32_on_stream(
+                query.ptr,
+                context_key.ptr,
+                context_value.ptr,
+                block_key.ptr,
+                block_value.ptr,
+                output.buffer_mut().ptr,
+                context_end as u32,
+                context_len as u32,
+                rows as u32,
+                q_heads as u32,
+                kv_heads as u32,
+                head_dim as u32,
+                window as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues one-token grouped-query attention with device-resident cache length.
 pub fn cached_gqa_attention_f32_indexed_into_on_stream(
     query: &DeviceBuffer<f32>,
@@ -12543,6 +12783,185 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn dflash2_capture_interleaves_target_taps_by_row() {
+        let input = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0]).expect("input");
+        let mut output = DeviceBuffer::from_host(&[-1.0f32; 12]).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dflash2_capture_f32_into_on_stream(&input, output.output(), 2, 2, 3, 1, &stream)
+            .expect("capture tap");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("captured").as_slice(),
+            [
+                -1.0, -1.0, 1.0, 2.0, -1.0, -1.0, -1.0, -1.0, 3.0, 4.0, -1.0, -1.0
+            ]
+        );
+    }
+
+    #[test]
+    fn dflash2_grouped_convolution_resets_at_each_block() {
+        let input =
+            DeviceBuffer::from_host(&(1..=24).map(|value| value as f32).collect::<Vec<_>>())
+                .expect("input");
+        let coefficients = DeviceBuffer::zeroed(6 * 8).expect("coefficients");
+        let base = DeviceBuffer::from_host(&[
+            1.0f32, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0, 2.0, 2.0, 2.0, 2.0, 20.0, 20.0, 20.0,
+            20.0,
+        ])
+        .expect("base");
+        let mut output = DeviceBuffer::zeroed(24).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dflash2_grouped_conv_f32_into_on_stream(
+            &input,
+            &coefficients,
+            &base,
+            output.output(),
+            6,
+            4,
+            2,
+            2,
+            3,
+            0,
+            &stream,
+        )
+        .expect("grouped convolution");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output").as_slice(),
+            [
+                1.0, 2.0, 3.0, 4.0, 15.0, 26.0, 37.0, 48.0, 59.0, 70.0, 81.0, 92.0, 13.0, 14.0,
+                15.0, 16.0, 147.0, 158.0, 169.0, 180.0, 191.0, 202.0, 213.0, 224.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn dflash2_attention_reads_future_proposal_rows() {
+        let query = DeviceBuffer::from_host(&[1.0f32, 1.0]).expect("query");
+        let context_key = DeviceBuffer::zeroed(2).expect("context key");
+        let context_value = DeviceBuffer::zeroed(2).expect("context value");
+        let block_key = DeviceBuffer::from_host(&[0.0f32, 2.0]).expect("block key");
+        let block_value = DeviceBuffer::from_host(&[10.0f32, 20.0]).expect("block value");
+        let mut output = DeviceBuffer::zeroed(2).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dflash2_noncausal_attention_f32_into_on_stream(
+            &query,
+            &context_key,
+            &context_value,
+            &block_key,
+            &block_value,
+            output.output(),
+            0,
+            0,
+            2,
+            1,
+            1,
+            1,
+            2,
+            &stream,
+        )
+        .expect("non-causal attention");
+        let output = output.copy_to_host(&stream).expect("output");
+        assert!(output[0] > 18.0, "future proposal row must be visible");
+        assert!((output[0] - output[1]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn dflash2_attention_matches_wrapped_multi_tile_reference() {
+        let rows = 3;
+        let q_heads = 2;
+        let kv_heads = 1;
+        let head_dim = 4;
+        let window = 320;
+        let context_end = 400;
+        let context_len = 320;
+        let query = (0..rows * q_heads * head_dim)
+            .map(|index| ((index * 13 % 29) as f32 - 14.0) / 17.0)
+            .collect::<Vec<_>>();
+        let mut context_key = vec![0.0f32; window * kv_heads * head_dim];
+        let mut context_value = vec![0.0f32; window * kv_heads * head_dim];
+        for position in context_end - context_len..context_end {
+            for dim in 0..head_dim {
+                let index = (position % window) * head_dim + dim;
+                context_key[index] = ((position * 7 + dim * 3) % 31) as f32 / 19.0 - 0.7;
+                context_value[index] = ((position * 5 + dim * 11) % 37) as f32 / 23.0 - 0.8;
+            }
+        }
+        let block_key = (0..rows * head_dim)
+            .map(|index| ((index * 17 % 23) as f32 - 11.0) / 13.0)
+            .collect::<Vec<_>>();
+        let block_value = (0..rows * head_dim)
+            .map(|index| ((index * 19 % 41) as f32 - 20.0) / 21.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; query.len()];
+        let context_start = (context_end - context_len).max(context_end + rows - window);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for row in 0..rows {
+            for head in 0..q_heads {
+                let q = &query
+                    [(row * q_heads + head) * head_dim..(row * q_heads + head + 1) * head_dim];
+                let mut scores = Vec::with_capacity(window);
+                let mut values = Vec::with_capacity(window);
+                for position in context_start..context_end {
+                    let slot = position % window;
+                    let key = &context_key[slot * head_dim..(slot + 1) * head_dim];
+                    scores.push(q.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * scale);
+                    values.push(&context_value[slot * head_dim..(slot + 1) * head_dim]);
+                }
+                for block_row in 0..rows {
+                    let key = &block_key[block_row * head_dim..(block_row + 1) * head_dim];
+                    scores.push(q.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * scale);
+                    values.push(&block_value[block_row * head_dim..(block_row + 1) * head_dim]);
+                }
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores
+                    .iter()
+                    .map(|score| (score - maximum).exp())
+                    .collect::<Vec<_>>();
+                let total = weights.iter().sum::<f32>();
+                for dim in 0..head_dim {
+                    expected[(row * q_heads + head) * head_dim + dim] = weights
+                        .iter()
+                        .zip(&values)
+                        .map(|(weight, value)| weight * value[dim])
+                        .sum::<f32>()
+                        / total;
+                }
+            }
+        }
+
+        let query_device = DeviceBuffer::from_host(&query).expect("query");
+        let context_key_device = DeviceBuffer::from_host(&context_key).expect("context key");
+        let context_value_device = DeviceBuffer::from_host(&context_value).expect("context value");
+        let block_key_device = DeviceBuffer::from_host(&block_key).expect("block key");
+        let block_value_device = DeviceBuffer::from_host(&block_value).expect("block value");
+        let mut output = DeviceBuffer::zeroed(query.len()).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dflash2_noncausal_attention_f32_into_on_stream(
+            &query_device,
+            &context_key_device,
+            &context_value_device,
+            &block_key_device,
+            &block_value_device,
+            output.output(),
+            context_end,
+            context_len,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            window,
+            &stream,
+        )
+        .expect("multi-tile attention");
+        let actual = output.copy_to_host(&stream).expect("attention output");
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2.0e-5,
+                "value {index}: expected {expected}, got {actual}"
+            );
+        }
+    }
 
     #[test]
     fn copies_active_rows_into_interleaved_feature_columns() {

@@ -1,6 +1,7 @@
 //! Qwen3.6 / Qwen3.5-MoE hybrid execution pieces.
 
 mod batch;
+mod dflash2;
 mod mtp;
 
 pub use batch::{
@@ -8,6 +9,8 @@ pub use batch::{
     Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
     Qwen36SpeculativeCycleOutcome, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
 };
+pub use dflash2::{DFlash2Config, inspect_dflash2_config, validate_dflash2_checkpoint};
+pub(crate) use dflash2::{Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace};
 pub use mtp::{Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36MtpWeights};
 
 use crate::metrics::ExpertPagingMetricHandle;
@@ -6047,6 +6050,7 @@ pub struct Qwen36TextModel {
     final_norm: DeviceBuffer<f32>,
     lm_head: Qwen36LmHead,
     mtp: Option<Qwen36MtpWeights>,
+    dflash2: Option<dflash2::Qwen38DFlash2>,
     expert_paging: bool,
     bf16_storage: Qwen36Bf16StorageConfig,
     fp8_attention_storage: Qwen36Fp8AttentionStorage,
@@ -6606,6 +6610,7 @@ impl Qwen36TextModel {
             final_norm,
             lm_head,
             mtp,
+            dflash2: None,
             expert_paging: is_moe && capacity_per_layer.is_some(),
             bf16_storage,
             fp8_attention_storage,

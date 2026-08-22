@@ -2099,6 +2099,44 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_dflash2_capture_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        hidden: u32,
+        taps: u32,
+        tap: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_dflash2_grouped_conv_f32_on_stream(
+        input: *const f32,
+        coefficients: *const f32,
+        base: *const f32,
+        output: *mut f32,
+        rows: u32,
+        hidden: u32,
+        groups: u32,
+        taps: u32,
+        block_size: u32,
+        side: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_dflash2_noncausal_attention_f32_on_stream(
+        query: *const f32,
+        context_key: *const f32,
+        context_value: *const f32,
+        block_key: *const f32,
+        block_value: *const f32,
+        output: *mut f32,
+        context_end: u32,
+        context_len: u32,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        window: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_cached_gqa_attention_f32_indexed_on_stream(
         query: *const f32,
         key_cache: *const f32,

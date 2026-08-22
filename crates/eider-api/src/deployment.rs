@@ -17,6 +17,8 @@ use crate::metrics::metrics as server_metrics;
 const MUSE_DFLASH_REPOSITORY: &str = "meta-models/Muse-Glimmer-30B-GGUF";
 const MUSE_DFLASH_REVISION: &str = "93769bc7ab5ad1e9cd22d857e3138cf5d977ae81";
 const MUSE_DFLASH_FILE: &str = "dflash-kquant.gguf";
+const QWEN38_DFLASH2_REPOSITORY: &str = "z-lab/Qwen3.8-27B-DFlash2";
+const QWEN38_DFLASH2_REVISION: &str = "50307d4c4cde6860d4eee73e2547cd786fe8e8a4";
 
 /// A reviewed model available through the `eider-serve` catalogue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +228,7 @@ pub struct ResolvedModel {
     pub checkpoint_dir: PathBuf,
     pub artifact_dir: PathBuf,
     pub dflash_gguf: Option<PathBuf>,
+    pub dflash2_dir: Option<PathBuf>,
     pub identity: String,
     pub defaults: ServingDefaults,
     pub preparation: ArtifactKind,
@@ -307,6 +310,11 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
     } else {
         None
     };
+    let dflash2_dir = if spec.id == "qwen3.8-27b" {
+        Some(resolve_qwen38_dflash2(offline).await?)
+    } else {
+        None
+    };
     info!(
         model = spec.id,
         repository = spec.repository,
@@ -319,10 +327,32 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
         checkpoint_dir,
         artifact_dir,
         dflash_gguf,
+        dflash2_dir,
         identity: format!("{}@{}", spec.id, spec.revision),
         defaults: spec.defaults,
         preparation: spec.artifact_kind,
     })
+}
+
+async fn resolve_qwen38_dflash2(offline: bool) -> Result<PathBuf, String> {
+    let (owner, name) = split_id(QWEN38_DFLASH2_REPOSITORY);
+    let client =
+        HFClient::new().map_err(|error| format!("configure Hugging Face client: {error}"))?;
+    client
+        .model(owner, name)
+        .snapshot_download()
+        .revision(QWEN38_DFLASH2_REVISION)
+        .allow_patterns(vec![
+            "config.json".to_string(),
+            "model.safetensors.index.json".to_string(),
+            "*.safetensors".to_string(),
+        ])
+        .local_files_only(offline)
+        .send()
+        .await
+        .map_err(|error| {
+            format!("resolve {QWEN38_DFLASH2_REPOSITORY}@{QWEN38_DFLASH2_REVISION}: {error}")
+        })
 }
 
 async fn resolve_muse_dflash(offline: bool) -> Result<PathBuf, String> {
@@ -587,6 +617,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
         checkpoint_dir,
         artifact_dir,
         dflash_gguf: None,
+        dflash2_dir: None,
         identity: format!("local-{model_type}"),
         defaults: ServingDefaults {
             served_model_name: "eider-local",
@@ -832,6 +863,11 @@ mod tests {
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8");
         assert_eq!(model.defaults.max_context_tokens, 32_768);
         assert_eq!(model.defaults.prefill_token_capacity, 1_024);
+        assert_eq!(QWEN38_DFLASH2_REPOSITORY, "z-lab/Qwen3.8-27B-DFlash2");
+        assert_eq!(
+            QWEN38_DFLASH2_REVISION,
+            "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
+        );
     }
 
     #[test]

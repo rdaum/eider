@@ -78,6 +78,9 @@ Development and checkpoint-conversion work retains an explicit local path:
 eider-serve --model-dir ./models/agents-a1-nvfp4
 eider-serve --model-dir ./models/muse-glimmer-30b-nvfp4 \
   --dflash-gguf ./dflash-kquant.gguf
+eider-serve --model-dir ./models/qwen3.8-27b-nvfp4 \
+  --dflash2-dir ./models/qwen3.8-27b-dflash2 \
+  --speculative-drafts 2
 ```
 
 `--model-dir` is mutually exclusive with the catalogue ID. Local checkpoints

@@ -1,6 +1,6 @@
 use infer::nvfp4::{CudaStream, GpuSamplingRow, SM12X_KV_PAGE_TOKENS};
 use infer::qwen3::qwen36::{
-    Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8AttentionStorage, Qwen36PrefillRow, Qwen36TextModel,
 };
 use infer::runtime::qwen36_sequence::{
@@ -500,6 +500,15 @@ fn production_only() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn bf16_storage(name: &str) -> Qwen36Bf16Storage {
+    match std::env::var(name).as_deref() {
+        Ok("bf16") => Qwen36Bf16Storage::Bf16,
+        Ok("fp8") => Qwen36Bf16Storage::Fp8,
+        Ok("nvfp4") | Err(_) => Qwen36Bf16Storage::Nvfp4,
+        Ok(value) => panic!("{name} must be bf16, fp8, or nvfp4; got {value}"),
+    }
+}
+
 fn main() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -516,6 +525,10 @@ fn main() {
     );
     let path = model_dir();
     let artifact_dir = artifact_dir();
+    let bf16_storage = Qwen36Bf16StorageConfig::new(
+        bf16_storage("QWEN36_BF16_ATTENTION"),
+        bf16_storage("QWEN36_BF16_LM_HEAD"),
+    );
     info!(
         model_dir = %path.display(),
         artifact_dir = artifact_dir.as_ref().map(|path| path.display().to_string()),
@@ -526,11 +539,11 @@ fn main() {
             Qwen36TextModel::open_with_storage_and_artifact_dir(
                 path,
                 artifact_dir,
-                Qwen36Bf16StorageConfig::default(),
+                bf16_storage,
                 Qwen36Fp8AttentionStorage::default(),
             )
         } else {
-            Qwen36TextModel::open(path)
+            Qwen36TextModel::open_with_bf16_storage(path, bf16_storage)
         }
         .expect("load Qwen3.6 model"),
     );
