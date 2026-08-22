@@ -4,6 +4,7 @@ use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::qwen36_sequence::{Qwen36Sequence, Qwen36SequenceCache};
 use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
+use super::tool_grammar::QwenXmlToolGrammar;
 use crate::metrics::metrics;
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
@@ -148,6 +149,8 @@ pub enum RequestFinishReason {
     Eos,
     /// The request reached its completion-token limit.
     Length,
+    /// A request-scoped tool grammar completed a function call.
+    ToolCalls,
 }
 
 /// One completion token produced by a scheduler tick.
@@ -277,6 +280,7 @@ struct Qwen36Request {
     device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     sampler: Sampler,
+    tool_grammar: Option<QwenXmlToolGrammar>,
     history: TokenHistory,
     last_token: Option<u32>,
     generated_tokens: Vec<Qwen36ScheduledToken>,
@@ -330,14 +334,20 @@ impl Qwen36Request {
         )
     }
 
-    fn apply_sample(&mut self, sampled: SampledToken) -> Qwen36ScheduledToken {
+    fn apply_sample(
+        &mut self,
+        sampled: SampledToken,
+        tool_grammar_complete: bool,
+    ) -> Qwen36ScheduledToken {
         if self.remaining_prompt_tokens() == 1 {
             self.prompt_position += 1;
         }
         self.last_token = Some(sampled.id);
         self.history.push(sampled.id);
         let generated_count = self.generated_tokens.len() + 1;
-        let finish_reason = if self.config.eos_token_ids.contains(&sampled.id) {
+        let finish_reason = if tool_grammar_complete {
+            Some(RequestFinishReason::ToolCalls)
+        } else if self.config.eos_token_ids.contains(&sampled.id) {
             Some(RequestFinishReason::Eos)
         } else if generated_count == self.config.max_new_tokens {
             Some(RequestFinishReason::Length)
@@ -552,6 +562,15 @@ impl<'model> Qwen36Scheduler<'model> {
         prompt_tokens: Vec<u32>,
         config: RequestConfig,
     ) -> Result<Qwen36RequestId> {
+        self.add_request_with_grammar(prompt_tokens, config, None)
+    }
+
+    pub(crate) fn add_request_with_grammar(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        config: RequestConfig,
+        tool_grammar: Option<QwenXmlToolGrammar>,
+    ) -> Result<Qwen36RequestId> {
         config.validate()?;
         if prompt_tokens.is_empty() {
             return Err(Error::Format {
@@ -612,6 +631,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 device_token_counts: None,
                 sequence_device_bytes: 0,
                 sampler,
+                tool_grammar,
                 history,
                 last_token: None,
                 generated_tokens: Vec::new(),
@@ -849,7 +869,13 @@ impl<'model> Qwen36Scheduler<'model> {
         };
         for (mut request, samples) in selected.into_iter().zip(samples_per_request) {
             for sample in samples {
-                let token = request.apply_sample(sample);
+                let tool_grammar_complete = if let Some(grammar) = request.tool_grammar.as_mut() {
+                    grammar.commit(sample.id)?;
+                    grammar.is_complete()
+                } else {
+                    false
+                };
+                let token = request.apply_sample(sample, tool_grammar_complete);
                 tick.generated.push(token);
                 if request.lifecycle == RequestState::Finished {
                     break;
@@ -890,6 +916,7 @@ impl<'model> Qwen36Scheduler<'model> {
             && request.spec_ready
             && request.spec_frontier.is_some()
             && (request.dflash2_state.is_some() || request.mtp_state.is_some())
+            && (request.tool_grammar.is_none() || request.dflash2_state.is_some())
             && request.sampler.config().uses_fast_argmax()
             && request.active_speculative_drafts(self.config.speculative_drafts) > 0
     }
@@ -930,6 +957,28 @@ impl<'model> Qwen36Scheduler<'model> {
             .as_deref_mut()
             .expect("speculative request has a sequence");
         let mut disable_dflash2 = false;
+        let mut grammar_preview = request
+            .tool_grammar
+            .as_ref()
+            .map(QwenXmlToolGrammar::deep_clone);
+        if request.spec_started
+            && let Some(grammar) = grammar_preview.as_mut()
+        {
+            grammar.commit(frontier.token)?;
+        }
+        if grammar_preview
+            .as_ref()
+            .is_some_and(QwenXmlToolGrammar::is_complete)
+        {
+            let sample = SampledToken {
+                id: frontier.token,
+                logit: frontier.logit,
+                adjusted_logit: frontier.logit,
+            };
+            request.spec_frontier = Some(frontier);
+            request.spec_started = true;
+            return Ok((vec![sample], 0));
+        }
         let outcome = if let Some(dflash2_state) = request.dflash2_state.as_mut() {
             if self.dflash2_workspace.is_none() {
                 self.dflash2_workspace = Some(self.model.new_dflash2_workspace()?);
@@ -946,13 +995,58 @@ impl<'model> Qwen36Scheduler<'model> {
                     dflash2_workspace,
                     workspace.stream(),
                 )?;
-                let outcome = self.model.verify_external_speculative_argmax(
-                    workspace,
-                    &proposals,
-                    &mut frontier,
-                    sequence,
-                    &mut self.sequence_cache,
-                )?;
+                let requires_constrained_verification = grammar_preview
+                    .as_ref()
+                    .map(|grammar| {
+                        let mut probe = grammar.deep_clone();
+                        if probe.is_active() {
+                            return Ok(true);
+                        }
+                        for &proposal in &proposals {
+                            probe.commit(proposal)?;
+                            if probe.is_active() {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                let outcome = if requires_constrained_verification {
+                    let grammar = grammar_preview
+                        .as_mut()
+                        .expect("constrained verification has a tool grammar");
+                    let mut selector = |logits: &[f32]| {
+                        if grammar.is_complete() {
+                            return Ok(None);
+                        }
+                        let selected = match grammar.mask()? {
+                            Some(mask) => argmax_logits_allowed(logits, &mask)?,
+                            None => argmax_logits(logits)?,
+                        };
+                        grammar.commit(selected.id)?;
+                        Ok(Some(Qwen36NextToken {
+                            id: selected.id,
+                            value: selected.logit,
+                        }))
+                    };
+                    self.model.verify_external_speculative_constrained(
+                        workspace,
+                        &proposals,
+                        &mut frontier,
+                        sequence,
+                        &mut self.sequence_cache,
+                        &mut selector,
+                    )?
+                } else {
+                    self.model.verify_external_speculative_argmax(
+                        workspace,
+                        &proposals,
+                        &mut frontier,
+                        sequence,
+                        &mut self.sequence_cache,
+                    )?
+                };
                 if let Err(error) = self.model.dflash2_append_speculative(
                     dflash2_state,
                     workspace,
@@ -1060,9 +1154,34 @@ impl<'model> Qwen36Scheduler<'model> {
             .expect("decode capacity classes cover the configured maximum");
         let mut rows = Vec::with_capacity(selected.len());
         let mut input_tokens = Vec::with_capacity(selected.len());
+        let mut grammar_masks = Vec::with_capacity(selected.len());
         for request in selected.iter_mut() {
             let token_id = request.decode_input_token()?;
             input_tokens.push(token_id);
+            let mask = if request.spec_ready && request.spec_started {
+                request
+                    .tool_grammar
+                    .as_ref()
+                    .map(|grammar| {
+                        let mut preview = grammar.deep_clone();
+                        let frontier = request
+                            .spec_frontier
+                            .as_ref()
+                            .expect("ready speculative request has a frontier");
+                        preview.commit(frontier.token)?;
+                        preview.mask()
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                request
+                    .tool_grammar
+                    .as_mut()
+                    .map(QwenXmlToolGrammar::mask)
+                    .transpose()?
+                    .flatten()
+            };
+            grammar_masks.push(mask);
             let sequence = request
                 .sequence
                 .as_deref_mut()
@@ -1078,6 +1197,25 @@ impl<'model> Qwen36Scheduler<'model> {
         drop(rows);
         let samples = {
             let mut decoded = decoded?;
+            if grammar_masks.iter().any(Option::is_some) {
+                let mask_words = decoded.vocab().div_ceil(32);
+                let mut packed = Vec::with_capacity(selected.len() * mask_words);
+                for mask in &grammar_masks {
+                    if let Some(mask) = mask {
+                        if mask.len() != mask_words {
+                            return Err(Error::Shape {
+                                label: "Qwen tool grammar mask",
+                                expected: format!("{mask_words} words"),
+                                actual: format!("{} words", mask.len()),
+                            });
+                        }
+                        packed.extend_from_slice(mask);
+                    } else {
+                        packed.resize(packed.len() + mask_words, u32::MAX);
+                    }
+                }
+                decoded.mask_logits(&packed)?;
+            }
             let hidden = self.model.manifest().hidden;
             let mut samples = if all_fast_argmax {
                 decoded
@@ -1681,6 +1819,30 @@ fn argmax_logits(logits: &[f32]) -> Result<SampledToken> {
     })
 }
 
+fn argmax_logits_allowed(logits: &[f32], allowed: &[u32]) -> Result<SampledToken> {
+    let (id, logit) = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(id, logit)| {
+            logit.is_finite() && QwenXmlToolGrammar::token_allowed(allowed, *id as u32)
+        })
+        .max_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.0.cmp(&left.0))
+        })
+        .ok_or_else(|| Error::Format {
+            label: "Qwen tool grammar logits",
+            detail: "grammar allowed no finite logits".to_string(),
+        })?;
+    Ok(SampledToken {
+        id: id as u32,
+        logit,
+        adjusted_logit: logit,
+    })
+}
+
 fn sequence_cache_error(error: CacheError<Error>) -> Error {
     Error::Format {
         label: "Qwen3.6 sequence cache",
@@ -1710,13 +1872,18 @@ fn prefill_chunk_tokens(
 mod tests {
     use super::{
         MAX_SPECULATIVE_DRAFTS, Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig,
-        RequestFinishReason, RequestState, SchedulerConfig, argmax_logits, decode_capacity_classes,
-        ordinary_decode_emission, prefill_chunk_tokens, speculative_draft_count,
+        RequestFinishReason, RequestState, SchedulerConfig, argmax_logits, argmax_logits_allowed,
+        decode_capacity_classes, ordinary_decode_emission, prefill_chunk_tokens,
+        speculative_draft_count,
     };
     use crate::qwen3::qwen36::{Qwen36DecodeBatchWorkspace, Qwen36TextModel};
     use crate::runtime::cache_config::SequenceCacheConfig;
+    use crate::runtime::chat::{ChatFunctionDefinition, ChatTool};
     use crate::runtime::sampling::{SampledToken, SamplingConfig};
+    use crate::runtime::tool_grammar::{QwenXmlGrammarFactory, QwenXmlToolGrammar};
+    use serde_json::json;
     use std::path::PathBuf;
+    use tokenizers::Tokenizer;
 
     #[test]
     fn argmax_prefers_the_lowest_token_on_a_tie() {
@@ -1726,11 +1893,20 @@ mod tests {
     }
 
     #[test]
+    fn grammar_argmax_ignores_disallowed_and_non_finite_tokens() {
+        let token =
+            argmax_logits_allowed(&[9.0, 7.0, f32::NAN, 8.0], &[0b1010]).expect("grammar argmax");
+        assert_eq!(token.id, 3);
+        assert_eq!(token.logit, 8.0);
+    }
+
+    #[test]
     fn lifecycle_finish_and_cancellation_are_distinct_public_states() {
         assert_ne!(RequestState::Waiting, RequestState::Prefilling);
         assert_ne!(RequestState::Prefilling, RequestState::Decoding);
         assert_ne!(RequestState::Decoding, RequestState::Finished);
         assert_ne!(RequestFinishReason::Eos, RequestFinishReason::Length);
+        assert_ne!(RequestFinishReason::Length, RequestFinishReason::ToolCalls);
         assert_eq!(Qwen36CancelOutcome::NotFound, Qwen36CancelOutcome::NotFound);
     }
 
@@ -1838,6 +2014,104 @@ mod tests {
         };
 
         assert_eq!(run(2), run(0));
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.8 and DFlash2 checkpoints"]
+    fn qwen38_dflash_verification_respects_active_tool_grammar() {
+        let model_dir = std::env::var_os("QWEN38_MODEL")
+            .map(PathBuf::from)
+            .expect("set QWEN38_MODEL to a Qwen3.8 checkpoint");
+        let dflash2_dir = std::env::var_os("QWEN38_DFLASH2")
+            .map(PathBuf::from)
+            .expect("set QWEN38_DFLASH2 to its DFlash2 companion");
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer");
+        let mut model = Qwen36TextModel::open(&model_dir).expect("load Qwen3.8 model");
+        model
+            .enable_dflash2(dflash2_dir)
+            .expect("load Qwen3.8 DFlash2 companion");
+        let tool = ChatTool::function(ChatFunctionDefinition {
+            name: "read".to_string(),
+            description: Some("Read a file".to_string()),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        });
+        let factory = QwenXmlGrammarFactory::new(&tokenizer, model.manifest().vocab)
+            .expect("grammar factory");
+        let seed = tokenizer
+            .encode(
+                "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n",
+                false,
+            )
+            .expect("tool-call prefix")
+            .get_ids()
+            .to_vec();
+        let new_seeded_grammar = || {
+            let mut grammar = factory
+                .build(std::slice::from_ref(&tool))
+                .expect("tool grammar")
+                .expect("one tool has a grammar");
+            for &token in &seed {
+                grammar.commit(token).expect("seed grammar");
+            }
+            grammar
+        };
+        let grammar = new_seeded_grammar();
+        assert!(grammar.is_active());
+        let mut scheduler = Qwen36Scheduler::new_with_cache_config(
+            &model,
+            SchedulerConfig {
+                decode_capacity: 1,
+                prefill_sequence_capacity: 1,
+                prefill_token_capacity: 16,
+                max_active_sequences: 1,
+                max_context_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                speculative_drafts: 2,
+            },
+            SequenceCacheConfig {
+                max_retained_bytes: 0,
+            },
+        )
+        .expect("scheduler");
+        let request = scheduler
+            .add_request_with_grammar(
+                vec![1, 2, 3, 4],
+                RequestConfig {
+                    sampling: SamplingConfig {
+                        temperature: 0.0,
+                        ..SamplingConfig::default()
+                    },
+                    max_new_tokens: 4,
+                    ..RequestConfig::default()
+                },
+                Some(grammar),
+            )
+            .expect("request");
+        for _ in 0..32 {
+            if scheduler.request_state(request) == Some(RequestState::Finished) {
+                break;
+            }
+            scheduler.tick().expect("scheduler tick");
+        }
+        let finished = scheduler
+            .remove_finished(request)
+            .expect("request finished");
+        assert_eq!(finished.finish_reason, RequestFinishReason::ToolCalls);
+        assert!(!finished.generated_tokens.is_empty());
+        let mut expected = new_seeded_grammar();
+        for token in finished.generated_tokens {
+            assert!(!expected.is_complete());
+            let mask = expected
+                .mask()
+                .expect("expected grammar mask")
+                .expect("seeded grammar remains active until the closing token");
+            assert!(QwenXmlToolGrammar::token_allowed(&mask, token.id));
+            expected.commit(token.id).expect("advance expected grammar");
+        }
+        assert!(expected.is_complete());
     }
 
     #[test]

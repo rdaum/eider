@@ -1115,7 +1115,13 @@ fn parse_function_call(
     })?;
     let emitted_name = &function[..open_end];
     validate_protocol_name("function", emitted_name)?;
-    let name = canonical_tool_name(emitted_name, tool_parameters);
+    let parameters = tool_parameters
+        .get(emitted_name)
+        .ok_or_else(|| Error::Format {
+            label: "chat tool call",
+            detail: format!("unknown function {emitted_name:?}"),
+        })?;
+    let name = emitted_name.to_string();
     let function_body = &function[open_end + 1..];
     let close_start = function_body
         .rfind("</function>")
@@ -1155,8 +1161,15 @@ fn parse_function_call(
         })?;
         let emitted_parameter_name = &parameter[..parameter_open_end];
         validate_protocol_name("parameter", emitted_parameter_name)?;
-        let parameter_name =
-            canonical_parameter_name(&name, emitted_parameter_name, tool_parameters);
+        if !parameters.names.contains(emitted_parameter_name) {
+            return Err(Error::Format {
+                label: "chat tool call",
+                detail: format!(
+                    "unknown parameter {emitted_parameter_name:?} for function {name:?}"
+                ),
+            });
+        }
+        let parameter_name = emitted_parameter_name.to_string();
         let parameter_body = &parameter[parameter_open_end + 1..];
         let parameter_close = parameter_body
             .find("</parameter>")
@@ -1175,6 +1188,17 @@ fn parse_function_call(
         remaining = &parameter_body[parameter_close + "</parameter>".len()..];
     }
 
+    if let Some(missing) = parameters
+        .required
+        .iter()
+        .find(|name| !arguments.contains_key(*name))
+    {
+        return Err(Error::Format {
+            label: "chat tool call",
+            detail: format!("missing required parameter {missing:?} for function {name:?}"),
+        });
+    }
+
     Ok(ChatFunctionCall { name, arguments })
 }
 
@@ -1187,53 +1211,6 @@ fn protocol_preview(value: &str) -> String {
     } else {
         format!("{preview:?}")
     }
-}
-
-fn canonical_tool_name(
-    emitted_name: &str,
-    tool_parameters: &BTreeMap<String, ToolParameters>,
-) -> String {
-    if tool_parameters.contains_key(emitted_name) {
-        return emitted_name.to_string();
-    }
-    let mut matches = tool_parameters
-        .keys()
-        .filter(|name| name.eq_ignore_ascii_case(emitted_name));
-    let first = matches.next();
-    let second = matches.next();
-    if let (Some(canonical), None) = (first, second) {
-        return canonical.clone();
-    }
-    if emitted_name == "list_files" && tool_parameters.contains_key("ls") {
-        return "ls".to_string();
-    }
-    emitted_name.to_string()
-}
-
-fn canonical_parameter_name(
-    function: &str,
-    emitted_name: &str,
-    tool_parameters: &BTreeMap<String, ToolParameters>,
-) -> String {
-    let Some(parameters) = tool_parameters.get(function) else {
-        return emitted_name.to_string();
-    };
-    if parameters.names.contains(emitted_name) {
-        return emitted_name.to_string();
-    }
-    let mut matches = parameters
-        .names
-        .iter()
-        .filter(|name| name.eq_ignore_ascii_case(emitted_name));
-    let first = matches.next();
-    let second = matches.next();
-    if let (Some(canonical), None) = (first, second) {
-        return canonical.clone();
-    }
-    if emitted_name == "file_path" && parameters.names.contains("path") {
-        return "path".to_string();
-    }
-    emitted_name.to_string()
 }
 
 fn parse_poolside_function_call(
@@ -1976,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_tool_call_uses_advertised_function_name_casing() {
+    fn standard_tool_call_rejects_wrong_function_name_casing() {
         let tools = vec![ChatTool::function(ChatFunctionDefinition {
             name: "bash".to_string(),
             description: Some("Run a shell command".to_string()),
@@ -1994,17 +1971,12 @@ mod tests {
             "</tool_call>"
         );
         let mut parser = ChatOutputParser::new(&tools, false).unwrap();
-        let mut events = parser.push_text(text).unwrap();
-        events.extend(parser.finish().unwrap());
-        let [ChatOutputEvent::ToolCall(call)] = events.as_slice() else {
-            panic!("expected one tool call");
-        };
-        assert_eq!(call.function.name, "bash");
-        assert_eq!(call.function.arguments.get("command"), Some(&json!("pwd")));
+        let message = parser.push_text(text).unwrap_err().to_string();
+        assert!(message.contains(r#"unknown function "Bash""#), "{message}");
     }
 
     #[test]
-    fn standard_tool_call_maps_list_files_to_advertised_ls() {
+    fn standard_tool_call_rejects_unadvertised_function_alias() {
         let tools = vec![ChatTool::function(ChatFunctionDefinition {
             name: "ls".to_string(),
             description: Some("List files".to_string()),
@@ -2021,20 +1993,15 @@ mod tests {
             "</tool_call>"
         );
         let mut parser = ChatOutputParser::new(&tools, false).unwrap();
-        let mut events = parser.push_text(text).unwrap();
-        events.extend(parser.finish().unwrap());
-        let [ChatOutputEvent::ToolCall(call)] = events.as_slice() else {
-            panic!("expected one tool call");
-        };
-        assert_eq!(call.function.name, "ls");
-        assert_eq!(
-            call.function.arguments.get("path"),
-            Some(&json!("/home/ryan/src/spark-infer"))
+        let message = parser.push_text(text).unwrap_err().to_string();
+        assert!(
+            message.contains(r#"unknown function "list_files""#),
+            "{message}"
         );
     }
 
     #[test]
-    fn standard_tool_call_maps_file_path_to_advertised_path() {
+    fn standard_tool_call_rejects_unadvertised_parameter_alias() {
         let tools = vec![ChatTool::function(ChatFunctionDefinition {
             name: "read".to_string(),
             description: Some("Read a file".to_string()),
@@ -2058,22 +2025,39 @@ mod tests {
             "</tool_call>"
         );
         let mut parser = ChatOutputParser::new(&tools, false).unwrap();
-        let mut events = parser.push_text(text).unwrap();
-        events.extend(parser.finish().unwrap());
-        let [ChatOutputEvent::ToolCall(call)] = events.as_slice() else {
-            panic!("expected one tool call");
-        };
-        assert_eq!(call.function.name, "read");
-        assert_eq!(
-            call.function.arguments,
-            BTreeMap::from([
-                ("limit".to_string(), json!(100)),
-                ("offset".to_string(), json!(1)),
-                (
-                    "path".to_string(),
-                    json!("/home/ryan/src/spark-infer/README.md"),
-                ),
-            ])
+        let message = parser.push_text(text).unwrap_err().to_string();
+        assert!(
+            message.contains(r#"unknown parameter "file_path""#),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn standard_tool_call_rejects_missing_required_parameter() {
+        let tools = vec![ChatTool::function(ChatFunctionDefinition {
+            name: "read".to_string(),
+            description: Some("Read a file".to_string()),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "number"}
+                },
+                "required": ["path"]
+            }),
+        })];
+        let text = concat!(
+            "<tool_call>\n",
+            "<function=read>\n",
+            "<parameter=offset>\n1\n</parameter>\n",
+            "</function>\n",
+            "</tool_call>"
+        );
+        let mut parser = ChatOutputParser::new(&tools, false).unwrap();
+        let message = parser.push_text(text).unwrap_err().to_string();
+        assert!(
+            message.contains(r#"missing required parameter "path""#),
+            "{message}"
         );
     }
 
@@ -2081,7 +2065,7 @@ mod tests {
     fn standard_tool_call_reports_unexpected_function_body() {
         let text = concat!(
             "<tool_call>\n",
-            "<function=tool>\n",
+            "<function=write_file>\n",
             "{\"name\":\"bash\"}\n",
             "</function>\n",
             "</tool_call>"
@@ -2091,7 +2075,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unexpected content"), "{message}");
         assert!(message.contains(r#"{\"name\":\"bash\"}"#), "{message}");
-        assert!(message.contains(r#"function "tool""#), "{message}");
+        assert!(message.contains(r#"function "write_file""#), "{message}");
     }
 
     #[test]

@@ -276,6 +276,8 @@ pub enum GenerationFinishReason {
     StopSequence(String),
     /// The request reached `max_new_tokens`.
     Length,
+    /// A request-scoped tool grammar completed a function call.
+    ToolCalls,
 }
 
 /// One generated token and the text now safe to stream to a client.
@@ -393,6 +395,7 @@ impl<'a> Qwen36GenerationSession<'a> {
         let mut finish_reason = sampled.finish_reason.map(|reason| match reason {
             RequestFinishReason::Eos => GenerationFinishReason::Eos,
             RequestFinishReason::Length => GenerationFinishReason::Length,
+            RequestFinishReason::ToolCalls => GenerationFinishReason::ToolCalls,
         });
         let mut text = String::new();
         if finish_reason == Some(GenerationFinishReason::Eos) {
@@ -410,7 +413,10 @@ impl<'a> Qwen36GenerationSession<'a> {
             finish_reason = output.matched.map(GenerationFinishReason::StopSequence);
         }
 
-        if finish_reason == Some(GenerationFinishReason::Length) {
+        if matches!(
+            finish_reason,
+            Some(GenerationFinishReason::Length | GenerationFinishReason::ToolCalls)
+        ) {
             text.push_str(&self.stop_buffer.finish());
         }
         if let Some(reason) = &finish_reason {

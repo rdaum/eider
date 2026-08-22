@@ -2256,6 +2256,14 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_mask_logits_f32_batch_on_stream(
+        logits: *mut f32,
+        allowed: *const u32,
+        rows: u32,
+        cols: u32,
+        mask_words: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_speculative_accept_argmax_f32_on_stream(
         previous_logits: *const *const f32,
         verification_logits: *const f32,

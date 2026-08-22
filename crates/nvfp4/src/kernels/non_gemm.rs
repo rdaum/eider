@@ -6909,6 +6909,54 @@ pub fn argmax_f32_batch_into_on_stream(
     }
 }
 
+/// Masks disallowed vocabulary logits in place with negative infinity.
+pub fn mask_logits_f32_batch_in_place_on_stream(
+    mut logits: DeviceInOut<'_, f32>,
+    allowed: &DeviceBuffer<u32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "logit grammar mask",
+        expected: "rows * vocabulary without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let mask_words = cols.div_ceil(32);
+    let mask_values = rows.checked_mul(mask_words).ok_or_else(|| Error::Shape {
+        label: "logit grammar mask",
+        expected: "rows * mask words without overflow".to_string(),
+        actual: format!("rows={rows} words={mask_words}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || mask_words > u32::MAX as usize
+        || logits.len() < values
+        || allowed.len() < mask_values
+    {
+        return Err(Error::Shape {
+            label: "logit grammar mask",
+            expected: format!("logits>={values} mask>={mask_values}"),
+            actual: format!("logits={} mask={}", logits.len(), allowed.len()),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_mask_logits_f32_batch_on_stream",
+            ffi::infer_mask_logits_f32_batch_on_stream(
+                logits.buffer_mut().ptr,
+                allowed.ptr,
+                rows as u32,
+                cols as u32,
+                mask_words as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Greedily accepts a contiguous speculative prefix for each sequence.
 ///
 /// Draft tokens and verification-logit rows are sequence-major. The first
@@ -12783,6 +12831,40 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn grammar_mask_applies_independent_rows_and_partial_words() {
+        let cols = 35usize;
+        let mut host_logits = (0..2 * cols).map(|value| value as f32).collect::<Vec<_>>();
+        host_logits[3] = 1000.0;
+        host_logits[cols + 34] = 2000.0;
+        let mut logits = DeviceBuffer::from_host(&host_logits).expect("logits");
+        let allowed = DeviceBuffer::from_host(&[1u32 << 3, 0, 1u32 << 1, 1u32 << (34 - 32)])
+            .expect("allowed mask");
+        let mut indices = DeviceBuffer::<u32>::zeroed(2).expect("indices");
+        let mut values = DeviceBuffer::<f32>::zeroed(2).expect("values");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        mask_logits_f32_batch_in_place_on_stream(logits.inout(), &allowed, 2, cols, &stream)
+            .expect("mask logits");
+        argmax_f32_batch_into_on_stream(
+            &logits,
+            indices.output(),
+            values.output(),
+            2,
+            cols,
+            &stream,
+        )
+        .expect("masked argmax");
+
+        assert_eq!(
+            indices.copy_to_host(&stream).expect("indices download"),
+            [3, 34]
+        );
+        let masked = logits.copy_to_host(&stream).expect("logits download");
+        assert!(masked[2].is_infinite() && masked[2].is_sign_negative());
+        assert!(masked[cols + 33].is_infinite() && masked[cols + 33].is_sign_negative());
+    }
 
     #[test]
     fn dflash2_capture_interleaves_target_taps_by_row() {

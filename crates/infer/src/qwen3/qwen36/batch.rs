@@ -16,7 +16,7 @@ use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
-    Nvfp4TnInputs, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
+    Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream,
@@ -25,8 +25,8 @@ use crate::nvfp4::{
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
-    lm_head_top1_f32_batch_into_on_stream, moe_topk_f32_batch_into_on_stream,
-    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    lm_head_top1_f32_batch_into_on_stream, mask_logits_f32_batch_in_place_on_stream,
+    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
@@ -165,6 +165,42 @@ impl Qwen36DecodedBatch<'_> {
             .logits
             .copy_prefix_to_host(active_logits, &self.workspace.stream)?
             .into_vec())
+    }
+
+    /// Applies one packed allowed-token bitset to each active logit row.
+    pub(crate) fn mask_logits(&mut self, allowed: &[u32]) -> Result<()> {
+        let mask_words = self.vocab.div_ceil(32);
+        let active_words =
+            self.rows
+                .checked_mul(mask_words)
+                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    label: "Qwen tool grammar masks",
+                    expected: "rows * mask words without overflow".to_string(),
+                    actual: format!("rows={} words={mask_words}", self.rows),
+                })?;
+        if allowed.len() != active_words {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen tool grammar masks",
+                expected: format!("{active_words} words"),
+                actual: format!("{} words", allowed.len()),
+            });
+        }
+        let host = self.workspace.host_grammar_masks.as_mut_slice();
+        host[..active_words].copy_from_slice(allowed);
+        self.workspace
+            .grammar_masks
+            .copy_range_from_pinned_on_stream(
+                0,
+                &self.workspace.host_grammar_masks,
+                &self.workspace.stream,
+            )?;
+        mask_logits_f32_batch_in_place_on_stream(
+            self.workspace.logits.inout(),
+            &self.workspace.grammar_masks,
+            self.rows,
+            self.vocab,
+            &self.workspace.stream,
+        )
     }
 
     /// Reduces each active logit row and copies the winning tokens to the host.
@@ -1805,6 +1841,8 @@ pub struct Qwen36DecodeBatchWorkspace {
     lm_head_quantized: DeviceBuffer<u8>,
     lm_head_scale: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
+    grammar_masks: DeviceBuffer<u32>,
+    host_grammar_masks: PinnedHostBuffer<u32>,
     next_indices: DeviceBuffer<u32>,
     next_values: DeviceBuffer<f32>,
     sampler: GpuTokenSampler,
@@ -1854,6 +1892,7 @@ impl Qwen36DecodeBatchWorkspace {
             + self.lm_head_quantized.device_bytes()
             + self.lm_head_scale.device_bytes()
             + self.logits.device_bytes()
+            + self.grammar_masks.device_bytes()
             + self.next_indices.device_bytes()
             + self.next_values.device_bytes()
             + self.sampler.device_bytes()
@@ -1926,6 +1965,8 @@ struct Qwen36SpeculativeVerification {
     next_logits: Vec<f32>,
     committed_logits: Vec<f32>,
 }
+
+type Qwen36LogitSelector<'a> = dyn FnMut(&[f32]) -> Result<Option<Qwen36NextToken>> + 'a;
 
 impl Qwen36SpeculativeCycleWorkspace {
     /// Returns the exact device bytes owned by the speculative workspace.
@@ -2692,6 +2733,10 @@ impl Qwen36TextModel {
             lm_head_quantized: DeviceBuffer::zeroed(capacity * self.manifest.hidden)?,
             lm_head_scale: DeviceBuffer::zeroed(capacity)?,
             logits: DeviceBuffer::zeroed(capacity * self.manifest.vocab)?,
+            grammar_masks: DeviceBuffer::zeroed(capacity * self.manifest.vocab.div_ceil(32))?,
+            host_grammar_masks: PinnedHostBuffer::zeroed(
+                capacity * self.manifest.vocab.div_ceil(32),
+            )?,
             next_indices: DeviceBuffer::zeroed(capacity)?,
             next_values: DeviceBuffer::zeroed(capacity)?,
             sampler: GpuTokenSampler::new(capacity, self.manifest.vocab)?,
@@ -3457,6 +3502,37 @@ impl Qwen36TextModel {
         sequence: &mut Qwen36Sequence,
         cache: &mut Qwen36SequenceCache,
     ) -> Result<Qwen36SpeculativeCycleOutcome> {
+        self.verify_external_speculative(workspace, drafted, frontier, sequence, cache, None)
+    }
+
+    pub(crate) fn verify_external_speculative_constrained(
+        &self,
+        workspace: &mut Qwen36SpeculativeCycleWorkspace,
+        drafted: &[u32],
+        frontier: &mut Qwen36SpeculativeFrontier,
+        sequence: &mut Qwen36Sequence,
+        cache: &mut Qwen36SequenceCache,
+        selector: &mut Qwen36LogitSelector<'_>,
+    ) -> Result<Qwen36SpeculativeCycleOutcome> {
+        self.verify_external_speculative(
+            workspace,
+            drafted,
+            frontier,
+            sequence,
+            cache,
+            Some(selector),
+        )
+    }
+
+    fn verify_external_speculative(
+        &self,
+        workspace: &mut Qwen36SpeculativeCycleWorkspace,
+        drafted: &[u32],
+        frontier: &mut Qwen36SpeculativeFrontier,
+        sequence: &mut Qwen36Sequence,
+        cache: &mut Qwen36SequenceCache,
+        mut selector: Option<&mut Qwen36LogitSelector<'_>>,
+    ) -> Result<Qwen36SpeculativeCycleOutcome> {
         if drafted.is_empty() || drafted.len() > workspace.drafts {
             return Err(crate::nvfp4::Error::Shape {
                 label: "Qwen3.8 external speculative proposal",
@@ -3526,24 +3602,26 @@ impl Qwen36TextModel {
                 verify.stream(),
             )?;
             round_f32_to_bf16_in_place_on_stream(workspace.normed_hidden.inout(), verify.stream())?;
-            match &self.lm_head {
-                Qwen36LmHead::Nvfp4(linear) => {
+            match (&self.lm_head, selector.is_some()) {
+                (Qwen36LmHead::Nvfp4(linear), _) => {
                     linear.run_f32_batch_into(
                         &workspace.normed_hidden,
                         &mut workspace.logits,
                         rows,
                         verify.stream(),
                     )?;
-                    argmax_f32_batch_into_on_stream(
-                        &workspace.logits,
-                        workspace.argmax_indices.output(),
-                        workspace.argmax_values.output(),
-                        row_capacity,
-                        self.manifest.vocab,
-                        verify.stream(),
-                    )?;
+                    if selector.is_none() {
+                        argmax_f32_batch_into_on_stream(
+                            &workspace.logits,
+                            workspace.argmax_indices.output(),
+                            workspace.argmax_values.output(),
+                            row_capacity,
+                            self.manifest.vocab,
+                            verify.stream(),
+                        )?;
+                    }
                 }
-                Qwen36LmHead::Bf16(linear) => {
+                (Qwen36LmHead::Bf16(linear), false) => {
                     lm_head_top1_f32_batch_into_on_stream(
                         &workspace.normed_hidden,
                         &linear.weight,
@@ -3557,7 +3635,18 @@ impl Qwen36TextModel {
                         verify.stream(),
                     )?;
                 }
-                Qwen36LmHead::Fp8 { .. } => {
+                (Qwen36LmHead::Bf16(linear), true) => {
+                    bf16_linear_logits_f32_batch_into_on_stream(
+                        &workspace.normed_hidden,
+                        &linear.weight,
+                        workspace.logits.output(),
+                        rows,
+                        linear.rows,
+                        linear.cols,
+                        verify.stream(),
+                    )?;
+                }
+                (Qwen36LmHead::Fp8 { .. }, _) => {
                     return Err(crate::nvfp4::Error::Format {
                         label: "Qwen3.8 speculative lm_head",
                         detail: "FP8 lm_head storage is unsupported for speculative decode"
@@ -3565,18 +3654,39 @@ impl Qwen36TextModel {
                     });
                 }
             }
-            let argmax = workspace
-                .argmax_indices
-                .copy_prefix_to_host(rows, verify.stream())?
-                .into_vec();
+            let (argmax, next_logits) = if let Some(selector) = selector.as_mut() {
+                let host = workspace
+                    .logits
+                    .copy_prefix_to_host(rows * self.manifest.vocab, verify.stream())?;
+                let mut argmax = Vec::with_capacity(rows);
+                let mut values = Vec::with_capacity(rows);
+                for logits in host.as_slice().chunks_exact(self.manifest.vocab) {
+                    let Some(selected) = selector(logits)? else {
+                        break;
+                    };
+                    argmax.push(selected.id);
+                    values.push(selected.value);
+                }
+                (argmax, values)
+            } else {
+                (
+                    workspace
+                        .argmax_indices
+                        .copy_prefix_to_host(rows, verify.stream())?
+                        .into_vec(),
+                    workspace
+                        .argmax_values
+                        .copy_prefix_to_host(rows, verify.stream())?
+                        .into_vec(),
+                )
+            };
             let mut accepted = 0;
-            while accepted < drafted.len() && drafted[accepted] == argmax[accepted] {
+            while accepted < drafted.len()
+                && accepted < argmax.len()
+                && drafted[accepted] == argmax[accepted]
+            {
                 accepted += 1;
             }
-            let next_logits = workspace
-                .argmax_values
-                .copy_prefix_to_host(accepted + 1, verify.stream())?
-                .into_vec();
             Ok(Qwen36SpeculativeVerification {
                 committed_logits: align_speculative_committed_logits(
                     frontier.logit,
@@ -3633,15 +3743,20 @@ impl Qwen36TextModel {
             return Err(error);
         }
         sequence.state.commit_append(committed_rows);
-        frontier.token = verification.argmax[verification.accepted];
-        frontier.logit = verification.next_logits[verification.accepted];
-        frontier.prev_hidden.copy_range_from_device_on_stream(
-            0,
-            verify.prompt_hidden(),
-            verification.accepted * hidden,
-            hidden,
-            verify.stream(),
-        )?;
+        if let (Some(&token), Some(&logit)) = (
+            verification.argmax.get(verification.accepted),
+            verification.next_logits.get(verification.accepted),
+        ) {
+            frontier.token = token;
+            frontier.logit = logit;
+            frontier.prev_hidden.copy_range_from_device_on_stream(
+                0,
+                verify.prompt_hidden(),
+                verification.accepted * hidden,
+                hidden,
+                verify.stream(),
+            )?;
+        }
         Ok(Qwen36SpeculativeCycleOutcome {
             committed: workspace.host_verify_tokens[..committed_rows].to_vec(),
             committed_logits: verification.committed_logits,

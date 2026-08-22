@@ -6709,6 +6709,39 @@ extern "C" cudaError_t infer_argmax_f32_batch_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_mask_logits_f32_batch_kernel(
+    float* logits,
+    const std::uint32_t* allowed,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t mask_words) {
+    const std::uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = blockIdx.y;
+    if (row >= rows || col >= cols) return;
+    const std::uint32_t word = allowed[row * mask_words + col / 32];
+    if ((word & (1U << (col % 32))) == 0) {
+        logits[static_cast<std::size_t>(row) * cols + col] = -INFINITY;
+    }
+}
+
+extern "C" cudaError_t infer_mask_logits_f32_batch_on_stream(
+    float* logits,
+    const std::uint32_t* allowed,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t mask_words,
+    cudaStream_t stream) {
+    if (logits == nullptr || allowed == nullptr || rows == 0 || cols == 0 ||
+        mask_words < (cols + 31) / 32) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 256;
+    const dim3 blocks((cols + kThreads - 1) / kThreads, rows);
+    infer_mask_logits_f32_batch_kernel<<<blocks, kThreads, 0, stream>>>(
+        logits, allowed, rows, cols, mask_words);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_argmax_f32_on_stream(const float* values,
                                                         std::uint32_t* out_index,
                                                         float* out_value,

@@ -473,10 +473,11 @@ fn tojson_compat(
     // Its default JSON policy sorts object keys and uses Python's `", "` and
     // `": "` separators. Preserve that exact prompt text: compact serde JSON
     // measurably changes tokenization for tool-heavy prompts.
-    let value = serde_json::to_value(value).map_err(|error| {
+    let mut value = serde_json::to_value(value).map_err(|error| {
         TemplateError::new(ErrorKind::InvalidOperation, "cannot serialize to JSON")
             .with_source(error)
     })?;
+    sort_json_object_keys(&mut value);
     let mut serialized = if let Some(indent) = indent {
         let mut output = Vec::new();
         let whitespace = " ".repeat(indent);
@@ -509,6 +510,21 @@ fn tojson_compat(
         }
     }
     Ok(TemplateValue::from_safe_string(safe))
+}
+
+fn sort_json_object_keys(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(sort_json_object_keys),
+        Value::Object(object) => {
+            let mut entries = std::mem::take(object).into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            for (_, value) in &mut entries {
+                sort_json_object_keys(value);
+            }
+            object.extend(entries);
+        }
+        _ => {}
+    }
 }
 
 struct JinjaJsonFormatter;

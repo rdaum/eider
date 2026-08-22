@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 fs2.workspace = true
+anyhow = "1"
 fast-telemetry.workspace = true
 rand = "0.9"
 rayon = "1"
@@ -16,6 +17,8 @@ minijinja = { version = "2.21.0", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 minijinja-contrib = { version = "2.21.0", features = ["pycompat"] }
 libc = "0.2"
+llguidance = "1.8"
+toktrie_hf_tokenizers = "1.8"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

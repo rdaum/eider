@@ -337,6 +337,7 @@ fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
     match reason {
         RequestFinishReason::Eos => ChatFinishReason::Eos,
         RequestFinishReason::Length => ChatFinishReason::Length,
+        RequestFinishReason::ToolCalls => ChatFinishReason::ToolCalls,
     }
 }
 

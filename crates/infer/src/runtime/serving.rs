@@ -9,6 +9,7 @@ use super::scheduler::{
     RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
 use super::stop::StopBuffer;
+use super::tool_grammar::QwenXmlGrammarFactory;
 use crate::qwen3::qwen36::Qwen36TextModel;
 use nvfp4::{Error, Result};
 use std::collections::BTreeMap;
@@ -138,6 +139,7 @@ struct ActiveChatRequest<'tokenizer> {
 pub struct Qwen36ChatService<'model, 'template> {
     template: &'template CheckpointChatTemplate,
     scheduler: Qwen36Scheduler<'model>,
+    tool_grammar: QwenXmlGrammarFactory,
     requests: BTreeMap<Qwen36RequestId, ActiveChatRequest<'template>>,
 }
 
@@ -158,9 +160,12 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         scheduler: SchedulerConfig,
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
+        let tool_grammar =
+            QwenXmlGrammarFactory::new(template.tokenizer(), model.manifest().vocab)?;
         Ok(Self {
             template,
             scheduler: Qwen36Scheduler::new_with_cache_config(model, scheduler, cache_config)?,
+            tool_grammar,
             requests: BTreeMap::new(),
         })
     }
@@ -183,9 +188,12 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         let filter = ResponseFilter::new(request.stop_sequences);
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
-        let id = self
-            .scheduler
-            .add_request(prompt.token_ids, request.generation)?;
+        let grammar = self.tool_grammar.build(&request.tools)?;
+        let id = self.scheduler.add_request_with_grammar(
+            prompt.token_ids,
+            request.generation,
+            grammar,
+        )?;
         let previous = self.requests.insert(
             id,
             ActiveChatRequest {
@@ -275,7 +283,10 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 .requests
                 .get_mut(&id)
                 .expect("terminal chat request is retained");
-            if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
+            if matches!(
+                reason,
+                ChatFinishReason::Eos | ChatFinishReason::Length | ChatFinishReason::ToolCalls
+            ) {
                 let events = if matches!(reason, ChatFinishReason::Length) {
                     request.output.finish_truncated()?
                 } else {
@@ -452,6 +463,7 @@ fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
     match reason {
         RequestFinishReason::Eos => ChatFinishReason::Eos,
         RequestFinishReason::Length => ChatFinishReason::Length,
+        RequestFinishReason::ToolCalls => ChatFinishReason::ToolCalls,
     }
 }
 
@@ -483,6 +495,10 @@ mod tests {
         assert_eq!(
             map_scheduler_finish(RequestFinishReason::Length),
             ChatFinishReason::Length
+        );
+        assert_eq!(
+            map_scheduler_finish(RequestFinishReason::ToolCalls),
+            ChatFinishReason::ToolCalls
         );
     }
 
