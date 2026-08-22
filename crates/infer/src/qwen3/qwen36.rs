@@ -10,7 +10,9 @@ pub use batch::{
     Qwen36SpeculativeCycleOutcome, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
 };
 pub use dflash2::{DFlash2Config, inspect_dflash2_config, validate_dflash2_checkpoint};
-pub(crate) use dflash2::{Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace};
+pub(crate) use dflash2::{
+    Qwen38DFlash2SequenceSnapshot, Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
+};
 pub use mtp::{Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36MtpWeights};
 
 use crate::metrics::ExpertPagingMetricHandle;

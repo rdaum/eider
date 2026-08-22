@@ -10,7 +10,7 @@ use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
     Qwen36NextToken, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
     Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier, Qwen36TextModel,
-    Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
+    Qwen38DFlash2SequenceSnapshot, Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
 };
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const MAX_SPECULATIVE_DRAFTS: usize = 7;
+/// Reserve one eighth of the configured prefix budget for DFlash2's bounded window state.
+const DFLASH2_RETAINED_BUDGET_DIVISOR: usize = 8;
 
 /// Stable scheduler identity for one request.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -371,6 +373,79 @@ impl Qwen36Request {
     }
 }
 
+struct Qwen38DFlash2PrefixEntry {
+    tokens: Box<[u32]>,
+    snapshot: Qwen38DFlash2SequenceSnapshot,
+    last_used: u64,
+}
+
+struct Qwen38DFlash2PrefixCache {
+    max_bytes: usize,
+    retained_bytes: usize,
+    clock: u64,
+    entries: Vec<Qwen38DFlash2PrefixEntry>,
+}
+
+impl Qwen38DFlash2PrefixCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            retained_bytes: 0,
+            clock: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, tokens: &[u32]) -> Option<&Qwen38DFlash2SequenceSnapshot> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens.as_ref() == tokens)?;
+        self.clock = self.clock.saturating_add(1);
+        self.entries[index].last_used = self.clock;
+        Some(&self.entries[index].snapshot)
+    }
+
+    fn can_retain(&self, bytes: usize) -> bool {
+        bytes != 0 && bytes <= self.max_bytes
+    }
+
+    fn insert(&mut self, tokens: &[u32], snapshot: Qwen38DFlash2SequenceSnapshot) -> bool {
+        let bytes = snapshot.device_bytes();
+        if bytes == 0 || bytes > self.max_bytes || snapshot.position() != tokens.len() {
+            return false;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens.as_ref() == tokens)
+        {
+            let replaced = self.entries.swap_remove(index);
+            self.retained_bytes -= replaced.snapshot.device_bytes();
+        }
+        while self.retained_bytes.saturating_add(bytes) > self.max_bytes {
+            let Some((index, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                return false;
+            };
+            let evicted = self.entries.swap_remove(index);
+            self.retained_bytes -= evicted.snapshot.device_bytes();
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.entries.push(Qwen38DFlash2PrefixEntry {
+            tokens: tokens.into(),
+            snapshot,
+            last_used: self.clock,
+        });
+        self.retained_bytes += bytes;
+        true
+    }
+}
+
 /// Decode-first continuous scheduler with deferred GPU admission.
 pub struct Qwen36Scheduler<'model> {
     model: &'model Qwen36TextModel,
@@ -387,6 +462,7 @@ pub struct Qwen36Scheduler<'model> {
     mtp_workspace: Option<Qwen36MtpDraftWorkspace>,
     mtp_hidden_scratch: Option<DeviceBuffer<f32>>,
     dflash2_workspace: Option<Qwen38DFlash2Workspace>,
+    dflash2_prefix_cache: Qwen38DFlash2PrefixCache,
     next_id: u64,
 }
 
@@ -488,21 +564,26 @@ impl<'model> Qwen36Scheduler<'model> {
                 actual: format!("fixed={fixed_capacity} pages={active_page_bytes}"),
             })?;
         let retained_bytes = cache_config.max_retained_bytes;
-        let snapshot_capacity = retained_bytes / 4;
-        let managed_bytes =
-            active_capacity
-                .checked_add(retained_bytes)
-                .ok_or_else(|| Error::Shape {
-                    label: "Qwen3.6 sequence-cache capacity",
-                    expected: "active and retained byte count without overflow".to_string(),
-                    actual: format!("active={active_capacity} retained={retained_bytes}"),
-                })?;
+        let dflash2_retained_bytes = if model.dflash2_enabled() && config.speculative_drafts > 0 {
+            retained_bytes / DFLASH2_RETAINED_BUDGET_DIVISOR
+        } else {
+            0
+        };
+        let target_retained_bytes = retained_bytes - dflash2_retained_bytes;
+        let snapshot_capacity = target_retained_bytes / 4;
+        let managed_bytes = active_capacity
+            .checked_add(target_retained_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 sequence-cache capacity",
+                expected: "active and retained byte count without overflow".to_string(),
+                actual: format!("active={active_capacity} retained={target_retained_bytes}"),
+            })?;
         let page_slots = eager_pages
-            .checked_add(retained_bytes.saturating_sub(snapshot_capacity) / page_bytes)
+            .checked_add(target_retained_bytes.saturating_sub(snapshot_capacity) / page_bytes)
             .ok_or_else(|| Error::Shape {
                 label: "Qwen3.6 sequence-cache page slots",
                 expected: "page count without overflow".to_string(),
-                actual: format!("active={eager_pages} retained={retained_bytes}"),
+                actual: format!("active={eager_pages} retained={target_retained_bytes}"),
             })?;
         if page_slots == 0 {
             return Err(Error::Shape {
@@ -528,7 +609,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 page_tokens: SM12X_KV_PAGE_TOKENS,
                 max_managed_bytes: managed_bytes,
                 max_snapshot_bytes: snapshot_capacity,
-                max_prefix_entries: (retained_bytes == 0).then_some(0),
+                max_prefix_entries: (target_retained_bytes == 0).then_some(0),
                 emergency_bytes: 0,
             },
             backend,
@@ -552,6 +633,7 @@ impl<'model> Qwen36Scheduler<'model> {
             mtp_workspace: None,
             mtp_hidden_scratch: None,
             dflash2_workspace: None,
+            dflash2_prefix_cache: Qwen38DFlash2PrefixCache::new(dflash2_retained_bytes),
             next_id: 0,
         })
     }
@@ -741,7 +823,6 @@ impl<'model> Qwen36Scheduler<'model> {
                     break;
                 }
             };
-            self.cache_stream.synchronize()?;
             let cached_prompt_tokens = sequence.position();
             let sequence = Qwen36Sequence::from_admission(cache_sequence, page_table, sequence);
             request.prompt_position = cached_prompt_tokens;
@@ -756,22 +837,37 @@ impl<'model> Qwen36Scheduler<'model> {
             if (self.model.dflash2_enabled() || self.model.mtp_weights().is_some())
                 && self.config.speculative_drafts > 0
                 && request.sampler.config().uses_fast_argmax()
-                && cached_prompt_tokens == 0
             {
                 let speculative_state = (|| {
-                    let dflash2_state = self
-                        .model
-                        .dflash2_enabled()
-                        .then(|| self.model.new_dflash2_sequence_state())
-                        .transpose()?;
-                    let mtp_state = if dflash2_state.is_none() {
+                    let dflash2_state = if !self.model.dflash2_enabled() {
+                        None
+                    } else if cached_prompt_tokens == 0 {
+                        Some(self.model.new_dflash2_sequence_state()?)
+                    } else if let Some(snapshot) = self
+                        .dflash2_prefix_cache
+                        .get(&request.prompt_tokens[..cached_prompt_tokens])
+                    {
+                        let mut state = self.model.new_dflash2_sequence_state()?;
+                        self.model.restore_dflash2_sequence_snapshot(
+                            snapshot,
+                            &mut state,
+                            &self.cache_stream,
+                        )?;
+                        Some(state)
+                    } else {
+                        None
+                    };
+                    let mtp_state = if !self.model.dflash2_enabled() && cached_prompt_tokens == 0 {
                         self.model
                             .new_mtp_sequence_state(request.max_tokens())
                             .map(Some)?
                     } else {
                         None
                     };
-                    Ok::<_, Error>((
+                    if dflash2_state.is_none() && mtp_state.is_none() {
+                        return Ok(None);
+                    }
+                    Ok::<_, Error>(Some((
                         dflash2_state,
                         mtp_state,
                         Qwen36SpeculativeFrontier {
@@ -779,14 +875,15 @@ impl<'model> Qwen36Scheduler<'model> {
                             logit: 0.0,
                             prev_hidden: DeviceBuffer::zeroed(self.model.manifest().hidden)?,
                         },
-                    ))
+                    )))
                 })();
                 match speculative_state {
-                    Ok((dflash2_state, mtp_state, frontier)) => {
+                    Ok(Some((dflash2_state, mtp_state, frontier))) => {
                         request.dflash2_state = dflash2_state;
                         request.mtp_state = mtp_state;
                         request.spec_frontier = Some(frontier);
                     }
+                    Ok(None) => {}
                     Err(error) => warn!(
                         request = request.id.get(),
                         %error,
@@ -794,6 +891,7 @@ impl<'model> Qwen36Scheduler<'model> {
                     ),
                 }
             }
+            self.cache_stream.synchronize()?;
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
             let progress = Qwen36AdmissionProgress {
@@ -1375,39 +1473,81 @@ impl<'model> Qwen36Scheduler<'model> {
         if sequence.position() != request.prefix_target {
             return;
         }
-        if self
+        let target_retained = if self
             .sequence_cache
             .contains_prefix(&request.prompt_tokens, request.prefix_target)
         {
-            request.prefix_retained = true;
-            return;
-        }
-        let snapshot = match self.model.snapshot_sequence(&sequence.state) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                warn!(
-                    request = request.id.get(),
-                    %error,
-                    "failed to copy recurrent prompt-prefix snapshot"
-                );
-                request.prefix_retained = true;
-                return;
+            true
+        } else {
+            let snapshot = match self.model.snapshot_sequence(&sequence.state) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to copy recurrent prompt-prefix snapshot"
+                    );
+                    request.prefix_retained = true;
+                    return;
+                }
+            };
+            match self.sequence_cache.retain_prefix(
+                sequence.cache_id,
+                &request.prompt_tokens,
+                snapshot,
+                &mut Sm12xCacheContext {
+                    stream: &self.cache_stream,
+                    page_table: &mut sequence.page_table,
+                },
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to retain shared prompt prefix"
+                    );
+                    false
+                }
             }
         };
-        if let Err(error) = self.sequence_cache.retain_prefix(
-            sequence.cache_id,
-            &request.prompt_tokens,
-            snapshot,
-            &mut Sm12xCacheContext {
-                stream: &self.cache_stream,
-                page_table: &mut sequence.page_table,
-            },
-        ) {
-            warn!(
-                request = request.id.get(),
-                %error,
-                "failed to retain shared prompt prefix"
-            );
+        if target_retained
+            && let Some(state) = request.dflash2_state.as_ref()
+            && state.position() == request.prefix_target
+        {
+            let prefix = &request.prompt_tokens[..request.prefix_target];
+            if self.dflash2_prefix_cache.get(prefix).is_none() {
+                let snapshot_bytes = self.model.dflash2_sequence_snapshot_bytes(state);
+                match snapshot_bytes {
+                    Ok(bytes) if self.dflash2_prefix_cache.can_retain(bytes) => match self
+                        .model
+                        .snapshot_dflash2_sequence_state(state, &self.cache_stream)
+                    {
+                        Ok(snapshot) => {
+                            if let Err(error) = self.cache_stream.synchronize() {
+                                warn!(
+                                    request = request.id.get(),
+                                    %error,
+                                    "failed to complete DFlash2 prefix snapshot"
+                                );
+                            } else {
+                                self.dflash2_prefix_cache.insert(prefix, snapshot);
+                            }
+                        }
+                        Err(error) => warn!(
+                            request = request.id.get(),
+                            %error,
+                            "failed to copy DFlash2 prompt-prefix snapshot"
+                        ),
+                    },
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        request = request.id.get(),
+                        %error,
+                        "failed to size DFlash2 prompt-prefix snapshot"
+                    ),
+                }
+            }
         }
         request.prefix_retained = true;
     }
@@ -2014,6 +2154,94 @@ mod tests {
         };
 
         assert_eq!(run(2), run(0));
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.8 and DFlash2 checkpoints"]
+    fn qwen38_cached_prefix_restores_dflash2_speculation() {
+        let model_dir = std::env::var_os("QWEN38_MODEL")
+            .map(PathBuf::from)
+            .expect("set QWEN38_MODEL to a Qwen3.8 checkpoint");
+        let dflash2_dir = std::env::var_os("QWEN38_DFLASH2")
+            .map(PathBuf::from)
+            .expect("set QWEN38_DFLASH2 to its DFlash2 companion");
+        let mut model = Qwen36TextModel::open(model_dir).expect("load Qwen3.8 model");
+        model
+            .enable_dflash2(dflash2_dir)
+            .expect("load Qwen3.8 DFlash2 companion");
+        let cached_prefix_tokens = crate::nvfp4::SM12X_KV_PAGE_TOKENS * 17;
+        let mut scheduler = Qwen36Scheduler::new_with_cache_config(
+            &model,
+            SchedulerConfig {
+                decode_capacity: 1,
+                prefill_sequence_capacity: 1,
+                prefill_token_capacity: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                max_active_sequences: 1,
+                max_context_tokens: cached_prefix_tokens + crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                speculative_drafts: 2,
+            },
+            SequenceCacheConfig {
+                max_retained_bytes: 1024 * 1024 * 1024,
+            },
+        )
+        .expect("scheduler");
+        let prompt = vec![1; cached_prefix_tokens + 1];
+        let run = |scheduler: &mut Qwen36Scheduler<'_>| {
+            let request = scheduler
+                .add_request(
+                    prompt.clone(),
+                    RequestConfig {
+                        sampling: SamplingConfig {
+                            temperature: 0.0,
+                            ..SamplingConfig::default()
+                        },
+                        max_new_tokens: 7,
+                        ..RequestConfig::default()
+                    },
+                )
+                .expect("request");
+            let mut cached_prompt_tokens = None;
+            let mut acceptance = Vec::new();
+            for _ in 0..32 {
+                let tick = scheduler.tick().expect("scheduler tick");
+                if let Some(progress) = tick
+                    .admitted
+                    .iter()
+                    .find(|progress| progress.request_id == request)
+                {
+                    cached_prompt_tokens = Some(progress.cached_prompt_tokens);
+                }
+                acceptance.extend(
+                    tick.speculative
+                        .iter()
+                        .filter(|progress| progress.request_id == request)
+                        .map(|progress| progress.accepted_drafts),
+                );
+                if scheduler.request_state(request) == Some(RequestState::Finished) {
+                    break;
+                }
+            }
+            let generated = scheduler
+                .remove_finished(request)
+                .expect("request finished")
+                .generated_tokens
+                .into_iter()
+                .map(|token| token.id)
+                .collect::<Vec<_>>();
+            (
+                cached_prompt_tokens.expect("request was admitted"),
+                generated,
+                acceptance,
+            )
+        };
+
+        let first = run(&mut scheduler);
+        let cached = run(&mut scheduler);
+        assert_eq!(first.0, 0);
+        assert_eq!(cached.0, cached_prefix_tokens);
+        assert_eq!(cached.1, first.1);
+        assert!(!cached.2.is_empty());
+        assert_eq!(cached.2, first.2);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::nvfp4::{
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use serde::Deserialize;
 use std::fs;
+use std::mem::size_of;
 use std::path::Path;
 
 const DFLASH2_ARCHITECTURE: &str = "DFlash2DraftModel";
@@ -406,6 +407,29 @@ impl Qwen38DFlash2SequenceState {
     }
 }
 
+struct DFlash2LayerSnapshot {
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    len: usize,
+}
+
+/// Immutable DFlash2 sliding-window state retained for one prompt prefix.
+pub(crate) struct Qwen38DFlash2SequenceSnapshot {
+    position: usize,
+    layers: Vec<DFlash2LayerSnapshot>,
+    device_bytes: usize,
+}
+
+impl Qwen38DFlash2SequenceSnapshot {
+    pub(crate) const fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) const fn device_bytes(&self) -> usize {
+        self.device_bytes
+    }
+}
+
 pub(crate) struct Qwen38DFlash2Workspace {
     token_ids: DeviceBuffer<u32>,
     aux: DeviceBuffer<f32>,
@@ -578,6 +602,112 @@ impl Qwen38DFlash2 {
             position: 0,
             layers,
         })
+    }
+
+    fn sequence_snapshot_device_bytes(&self, source: &Qwen38DFlash2SequenceState) -> Result<usize> {
+        let retained_rows = source.position.min(self.config.sliding_window);
+        if source.position == 0
+            || source.layers.len() != self.layers.len()
+            || source.layers.iter().any(|layer| layer.len != retained_rows)
+        {
+            return Err(Error::Format {
+                label: "DFlash2 sequence snapshot",
+                detail: "source position and layer windows are inconsistent".to_string(),
+            });
+        }
+        let kv_width = self.config.kv_heads * self.config.head_dim;
+        retained_rows
+            .checked_mul(kv_width)
+            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_mul(source.layers.len()))
+            .ok_or_else(|| Error::Shape {
+                label: "DFlash2 sequence snapshot",
+                expected: "device byte count without overflow".to_string(),
+                actual: format!("rows={retained_rows} width={kv_width}"),
+            })
+    }
+
+    fn snapshot_sequence_state(
+        &self,
+        source: &Qwen38DFlash2SequenceState,
+        stream: &CudaStream,
+    ) -> Result<Qwen38DFlash2SequenceSnapshot> {
+        let retained_rows = source.position.min(self.config.sliding_window);
+        let expected_device_bytes = self.sequence_snapshot_device_bytes(source)?;
+        let kv_width = self.config.kv_heads * self.config.head_dim;
+        let elements = retained_rows * kv_width;
+        let mut layers = Vec::with_capacity(source.layers.len());
+        let mut device_bytes = 0usize;
+        for source in &source.layers {
+            let mut key = DeviceBuffer::zeroed(elements)?;
+            let mut value = DeviceBuffer::zeroed(elements)?;
+            key.copy_prefix_from_device_on_stream(&source.key, elements, stream)?;
+            value.copy_prefix_from_device_on_stream(&source.value, elements, stream)?;
+            device_bytes = device_bytes
+                .checked_add(key.device_bytes())
+                .and_then(|bytes| bytes.checked_add(value.device_bytes()))
+                .ok_or_else(|| Error::Shape {
+                    label: "DFlash2 sequence snapshot",
+                    expected: "device byte count without overflow".to_string(),
+                    actual: format!("layers={}", self.layers.len()),
+                })?;
+            layers.push(DFlash2LayerSnapshot {
+                key,
+                value,
+                len: source.len,
+            });
+        }
+        debug_assert_eq!(device_bytes, expected_device_bytes);
+        Ok(Qwen38DFlash2SequenceSnapshot {
+            position: source.position,
+            layers,
+            device_bytes,
+        })
+    }
+
+    fn restore_sequence_snapshot(
+        &self,
+        snapshot: &Qwen38DFlash2SequenceSnapshot,
+        destination: &mut Qwen38DFlash2SequenceState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let retained_rows = snapshot.position.min(self.config.sliding_window);
+        let kv_width = self.config.kv_heads * self.config.head_dim;
+        let elements = retained_rows
+            .checked_mul(kv_width)
+            .ok_or_else(|| Error::Shape {
+                label: "DFlash2 sequence snapshot restore",
+                expected: "window elements without overflow".to_string(),
+                actual: format!("rows={retained_rows} width={kv_width}"),
+            })?;
+        if destination.position != 0
+            || snapshot.layers.len() != self.layers.len()
+            || destination.layers.len() != self.layers.len()
+            || snapshot.layers.iter().any(|layer| {
+                layer.len != retained_rows
+                    || layer.key.len() != elements
+                    || layer.value.len() != elements
+            })
+        {
+            return Err(Error::Format {
+                label: "DFlash2 sequence snapshot restore",
+                detail: "snapshot and empty destination are incompatible".to_string(),
+            });
+        }
+        for (snapshot, destination) in snapshot.layers.iter().zip(&mut destination.layers) {
+            destination
+                .key
+                .copy_prefix_from_device_on_stream(&snapshot.key, elements, stream)?;
+            destination.value.copy_prefix_from_device_on_stream(
+                &snapshot.value,
+                elements,
+                stream,
+            )?;
+            destination.len = snapshot.len;
+        }
+        destination.position = snapshot.position;
+        Ok(())
     }
 
     pub(crate) fn new_workspace(&self) -> Result<Qwen38DFlash2Workspace> {
@@ -1177,6 +1307,48 @@ impl Qwen36TextModel {
                 detail: "no companion is enabled".to_string(),
             })?
             .new_workspace()
+    }
+
+    pub(crate) fn snapshot_dflash2_sequence_state(
+        &self,
+        source: &Qwen38DFlash2SequenceState,
+        stream: &CudaStream,
+    ) -> Result<Qwen38DFlash2SequenceSnapshot> {
+        self.dflash2
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "DFlash2 snapshot",
+                detail: "no companion is enabled".to_string(),
+            })?
+            .snapshot_sequence_state(source, stream)
+    }
+
+    pub(crate) fn dflash2_sequence_snapshot_bytes(
+        &self,
+        source: &Qwen38DFlash2SequenceState,
+    ) -> Result<usize> {
+        self.dflash2
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "DFlash2 snapshot bytes",
+                detail: "no companion is enabled".to_string(),
+            })?
+            .sequence_snapshot_device_bytes(source)
+    }
+
+    pub(crate) fn restore_dflash2_sequence_snapshot(
+        &self,
+        snapshot: &Qwen38DFlash2SequenceSnapshot,
+        destination: &mut Qwen38DFlash2SequenceState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.dflash2
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "DFlash2 snapshot restore",
+                detail: "no companion is enabled".to_string(),
+            })?
+            .restore_sequence_snapshot(snapshot, destination, stream)
     }
 
     pub(crate) fn enable_dflash2_prefill_capture(
