@@ -285,12 +285,7 @@ fn build_arguments(grammar: &mut String, tool: usize, schema: &Value) -> Result<
     grammar.push('\n');
     build_required_states(grammar, tool, &required_parameters);
     if !optional_parameters.is_empty() {
-        grammar.push_str(&format!("optional_{tool}: ("));
-        for (position, parameter) in optional_parameters.iter().enumerate() {
-            grammar.push_str(if position == 0 { "" } else { " | " });
-            grammar.push_str(&format!("parameter_{tool}_{parameter}"));
-        }
-        grammar.push_str(")*\n");
+        build_optional_states(grammar, tool, &optional_parameters);
     }
 
     for (parameter, (name, parameter_schema)) in properties.iter().enumerate() {
@@ -350,6 +345,41 @@ fn build_required_states(grammar: &mut String, tool: usize, required: &[usize]) 
         grammar.push('\n');
     }
     grammar.push_str(&format!("required_{tool}: required_{tool}_0\n"));
+}
+
+fn build_optional_states(grammar: &mut String, tool: usize, optional: &[usize]) {
+    if optional.len() > MAX_PERMUTED_PARAMETERS {
+        for position in 0..=optional.len() {
+            grammar.push_str(&format!("optional_{tool}_{position}:"));
+            if let Some(parameter) = optional.get(position) {
+                grammar.push_str(&format!(
+                    " optional_{tool}_{} | parameter_{tool}_{parameter} optional_{tool}_{}\n",
+                    position + 1,
+                    position + 1
+                ));
+            } else {
+                grammar.push_str(" \"\"\n");
+            }
+        }
+        grammar.push_str(&format!("optional_{tool}: optional_{tool}_0\n"));
+        return;
+    }
+
+    let full = (1u64 << optional.len()) - 1;
+    for seen in 0..=full {
+        grammar.push_str(&format!("optional_{tool}_{seen}: \"\""));
+        for (bit, parameter) in optional.iter().enumerate() {
+            if seen & (1 << bit) != 0 {
+                continue;
+            }
+            let next = seen | (1 << bit);
+            grammar.push_str(&format!(
+                " | parameter_{tool}_{parameter} optional_{tool}_{next}"
+            ));
+        }
+        grammar.push('\n');
+    }
+    grammar.push_str(&format!("optional_{tool}: optional_{tool}_0\n"));
 }
 
 fn resolves_to_string(schema: &Value) -> bool {
@@ -447,6 +477,24 @@ mod tests {
     }
 
     #[test]
+    fn optional_parameters_use_uniqueness_tracking() {
+        let tool = tool();
+        let optional_index = tool.function.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .position(|name| name == "line")
+            .unwrap();
+        let (source, _) = build_qwen_xml_grammar(&[tool], None, None).unwrap();
+
+        assert!(source.contains(&format!(
+            "optional_0_0: \"\" | parameter_0_{optional_index} optional_0_1"
+        )));
+        assert!(source.contains("optional_0_1: \"\""));
+        assert!(!source.contains("optional_0: ("));
+    }
+
+    #[test]
     fn qwen_xml_rejects_invalid_protocol_names() {
         let mut invalid = tool();
         invalid.function.name = "read file".to_string();
@@ -517,6 +565,25 @@ mod tests {
                 break;
             }
             invalid.commit(token).unwrap();
+        }
+        assert!(rejected);
+
+        let mut duplicate = factory.build(&[tool()]).unwrap().unwrap();
+        let duplicate_call = tokenizer
+            .encode(
+                "<tool_call>\n<function=read>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=line>\n1\n</parameter>\n<parameter=line>\n2\n</parameter>\n</function>\n</tool_call>",
+                false,
+            )
+            .unwrap();
+        let mut rejected = false;
+        for &token in duplicate_call.get_ids() {
+            if let Some(mask) = duplicate.mask().unwrap()
+                && !QwenXmlToolGrammar::token_allowed(&mask, token)
+            {
+                rejected = true;
+                break;
+            }
+            duplicate.commit(token).unwrap();
         }
         assert!(rejected);
     }
