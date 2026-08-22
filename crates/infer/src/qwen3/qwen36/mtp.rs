@@ -22,7 +22,7 @@
 //! they propose tokens only. The drafter reuses the target LM head.
 
 use super::{
-    Nvfp4DeviceLinear, Qwen36FullAttentionState, Qwen36FullAttentionWeights,
+    Nvfp4DeviceLinear, Qwen36Fp8Nvfp4Cache, Qwen36FullAttentionState, Qwen36FullAttentionWeights,
     Qwen36FullAttentionWorkspace, Qwen36LmHeadWorkspace, Qwen36TextModel, read_bf16_matrix_host,
     read_bf16_vector_delta_as_f32_device,
 };
@@ -129,6 +129,7 @@ impl Qwen36MtpWeights {
     pub(super) fn load(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let hidden = manifest.hidden;
         let intermediate = manifest.intermediate;
@@ -142,6 +143,7 @@ impl Qwen36MtpWeights {
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
                 super::Qwen36Fp8Storage::Fp8,
+                fp8_nvfp4_cache,
             )?,
             k: super::Qwen36Linear::load(
                 checkpoint,
@@ -150,6 +152,7 @@ impl Qwen36MtpWeights {
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
                 super::Qwen36Fp8Storage::Fp8,
+                fp8_nvfp4_cache,
             )?,
             v: super::Qwen36Linear::load(
                 checkpoint,
@@ -158,6 +161,7 @@ impl Qwen36MtpWeights {
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
                 super::Qwen36Fp8Storage::Fp8,
+                fp8_nvfp4_cache,
             )?,
             o: super::Qwen36Linear::load(
                 checkpoint,
@@ -166,6 +170,7 @@ impl Qwen36MtpWeights {
                 manifest.q_heads * manifest.head_dim,
                 super::Qwen36Bf16Storage::Bf16,
                 super::Qwen36Fp8Storage::Fp8,
+                fp8_nvfp4_cache,
             )?,
             q_norm_weight: read_bf16_vector_delta_as_f32_device(
                 checkpoint,

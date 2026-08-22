@@ -7,10 +7,70 @@ use nvfp4::{
 };
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
 
 const CACHE_MARKER_VERSION: &str = "eider-qwen36-experts-v2";
+const FP8_NVFP4_CACHE_VERSION: &str = "qwen-fp8-nvfp4-v1";
+
+#[derive(Clone)]
+pub(crate) struct Qwen36Fp8Nvfp4Cache {
+    root: PathBuf,
+    hits: Arc<AtomicUsize>,
+    prepared: Arc<AtomicUsize>,
+}
+
+impl Qwen36Fp8Nvfp4Cache {
+    pub(crate) fn new(checkpoint: &ModelOptCheckpoint, artifact_root: &Path) -> Result<Self> {
+        let source = checkpoint_stamp(checkpoint.root())?;
+        let source_id = stable_hash(source.as_bytes());
+        let root = artifact_root
+            .join(FP8_NVFP4_CACHE_VERSION)
+            .join(format!("{source_id:016x}"));
+        std::fs::create_dir_all(&root).map_err(|error| cache_fs_error("create", &root, error))?;
+        Ok(Self {
+            root,
+            hits: Arc::new(AtomicUsize::new(0)),
+            prepared: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub(crate) fn load_or_quantize(
+        &self,
+        checkpoint: &ModelOptCheckpoint,
+        prefix: &str,
+    ) -> Result<ModelOptNvfp4Linear> {
+        let path = self
+            .root
+            .join(format!("{:016x}.nvfp4", stable_hash(prefix.as_bytes())));
+        if let Ok(weight) = ModelOptNvfp4Linear::read_cache_file(&path)
+            && weight.prefix == prefix
+        {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(weight);
+        }
+
+        let source = checkpoint.load_fp8_linear(prefix)?;
+        let weight = ModelOptNvfp4Linear::quantize_fp8(&source)?;
+        weight.write_cache_file(&path)?;
+        self.prepared.fetch_add(1, Ordering::Relaxed);
+        Ok(weight)
+    }
+
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.prepared.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
 
 pub(crate) fn ensure_model_cache(
     checkpoint: &ModelOptCheckpoint,

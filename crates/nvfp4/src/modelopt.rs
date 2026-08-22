@@ -23,9 +23,14 @@ use crate::safetensors::{SafeTensorInfo, SafeTensorShard};
 use crate::{CudaStream, DeviceBuffer};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+const NVFP4_CACHE_MAGIC: &[u8; 8] = b"EIDNVF4\0";
+const NVFP4_CACHE_VERSION: u32 = 1;
+const NVFP4_CACHE_HEADER_BYTES: u64 = 60;
 
 /// Metadata and raw host bytes for one ModelOpt NVFP4 linear weight.
 #[derive(Clone, Debug)]
@@ -281,6 +286,109 @@ impl ModelOptCublasLtWeight {
 }
 
 impl ModelOptNvfp4Linear {
+    /// Writes this host NVFP4 weight to an Eider-owned cache file.
+    pub fn write_cache_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        validate_cached_nvfp4(self)?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = File::create(&temporary)
+            .map_err(|error| nvfp4_cache_error("create", &temporary, error))?;
+        file.write_all(NVFP4_CACHE_MAGIC)
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.write_all(&NVFP4_CACHE_VERSION.to_le_bytes())
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        for value in [
+            self.out_features,
+            self.in_features,
+            self.packed_weight.len(),
+            self.weight_scale.len(),
+            self.prefix.len(),
+        ] {
+            file.write_all(&(value as u64).to_le_bytes())
+                .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        }
+        file.write_all(&self.weight_scale_2.to_le_bytes())
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.write_all(&self.input_scale.to_le_bytes())
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.write_all(self.prefix.as_bytes())
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.write_all(&self.packed_weight)
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.write_all(&self.weight_scale)
+            .map_err(|error| nvfp4_cache_error("write", &temporary, error))?;
+        file.flush()
+            .map_err(|error| nvfp4_cache_error("flush", &temporary, error))?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|error| nvfp4_cache_error("rename", path, error))
+    }
+
+    /// Reads and validates an Eider-owned host NVFP4 cache file.
+    pub fn read_cache_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|error| nvfp4_cache_error("open", path, error))?;
+        let file_len = file
+            .metadata()
+            .map_err(|error| nvfp4_cache_error("inspect", path, error))?
+            .len();
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)
+            .map_err(|error| nvfp4_cache_error("read", path, error))?;
+        let version = read_cache_u32(&mut file, path)?;
+        if magic != *NVFP4_CACHE_MAGIC || version != NVFP4_CACHE_VERSION {
+            return Err(Error::Format {
+                label: "NVFP4 host cache",
+                detail: format!("invalid header in {}", path.display()),
+            });
+        }
+        let out_features = read_cache_usize(&mut file, path)?;
+        let in_features = read_cache_usize(&mut file, path)?;
+        let packed_len = read_cache_usize(&mut file, path)?;
+        let scale_len = read_cache_usize(&mut file, path)?;
+        let prefix_len = read_cache_usize(&mut file, path)?;
+        let weight_scale_2 = read_cache_f32(&mut file, path)?;
+        let input_scale = read_cache_f32(&mut file, path)?;
+        let expected_len = NVFP4_CACHE_HEADER_BYTES
+            .checked_add(prefix_len as u64)
+            .and_then(|len| len.checked_add(packed_len as u64))
+            .and_then(|len| len.checked_add(scale_len as u64))
+            .ok_or_else(|| Error::Format {
+                label: "NVFP4 host cache",
+                detail: format!("payload length overflow in {}", path.display()),
+            })?;
+        if file_len != expected_len {
+            return Err(Error::Format {
+                label: "NVFP4 host cache",
+                detail: format!(
+                    "expected {expected_len} bytes in {}, got {file_len}",
+                    path.display()
+                ),
+            });
+        }
+        let mut prefix = vec![0; prefix_len];
+        let mut packed_weight = vec![0; packed_len];
+        let mut weight_scale = vec![0; scale_len];
+        file.read_exact(&mut prefix)
+            .and_then(|()| file.read_exact(&mut packed_weight))
+            .and_then(|()| file.read_exact(&mut weight_scale))
+            .map_err(|error| nvfp4_cache_error("read", path, error))?;
+        let prefix = String::from_utf8(prefix).map_err(|error| Error::Format {
+            label: "NVFP4 host cache",
+            detail: format!("non-UTF-8 prefix in {}: {error}", path.display()),
+        })?;
+        let weight = Self {
+            prefix,
+            out_features,
+            in_features,
+            packed_weight,
+            weight_scale,
+            weight_scale_2,
+            input_scale,
+        };
+        validate_cached_nvfp4(&weight)?;
+        Ok(weight)
+    }
+
     /// Quantizes a row-major BF16 weight to ModelOpt-compatible NVFP4 storage.
     ///
     /// This is a weight-only conversion: each consecutive K16 block receives
@@ -1342,9 +1450,129 @@ fn validate_modelopt_expert_scale(
     Ok(())
 }
 
+fn validate_cached_nvfp4(weight: &ModelOptNvfp4Linear) -> Result<()> {
+    if weight.out_features == 0 || weight.in_features == 0 || !weight.in_features.is_multiple_of(16)
+    {
+        return Err(Error::Shape {
+            label: "NVFP4 host cache",
+            expected: "non-zero dimensions and in_features divisible by 16".to_string(),
+            actual: format!(
+                "out_features={} in_features={}",
+                weight.out_features, weight.in_features
+            ),
+        });
+    }
+    let elements = weight
+        .out_features
+        .checked_mul(weight.in_features)
+        .ok_or_else(|| Error::Shape {
+            label: "NVFP4 host cache",
+            expected: "out_features * in_features without overflow".to_string(),
+            actual: format!(
+                "out_features={} in_features={}",
+                weight.out_features, weight.in_features
+            ),
+        })?;
+    let expected_weight = elements / 2;
+    let expected_scales = elements / 16;
+    if weight.packed_weight.len() != expected_weight || weight.weight_scale.len() != expected_scales
+    {
+        return Err(Error::Shape {
+            label: "NVFP4 host cache",
+            expected: format!("weight={expected_weight} scales={expected_scales}"),
+            actual: format!(
+                "weight={} scales={}",
+                weight.packed_weight.len(),
+                weight.weight_scale.len()
+            ),
+        });
+    }
+    if weight.prefix.is_empty()
+        || !weight.weight_scale_2.is_finite()
+        || !weight.input_scale.is_finite()
+    {
+        return Err(Error::Format {
+            label: "NVFP4 host cache",
+            detail: format!(
+                "expected a prefix and finite scales, got prefix={:?} weight_scale_2={} input_scale={}",
+                weight.prefix, weight.weight_scale_2, weight.input_scale
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_cache_u32(file: &mut File, path: &Path) -> Result<u32> {
+    let mut bytes = [0; 4];
+    file.read_exact(&mut bytes)
+        .map_err(|error| nvfp4_cache_error("read", path, error))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_cache_usize(file: &mut File, path: &Path) -> Result<usize> {
+    let mut bytes = [0; 8];
+    file.read_exact(&mut bytes)
+        .map_err(|error| nvfp4_cache_error("read", path, error))?;
+    usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| Error::Format {
+        label: "NVFP4 host cache",
+        detail: format!("dimension exceeds usize in {}", path.display()),
+    })
+}
+
+fn read_cache_f32(file: &mut File, path: &Path) -> Result<f32> {
+    let mut bytes = [0; 4];
+    file.read_exact(&mut bytes)
+        .map_err(|error| nvfp4_cache_error("read", path, error))?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+fn nvfp4_cache_error(action: &'static str, path: &Path, error: std::io::Error) -> Error {
+    Error::Format {
+        label: "NVFP4 host cache",
+        detail: format!("failed to {action} {}: {error}", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_CACHE_FILE: AtomicUsize = AtomicUsize::new(1);
+
+    fn cache_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eider-modelopt-nvfp4-cache-{}-{}",
+            std::process::id(),
+            NEXT_CACHE_FILE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn nvfp4_host_cache_round_trips() {
+        let path = cache_path();
+        let source = ModelOptNvfp4Linear {
+            prefix: "model.layers.7.mlp.down_proj".to_string(),
+            out_features: 2,
+            in_features: 16,
+            packed_weight: (0..16).collect(),
+            weight_scale: vec![11, 22],
+            weight_scale_2: 0.75,
+            input_scale: 1.25,
+        };
+
+        source.write_cache_file(&path).expect("write cache");
+        let restored = ModelOptNvfp4Linear::read_cache_file(&path).expect("read cache");
+        std::fs::remove_file(&path).expect("remove cache");
+
+        assert_eq!(restored.prefix, source.prefix);
+        assert_eq!(restored.out_features, source.out_features);
+        assert_eq!(restored.in_features, source.in_features);
+        assert_eq!(restored.packed_weight, source.packed_weight);
+        assert_eq!(restored.weight_scale, source.weight_scale);
+        assert_eq!(restored.weight_scale_2, source.weight_scale_2);
+        assert_eq!(restored.input_scale, source.input_scale);
+    }
 
     #[test]
     fn bf16_weight_quantization_emits_modelopt_k16_blocks() {

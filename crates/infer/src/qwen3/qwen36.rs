@@ -53,7 +53,8 @@ use super::infer::{
     QwenModelManifest,
 };
 use super::qwen36_cache::{
-    down_path, ensure_layer_cache, ensure_model_cache, gate_up_path, prepared_layer_dir,
+    Qwen36Fp8Nvfp4Cache, down_path, ensure_layer_cache, ensure_model_cache, gate_up_path,
+    prepared_layer_dir,
 };
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertUploadCoordinator, read_expert_misses,
@@ -76,6 +77,7 @@ pub struct Qwen36Model {
     fp8_attention_storage: Qwen36Fp8Storage,
     fp8_dense_mlp_storage: Qwen36Fp8Storage,
     fp8_lm_head_storage: Qwen36Fp8Storage,
+    fp8_nvfp4_cache: Qwen36Fp8Nvfp4Cache,
 }
 
 /// Runtime storage for checkpoint BF16 projection weights.
@@ -413,14 +415,17 @@ impl Qwen36Model {
             });
         }
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
+        let artifact_dir = artifact_dir.into();
+        let fp8_nvfp4_cache = Qwen36Fp8Nvfp4Cache::new(&checkpoint, &artifact_dir)?;
         Ok(Self {
             manifest,
             checkpoint,
-            artifact_dir: artifact_dir.into(),
+            artifact_dir,
             bf16_storage,
             fp8_attention_storage,
             fp8_dense_mlp_storage,
             fp8_lm_head_storage,
+            fp8_nvfp4_cache,
         })
     }
 
@@ -457,6 +462,7 @@ impl Qwen36Model {
                     layer,
                     self.bf16_storage.attention,
                     self.fp8_attention_storage,
+                    &self.fp8_nvfp4_cache,
                 )?,
             )),
             QwenLayerKind::FullAttention => Ok(Qwen36LayerWeights::FullAttention(
@@ -466,6 +472,7 @@ impl Qwen36Model {
                     layer,
                     self.bf16_storage.attention,
                     self.fp8_attention_storage,
+                    &self.fp8_nvfp4_cache,
                 )?,
             )),
         }
@@ -601,12 +608,13 @@ impl Qwen36Model {
 
 impl Qwen36FullAttentionWeights {
     /// Loads a full-attention layer by layer index from the Qwen3.6 text stack.
-    pub fn load(
+    pub(crate) fn load(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         layer: usize,
         bf16_storage: Qwen36Bf16Storage,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let prefix = format!("{}.layers.{layer}.self_attn", manifest.tensor_prefix);
         let expected_q_rows = manifest
@@ -639,6 +647,7 @@ impl Qwen36FullAttentionWeights {
             manifest.hidden,
             bf16_storage,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         let k = Qwen36Linear::load(
             checkpoint,
@@ -647,6 +656,7 @@ impl Qwen36FullAttentionWeights {
             manifest.hidden,
             bf16_storage,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         let v = Qwen36Linear::load(
             checkpoint,
@@ -655,6 +665,7 @@ impl Qwen36FullAttentionWeights {
             manifest.hidden,
             bf16_storage,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         let o = Qwen36Linear::load(
             checkpoint,
@@ -663,6 +674,7 @@ impl Qwen36FullAttentionWeights {
             manifest.q_heads * manifest.head_dim,
             bf16_storage,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         q.require_shape(expected_q_rows, manifest.hidden, "Qwen3.6 q_proj")?;
         k.require_shape(expected_kv_rows, manifest.hidden, "Qwen3.6 k_proj")?;
@@ -950,12 +962,13 @@ impl Qwen36FullAttentionWeights {
 
 impl Qwen36LinearAttentionWeights {
     /// Loads a linear-attention layer by layer index from the Qwen3.6 text stack.
-    pub fn load(
+    pub(crate) fn load(
         checkpoint: &ModelOptCheckpoint,
         manifest: &QwenModelManifest,
         layer: usize,
         bf16_storage: Qwen36Bf16Storage,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let fp8 = Rc::new(Qwen36LinearFp8Execution::new(
             checkpoint,
@@ -963,7 +976,15 @@ impl Qwen36LinearAttentionWeights {
             Qwen36Bf16StorageConfig::new(bf16_storage, Qwen36Bf16Storage::Bf16),
             fp8_storage,
         )?);
-        Self::load_with_fp8(checkpoint, manifest, layer, fp8, bf16_storage, fp8_storage)
+        Self::load_with_fp8(
+            checkpoint,
+            manifest,
+            layer,
+            fp8,
+            bf16_storage,
+            fp8_storage,
+            fp8_nvfp4_cache,
+        )
     }
 
     fn load_with_fp8(
@@ -973,6 +994,7 @@ impl Qwen36LinearAttentionWeights {
         fp8: Rc<Qwen36LinearFp8Execution>,
         bf16_storage: Qwen36Bf16Storage,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let linear = manifest.linear_attention.ok_or_else(|| Error::Format {
             label: "Qwen3.6 linear attention",
@@ -996,6 +1018,7 @@ impl Qwen36LinearAttentionWeights {
             manifest.hidden,
             bf16_storage,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         let z = Qwen36Linear::load_reordered_v_rows(
             checkpoint,
@@ -1005,6 +1028,7 @@ impl Qwen36LinearAttentionWeights {
             manifest.hidden,
             key_heads,
             storage,
+            fp8_nvfp4_cache,
         )?;
         let out = Qwen36Linear::load_reordered_v_cols(
             checkpoint,
@@ -1014,6 +1038,7 @@ impl Qwen36LinearAttentionWeights {
             head_v_dim,
             key_heads,
             storage,
+            fp8_nvfp4_cache,
         )?;
 
         // Reorder V heads from grouped-by-K to tiled order for tensors consumed after GDN prep.
@@ -1745,6 +1770,7 @@ impl Qwen36Linear {
         cols: usize,
         bf16_storage: Qwen36Bf16Storage,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let linear = if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
@@ -1768,16 +1794,21 @@ impl Qwen36Linear {
                 }
             }
         } else {
-            let host = checkpoint.load_fp8_linear(prefix)?;
             match fp8_storage {
-                Qwen36Fp8Storage::Fp8 => Self::Fp8(Fp8Linear::from_host(&host)?),
-                Qwen36Fp8Storage::Nvfp4 => Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?),
+                Qwen36Fp8Storage::Fp8 => {
+                    let host = checkpoint.load_fp8_linear(prefix)?;
+                    Self::Fp8(Fp8Linear::from_host(&host)?)
+                }
+                Qwen36Fp8Storage::Nvfp4 => Self::Nvfp4(Nvfp4DeviceLinear::from_host(
+                    &fp8_nvfp4_cache.load_or_quantize(checkpoint, prefix)?,
+                )?),
             }
         };
         linear.require_shape(rows, cols, "Qwen3.5 projection")?;
         Ok(linear)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_reordered_v_rows(
         checkpoint: &ModelOptCheckpoint,
         prefix: &str,
@@ -1786,6 +1817,7 @@ impl Qwen36Linear {
         cols: usize,
         key_heads: usize,
         storage: Qwen36AttentionStorage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let rows = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1816,18 +1848,29 @@ impl Qwen36Linear {
                 )?)),
             };
         }
-        let host = reorder_fp8_v_rows(
-            checkpoint.load_fp8_linear(prefix)?,
-            key_heads,
-            value_heads,
-            head_dim,
-        );
         match storage.fp8 {
-            Qwen36Fp8Storage::Fp8 => Ok(Self::Fp8(Fp8Linear::from_host(&host)?)),
-            Qwen36Fp8Storage::Nvfp4 => Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?)),
+            Qwen36Fp8Storage::Fp8 => {
+                let host = reorder_fp8_v_rows(
+                    checkpoint.load_fp8_linear(prefix)?,
+                    key_heads,
+                    value_heads,
+                    head_dim,
+                );
+                Ok(Self::Fp8(Fp8Linear::from_host(&host)?))
+            }
+            Qwen36Fp8Storage::Nvfp4 => {
+                let host = reorder_nvfp4_v_rows(
+                    fp8_nvfp4_cache.load_or_quantize(checkpoint, prefix)?,
+                    key_heads,
+                    value_heads,
+                    head_dim,
+                );
+                Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_host(&host)?))
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_reordered_v_cols(
         checkpoint: &ModelOptCheckpoint,
         prefix: &str,
@@ -1836,6 +1879,7 @@ impl Qwen36Linear {
         head_dim: usize,
         key_heads: usize,
         storage: Qwen36AttentionStorage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let cols = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
@@ -1866,15 +1910,25 @@ impl Qwen36Linear {
                 )?)),
             };
         }
-        let host = reorder_fp8_v_cols(
-            checkpoint.load_fp8_linear(prefix)?,
-            key_heads,
-            value_heads,
-            head_dim,
-        );
         match storage.fp8 {
-            Qwen36Fp8Storage::Fp8 => Ok(Self::Fp8(Fp8Linear::from_host(&host)?)),
-            Qwen36Fp8Storage::Nvfp4 => Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_fp8_host(&host)?)),
+            Qwen36Fp8Storage::Fp8 => {
+                let host = reorder_fp8_v_cols(
+                    checkpoint.load_fp8_linear(prefix)?,
+                    key_heads,
+                    value_heads,
+                    head_dim,
+                );
+                Ok(Self::Fp8(Fp8Linear::from_host(&host)?))
+            }
+            Qwen36Fp8Storage::Nvfp4 => {
+                let host = reorder_nvfp4_v_cols(
+                    fp8_nvfp4_cache.load_or_quantize(checkpoint, prefix)?,
+                    key_heads,
+                    value_heads,
+                    head_dim,
+                );
+                Ok(Self::Nvfp4(Nvfp4DeviceLinear::from_host(&host)?))
+            }
         }
     }
 
@@ -4971,11 +5025,6 @@ impl Nvfp4DeviceLinear {
         Self::from_host(&host)
     }
 
-    fn from_fp8_host(weight: &ModelOptFp8Linear) -> Result<Self> {
-        let host = ModelOptNvfp4Linear::quantize_fp8(weight)?;
-        Self::from_host(&host)
-    }
-
     /// W4A16 matvec: f32 input × dequantized NVFP4 weight → f32 output.
     fn run_f32_into(
         &self,
@@ -5256,6 +5305,7 @@ fn load_dense_gate_up(
     gate_prefix: &str,
     up_prefix: &str,
     fp8_storage: Qwen36Fp8Storage,
+    fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
 ) -> Result<Qwen36Linear> {
     let gate_nvfp4 = checkpoint.contains_tensor(&format!("{gate_prefix}.weight_scale_2"))
         || checkpoint.contains_tensor(&format!("{gate_prefix}.weight_global_scale"));
@@ -5309,21 +5359,28 @@ fn load_dense_gate_up(
             label: "Qwen dense gate/up storage",
             detail: "gate and up projections use different quantization formats".to_string(),
         }),
-        _ => {
-            let gate = checkpoint.load_fp8_linear(gate_prefix)?;
-            let up = checkpoint.load_fp8_linear(up_prefix)?;
-            let joined = ModelOptFp8Linear::concat_out_features(
-                format!("{gate_prefix}.gate_up_proj"),
-                &gate,
-                &up,
-            )?;
-            match fp8_storage {
-                Qwen36Fp8Storage::Fp8 => Fp8Linear::from_host(&joined).map(Qwen36Linear::Fp8),
-                Qwen36Fp8Storage::Nvfp4 => {
-                    Nvfp4DeviceLinear::from_fp8_host(&joined).map(Qwen36Linear::Nvfp4)
-                }
+        _ => match fp8_storage {
+            Qwen36Fp8Storage::Fp8 => {
+                let gate = checkpoint.load_fp8_linear(gate_prefix)?;
+                let up = checkpoint.load_fp8_linear(up_prefix)?;
+                let joined = ModelOptFp8Linear::concat_out_features(
+                    format!("{gate_prefix}.gate_up_proj"),
+                    &gate,
+                    &up,
+                )?;
+                Fp8Linear::from_host(&joined).map(Qwen36Linear::Fp8)
             }
-        }
+            Qwen36Fp8Storage::Nvfp4 => {
+                let gate = fp8_nvfp4_cache.load_or_quantize(checkpoint, gate_prefix)?;
+                let up = fp8_nvfp4_cache.load_or_quantize(checkpoint, up_prefix)?;
+                let joined = ModelOptNvfp4Linear::concat_out_features(
+                    format!("{gate_prefix}.gate_up_proj"),
+                    &gate,
+                    &up,
+                )?;
+                Nvfp4DeviceLinear::from_host(&joined).map(Qwen36Linear::Nvfp4)
+            }
+        },
     }
 }
 
@@ -5333,6 +5390,7 @@ impl Qwen36DenseMlpWeights {
         manifest: &QwenModelManifest,
         layer: usize,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let prefix = format!("{}.layers.{layer}.mlp", manifest.tensor_prefix);
         let gate_up = load_dense_gate_up(
@@ -5340,6 +5398,7 @@ impl Qwen36DenseMlpWeights {
             &format!("{prefix}.gate_proj"),
             &format!("{prefix}.up_proj"),
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         let down = Qwen36Linear::load(
             checkpoint,
@@ -5348,6 +5407,7 @@ impl Qwen36DenseMlpWeights {
             manifest.intermediate,
             Qwen36Bf16Storage::Bf16,
             fp8_storage,
+            fp8_nvfp4_cache,
         )?;
         if gate_up.rows() != manifest.intermediate * 2
             || gate_up.cols() != manifest.hidden
@@ -5631,6 +5691,7 @@ impl Qwen36LayerBlock {
                     fp8,
                     model.bf16_storage.attention,
                     model.fp8_attention_storage,
+                    &model.fp8_nvfp4_cache,
                 )?)
             }
             QwenLayerKind::FullAttention => {
@@ -5640,6 +5701,7 @@ impl Qwen36LayerBlock {
                     layer,
                     model.bf16_storage.attention,
                     model.fp8_attention_storage,
+                    &model.fp8_nvfp4_cache,
                 )?)
             }
         };
@@ -5660,6 +5722,7 @@ impl Qwen36LayerBlock {
                     &model.manifest,
                     layer,
                     model.fp8_dense_mlp_storage,
+                    &model.fp8_nvfp4_cache,
                 )?))
             }
         };
@@ -6182,6 +6245,7 @@ pub struct Qwen36TextModel {
     fp8_attention_storage: Qwen36Fp8Storage,
     fp8_dense_mlp_storage: Qwen36Fp8Storage,
     fp8_lm_head_storage: Qwen36Fp8Storage,
+    fp8_nvfp4_cache: Qwen36Fp8Nvfp4Cache,
 }
 
 enum Qwen36Embedding {
@@ -6256,6 +6320,7 @@ impl Qwen36LmHead {
         lt: &CublasLt,
         bf16_storage: Qwen36Bf16Storage,
         fp8_storage: Qwen36Fp8Storage,
+        fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         if checkpoint.contains_tensor("lm_head.weight_scale_2")
             || checkpoint.contains_tensor("lm_head.weight_global_scale")
@@ -6290,9 +6355,9 @@ impl Qwen36LmHead {
                 }
             }
         } else {
-            let host = checkpoint.load_fp8_linear("lm_head")?;
             match fp8_storage {
                 Qwen36Fp8Storage::Fp8 => {
+                    let host = checkpoint.load_fp8_linear("lm_head")?;
                     let linear = Fp8Linear::from_host(&host)?;
                     let plan = Fp8TnMatmulPlan::new(
                         lt,
@@ -6304,7 +6369,10 @@ impl Qwen36LmHead {
                         plan: Some(Box::new(plan)),
                     })
                 }
-                Qwen36Fp8Storage::Nvfp4 => Nvfp4DeviceLinear::from_fp8_host(&host).map(Self::Nvfp4),
+                Qwen36Fp8Storage::Nvfp4 => Nvfp4DeviceLinear::from_host(
+                    &fp8_nvfp4_cache.load_or_quantize(checkpoint, "lm_head")?,
+                )
+                .map(Self::Nvfp4),
             }
         }
     }
@@ -6768,6 +6836,7 @@ impl Qwen36TextModel {
         let fp8_attention_storage = model.fp8_attention_storage;
         let fp8_dense_mlp_storage = model.fp8_dense_mlp_storage;
         let fp8_lm_head_storage = model.fp8_lm_head_storage;
+        let fp8_nvfp4_cache = model.fp8_nvfp4_cache.clone();
         let is_moe = matches!(manifest.ffn, QwenFfnConfig::Moe { .. });
         if is_moe {
             ensure_model_cache(&checkpoint, &manifest, &artifact_dir)?;
@@ -6804,8 +6873,13 @@ impl Qwen36TextModel {
             &format!("{}.norm.weight", manifest.tensor_prefix),
             manifest.hidden,
         )?;
-        let lm_head =
-            Qwen36LmHead::load(&checkpoint, &lt, bf16_storage.lm_head, fp8_lm_head_storage)?;
+        let lm_head = Qwen36LmHead::load(
+            &checkpoint,
+            &lt,
+            bf16_storage.lm_head,
+            fp8_lm_head_storage,
+            &fp8_nvfp4_cache,
+        )?;
         let lm_head_shape = lm_head.shape();
         if lm_head_shape != (manifest.vocab, manifest.hidden) {
             return Err(Error::Shape {
@@ -6815,10 +6889,22 @@ impl Qwen36TextModel {
             });
         }
         let mtp = if manifest.mtp_layers > 0 && checkpoint.contains_tensor("mtp.fc.weight") {
-            Some(Qwen36MtpWeights::load(&checkpoint, &manifest)?)
+            Some(Qwen36MtpWeights::load(
+                &checkpoint,
+                &manifest,
+                &fp8_nvfp4_cache,
+            )?)
         } else {
             None
         };
+        let (cache_hits, cache_prepared) = fp8_nvfp4_cache.stats();
+        if cache_hits + cache_prepared > 0 {
+            tracing::info!(
+                cache_hits,
+                cache_prepared,
+                "loaded Qwen FP8-to-NVFP4 weight cache"
+            );
+        }
         Ok(Self {
             model_id: NEXT_QWEN36_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             manifest,
@@ -6836,6 +6922,7 @@ impl Qwen36TextModel {
             fp8_attention_storage,
             fp8_dense_mlp_storage,
             fp8_lm_head_storage,
+            fp8_nvfp4_cache,
         })
     }
 
@@ -6859,6 +6946,7 @@ impl Qwen36TextModel {
             fp8_attention_storage: self.fp8_attention_storage,
             fp8_dense_mlp_storage: self.fp8_dense_mlp_storage,
             fp8_lm_head_storage: self.fp8_lm_head_storage,
+            fp8_nvfp4_cache: self.fp8_nvfp4_cache.clone(),
         };
         for block in &mut self.layers {
             block
@@ -7086,6 +7174,7 @@ impl Qwen36TextModel {
             fp8_attention_storage: self.fp8_attention_storage,
             fp8_dense_mlp_storage: self.fp8_dense_mlp_storage,
             fp8_lm_head_storage: self.fp8_lm_head_storage,
+            fp8_nvfp4_cache: self.fp8_nvfp4_cache.clone(),
         };
         for block in &self.layers {
             layer_workspaces.push(block.workspace(&model, max_tokens)?);
@@ -7372,7 +7461,7 @@ impl Qwen36TextModel {
 mod tests {
     use super::{
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
-        reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
+        reorder_fp8_v_cols, reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
     use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
@@ -7519,6 +7608,56 @@ mod tests {
             [0, 2, 1, 3]
         );
         assert_eq!(reordered.weight_scale, [10, 12, 11, 13]);
+    }
+
+    #[test]
+    fn fp8_to_nvfp4_conversion_commutes_with_v_row_reordering() {
+        let source = ModelOptFp8Linear {
+            prefix: "z".to_string(),
+            out_features: 64,
+            in_features: 16,
+            weight: (0..64 * 16).map(|index| (index % 239) as u8).collect(),
+            weight_scale: 0.5,
+            channel_weight_scale: Some((0..64).map(|row| 0.25 + row as f32 / 64.0).collect()),
+            input_scale: None,
+        };
+        let converted_after =
+            ModelOptNvfp4Linear::quantize_fp8(&reorder_fp8_v_rows(source.clone(), 2, 4, 16))
+                .expect("convert reordered FP8");
+        let reordered_after = reorder_nvfp4_v_rows(
+            ModelOptNvfp4Linear::quantize_fp8(&source).expect("convert FP8"),
+            2,
+            4,
+            16,
+        );
+
+        assert_eq!(reordered_after.packed_weight, converted_after.packed_weight);
+        assert_eq!(reordered_after.weight_scale, converted_after.weight_scale);
+    }
+
+    #[test]
+    fn fp8_to_nvfp4_conversion_commutes_with_v_column_reordering() {
+        let source = ModelOptFp8Linear {
+            prefix: "out".to_string(),
+            out_features: 2,
+            in_features: 64,
+            weight: (0..2 * 64).map(|index| (index % 239) as u8).collect(),
+            weight_scale: 0.75,
+            channel_weight_scale: Some(vec![0.5, 1.25]),
+            input_scale: None,
+        };
+        let converted_after =
+            ModelOptNvfp4Linear::quantize_fp8(&reorder_fp8_v_cols(source.clone(), 2, 4, 16))
+                .expect("convert reordered FP8");
+        let reordered_after = reorder_nvfp4_v_cols(
+            ModelOptNvfp4Linear::quantize_fp8(&source).expect("convert FP8"),
+            2,
+            4,
+            16,
+        );
+
+        assert_eq!(reordered_after.packed_weight, converted_after.packed_weight);
+        assert_eq!(reordered_after.weight_scale, converted_after.weight_scale);
     }
 
     #[test]

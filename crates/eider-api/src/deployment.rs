@@ -36,6 +36,7 @@ pub struct ModelSpec {
 pub enum ArtifactKind {
     None,
     Qwen36Experts,
+    Qwen38Weights,
     Step37Experts,
     LagunaExperts,
     Deepseek4Experts,
@@ -111,8 +112,8 @@ const CATALOGUE: &[ModelSpec] = &[
         repository: "unsloth/Qwen3.8-27B-NVFP4",
         revision: "7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108",
         model_type: "qwen3_5",
-        artifact_kind: ArtifactKind::None,
-        artifact_estimate_bytes: 0,
+        artifact_kind: ArtifactKind::Qwen38Weights,
+        artifact_estimate_bytes: 16 << 30,
         defaults: ServingDefaults {
             served_model_name: "eider-qwen3.8",
             max_context_tokens: 32_768,
@@ -636,6 +637,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
         },
         preparation: match model_type.as_str() {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
+            "qwen3_5" => ArtifactKind::Qwen38Weights,
             "step3p7" => ArtifactKind::Step37Experts,
             "laguna" => ArtifactKind::LagunaExperts,
             "deepseek_v4" => ArtifactKind::Deepseek4Experts,
@@ -778,6 +780,7 @@ fn artifact_dir(repository: &str, revision: &str, kind: ArtifactKind) -> Result<
     let kind = match kind {
         ArtifactKind::None => "none",
         ArtifactKind::Qwen36Experts => "qwen36-experts-v1",
+        ArtifactKind::Qwen38Weights => "qwen38-derived-v1",
         ArtifactKind::Step37Experts => "step37-experts-v1",
         ArtifactKind::LagunaExperts => "laguna-experts-v1",
         ArtifactKind::Deepseek4Experts => "deepseek4-experts-nvfp4-v1",
@@ -800,6 +803,7 @@ fn local_artifact_dir(checkpoint_dir: &Path, model_type: &str) -> Result<PathBuf
         model_type,
         match model_type {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
+            "qwen3_5" => ArtifactKind::Qwen38Weights,
             "step3p7" => ArtifactKind::Step37Experts,
             "laguna" => ArtifactKind::LagunaExperts,
             "deepseek_v4" => ArtifactKind::Deepseek4Experts,
@@ -859,7 +863,8 @@ mod tests {
         assert_eq!(model.model_type, "qwen3_5");
         assert_eq!(model.repository, "unsloth/Qwen3.8-27B-NVFP4");
         assert_eq!(model.revision, "7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108");
-        assert_eq!(model.artifact_kind, ArtifactKind::None);
+        assert_eq!(model.artifact_kind, ArtifactKind::Qwen38Weights);
+        assert!(model.artifact_estimate_bytes >= 16 << 30);
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8");
         assert_eq!(model.defaults.max_context_tokens, 32_768);
         assert_eq!(model.defaults.prefill_token_capacity, 1_024);
