@@ -171,7 +171,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and admits a structured request to the CPU waiting queue.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Qwen36ChatAdmission> {
+    pub fn add_request(&mut self, mut request: ChatRequest) -> Result<Qwen36ChatAdmission> {
         validate_stop_sequences(&request.stop_sequences)?;
         let prompt = self.template.render_and_tokenize(
             &request.messages,
@@ -187,6 +187,11 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         )?;
         let filter = ResponseFilter::new(request.stop_sequences);
         let prompt_tokens = prompt.token_ids.len();
+        request.generation.max_new_tokens = completion_tokens_within_context(
+            prompt_tokens,
+            request.generation.max_new_tokens,
+            self.scheduler.config().max_context_tokens,
+        )?;
         let max_output_tokens = request.generation.max_new_tokens;
         let grammar = self.tool_grammar.build(&request.tools)?;
         let id = self.scheduler.add_request_with_grammar(
@@ -459,6 +464,21 @@ fn validate_stop_sequences(stop_sequences: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn completion_tokens_within_context(
+    prompt_tokens: usize,
+    requested_completion_tokens: usize,
+    max_context_tokens: usize,
+) -> Result<usize> {
+    let Some(remaining_tokens) = max_context_tokens.checked_sub(prompt_tokens) else {
+        return Err(Error::Shape {
+            label: "Qwen3.6 chat prompt capacity",
+            expected: format!("at most {max_context_tokens} tokens"),
+            actual: format!("{prompt_tokens} tokens"),
+        });
+    };
+    Ok(requested_completion_tokens.min(remaining_tokens))
+}
+
 fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
     match reason {
         RequestFinishReason::Eos => ChatFinishReason::Eos,
@@ -484,6 +504,20 @@ mod tests {
     fn empty_stop_sequences_are_rejected() {
         assert!(validate_stop_sequences(&[String::new()]).is_err());
         assert!(validate_stop_sequences(&["END".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn completion_limit_is_capped_to_remaining_context() {
+        assert_eq!(
+            completion_tokens_within_context(29_064, 4_096, 32_768).expect("prompt fits context"),
+            3_704
+        );
+        assert_eq!(
+            completion_tokens_within_context(32_768, 4_096, 32_768)
+                .expect("full prompt fits context"),
+            0
+        );
+        assert!(completion_tokens_within_context(32_769, 1, 32_768).is_err());
     }
 
     #[test]
