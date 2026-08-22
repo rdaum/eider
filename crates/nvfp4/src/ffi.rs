@@ -1957,6 +1957,15 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_copy_fp8_rows_to_f32_indexed_on_stream(
+        input: *const u8,
+        row_scales: *const f32,
+        rows: *const u32,
+        output: *mut f32,
+        batch_size: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_quantize_nvfp4_col_major_f32(
         input: *const f32,
         packed: *mut u8,

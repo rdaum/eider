@@ -1,6 +1,4 @@
-use infer::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, Result, copy_bf16_row_to_f32_indexed_into_on_stream,
-};
+use infer::nvfp4::{CublasLt, CudaStream, DeviceBuffer, Result};
 use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
 use std::env;
 use std::path::PathBuf;
@@ -18,14 +16,7 @@ fn main() -> Result<()> {
     let text = Qwen36TextModel::open(&model_dir)?;
     let mut hidden = DeviceBuffer::zeroed(manifest.hidden)?;
     let token_id_device = DeviceBuffer::from_host(&[0u32])?;
-    copy_bf16_row_to_f32_indexed_into_on_stream(
-        manifest.vocab,
-        manifest.hidden,
-        text.embedding(),
-        &token_id_device,
-        hidden.output(),
-        &stream,
-    )?;
+    text.gather_embedding(&token_id_device, hidden.output(), &stream)?;
     let h = hidden.copy_to_host(&stream)?;
     println!("embedding[0]: first={:.6} max|={:.6}", h[0], max_abs(&h));
 

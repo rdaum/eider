@@ -17,10 +17,13 @@ Eider has three priorities:
 ## Qwen3.8 quick start
 
 Qwen3.8 27B is the primary dense model in Eider. The standard launcher uses
-the [Inferact NVFP4 checkpoint](https://huggingface.co/Inferact/Qwen3.8-27B-NVFP4)
+the [Unsloth Dynamic NVFP4 checkpoint](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)
 and its
 [`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
 companion.
+
+The checkpoint uses NVFP4 for most MLP weights. It keeps attention, the LM
+head, and the final eight MLP blocks in FP8.
 
 You need a DGX Spark, stable Rust, and CUDA 13.x. The CUDA installation must
 include `nvcc` and cuBLASLt.
@@ -113,7 +116,7 @@ second column.
 
 | Catalogue ID | API model | Runtime path |
 | --- | --- | --- |
-| [`qwen3.8-27b`](https://huggingface.co/Inferact/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, ModelOpt NVFP4, DFlash2, compact FP4 KV, 262K model context |
+| [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE and compact FP4 KV |
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agent model with 262K context |
 | [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |

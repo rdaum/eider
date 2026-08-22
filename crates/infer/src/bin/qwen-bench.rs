@@ -9,7 +9,7 @@ use infer::qwen3::infer::{
 };
 use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
 use infer::qwen3::qwen36::{
-    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8AttentionStorage,
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8Storage,
     Qwen36GpuCounterProbe, Qwen36GpuCounterStage, Qwen36Model, Qwen36PrefillRow, Qwen36TextModel,
 };
 use infer::runtime::qwen36_sequence::{Qwen36Sequence, new_qwen36_sequence_cache};
@@ -32,7 +32,7 @@ struct BenchArgs {
     gpu_counter_stage: Option<Qwen36GpuCounterStage>,
     expert_cache_capacity: Option<usize>,
     bf16_storage: Qwen36Bf16StorageConfig,
-    fp8_attention_storage: Qwen36Fp8AttentionStorage,
+    fp8_attention_storage: Qwen36Fp8Storage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -290,7 +290,7 @@ impl BenchModel {
         artifact_dir: Option<&Path>,
         expert_cache_capacity: Option<usize>,
         bf16_storage: Qwen36Bf16StorageConfig,
-        fp8_attention_storage: Qwen36Fp8AttentionStorage,
+        fp8_attention_storage: Qwen36Fp8Storage,
     ) -> Result<Self> {
         let manifest = QwenModelManifest::load(model_dir)?;
         match manifest.architecture {
@@ -642,7 +642,7 @@ impl BenchArgs {
         let mut gpu_counter_stage = None;
         let mut expert_cache_capacity = None;
         let mut bf16_storage = Qwen36Bf16StorageConfig::default();
-        let mut fp8_attention_storage = Qwen36Fp8AttentionStorage::default();
+        let mut fp8_attention_storage = Qwen36Fp8Storage::default();
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -817,10 +817,10 @@ fn parse_bf16_storage(label: &'static str, value: &str) -> Result<Qwen36Bf16Stor
     }
 }
 
-fn parse_fp8_storage(value: &str) -> Result<Qwen36Fp8AttentionStorage> {
+fn parse_fp8_storage(value: &str) -> Result<Qwen36Fp8Storage> {
     match value {
-        "fp8" => Ok(Qwen36Fp8AttentionStorage::Fp8),
-        "nvfp4" => Ok(Qwen36Fp8AttentionStorage::Nvfp4),
+        "fp8" => Ok(Qwen36Fp8Storage::Fp8),
+        "nvfp4" => Ok(Qwen36Fp8Storage::Nvfp4),
         _ => Err(Error::Format {
             label: "--qwen-fp8-attention",
             detail: format!("unknown mode {value:?}"),

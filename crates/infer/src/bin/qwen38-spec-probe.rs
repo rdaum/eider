@@ -10,7 +10,7 @@
 
 use infer::nvfp4::{CudaStream, DeviceBuffer, Error, Result};
 use infer::qwen3::qwen36::{
-    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8AttentionStorage,
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8Storage,
     Qwen36PrefillRow, Qwen36SpeculativeFrontier, Qwen36TextModel,
 };
 use infer::runtime::qwen36_sequence::{Qwen36Sequence, new_qwen36_sequence_cache};
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
     let model = Qwen36TextModel::open_with_storage(
         &args.model_dir,
         Qwen36Bf16StorageConfig::new(Qwen36Bf16Storage::Bf16, Qwen36Bf16Storage::Bf16),
-        Qwen36Fp8AttentionStorage::Fp8,
+        Qwen36Fp8Storage::Fp8,
     )?;
     let manifest = model.manifest();
     println!(

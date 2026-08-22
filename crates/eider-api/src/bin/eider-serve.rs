@@ -7,7 +7,7 @@ use infer::metrics::metrics as infer_metrics;
 use infer::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
 };
-use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage};
+use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage};
 use infer::runtime::scheduler::SchedulerConfig;
 use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
 use std::future::Future;
@@ -42,17 +42,17 @@ impl From<QwenBf16StorageArg> for Qwen36Bf16Storage {
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum QwenFp8AttentionStorageArg {
-    #[default]
+enum QwenFp8StorageArg {
     Fp8,
+    #[default]
     Nvfp4,
 }
 
-impl From<QwenFp8AttentionStorageArg> for Qwen36Fp8AttentionStorage {
-    fn from(value: QwenFp8AttentionStorageArg) -> Self {
+impl From<QwenFp8StorageArg> for Qwen36Fp8Storage {
+    fn from(value: QwenFp8StorageArg) -> Self {
         match value {
-            QwenFp8AttentionStorageArg::Fp8 => Self::Fp8,
-            QwenFp8AttentionStorageArg::Nvfp4 => Self::Nvfp4,
+            QwenFp8StorageArg::Fp8 => Self::Fp8,
+            QwenFp8StorageArg::Nvfp4 => Self::Nvfp4,
         }
     }
 }
@@ -194,8 +194,16 @@ struct Args {
     qwen_bf16_lm_head: QwenBf16StorageArg,
 
     /// Runtime storage for native FP8 Qwen attention projections.
-    #[arg(long, value_enum, default_value_t = QwenFp8AttentionStorageArg::Fp8)]
-    qwen_fp8_attention: QwenFp8AttentionStorageArg,
+    #[arg(long, value_enum, default_value_t = QwenFp8StorageArg::Nvfp4)]
+    qwen_fp8_attention: QwenFp8StorageArg,
+
+    /// Runtime storage for native FP8 Qwen dense-MLP projections.
+    #[arg(long, value_enum, default_value_t = QwenFp8StorageArg::Nvfp4)]
+    qwen_fp8_dense_mlp: QwenFp8StorageArg,
+
+    /// Runtime storage for the native FP8 Qwen LM head.
+    #[arg(long, value_enum, default_value_t = QwenFp8StorageArg::Nvfp4)]
+    qwen_fp8_lm_head: QwenFp8StorageArg,
 
     /// Resident expert slots per routed Step layer.
     #[arg(long)]
@@ -333,6 +341,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.qwen_bf16_lm_head.into(),
     );
     actor_config.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
+    actor_config.qwen_fp8_dense_mlp_storage = args.qwen_fp8_dense_mlp.into();
+    actor_config.qwen_fp8_lm_head_storage = args.qwen_fp8_lm_head.into();
     actor_config.step_expert_capacity = step_expert_capacity;
     actor_config.deepseek_expert_capacity = args.deepseek_expert_capacity;
     actor_config.step_bf16_storage = Step37Bf16StorageConfig {

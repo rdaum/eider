@@ -4,15 +4,16 @@
 //! non-causal block, and lets the target commit the accepted prefix. This
 //! module keeps the companion's format separate from the target checkpoint.
 
+use super::batch::{BatchFp8InputQuantization, BatchFp8LinearPlan, run_fp8_batch};
 use super::{Qwen36LmHead, Qwen36TextModel};
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, ModelOptCheckpoint,
     PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
     dflash2_noncausal_attention_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_prefix_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_sequence_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    fill_f32_prefix_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream,
 };
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use serde::Deserialize;
@@ -446,6 +447,9 @@ pub(crate) struct Qwen38DFlash2Workspace {
     activated: DeviceBuffer<f32>,
     bf16_input: DeviceBuffer<u16>,
     sample_hidden: DeviceBuffer<f32>,
+    lm_head_plan: Option<BatchFp8LinearPlan>,
+    lm_head_quantized: DeviceBuffer<u8>,
+    lm_head_scale: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     host_hidden: PinnedHostBuffer<f32>,
     host_logits: PinnedHostBuffer<f32>,
@@ -710,13 +714,20 @@ impl Qwen38DFlash2 {
         Ok(())
     }
 
-    pub(crate) fn new_workspace(&self) -> Result<Qwen38DFlash2Workspace> {
+    pub(crate) fn new_workspace(&self, model: &Qwen36TextModel) -> Result<Qwen38DFlash2Workspace> {
         let rows = DFLASH2_CONTEXT_ROWS;
         let block_rows = DFLASH2_BLOCK_ROWS;
         let hidden = self.config.hidden;
         let kv_width = self.config.kv_heads * self.config.head_dim;
         let q_width = self.config.heads * self.config.head_dim;
         let groups = hidden / self.config.conv_group_size;
+        let draft_tokens = self.config.draft_tokens();
+        let lm_head_plan = match &model.lm_head {
+            Qwen36LmHead::Fp8 { linear, .. } => {
+                Some(BatchFp8LinearPlan::new(model, linear, draft_tokens)?)
+            }
+            Qwen36LmHead::Nvfp4(_) | Qwen36LmHead::Bf16(_) => None,
+        };
         Ok(Qwen38DFlash2Workspace {
             token_ids: DeviceBuffer::zeroed(block_rows)?,
             aux: DeviceBuffer::zeroed(rows * self.config.target_layers.len() * hidden)?,
@@ -737,11 +748,14 @@ impl Qwen38DFlash2 {
                     .intermediate
                     .max(self.config.target_layers.len() * hidden),
             )?,
-            sample_hidden: DeviceBuffer::zeroed(self.config.draft_tokens() * hidden)?,
-            logits: DeviceBuffer::zeroed(self.config.draft_tokens() * self.config.vocab)?,
-            host_hidden: PinnedHostBuffer::zeroed(self.config.draft_tokens() * hidden)?,
-            host_logits: PinnedHostBuffer::zeroed(self.config.draft_tokens() * self.config.vocab)?,
-            projected: Vec::with_capacity(self.config.draft_tokens() * self.config.selector_rank),
+            sample_hidden: DeviceBuffer::zeroed(draft_tokens * hidden)?,
+            lm_head_plan,
+            lm_head_quantized: DeviceBuffer::zeroed(draft_tokens * hidden)?,
+            lm_head_scale: DeviceBuffer::zeroed(draft_tokens)?,
+            logits: DeviceBuffer::zeroed(draft_tokens * self.config.vocab)?,
+            host_hidden: PinnedHostBuffer::zeroed(draft_tokens * hidden)?,
+            host_logits: PinnedHostBuffer::zeroed(draft_tokens * self.config.vocab)?,
+            projected: Vec::with_capacity(draft_tokens * self.config.selector_rank),
             candidates: Vec::with_capacity(self.config.selector_top_k),
             drafts: Vec::with_capacity(self.config.draft_tokens()),
         })
@@ -905,10 +919,9 @@ impl Qwen38DFlash2 {
         let mut tokens = [self.config.mask_token; DFLASH2_BLOCK_ROWS];
         tokens[0] = anchor_token;
         workspace.token_ids.copy_prefix_from_host(&tokens[..rows])?;
-        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+        model.embedding.gather_prefix(
             self.config.vocab,
             self.config.hidden,
-            &model.embedding,
             &workspace.token_ids,
             workspace.hidden.output(),
             rows,
@@ -1146,11 +1159,32 @@ impl Qwen38DFlash2 {
                     stream,
                 )?;
             }
-            Qwen36LmHead::Fp8 { .. } => {
-                return Err(Error::Format {
-                    label: "DFlash2 target LM head",
-                    detail: "FP8 target LM-head storage is not supported".to_string(),
-                });
+            Qwen36LmHead::Fp8 { linear, .. } => {
+                quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                    &workspace.sample_hidden,
+                    &mut workspace.lm_head_quantized,
+                    &mut workspace.lm_head_scale,
+                    drafts,
+                    linear.cols,
+                    stream,
+                )?;
+                run_fp8_batch(
+                    model,
+                    linear,
+                    workspace
+                        .lm_head_plan
+                        .as_mut()
+                        .expect("FP8 DFlash2 target LM head has a batch plan"),
+                    &workspace.sample_hidden,
+                    &workspace.lm_head_quantized,
+                    &workspace.lm_head_scale,
+                    BatchFp8InputQuantization::Dynamic,
+                    &mut workspace.logits,
+                    drafts,
+                    256,
+                    true,
+                    stream,
+                )?;
             }
         }
         let hidden_values = drafts * self.config.hidden;
@@ -1306,7 +1340,7 @@ impl Qwen36TextModel {
                 label: "DFlash2 workspace",
                 detail: "no companion is enabled".to_string(),
             })?
-            .new_workspace()
+            .new_workspace(self)
     }
 
     pub(crate) fn snapshot_dflash2_sequence_state(

@@ -1,7 +1,7 @@
 use infer::nvfp4::CudaStream;
 use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
-    Qwen36Fp8AttentionStorage, Qwen36TextModel,
+    Qwen36Fp8Storage, Qwen36TextModel,
 };
 use infer::runtime::qwen36_sequence::{
     Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
@@ -363,7 +363,7 @@ fn main() {
                 model_dir,
                 artifact_dir,
                 Qwen36Bf16StorageConfig::default(),
-                Qwen36Fp8AttentionStorage::default(),
+                Qwen36Fp8Storage::default(),
             )
         } else {
             Qwen36TextModel::open(model_dir)

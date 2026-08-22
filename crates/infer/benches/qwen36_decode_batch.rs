@@ -1,7 +1,7 @@
 use infer::nvfp4::{CudaStream, GpuSamplingRow, SM12X_KV_PAGE_TOKENS};
 use infer::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
-    Qwen36Fp8AttentionStorage, Qwen36PrefillRow, Qwen36TextModel,
+    Qwen36Fp8Storage, Qwen36PrefillRow, Qwen36TextModel,
 };
 use infer::runtime::qwen36_sequence::{
     Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
@@ -540,7 +540,7 @@ fn main() {
                 path,
                 artifact_dir,
                 bf16_storage,
-                Qwen36Fp8AttentionStorage::default(),
+                Qwen36Fp8Storage::default(),
             )
         } else {
             Qwen36TextModel::open_with_bf16_storage(path, bf16_storage)

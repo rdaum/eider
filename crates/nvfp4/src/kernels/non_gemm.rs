@@ -4858,6 +4858,68 @@ pub fn copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
     }
 }
 
+/// Copies FP8 embedding rows to f32 and applies one scale per vocabulary row.
+pub fn copy_fp8_rows_to_f32_indexed_prefix_into_on_stream(
+    vocab_rows: usize,
+    cols: usize,
+    input: &DeviceBuffer<u8>,
+    row_scales: &DeviceBuffer<f32>,
+    rows: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    row_count: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = vocab_rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "copy FP8 rows to f32 input",
+        expected: "vocab_rows * cols without overflow".to_string(),
+        actual: format!("vocab_rows={vocab_rows} cols={cols}"),
+    })?;
+    let output_len = row_count.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "copy FP8 rows to f32 output",
+        expected: "row_count * cols without overflow".to_string(),
+        actual: format!("row_count={row_count} cols={cols}"),
+    })?;
+    if vocab_rows == 0
+        || cols == 0
+        || row_count == 0
+        || vocab_rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || row_count > u32::MAX as usize
+        || input.len() != input_len
+        || row_scales.len() != vocab_rows
+        || rows.len() < row_count
+        || output.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "copy FP8 rows to f32 buffers",
+            expected: format!(
+                "input={input_len} scales={vocab_rows} rows>={row_count} output>={output_len}"
+            ),
+            actual: format!(
+                "input={} scales={} rows={} output={}",
+                input.len(),
+                row_scales.len(),
+                rows.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_copy_fp8_rows_to_f32_indexed_on_stream",
+            ffi::infer_copy_fp8_rows_to_f32_indexed_on_stream(
+                input.ptr,
+                row_scales.ptr,
+                rows.ptr,
+                output.buffer_mut().ptr,
+                row_count as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 fn validate_copy_row(
     label: &'static str,
     rows: usize,
@@ -16112,6 +16174,48 @@ mod tests {
                 .copy_to_host(&stream)
                 .expect("host-indexed row download"),
             expected_host_index,
+        );
+    }
+
+    #[test]
+    fn copy_fp8_rows_to_f32_indexed_applies_selected_row_scales() {
+        let rows = 3;
+        let cols = 4;
+        let values = vec![
+            0x38, 0x30, 0xb8, 0x00, 0x38, 0x40, 0x44, 0xb0, 0x30, 0x38, 0x40, 0x44,
+        ];
+        let scales = vec![0.5, 2.0, 4.0];
+        let indices = vec![2u32, 0];
+        let input = DeviceBuffer::from_host(&values).expect("FP8 embedding upload");
+        let scales_device = DeviceBuffer::from_host(&scales).expect("FP8 scale upload");
+        let indices_device = DeviceBuffer::from_host(&indices).expect("row index upload");
+        let mut output = DeviceBuffer::zeroed(indices.len() * cols).expect("FP8 row output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        copy_fp8_rows_to_f32_indexed_prefix_into_on_stream(
+            rows,
+            cols,
+            &input,
+            &scales_device,
+            &indices_device,
+            output.output(),
+            indices.len(),
+            &stream,
+        )
+        .expect("FP8 embedding gather");
+
+        let expected = indices
+            .iter()
+            .flat_map(|&row| {
+                let scale = scales[row as usize];
+                values[row as usize * cols..(row as usize + 1) * cols]
+                    .iter()
+                    .map(move |&value| format::e4m3_value(value) * scale)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output.copy_to_host(&stream).expect("FP8 row download"),
+            expected
         );
     }
 

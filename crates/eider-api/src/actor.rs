@@ -11,7 +11,7 @@ use infer::ling3::Ling3Model;
 use infer::metrics::metrics as infer_metrics;
 use infer::muse_glimmer::MuseGlimmerModel;
 use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
-use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8AttentionStorage, Qwen36TextModel};
+use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
 use infer::runtime::bitnet_serving::{
     BitNetAdmissionProgress, BitNetCancelOutcome, BitNetChatService, BitNetRequestId,
 };
@@ -73,7 +73,9 @@ pub struct InferenceActorConfig {
     pub scheduler: SchedulerConfig,
     pub sequence_cache: SequenceCacheConfig,
     pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
-    pub qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage,
+    pub qwen_fp8_attention_storage: Qwen36Fp8Storage,
+    pub qwen_fp8_dense_mlp_storage: Qwen36Fp8Storage,
+    pub qwen_fp8_lm_head_storage: Qwen36Fp8Storage,
     pub step_expert_capacity: usize,
     pub deepseek_expert_capacity: usize,
     pub step_bf16_storage: Step37Bf16StorageConfig,
@@ -92,7 +94,9 @@ impl InferenceActorConfig {
             scheduler: SchedulerConfig::default(),
             sequence_cache: SequenceCacheConfig::default(),
             qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
-            qwen_fp8_attention_storage: Qwen36Fp8AttentionStorage::default(),
+            qwen_fp8_attention_storage: Qwen36Fp8Storage::default(),
+            qwen_fp8_dense_mlp_storage: Qwen36Fp8Storage::default(),
+            qwen_fp8_lm_head_storage: Qwen36Fp8Storage::default(),
             step_expert_capacity: 240,
             deepseek_expert_capacity: 8,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
@@ -278,6 +282,8 @@ fn actor_main(
         sequence_cache,
         qwen_bf16_storage,
         qwen_fp8_attention_storage,
+        qwen_fp8_dense_mlp_storage,
+        qwen_fp8_lm_head_storage,
         step_expert_capacity,
         deepseek_expert_capacity,
         step_bf16_storage,
@@ -463,13 +469,17 @@ fn actor_main(
                 retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 bf16_storage = ?qwen_bf16_storage,
                 native_fp8_attention_storage = ?qwen_fp8_attention_storage,
+                native_fp8_dense_mlp_storage = ?qwen_fp8_dense_mlp_storage,
+                native_fp8_lm_head_storage = ?qwen_fp8_lm_head_storage,
                 "loading Qwen hybrid model"
             );
-            let mut model = match Qwen36TextModel::open_with_storage_and_artifact_dir(
+            let mut model = match Qwen36TextModel::open_with_fp8_storage_and_artifact_dir(
                 &model_dir,
                 &artifact_dir,
                 qwen_bf16_storage,
                 qwen_fp8_attention_storage,
+                qwen_fp8_dense_mlp_storage,
+                qwen_fp8_lm_head_storage,
             ) {
                 Ok(model) => model,
                 Err(error) => {

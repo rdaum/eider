@@ -108,8 +108,8 @@ const CATALOGUE: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "qwen3.8-27b",
-        repository: "Inferact/Qwen3.8-27B-NVFP4",
-        revision: "6128240ebaf4eaa7bad2b3d1c72c37d677c5f462",
+        repository: "unsloth/Qwen3.8-27B-NVFP4",
+        revision: "7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108",
         model_type: "qwen3_5",
         artifact_kind: ArtifactKind::None,
         artifact_estimate_bytes: 0,
@@ -857,8 +857,8 @@ mod tests {
     fn catalogue_pins_qwen38_nvfp4_checkpoint() {
         let model = catalogue_model("qwen3.8-27b").unwrap();
         assert_eq!(model.model_type, "qwen3_5");
-        assert_eq!(model.repository, "Inferact/Qwen3.8-27B-NVFP4");
-        assert_eq!(model.revision, "6128240ebaf4eaa7bad2b3d1c72c37d677c5f462");
+        assert_eq!(model.repository, "unsloth/Qwen3.8-27B-NVFP4");
+        assert_eq!(model.revision, "7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108");
         assert_eq!(model.artifact_kind, ArtifactKind::None);
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8");
         assert_eq!(model.defaults.max_context_tokens, 32_768);

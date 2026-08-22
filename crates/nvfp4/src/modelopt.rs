@@ -712,6 +712,58 @@ impl ModelOptFp8Linear {
     pub fn expected_weight_bytes(&self) -> usize {
         self.out_features * self.in_features
     }
+
+    /// Concatenates two FP8 projections along their output-feature dimension.
+    pub fn concat_out_features(
+        prefix: impl Into<String>,
+        first: &Self,
+        second: &Self,
+    ) -> Result<Self> {
+        if first.in_features != second.in_features {
+            return Err(Error::Shape {
+                label: "FP8 concat in_features",
+                expected: first.in_features.to_string(),
+                actual: second.in_features.to_string(),
+            });
+        }
+        if first.weight_scale.to_bits() != second.weight_scale.to_bits()
+            || first.input_scale.map(f32::to_bits) != second.input_scale.map(f32::to_bits)
+            || first.channel_weight_scale.is_some() != second.channel_weight_scale.is_some()
+        {
+            return Err(Error::Format {
+                label: "FP8 concat scales",
+                detail: "projections use incompatible tensor, channel, or activation scales"
+                    .to_string(),
+            });
+        }
+
+        let mut weight = Vec::with_capacity(first.weight.len() + second.weight.len());
+        weight.extend_from_slice(&first.weight);
+        weight.extend_from_slice(&second.weight);
+        let channel_weight_scale = match (
+            first.channel_weight_scale.as_ref(),
+            second.channel_weight_scale.as_ref(),
+        ) {
+            (Some(first), Some(second)) => {
+                let mut scales = Vec::with_capacity(first.len() + second.len());
+                scales.extend_from_slice(first);
+                scales.extend_from_slice(second);
+                Some(scales)
+            }
+            (None, None) => None,
+            _ => unreachable!("scale presence was validated"),
+        };
+
+        Ok(Self {
+            prefix: prefix.into(),
+            out_features: first.out_features + second.out_features,
+            in_features: first.in_features,
+            weight,
+            weight_scale: first.weight_scale,
+            channel_weight_scale,
+            input_scale: first.input_scale,
+        })
+    }
 }
 
 /// Sharded ModelOpt safetensors checkpoint index.
@@ -1385,6 +1437,63 @@ mod tests {
         assert_eq!(format::e4m3_value(quantized.weight_scale[1]), 0.25);
         let expected = [vec![6.0; 16], vec![1.5; 16]].concat();
         assert_eq!(quantized.dequantize_to_f32_col_major(), expected);
+    }
+
+    #[test]
+    fn fp8_concat_preserves_output_channel_scales() {
+        let gate = ModelOptFp8Linear {
+            prefix: "gate".to_string(),
+            out_features: 2,
+            in_features: 2,
+            weight: vec![1, 2, 3, 4],
+            weight_scale: 1.0,
+            channel_weight_scale: Some(vec![0.5, 1.0]),
+            input_scale: None,
+        };
+        let up = ModelOptFp8Linear {
+            prefix: "up".to_string(),
+            out_features: 1,
+            in_features: 2,
+            weight: vec![5, 6],
+            weight_scale: 1.0,
+            channel_weight_scale: Some(vec![2.0]),
+            input_scale: None,
+        };
+
+        let joined = ModelOptFp8Linear::concat_out_features("gate_up", &gate, &up)
+            .expect("concatenate FP8 projections");
+        assert_eq!(joined.prefix, "gate_up");
+        assert_eq!(joined.out_features, 3);
+        assert_eq!(joined.in_features, 2);
+        assert_eq!(joined.weight, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(joined.channel_weight_scale, Some(vec![0.5, 1.0, 2.0]));
+    }
+
+    #[test]
+    fn fp8_concat_rejects_mixed_scale_schemes() {
+        let channel_scaled = ModelOptFp8Linear {
+            prefix: "gate".to_string(),
+            out_features: 1,
+            in_features: 2,
+            weight: vec![1, 2],
+            weight_scale: 1.0,
+            channel_weight_scale: Some(vec![0.5]),
+            input_scale: None,
+        };
+        let tensor_scaled = ModelOptFp8Linear {
+            prefix: "up".to_string(),
+            out_features: 1,
+            in_features: 2,
+            weight: vec![3, 4],
+            weight_scale: 1.0,
+            channel_weight_scale: None,
+            input_scale: Some(0.25),
+        };
+
+        let error =
+            ModelOptFp8Linear::concat_out_features("gate_up", &channel_scaled, &tensor_scaled)
+                .expect_err("reject incompatible FP8 projections");
+        assert!(matches!(error, Error::Format { .. }));
     }
 
     #[test]

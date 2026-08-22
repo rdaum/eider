@@ -580,8 +580,16 @@ fn parse_layer_kinds(
 fn push_tensor_check(
     checkpoint: &ModelOptCheckpoint,
     tensors: &mut Vec<QwenTensorCheck>,
-    name: String,
+    mut name: String,
 ) -> Result<()> {
+    if !checkpoint.contains_tensor(&name)
+        && let Some(prefix) = name.strip_suffix(".weight")
+    {
+        let packed = format!("{prefix}.weight_packed");
+        if checkpoint.contains_tensor(&packed) {
+            name = packed;
+        }
+    }
     let info: Option<SafeTensorInfo> = if checkpoint.contains_tensor(&name) {
         Some(checkpoint.tensor_info(&name)?)
     } else {

@@ -4991,6 +4991,43 @@ extern "C" cudaError_t infer_copy_bf16_rows_to_f32_indexed_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_copy_fp8_rows_to_f32_indexed_kernel(
+    const std::uint8_t* input,
+    const float* row_scales,
+    const std::uint32_t* rows,
+    float* output,
+    std::uint32_t batch_size,
+    std::uint32_t cols) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = batch_size * cols;
+    if (idx >= len) return;
+    const std::uint32_t batch = idx / cols;
+    const std::uint32_t col = idx % cols;
+    const std::uint32_t row = rows[batch];
+    output[idx] = infer_e4m3_value(input[static_cast<std::size_t>(row) * cols + col]) *
+                  row_scales[row];
+}
+
+extern "C" cudaError_t infer_copy_fp8_rows_to_f32_indexed_on_stream(
+    const std::uint8_t* input,
+    const float* row_scales,
+    const std::uint32_t* rows,
+    float* output,
+    std::uint32_t batch_size,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || row_scales == nullptr || rows == nullptr || output == nullptr ||
+        batch_size == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t len = batch_size * cols;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_copy_fp8_rows_to_f32_indexed_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, row_scales, rows, output, batch_size, cols);
+    return cudaGetLastError();
+}
+
 __global__ void infer_single_token_gqa_f32_kernel(const float* value,
                                                         float* output,
                                                         std::uint32_t q_heads,

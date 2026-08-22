@@ -4,7 +4,7 @@
 //! stack, kept outside the NVFP4 quantization groups: two pre-projection
 //! RMSNorms, a fused `[embedding | hidden]` projection, one full-attention
 //! decoder layer with a dense SwiGLU feed-forward, and a final norm. The
-//! drafter shares the target's BF16 embedding table and LM head, and keeps a
+//! drafter shares the target's embedding table and LM head, and keeps a
 //! private single-layer compact K/V cache per sequence.
 //!
 //! The block semantics mirror the Qwen3-Next MTP family:
@@ -18,9 +18,8 @@
 //!
 //! Draft quality only affects speculative acceptance rates; the target model
 //! decides which tokens commit. The MTP attention Q/K/V/O weights remain BF16,
-//! while its private fusion, feed-forward, and LM-head projections use NVFP4
-//! because they propose tokens only; target verification still uses the
-//! configured serving precision.
+//! while its private fusion and feed-forward projections use NVFP4 because
+//! they propose tokens only. The drafter reuses the target LM head.
 
 use super::{
     Nvfp4DeviceLinear, Qwen36FullAttentionState, Qwen36FullAttentionWeights,
@@ -29,8 +28,7 @@ use super::{
 };
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    nvfp4_w4a16_top1_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    concat_f32_rows_into_on_stream, rms_norm_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, silu_mul_halves_f32_into_on_stream,
 };
 use crate::qwen3::infer::QwenModelManifest;
@@ -46,28 +44,11 @@ pub struct Qwen36MtpWeights {
     gate_up: Nvfp4DeviceLinear,
     down: Nvfp4DeviceLinear,
     final_norm: DeviceBuffer<f32>,
-    draft_lm_head: Nvfp4DeviceLinear,
 }
 
 /// Persistent MTP drafter state owned by one generated sequence.
 pub struct Qwen36MtpSequenceState {
     attention: Qwen36FullAttentionState,
-}
-
-fn load_draft_lm_head(
-    checkpoint: &ModelOptCheckpoint,
-    manifest: &QwenModelManifest,
-) -> Result<Nvfp4DeviceLinear> {
-    if checkpoint.contains_tensor("lm_head.weight_scale_2") {
-        return Nvfp4DeviceLinear::load(checkpoint, "lm_head");
-    }
-    load_nvfp4_bf16_linear(
-        checkpoint,
-        "lm_head.weight",
-        "mtp.draft_lm_head",
-        manifest.vocab,
-        manifest.hidden,
-    )
 }
 
 fn load_nvfp4_bf16_linear(
@@ -160,7 +141,7 @@ impl Qwen36MtpWeights {
                 manifest.q_heads * manifest.head_dim * 2,
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
-                super::Qwen36Fp8AttentionStorage::Fp8,
+                super::Qwen36Fp8Storage::Fp8,
             )?,
             k: super::Qwen36Linear::load(
                 checkpoint,
@@ -168,7 +149,7 @@ impl Qwen36MtpWeights {
                 manifest.kv_heads * manifest.head_dim,
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
-                super::Qwen36Fp8AttentionStorage::Fp8,
+                super::Qwen36Fp8Storage::Fp8,
             )?,
             v: super::Qwen36Linear::load(
                 checkpoint,
@@ -176,7 +157,7 @@ impl Qwen36MtpWeights {
                 manifest.kv_heads * manifest.head_dim,
                 hidden,
                 super::Qwen36Bf16Storage::Bf16,
-                super::Qwen36Fp8AttentionStorage::Fp8,
+                super::Qwen36Fp8Storage::Fp8,
             )?,
             o: super::Qwen36Linear::load(
                 checkpoint,
@@ -184,7 +165,7 @@ impl Qwen36MtpWeights {
                 hidden,
                 manifest.q_heads * manifest.head_dim,
                 super::Qwen36Bf16Storage::Bf16,
-                super::Qwen36Fp8AttentionStorage::Fp8,
+                super::Qwen36Fp8Storage::Fp8,
             )?,
             q_norm_weight: read_bf16_vector_delta_as_f32_device(
                 checkpoint,
@@ -257,7 +238,6 @@ impl Qwen36MtpWeights {
                 "mtp.norm.weight",
                 hidden,
             )?,
-            draft_lm_head: load_draft_lm_head(checkpoint, manifest)?,
         })
     }
 
@@ -273,12 +253,12 @@ impl Qwen36MtpWeights {
     ) -> Result<()> {
         let manifest = &model.manifest;
         let hidden = manifest.hidden;
-        copy_bf16_rows_to_f32_indexed_into_on_stream(
+        model.embedding.gather_prefix(
             manifest.vocab,
             hidden,
-            &model.embedding,
             &workspace.tokens,
             workspace.embedded.output(),
+            1,
             stream,
         )?;
         rms_norm_f32_into_on_stream(
@@ -639,18 +619,10 @@ impl Qwen36TextModel {
                 )?;
                 mtp.draft_step(self, workspace, state, chained, stream)?;
             }
-            let linear = &mtp.draft_lm_head;
-            nvfp4_w4a16_top1_f32_into_on_stream(
+            self.lm_head.run_top1(
+                &self.lt,
                 &workspace.final_hidden,
-                &linear.packed_weight,
-                &linear.weight_scale,
-                &workspace.lm_head.scratch_value,
-                &workspace.lm_head.scratch_index,
-                &workspace.lm_head.next_index,
-                &workspace.lm_head.next_value,
-                linear.out_features,
-                linear.in_features,
-                linear.weight_scale_2,
+                &mut workspace.lm_head,
                 stream,
             )?;
             workspace.draft_tokens.copy_range_from_device_on_stream(

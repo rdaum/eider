@@ -19,9 +19,7 @@ use crate::nvfp4::{
     Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, dflash2_capture_f32_into_on_stream,
-    f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
+    dflash2_capture_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
@@ -250,13 +248,13 @@ impl Qwen36DecodedBatch<'_> {
     }
 }
 
-struct BatchFp8LinearPlan {
+pub(super) struct BatchFp8LinearPlan {
     plans: HashMap<usize, Fp8TnMatmulPlan>,
     scalar_channel_scale: DeviceBuffer<f32>,
 }
 
 #[derive(Clone, Copy)]
-enum BatchFp8InputQuantization {
+pub(super) enum BatchFp8InputQuantization {
     Unused,
     Dynamic,
     Static(f32),
@@ -327,7 +325,11 @@ fn prepare_fp8_batch_input(
 }
 
 impl BatchFp8LinearPlan {
-    fn new(model: &Qwen36TextModel, linear: &Fp8Linear, capacity: usize) -> Result<Self> {
+    pub(super) fn new(
+        model: &Qwen36TextModel,
+        linear: &Fp8Linear,
+        capacity: usize,
+    ) -> Result<Self> {
         let mut plans = HashMap::new();
         plans.insert(
             capacity,
@@ -337,13 +339,23 @@ impl BatchFp8LinearPlan {
                 8 << 20,
             )?,
         );
+        if capacity != 1 {
+            plans.insert(
+                1,
+                Fp8TnMatmulPlan::new(
+                    &model.lt,
+                    GemmShape::new(linear.rows, 1, linear.cols),
+                    8 << 20,
+                )?,
+            );
+        }
         Ok(Self {
             plans,
             scalar_channel_scale: DeviceBuffer::zeroed(linear.rows)?,
         })
     }
 
-    fn device_bytes(&self) -> usize {
+    pub(super) fn device_bytes(&self) -> usize {
         self.plans
             .values()
             .map(Fp8TnMatmulPlan::workspace_bytes)
@@ -392,6 +404,68 @@ enum BatchLinearPlan {
     Bf16(BatchBf16LinearPlan),
     Fp8(BatchFp8LinearPlan),
     Nvfp4(BatchNvfp4LinearPlan),
+}
+
+struct BatchLinearPlanSet {
+    bf16: Option<BatchBf16LinearPlan>,
+    fp8: Option<BatchFp8LinearPlan>,
+    nvfp4: Option<BatchNvfp4LinearPlan>,
+}
+
+impl BatchLinearPlanSet {
+    fn new<'a>(
+        model: &Qwen36TextModel,
+        linears: impl IntoIterator<Item = &'a Qwen36Linear>,
+        capacity: usize,
+    ) -> Result<Self> {
+        let mut plans = Self {
+            bf16: None,
+            fp8: None,
+            nvfp4: None,
+        };
+        for linear in linears {
+            match linear {
+                Qwen36Linear::Bf16(linear) if plans.bf16.is_none() => {
+                    plans.bf16 = Some(BatchBf16LinearPlan::new(model, linear, capacity)?);
+                }
+                Qwen36Linear::Fp8(linear) if plans.fp8.is_none() => {
+                    plans.fp8 = Some(BatchFp8LinearPlan::new(model, linear, capacity)?);
+                }
+                Qwen36Linear::Nvfp4(linear) if plans.nvfp4.is_none() => {
+                    plans.nvfp4 = Some(new_nvfp4_batch_linear_plan(model, linear, capacity)?);
+                }
+                Qwen36Linear::Bf16(_) | Qwen36Linear::Fp8(_) | Qwen36Linear::Nvfp4(_) => {}
+            }
+        }
+        Ok(plans)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.bf16
+            .as_ref()
+            .map_or(0, BatchBf16LinearPlan::device_bytes)
+            + self
+                .fp8
+                .as_ref()
+                .map_or(0, BatchFp8LinearPlan::device_bytes)
+            + self.nvfp4.as_ref().map_or(0, |plan| {
+                plan.plans
+                    .values()
+                    .map(Fp4TnMatmulPlan::workspace_bytes)
+                    .sum::<usize>()
+                    + plan.activation.device_bytes()
+            })
+    }
+}
+
+impl BatchLinearPlan {
+    fn storage_name(&self) -> &'static str {
+        match self {
+            Self::Bf16(_) => "BF16",
+            Self::Fp8(_) => "FP8",
+            Self::Nvfp4(_) => "NVFP4",
+        }
+    }
 }
 
 impl BatchLinearPlan {
@@ -446,7 +520,7 @@ fn new_batch_linear_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_fp8_batch(
+pub(super) fn run_fp8_batch(
     model: &Qwen36TextModel,
     linear: &Fp8Linear,
     plan: &mut BatchFp8LinearPlan,
@@ -690,37 +764,72 @@ fn run_linear_batch(
 ) -> Result<()> {
     match linear {
         Qwen36Linear::Nvfp4(linear) => {
-            let BatchLinearPlan::Nvfp4(plan) =
-                plan.as_mut().expect("NVFP4 projection has a batch plan")
-            else {
-                unreachable!("NVFP4 projection has an NVFP4 plan")
+            let Some(plan) = plan.as_mut() else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: "NVFP4 projection has no batch plan".to_string(),
+                });
+            };
+            let actual = plan.storage_name();
+            let BatchLinearPlan::Nvfp4(plan) = plan else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: format!(
+                        "NVFP4 projection [{}, {}] has a {actual} plan",
+                        linear.out_features, linear.in_features
+                    ),
+                });
             };
             run_nvfp4_batch(model, linear, plan, raw_input, output, rows, stream)
         }
-        Qwen36Linear::Fp8(linear) => run_fp8_batch(
-            model,
-            linear,
-            match plan.as_mut().expect("FP8 projection has a batch plan") {
-                BatchLinearPlan::Fp8(plan) => plan,
-                BatchLinearPlan::Bf16(_) | BatchLinearPlan::Nvfp4(_) => {
-                    unreachable!("FP8 projection has an FP8 plan")
-                }
-            },
-            raw_input,
-            input,
-            input_scale,
-            input_quantization,
-            output,
-            rows,
-            w8a16_threads,
-            byte_identical,
-            stream,
-        ),
+        Qwen36Linear::Fp8(linear) => {
+            let Some(plan) = plan.as_mut() else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: "FP8 projection has no batch plan".to_string(),
+                });
+            };
+            let actual = plan.storage_name();
+            let BatchLinearPlan::Fp8(plan) = plan else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: format!(
+                        "FP8 projection [{}, {}] has a {actual} plan",
+                        linear.rows, linear.cols
+                    ),
+                });
+            };
+            run_fp8_batch(
+                model,
+                linear,
+                plan,
+                raw_input,
+                input,
+                input_scale,
+                input_quantization,
+                output,
+                rows,
+                w8a16_threads,
+                byte_identical,
+                stream,
+            )
+        }
         Qwen36Linear::Bf16(linear) => {
-            let BatchLinearPlan::Bf16(plan) =
-                plan.as_mut().expect("BF16 projection has a batch plan")
-            else {
-                unreachable!("BF16 projection has a BF16 plan")
+            let Some(plan) = plan.as_mut() else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: "BF16 projection has no batch plan".to_string(),
+                });
+            };
+            let actual = plan.storage_name();
+            let BatchLinearPlan::Bf16(plan) = plan else {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: format!(
+                        "BF16 projection [{}, {}] has a {actual} plan",
+                        linear.rows, linear.cols
+                    ),
+                });
             };
             run_bf16_batch(
                 model,
@@ -733,6 +842,76 @@ fn run_linear_batch(
                 stream,
             )
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_linear_batch_from_set(
+    model: &Qwen36TextModel,
+    linear: &Qwen36Linear,
+    plans: &mut BatchLinearPlanSet,
+    raw_input: &DeviceBuffer<f32>,
+    input: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    input_quantization: BatchFp8InputQuantization,
+    output: &mut DeviceBuffer<f32>,
+    rows: usize,
+    w8a16_threads: usize,
+    byte_identical: bool,
+    stream: &CudaStream,
+) -> Result<()> {
+    match linear {
+        Qwen36Linear::Nvfp4(linear) => run_nvfp4_batch(
+            model,
+            linear,
+            plans
+                .nvfp4
+                .as_mut()
+                .ok_or_else(|| crate::nvfp4::Error::Format {
+                    label: "Qwen dense batch plan",
+                    detail: "NVFP4 projection has no NVFP4 plan".to_string(),
+                })?,
+            raw_input,
+            output,
+            rows,
+            stream,
+        ),
+        Qwen36Linear::Fp8(linear) => run_fp8_batch(
+            model,
+            linear,
+            plans
+                .fp8
+                .as_mut()
+                .ok_or_else(|| crate::nvfp4::Error::Format {
+                    label: "Qwen dense batch plan",
+                    detail: "FP8 projection has no FP8 plan".to_string(),
+                })?,
+            raw_input,
+            input,
+            input_scale,
+            input_quantization,
+            output,
+            rows,
+            w8a16_threads,
+            byte_identical,
+            stream,
+        ),
+        Qwen36Linear::Bf16(linear) => run_bf16_batch(
+            model,
+            linear,
+            plans
+                .bf16
+                .as_mut()
+                .ok_or_else(|| crate::nvfp4::Error::Format {
+                    label: "Qwen dense batch plan",
+                    detail: "BF16 projection has no BF16 plan".to_string(),
+                })?,
+            raw_input,
+            output,
+            rows,
+            byte_identical,
+            stream,
+        ),
     }
 }
 
@@ -1424,11 +1603,15 @@ struct BatchMoeWorkspace {
 }
 
 struct BatchDenseMlpWorkspace {
-    gate_up_plan: BatchNvfp4LinearPlan,
-    down_plan: BatchNvfp4LinearPlan,
+    gate_up_plans: BatchLinearPlanSet,
+    down_plans: BatchLinearPlanSet,
     gate_up: DeviceBuffer<f32>,
+    gate_up_quantized: DeviceBuffer<u8>,
+    gate_up_scale: DeviceBuffer<f32>,
     activated: DeviceBuffer<f32>,
     down: DeviceBuffer<f32>,
+    down_quantized: DeviceBuffer<u8>,
+    down_scale: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
 }
 
@@ -1752,33 +1935,46 @@ impl BatchDenseMlpWorkspace {
         weights: &super::Qwen36DenseMlpWeights,
         capacity: usize,
     ) -> Result<Self> {
+        let dense_weights = model
+            .layers
+            .iter()
+            .filter_map(|layer| match &layer.moe {
+                Qwen36LayerFfnWeights::Dense(weights) => Some(weights),
+                Qwen36LayerFfnWeights::Moe(_) => None,
+            })
+            .collect::<Vec<_>>();
         Ok(Self {
-            gate_up_plan: new_nvfp4_batch_linear_plan(model, &weights.gate_up, capacity)?,
-            down_plan: new_nvfp4_batch_linear_plan(model, &weights.down, capacity)?,
-            gate_up: DeviceBuffer::zeroed(capacity * weights.gate_up.out_features)?,
-            activated: DeviceBuffer::zeroed(capacity * weights.down.in_features)?,
-            down: DeviceBuffer::zeroed(capacity * weights.down.out_features)?,
-            output: DeviceBuffer::zeroed(capacity * weights.down.out_features)?,
+            gate_up_plans: BatchLinearPlanSet::new(
+                model,
+                dense_weights.iter().map(|weights| &weights.gate_up),
+                capacity,
+            )?,
+            down_plans: BatchLinearPlanSet::new(
+                model,
+                dense_weights.iter().map(|weights| &weights.down),
+                capacity,
+            )?,
+            gate_up: DeviceBuffer::zeroed(capacity * weights.gate_up.rows())?,
+            gate_up_quantized: DeviceBuffer::zeroed(capacity * weights.gate_up.cols())?,
+            gate_up_scale: DeviceBuffer::zeroed(capacity)?,
+            activated: DeviceBuffer::zeroed(capacity * weights.down.cols())?,
+            down: DeviceBuffer::zeroed(capacity * weights.down.rows())?,
+            down_quantized: DeviceBuffer::zeroed(capacity * weights.down.cols())?,
+            down_scale: DeviceBuffer::zeroed(capacity)?,
+            output: DeviceBuffer::zeroed(capacity * weights.down.rows())?,
         })
     }
 
     fn device_bytes(&self) -> usize {
-        self.gate_up_plan
-            .plans
-            .values()
-            .map(Fp4TnMatmulPlan::workspace_bytes)
-            .sum::<usize>()
-            + self.gate_up_plan.activation.device_bytes()
-            + self
-                .down_plan
-                .plans
-                .values()
-                .map(Fp4TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self.down_plan.activation.device_bytes()
+        self.gate_up_plans.device_bytes()
+            + self.down_plans.device_bytes()
             + self.gate_up.device_bytes()
+            + self.gate_up_quantized.device_bytes()
+            + self.gate_up_scale.device_bytes()
             + self.activated.device_bytes()
             + self.down.device_bytes()
+            + self.down_quantized.device_bytes()
+            + self.down_scale.device_bytes()
             + self.output.device_bytes()
     }
 }
@@ -1940,6 +2136,9 @@ pub struct Qwen36SpeculativeCycleWorkspace {
     verify: Qwen36PrefillBatchWorkspace,
     mtp: Option<Qwen36MtpDraftWorkspace>,
     normed_hidden: DeviceBuffer<f32>,
+    lm_head_plan: Option<BatchFp8LinearPlan>,
+    lm_head_quantized: DeviceBuffer<u8>,
+    lm_head_scale: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     top1_scratch_indices: DeviceBuffer<u32>,
     argmax_indices: DeviceBuffer<u32>,
@@ -1977,6 +2176,12 @@ impl Qwen36SpeculativeCycleWorkspace {
                 .as_ref()
                 .map_or(0, Qwen36MtpDraftWorkspace::device_bytes)
             + self.normed_hidden.device_bytes()
+            + self
+                .lm_head_plan
+                .as_ref()
+                .map_or(0, BatchFp8LinearPlan::device_bytes)
+            + self.lm_head_quantized.device_bytes()
+            + self.lm_head_scale.device_bytes()
             + self.logits.device_bytes()
             + self.top1_scratch_indices.device_bytes()
             + self.argmax_indices.device_bytes()
@@ -2395,10 +2600,9 @@ impl Qwen36TextModel {
         }
 
         let stream = &workspace.stream;
-        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+        self.embedding.gather_prefix(
             self.manifest.vocab,
             self.manifest.hidden,
-            &self.embedding,
             &workspace.token_ids,
             workspace.hidden.output(),
             total_tokens,
@@ -2508,7 +2712,7 @@ impl Qwen36TextModel {
                 &mut workspace.attn_residual,
                 &mut workspace.ffn_norm,
                 total_tokens,
-                false,
+                workspace.serial_linear_attention_projections,
                 stream,
                 Some(Qwen36ParallelMoe {
                     shared_stream: &workspace.shared_moe_stream,
@@ -2603,7 +2807,7 @@ impl Qwen36TextModel {
                             attn_residual,
                             ffn_norm,
                             *token_capacity,
-                            false,
+                            *serial_linear_attention_projections,
                             stream,
                             Some(parallel_moe()),
                         )
@@ -2640,7 +2844,7 @@ impl Qwen36TextModel {
                             attn_residual,
                             ffn_norm,
                             *token_capacity,
-                            false,
+                            *serial_linear_attention_projections,
                             stream,
                             Some(parallel_moe()),
                         )
@@ -3213,12 +3417,12 @@ impl Qwen36TextModel {
             .linear
             .update_state_tables(rows, self.layers.len(), workspace.capacity)?;
         let stream = &workspace.stream;
-        copy_bf16_rows_to_f32_indexed_into_on_stream(
+        self.embedding.gather_prefix(
             self.manifest.vocab,
             self.manifest.hidden,
-            &self.embedding,
             &workspace.token_ids,
             workspace.hidden.output(),
+            active_rows,
             stream,
         )?;
 
@@ -3478,11 +3682,18 @@ impl Qwen36TextModel {
         let mtp = include_mtp
             .then(|| self.new_mtp_draft_workspace(max_context_tokens))
             .transpose()?;
+        let lm_head_plan = match &self.lm_head {
+            Qwen36LmHead::Fp8 { linear, .. } => Some(BatchFp8LinearPlan::new(self, linear, rows)?),
+            Qwen36LmHead::Nvfp4(_) | Qwen36LmHead::Bf16(_) => None,
+        };
         Ok(Qwen36SpeculativeCycleWorkspace {
             drafts,
             verify,
             mtp,
             normed_hidden: DeviceBuffer::zeroed(rows * self.manifest.hidden)?,
+            lm_head_plan,
+            lm_head_quantized: DeviceBuffer::zeroed(rows * self.manifest.hidden)?,
+            lm_head_scale: DeviceBuffer::zeroed(rows)?,
             logits: DeviceBuffer::zeroed(rows * self.manifest.vocab)?,
             top1_scratch_indices: DeviceBuffer::zeroed(rows * self.manifest.vocab.div_ceil(8))?,
             argmax_indices: DeviceBuffer::zeroed(rows)?,
@@ -3490,6 +3701,88 @@ impl Qwen36TextModel {
             catchup_hidden: DeviceBuffer::zeroed(self.manifest.hidden)?,
             host_verify_tokens: Vec::with_capacity(rows),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_speculative_lm_head(
+        &self,
+        normed_hidden: &DeviceBuffer<f32>,
+        lm_head_plan: &mut Option<BatchFp8LinearPlan>,
+        lm_head_quantized: &mut DeviceBuffer<u8>,
+        lm_head_scale: &mut DeviceBuffer<f32>,
+        logits: &mut DeviceBuffer<f32>,
+        top1_scratch_indices: &DeviceBuffer<u32>,
+        argmax_indices: &mut DeviceBuffer<u32>,
+        argmax_values: &mut DeviceBuffer<f32>,
+        rows: usize,
+        row_capacity: usize,
+        materialize_logits: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match &self.lm_head {
+            Qwen36LmHead::Nvfp4(linear) => {
+                linear.run_f32_batch_into(normed_hidden, logits, rows, stream)?;
+            }
+            Qwen36LmHead::Bf16(linear) if !materialize_logits => {
+                return lm_head_top1_f32_batch_into_on_stream(
+                    normed_hidden,
+                    &linear.weight,
+                    logits,
+                    top1_scratch_indices,
+                    argmax_indices,
+                    argmax_values,
+                    rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                );
+            }
+            Qwen36LmHead::Bf16(linear) => {
+                bf16_linear_logits_f32_batch_into_on_stream(
+                    normed_hidden,
+                    &linear.weight,
+                    logits.output(),
+                    rows,
+                    linear.rows,
+                    linear.cols,
+                    stream,
+                )?;
+            }
+            Qwen36LmHead::Fp8 { linear, .. } => {
+                quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
+                    normed_hidden,
+                    lm_head_quantized,
+                    lm_head_scale,
+                    rows,
+                    linear.cols,
+                    stream,
+                )?;
+                run_fp8_batch(
+                    self,
+                    linear,
+                    lm_head_plan
+                        .as_mut()
+                        .expect("FP8 speculative LM head has a batch plan"),
+                    normed_hidden,
+                    lm_head_quantized,
+                    lm_head_scale,
+                    BatchFp8InputQuantization::Dynamic,
+                    logits,
+                    rows,
+                    256,
+                    true,
+                    stream,
+                )?;
+            }
+        }
+        argmax_f32_batch_into_on_stream(
+            logits,
+            argmax_indices.output(),
+            argmax_values.output(),
+            row_capacity,
+            self.manifest.vocab,
+            stream,
+        )
     }
 
     /// Verifies a proposal supplied by an external drafter and commits its
@@ -3602,58 +3895,20 @@ impl Qwen36TextModel {
                 verify.stream(),
             )?;
             round_f32_to_bf16_in_place_on_stream(workspace.normed_hidden.inout(), verify.stream())?;
-            match (&self.lm_head, selector.is_some()) {
-                (Qwen36LmHead::Nvfp4(linear), _) => {
-                    linear.run_f32_batch_into(
-                        &workspace.normed_hidden,
-                        &mut workspace.logits,
-                        rows,
-                        verify.stream(),
-                    )?;
-                    if selector.is_none() {
-                        argmax_f32_batch_into_on_stream(
-                            &workspace.logits,
-                            workspace.argmax_indices.output(),
-                            workspace.argmax_values.output(),
-                            row_capacity,
-                            self.manifest.vocab,
-                            verify.stream(),
-                        )?;
-                    }
-                }
-                (Qwen36LmHead::Bf16(linear), false) => {
-                    lm_head_top1_f32_batch_into_on_stream(
-                        &workspace.normed_hidden,
-                        &linear.weight,
-                        &workspace.logits,
-                        &workspace.top1_scratch_indices,
-                        &workspace.argmax_indices,
-                        &workspace.argmax_values,
-                        rows,
-                        linear.rows,
-                        linear.cols,
-                        verify.stream(),
-                    )?;
-                }
-                (Qwen36LmHead::Bf16(linear), true) => {
-                    bf16_linear_logits_f32_batch_into_on_stream(
-                        &workspace.normed_hidden,
-                        &linear.weight,
-                        workspace.logits.output(),
-                        rows,
-                        linear.rows,
-                        linear.cols,
-                        verify.stream(),
-                    )?;
-                }
-                (Qwen36LmHead::Fp8 { .. }, _) => {
-                    return Err(crate::nvfp4::Error::Format {
-                        label: "Qwen3.8 speculative lm_head",
-                        detail: "FP8 lm_head storage is unsupported for speculative decode"
-                            .to_string(),
-                    });
-                }
-            }
+            self.run_speculative_lm_head(
+                &workspace.normed_hidden,
+                &mut workspace.lm_head_plan,
+                &mut workspace.lm_head_quantized,
+                &mut workspace.lm_head_scale,
+                &mut workspace.logits,
+                &workspace.top1_scratch_indices,
+                &mut workspace.argmax_indices,
+                &mut workspace.argmax_values,
+                rows,
+                row_capacity,
+                selector.is_some(),
+                verify.stream(),
+            )?;
             let (argmax, next_logits) = if let Some(selector) = selector.as_mut() {
                 let host = workspace
                     .logits
@@ -3788,6 +4043,9 @@ impl Qwen36TextModel {
             verify,
             mtp,
             normed_hidden,
+            lm_head_plan,
+            lm_head_quantized,
+            lm_head_scale,
             logits,
             top1_scratch_indices,
             argmax_indices,
@@ -3888,40 +4146,20 @@ impl Qwen36TextModel {
                     verify.stream(),
                 )?;
                 round_f32_to_bf16_in_place_on_stream(normed_hidden.inout(), verify.stream())?;
-                match &self.lm_head {
-                    Qwen36LmHead::Nvfp4(linear) => {
-                        linear.run_f32_batch_into(normed_hidden, logits, rows, verify.stream())?;
-                        argmax_f32_batch_into_on_stream(
-                            logits,
-                            argmax_indices.output(),
-                            argmax_values.output(),
-                            row_capacity,
-                            self.manifest.vocab,
-                            verify.stream(),
-                        )?;
-                    }
-                    Qwen36LmHead::Bf16(linear) => {
-                        lm_head_top1_f32_batch_into_on_stream(
-                            normed_hidden,
-                            &linear.weight,
-                            logits,
-                            top1_scratch_indices,
-                            argmax_indices,
-                            argmax_values,
-                            rows,
-                            linear.rows,
-                            linear.cols,
-                            verify.stream(),
-                        )?;
-                    }
-                    Qwen36LmHead::Fp8 { .. } => {
-                        return Err(crate::nvfp4::Error::Format {
-                            label: "Qwen3.8 speculative lm_head",
-                            detail: "FP8 lm_head storage is unsupported for speculative decode"
-                                .to_string(),
-                        });
-                    }
-                }
+                self.run_speculative_lm_head(
+                    normed_hidden,
+                    lm_head_plan,
+                    lm_head_quantized,
+                    lm_head_scale,
+                    logits,
+                    top1_scratch_indices,
+                    argmax_indices,
+                    argmax_values,
+                    rows,
+                    row_capacity,
+                    false,
+                    verify.stream(),
+                )?;
                 let verify_argmax = argmax_indices
                     .copy_prefix_to_host(rows, verify.stream())?
                     .into_vec();
@@ -4908,29 +5146,57 @@ impl Qwen36LayerFfnWeights {
                 parallel_moe,
             ),
             (Self::Dense(weights), BatchFfnWorkspace::Dense(workspace)) => {
-                run_nvfp4_batch(
+                let gate_up_quantization = prepare_fp8_batch_input(
+                    &[&weights.gate_up],
+                    ffn_norm,
+                    &mut workspace.gate_up_quantized,
+                    &mut workspace.gate_up_scale,
+                    capacity,
+                    weights.gate_up.cols(),
+                    stream,
+                )?;
+                run_linear_batch_from_set(
                     model,
                     &weights.gate_up,
-                    &mut workspace.gate_up_plan,
+                    &mut workspace.gate_up_plans,
                     ffn_norm,
+                    &workspace.gate_up_quantized,
+                    &workspace.gate_up_scale,
+                    gate_up_quantization,
                     &mut workspace.gate_up,
                     capacity,
+                    256,
+                    stabilise_router_logits,
                     stream,
                 )?;
                 silu_mul_halves_f32_batch_into_on_stream(
                     &workspace.gate_up,
                     workspace.activated.output(),
                     capacity,
-                    weights.down.in_features,
+                    weights.down.cols(),
                     stream,
                 )?;
-                run_nvfp4_batch(
+                let down_quantization = prepare_fp8_batch_input(
+                    &[&weights.down],
+                    &workspace.activated,
+                    &mut workspace.down_quantized,
+                    &mut workspace.down_scale,
+                    capacity,
+                    weights.down.cols(),
+                    stream,
+                )?;
+                run_linear_batch_from_set(
                     model,
                     &weights.down,
-                    &mut workspace.down_plan,
+                    &mut workspace.down_plans,
                     &workspace.activated,
+                    &workspace.down_quantized,
+                    &workspace.down_scale,
+                    down_quantization,
                     &mut workspace.down,
                     capacity,
+                    256,
+                    stabilise_router_logits,
                     stream,
                 )?;
                 add_f32_prefix_into_on_stream(
