@@ -116,13 +116,17 @@ Each Eider release contains a small, reviewed catalogue. A model entry includes:
 - Preparation strategy and prepared-format version.
 - Default served model name, context limit, and paging settings.
 
-The current catalogue includes Qwen3.6 35B-A3B, dense Qwen3.8 27B,
-Agents-A1, Step-3.7-Flash, Muse Glimmer 30B, Nemotron 3 Puzzle 75B-A9B, and
-both supported Gemma 4 26B-A4B weight formats:
+The current catalogue includes Qwen3.6 35B-A3B, Ornith 1.5 35B-A3B,
+dense Qwen3.8 27B, Agents-A1, Step-3.7-Flash, Muse Glimmer 30B,
+Nemotron 3 Puzzle 75B-A9B, and both supported Gemma 4 26B-A4B weight formats:
 the NVIDIA ModelOpt NVFP4 checkpoint (`gemma-4-26b-a4b-nvfp4`) and Google's
 upstream BF16 instruction-tuned checkpoint (`gemma-4-26b-a4b-it`). Both Gemma
 entries use the Gemma 4 text runtime; image, video, and audio inputs remain
 outside Eider's text-serving interface.
+
+Ornith uses the Qwen3.5-MoE text runtime. Its ModelOpt checkpoint stores the
+MoE and LM-head weights as W4A16 NVFP4 without static activation scales.
+Eider does not load Ornith's vision tower or its MoE MTP draft block.
 
 Muse Glimmer uses the pinned Inferact ModelOpt NVFP4 target and the pinned
 `dflash-kquant.gguf` companion from Meta's official GGUF repository. Catalogue

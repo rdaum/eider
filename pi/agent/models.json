@@ -26,6 +26,25 @@
           }
         },
         {
+          "id": "eider-ornith-1.5-35b-a3b",
+          "name": "Ornith 1.5 35B-A3B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 262144,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-qwen3.8",
           "name": "Qwen3.8 27B NVFP4",
           "reasoning": true,
@@ -212,6 +231,25 @@
           "reasoning": false,
           "input": ["text"],
           "contextWindow": 32768,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-ornith-1.5-35b-a3b",
+          "name": "Ornith 1.5 35B-A3B NVFP4",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "xhigh": "high"
+          },
+          "input": ["text"],
+          "contextWindow": 262144,
           "maxTokens": 4096,
           "cost": {
             "input": 0,

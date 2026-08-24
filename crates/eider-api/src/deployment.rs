@@ -108,6 +108,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "ornith-1.5-35b-a3b",
+        repository: "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
+        revision: "0f0b1b59b879ccde1353e6ebd0fb10c204d4c544",
+        model_type: "qwen3_5_moe",
+        artifact_kind: ArtifactKind::Qwen36Experts,
+        artifact_estimate_bytes: 20 << 30,
+        defaults: ServingDefaults {
+            served_model_name: "eider-ornith-1.5-35b-a3b",
+            max_context_tokens: 262_144,
+            prefill_token_capacity: 2_048,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "qwen3.8-27b",
         repository: "unsloth/Qwen3.8-27B-NVFP4",
         revision: "7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108",
@@ -873,6 +887,18 @@ mod tests {
             QWEN38_DFLASH2_REVISION,
             "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
         );
+    }
+
+    #[test]
+    fn catalogue_pins_ornith_15_nvfp4_checkpoint() {
+        let model = catalogue_model("ornith-1.5-35b-a3b").unwrap();
+        assert_eq!(model.model_type, "qwen3_5_moe");
+        assert_eq!(model.repository, "ornith-ai/Ornith-1.5-35B-A3B-NVFP4");
+        assert_eq!(model.revision, "0f0b1b59b879ccde1353e6ebd0fb10c204d4c544");
+        assert_eq!(model.artifact_kind, ArtifactKind::Qwen36Experts);
+        assert!(model.artifact_estimate_bytes >= 18 << 30);
+        assert_eq!(model.defaults.served_model_name, "eider-ornith-1.5-35b-a3b");
+        assert_eq!(model.defaults.max_context_tokens, 262_144);
     }
 
     #[test]

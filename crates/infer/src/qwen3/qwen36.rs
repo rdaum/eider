@@ -6888,13 +6888,18 @@ impl Qwen36TextModel {
                 actual: format!("[{}, {}]", lm_head_shape.0, lm_head_shape.1),
             });
         }
-        let mtp = if manifest.mtp_layers > 0 && checkpoint.contains_tensor("mtp.fc.weight") {
+        let has_mtp = manifest.mtp_layers > 0 && checkpoint.contains_tensor("mtp.fc.weight");
+        let has_dense_mtp = checkpoint.contains_tensor("mtp.layers.0.mlp.gate_proj.weight");
+        let mtp = if has_mtp && has_dense_mtp {
             Some(Qwen36MtpWeights::load(
                 &checkpoint,
                 &manifest,
                 &fp8_nvfp4_cache,
             )?)
         } else {
+            if has_mtp {
+                tracing::info!("checkpoint MTP block is not a supported dense draft; MTP disabled");
+            }
             None
         };
         let (cache_hits, cache_prepared) = fp8_nvfp4_cache.stats();

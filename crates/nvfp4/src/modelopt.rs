@@ -5,7 +5,10 @@
 //! - `<prefix>.weight`: packed FP4 E2M1 bytes with shape `[out, in / 2]`;
 //! - `<prefix>.weight_scale`: E4M3 scale bytes with shape `[out, in / 16]`;
 //! - `<prefix>.weight_scale_2`: scalar F32 tensor-wide scale;
-//! - `<prefix>.input_scale`: scalar F32 calibrated activation scale.
+//! - `<prefix>.input_scale`: optional scalar F32 calibrated activation scale.
+//!
+//! W4A16 checkpoints omit `input_scale`; imports represent that weight-only
+//! convention with a unity input scale.
 //!
 //! The packed value layout is compatible with the current cuBLASLt TN weight
 //! convention when interpreted as a column-major `K x M` matrix with `K=in`
@@ -47,7 +50,7 @@ pub struct ModelOptNvfp4Linear {
     pub weight_scale: Vec<u8>,
     /// Tensor-wide ModelOpt weight scale.
     pub weight_scale_2: f32,
-    /// Static calibrated activation scale.
+    /// Static calibrated activation scale, or `1.0` for W4A16 weights.
     pub input_scale: f32,
 }
 
@@ -651,7 +654,7 @@ impl ModelOptNvfp4Linear {
             packed_weight: shard.read_tensor_bytes(&weight_name)?,
             weight_scale: shard.read_tensor_bytes(&scale_name)?,
             weight_scale_2: shard.read_scalar_f32(&weight_scale_2_name)?,
-            input_scale: shard.read_scalar_f32(&input_scale_name)?,
+            input_scale: read_modelopt_input_scale(shard, &input_scale_name)?,
         })
     }
 
@@ -993,7 +996,6 @@ impl ModelOptCheckpoint {
         let weight_shard = self.open_shard_for_tensor(&weight_name)?;
         let scale_shard = self.open_shard_for_tensor(&scale_name)?;
         let weight_scale_2_shard = self.open_shard_for_tensor(&weight_scale_2_name)?;
-        let input_scale_shard = self.open_shard_for_tensor(&input_scale_name)?;
 
         let weight_info = weight_shard.require_tensor(&weight_name)?;
         let scale_info = scale_shard.require_tensor(&scale_name)?;
@@ -1007,7 +1009,7 @@ impl ModelOptCheckpoint {
             packed_weight: weight_shard.read_tensor_bytes(&weight_name)?,
             weight_scale: scale_shard.read_tensor_bytes(&scale_name)?,
             weight_scale_2: weight_scale_2_shard.read_scalar_f32(&weight_scale_2_name)?,
-            input_scale: input_scale_shard.read_scalar_f32(&input_scale_name)?,
+            input_scale: self.load_modelopt_input_scale(&input_scale_name)?,
         })
     }
 
@@ -1029,7 +1031,6 @@ impl ModelOptCheckpoint {
         let weight_shard = self.open_shard_for_tensor(&weight_name)?;
         let scale_shard = self.open_shard_for_tensor(&scale_name)?;
         let weight_scale_2_shard = self.open_shard_for_tensor(&weight_scale_2_name)?;
-        let input_scale_shard = self.open_shard_for_tensor(&input_scale_name)?;
 
         let weight_info = weight_shard.require_tensor(&weight_name)?;
         let scale_info = scale_shard.require_tensor(&scale_name)?;
@@ -1046,7 +1047,12 @@ impl ModelOptCheckpoint {
         let weight_bytes = out_features * in_features / 2;
         let scale_bytes = out_features * in_features / 16;
         let weight_scale_2 = weight_scale_2_shard.read_float_tensor_as_f32(&weight_scale_2_name)?;
-        let input_scale = input_scale_shard.read_float_tensor_as_f32(&input_scale_name)?;
+        let input_scale = if self.contains_tensor(&input_scale_name) {
+            self.open_shard_for_tensor(&input_scale_name)?
+                .read_float_tensor_as_f32(&input_scale_name)?
+        } else {
+            vec![1.0; experts]
+        };
         if weight_scale_2.len() != experts || input_scale.len() != experts {
             return Err(Error::Shape {
                 label: "ModelOpt NVFP4 expert scalar scales",
@@ -1110,11 +1116,17 @@ impl ModelOptCheckpoint {
         let weight_name = format!("{prefix}.weight_scale_2");
         let input_name = format!("{prefix}.input_scale");
         let weight_shard = self.open_shard_for_tensor(&weight_name)?;
-        let input_shard = self.open_shard_for_tensor(&input_name)?;
         Ok((
             weight_shard.read_scalar_f32(&weight_name)?,
-            input_shard.read_scalar_f32(&input_name)?,
+            self.load_modelopt_input_scale(&input_name)?,
         ))
+    }
+
+    fn load_modelopt_input_scale(&self, name: &str) -> Result<f32> {
+        if !self.contains_tensor(name) {
+            return Ok(1.0);
+        }
+        self.open_shard_for_tensor(name)?.read_scalar_f32(name)
     }
 
     /// Imports a ModelOpt FP8 linear by tensor prefix.
@@ -1250,6 +1262,13 @@ impl ModelOptCheckpoint {
             )?,
         })
     }
+}
+
+fn read_modelopt_input_scale(shard: &SafeTensorShard, name: &str) -> Result<f32> {
+    if shard.tensor(name).is_none() {
+        return Ok(1.0);
+    }
+    shard.read_scalar_f32(name)
 }
 
 fn read_single_f32(shard: &SafeTensorShard, name: &str, label: &'static str) -> Result<f32> {
@@ -1536,6 +1555,7 @@ fn nvfp4_cache_error(action: &'static str, path: &Path, error: std::io::Error) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_CACHE_FILE: AtomicUsize = AtomicUsize::new(1);
@@ -1572,6 +1592,35 @@ mod tests {
         assert_eq!(restored.weight_scale, source.weight_scale);
         assert_eq!(restored.weight_scale_2, source.weight_scale_2);
         assert_eq!(restored.input_scale, source.input_scale);
+    }
+
+    #[test]
+    fn modelopt_w4a16_input_scale_defaults_to_unity() {
+        let path = cache_path();
+        let mut header = serde_json::to_vec(&json!({
+            "test.input_scale": {"dtype":"F32", "shape":[], "data_offsets":[0,4]}
+        }))
+        .expect("header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = File::create(&path).expect("fixture");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .and_then(|()| file.write_all(&header))
+            .and_then(|()| file.write_all(&0.25f32.to_le_bytes()))
+            .expect("write fixture");
+        drop(file);
+
+        let shard = SafeTensorShard::open(&path).expect("open fixture");
+        assert_eq!(
+            read_modelopt_input_scale(&shard, "test.input_scale").expect("static scale"),
+            0.25
+        );
+        assert_eq!(
+            read_modelopt_input_scale(&shard, "test.w4a16_input_scale").expect("W4A16 scale"),
+            1.0
+        );
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]

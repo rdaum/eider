@@ -118,6 +118,7 @@ second column.
 | --- | --- | --- |
 | [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE and compact FP4 KV |
+| [`ornith-1.5-35b-a3b`](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4) | `eider-ornith-1.5-35b-a3b` | Text path, W4A16 MoE, and compact FP4 KV; vision and the MoE MTP block are not served |
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agent model with 262K context |
 | [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |
 | [`gemma-4-26b-a4b-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | `eider-gemma4-26b` | Upstream BF16 checkpoint on the same runtime |
@@ -214,6 +215,7 @@ Start a catalogue model directly:
 ```sh
 eider-serve qwen3.8-27b
 eider-serve qwen3.6-35b-a3b
+eider-serve ornith-1.5-35b-a3b
 eider-serve muse-glimmer-30b-nvfp4
 eider-serve step-3.7-flash --offline
 ```
@@ -248,6 +250,7 @@ change the global Pi configuration.
 ```sh
 scripts/run-pi-eider-qwen38.sh
 scripts/run-pi-eider-qwen.sh
+scripts/run-pi-eider-ornith.sh
 scripts/run-pi-eider-agents-a1.sh
 scripts/run-pi-eider-stepfun.sh
 scripts/run-pi-eider-laguna.sh

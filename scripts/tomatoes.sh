@@ -32,6 +32,7 @@ model_rows=(
     "eider-muse-glimmer-30b|muse-glimmer-30b-nvfp4|EIDER_MODEL=muse-glimmer-30b-nvfp4 scripts/run-eider"
     "eider-ling-3.0-tiny|ling-3.0-tiny-nvfp4|scripts/run-ling3-tiny"
     "eider-qwen3.6|qwen3.6-35b-a3b|EIDER_MODEL=qwen3.6-35b-a3b scripts/run-eider"
+    "eider-ornith-1.5-35b-a3b|ornith-1.5-35b-a3b|EIDER_MODEL=ornith-1.5-35b-a3b scripts/run-eider"
     "eider-qwen3.8|qwen3.8-27b|scripts/run-eider-qwen38.sh"
     "eider-agents-a1|agents-a1|EIDER_MODEL=agents-a1 scripts/run-eider"
     "eider-laguna-s-2.1|laguna-s-2.1|EIDER_MODEL=laguna-s-2.1 scripts/run-eider"
