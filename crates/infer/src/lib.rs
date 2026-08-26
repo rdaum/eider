@@ -28,6 +28,9 @@ pub mod gguf_quant;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Hashed n-gram embedding identifiers and transactional token-window state.
+pub mod ngram;
+
 /// Gemma 4 text-model loading and inference.
 pub mod gemma4;
 
