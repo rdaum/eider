@@ -5,6 +5,10 @@ implements the public LongCat-Flash-Lite contract: every token selects one row
 from each order/split table, applies one table-specific projection, adds the
 word embedding, and averages all sources.
 
+The executable contract comes from
+[vLLM PR #47857](https://github.com/vllm-project/vllm/pull/47857).
+That implementation isolates token history per request and covers chunked prefill.
+
 The device bank supports three row-major formats:
 
 | Format | Values | Scale storage |
