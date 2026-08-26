@@ -6,7 +6,7 @@ cache_root="${XDG_CACHE_HOME:-$HOME/.cache}"
 revision="${DEEPSEEK4_REVISION:-e3cd60e7de98e9867116860d522499a728de1cf9}"
 model_root="${DEEPSEEK4_MODEL_ROOT:-$cache_root/eider/models/nvidia--DeepSeek-V4-Flash-NVFP4/$revision}"
 model_dir="${DEEPSEEK4_THIN_DIR:-$model_root/deepseek4-thin-nvfp4-v1}"
-artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$model_root/deepseek4-experts-nvfp4-v1}"
+artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$model_root/deepseek4-experts-nvfp4-v2}"
 served_model="${EIDER_SERVED_MODEL:-eider-deepseek-v4}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-32768}"
 prefill_token_capacity="${EIDER_PREFILL_TOKEN_CAPACITY:-2048}"
@@ -17,7 +17,7 @@ if [[ ! -f "$model_dir/model.safetensors.index.json" ]]; then
   echo "run scripts/prepare-deepseek4-experts-streaming.sh first" >&2
   exit 1
 fi
-if [[ ! -f "$artifact_dir/layer-00/expert-000.nvf4" ]]; then
+if [[ ! -f "$artifact_dir/layer-00.nvf4" ]]; then
   echo "DeepSeek V4 exact NVFP4 expert store is not prepared: $artifact_dir" >&2
   echo "run scripts/prepare-deepseek4-experts-streaming.sh first" >&2
   exit 1

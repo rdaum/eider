@@ -37,9 +37,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, IoSliceMut, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -48,6 +49,11 @@ const HOT_EXPERT_MAGIC: &[u8; 8] = b"EIDDS4H1";
 const EXPERT_PREPARATION_BATCH: usize = 16;
 const HOT_EXPERT_VERSION: u32 = 1;
 const HOT_EXPERT_HEADER_BYTES: u64 = 8 + 5 * 4 + 6 * 4;
+const NVFP4_LAYER_MAGIC: &[u8; 8] = b"EIDDS4L2";
+const NVFP4_LAYER_VERSION: u32 = 2;
+const NVFP4_LAYER_HEADER_BYTES: usize = 8192;
+const NVFP4_LAYER_METADATA_OFFSET: usize = 64;
+const DIRECT_IO_ALIGNMENT: usize = 4096;
 
 /// Model dimensions needed by the routed-expert storage path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -227,27 +233,7 @@ impl Deepseek4HotExpertCache {
             if validate_hot_record_file(&path, &self.manifest, layer, expert).is_ok() {
                 continue;
             }
-            let prefix = format!("layers.{layer}.ffn.experts.{expert}");
-            let weights = Deepseek4HotExpert {
-                w1: load_expert_linear(
-                    checkpoint,
-                    &format!("{prefix}.w1"),
-                    self.manifest.expert_intermediate,
-                    self.manifest.hidden,
-                )?,
-                w3: load_expert_linear(
-                    checkpoint,
-                    &format!("{prefix}.w3"),
-                    self.manifest.expert_intermediate,
-                    self.manifest.hidden,
-                )?,
-                w2: load_expert_linear(
-                    checkpoint,
-                    &format!("{prefix}.w2"),
-                    self.manifest.hidden,
-                    self.manifest.expert_intermediate,
-                )?,
-            };
+            let weights = load_checkpoint_hot_expert(checkpoint, &self.manifest, layer, expert)?;
             write_hot_expert(&path, &self.manifest, layer, expert, &weights)?;
         }
         self.inspect_layer(layer)
@@ -311,22 +297,48 @@ impl Deepseek4HotExpertCache {
     pub fn resident_capacity(&self, layer: usize) -> Result<usize> {
         Ok(self.cached_experts(layer)?.len().max(1))
     }
+}
+
+/// One aligned layer file used by the exact-NVFP4 paging path.
+struct Deepseek4Nvfp4ExpertLayerSource {
+    direct_file: File,
+    path: PathBuf,
+    manifest: Deepseek4Manifest,
+    layer: usize,
+    layout: Deepseek4Nvfp4RecordLayout,
+    scalar_metadata: Vec<[f32; 6]>,
+}
+
+impl Deepseek4Nvfp4ExpertLayerSource {
+    fn open(root: impl AsRef<Path>, manifest: &Deepseek4Manifest, layer: usize) -> Result<Self> {
+        validate_layer_expert(manifest, layer, 0)?;
+        let layout = Deepseek4Nvfp4RecordLayout::new(manifest)?;
+        let path = nvfp4_layer_path(root.as_ref(), layer);
+        let file = File::open(&path).map_err(nvfp4_store_io(&path))?;
+        let scalar_metadata = read_nvfp4_layer_header(&file, &path, manifest, layer, layout)?;
+        let direct_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+            .map_err(nvfp4_store_io(&path))?;
+        Ok(Self {
+            direct_file,
+            path,
+            manifest: manifest.clone(),
+            layer,
+            layout,
+            scalar_metadata,
+        })
+    }
 
     fn read_record_into_slot(
         &self,
-        layer: usize,
         expert: usize,
         destination: Deepseek4PagedExpertDestination<'_>,
     ) -> Result<()> {
-        validate_layer_expert(&self.manifest, layer, expert)?;
-        let path = hot_expert_path(&self.root, layer, expert);
-        let expected_bytes = usize::try_from(hot_expert_expected_file_bytes(&self.manifest)?)
-            .map_err(|_| Error::Format {
-                label: "DeepSeek V4 NVFP4 expert record",
-                detail: "record size does not fit usize".to_string(),
-            })?;
+        validate_layer_expert(&self.manifest, self.layer, expert)?;
         let Deepseek4PagedExpertDestination { w1, w3, w2, layout } = destination;
-        if expected_bytes != layout.record_bytes
+        if layout != self.layout
             || w1.packed_weight.len() != layout.packed_bytes
             || w1.weight_scale.len() != layout.scale_bytes
             || w3.packed_weight.len() != layout.packed_bytes
@@ -337,8 +349,8 @@ impl Deepseek4HotExpertCache {
             return Err(Error::Shape {
                 label: "DeepSeek V4 NVFP4 expert destination",
                 expected: format!(
-                    "record={expected_bytes} packed={} scales={}",
-                    layout.packed_bytes, layout.scale_bytes
+                    "record={} packed={} scales={}",
+                    self.layout.record_bytes, self.layout.packed_bytes, self.layout.scale_bytes
                 ),
                 actual: format!(
                     "record={} w1={}/{} w3={}/{} w2={}/{}",
@@ -352,20 +364,7 @@ impl Deepseek4HotExpertCache {
                 ),
             });
         }
-        let file = File::open(&path).map_err(hot_cache_io(&path))?;
-        let actual_bytes = file.metadata().map_err(hot_cache_io(&path))?.len();
-        if actual_bytes != expected_bytes as u64 {
-            return Err(Error::Format {
-                label: "DeepSeek V4 NVFP4 expert record",
-                detail: format!(
-                    "{} has {actual_bytes} bytes, expected {expected_bytes}",
-                    path.display()
-                ),
-            });
-        }
-        let mut header = [0u8; HOT_EXPERT_HEADER_BYTES as usize];
         let mut destinations = [
-            IoSliceMut::new(&mut header),
             IoSliceMut::new(w1.packed_weight),
             IoSliceMut::new(w1.weight_scale),
             IoSliceMut::new(w3.packed_weight),
@@ -373,11 +372,32 @@ impl Deepseek4HotExpertCache {
             IoSliceMut::new(w2.packed_weight),
             IoSliceMut::new(w2.weight_scale),
         ];
-        read_exact_vectored_at(&file, &mut destinations, 0).map_err(hot_cache_io(&path))?;
-        validate_hot_record_header(&header, &self.manifest, layer, expert)?;
-        *w1.weight_scale_2 = read_record_f32(&header, 28)?;
-        *w3.weight_scale_2 = read_record_f32(&header, 36)?;
-        *w2.weight_scale_2 = read_record_f32(&header, 44)?;
+        for destination in &destinations {
+            let address = destination.as_ptr() as usize;
+            if !address.is_multiple_of(DIRECT_IO_ALIGNMENT)
+                || !destination.len().is_multiple_of(DIRECT_IO_ALIGNMENT)
+            {
+                return Err(Error::Format {
+                    label: "DeepSeek V4 direct expert read",
+                    detail: format!(
+                        "destination address 0x{address:x} and length {} must be {DIRECT_IO_ALIGNMENT}-byte aligned",
+                        destination.len()
+                    ),
+                });
+            }
+        }
+        let record_offset = NVFP4_LAYER_HEADER_BYTES
+            .checked_add(expert.saturating_mul(layout.record_bytes))
+            .ok_or_else(|| Error::Format {
+                label: "DeepSeek V4 direct expert read",
+                detail: "record offset overflowed usize".to_string(),
+            })?;
+        read_exact_vectored_at(&self.direct_file, &mut destinations, record_offset as u64)
+            .map_err(nvfp4_store_io(&self.path))?;
+        let scales = self.scalar_metadata[expert];
+        *w1.weight_scale_2 = scales[0];
+        *w3.weight_scale_2 = scales[2];
+        *w2.weight_scale_2 = scales[4];
         Ok(())
     }
 }
@@ -394,7 +414,7 @@ fn read_exact_vectored_at(
     mut destinations: &mut [IoSliceMut<'_>],
     mut offset: u64,
 ) -> std::io::Result<()> {
-    const MAX_DESTINATIONS: usize = 7;
+    const MAX_DESTINATIONS: usize = 6;
     while !destinations.is_empty() {
         if destinations.len() > MAX_DESTINATIONS {
             return Err(std::io::Error::new(
@@ -538,7 +558,7 @@ impl Deepseek4ExpertWorkspace {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Deepseek4Nvfp4RecordLayout {
     record_bytes: usize,
     packed_bytes: usize,
@@ -567,24 +587,23 @@ impl Deepseek4Nvfp4RecordLayout {
         }
         let packed_bytes = weights / 2;
         let scale_bytes = weights / 16;
-        let w1_packed = HOT_EXPERT_HEADER_BYTES as usize;
-        let w1_scale = w1_packed + packed_bytes;
-        let w3_packed = w1_scale + scale_bytes;
-        let w3_scale = w3_packed + packed_bytes;
-        let w2_packed = w3_scale + scale_bytes;
-        let w2_scale = w2_packed + packed_bytes;
-        let record_bytes = w2_scale + scale_bytes;
-        let expected =
-            usize::try_from(hot_expert_expected_file_bytes(manifest)?).map_err(|_| {
-                Error::Format {
-                    label: "DeepSeek V4 NVFP4 expert record",
-                    detail: "record size does not fit usize".to_string(),
-                }
-            })?;
-        if record_bytes != expected {
-            return Err(Error::Format {
+        let record_bytes = packed_bytes
+            .checked_add(scale_bytes)
+            .and_then(|value| value.checked_mul(3))
+            .ok_or_else(|| Error::Format {
                 label: "DeepSeek V4 NVFP4 expert record",
-                detail: format!("layout has {record_bytes} bytes, expected {expected}"),
+                detail: "record size overflowed usize".to_string(),
+            })?;
+        if !packed_bytes.is_multiple_of(DIRECT_IO_ALIGNMENT)
+            || !scale_bytes.is_multiple_of(DIRECT_IO_ALIGNMENT)
+            || !record_bytes.is_multiple_of(DIRECT_IO_ALIGNMENT)
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 direct expert record",
+                expected: format!(
+                    "packed, scale, and record byte counts divisible by {DIRECT_IO_ALIGNMENT}"
+                ),
+                actual: format!("packed={packed_bytes} scale={scale_bytes} record={record_bytes}"),
             });
         }
         Ok(Self {
@@ -605,9 +624,8 @@ pub struct Deepseek4PagingStats {
 
 /// One DeepSeek V4 routed-expert layer backed by bounded exact NVFP4 slots.
 pub struct Deepseek4PagedExpertLayer {
-    layer: usize,
     manifest: Deepseek4Manifest,
-    source: Deepseek4HotExpertCache,
+    source: Deepseek4Nvfp4ExpertLayerSource,
     layout: Deepseek4Nvfp4RecordLayout,
     w1: Nvfp4LinearSlots,
     w3: Nvfp4LinearSlots,
@@ -637,7 +655,7 @@ impl Deepseek4PagedExpertLayer {
             });
         }
         let layout = Deepseek4Nvfp4RecordLayout::new(manifest)?;
-        let source = Deepseek4HotExpertCache::open(source_dir, manifest, manifest.routed_experts)?;
+        let source = Deepseek4Nvfp4ExpertLayerSource::open(source_dir, manifest, layer)?;
         let w1 = Nvfp4LinearSlots::new(capacity, manifest.expert_intermediate, manifest.hidden)?;
         let w3 = Nvfp4LinearSlots::new(capacity, manifest.expert_intermediate, manifest.hidden)?;
         let w2 = Nvfp4LinearSlots::new(capacity, manifest.hidden, manifest.expert_intermediate)?;
@@ -646,7 +664,6 @@ impl Deepseek4PagedExpertLayer {
             .saturating_add(w3.device_bytes())
             .saturating_add(w2.device_bytes());
         Ok(Self {
-            layer,
             manifest: manifest.clone(),
             source,
             layout,
@@ -902,7 +919,6 @@ impl Deepseek4PagedExpertLayer {
                 .map(|miss| miss.slot)
                 .collect::<Vec<_>>();
             let source = &self.source;
-            let layer = self.layer;
             let layout = self.layout;
             let w1_slots = self.w1.slots_mut(&slot_ids)?;
             let w3_slots = self.w3.slots_mut(&slot_ids)?;
@@ -916,7 +932,6 @@ impl Deepseek4PagedExpertLayer {
                     .map(|(((miss, w1), w3), w2)| {
                         scope.spawn(move || {
                             source.read_record_into_slot(
-                                layer,
                                 miss.expert,
                                 Deepseek4PagedExpertDestination { w1, w3, w2, layout },
                             )
@@ -1416,13 +1431,17 @@ pub fn prepare_nvfp4_expert_layer(
     layer: usize,
 ) -> Result<Deepseek4HotExpertCacheInfo> {
     let manifest = Deepseek4Manifest::load(&model_dir)?;
+    validate_layer_expert(&manifest, layer, 0)?;
+    let store_dir = store_dir.as_ref();
+    fs::create_dir_all(store_dir).map_err(|error| Error::Format {
+        label: "DeepSeek V4 exact NVFP4 expert store",
+        detail: format!("failed to create {}: {error}", store_dir.display()),
+    })?;
     let checkpoint = ModelOptCheckpoint::open(model_dir)?;
-    let experts = (0..manifest.routed_experts).collect::<Vec<_>>();
-    Deepseek4HotExpertCache::open(store_dir, &manifest, manifest.routed_experts)?.replace_layer(
-        &checkpoint,
-        layer,
-        &experts,
-    )
+    write_nvfp4_expert_layer(store_dir, &manifest, layer, |expert| {
+        load_checkpoint_hot_expert(&checkpoint, &manifest, layer, expert)
+    })?;
+    inspect_nvfp4_expert_layer_with_manifest(store_dir, &manifest, layer)
 }
 
 /// Validates one complete exact-NVFP4 expert layer without reading payloads.
@@ -1432,18 +1451,7 @@ pub fn inspect_nvfp4_expert_layer(
     layer: usize,
 ) -> Result<Deepseek4HotExpertCacheInfo> {
     let manifest = Deepseek4Manifest::load(model_dir)?;
-    let store = Deepseek4HotExpertCache::open(store_dir, &manifest, manifest.routed_experts)?;
-    let info = store.inspect_layer(layer)?;
-    if info.experts != manifest.routed_experts {
-        return Err(Error::Format {
-            label: "DeepSeek V4 exact NVFP4 expert store",
-            detail: format!(
-                "layer {layer} has {} of {} experts",
-                info.experts, manifest.routed_experts
-            ),
-        });
-    }
-    Ok(info)
+    inspect_nvfp4_expert_layer_with_manifest(store_dir.as_ref(), &manifest, layer)
 }
 
 /// Validates that the exact-NVFP4 expert store contains every decoder layer.
@@ -1941,6 +1949,238 @@ fn load_expert_linear(
     Ok(linear)
 }
 
+fn load_checkpoint_hot_expert(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+    expert: usize,
+) -> Result<Deepseek4HotExpert> {
+    validate_layer_expert(manifest, layer, expert)?;
+    let prefix = format!("layers.{layer}.ffn.experts.{expert}");
+    Ok(Deepseek4HotExpert {
+        w1: load_expert_linear(
+            checkpoint,
+            &format!("{prefix}.w1"),
+            manifest.expert_intermediate,
+            manifest.hidden,
+        )?,
+        w3: load_expert_linear(
+            checkpoint,
+            &format!("{prefix}.w3"),
+            manifest.expert_intermediate,
+            manifest.hidden,
+        )?,
+        w2: load_expert_linear(
+            checkpoint,
+            &format!("{prefix}.w2"),
+            manifest.hidden,
+            manifest.expert_intermediate,
+        )?,
+    })
+}
+
+fn nvfp4_layer_path(root: &Path, layer: usize) -> PathBuf {
+    root.join(format!("layer-{layer:02}.nvf4"))
+}
+
+fn inspect_nvfp4_expert_layer_with_manifest(
+    store_dir: &Path,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+) -> Result<Deepseek4HotExpertCacheInfo> {
+    let source = Deepseek4Nvfp4ExpertLayerSource::open(store_dir, manifest, layer)?;
+    let file_bytes = source
+        .path
+        .metadata()
+        .map_err(nvfp4_store_io(&source.path))?
+        .len();
+    Ok(Deepseek4HotExpertCacheInfo {
+        experts: manifest.routed_experts,
+        file_bytes,
+    })
+}
+
+fn write_nvfp4_expert_layer(
+    store_dir: &Path,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+    mut load: impl FnMut(usize) -> Result<Deepseek4HotExpert>,
+) -> Result<()> {
+    validate_layer_expert(manifest, layer, 0)?;
+    let layout = Deepseek4Nvfp4RecordLayout::new(manifest)?;
+    let metadata_bytes = manifest
+        .routed_experts
+        .checked_mul(6 * std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_add(NVFP4_LAYER_METADATA_OFFSET))
+        .ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 exact NVFP4 expert store",
+            detail: "layer metadata size overflowed usize".to_string(),
+        })?;
+    if metadata_bytes > NVFP4_LAYER_HEADER_BYTES {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 exact NVFP4 layer header",
+            expected: format!("metadata <= {NVFP4_LAYER_HEADER_BYTES} bytes"),
+            actual: metadata_bytes.to_string(),
+        });
+    }
+
+    let path = nvfp4_layer_path(store_dir, layer);
+    let temporary = path.with_extension("nvf4.tmp");
+    let result = (|| {
+        let mut header = vec![0u8; NVFP4_LAYER_HEADER_BYTES];
+        header[..8].copy_from_slice(NVFP4_LAYER_MAGIC);
+        for (offset, value, label) in [
+            (8, NVFP4_LAYER_VERSION as usize, "version"),
+            (12, layer, "layer"),
+            (16, manifest.routed_experts, "experts"),
+            (20, manifest.hidden, "hidden"),
+            (24, manifest.expert_intermediate, "intermediate"),
+            (28, layout.record_bytes, "record bytes"),
+            (32, NVFP4_LAYER_HEADER_BYTES, "header bytes"),
+        ] {
+            let value = u32::try_from(value).map_err(|_| Error::Shape {
+                label: "DeepSeek V4 exact NVFP4 layer header",
+                expected: format!("{label} fits u32"),
+                actual: value.to_string(),
+            })?;
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let file = File::create(&temporary).map_err(nvfp4_store_io(&temporary))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(&header)
+            .map_err(nvfp4_store_io(&temporary))?;
+        for expert in 0..manifest.routed_experts {
+            let weights = load(expert)?;
+            validate_hot_linear(
+                &weights.w1,
+                manifest.expert_intermediate,
+                manifest.hidden,
+                "w1",
+            )?;
+            validate_hot_linear(
+                &weights.w3,
+                manifest.expert_intermediate,
+                manifest.hidden,
+                "w3",
+            )?;
+            validate_hot_linear(
+                &weights.w2,
+                manifest.hidden,
+                manifest.expert_intermediate,
+                "w2",
+            )?;
+            let metadata_offset = NVFP4_LAYER_METADATA_OFFSET + expert * 6 * 4;
+            for (index, value) in [
+                weights.w1.weight_scale_2,
+                weights.w1.input_scale,
+                weights.w3.weight_scale_2,
+                weights.w3.input_scale,
+                weights.w2.weight_scale_2,
+                weights.w2.input_scale,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let offset = metadata_offset + index * 4;
+                header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for linear in [&weights.w1, &weights.w3, &weights.w2] {
+                writer
+                    .write_all(&linear.packed_weight)
+                    .and_then(|()| writer.write_all(&linear.weight_scale))
+                    .map_err(nvfp4_store_io(&temporary))?;
+            }
+        }
+        writer
+            .seek(SeekFrom::Start(0))
+            .map_err(nvfp4_store_io(&temporary))?;
+        writer
+            .write_all(&header)
+            .and_then(|()| writer.flush())
+            .map_err(nvfp4_store_io(&temporary))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(nvfp4_store_io(&temporary))?;
+        fs::rename(&temporary, &path).map_err(nvfp4_store_io(&path))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_nvfp4_layer_header(
+    file: &File,
+    path: &Path,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+    layout: Deepseek4Nvfp4RecordLayout,
+) -> Result<Vec<[f32; 6]>> {
+    let expected_bytes = NVFP4_LAYER_HEADER_BYTES as u64
+        + (manifest.routed_experts as u64).saturating_mul(layout.record_bytes as u64);
+    let actual_bytes = file.metadata().map_err(nvfp4_store_io(path))?.len();
+    if actual_bytes != expected_bytes {
+        return Err(Error::Format {
+            label: "DeepSeek V4 exact NVFP4 expert store",
+            detail: format!(
+                "{} has {actual_bytes} bytes, expected {expected_bytes}",
+                path.display()
+            ),
+        });
+    }
+    let mut header = vec![0u8; NVFP4_LAYER_HEADER_BYTES];
+    BufReader::new(file)
+        .read_exact(&mut header)
+        .map_err(nvfp4_store_io(path))?;
+    let stored = [
+        read_record_u32(&header, 8)? as usize,
+        read_record_u32(&header, 12)? as usize,
+        read_record_u32(&header, 16)? as usize,
+        read_record_u32(&header, 20)? as usize,
+        read_record_u32(&header, 24)? as usize,
+        read_record_u32(&header, 28)? as usize,
+        read_record_u32(&header, 32)? as usize,
+    ];
+    let expected = [
+        NVFP4_LAYER_VERSION as usize,
+        layer,
+        manifest.routed_experts,
+        manifest.hidden,
+        manifest.expert_intermediate,
+        layout.record_bytes,
+        NVFP4_LAYER_HEADER_BYTES,
+    ];
+    if header.get(..8) != Some(NVFP4_LAYER_MAGIC.as_slice()) || stored != expected {
+        return Err(Error::Format {
+            label: "DeepSeek V4 exact NVFP4 expert store",
+            detail: format!("invalid layer header in {}: {stored:?}", path.display()),
+        });
+    }
+    (0..manifest.routed_experts)
+        .map(|expert| {
+            let offset = NVFP4_LAYER_METADATA_OFFSET + expert * 6 * 4;
+            Ok([
+                read_record_f32(&header, offset)?,
+                read_record_f32(&header, offset + 4)?,
+                read_record_f32(&header, offset + 8)?,
+                read_record_f32(&header, offset + 12)?,
+                read_record_f32(&header, offset + 16)?,
+                read_record_f32(&header, offset + 20)?,
+            ])
+        })
+        .collect()
+}
+
+fn nvfp4_store_io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
+    move |error| Error::Format {
+        label: "DeepSeek V4 exact NVFP4 expert store",
+        detail: format!("{}: {error}", path.display()),
+    }
+}
+
 fn hot_layer_dir(root: &Path, layer: usize) -> PathBuf {
     root.join(format!("layer-{layer:02}"))
 }
@@ -2394,9 +2634,10 @@ fn write_manifest(artifact_dir: &Path, manifest: &Deepseek4Manifest) -> Result<(
 mod tests {
     use super::{
         Deepseek4ExpertLayer, Deepseek4ExpertWorkspace, Deepseek4HotExpert,
-        Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4PagedExpertLayer,
-        finalise_thin_checkpoint, hot_expert_expected_file_bytes, hot_expert_path, hot_layer_dir,
-        inspect_thin_checkpoint, layer_paths, prepare_thin_checkpoint_shard, write_hot_expert,
+        Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4Nvfp4RecordLayout,
+        Deepseek4PagedExpertLayer, finalise_thin_checkpoint, hot_expert_expected_file_bytes,
+        hot_expert_path, hot_layer_dir, inspect_thin_checkpoint, layer_paths,
+        prepare_thin_checkpoint_shard, write_hot_expert, write_nvfp4_expert_layer,
     };
     use crate::nvfp4::{
         CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q3ExpertTableCacheWriter, format,
@@ -2426,11 +2667,11 @@ mod tests {
     #[test]
     fn paged_nvfp4_reads_records_directly_into_kernel_slots() {
         let manifest = Deepseek4Manifest {
-            hidden: 128,
+            hidden: 256,
             layers: 1,
             routed_experts: 3,
             experts_per_token: 2,
-            expert_intermediate: 128,
+            expert_intermediate: 256,
             shared_experts: 1,
             hash_layers: 0,
             swiglu_limit: 10.0,
@@ -2440,36 +2681,27 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        std::fs::create_dir_all(hot_layer_dir(&hot_dir, 0)).expect("hot layer directory");
+        std::fs::create_dir_all(&hot_dir).expect("expert store directory");
         let make_weight = |name: &str, value: f32| {
             ModelOptNvfp4Linear::quantize_bf16(
                 name,
-                128,
-                128,
-                &vec![format::f32_to_bf16(value); 128 * 128],
+                256,
+                256,
+                &vec![format::f32_to_bf16(value); 256 * 256],
             )
             .expect("NVFP4 weight")
         };
-        let experts = (0..3)
-            .map(|expert| {
-                let multiplier = (expert + 1) as f32;
-                Deepseek4HotExpert {
-                    w1: make_weight("w1", multiplier * 0.03125),
-                    w3: make_weight("w3", multiplier * 0.015625),
-                    w2: make_weight("w2", multiplier * 0.0078125),
-                }
-            })
-            .collect::<Vec<_>>();
-        for (expert, weights) in experts.iter().enumerate() {
-            write_hot_expert(
-                &hot_expert_path(&hot_dir, 0, expert),
-                &manifest,
-                0,
-                expert,
-                weights,
-            )
-            .expect("write hot expert");
-        }
+        let make_expert = |expert: usize| {
+            let multiplier = (expert + 1) as f32;
+            Deepseek4HotExpert {
+                w1: make_weight("w1", multiplier * 0.03125),
+                w3: make_weight("w3", multiplier * 0.015625),
+                w2: make_weight("w2", multiplier * 0.0078125),
+            }
+        };
+        let experts = (0..3).map(make_expert).collect::<Vec<_>>();
+        write_nvfp4_expert_layer(&hot_dir, &manifest, 0, |expert| Ok(make_expert(expert)))
+            .expect("write aligned expert layer");
 
         let mut layer =
             Deepseek4PagedExpertLayer::load(&hot_dir, &manifest, 0, 2).expect("paged layer");
@@ -2529,7 +2761,9 @@ mod tests {
         assert_eq!(layer.stats().misses, 3);
         assert_eq!(
             layer.stats().bytes_read,
-            3 * hot_expert_expected_file_bytes(&manifest).expect("record bytes")
+            3 * Deepseek4Nvfp4RecordLayout::new(&manifest)
+                .expect("record layout")
+                .record_bytes as u64
         );
         std::fs::remove_dir_all(hot_dir).expect("remove hot directory");
     }
