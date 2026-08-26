@@ -26,6 +26,18 @@ impl RetainedSnapshot for Qwen38FlashNextSequenceSnapshot {
 pub type Qwen38FlashNextSequenceCache =
     SequenceCache<Qwen38FlashNextPageBackend, Qwen38FlashNextSequenceSnapshot>;
 
+/// Private one-layer QSA cache used by the native MTP drafter.
+pub(crate) type Qwen38FlashNextMtpSequenceCache =
+    SequenceCache<Qwen38FlashNextPageBackend, Qwen38FlashNextMtpSnapshot>;
+
+pub(crate) struct Qwen38FlashNextMtpSnapshot;
+
+impl RetainedSnapshot for Qwen38FlashNextMtpSnapshot {
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+}
+
 /// One admitted Flash Next sequence and its stable device page table.
 pub struct Qwen38FlashNextSequence {
     pub(crate) cache_id: SequenceId,
@@ -342,6 +354,84 @@ pub fn new_qwen38_flash_next_sequence_cache_with_config(
             page_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: snapshot_capacity,
+            max_prefix_entries: (retained_bytes == 0).then_some(0),
+            emergency_bytes: 0,
+        },
+        backend,
+    )
+    .map_err(qwen38_flash_next_cache_error)
+}
+
+/// Allocates private QSA pages for the released one-layer MTP drafter.
+pub(crate) fn new_qwen38_flash_next_mtp_sequence_cache(
+    model: &Qwen38FlashNextModel,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+    retained_bytes: usize,
+) -> Result<Qwen38FlashNextMtpSequenceCache> {
+    if sequence_capacity == 0 || max_context_tokens == 0 {
+        return Err(Error::Shape {
+            label: "Qwen3.8 Flash Next MTP sequence cache",
+            expected: "positive sequence and context capacities".to_string(),
+            actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
+        });
+    }
+    let pages_per_sequence = max_context_tokens.div_ceil(crate::nvfp4::SM12X_KV_PAGE_TOKENS);
+    let page_slots = sequence_capacity
+        .checked_mul(pages_per_sequence)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP pages",
+            expected: "page count without overflow".to_string(),
+            actual: format!(
+                "sequences={sequence_capacity} pages_per_sequence={pages_per_sequence}"
+            ),
+        })?;
+    let probe = Qwen38FlashNextPageBackend::new(
+        [true],
+        1,
+        model.manifest().kv_heads,
+        model.manifest().head_dim,
+        model.config().indexer_head_dim,
+    )?;
+    let page_bytes = probe.page_bytes();
+    let retained_slots = retained_bytes / page_bytes;
+    let total_slots = page_slots
+        .checked_add(retained_slots)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP retained pages",
+            expected: "active and retained pages without overflow".to_string(),
+            actual: format!("active={page_slots} retained={retained_slots}"),
+        })?;
+    let backend = Qwen38FlashNextPageBackend::new(
+        [true],
+        total_slots,
+        model.manifest().kv_heads,
+        model.manifest().head_dim,
+        model.config().indexer_head_dim,
+    )?;
+    let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
+    let active_bytes = page_bytes
+        .checked_mul(page_slots)
+        .and_then(|bytes| bytes.checked_add(table_bytes * sequence_capacity))
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP cache bytes",
+            expected: "page and table bytes without overflow".to_string(),
+            actual: format!(
+                "page_bytes={page_bytes} page_slots={page_slots} table_bytes={table_bytes}"
+            ),
+        })?;
+    let managed_bytes = active_bytes
+        .checked_add(retained_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP retained bytes",
+            expected: "active and retained bytes without overflow".to_string(),
+            actual: format!("active={active_bytes} retained={retained_bytes}"),
+        })?;
+    Qwen38FlashNextMtpSequenceCache::new(
+        CacheConfig {
+            page_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+            max_managed_bytes: managed_bytes,
+            max_snapshot_bytes: 0,
             max_prefix_entries: (retained_bytes == 0).then_some(0),
             emergency_bytes: 0,
         },

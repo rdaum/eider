@@ -36,7 +36,7 @@ use crate::nvfp4::{
     fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
     gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
-    ling3_sigmoid_gated_rms_norm_f32_into_on_stream,
+    ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
     nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
@@ -6846,6 +6846,50 @@ impl Qwen36LmHead {
                 )
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_bf16_top1_batch(
+        &self,
+        input: &DeviceBuffer<f32>,
+        logits: &mut DeviceBuffer<f32>,
+        scratch_indices: &DeviceBuffer<u32>,
+        output_indices: &mut DeviceBuffer<u32>,
+        output_values: &mut DeviceBuffer<f32>,
+        rows: usize,
+        row_capacity: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Self::Bf16(linear) = self else {
+            return Err(Error::Format {
+                label: "Qwen BF16 batched lm_head",
+                detail: "the loaded vocabulary head is not BF16".to_string(),
+            });
+        };
+        lm_head_top1_f32_batch_into_on_stream(
+            input,
+            &linear.weight,
+            logits,
+            scratch_indices,
+            output_indices,
+            output_values,
+            rows,
+            linear.rows,
+            linear.cols,
+            stream,
+        )?;
+        if output_indices.len() < row_capacity || output_values.len() < row_capacity {
+            return Err(Error::Shape {
+                label: "Qwen BF16 batched lm_head outputs",
+                expected: format!("at least {row_capacity} rows"),
+                actual: format!(
+                    "indices={} values={}",
+                    output_indices.len(),
+                    output_values.len()
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn run_logits(

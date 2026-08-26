@@ -50,6 +50,10 @@ pub struct ServingDefaults {
     pub step_expert_capacity: usize,
 }
 
+fn default_speculative_drafts(model_type: &str) -> usize {
+    usize::from(model_type == "qwen3_8_flash_next")
+}
+
 const CATALOGUE: &[ModelSpec] = &[
     ModelSpec {
         id: "bitnet-b1.58-2b-4t",
@@ -260,6 +264,7 @@ pub struct ResolvedModel {
     pub dflash2_dir: Option<PathBuf>,
     pub identity: String,
     pub defaults: ServingDefaults,
+    pub default_speculative_drafts: usize,
     pub preparation: ArtifactKind,
 }
 
@@ -359,6 +364,7 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
         dflash2_dir,
         identity: format!("{}@{}", spec.id, spec.revision),
         defaults: spec.defaults,
+        default_speculative_drafts: default_speculative_drafts(spec.model_type),
         preparation: spec.artifact_kind,
     })
 }
@@ -666,6 +672,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             },
             step_expert_capacity: 240,
         },
+        default_speculative_drafts: default_speculative_drafts(&model_type),
         preparation: match model_type.as_str() {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
             "qwen3_5" => ArtifactKind::Qwen38Weights,
@@ -916,6 +923,8 @@ mod tests {
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8-flash-next");
         assert_eq!(model.defaults.max_context_tokens, 262_144);
         assert_eq!(model.defaults.prefill_token_capacity, 64);
+        assert_eq!(default_speculative_drafts(model.model_type), 1);
+        assert_eq!(default_speculative_drafts("qwen3_5"), 0);
     }
 
     #[test]

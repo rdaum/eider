@@ -2086,6 +2086,7 @@ impl Qwen36HybridPrefillWorkspace {
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         self.require_tokens(tokens)?;
+        let serial_recurrence = self.linear.state_snapshots.is_some();
         weights.enqueue_prefill_chunks(
             model,
             &mut self.linear,
@@ -2099,7 +2100,7 @@ impl Qwen36HybridPrefillWorkspace {
             tokens,
             tokens,
             false,
-            false,
+            serial_recurrence,
             true,
             stream,
         )?;
@@ -2122,6 +2123,18 @@ impl Qwen36HybridPrefillWorkspace {
 
     pub(crate) fn finish_gdn_prefill(&mut self) -> Result<()> {
         self.linear.upload_single_prefill_states()
+    }
+
+    pub(crate) fn enable_state_snapshots(
+        &mut self,
+        model: &Qwen36BatchModelView<'_>,
+        slots: usize,
+    ) -> Result<()> {
+        self.linear.enable_state_snapshots(model, slots)
+    }
+
+    pub(crate) fn restore_state_snapshot(&self, slot: usize, stream: &CudaStream) -> Result<()> {
+        self.linear.restore_state_snapshot(slot, stream)
     }
 
     pub(crate) fn run_moe<'a>(

@@ -524,6 +524,7 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Qwen38FlashNext => {
+            let mut defaults = defaults;
             info!(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
@@ -531,18 +532,24 @@ fn actor_main(
                 max_context_tokens = scheduler.max_context_tokens,
                 "loading Qwen3.8 Flash Next model"
             );
-            let model = match Qwen38FlashNextModel::open(&model_dir, &artifact_dir) {
+            let mut model = match Qwen38FlashNextModel::open(&model_dir, &artifact_dir) {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
                     return;
                 }
             };
+            if scheduler.speculative_drafts > 0 {
+                if let Err(error) = model.enable_mtp() {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+                defaults.sampling.temperature = 0.0;
+            }
             let qsa_scheduler = SchedulerConfig {
                 max_context_tokens: scheduler
                     .max_context_tokens
                     .min(model.config().max_position_embeddings),
-                speculative_drafts: 0,
                 ..scheduler
             };
             let service = match Qwen38FlashNextChatService::new_with_cache_config(
@@ -1231,7 +1238,15 @@ impl ActorService for Qwen38FlashNextActorService<'_> {
                 .into_iter()
                 .map(Qwen38FlashNextRequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            qwen38_speculative: tick
+                .speculative
+                .into_iter()
+                .map(|progress| EngineQwen38SpeculativeProgress {
+                    request_id: progress.request_id.get(),
+                    cycles: progress.cycles,
+                    accepted_drafts: progress.accepted_drafts,
+                })
+                .collect(),
             dflash: Vec::new(),
             output: tick
                 .output

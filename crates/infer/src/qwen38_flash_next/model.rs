@@ -6,19 +6,20 @@ use super::{
 use crate::nvfp4::{
     CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     ModelOptCheckpoint, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
+    rms_norm_f32_into_on_stream,
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
-    Qwen36BatchModelView, Qwen36Embedding, Qwen36HybridPrefillWorkspace,
+    Bf16Linear, Qwen36BatchModelView, Qwen36Embedding, Qwen36HybridPrefillWorkspace,
     Qwen36LinearAttentionState, Qwen36LinearAttentionWeights, Qwen36LinearAttentionWorkspace,
     Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36MoeWeights, Qwen36MoeWorkspace,
-    load_hybrid_full_attention, load_hybrid_linear_attention,
+    load_hybrid_full_attention, load_hybrid_linear_attention, read_bf16_vector_delta_as_f32_device,
 };
 use crate::runtime::qwen38_flash_next_sequence::{
-    Qwen38FlashNextSequenceCache, qwen38_flash_next_cache_error,
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextSequenceCache, qwen38_flash_next_cache_error,
 };
 use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
-use seqcache::{AppendReservation, SequenceId};
+use seqcache::{AdmissionOutcome, AdmissionRequest, AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,6 +69,50 @@ pub struct Qwen38FlashNextModel {
     ple_weights: Qwen38PleWeights,
     final_mixer: Qwen38HyperConnectionWeights,
     lm_head: Qwen36LmHead,
+    mtp: Option<Box<Qwen38FlashNextMtpWeights>>,
+}
+
+struct Qwen38FlashNextMtpWeights {
+    manifest: QwenModelManifest,
+    pre_fc_norm_embedding: DeviceBuffer<f32>,
+    pre_fc_norm_hidden: DeviceBuffer<f32>,
+    fc_embedding: Bf16Linear,
+    fc_hidden: Bf16Linear,
+    attention_hyper: Qwen38HyperConnectionWeights,
+    attention: Qwen38QsaWeights,
+    mlp_hyper: Qwen38HyperConnectionWeights,
+    moe: Qwen36MoeWeights,
+    final_mixer: Qwen38HyperConnectionWeights,
+}
+
+/// Persistent private QSA position for one native MTP drafter.
+pub(crate) struct Qwen38FlashNextMtpSequenceState {
+    pub(crate) cache_id: SequenceId,
+    pub(crate) page_table: Sm12xPageTable,
+    position: usize,
+    max_tokens: usize,
+}
+
+/// Reusable one-row storage for the released native MTP block.
+pub(crate) struct Qwen38FlashNextMtpWorkspace {
+    token: DeviceBuffer<u32>,
+    embedded: DeviceBuffer<f32>,
+    normed_embedding: DeviceBuffer<f32>,
+    projected_embedding: DeviceBuffer<f32>,
+    normed_hidden: DeviceBuffer<f32>,
+    projected_hidden: DeviceBuffer<f32>,
+    repeated_embedding: DeviceBuffer<f32>,
+    streams_a: DeviceBuffer<f32>,
+    streams_b: DeviceBuffer<f32>,
+    zero_hidden: DeviceBuffer<f32>,
+    attention_hyper: Qwen38HyperConnectionWorkspace,
+    attention: Qwen38QsaWorkspace,
+    attention_output: DeviceBuffer<f32>,
+    mlp_hyper: Qwen38HyperConnectionWorkspace,
+    moe: Qwen36MoeWorkspace,
+    final_hyper: Qwen38HyperConnectionWorkspace,
+    final_hidden: DeviceBuffer<f32>,
+    lm_head: Qwen36LmHeadWorkspace,
 }
 
 /// Mutable one-sequence state and reusable single-token workspace.
@@ -121,6 +166,7 @@ pub struct Qwen38FlashNextSequenceSnapshot {
     linear_states: Vec<Option<Qwen36LinearAttentionState>>,
     ple_window: Qwen38PleTokenWindow,
     ple_conv: DeviceBuffer<f32>,
+    frontier_streams: DeviceBuffer<f32>,
     device_bytes: usize,
 }
 
@@ -143,6 +189,29 @@ pub struct Qwen38NextToken {
     pub id: u32,
     /// Winning logit.
     pub value: f32,
+}
+
+/// Committed-but-unprocessed token and the target streams that produced it.
+pub(crate) struct Qwen38FlashNextSpeculativeFrontier {
+    pub(crate) token: u32,
+    pub(crate) logit: f32,
+    pub(crate) previous_streams: DeviceBuffer<f32>,
+}
+
+pub(crate) struct Qwen38FlashNextSpeculativeOutcome {
+    pub(crate) committed: Vec<Qwen38NextToken>,
+    pub(crate) accepted_drafts: usize,
+}
+
+pub(crate) struct Qwen38FlashNextSpeculativeWorkspace {
+    verify: Qwen38FlashNextPrefillWorkspace,
+    final_hyper: Qwen38HyperConnectionWorkspace,
+    final_hidden: DeviceBuffer<f32>,
+    top1_scratch_values: DeviceBuffer<f32>,
+    top1_scratch_indices: DeviceBuffer<u32>,
+    argmax_indices: DeviceBuffer<u32>,
+    argmax_values: DeviceBuffer<f32>,
+    host_tokens: Vec<u32>,
 }
 
 /// Vocabulary-head work requested for one committed token.
@@ -241,6 +310,648 @@ impl Qwen38FlashNextModel {
             ple_weights,
             final_mixer,
             lm_head,
+            mtp: None,
+        })
+    }
+
+    /// Loads the released one-layer QSA/MoE MTP drafter on demand.
+    pub fn enable_mtp(&mut self) -> Result<()> {
+        if self.mtp.is_some() {
+            return Ok(());
+        }
+        if self.config.mtp_layers != 1
+            || !self.checkpoint.contains_tensor("mtp.fc_embedding.weight")
+        {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next MTP",
+                detail: "checkpoint does not contain the released one-layer MTP block".to_string(),
+            });
+        }
+        let hidden = self.config.hidden;
+        let hc_dim = hidden * self.config.hc_count;
+        let mut manifest = self.manifest.clone();
+        manifest.tensor_prefix = "mtp".to_string();
+        manifest.layers = 1;
+        manifest.layer_kinds = vec![QwenLayerKind::FullAttention];
+        manifest.linear_attention = None;
+        manifest.mtp_layers = 0;
+        let artifact_dir = self.artifact_dir.join("mtp");
+        let attention = load_hybrid_full_attention(&self.checkpoint, &manifest, &artifact_dir, 0)?;
+        let attention = Qwen38QsaWeights::load_at_prefix(
+            &self.checkpoint,
+            &self.config,
+            "mtp.layers.0.self_attn.indexer",
+            attention,
+        )?;
+        let mtp = Qwen38FlashNextMtpWeights {
+            manifest: manifest.clone(),
+            pre_fc_norm_embedding: read_bf16_vector_delta_as_f32_device(
+                &self.checkpoint,
+                "mtp.pre_fc_norm_embedding.weight",
+                hidden,
+            )?,
+            pre_fc_norm_hidden: read_bf16_vector_delta_as_f32_device(
+                &self.checkpoint,
+                "mtp.pre_fc_norm_hidden.weight",
+                hc_dim,
+            )?,
+            fc_embedding: Bf16Linear::load(
+                &self.checkpoint,
+                "mtp.fc_embedding.weight",
+                hidden,
+                hidden,
+            )?,
+            fc_hidden: Bf16Linear::load(&self.checkpoint, "mtp.fc_hidden.weight", hidden, hidden)?,
+            attention_hyper: Qwen38HyperConnectionWeights::load(
+                &self.checkpoint,
+                "mtp.layers.0.attn_hyper_connection",
+                &self.config,
+                true,
+            )?,
+            attention,
+            mlp_hyper: Qwen38HyperConnectionWeights::load(
+                &self.checkpoint,
+                "mtp.layers.0.mlp_hyper_connection",
+                &self.config,
+                true,
+            )?,
+            moe: Qwen36MoeWeights::load_checkpoint_layout(
+                &self.checkpoint,
+                &manifest,
+                &artifact_dir,
+                0,
+            )?,
+            final_mixer: Qwen38HyperConnectionWeights::load(
+                &self.checkpoint,
+                "mtp.hyper_connection_mixer",
+                &self.config,
+                false,
+            )?,
+        };
+        self.mtp = Some(Box::new(mtp));
+        Ok(())
+    }
+
+    pub(crate) fn mtp_enabled(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    pub(crate) fn new_mtp_workspace(
+        &self,
+        max_tokens: usize,
+    ) -> Result<Qwen38FlashNextMtpWorkspace> {
+        let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next MTP workspace",
+            detail: "MTP weights are not enabled".to_string(),
+        })?;
+        let hidden = self.config.hidden;
+        let hc_dim = hidden * self.config.hc_count;
+        Ok(Qwen38FlashNextMtpWorkspace {
+            token: DeviceBuffer::zeroed(1)?,
+            embedded: DeviceBuffer::zeroed(hidden)?,
+            normed_embedding: DeviceBuffer::zeroed(hidden)?,
+            projected_embedding: DeviceBuffer::zeroed(hidden)?,
+            normed_hidden: DeviceBuffer::zeroed(hc_dim)?,
+            projected_hidden: DeviceBuffer::zeroed(hc_dim)?,
+            repeated_embedding: DeviceBuffer::zeroed(hc_dim)?,
+            streams_a: DeviceBuffer::zeroed(hc_dim)?,
+            streams_b: DeviceBuffer::zeroed(hc_dim)?,
+            zero_hidden: DeviceBuffer::zeroed(hidden)?,
+            attention_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
+            attention: Qwen38QsaWorkspace::new(
+                &self.config,
+                &mtp.manifest,
+                &mtp.attention,
+                max_tokens,
+            )?,
+            attention_output: DeviceBuffer::zeroed(hidden)?,
+            mlp_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
+            moe: Qwen36MoeWorkspace::new(&mtp.manifest)?,
+            final_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
+            final_hidden: DeviceBuffer::zeroed(hidden)?,
+            lm_head: Qwen36LmHeadWorkspace::new(self.config.vocab, hidden)?,
+        })
+    }
+
+    pub(crate) fn new_speculative_workspace(
+        &self,
+        drafts: usize,
+    ) -> Result<Qwen38FlashNextSpeculativeWorkspace> {
+        if drafts != 1 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next speculative drafts",
+                expected: "exactly one draft in the initial native MTP path".to_string(),
+                actual: drafts.to_string(),
+            });
+        }
+        let rows = drafts + 1;
+        let mut verify = self.new_prefill_workspace(rows)?;
+        let model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &verify.linear_layers);
+        verify.hybrid.enable_state_snapshots(&model, drafts)?;
+        Ok(Qwen38FlashNextSpeculativeWorkspace {
+            verify,
+            final_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, rows)?,
+            final_hidden: DeviceBuffer::zeroed(rows * self.config.hidden)?,
+            top1_scratch_values: DeviceBuffer::zeroed(rows * self.config.vocab.div_ceil(8))?,
+            top1_scratch_indices: DeviceBuffer::zeroed(rows * self.config.vocab.div_ceil(8))?,
+            argmax_indices: DeviceBuffer::zeroed(rows)?,
+            argmax_values: DeviceBuffer::zeroed(rows)?,
+            host_tokens: Vec::with_capacity(rows),
+        })
+    }
+
+    pub(crate) fn new_mtp_sequence_state(
+        &self,
+        cache: &mut Qwen38FlashNextMtpSequenceCache,
+        max_tokens: usize,
+        prompt_tokens: &[u32],
+        stream: &CudaStream,
+    ) -> Result<Qwen38FlashNextMtpSequenceState> {
+        if !self.mtp_enabled() {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next MTP sequence",
+                detail: "MTP weights are not enabled".to_string(),
+            });
+        }
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let prefix = cache.lookup_prefix(prompt_tokens);
+        let mut restored_position = 0usize;
+        let outcome = cache
+            .admit(
+                prefix,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: 0,
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+                |_snapshot, position| {
+                    restored_position = position;
+                    Ok(())
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next MTP admission",
+                detail: "configured drafter cache has insufficient capacity".to_string(),
+            });
+        };
+        Ok(Qwen38FlashNextMtpSequenceState {
+            cache_id,
+            page_table,
+            position: restored_position,
+            max_tokens,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mtp_forward_token(
+        &self,
+        state: &mut Qwen38FlashNextMtpSequenceState,
+        workspace: &mut Qwen38FlashNextMtpWorkspace,
+        cache: &mut Qwen38FlashNextMtpSequenceCache,
+        token: u32,
+        previous_target_streams: &DeviceBuffer<f32>,
+        logits: bool,
+        stream: &CudaStream,
+    ) -> Result<Option<Qwen38NextToken>> {
+        let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next MTP forward",
+            detail: "MTP weights are not enabled".to_string(),
+        })?;
+        if state.position >= state.max_tokens {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP position",
+                expected: format!("position < {}", state.max_tokens),
+                actual: state.position.to_string(),
+            });
+        }
+        let hidden = self.config.hidden;
+        let hc_dim = hidden * self.config.hc_count;
+        if previous_target_streams.len() < hc_dim {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP target streams",
+                expected: format!("at least {hc_dim} values"),
+                actual: previous_target_streams.len().to_string(),
+            });
+        }
+        workspace.token.copy_from_host(&[token])?;
+        self.embedding.gather_prefix(
+            self.config.vocab,
+            hidden,
+            &workspace.token,
+            workspace.embedded.output(),
+            1,
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            1,
+            hidden,
+            &workspace.embedded,
+            &mtp.pre_fc_norm_embedding,
+            workspace.normed_embedding.output(),
+            self.config.rms_eps(),
+            stream,
+        )?;
+        mtp.fc_embedding.run_into(
+            &workspace.normed_embedding,
+            &mut workspace.projected_embedding,
+            stream,
+        )?;
+        rms_norm_f32_into_on_stream(
+            1,
+            hc_dim,
+            previous_target_streams,
+            &mtp.pre_fc_norm_hidden,
+            workspace.normed_hidden.output(),
+            self.config.rms_eps(),
+            stream,
+        )?;
+        mtp.fc_hidden.run_batch_into(
+            &workspace.normed_hidden,
+            &mut workspace.projected_hidden,
+            self.config.hc_count,
+            stream,
+        )?;
+        qwen38_repeat_streams_f32_into_on_stream(
+            &workspace.projected_embedding,
+            workspace.repeated_embedding.output(),
+            1,
+            hidden,
+            self.config.hc_count,
+            stream,
+        )?;
+        add_f32_into_on_stream(
+            &workspace.projected_hidden,
+            &workspace.repeated_embedding,
+            workspace.streams_a.output(),
+            stream,
+        )?;
+        mtp.attention_hyper.mix(
+            &workspace.streams_a,
+            &mut workspace.attention_hyper,
+            1,
+            stream,
+        )?;
+
+        let reservation = cache
+            .reserve_append(
+                state.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let attention = cache
+            .with_append_pages(&reservation, |backend, pages| {
+                let page = pages.iter().next().ok_or_else(|| Error::Format {
+                    label: "Qwen3.8 Flash Next MTP QSA append",
+                    detail: "one-token reservation contains no physical page".to_string(),
+                })?;
+                let output = mtp.attention.run_one_token(
+                    &mut workspace.attention,
+                    backend,
+                    state.page_table.device(),
+                    page.page(),
+                    page.segment().page_offset(),
+                    &self.config,
+                    &mtp.manifest,
+                    workspace.attention_hyper.mixed(),
+                    0,
+                    state.position,
+                    stream,
+                )?;
+                workspace
+                    .attention_output
+                    .copy_prefix_from_device_on_stream(output, hidden, stream)?;
+                Ok(())
+            })
+            .map_err(qwen38_flash_next_cache_error);
+        if let Err(error) = attention {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut state.page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        let body = (|| -> Result<Option<Qwen38NextToken>> {
+            mtp.attention_hyper.combine(
+                &workspace.streams_a,
+                &workspace.attention_output,
+                &mut workspace.attention_hyper,
+                &mut workspace.streams_b,
+                1,
+                stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+            mtp.mlp_hyper
+                .mix(&workspace.streams_a, &mut workspace.mlp_hyper, 1, stream)?;
+            let ffn = mtp.moe.run_one_token(
+                &self.lt,
+                &mut workspace.moe,
+                &mtp.manifest,
+                workspace.mlp_hyper.mixed(),
+                &workspace.zero_hidden,
+                stream,
+                None,
+                None,
+            )?;
+            mtp.mlp_hyper.combine(
+                &workspace.streams_a,
+                ffn.ffn_out,
+                &mut workspace.mlp_hyper,
+                &mut workspace.streams_b,
+                1,
+                stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+            if !logits {
+                return Ok(None);
+            }
+            mtp.final_mixer
+                .mix(&workspace.streams_a, &mut workspace.final_hyper, 1, stream)?;
+            workspace.final_hidden.copy_prefix_from_device_on_stream(
+                workspace.final_hyper.mixed(),
+                hidden,
+                stream,
+            )?;
+            self.lm_head.run_top1(
+                &self.lt,
+                &workspace.final_hidden,
+                &mut workspace.lm_head,
+                stream,
+            )?;
+            let (id, value) = workspace.lm_head.read_top1(stream)?;
+            Ok(Some(Qwen38NextToken { id, value }))
+        })();
+        match body {
+            Ok(next) => {
+                cache
+                    .commit_append(
+                        reservation,
+                        1,
+                        &mut Sm12xCacheContext {
+                            stream,
+                            page_table: &mut state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                state.position += 1;
+                Ok(next)
+            }
+            Err(error) => {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream,
+                            page_table: &mut state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn speculative_cycle_argmax(
+        &mut self,
+        workspace: &mut Qwen38FlashNextSpeculativeWorkspace,
+        frontier: &mut Qwen38FlashNextSpeculativeFrontier,
+        target_state: &mut Qwen38FlashNextDecodeState,
+        target_cache: &mut Qwen38FlashNextSequenceCache,
+        target_cache_id: SequenceId,
+        target_page_table: &mut Sm12xPageTable,
+        mtp_state: &mut Qwen38FlashNextMtpSequenceState,
+        mtp_workspace: &mut Qwen38FlashNextMtpWorkspace,
+        mtp_cache: &mut Qwen38FlashNextMtpSequenceCache,
+    ) -> Result<Qwen38FlashNextSpeculativeOutcome> {
+        let draft = self
+            .mtp_forward_token(
+                mtp_state,
+                mtp_workspace,
+                mtp_cache,
+                frontier.token,
+                &frontier.previous_streams,
+                true,
+                &target_state.stream,
+            )?
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next MTP draft",
+                detail: "draft step produced no vocabulary result".to_string(),
+            })?;
+        workspace.host_tokens.clear();
+        workspace.host_tokens.extend([frontier.token, draft.id]);
+        let rows = workspace.host_tokens.len();
+        let reservation = target_cache
+            .reserve_append(
+                target_cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream: &target_state.stream,
+                    page_table: target_page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        if let Err(error) = target_state.begin_append() {
+            target_cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &target_state.stream,
+                        page_table: target_page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        if let Err(error) = workspace
+            .verify
+            .ple_pager
+            .begin_read_tokens(&mut target_state.ple_window, &workspace.host_tokens)
+        {
+            target_state.abort_append()?;
+            target_cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &target_state.stream,
+                        page_table: target_page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        let forward = self.prefill_tokens_inner(
+            target_state,
+            &mut workspace.verify,
+            target_cache,
+            &reservation,
+            target_page_table,
+            &workspace.host_tokens,
+            Qwen38LogitsMode::None,
+        );
+        if let Err(error) = forward {
+            target_state.abort_append()?;
+            target_cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &target_state.stream,
+                        page_table: target_page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        let verification = (|| -> Result<(usize, Vec<u32>, Vec<f32>)> {
+            self.final_mixer.mix(
+                &workspace.verify.streams_a,
+                &mut workspace.final_hyper,
+                rows,
+                &target_state.stream,
+            )?;
+            workspace.final_hidden.copy_prefix_from_device_on_stream(
+                workspace.final_hyper.mixed(),
+                rows * self.config.hidden,
+                &target_state.stream,
+            )?;
+            self.lm_head.run_bf16_top1_batch(
+                &workspace.final_hidden,
+                &mut workspace.top1_scratch_values,
+                &workspace.top1_scratch_indices,
+                &mut workspace.argmax_indices,
+                &mut workspace.argmax_values,
+                rows,
+                rows,
+                &target_state.stream,
+            )?;
+            let indices = workspace
+                .argmax_indices
+                .copy_prefix_to_host(rows, &target_state.stream)?
+                .into_vec();
+            let values = workspace
+                .argmax_values
+                .copy_prefix_to_host(rows, &target_state.stream)?
+                .into_vec();
+            let accepted = usize::from(indices[0] == draft.id);
+            Ok((accepted, indices, values))
+        })();
+        let (accepted, indices, values) = match verification {
+            Ok(verification) => verification,
+            Err(error) => {
+                target_state.abort_append()?;
+                target_cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &target_state.stream,
+                            page_table: target_page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                return Err(error);
+            }
+        };
+        let committed_rows = accepted + 1;
+        if accepted == 0 {
+            workspace
+                .verify
+                .hybrid
+                .restore_state_snapshot(0, &target_state.stream)?;
+            target_state.ple_state.restore_append_prefix(
+                &self.ple_weights,
+                &mut workspace.verify.ple,
+                committed_rows,
+                &target_state.stream,
+            )?;
+            target_state
+                .ple_window
+                .restore_append_prefix(&workspace.host_tokens[..committed_rows])?;
+        }
+        if let Err(error) = target_cache
+            .commit_append(
+                reservation,
+                committed_rows,
+                &mut Sm12xCacheContext {
+                    stream: &target_state.stream,
+                    page_table: target_page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)
+        {
+            target_state.abort_append()?;
+            return Err(error);
+        }
+        target_state.commit_append(committed_rows)?;
+        let hc_dim = self.config.hidden * self.config.hc_count;
+        target_state.streams_a.copy_range_from_device_on_stream(
+            0,
+            &workspace.verify.streams_a,
+            accepted * hc_dim,
+            hc_dim,
+            &target_state.stream,
+        )?;
+        target_state.hidden.copy_range_from_device_on_stream(
+            0,
+            &workspace.final_hidden,
+            accepted * self.config.hidden,
+            self.config.hidden,
+            &target_state.stream,
+        )?;
+
+        let old_frontier = Qwen38NextToken {
+            id: frontier.token,
+            value: frontier.logit,
+        };
+        let mut committed = vec![old_frontier];
+        if accepted == 1 {
+            frontier.previous_streams.copy_range_from_device_on_stream(
+                0,
+                &workspace.verify.streams_a,
+                0,
+                hc_dim,
+                &target_state.stream,
+            )?;
+            self.mtp_forward_token(
+                mtp_state,
+                mtp_workspace,
+                mtp_cache,
+                draft.id,
+                &frontier.previous_streams,
+                false,
+                &target_state.stream,
+            )?;
+            committed.push(Qwen38NextToken {
+                id: draft.id,
+                value: values[0],
+            });
+        }
+        frontier.previous_streams.copy_range_from_device_on_stream(
+            0,
+            &workspace.verify.streams_a,
+            accepted * hc_dim,
+            hc_dim,
+            &target_state.stream,
+        )?;
+        frontier.token = indices[accepted];
+        frontier.logit = values[accepted];
+        Ok(Qwen38FlashNextSpeculativeOutcome {
+            committed,
+            accepted_drafts: accepted,
         })
     }
 
@@ -393,8 +1104,14 @@ impl Qwen38FlashNextModel {
         }
         let ple_window = source.ple_window.snapshot()?;
         let ple_conv = source.ple_state.snapshot_on_stream(&source.stream)?;
+        let mut frontier_streams = DeviceBuffer::zeroed(source.streams_a.len())?;
+        frontier_streams.copy_prefix_from_device_on_stream(
+            &source.streams_a,
+            source.streams_a.len(),
+            &source.stream,
+        )?;
         let mut linear_states = Vec::with_capacity(source.attention_states.len());
-        let mut device_bytes = ple_conv.device_bytes();
+        let mut device_bytes = ple_conv.device_bytes() + frontier_streams.device_bytes();
         for state in &source.attention_states {
             match state {
                 Qwen38AttentionState::Linear(linear_source) => {
@@ -422,6 +1139,7 @@ impl Qwen38FlashNextModel {
             linear_states,
             ple_window,
             ple_conv,
+            frontier_streams,
             device_bytes,
         })
     }
@@ -464,6 +1182,11 @@ impl Qwen38FlashNextModel {
         destination
             .ple_state
             .restore_from_on_stream(&snapshot.ple_conv, &destination.stream)?;
+        destination.streams_a.copy_prefix_from_device_on_stream(
+            &snapshot.frontier_streams,
+            snapshot.frontier_streams.len(),
+            &destination.stream,
+        )?;
         destination.ple_window.restore_from(&snapshot.ple_window)?;
         destination.stream.synchronize()?;
         destination.position = snapshot.position;
@@ -783,10 +1506,6 @@ impl Qwen38FlashNextModel {
             std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
         }
 
-        if logits == Qwen38LogitsMode::None {
-            state.stream.synchronize()?;
-            return Ok(None);
-        }
         let hc_dim = self.config.hidden * self.config.hc_count;
         state.streams_a.copy_range_from_device_on_stream(
             0,
@@ -795,6 +1514,10 @@ impl Qwen38FlashNextModel {
             hc_dim,
             &state.stream,
         )?;
+        if logits == Qwen38LogitsMode::None {
+            state.stream.synchronize()?;
+            return Ok(None);
+        }
         self.final_mixer
             .mix(&state.streams_a, &mut state.final_hyper, 1, &state.stream)?;
         state.hidden.copy_prefix_from_device_on_stream(
@@ -1143,6 +1866,35 @@ impl Qwen38FlashNextModel {
         &self.manifest
     }
 
+    pub(crate) fn copy_prefill_target_streams(
+        &self,
+        workspace: &Qwen38FlashNextPrefillWorkspace,
+        row: usize,
+        destination: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let width = self.config.hidden * self.config.hc_count;
+        destination.copy_range_from_device_on_stream(
+            0,
+            &workspace.streams_a,
+            row * width,
+            width,
+            stream,
+        )
+    }
+
+    pub(crate) fn copy_decode_target_streams(
+        &self,
+        state: &Qwen38FlashNextDecodeState,
+        destination: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        destination.copy_prefix_from_device_on_stream(
+            &state.streams_a,
+            state.streams_a.len(),
+            &state.stream,
+        )
+    }
+
     /// Checkpoint retained by the loaded runtime.
     pub fn checkpoint(&self) -> &ModelOptCheckpoint {
         &self.checkpoint
@@ -1236,6 +1988,33 @@ impl Qwen38FlashNextDecodeState {
     /// Number of committed tokens.
     pub fn position(&self) -> usize {
         self.position
+    }
+}
+
+impl Qwen38FlashNextMtpSequenceState {
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.page_table.managed_bytes()
+    }
+
+    pub(crate) fn finish(
+        self,
+        cache: &mut Qwen38FlashNextMtpSequenceCache,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let mut page_table = self.page_table;
+        cache
+            .finish(
+                self.cache_id,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)
     }
 }
 

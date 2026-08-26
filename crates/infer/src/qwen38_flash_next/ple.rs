@@ -222,6 +222,23 @@ impl Qwen38PleTokenWindow {
         Ok(())
     }
 
+    /// Commits only the accepted prefix of the tokens hashed in this append.
+    pub(crate) fn restore_append_prefix(&mut self, tokens: &[u32]) -> Result<()> {
+        let previous = self
+            .rollback
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 PLE append",
+                detail: "no append transaction is active".to_string(),
+            })?
+            .clone();
+        self.previous = previous;
+        for &token in tokens {
+            self.push(token);
+        }
+        Ok(())
+    }
+
     /// Restores token history from the start of the current transaction.
     pub fn abort_append(&mut self) -> Result<()> {
         let previous = self.rollback.take().ok_or_else(|| Error::Format {

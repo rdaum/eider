@@ -16,5 +16,5 @@ exec cargo run --release \
   --max-active-sequences 2 \
   --decode-capacity 2 \
   --prefill-sequence-capacity 2 \
-  --speculative-drafts 0 \
+  --speculative-drafts "${EIDER_SPECULATIVE_DRAFTS:-1}" \
   "$@"

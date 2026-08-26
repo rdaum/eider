@@ -51,10 +51,8 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Release-day performance
 
-These results come from an active Pi tool-use session on one DGX
-Spark. The server used target-only decoding without MTP speculation
-(the checkpoint includes native MTP weights, support for them isn't
-there yet; coming next.)
+These target-only results come from an active Pi tool-use session on one DGX
+Spark. The table records the release-day baseline before native MTP support.
 
 More performance work will follow as we profile longer sessions.
 
@@ -70,6 +68,24 @@ More performance work will follow as we profile longer sessions.
 
 The cached turns restored 5,760 and 5,888 prompt tokens. They completed with
 tool calls and preserved the shared model state between requests.
+
+The launcher now uses one native MTP draft per target pass. Eider serves the
+released QSA and MoE MTP block from the same checkpoint.
+
+| MTP measurement | Result | Workload |
+| --- | ---: | --- |
+| Short-prompt decode | 19.3 tokens/sec | 32 output tokens, 16/16 drafts accepted |
+| Mixed-acceptance decode | 16.6 tokens/sec | 128 output tokens, 53/74 drafts accepted |
+| Cached-prefix decode | 20.9 tokens/sec | 1,792 cached prompt tokens, 4/4 drafts accepted |
+| Cached-prefix time to first token | 598 ms | 30 uncached prompt tokens |
+
+MTP output matched the target-only output exactly in the 32-token comparison.
+The target model verifies each draft before Eider commits it.
+
+The shared radix cache retains the target prefix and the MTP QSA prefix. Thus,
+Pi follow-up turns keep MTP speculation after a prefix-cache hit.
+
+Set `EIDER_SPECULATIVE_DRAFTS=0` to measure target-only decoding.
 
 These values are server telemetry, not isolated kernel rates. The PLE n-gram
 table remains on NVMe, while the complete neural body stays resident in

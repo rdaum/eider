@@ -173,9 +173,10 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_active_sequences: usize,
 
-    /// Greedy-only native drafts per speculative cycle. Zero disables speculation.
-    #[arg(long, default_value_t = 0)]
-    speculative_drafts: usize,
+    /// Greedy-only native drafts per speculative cycle.
+    /// Omit this option to use the model default. Zero disables speculation.
+    #[arg(long)]
+    speculative_drafts: Option<usize>,
 
     /// Maximum prompt plus generated tokens per request.
     #[arg(long)]
@@ -320,6 +321,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let step_expert_capacity = args
         .step_expert_capacity
         .unwrap_or(defaults.step_expert_capacity);
+    let speculative_drafts = args
+        .speculative_drafts
+        .unwrap_or(resolved.default_speculative_drafts);
     let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
     actor_config.artifact_dir = resolved.artifact_dir.clone();
     actor_config.dflash_gguf = resolved.dflash_gguf.clone();
@@ -330,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefill_token_capacity,
         max_active_sequences: args.max_active_sequences,
         max_context_tokens,
-        speculative_drafts: args.speculative_drafts,
+        speculative_drafts,
     };
     actor_config.sequence_cache.max_retained_bytes = args
         .retained_prefix_gib

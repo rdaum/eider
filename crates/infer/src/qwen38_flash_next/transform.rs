@@ -286,6 +286,41 @@ impl Qwen38PleState {
         Ok(())
     }
 
+    /// Restores the pre-append state and advances it through an accepted prefix.
+    pub(crate) fn restore_append_prefix(
+        &mut self,
+        weights: &Qwen38PleWeights,
+        workspace: &mut Qwen38PleWorkspace,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if !self.append_pending || tokens == 0 || tokens > workspace.token_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 PLE partial commit",
+                expected: format!("pending append and 1..={} tokens", workspace.token_capacity),
+                actual: format!("pending={} tokens={tokens}", self.append_pending),
+            });
+        }
+        self.conv.copy_prefix_from_device_on_stream(
+            &self.rollback,
+            self.channels * self.history,
+            stream,
+        )?;
+        qwen38_ple_conv_update_f32_into_on_stream(
+            &workspace.conv_normed,
+            &workspace.gated,
+            &weights.conv_weight,
+            &mut self.conv,
+            workspace.output.output(),
+            tokens,
+            self.channels,
+            weights.conv_kernel,
+            weights.conv_dilation,
+            stream,
+        )?;
+        Ok(())
+    }
+
     /// Restores convolution history from the start of the transaction.
     pub fn abort_append(&mut self, stream: &CudaStream) -> Result<()> {
         if !self.append_pending {

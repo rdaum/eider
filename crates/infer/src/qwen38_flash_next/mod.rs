@@ -9,10 +9,13 @@ mod transform;
 
 pub use config::Qwen38FlashNextConfig;
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
-pub(crate) use model::Qwen38FlashNextPrefillWorkspace;
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
     Qwen38LogitsMode, Qwen38NextToken,
+};
+pub(crate) use model::{
+    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace, Qwen38FlashNextPrefillWorkspace,
+    Qwen38FlashNextSpeculativeFrontier, Qwen38FlashNextSpeculativeWorkspace,
 };
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};

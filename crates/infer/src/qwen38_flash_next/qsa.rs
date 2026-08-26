@@ -32,6 +32,15 @@ impl Qwen38QsaWeights {
         attention: Qwen36FullAttentionWeights,
     ) -> Result<Self> {
         let prefix = format!("model.language_model.layers.{layer}.self_attn.indexer");
+        Self::load_at_prefix(checkpoint, config, &prefix, attention)
+    }
+
+    pub(crate) fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Qwen38FlashNextConfig,
+        prefix: &str,
+        attention: Qwen36FullAttentionWeights,
+    ) -> Result<Self> {
         let projection_rows = (config.indexer_heads + config.indexer_kv_heads)
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| Error::Shape {
