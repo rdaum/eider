@@ -2,7 +2,9 @@ use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,
 };
-use nvfp4::{CudaEvent, CudaStream, DeviceBuffer, indexer_topk_f32_batch_into_on_stream};
+use nvfp4::{
+    CudaEvent, CudaStream, DeviceBuffer, INDEXER_SCORE_SLAB, indexer_topk_f32_batch_into_on_stream,
+};
 use std::time::Duration;
 
 const HEADS: usize = 64;
@@ -23,6 +25,8 @@ struct IndexerBench<const ROWS: usize, const ENTRIES: usize> {
     compressed_tables: DeviceBuffer<*const f32>,
     compressed_lengths: DeviceBuffer<u32>,
     positions: DeviceBuffer<u32>,
+    score_scratch: DeviceBuffer<f32>,
+    selected_scores: DeviceBuffer<f32>,
     selected: DeviceBuffer<i32>,
 }
 
@@ -34,12 +38,15 @@ impl<const ROWS: usize, const ENTRIES: usize> IndexerBench<ROWS, ENTRIES> {
             &self.compressed_tables,
             &self.compressed_lengths,
             &self.positions,
+            self.score_scratch.output(),
+            self.selected_scores.output(),
             self.selected.output(),
             ROWS,
             HEADS,
             HEAD_DIM,
             COMPRESSION_RATIO,
             TOP_K,
+            ENTRIES,
             &self.stream,
         )
         .expect("DeepSeek V4 indexer");
@@ -97,6 +104,9 @@ impl<const ROWS: usize, const ENTRIES: usize> BenchContext for IndexerBench<ROWS
                 .expect("compressed lengths"),
             positions: DeviceBuffer::from_host(&[(ENTRIES * COMPRESSION_RATIO - 1) as u32; ROWS])
                 .expect("positions"),
+            score_scratch: DeviceBuffer::zeroed(ROWS * ENTRIES.min(INDEXER_SCORE_SLAB))
+                .expect("score scratch"),
+            selected_scores: DeviceBuffer::zeroed(ROWS * TOP_K).expect("selected scores"),
             selected: DeviceBuffer::zeroed(ROWS * TOP_K).expect("selected indices"),
         };
         context.validate();

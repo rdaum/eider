@@ -741,75 +741,155 @@ __global__ void causal_attention_f32_kernel(
     }
 }
 
-__global__ void indexer_topk_f32_kernel(
+__global__ void indexer_scores_f32_kernel(
     const float* __restrict__ query,
     const float* __restrict__ head_weights,
     const float* const* __restrict__ compressed_tables,
     const std::uint32_t* __restrict__ compressed_lengths,
     const std::uint32_t* __restrict__ positions,
-    std::int32_t* __restrict__ selected_indices,
+    float* __restrict__ scores,
     std::uint32_t batch_rows,
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t compression_ratio,
-    std::uint32_t top_k,
+    std::uint32_t entry_offset,
+    std::uint32_t score_count,
     float query_scale,
     float weights_scale) {
+    const std::uint32_t local_entry = blockIdx.x;
+    const std::uint32_t batch = blockIdx.y;
+    if (batch >= batch_rows || local_entry >= score_count) {
+        return;
+    }
+    const std::uint32_t entry = entry_offset + local_entry;
+    const std::uint32_t causal_length = min(
+        compressed_lengths[batch],
+        (positions[batch] + 1) / compression_ratio);
+    if (entry >= causal_length) {
+        if (threadIdx.x == 0) {
+            scores[static_cast<std::size_t>(batch) * score_count + local_entry] =
+                -__int_as_float(0x7f800000);
+        }
+        return;
+    }
+
+    float contribution = 0.0f;
+    if (threadIdx.x < heads) {
+        const float* q = query
+            + (static_cast<std::size_t>(batch) * heads + threadIdx.x) * head_dim;
+        const float* key = compressed_tables[batch]
+            + static_cast<std::size_t>(entry) * head_dim;
+        float dot = 0.0f;
+        for (std::uint32_t feature = 0; feature < head_dim; ++feature) {
+            dot = fmaf(q[feature], key[feature], dot);
+        }
+        contribution =
+            head_weights[static_cast<std::size_t>(batch) * heads + threadIdx.x]
+            * fmaxf(0.0f, dot * query_scale)
+            * weights_scale;
+    }
+    const float score = block_sum(contribution);
+    if (threadIdx.x == 0) {
+        scores[static_cast<std::size_t>(batch) * score_count + local_entry] = score;
+    }
+}
+
+__device__ __forceinline__ bool indexer_better(
+    float left_score,
+    std::int32_t left_index,
+    float right_score,
+    std::int32_t right_index) {
+    return left_index >= 0 && left_score > -__int_as_float(0x7f800000)
+        && (right_index < 0 || left_score > right_score
+            || (left_score == right_score && left_index < right_index));
+}
+
+__global__ void indexer_merge_topk_f32_kernel(
+    float* __restrict__ scores,
+    float* __restrict__ selected_scores,
+    std::int32_t* __restrict__ selected_indices,
+    std::uint32_t batch_rows,
+    std::uint32_t score_count,
+    std::uint32_t entry_offset,
+    std::uint32_t top_k) {
     const std::uint32_t batch = blockIdx.x;
     if (batch >= batch_rows) {
         return;
     }
     extern __shared__ unsigned char shared_storage[];
-    float* best_scores = reinterpret_cast<float*>(shared_storage);
-    std::int32_t* best_indices =
-        reinterpret_cast<std::int32_t*>(best_scores + top_k);
+    float* old_scores = reinterpret_cast<float*>(shared_storage);
+    std::int32_t* old_indices =
+        reinterpret_cast<std::int32_t*>(old_scores + top_k);
+    float* reduction_scores = reinterpret_cast<float*>(old_indices + top_k);
+    std::int32_t* reduction_indices =
+        reinterpret_cast<std::int32_t*>(reduction_scores + kThreads);
+    std::int32_t* reduction_sources = reduction_indices + kThreads;
+    const bool first_slab = entry_offset == 0;
     for (std::uint32_t slot = threadIdx.x; slot < top_k;
          slot += blockDim.x) {
-        best_scores[slot] = -__int_as_float(0x7f800000);
-        best_indices[slot] = -1;
+        old_scores[slot] = first_slab
+            ? -__int_as_float(0x7f800000)
+            : selected_scores[static_cast<std::size_t>(batch) * top_k + slot];
+        old_indices[slot] = first_slab
+            ? -1
+            : selected_indices[static_cast<std::size_t>(batch) * top_k + slot];
     }
     __syncthreads();
 
-    const float* compressed = compressed_tables[batch];
-    const std::uint32_t causal_length = min(
-        compressed_lengths[batch],
-        (positions[batch] + 1) / compression_ratio);
-    for (std::uint32_t entry = 0; entry < causal_length; ++entry) {
-        float contribution = 0.0f;
-        if (threadIdx.x < heads) {
-            const float* q =
-                query
-                + (static_cast<std::size_t>(batch) * heads + threadIdx.x)
-                    * head_dim;
-            const float* key =
-                compressed + static_cast<std::size_t>(entry) * head_dim;
-            float dot = 0.0f;
-            for (std::uint32_t feature = 0; feature < head_dim; ++feature) {
-                dot = fmaf(q[feature], key[feature], dot);
+    float* row_scores = scores + static_cast<std::size_t>(batch) * score_count;
+    for (std::uint32_t output_slot = 0; output_slot < top_k; ++output_slot) {
+        float best_score = -__int_as_float(0x7f800000);
+        std::int32_t best_index = -1;
+        std::int32_t best_source = -1;
+        for (std::uint32_t slot = threadIdx.x; slot < top_k;
+             slot += blockDim.x) {
+            if (indexer_better(
+                    old_scores[slot], old_indices[slot], best_score, best_index)) {
+                best_score = old_scores[slot];
+                best_index = old_indices[slot];
+                best_source = -static_cast<std::int32_t>(slot) - 1;
             }
-            contribution =
-                head_weights[static_cast<std::size_t>(batch) * heads + threadIdx.x]
-                * fmaxf(0.0f, dot * query_scale)
-                * weights_scale;
         }
-        const float score = block_sum(contribution);
-        if (threadIdx.x == 0 && score > best_scores[top_k - 1]) {
-            std::uint32_t insert = top_k - 1;
-            while (insert > 0 && score > best_scores[insert - 1]) {
-                best_scores[insert] = best_scores[insert - 1];
-                best_indices[insert] = best_indices[insert - 1];
-                --insert;
+        for (std::uint32_t slot = threadIdx.x; slot < score_count;
+             slot += blockDim.x) {
+            const std::int32_t index = static_cast<std::int32_t>(entry_offset + slot);
+            if (indexer_better(row_scores[slot], index, best_score, best_index)) {
+                best_score = row_scores[slot];
+                best_index = index;
+                best_source = static_cast<std::int32_t>(slot);
             }
-            best_scores[insert] = score;
-            best_indices[insert] = static_cast<std::int32_t>(entry);
+        }
+        reduction_scores[threadIdx.x] = best_score;
+        reduction_indices[threadIdx.x] = best_index;
+        reduction_sources[threadIdx.x] = best_source;
+        __syncthreads();
+        for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride
+                && indexer_better(
+                    reduction_scores[threadIdx.x + stride],
+                    reduction_indices[threadIdx.x + stride],
+                    reduction_scores[threadIdx.x],
+                    reduction_indices[threadIdx.x])) {
+                reduction_scores[threadIdx.x] = reduction_scores[threadIdx.x + stride];
+                reduction_indices[threadIdx.x] = reduction_indices[threadIdx.x + stride];
+                reduction_sources[threadIdx.x] = reduction_sources[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const std::size_t output =
+                static_cast<std::size_t>(batch) * top_k + output_slot;
+            selected_scores[output] = reduction_scores[0];
+            selected_indices[output] = reduction_indices[0];
+            const std::int32_t source = reduction_sources[0];
+            if (source >= 0) {
+                row_scores[source] = -__int_as_float(0x7f800000);
+            } else if (source < 0) {
+                old_scores[-source - 1] = -__int_as_float(0x7f800000);
+                old_indices[-source - 1] = -1;
+            }
         }
         __syncthreads();
-    }
-    for (std::uint32_t slot = threadIdx.x; slot < top_k;
-         slot += blockDim.x) {
-        selected_indices[
-            static_cast<std::size_t>(batch) * top_k + slot] =
-            best_indices[slot];
     }
 }
 
@@ -1414,38 +1494,58 @@ extern "C" cudaError_t infer_deepseek4_indexer_topk_f32_on_stream(
     const float* const* compressed_tables,
     const std::uint32_t* compressed_lengths,
     const std::uint32_t* positions,
+    float* score_scratch,
+    float* selected_scores,
     std::int32_t* selected_indices,
     std::uint32_t batch_rows,
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t compression_ratio,
     std::uint32_t top_k,
+    std::uint32_t score_entries,
     cudaStream_t stream) {
     if (query == nullptr || head_weights == nullptr
         || compressed_tables == nullptr || compressed_lengths == nullptr
-        || positions == nullptr || selected_indices == nullptr
+        || positions == nullptr || score_scratch == nullptr
+        || selected_scores == nullptr || selected_indices == nullptr
         || batch_rows == 0 || heads == 0 || heads > kThreads
         || head_dim == 0 || compression_ratio == 0 || top_k == 0
-        || top_k > 4096) {
+        || top_k > 4096 || score_entries == 0
+        || score_entries > static_cast<std::uint32_t>(INT32_MAX)) {
         return cudaErrorInvalidValue;
     }
+    constexpr std::uint32_t kScoreSlab = 4096;
     const std::size_t shared_bytes =
         static_cast<std::size_t>(top_k)
-        * (sizeof(float) + sizeof(std::int32_t));
-    indexer_topk_f32_kernel<<<batch_rows, kThreads, shared_bytes, stream>>>(
-        query,
-        head_weights,
-        compressed_tables,
-        compressed_lengths,
-        positions,
-        selected_indices,
-        batch_rows,
-        heads,
-        head_dim,
-        compression_ratio,
-        top_k,
-        rsqrtf(static_cast<float>(head_dim)),
-        rsqrtf(static_cast<float>(heads)));
+            * (sizeof(float) + sizeof(std::int32_t))
+        + static_cast<std::size_t>(kThreads)
+            * (sizeof(float) + 2 * sizeof(std::int32_t));
+    for (std::uint32_t offset = 0; offset < score_entries; offset += kScoreSlab) {
+        const std::uint32_t count = min(kScoreSlab, score_entries - offset);
+        indexer_scores_f32_kernel<<<dim3(count, batch_rows), kThreads, 0, stream>>>(
+            query,
+            head_weights,
+            compressed_tables,
+            compressed_lengths,
+            positions,
+            score_scratch,
+            batch_rows,
+            heads,
+            head_dim,
+            compression_ratio,
+            offset,
+            count,
+            rsqrtf(static_cast<float>(head_dim)),
+            rsqrtf(static_cast<float>(heads)));
+        indexer_merge_topk_f32_kernel<<<batch_rows, kThreads, shared_bytes, stream>>>(
+            score_scratch,
+            selected_scores,
+            selected_indices,
+            batch_rows,
+            count,
+            offset,
+            top_k);
+    }
     return cudaGetLastError();
 }
 

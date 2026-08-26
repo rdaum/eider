@@ -6,17 +6,18 @@ use super::{
     Deepseek4SequenceState,
 };
 use crate::nvfp4::{
-    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear,
-    ModelOptCheckpoint, PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
-    arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
-    causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, hyper_apply_f32_batch_into_on_stream,
-    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-    indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
-    router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
-    store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
+    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, INDEXER_SCORE_SLAB,
+    ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
+    add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
+    block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
+    compress_windows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
+    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
+    repeat_hyper_streams_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_interleaved_trailing_f32_indexed_in_place_on_stream, router_hash_f32_batch_into_on_stream,
+    router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
+    swiglu_pair_f32_batch_into_on_stream,
 };
 use crate::runtime::deepseek4_sequence_cache::{
     Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
@@ -902,11 +903,14 @@ pub struct Deepseek4IndexerWorkspace {
     pub compressor: Deepseek4CompressorWorkspace,
     query: DeviceBuffer<f32>,
     head_weights: DeviceBuffer<f32>,
+    score_scratch: DeviceBuffer<f32>,
+    selected_scores: DeviceBuffer<f32>,
     selected: DeviceBuffer<i32>,
     batch_capacity: usize,
     heads: usize,
     head_dim: usize,
     top_k: usize,
+    score_capacity: usize,
 }
 
 impl Deepseek4IndexerWeights {
@@ -952,16 +956,24 @@ impl Deepseek4IndexerWeights {
         heads: usize,
         head_dim: usize,
         top_k: usize,
+        max_context_tokens: usize,
     ) -> Result<Deepseek4IndexerWorkspace> {
-        if batch_capacity == 0 || heads == 0 || head_dim == 0 || top_k == 0 {
+        if batch_capacity == 0
+            || heads == 0
+            || head_dim == 0
+            || top_k == 0
+            || max_context_tokens == 0
+        {
             return Err(Error::Shape {
                 label: "DeepSeek V4 indexer workspace",
-                expected: "positive batch, heads, head dimension, and top-k".to_string(),
+                expected: "positive batch, heads, head dimension, top-k, and context".to_string(),
                 actual: format!(
-                    "batch={batch_capacity} heads={heads} head_dim={head_dim} top_k={top_k}"
+                    "batch={batch_capacity} heads={heads} head_dim={head_dim} top_k={top_k} context={max_context_tokens}"
                 ),
             });
         }
+        let score_capacity = max_context_tokens.div_ceil(self.compressor.ratio);
+        let score_slab = score_capacity.min(INDEXER_SCORE_SLAB);
         Ok(Deepseek4IndexerWorkspace {
             compressor: self.compressor.allocate_workspace(batch_capacity)?,
             query: DeviceBuffer::zeroed(
@@ -970,11 +982,14 @@ impl Deepseek4IndexerWeights {
                     .saturating_mul(head_dim),
             )?,
             head_weights: DeviceBuffer::zeroed(batch_capacity.saturating_mul(heads))?,
+            score_scratch: DeviceBuffer::zeroed(batch_capacity.saturating_mul(score_slab))?,
+            selected_scores: DeviceBuffer::zeroed(batch_capacity.saturating_mul(top_k))?,
             selected: DeviceBuffer::zeroed(batch_capacity.saturating_mul(top_k))?,
             batch_capacity,
             heads,
             head_dim,
             top_k,
+            score_capacity,
         })
     }
 
@@ -1020,21 +1035,32 @@ impl Deepseek4IndexerWeights {
         compressed_lengths: &DeviceBuffer<u32>,
         positions: &DeviceBuffer<u32>,
         batch_rows: usize,
+        score_entries: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         workspace.validate(batch_rows)?;
+        if score_entries == 0 || score_entries > workspace.score_capacity {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 indexer score entries",
+                expected: format!("entries in 1..={}", workspace.score_capacity),
+                actual: score_entries.to_string(),
+            });
+        }
         indexer_topk_f32_batch_into_on_stream(
             &workspace.query,
             &workspace.head_weights,
             compressed_tables,
             compressed_lengths,
             positions,
+            workspace.score_scratch.output(),
+            workspace.selected_scores.output(),
             workspace.selected.output(),
             batch_rows,
             workspace.heads,
             workspace.head_dim,
             self.compressor.ratio,
             workspace.top_k,
+            score_entries,
             stream,
         )
     }
@@ -1061,6 +1087,8 @@ impl Deepseek4IndexerWorkspace {
             .device_bytes()
             .saturating_add(self.query.device_bytes())
             .saturating_add(self.head_weights.device_bytes())
+            .saturating_add(self.score_scratch.device_bytes())
+            .saturating_add(self.selected_scores.device_bytes())
             .saturating_add(self.selected.device_bytes())
     }
 }
@@ -1291,6 +1319,7 @@ impl Deepseek4AttentionWeights {
                     config.index_heads,
                     config.index_head_dim,
                     config.index_topk,
+                    config.max_position_embeddings,
                 )?),
             },
             Deepseek4CompressedAttentionWeights::HeavilyCompressed { compressor } => {
@@ -1310,6 +1339,7 @@ impl Deepseek4AttentionWeights {
         config: &Deepseek4ModelConfig,
         layers: &[Deepseek4ResidentLayer],
         batch_capacity: usize,
+        max_context_tokens: usize,
     ) -> Result<Deepseek4AttentionWorkspace> {
         let csa = layers.iter().find_map(|layer| {
             if let Deepseek4CompressedAttentionWeights::CompressedSparse {
@@ -1353,6 +1383,7 @@ impl Deepseek4AttentionWeights {
                     config.index_heads,
                     config.index_head_dim,
                     config.index_topk,
+                    max_context_tokens,
                 )?),
                 hca_compressor: hca_compressor.allocate_workspace(batch_capacity)?,
             },
@@ -1898,6 +1929,12 @@ fn run_csa_compression(
         stream,
     )?;
     fill_index_metadata(index_metadata, rows)?;
+    let score_entries = index_metadata.lengths.host.as_slice()[..batch_rows]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1) as usize;
     index_metadata.upload(stream)?;
     indexer.select_rows(
         indexer_workspace,
@@ -1905,6 +1942,7 @@ fn run_csa_compression(
         &index_metadata.lengths.device,
         positions,
         batch_rows,
+        score_entries,
         stream,
     )?;
     fill_main_compressed_metadata(compressed_metadata, rows)?;
@@ -2953,6 +2991,7 @@ impl Deepseek4TextModel {
             config,
             &self.weights.layers,
             token_capacity,
+            max_context_tokens,
         )?;
         let first_layer = self.weights.layers.first().ok_or_else(|| Error::Format {
             label: "DeepSeek V4 model",

@@ -8,6 +8,8 @@ use crate::kernels::non_gemm::MoeSortedRoutes;
 const SCALE_BLOCK: usize = 128;
 const HYPER_STREAMS: usize = 4;
 const HYPER_MIX: usize = 24;
+/// Maximum number of Lightning Indexer scores materialized per selection slab.
+pub const INDEXER_SCORE_SLAB: usize = 4096;
 
 /// Pointer tables and lengths for one batched DeepSeek attention operation.
 pub struct Deepseek4AttentionBatch<'a> {
@@ -716,12 +718,15 @@ pub fn indexer_topk_f32_batch_into_on_stream(
     compressed_tables: &DeviceBuffer<*const f32>,
     compressed_lengths: &DeviceBuffer<u32>,
     positions: &DeviceBuffer<u32>,
+    mut score_scratch: DeviceOutput<'_, f32>,
+    mut selected_scores: DeviceOutput<'_, f32>,
     mut selected_indices: DeviceOutput<'_, i32>,
     batch_rows: usize,
     heads: usize,
     head_dim: usize,
     compression_ratio: usize,
     top_k: usize,
+    score_entries: usize,
     stream: &CudaStream,
 ) -> Result<()> {
     let query_values = batch_rows
@@ -729,6 +734,7 @@ pub fn indexer_topk_f32_batch_into_on_stream(
         .and_then(|value| value.checked_mul(head_dim))
         .unwrap_or(usize::MAX);
     let weight_values = batch_rows.saturating_mul(heads);
+    let score_values = batch_rows.saturating_mul(score_entries.min(INDEXER_SCORE_SLAB));
     let selected_values = batch_rows.saturating_mul(top_k);
     if batch_rows == 0
         || heads == 0
@@ -737,28 +743,41 @@ pub fn indexer_topk_f32_batch_into_on_stream(
         || compression_ratio == 0
         || top_k == 0
         || top_k > 4096
-        || [batch_rows, heads, head_dim, compression_ratio, top_k]
-            .into_iter()
-            .any(|value| value > u32::MAX as usize)
+        || score_entries == 0
+        || score_entries > i32::MAX as usize
+        || [
+            batch_rows,
+            heads,
+            head_dim,
+            compression_ratio,
+            top_k,
+            score_entries,
+        ]
+        .into_iter()
+        .any(|value| value > u32::MAX as usize)
         || query.len() < query_values
         || head_weights.len() < weight_values
         || compressed_tables.len() < batch_rows
         || compressed_lengths.len() < batch_rows
         || positions.len() < batch_rows
+        || score_scratch.len() < score_values
+        || selected_scores.len() < selected_values
         || selected_indices.len() < selected_values
     {
         return Err(Error::Shape {
             label: "DeepSeek V4 indexer top-k",
             expected: format!(
-                "query>={query_values} weights>={weight_values} metadata>={batch_rows} selected>={selected_values}"
+                "query>={query_values} weights>={weight_values} metadata>={batch_rows} scores>={score_values} selected>={selected_values}"
             ),
             actual: format!(
-                "batch={batch_rows} heads={heads} dim={head_dim} ratio={compression_ratio} top_k={top_k} query={} weights={} tables={} lengths={} positions={} selected={}",
+                "batch={batch_rows} heads={heads} dim={head_dim} ratio={compression_ratio} top_k={top_k} score_entries={score_entries} query={} weights={} tables={} lengths={} positions={} scores={} selected_scores={} selected={}",
                 query.len(),
                 head_weights.len(),
                 compressed_tables.len(),
                 compressed_lengths.len(),
                 positions.len(),
+                score_scratch.len(),
+                selected_scores.len(),
                 selected_indices.len()
             ),
         });
@@ -772,12 +791,15 @@ pub fn indexer_topk_f32_batch_into_on_stream(
                 compressed_tables.as_const_ptr().cast(),
                 compressed_lengths.as_const_ptr().cast(),
                 positions.as_const_ptr().cast(),
+                score_scratch.as_mut_ptr().cast(),
+                selected_scores.as_mut_ptr().cast(),
                 selected_indices.as_mut_ptr().cast(),
                 batch_rows as u32,
                 heads as u32,
                 head_dim as u32,
                 compression_ratio as u32,
                 top_k as u32,
+                score_entries as u32,
                 stream.as_raw(),
             ),
         )
@@ -2030,6 +2052,8 @@ mod tests {
         let compressed_lengths =
             DeviceBuffer::from_host(&compressed_lengths).expect("compressed lengths");
         let positions = DeviceBuffer::from_host(&positions).expect("positions");
+        let mut score_scratch = DeviceBuffer::zeroed(ROWS * 4).expect("score scratch");
+        let mut selected_scores = DeviceBuffer::zeroed(ROWS * TOP_K).expect("selected scores");
         let mut selected = DeviceBuffer::zeroed(ROWS * TOP_K).expect("selected");
         let stream = CudaStream::new_non_blocking().expect("stream");
         indexer_topk_f32_batch_into_on_stream(
@@ -2038,12 +2062,15 @@ mod tests {
             &compressed_tables,
             &compressed_lengths,
             &positions,
+            score_scratch.output(),
+            selected_scores.output(),
             selected.output(),
             ROWS,
             HEADS,
             DIM,
             RATIO,
             TOP_K,
+            4,
             &stream,
         )
         .expect("indexer");
@@ -2085,6 +2112,9 @@ mod tests {
         .expect("tables");
         let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
         let positions_device = DeviceBuffer::from_host(&positions).expect("positions");
+        let mut block_scores = DeviceBuffer::zeroed(ROWS * 7).expect("block scores");
+        let mut block_selected_scores =
+            DeviceBuffer::zeroed(ROWS * TOP_K).expect("block selected scores");
         let mut block = DeviceBuffer::zeroed(ROWS * TOP_K).expect("block selected");
         let stream = CudaStream::new_non_blocking().expect("stream");
         indexer_topk_f32_batch_into_on_stream(
@@ -2093,12 +2123,15 @@ mod tests {
             &tables,
             &lengths_device,
             &positions_device,
+            block_scores.output(),
+            block_selected_scores.output(),
             block.output(),
             ROWS,
             HEADS,
             DIM,
             RATIO,
             TOP_K,
+            7,
             &stream,
         )
         .expect("block selection");
@@ -2115,6 +2148,10 @@ mod tests {
                     .expect("row table");
             let length = DeviceBuffer::from_host(&lengths[row..=row]).expect("row length");
             let position = DeviceBuffer::from_host(&positions[row..=row]).expect("row position");
+            let mut token_scores =
+                DeviceBuffer::zeroed(lengths[row] as usize).expect("token scores");
+            let mut token_selected_scores =
+                DeviceBuffer::zeroed(TOP_K).expect("token selected scores");
             let mut token = DeviceBuffer::zeroed(TOP_K).expect("token selected");
             indexer_topk_f32_batch_into_on_stream(
                 &query,
@@ -2122,12 +2159,15 @@ mod tests {
                 &table,
                 &length,
                 &position,
+                token_scores.output(),
+                token_selected_scores.output(),
                 token.output(),
                 1,
                 HEADS,
                 DIM,
                 RATIO,
                 TOP_K,
+                lengths[row] as usize,
                 &stream,
             )
             .expect("token selection");

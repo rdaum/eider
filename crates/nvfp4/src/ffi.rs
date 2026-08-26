@@ -280,12 +280,15 @@ unsafe extern "C" {
         compressed_tables: *const *const f32,
         compressed_lengths: *const u32,
         positions: *const u32,
+        score_scratch: *mut f32,
+        selected_scores: *mut f32,
         selected_indices: *mut i32,
         batch_rows: u32,
         heads: u32,
         head_dim: u32,
         compression_ratio: u32,
         top_k: u32,
+        score_entries: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_deepseek4_router_topk_f32_on_stream(
