@@ -14,9 +14,10 @@ pub use model::{
     Deepseek4CompressedAttentionWeights, Deepseek4CompressorWeights, Deepseek4CompressorWorkspace,
     Deepseek4FfnWorkspace, Deepseek4HyperConnection, Deepseek4HyperHead, Deepseek4HyperWorkspace,
     Deepseek4IndexerWeights, Deepseek4IndexerWorkspace, Deepseek4LayerWorkspace,
-    Deepseek4LogitsBatch, Deepseek4ModelWeights, Deepseek4ResidentLayer, Deepseek4RmsNorm,
-    Deepseek4Router, Deepseek4RouterWorkspace, Deepseek4SharedExpertWeights,
-    Deepseek4SharedExpertWorkspace, Deepseek4TextModel, Deepseek4UnweightedRmsNorm,
+    Deepseek4LogitsBatch, Deepseek4ModelWeights, Deepseek4MtpBatchRow, Deepseek4MtpWorkspace,
+    Deepseek4ResidentLayer, Deepseek4RmsNorm, Deepseek4Router, Deepseek4RouterWorkspace,
+    Deepseek4SharedExpertWeights, Deepseek4SharedExpertWorkspace, Deepseek4SpeculativeCycleResult,
+    Deepseek4TextModel, Deepseek4UnweightedRmsNorm,
 };
 pub use state::Deepseek4SequenceCheckpoint;
 pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek4SequenceState};
@@ -1444,6 +1445,59 @@ pub fn prepare_nvfp4_expert_layer(
     inspect_nvfp4_expert_layer_with_manifest(store_dir, &manifest, layer)
 }
 
+/// Converts the optional MTP block's exact MXFP4 routed experts to runtime NVFP4.
+pub fn prepare_nvfp4_mtp_layer(
+    model_dir: impl AsRef<Path>,
+    store_dir: impl AsRef<Path>,
+) -> Result<Deepseek4HotExpertCacheInfo> {
+    let config = Deepseek4ModelConfig::load(&model_dir)?;
+    if config.nextn_predict_layers != 1 {
+        return Err(Error::Format {
+            label: "DeepSeek V4 MTP expert layer",
+            detail: "checkpoint does not declare exactly one next-token prediction layer"
+                .to_string(),
+        });
+    }
+    let mut manifest = Deepseek4Manifest::from(&config);
+    let layer = manifest.layers;
+    manifest.layers += 1;
+    let store_dir = store_dir.as_ref();
+    fs::create_dir_all(store_dir).map_err(|error| Error::Format {
+        label: "DeepSeek V4 exact NVFP4 expert store",
+        detail: format!("failed to create {}: {error}", store_dir.display()),
+    })?;
+    let checkpoint = ModelOptCheckpoint::open(model_dir)?;
+    write_nvfp4_expert_layer(store_dir, &manifest, layer, |expert| {
+        load_checkpoint_hot_expert_at_prefix(
+            &checkpoint,
+            &manifest,
+            layer,
+            expert,
+            &format!("mtp.0.ffn.experts.{expert}"),
+        )
+    })?;
+    inspect_nvfp4_expert_layer_with_manifest(store_dir, &manifest, layer)
+}
+
+/// Validates the complete exact-NVFP4 routed-expert table for the MTP block.
+pub fn inspect_nvfp4_mtp_layer(
+    model_dir: impl AsRef<Path>,
+    store_dir: impl AsRef<Path>,
+) -> Result<Deepseek4HotExpertCacheInfo> {
+    let config = Deepseek4ModelConfig::load(model_dir)?;
+    if config.nextn_predict_layers != 1 {
+        return Err(Error::Format {
+            label: "DeepSeek V4 MTP expert layer",
+            detail: "checkpoint does not declare exactly one next-token prediction layer"
+                .to_string(),
+        });
+    }
+    let mut manifest = Deepseek4Manifest::from(&config);
+    let layer = manifest.layers;
+    manifest.layers += 1;
+    inspect_nvfp4_expert_layer_with_manifest(store_dir.as_ref(), &manifest, layer)
+}
+
 /// Validates one complete exact-NVFP4 expert layer without reading payloads.
 pub fn inspect_nvfp4_expert_layer(
     model_dir: impl AsRef<Path>,
@@ -1474,7 +1528,7 @@ pub fn inspect_nvfp4_expert_store(
     Ok(info)
 }
 
-/// Copies one source shard without routed experts or the optional MTP block.
+/// Copies one source shard without routed experts.
 ///
 /// The output is a regular safetensors shard and is published atomically.
 pub fn prepare_thin_checkpoint_shard(
@@ -1580,7 +1634,7 @@ pub fn inspect_thin_checkpoint(thin_dir: impl AsRef<Path>) -> Result<Deepseek4Th
     {
         return Err(Error::Format {
             label: "DeepSeek V4 thin checkpoint",
-            detail: "published index contains routed-expert or MTP tensors".to_string(),
+            detail: "published index contains routed-expert tensors".to_string(),
         });
     }
     let mut info = validate_thin_checkpoint_files(thin_dir, &index.weight_map)?;
@@ -1657,7 +1711,7 @@ fn load_weight_index(model_dir: &Path) -> Result<Deepseek4WeightIndex> {
 }
 
 fn is_thin_checkpoint_tensor(tensor: &str) -> bool {
-    !tensor.contains(".ffn.experts.") && !tensor.starts_with("mtp.")
+    !tensor.contains(".ffn.experts.")
 }
 
 fn thin_tensors_for_shard(index: &Deepseek4WeightIndex, shard_name: &str) -> Vec<String> {
@@ -1957,25 +2011,42 @@ fn load_checkpoint_hot_expert(
 ) -> Result<Deepseek4HotExpert> {
     validate_layer_expert(manifest, layer, expert)?;
     let prefix = format!("layers.{layer}.ffn.experts.{expert}");
+    load_checkpoint_hot_expert_at_prefix(checkpoint, manifest, layer, expert, &prefix)
+}
+
+fn load_checkpoint_hot_expert_at_prefix(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &Deepseek4Manifest,
+    layer: usize,
+    expert: usize,
+    prefix: &str,
+) -> Result<Deepseek4HotExpert> {
+    validate_layer_expert(manifest, layer, expert)?;
+    let load = |linear: &str, rows, cols| {
+        let prefix = format!("{prefix}.{linear}");
+        let value = if checkpoint.contains_tensor(&format!("{prefix}.scale"))
+            && !checkpoint.contains_tensor(&format!("{prefix}.weight_scale"))
+        {
+            checkpoint.load_mxfp4_linear(&prefix)?
+        } else {
+            checkpoint.load_nvfp4_linear(&prefix)?
+        };
+        if value.out_features != rows || value.in_features != cols {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 expert linear",
+                expected: format!("{prefix}=[{rows}, {cols}]"),
+                actual: format!(
+                    "{}=[{}, {}]",
+                    value.prefix, value.out_features, value.in_features
+                ),
+            });
+        }
+        Ok(value)
+    };
     Ok(Deepseek4HotExpert {
-        w1: load_expert_linear(
-            checkpoint,
-            &format!("{prefix}.w1"),
-            manifest.expert_intermediate,
-            manifest.hidden,
-        )?,
-        w3: load_expert_linear(
-            checkpoint,
-            &format!("{prefix}.w3"),
-            manifest.expert_intermediate,
-            manifest.hidden,
-        )?,
-        w2: load_expert_linear(
-            checkpoint,
-            &format!("{prefix}.w2"),
-            manifest.hidden,
-            manifest.expert_intermediate,
-        )?,
+        w1: load("w1", manifest.expert_intermediate, manifest.hidden)?,
+        w3: load("w3", manifest.expert_intermediate, manifest.hidden)?,
+        w2: load("w2", manifest.hidden, manifest.expert_intermediate)?,
     })
 }
 
@@ -3054,10 +3125,14 @@ mod tests {
         std::fs::create_dir_all(&source_dir).expect("source directory");
         let shard_name = "model-00001-of-00001.safetensors";
         let retained = "layers.0.attn_norm.weight";
+        let mtp_retained = "mtp.0.hnorm.weight";
         let routed = "layers.0.ffn.experts.0.w1.weight";
+        let mtp_routed = "mtp.0.ffn.experts.0.w1.weight";
         let mut header = serde_json::to_vec(&json!({
             (retained): {"dtype":"U8", "shape":[4], "data_offsets":[0,4]},
-            (routed): {"dtype":"U8", "shape":[4], "data_offsets":[4,8]}
+            (mtp_retained): {"dtype":"U8", "shape":[4], "data_offsets":[4,8]},
+            (routed): {"dtype":"U8", "shape":[4], "data_offsets":[8,12]},
+            (mtp_routed): {"dtype":"U8", "shape":[4], "data_offsets":[12,16]}
         }))
         .expect("header");
         while !header.len().is_multiple_of(8) {
@@ -3067,13 +3142,20 @@ mod tests {
         shard
             .write_all(&(header.len() as u64).to_le_bytes())
             .and_then(|()| shard.write_all(&header))
-            .and_then(|()| shard.write_all(&[1, 2, 3, 4, 5, 6, 7, 8]))
+            .and_then(|()| {
+                shard.write_all(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+            })
             .expect("source shard contents");
         std::fs::write(
             source_dir.join("model.safetensors.index.json"),
             serde_json::to_vec(&json!({
-                "metadata": {"total_size": 8},
-                "weight_map": {(retained): shard_name, (routed): shard_name}
+                "metadata": {"total_size": 16},
+                "weight_map": {
+                    (retained): shard_name,
+                    (mtp_retained): shard_name,
+                    (routed): shard_name,
+                    (mtp_routed): shard_name
+                }
             }))
             .expect("source index"),
         )
@@ -3083,8 +3165,8 @@ mod tests {
             .expect("prepare thin shard");
         let info =
             finalise_thin_checkpoint(&source_dir, &thin_dir).expect("finalise thin checkpoint");
-        assert_eq!(info.tensors, 1);
-        assert_eq!(info.payload_bytes, 4);
+        assert_eq!(info.tensors, 2);
+        assert_eq!(info.payload_bytes, 8);
         assert_eq!(
             inspect_thin_checkpoint(&thin_dir).expect("inspect thin checkpoint"),
             info
@@ -3092,7 +3174,9 @@ mod tests {
         let checkpoint =
             crate::nvfp4::ModelOptCheckpoint::open(&thin_dir).expect("open thin checkpoint");
         assert!(checkpoint.contains_tensor(retained));
+        assert!(checkpoint.contains_tensor(mtp_retained));
         assert!(!checkpoint.contains_tensor(routed));
+        assert!(!checkpoint.contains_tensor(mtp_routed));
         std::fs::remove_dir_all(root).expect("remove fixture");
     }
 }

@@ -23,6 +23,7 @@ use infer::runtime::chat::CheckpointChatTemplate;
 use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::deepseek4_serving::{
     Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
+    Deepseek4SpeculativeProgress,
 };
 use infer::runtime::gemma4_serving::{
     Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
@@ -658,6 +659,10 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Deepseek4 => {
+            let mut defaults = defaults;
+            if scheduler.speculative_drafts > 0 {
+                defaults.sampling.temperature = 0.0;
+            }
             info!(
                 model_dir = %model_dir.display(),
                 expert_store_dir = %artifact_dir.display(),
@@ -665,11 +670,19 @@ fn actor_main(
                 retained_prefix_bytes = sequence_cache.max_retained_bytes,
                 "loading DeepSeek V4 model"
             );
-            let model = match Deepseek4TextModel::load_paged_nvfp4(
-                &model_dir,
-                &artifact_dir,
-                deepseek_expert_capacity,
-            ) {
+            let model = match if scheduler.speculative_drafts > 0 {
+                Deepseek4TextModel::load_paged_nvfp4_with_mtp(
+                    &model_dir,
+                    &artifact_dir,
+                    deepseek_expert_capacity,
+                )
+            } else {
+                Deepseek4TextModel::load_paged_nvfp4(
+                    &model_dir,
+                    &artifact_dir,
+                    deepseek_expert_capacity,
+                )
+            } {
                 Ok(model) => model,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
@@ -795,6 +808,16 @@ fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmission
 
 fn qwen38_speculative_progress(
     progress: Qwen38SpeculativeProgress,
+) -> EngineQwen38SpeculativeProgress {
+    EngineQwen38SpeculativeProgress {
+        request_id: progress.request_id.get(),
+        cycles: progress.cycles,
+        accepted_drafts: progress.accepted_drafts,
+    }
+}
+
+fn deepseek4_speculative_progress(
+    progress: Deepseek4SpeculativeProgress,
 ) -> EngineQwen38SpeculativeProgress {
     EngineQwen38SpeculativeProgress {
         request_id: progress.request_id.get(),
@@ -2007,7 +2030,11 @@ impl ActorService for DeepseekActorService<'_> {
                 .into_iter()
                 .map(Deepseek4RequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            qwen38_speculative: tick
+                .speculative
+                .into_iter()
+                .map(deepseek4_speculative_progress)
+                .collect(),
             dflash: Vec::new(),
             output: tick
                 .output

@@ -173,7 +173,7 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_active_sequences: usize,
 
-    /// Greedy-only drafts per Qwen3.8 speculative cycle. Zero disables speculation.
+    /// Greedy-only native drafts per speculative cycle. Zero disables speculation.
     #[arg(long, default_value_t = 0)]
     speculative_drafts: usize,
 

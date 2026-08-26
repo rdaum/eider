@@ -8,20 +8,20 @@ use super::{
 use crate::nvfp4::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, INDEXER_SCORE_SLAB,
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
-    add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
-    block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
-    compress_windows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
-    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
-    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
-    repeat_hyper_streams_f32_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_interleaved_trailing_f32_indexed_in_place_on_stream, router_hash_f32_batch_into_on_stream,
-    router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
-    swiglu_pair_f32_batch_into_on_stream,
+    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
+    arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
+    causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, hyper_apply_f32_batch_into_on_stream,
+    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
+    indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
+    router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
+    store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
 };
 use crate::runtime::deepseek4_sequence_cache::{
-    Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
-    deepseek4_cache_error,
+    Deepseek4CacheContext, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4PageBackend,
+    Deepseek4Sequence, Deepseek4SequenceCache, deepseek4_cache_error,
 };
 use std::path::Path;
 use tracing::info;
@@ -419,11 +419,23 @@ pub struct Deepseek4HyperHead {
 
 impl Deepseek4HyperHead {
     pub fn load(checkpoint: &ModelOptCheckpoint, config: &Deepseek4ModelConfig) -> Result<Self> {
+        Self::load_at_prefix(checkpoint, config, "hc_head")
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Deepseek4ModelConfig,
+        prefix: &str,
+    ) -> Result<Self> {
         let flattened = config.hc_mult * config.hidden_size;
         Ok(Self {
-            function: load_f32(checkpoint, "hc_head_fn", &[config.hc_mult, flattened])?,
-            base: load_f32(checkpoint, "hc_head_base", &[config.hc_mult])?,
-            scale: load_f32(checkpoint, "hc_head_scale", &[1])?,
+            function: load_f32(
+                checkpoint,
+                &format!("{prefix}_fn"),
+                &[config.hc_mult, flattened],
+            )?,
+            base: load_f32(checkpoint, &format!("{prefix}_base"), &[config.hc_mult])?,
+            scale: load_f32(checkpoint, &format!("{prefix}_scale"), &[1])?,
             hidden: config.hidden_size,
             rms_eps: config.rms_norm_eps,
             hc_eps: config.hc_eps,
@@ -477,6 +489,14 @@ impl Deepseek4AttentionWeights {
     ) -> Result<Self> {
         config.attention_kind(layer)?;
         let prefix = format!("layers.{layer}.attn");
+        Self::load_at_prefix(checkpoint, config, &prefix)
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Deepseek4ModelConfig,
+        prefix: &str,
+    ) -> Result<Self> {
         let q_width = config.num_attention_heads * config.head_dim;
         let q_group_width = q_width / config.o_groups;
         let o_a_width = config.o_groups * config.o_lora_rank;
@@ -1106,12 +1126,12 @@ pub enum Deepseek4CompressedAttentionWeights {
 }
 
 impl Deepseek4CompressedAttentionWeights {
-    fn load(
+    fn load_at_prefix(
         checkpoint: &ModelOptCheckpoint,
         config: &Deepseek4ModelConfig,
         layer: usize,
+        prefix: &str,
     ) -> Result<Self> {
-        let prefix = format!("layers.{layer}.attn");
         match config.attention_kind(layer)? {
             Deepseek4AttentionKind::Sliding => Ok(Self::Sliding),
             Deepseek4AttentionKind::CompressedSparse => {
@@ -2057,6 +2077,14 @@ impl Deepseek4SharedExpertWeights {
     ) -> Result<Self> {
         config.attention_kind(layer)?;
         let prefix = format!("layers.{layer}.ffn.shared_experts");
+        Self::load_at_prefix(checkpoint, config, &prefix)
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Deepseek4ModelConfig,
+        prefix: &str,
+    ) -> Result<Self> {
         Ok(Self {
             gate: Deepseek4BlockFp8Linear::load(
                 checkpoint,
@@ -2198,9 +2226,18 @@ impl Deepseek4Router {
     ) -> Result<Self> {
         config.attention_kind(layer)?;
         let prefix = format!("layers.{layer}.ffn.gate");
+        Self::load_at_prefix(checkpoint, config, layer, &prefix)
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Deepseek4ModelConfig,
+        layer: usize,
+        prefix: &str,
+    ) -> Result<Self> {
         let gate = Deepseek4Bf16Linear::load(
             checkpoint,
-            &prefix,
+            prefix,
             config.routed_experts,
             config.hidden_size,
         )?;
@@ -2364,10 +2401,26 @@ impl Deepseek4ResidentLayer {
     ) -> Result<Self> {
         config.attention_kind(layer)?;
         let prefix = format!("layers.{layer}");
+        Self::load_at_prefix(checkpoint, config, layer, &prefix)
+    }
+
+    fn load_at_prefix(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Deepseek4ModelConfig,
+        layer: usize,
+        prefix: &str,
+    ) -> Result<Self> {
         Ok(Self {
-            attention: Deepseek4AttentionWeights::load(checkpoint, config, layer)?,
-            compressed_attention: Deepseek4CompressedAttentionWeights::load(
-                checkpoint, config, layer,
+            attention: Deepseek4AttentionWeights::load_at_prefix(
+                checkpoint,
+                config,
+                &format!("{prefix}.attn"),
+            )?,
+            compressed_attention: Deepseek4CompressedAttentionWeights::load_at_prefix(
+                checkpoint,
+                config,
+                layer,
+                &format!("{prefix}.attn"),
             )?,
             attention_norm: Deepseek4RmsNorm::load(
                 checkpoint,
@@ -2391,8 +2444,17 @@ impl Deepseek4ResidentLayer {
                 &format!("{prefix}.hc_ffn"),
                 config,
             )?,
-            router: Deepseek4Router::load(checkpoint, config, layer)?,
-            shared_expert: Deepseek4SharedExpertWeights::load(checkpoint, config, layer)?,
+            router: Deepseek4Router::load_at_prefix(
+                checkpoint,
+                config,
+                layer,
+                &format!("{prefix}.ffn.gate"),
+            )?,
+            shared_expert: Deepseek4SharedExpertWeights::load_at_prefix(
+                checkpoint,
+                config,
+                &format!("{prefix}.ffn.shared_experts"),
+            )?,
         })
     }
 
@@ -2750,12 +2812,46 @@ pub struct Deepseek4BatchRow<'tokens, 'state> {
     pub sequence: &'state mut Deepseek4Sequence,
 }
 
+/// One MTP cache row aligned with a target-model row.
+pub struct Deepseek4MtpBatchRow<'tokens, 'state> {
+    pub token_ids: &'tokens [u32],
+    pub sequence: &'state mut Deepseek4MtpSequence,
+}
+
 /// Device-resident final-token logits in the same order as the input rows.
 pub struct Deepseek4LogitsBatch<'a> {
     logits: &'a DeviceBuffer<f32>,
     stream: &'a CudaStream,
     rows: usize,
     vocab: usize,
+}
+
+pub struct Deepseek4SpeculativeCycleResult {
+    drafts: Vec<u32>,
+    next_tokens: Vec<u32>,
+    accepted: Vec<bool>,
+}
+
+impl Deepseek4SpeculativeCycleResult {
+    pub fn accepted_counts(&self) -> impl Iterator<Item = u32> + '_ {
+        self.accepted.iter().map(|&accepted| u32::from(accepted))
+    }
+
+    pub fn emitted_tokens(&self, sequence: usize) -> Result<Vec<u32>> {
+        let Some(&accepted) = self.accepted.get(sequence) else {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 speculative result",
+                expected: format!("sequence < {}", self.accepted.len()),
+                actual: sequence.to_string(),
+            });
+        };
+        let mut emitted = Vec::with_capacity(2);
+        if accepted {
+            emitted.push(self.drafts[sequence]);
+        }
+        emitted.push(self.next_tokens[sequence]);
+        Ok(emitted)
+    }
 }
 
 impl Deepseek4LogitsBatch<'_> {
@@ -2805,6 +2901,65 @@ pub struct Deepseek4BatchWorkspace {
     max_context_tokens: usize,
 }
 
+/// Reusable one-layer MTP and two-row target-verification storage.
+pub struct Deepseek4MtpWorkspace {
+    token_ids: DeviceBuffer<u32>,
+    host_token_ids: Vec<u32>,
+    embedding: DeviceBuffer<f32>,
+    normalized_embedding: DeviceBuffer<f32>,
+    previous_streams: DeviceBuffer<f32>,
+    normalized_previous: DeviceBuffer<f32>,
+    projected_embedding: DeviceBuffer<f32>,
+    projected_previous: DeviceBuffer<f32>,
+    streams: DeviceBuffer<f32>,
+    next_streams: DeviceBuffer<f32>,
+    zero_stream: DeviceBuffer<f32>,
+    final_streams: DeviceBuffer<f32>,
+    final_hidden: DeviceBuffer<f32>,
+    final_normed: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    argmax_values: DeviceBuffer<f32>,
+    argmax_ids: DeviceBuffer<u32>,
+    verification_streams: DeviceBuffer<f32>,
+    verification_hidden: DeviceBuffer<f32>,
+    verification_normed: DeviceBuffer<f32>,
+    verification_logits: DeviceBuffer<f32>,
+    verification_argmax_values: DeviceBuffer<f32>,
+    verification_argmax_ids: DeviceBuffer<u32>,
+    layer: Deepseek4LayerWorkspace,
+    sequence_capacity: usize,
+    token_capacity: usize,
+}
+
+impl Deepseek4MtpWorkspace {
+    pub fn device_bytes(&self) -> usize {
+        self.token_ids
+            .device_bytes()
+            .saturating_add(self.embedding.device_bytes())
+            .saturating_add(self.normalized_embedding.device_bytes())
+            .saturating_add(self.previous_streams.device_bytes())
+            .saturating_add(self.normalized_previous.device_bytes())
+            .saturating_add(self.projected_embedding.device_bytes())
+            .saturating_add(self.projected_previous.device_bytes())
+            .saturating_add(self.streams.device_bytes())
+            .saturating_add(self.next_streams.device_bytes())
+            .saturating_add(self.zero_stream.device_bytes())
+            .saturating_add(self.final_streams.device_bytes())
+            .saturating_add(self.final_hidden.device_bytes())
+            .saturating_add(self.final_normed.device_bytes())
+            .saturating_add(self.logits.device_bytes())
+            .saturating_add(self.argmax_values.device_bytes())
+            .saturating_add(self.argmax_ids.device_bytes())
+            .saturating_add(self.verification_streams.device_bytes())
+            .saturating_add(self.verification_hidden.device_bytes())
+            .saturating_add(self.verification_normed.device_bytes())
+            .saturating_add(self.verification_logits.device_bytes())
+            .saturating_add(self.verification_argmax_values.device_bytes())
+            .saturating_add(self.verification_argmax_ids.device_bytes())
+            .saturating_add(self.layer.device_bytes())
+    }
+}
+
 impl Deepseek4BatchWorkspace {
     pub fn device_bytes(&self) -> usize {
         self.token_ids
@@ -2828,6 +2983,108 @@ impl Deepseek4BatchWorkspace {
 pub struct Deepseek4TextModel {
     pub weights: Deepseek4ModelWeights,
     routed_experts: Vec<Deepseek4RoutedExpertLayer>,
+    mtp: Option<Deepseek4MtpWeights>,
+}
+
+struct Deepseek4MtpWeights {
+    embedding_norm: Deepseek4RmsNorm,
+    hidden_norm: Deepseek4RmsNorm,
+    embedding_projection: Deepseek4BlockFp8Linear,
+    hidden_projection: Deepseek4BlockFp8Linear,
+    layer: Deepseek4ResidentLayer,
+    routed_experts: Deepseek4RoutedExpertLayer,
+    hyper_head: Deepseek4HyperHead,
+    final_norm: Deepseek4RmsNorm,
+}
+
+impl Deepseek4MtpWeights {
+    fn load(
+        model_dir: &Path,
+        expert_store_dir: &Path,
+        capacity: usize,
+        config: &Deepseek4ModelConfig,
+    ) -> Result<Self> {
+        if config.nextn_predict_layers != 1 {
+            return Err(Error::Format {
+                label: "DeepSeek V4 MTP",
+                detail: "checkpoint does not declare exactly one MTP layer".to_string(),
+            });
+        }
+        let layer_index = config.num_hidden_layers;
+        if config.attention_kind(layer_index)? != Deepseek4AttentionKind::Sliding {
+            return Err(Error::Format {
+                label: "DeepSeek V4 MTP",
+                detail: "only a sliding-attention MTP block is supported".to_string(),
+            });
+        }
+        let checkpoint = ModelOptCheckpoint::open(model_dir)?;
+        let prefix = "mtp.0";
+        let mut manifest = Deepseek4Manifest::from(config);
+        manifest.layers += 1;
+        Ok(Self {
+            embedding_norm: Deepseek4RmsNorm::load(
+                &checkpoint,
+                &format!("{prefix}.enorm.weight"),
+                config.hidden_size,
+                config.rms_norm_eps,
+            )?,
+            hidden_norm: Deepseek4RmsNorm::load(
+                &checkpoint,
+                &format!("{prefix}.hnorm.weight"),
+                config.hidden_size,
+                config.rms_norm_eps,
+            )?,
+            embedding_projection: Deepseek4BlockFp8Linear::load(
+                &checkpoint,
+                &format!("{prefix}.e_proj"),
+                config.hidden_size,
+                config.hidden_size,
+            )?,
+            hidden_projection: Deepseek4BlockFp8Linear::load(
+                &checkpoint,
+                &format!("{prefix}.h_proj"),
+                config.hidden_size,
+                config.hidden_size,
+            )?,
+            layer: Deepseek4ResidentLayer::load_at_prefix(
+                &checkpoint,
+                config,
+                layer_index,
+                prefix,
+            )?,
+            routed_experts: Deepseek4RoutedExpertLayer::PagedNvfp4(Box::new(
+                Deepseek4PagedExpertLayer::load(
+                    expert_store_dir,
+                    &manifest,
+                    layer_index,
+                    capacity,
+                )?,
+            )),
+            hyper_head: Deepseek4HyperHead::load_at_prefix(
+                &checkpoint,
+                config,
+                &format!("{prefix}.hc_head"),
+            )?,
+            final_norm: Deepseek4RmsNorm::load(
+                &checkpoint,
+                &format!("{prefix}.norm.weight"),
+                config.hidden_size,
+                config.rms_norm_eps,
+            )?,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.embedding_norm
+            .device_bytes()
+            .saturating_add(self.hidden_norm.device_bytes())
+            .saturating_add(self.embedding_projection.device_bytes())
+            .saturating_add(self.hidden_projection.device_bytes())
+            .saturating_add(self.layer.device_bytes())
+            .saturating_add(self.routed_experts.device_bytes())
+            .saturating_add(self.hyper_head.device_bytes())
+            .saturating_add(self.final_norm.device_bytes())
+    }
 }
 
 impl Deepseek4TextModel {
@@ -2879,6 +3136,7 @@ impl Deepseek4TextModel {
         let mut model = Self {
             weights,
             routed_experts,
+            mtp: None,
         };
         if let Some(source) = hot_source.as_ref() {
             let mut installed = 0usize;
@@ -2927,7 +3185,30 @@ impl Deepseek4TextModel {
         Ok(Self {
             weights,
             routed_experts,
+            mtp: None,
         })
+    }
+
+    /// Loads the target and its native one-layer MTP draft model.
+    pub fn load_paged_nvfp4_with_mtp(
+        model_dir: impl AsRef<Path>,
+        expert_store_dir: impl AsRef<Path>,
+        capacity_per_layer: usize,
+    ) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let expert_store_dir = expert_store_dir.as_ref();
+        let mut model = Self::load_paged_nvfp4(model_dir, expert_store_dir, capacity_per_layer)?;
+        model.mtp = Some(Deepseek4MtpWeights::load(
+            model_dir,
+            expert_store_dir,
+            capacity_per_layer,
+            &model.weights.config,
+        )?);
+        Ok(model)
+    }
+
+    pub fn mtp_enabled(&self) -> bool {
+        self.mtp.is_some()
     }
 
     pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Deepseek4SequenceState> {
@@ -3025,6 +3306,56 @@ impl Deepseek4TextModel {
         })
     }
 
+    pub fn new_mtp_workspace(
+        &self,
+        sequence_capacity: usize,
+        token_capacity: usize,
+    ) -> Result<Deepseek4MtpWorkspace> {
+        let mtp = self.mtp.as_ref().ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 MTP workspace",
+            detail: "model was loaded without MTP weights".to_string(),
+        })?;
+        if sequence_capacity == 0 || token_capacity < sequence_capacity {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 MTP workspace",
+                expected: "positive token capacity at least sequence capacity".to_string(),
+                actual: format!("sequences={sequence_capacity} tokens={token_capacity}"),
+            });
+        }
+        let config = &self.weights.config;
+        let hidden = config.hidden_size;
+        let stream_width = HYPER_STREAMS * hidden;
+        let verification_rows = sequence_capacity * 2;
+        Ok(Deepseek4MtpWorkspace {
+            token_ids: DeviceBuffer::zeroed(token_capacity)?,
+            host_token_ids: vec![0; token_capacity],
+            embedding: DeviceBuffer::zeroed(token_capacity * hidden)?,
+            normalized_embedding: DeviceBuffer::zeroed(token_capacity * hidden)?,
+            previous_streams: DeviceBuffer::zeroed(token_capacity * stream_width)?,
+            normalized_previous: DeviceBuffer::zeroed(token_capacity * stream_width)?,
+            projected_embedding: DeviceBuffer::zeroed(token_capacity * hidden)?,
+            projected_previous: DeviceBuffer::zeroed(token_capacity * stream_width)?,
+            streams: DeviceBuffer::zeroed(token_capacity * stream_width)?,
+            next_streams: DeviceBuffer::zeroed(token_capacity * stream_width)?,
+            zero_stream: DeviceBuffer::zeroed(stream_width)?,
+            final_streams: DeviceBuffer::zeroed(sequence_capacity * stream_width)?,
+            final_hidden: DeviceBuffer::zeroed(sequence_capacity * hidden)?,
+            final_normed: DeviceBuffer::zeroed(sequence_capacity * hidden)?,
+            logits: DeviceBuffer::zeroed(sequence_capacity * config.vocab_size)?,
+            argmax_values: DeviceBuffer::zeroed(sequence_capacity)?,
+            argmax_ids: DeviceBuffer::zeroed(sequence_capacity)?,
+            verification_streams: DeviceBuffer::zeroed(verification_rows * stream_width)?,
+            verification_hidden: DeviceBuffer::zeroed(verification_rows * hidden)?,
+            verification_normed: DeviceBuffer::zeroed(verification_rows * hidden)?,
+            verification_logits: DeviceBuffer::zeroed(verification_rows * config.vocab_size)?,
+            verification_argmax_values: DeviceBuffer::zeroed(verification_rows)?,
+            verification_argmax_ids: DeviceBuffer::zeroed(verification_rows)?,
+            layer: mtp.layer.allocate_layer_workspace(config, token_capacity)?,
+            sequence_capacity,
+            token_capacity,
+        })
+    }
+
     /// Advances ragged prompt chunks without running the final vocabulary projection.
     pub fn prefill_batch(
         &mut self,
@@ -3041,6 +3372,31 @@ impl Deepseek4TextModel {
             return Err(error);
         }
         commit_model_rows(rows, reservations, cache, &workspace.stream)
+    }
+
+    pub fn prefill_batch_with_mtp(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        mtp_workspace: &mut Deepseek4MtpWorkspace,
+        rows: &mut [Deepseek4BatchRow<'_, '_>],
+        mtp_rows: &mut [Deepseek4MtpBatchRow<'_, '_>],
+        cache: &mut Deepseek4SequenceCache,
+        mtp_cache: &mut Deepseek4MtpSequenceCache,
+    ) -> Result<()> {
+        if rows.len() != mtp_rows.len()
+            || rows
+                .iter()
+                .zip(mtp_rows.iter())
+                .any(|(target, mtp)| target.token_ids != mtp.token_ids)
+        {
+            return Err(Error::Format {
+                label: "DeepSeek V4 MTP prefill",
+                detail: "target and MTP rows are not aligned".to_string(),
+            });
+        }
+        self.prefill_batch(workspace, rows, cache)?;
+        self.append_mtp_from_target(mtp_workspace, workspace, mtp_rows, mtp_cache, false)?;
+        Ok(())
     }
 
     /// Executes the embedding, decoder, hyper-head, norm, and LM-head path.
@@ -3100,6 +3456,578 @@ impl Deepseek4TextModel {
             rows: sequence_count,
             vocab: self.weights.config.vocab_size,
         })
+    }
+
+    pub fn forward_batch_with_mtp(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        mtp_workspace: &mut Deepseek4MtpWorkspace,
+        rows: &mut [Deepseek4BatchRow<'_, '_>],
+        mtp_rows: &mut [Deepseek4MtpBatchRow<'_, '_>],
+        cache: &mut Deepseek4SequenceCache,
+        mtp_cache: &mut Deepseek4MtpSequenceCache,
+    ) -> Result<Vec<f32>> {
+        if rows.len() != mtp_rows.len()
+            || rows
+                .iter()
+                .zip(mtp_rows.iter())
+                .any(|(target, mtp)| target.token_ids != mtp.token_ids)
+        {
+            return Err(Error::Format {
+                label: "DeepSeek V4 MTP forward",
+                detail: "target and MTP rows are not aligned".to_string(),
+            });
+        }
+        let logits = self.forward_batch(workspace, rows, cache)?.copy_to_host()?;
+        self.append_mtp_from_target(mtp_workspace, workspace, mtp_rows, mtp_cache, false)?;
+        Ok(logits)
+    }
+
+    pub fn draft_mtp_argmax(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        mtp_workspace: &mut Deepseek4MtpWorkspace,
+        rows: &mut [Deepseek4MtpBatchRow<'_, '_>],
+        mtp_cache: &mut Deepseek4MtpSequenceCache,
+    ) -> Result<Vec<u32>> {
+        let stream_width = HYPER_STREAMS * self.weights.config.hidden_size;
+        for (sequence, row) in rows.iter().enumerate() {
+            if row.token_ids.len() != 1 || row.sequence.position == 0 {
+                return Err(Error::Format {
+                    label: "DeepSeek V4 MTP draft",
+                    detail: "draft rows require one token and a prefetched MTP state".to_string(),
+                });
+            }
+            workspace.streams.copy_range_from_device_on_stream(
+                sequence * stream_width,
+                &row.sequence.previous_hidden,
+                0,
+                stream_width,
+                &workspace.stream,
+            )?;
+        }
+        Ok(self
+            .append_mtp_from_target(mtp_workspace, workspace, rows, mtp_cache, true)?
+            .expect("MTP argmax was requested"))
+    }
+
+    /// Runs one exact greedy native-MTP proposal and target-verification cycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speculative_cycle_argmax(
+        &mut self,
+        workspace: &mut Deepseek4BatchWorkspace,
+        mtp_workspace: &mut Deepseek4MtpWorkspace,
+        sequences: &mut [&mut Deepseek4Sequence],
+        mtp_sequences: &mut [&mut Deepseek4MtpSequence],
+        input_tokens: &[u32],
+        cache: &mut Deepseek4SequenceCache,
+        mtp_cache: &mut Deepseek4MtpSequenceCache,
+    ) -> Result<Deepseek4SpeculativeCycleResult> {
+        let sequence_count = sequences.len();
+        if sequence_count == 0
+            || sequence_count != mtp_sequences.len()
+            || sequence_count != input_tokens.len()
+            || sequence_count > mtp_workspace.sequence_capacity
+            || sequence_count * 2 > workspace.token_capacity
+        {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 speculative cycle",
+                expected: format!(
+                    "1..={} aligned sequences and {} target rows",
+                    mtp_workspace.sequence_capacity,
+                    sequence_count * 2
+                ),
+                actual: format!(
+                    "target={} mtp={} inputs={} target_capacity={}",
+                    sequence_count,
+                    mtp_sequences.len(),
+                    input_tokens.len(),
+                    workspace.token_capacity
+                ),
+            });
+        }
+        let draft_rows_storage = input_tokens
+            .iter()
+            .map(|token| [*token])
+            .collect::<Vec<_>>();
+        let mut draft_rows = draft_rows_storage
+            .iter()
+            .zip(mtp_sequences.iter_mut())
+            .map(|(tokens, sequence)| Deepseek4MtpBatchRow {
+                token_ids: tokens,
+                sequence,
+            })
+            .collect::<Vec<_>>();
+        let drafts = self.draft_mtp_argmax(workspace, mtp_workspace, &mut draft_rows, mtp_cache)?;
+
+        let verification_tokens = input_tokens
+            .iter()
+            .zip(&drafts)
+            .map(|(&input, &draft)| [input, draft])
+            .collect::<Vec<_>>();
+        let mut rows = verification_tokens
+            .iter()
+            .zip(sequences.iter_mut())
+            .map(|(tokens, sequence)| Deepseek4BatchRow {
+                token_ids: tokens,
+                sequence,
+            })
+            .collect::<Vec<_>>();
+        let reservations = reserve_model_rows(&mut rows, cache, &workspace.stream)?;
+        if let Err(error) = self.run_decoder_batch(workspace, &mut rows, cache, &reservations) {
+            abort_model_rows(&mut rows, reservations, cache, &workspace.stream)?;
+            return Err(error);
+        }
+        let config = &self.weights.config;
+        let hidden = config.hidden_size;
+        let stream_width = HYPER_STREAMS * hidden;
+        let verification_rows = sequence_count * 2;
+        mtp_workspace
+            .verification_streams
+            .copy_prefix_from_device_on_stream(
+                &workspace.streams,
+                verification_rows * stream_width,
+                &workspace.stream,
+            )?;
+        self.weights.hyper_head.run_rows(
+            &workspace.streams,
+            &mut mtp_workspace.verification_hidden,
+            verification_rows,
+            &workspace.stream,
+        )?;
+        self.weights.final_norm.run_rows(
+            &mtp_workspace.verification_hidden,
+            &mut mtp_workspace.verification_normed,
+            verification_rows,
+            &workspace.stream,
+        )?;
+        self.weights.lm_head.run_rows(
+            &mtp_workspace.verification_normed,
+            &mut mtp_workspace.verification_logits,
+            verification_rows,
+            &workspace.stream,
+        )?;
+        argmax_f32_batch_into_on_stream(
+            &mtp_workspace.verification_logits,
+            mtp_workspace.verification_argmax_ids.output(),
+            mtp_workspace.verification_argmax_values.output(),
+            verification_rows,
+            config.vocab_size,
+            &workspace.stream,
+        )?;
+        workspace.stream.synchronize()?;
+        let target_tokens = mtp_workspace
+            .verification_argmax_ids
+            .copy_prefix_to_host(verification_rows, &workspace.stream)?
+            .into_vec();
+        let mut accepted = Vec::with_capacity(sequence_count);
+        let mut next_tokens = Vec::with_capacity(sequence_count);
+        for (sequence, &draft) in drafts.iter().enumerate() {
+            let current_token = target_tokens[sequence * 2];
+            let draft_token = target_tokens[sequence * 2 + 1];
+            let matched = current_token == draft;
+            accepted.push(matched);
+            next_tokens.push(if matched { draft_token } else { current_token });
+        }
+
+        for index in 0..rows.len() {
+            let row = &mut rows[index];
+            if accepted[index] {
+                cache
+                    .commit_append(
+                        reservations[index].clone(),
+                        2,
+                        &mut Deepseek4CacheContext {
+                            stream: &workspace.stream,
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(deepseek4_cache_error)?;
+                row.sequence.state.commit_append(2);
+            } else {
+                row.sequence.state.abort_append(&workspace.stream)?;
+                cache
+                    .abort_append(
+                        reservations[index].clone(),
+                        &mut Deepseek4CacheContext {
+                            stream: &workspace.stream,
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(deepseek4_cache_error)?;
+            }
+        }
+        drop(rows);
+
+        let rejected = accepted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, accepted)| (!accepted).then_some(index))
+            .collect::<Vec<_>>();
+        for &sequence in &rejected {
+            let token = [input_tokens[sequence]];
+            let mut rejected_row = [Deepseek4BatchRow {
+                token_ids: &token,
+                sequence: &mut *sequences[sequence],
+            }];
+            self.forward_batch(workspace, &mut rejected_row, cache)?;
+            mtp_workspace
+                .verification_streams
+                .copy_range_from_device_on_stream(
+                    sequence * 2 * stream_width,
+                    &workspace.streams,
+                    0,
+                    stream_width,
+                    &workspace.stream,
+                )?;
+        }
+        workspace.stream.synchronize()?;
+
+        for (sequence, mtp_sequence) in mtp_sequences.iter_mut().enumerate() {
+            mtp_sequence
+                .previous_hidden
+                .copy_range_from_device_on_stream(
+                    0,
+                    &mtp_workspace.verification_streams,
+                    sequence * 2 * stream_width,
+                    stream_width,
+                    &workspace.stream,
+                )?;
+        }
+        let accepted_indices = accepted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, accepted)| accepted.then_some(index))
+            .collect::<Vec<_>>();
+        for &sequence in &accepted_indices {
+            workspace.streams.copy_range_from_device_on_stream(
+                0,
+                &mtp_workspace.verification_streams,
+                (sequence * 2 + 1) * stream_width,
+                stream_width,
+                &workspace.stream,
+            )?;
+            let token = [drafts[sequence]];
+            let mut catchup_row = [Deepseek4MtpBatchRow {
+                token_ids: &token,
+                sequence: &mut *mtp_sequences[sequence],
+            }];
+            self.append_mtp_from_target(
+                mtp_workspace,
+                workspace,
+                &mut catchup_row,
+                mtp_cache,
+                false,
+            )?;
+        }
+        workspace.stream.synchronize()?;
+        Ok(Deepseek4SpeculativeCycleResult {
+            drafts,
+            next_tokens,
+            accepted,
+        })
+    }
+
+    fn append_mtp_from_target(
+        &mut self,
+        workspace: &mut Deepseek4MtpWorkspace,
+        target_workspace: &Deepseek4BatchWorkspace,
+        rows: &mut [Deepseek4MtpBatchRow<'_, '_>],
+        cache: &mut Deepseek4MtpSequenceCache,
+        project_logits: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 MTP append",
+            detail: "model was loaded without MTP weights".to_string(),
+        })?;
+        if rows.is_empty() || rows.len() > workspace.sequence_capacity {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 MTP rows",
+                expected: format!("1..={} sequences", workspace.sequence_capacity),
+                actual: rows.len().to_string(),
+            });
+        }
+        let total_tokens = rows.iter().try_fold(0usize, |total, row| {
+            if row.token_ids.is_empty() {
+                return Err(Error::Shape {
+                    label: "DeepSeek V4 MTP row",
+                    expected: "at least one token".to_string(),
+                    actual: "0 tokens".to_string(),
+                });
+            }
+            total
+                .checked_add(row.token_ids.len())
+                .ok_or_else(|| Error::Format {
+                    label: "DeepSeek V4 MTP rows",
+                    detail: "token count overflowed usize".to_string(),
+                })
+        })?;
+        if total_tokens > workspace.token_capacity {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 MTP rows",
+                expected: format!("at most {} tokens", workspace.token_capacity),
+                actual: total_tokens.to_string(),
+            });
+        }
+        let config = &self.weights.config;
+        let hidden = config.hidden_size;
+        let stream_width = HYPER_STREAMS * hidden;
+        let mut offset = 0;
+        for (sequence, row) in rows.iter().enumerate() {
+            let end = offset + row.token_ids.len();
+            workspace.host_token_ids[offset..end].copy_from_slice(row.token_ids);
+            if row.sequence.position == 0 {
+                workspace
+                    .previous_streams
+                    .copy_range_from_device_on_stream(
+                        offset * stream_width,
+                        &workspace.zero_stream,
+                        0,
+                        stream_width,
+                        &target_workspace.stream,
+                    )?;
+            } else {
+                workspace
+                    .previous_streams
+                    .copy_range_from_device_on_stream(
+                        offset * stream_width,
+                        &row.sequence.previous_hidden,
+                        0,
+                        stream_width,
+                        &target_workspace.stream,
+                    )?;
+            }
+            if row.token_ids.len() > 1 {
+                workspace
+                    .previous_streams
+                    .copy_range_from_device_on_stream(
+                        (offset + 1) * stream_width,
+                        &target_workspace.streams,
+                        offset * stream_width,
+                        (row.token_ids.len() - 1) * stream_width,
+                        &target_workspace.stream,
+                    )?;
+            }
+            workspace
+                .verification_streams
+                .copy_range_from_device_on_stream(
+                    sequence * stream_width,
+                    &target_workspace.streams,
+                    (end - 1) * stream_width,
+                    stream_width,
+                    &target_workspace.stream,
+                )?;
+            offset = end;
+        }
+        workspace
+            .token_ids
+            .copy_prefix_from_host(&workspace.host_token_ids[..total_tokens])?;
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+            config.vocab_size,
+            hidden,
+            &self.weights.embedding,
+            &workspace.token_ids,
+            workspace.embedding.output(),
+            total_tokens,
+            &target_workspace.stream,
+        )?;
+        mtp.embedding_norm.run_rows(
+            &workspace.embedding,
+            &mut workspace.normalized_embedding,
+            total_tokens,
+            &target_workspace.stream,
+        )?;
+        mtp.hidden_norm.run_rows(
+            &workspace.previous_streams,
+            &mut workspace.normalized_previous,
+            total_tokens * HYPER_STREAMS,
+            &target_workspace.stream,
+        )?;
+        mtp.embedding_projection.run_rows(
+            &workspace.normalized_embedding,
+            &mut workspace.projected_embedding,
+            total_tokens,
+            &target_workspace.stream,
+        )?;
+        mtp.hidden_projection.run_rows(
+            &workspace.normalized_previous,
+            &mut workspace.projected_previous,
+            total_tokens * HYPER_STREAMS,
+            &target_workspace.stream,
+        )?;
+        repeat_hyper_streams_f32_into_on_stream(
+            &workspace.projected_embedding,
+            workspace.streams.output(),
+            total_tokens,
+            hidden,
+            &target_workspace.stream,
+        )?;
+        add_f32_prefix_into_on_stream(
+            &workspace.streams,
+            &workspace.projected_previous,
+            workspace.next_streams.output(),
+            total_tokens * stream_width,
+            &target_workspace.stream,
+        )?;
+        std::mem::swap(&mut workspace.streams, &mut workspace.next_streams);
+        let mut row_offset = 0;
+        for row in rows.iter() {
+            if row.sequence.position == 0 {
+                workspace.streams.copy_range_from_device_on_stream(
+                    row_offset * stream_width,
+                    &workspace.zero_stream,
+                    0,
+                    stream_width,
+                    &target_workspace.stream,
+                )?;
+            }
+            row_offset += row.token_ids.len();
+        }
+
+        let mut reservations = Vec::with_capacity(rows.len());
+        for index in 0..rows.len() {
+            let row = &mut rows[index];
+            match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Deepseek4CacheContext {
+                    stream: &target_workspace.stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Deepseek4CacheContext {
+                                    stream: &target_workspace.stream,
+                                    page_table: &mut row.sequence.page_table,
+                                },
+                            )
+                            .map_err(deepseek4_cache_error)?;
+                    }
+                    return Err(deepseek4_cache_error(error));
+                }
+            }
+        }
+        let result = (|| {
+            let mut attention_rows = rows
+                .iter_mut()
+                .map(|row| Deepseek4AttentionRow {
+                    state: &mut row.sequence.state,
+                    page_table: row.sequence.page_table.device(),
+                    rows: row.token_ids.len(),
+                    position: row.sequence.position,
+                })
+                .collect::<Vec<_>>();
+            cache
+                .with_append_reservations(&reservations, |backend, pages| {
+                    mtp.layer.run_layer_rows(
+                        &mut mtp.routed_experts,
+                        &mut workspace.layer,
+                        &mut attention_rows,
+                        backend,
+                        pages,
+                        0,
+                        &workspace.streams,
+                        &workspace.token_ids,
+                        &self.weights.sliding_rope_inv_freq,
+                        &mut workspace.next_streams,
+                        config,
+                        &target_workspace.stream,
+                    )
+                })
+                .map_err(deepseek4_cache_error)?;
+            if project_logits {
+                let mut source = 0;
+                for (sequence, row) in rows.iter().enumerate() {
+                    workspace.final_streams.copy_range_from_device_on_stream(
+                        sequence * stream_width,
+                        &workspace.next_streams,
+                        (source + row.token_ids.len() - 1) * stream_width,
+                        stream_width,
+                        &target_workspace.stream,
+                    )?;
+                    source += row.token_ids.len();
+                }
+                mtp.hyper_head.run_rows(
+                    &workspace.final_streams,
+                    &mut workspace.final_hidden,
+                    rows.len(),
+                    &target_workspace.stream,
+                )?;
+                mtp.final_norm.run_rows(
+                    &workspace.final_hidden,
+                    &mut workspace.final_normed,
+                    rows.len(),
+                    &target_workspace.stream,
+                )?;
+                self.weights.lm_head.run_rows(
+                    &workspace.final_normed,
+                    &mut workspace.logits,
+                    rows.len(),
+                    &target_workspace.stream,
+                )?;
+                argmax_f32_batch_into_on_stream(
+                    &workspace.logits,
+                    workspace.argmax_ids.output(),
+                    workspace.argmax_values.output(),
+                    rows.len(),
+                    config.vocab_size,
+                    &target_workspace.stream,
+                )?;
+            }
+            target_workspace.stream.synchronize()
+        })();
+        if let Err(error) = result {
+            for (row, reservation) in rows.iter_mut().zip(reservations) {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Deepseek4CacheContext {
+                            stream: &target_workspace.stream,
+                            page_table: &mut row.sequence.page_table,
+                        },
+                    )
+                    .map_err(deepseek4_cache_error)?;
+            }
+            return Err(error);
+        }
+        for (sequence, (row, reservation)) in rows.iter_mut().zip(reservations).enumerate() {
+            cache
+                .commit_append(
+                    reservation,
+                    row.token_ids.len(),
+                    &mut Deepseek4CacheContext {
+                        stream: &target_workspace.stream,
+                        page_table: &mut row.sequence.page_table,
+                    },
+                )
+                .map_err(deepseek4_cache_error)?;
+            row.sequence.position += row.token_ids.len();
+            row.sequence
+                .previous_hidden
+                .copy_range_from_device_on_stream(
+                    0,
+                    &workspace.verification_streams,
+                    sequence * stream_width,
+                    stream_width,
+                    &target_workspace.stream,
+                )?;
+        }
+        target_workspace.stream.synchronize()?;
+        if project_logits {
+            Ok(Some(
+                workspace
+                    .argmax_ids
+                    .copy_prefix_to_host(rows.len(), &target_workspace.stream)?
+                    .into_vec(),
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     fn run_decoder_batch(
@@ -3181,12 +4109,19 @@ impl Deepseek4TextModel {
     }
 
     pub fn device_bytes(&self) -> usize {
-        self.weights.device_bytes().saturating_add(
-            self.routed_experts
-                .iter()
-                .map(Deepseek4RoutedExpertLayer::device_bytes)
-                .sum::<usize>(),
-        )
+        self.weights
+            .device_bytes()
+            .saturating_add(
+                self.routed_experts
+                    .iter()
+                    .map(Deepseek4RoutedExpertLayer::device_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.mtp
+                    .as_ref()
+                    .map_or(0, Deepseek4MtpWeights::device_bytes),
+            )
     }
 
     /// Snapshots cumulative per-layer routing for bounded hot-cache preparation.

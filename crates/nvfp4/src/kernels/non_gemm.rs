@@ -6939,15 +6939,15 @@ pub fn argmax_f32_batch_into_on_stream(
     let len = rows.saturating_mul(cols);
     if rows == 0
         || cols == 0
-        || values.len() != len
-        || out_index.len() != rows
-        || out_value.len() != rows
+        || values.len() < len
+        || out_index.len() < rows
+        || out_value.len() < rows
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
     {
         return Err(Error::Shape {
             label: "batched argmax f32 buffers",
-            expected: format!("values={len} index/value={rows}"),
+            expected: format!("values>={len} index/value>={rows}"),
             actual: format!(
                 "values={} index={} value={} rows={rows} cols={cols}",
                 values.len(),
@@ -12900,11 +12900,12 @@ mod tests {
         let mut host_logits = (0..2 * cols).map(|value| value as f32).collect::<Vec<_>>();
         host_logits[3] = 1000.0;
         host_logits[cols + 34] = 2000.0;
+        host_logits.extend_from_slice(&[-1.0; 2 * 35]);
         let mut logits = DeviceBuffer::from_host(&host_logits).expect("logits");
         let allowed = DeviceBuffer::from_host(&[1u32 << 3, 0, 1u32 << 1, 1u32 << (34 - 32)])
             .expect("allowed mask");
-        let mut indices = DeviceBuffer::<u32>::zeroed(2).expect("indices");
-        let mut values = DeviceBuffer::<f32>::zeroed(2).expect("values");
+        let mut indices = DeviceBuffer::<u32>::zeroed(4).expect("indices");
+        let mut values = DeviceBuffer::<f32>::zeroed(4).expect("values");
         let stream = CudaStream::new_non_blocking().expect("stream");
 
         mask_logits_f32_batch_in_place_on_stream(logits.inout(), &allowed, 2, cols, &stream)
@@ -12920,7 +12921,7 @@ mod tests {
         .expect("masked argmax");
 
         assert_eq!(
-            indices.copy_to_host(&stream).expect("indices download"),
+            &indices.copy_to_host(&stream).expect("indices download")[..2],
             [3, 34]
         );
         let masked = logits.copy_to_host(&stream).expect("logits download");

@@ -343,7 +343,11 @@ impl Deepseek4CompressionState {
 }
 
 impl Deepseek4LayerSequenceState {
-    fn new(config: &Deepseek4ModelConfig, layer: usize, max_tokens: usize) -> Result<Self> {
+    pub(crate) fn new(
+        config: &Deepseek4ModelConfig,
+        layer: usize,
+        max_tokens: usize,
+    ) -> Result<Self> {
         let compression = match config.attention_kind(layer)? {
             Deepseek4AttentionKind::Sliding => Deepseek4LayerCompressionState::Sliding,
             Deepseek4AttentionKind::CompressedSparse => {

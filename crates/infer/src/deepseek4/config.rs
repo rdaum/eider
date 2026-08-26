@@ -88,7 +88,7 @@ impl Deepseek4ModelConfig {
             .copied()
             .ok_or_else(|| Error::Shape {
                 label: "DeepSeek V4 layer",
-                expected: format!("layer < {}", self.num_hidden_layers),
+                expected: format!("layer < {}", self.layer_attention.len()),
                 actual: layer.to_string(),
             })
     }
@@ -248,7 +248,8 @@ impl RawDeepseek4Config {
             )));
         }
 
-        let layer_attention = self.compress_ratios[..self.num_hidden_layers]
+        let layer_attention = self
+            .compress_ratios
             .iter()
             .enumerate()
             .map(|(layer, &ratio)| match ratio {
@@ -401,6 +402,10 @@ mod tests {
             Deepseek4AttentionKind::HeavilyCompressed
         );
         assert_eq!(config.compression_ratio(3).expect("ratio"), 128);
+        assert_eq!(
+            config.attention_kind(4).expect("MTP layer"),
+            Deepseek4AttentionKind::Sliding
+        );
     }
 
     #[test]

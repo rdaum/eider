@@ -1013,6 +1013,80 @@ impl ModelOptCheckpoint {
         })
     }
 
+    /// Imports packed MXFP4 weights and converts their exact power-of-two
+    /// E8M0 K32 block scales to the duplicated K16 UE4M3 representation
+    /// consumed by SM12x NVFP4.
+    pub fn load_mxfp4_linear(&self, prefix: &str) -> Result<ModelOptNvfp4Linear> {
+        let weight_name = format!("{prefix}.weight");
+        let scale_name = format!("{prefix}.scale");
+        let weight_shard = self.open_shard_for_tensor(&weight_name)?;
+        let scale_shard = self.open_shard_for_tensor(&scale_name)?;
+        let weight_info = weight_shard.require_tensor(&weight_name)?;
+        let scale_info = scale_shard.require_tensor(&scale_name)?;
+        if weight_info.dtype != "I8" || weight_info.shape.len() != 2 {
+            return Err(Error::Shape {
+                label: "MXFP4 weight",
+                expected: "dtype=I8 shape=[out,in/2]".to_string(),
+                actual: format!("dtype={} shape={:?}", weight_info.dtype, weight_info.shape),
+            });
+        }
+        let out_features = weight_info.shape[0];
+        let in_features = weight_info.shape[1] * 2;
+        if !in_features.is_multiple_of(32) {
+            return Err(Error::Shape {
+                label: "MXFP4 weight",
+                expected: "input width divisible by 32".to_string(),
+                actual: in_features.to_string(),
+            });
+        }
+        let expected_scale_shape = [out_features, in_features / 32];
+        if scale_info.dtype != "F8_E8M0"
+            || scale_info.shape != expected_scale_shape
+            || scale_info.byte_len() != (out_features * in_features / 32) as u64
+        {
+            return Err(Error::Shape {
+                label: "MXFP4 scale",
+                expected: format!("dtype=F8_E8M0 shape={expected_scale_shape:?}"),
+                actual: format!("dtype={} shape={:?}", scale_info.dtype, scale_info.shape),
+            });
+        }
+        let weight_scale = scale_shard
+            .read_tensor_bytes(&scale_name)?
+            .into_iter()
+            .map(|code| {
+                let value = format::e8m0_value(code);
+                if !value.is_finite() {
+                    return Err(Error::Format {
+                        label: "MXFP4 scale",
+                        detail: format!("{scale_name} contains a NaN scale code"),
+                    });
+                }
+                let converted = format::ue4m3_code(value);
+                if format::e4m3_value(converted) != value {
+                    return Err(Error::Format {
+                        label: "MXFP4 scale",
+                        detail: format!(
+                            "{scale_name} contains E8M0 scale {value} outside exact UE4M3 range"
+                        ),
+                    });
+                }
+                Ok(converted)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|scale| [scale, scale])
+            .collect();
+        Ok(ModelOptNvfp4Linear {
+            prefix: prefix.to_string(),
+            out_features,
+            in_features,
+            packed_weight: weight_shard.read_tensor_bytes(&weight_name)?,
+            weight_scale,
+            weight_scale_2: 1.0,
+            input_scale: 1.0,
+        })
+    }
+
     /// Imports one expert from a stacked ModelOpt NVFP4 linear.
     ///
     /// Stacked MoE checkpoints store the packed weight and block scales as
@@ -1621,6 +1695,42 @@ mod tests {
             1.0
         );
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn mxfp4_import_duplicates_exact_k32_scales_for_k16_runtime_blocks() {
+        let root = cache_path();
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let path = root.join("model.safetensors");
+        let mut header = serde_json::to_vec(&json!({
+            "test.weight": {"dtype":"I8", "shape":[2,16], "data_offsets":[0,32]},
+            "test.scale": {"dtype":"F8_E8M0", "shape":[2,1], "data_offsets":[32,34]}
+        }))
+        .expect("header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let packed = (0..32u8).collect::<Vec<_>>();
+        let mut file = File::create(&path).expect("fixture");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .and_then(|()| file.write_all(&header))
+            .and_then(|()| file.write_all(&packed))
+            .and_then(|()| file.write_all(&[125, 127]))
+            .expect("write fixture");
+        drop(file);
+
+        let checkpoint = ModelOptCheckpoint::open(&root).expect("open checkpoint");
+        let linear = checkpoint.load_mxfp4_linear("test").expect("import MXFP4");
+        assert_eq!(linear.out_features, 2);
+        assert_eq!(linear.in_features, 32);
+        assert_eq!(linear.packed_weight, packed);
+        assert_eq!(
+            linear.weight_scale,
+            [0.25, 0.25, 1.0, 1.0].map(format::ue4m3_code).to_vec()
+        );
+        assert_eq!(linear.weight_scale_2, 1.0);
+        assert_eq!(linear.input_scale, 1.0);
+        std::fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]

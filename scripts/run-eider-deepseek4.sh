@@ -10,7 +10,8 @@ artifact_dir="${DEEPSEEK4_ARTIFACT_DIR:-$model_root/deepseek4-experts-nvfp4-v2}"
 served_model="${EIDER_SERVED_MODEL:-eider-deepseek-v4}"
 max_context_tokens="${EIDER_MAX_CONTEXT_TOKENS:-32768}"
 prefill_token_capacity="${EIDER_PREFILL_TOKEN_CAPACITY:-2048}"
-expert_capacity="${DEEPSEEK4_EXPERT_CAPACITY:-8}"
+expert_capacity="${DEEPSEEK4_EXPERT_CAPACITY:-96}"
+speculative_drafts="${EIDER_SPECULATIVE_DRAFTS:-0}"
 
 if [[ ! -f "$model_dir/model.safetensors.index.json" ]]; then
   echo "DeepSeek V4 thin checkpoint is not prepared: $model_dir" >&2
@@ -19,6 +20,11 @@ if [[ ! -f "$model_dir/model.safetensors.index.json" ]]; then
 fi
 if [[ ! -f "$artifact_dir/layer-00.nvf4" ]]; then
   echo "DeepSeek V4 exact NVFP4 expert store is not prepared: $artifact_dir" >&2
+  echo "run scripts/prepare-deepseek4-experts-streaming.sh first" >&2
+  exit 1
+fi
+if ((speculative_drafts > 0)) && [[ ! -f "$artifact_dir/layer-43.nvf4" ]]; then
+  echo "DeepSeek V4 MTP expert layer is not prepared: $artifact_dir/layer-43.nvf4" >&2
   echo "run scripts/prepare-deepseek4-experts-streaming.sh first" >&2
   exit 1
 fi
@@ -34,4 +40,5 @@ exec cargo run --release \
   --max-context-tokens "$max_context_tokens" \
   --prefill-token-capacity "$prefill_token_capacity" \
   --deepseek-expert-capacity "$expert_capacity" \
+  --speculative-drafts "$speculative_drafts" \
   "$@"

@@ -10,12 +10,59 @@ use seqcache::{
 use std::mem::size_of;
 
 pub type Deepseek4SequenceCache = SequenceCache<Deepseek4PageBackend, Deepseek4SequenceCheckpoint>;
+pub type Deepseek4MtpSequenceCache = SequenceCache<Deepseek4PageBackend, ()>;
 
 /// One admitted DeepSeek sequence and its private compressed-attention state.
 pub struct Deepseek4Sequence {
     pub(crate) cache_id: SequenceId,
     pub(crate) page_table: Sm12xPageTable,
     pub(crate) state: Deepseek4SequenceState,
+}
+
+/// One admitted cache and previous target residual for the MTP decoder layer.
+pub struct Deepseek4MtpSequence {
+    pub(crate) cache_id: SequenceId,
+    pub(crate) page_table: Sm12xPageTable,
+    pub(crate) state: crate::deepseek4::Deepseek4LayerSequenceState,
+    pub(crate) previous_hidden: DeviceBuffer<f32>,
+    pub(crate) position: usize,
+}
+
+impl Deepseek4MtpSequence {
+    pub(crate) fn from_admission(
+        cache_id: SequenceId,
+        page_table: Sm12xPageTable,
+        state: crate::deepseek4::Deepseek4LayerSequenceState,
+        hidden_values: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            cache_id,
+            page_table,
+            state,
+            previous_hidden: DeviceBuffer::zeroed(hidden_values)?,
+            position: 0,
+        })
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        self.state
+            .device_bytes()
+            .saturating_add(self.previous_hidden.device_bytes())
+            .saturating_add(self.page_table.managed_bytes())
+    }
+
+    pub fn finish(self, stream: &CudaStream, cache: &mut Deepseek4MtpSequenceCache) -> Result<()> {
+        let mut page_table = self.page_table;
+        cache
+            .finish(
+                self.cache_id,
+                &mut Deepseek4CacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(deepseek4_cache_error)
+    }
 }
 
 impl Deepseek4Sequence {
@@ -127,6 +174,67 @@ pub fn new_deepseek4_sequence_cache(
             emergency_bytes: 0,
         },
         backend,
+    )
+    .map_err(deepseek4_cache_error)
+}
+
+pub fn new_deepseek4_mtp_sequence_cache(
+    model: &Deepseek4TextModel,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+) -> Result<Deepseek4MtpSequenceCache> {
+    if sequence_capacity == 0 || max_context_tokens == 0 {
+        return Err(Error::Shape {
+            label: "DeepSeek V4 MTP sequence cache",
+            expected: "positive sequence and context capacities".to_string(),
+            actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
+        });
+    }
+    let config = &model.weights.config;
+    if config.nextn_predict_layers != 1 {
+        return Err(Error::Format {
+            label: "DeepSeek V4 MTP sequence cache",
+            detail: "model has no MTP layer".to_string(),
+        });
+    }
+    let probe = Deepseek4PageBackend::new(1, config.head_dim, 1)?;
+    let page_bytes = probe.page_bytes();
+    let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
+    let private_bytes = config
+        .hc_mult
+        .checked_mul(config.hidden_size)
+        .and_then(|values| values.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 MTP sequence cache",
+            detail: "private residual byte count overflowed usize".to_string(),
+        })?;
+    let pages = sequence_capacity
+        .checked_mul(max_context_tokens.div_ceil(SM12X_KV_PAGE_TOKENS))
+        .ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 MTP sequence cache",
+            detail: "page count overflowed usize".to_string(),
+        })?;
+    let managed_bytes = pages
+        .checked_mul(page_bytes)
+        .and_then(|bytes| {
+            table_bytes
+                .checked_add(private_bytes)
+                .and_then(|fixed| fixed.checked_mul(sequence_capacity))
+                .and_then(|fixed| bytes.checked_add(fixed))
+        })
+        .ok_or_else(|| Error::Format {
+            label: "DeepSeek V4 MTP sequence cache",
+            detail: "managed byte count overflowed usize".to_string(),
+        })?;
+    Deepseek4MtpSequenceCache::new(
+        CacheConfig {
+            page_tokens: SM12X_KV_PAGE_TOKENS,
+            max_managed_bytes: managed_bytes,
+            max_snapshot_bytes: 0,
+            max_prefix_entries: Some(0),
+            emergency_bytes: 0,
+        },
+        Deepseek4PageBackend::new(1, config.head_dim, pages)?,
     )
     .map_err(deepseek4_cache_error)
 }

@@ -2,10 +2,10 @@
 
 use infer::deepseek4::{
     finalise_thin_checkpoint, inspect_expert_artifacts, inspect_hot_expert_cache,
-    inspect_nvfp4_expert_layer, inspect_nvfp4_expert_store, inspect_thin_checkpoint,
-    inspect_thin_checkpoint_shard, preflight_expert_artifacts, prepare_all_experts,
-    prepare_expert_layer, prepare_hot_expert_layer, prepare_nvfp4_expert_layer,
-    prepare_thin_checkpoint_shard,
+    inspect_nvfp4_expert_layer, inspect_nvfp4_expert_store, inspect_nvfp4_mtp_layer,
+    inspect_thin_checkpoint, inspect_thin_checkpoint_shard, preflight_expert_artifacts,
+    prepare_all_experts, prepare_expert_layer, prepare_hot_expert_layer,
+    prepare_nvfp4_expert_layer, prepare_nvfp4_mtp_layer, prepare_thin_checkpoint_shard,
 };
 use infer::nvfp4::{Error, Result};
 use std::ffi::OsString;
@@ -137,6 +137,24 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        "prepare-nvfp4-mtp" if args.len() == 2 => {
+            let info = prepare_nvfp4_mtp_layer(PathBuf::from(&args[0]), PathBuf::from(&args[1]))?;
+            tracing::info!(
+                experts = info.experts,
+                layer_gib = info.file_bytes as f64 / (1u64 << 30) as f64,
+                "prepared exact DeepSeek V4 MTP NVFP4 expert layer"
+            );
+            Ok(())
+        }
+        "inspect-nvfp4-mtp" if args.len() == 2 => {
+            let info = inspect_nvfp4_mtp_layer(PathBuf::from(&args[0]), PathBuf::from(&args[1]))?;
+            tracing::info!(
+                experts = info.experts,
+                layer_gib = info.file_bytes as f64 / (1u64 << 30) as f64,
+                "validated exact DeepSeek V4 MTP NVFP4 expert layer"
+            );
+            Ok(())
+        }
         "prepare-thin-shard" if args.len() == 3 => {
             let shard = args[2].to_str().ok_or_else(|| Error::Format {
                 label: "usage",
@@ -217,6 +235,8 @@ fn usage(program: &str) -> Result<()> {
              {program} prepare-nvfp4-layer <model-dir> <store-dir> <layer>\n\
              {program} inspect-nvfp4-layer <model-dir> <store-dir> <layer>\n\
              {program} inspect-nvfp4 <model-dir> <store-dir>\n\
+             {program} prepare-nvfp4-mtp <model-dir> <store-dir>\n\
+             {program} inspect-nvfp4-mtp <model-dir> <store-dir>\n\
              {program} prepare-thin-shard <model-dir> <thin-dir> <shard>\n\
              {program} inspect-thin-shard <model-dir> <thin-dir> <shard>\n\
              {program} finalise-thin <model-dir> <thin-dir>\n\
