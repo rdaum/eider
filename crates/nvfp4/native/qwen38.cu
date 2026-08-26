@@ -29,6 +29,236 @@ __device__ __forceinline__ float block_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float qwen38_rope_value(
+    const float* values,
+    std::uint32_t dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t position,
+    float theta) {
+    if (dim >= rotary_dim) {
+        return values[dim];
+    }
+    const std::uint32_t half = rotary_dim / 2;
+    const std::uint32_t pair = dim % half;
+    const float frequency = powf(
+        theta, -2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dim));
+    float sine;
+    float cosine;
+    sincosf(static_cast<float>(position) * frequency, &sine, &cosine);
+    const float first = values[pair];
+    const float second = values[pair + half];
+    return dim < half ? first * cosine - second * sine
+                      : second * cosine + first * sine;
+}
+
+__global__ void qwen38_qsa_prepare_query_kernel(
+    const float* projection,
+    const float* q_norm,
+    float* query,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t position,
+    float eps,
+    float theta) {
+    const std::uint32_t head = blockIdx.x;
+    const std::uint32_t dim = threadIdx.x;
+    if (head >= heads || dim >= head_dim) {
+        return;
+    }
+    const float* input = projection + static_cast<std::size_t>(head) * head_dim;
+    extern __shared__ float scratch[];
+    const float value = input[dim];
+    scratch[dim] = value * value;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (dim < stride) {
+            scratch[dim] += scratch[dim + stride];
+        }
+        __syncthreads();
+    }
+    const float inverse_rms = rsqrtf(scratch[0] / static_cast<float>(head_dim) + eps);
+    scratch[dim] = value * inverse_rms * q_norm[dim];
+    __syncthreads();
+    query[static_cast<std::size_t>(head) * head_dim + dim] = qwen38_rope_value(
+        scratch, dim, rotary_dim, position, theta);
+}
+
+__global__ void qwen38_qsa_append_key_kernel(
+    const float* projection,
+    __nv_bfloat16* key_pool,
+    std::uint32_t slot,
+    std::uint32_t page_offset,
+    std::uint32_t page_tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const std::uint32_t dim = blockIdx.x * blockDim.x + threadIdx.x;
+    if (dim >= head_dim) {
+        return;
+    }
+    const float* key = projection + static_cast<std::size_t>(heads) * head_dim;
+    const std::size_t destination =
+        (static_cast<std::size_t>(slot) * page_tokens + page_offset) * head_dim + dim;
+    key_pool[destination] = __float2bfloat16_rn(key[dim]);
+}
+
+__global__ void qwen38_qsa_score_blocks_kernel(
+    const float* query,
+    const __nv_bfloat16* key_pool,
+    const std::uint32_t* page_table,
+    const float* k_norm,
+    float* scores,
+    std::uint32_t complete_blocks,
+    std::uint32_t page_tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    float eps,
+    float theta) {
+    const std::uint32_t block = blockIdx.x;
+    const std::uint32_t dim = threadIdx.x;
+    if (block >= complete_blocks || dim >= head_dim) {
+        return;
+    }
+    const std::uint32_t token = block * 4;
+    const std::uint32_t page_slot = page_table[token / page_tokens];
+    const std::uint32_t page_offset = token % page_tokens;
+    const std::size_t page_base =
+        static_cast<std::size_t>(page_slot) * page_tokens * head_dim;
+    float pooled = 0.0f;
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        pooled += __bfloat162float(key_pool[
+            page_base + static_cast<std::size_t>(page_offset + row) * head_dim + dim]);
+    }
+    pooled = __bfloat162float(__float2bfloat16_rn(pooled * 0.25f));
+    extern __shared__ float scratch[];
+    scratch[dim] = pooled;
+    scratch[head_dim + dim] = pooled * pooled;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (dim < stride) {
+            scratch[head_dim + dim] += scratch[head_dim + dim + stride];
+        }
+        __syncthreads();
+    }
+    const float inverse_rms =
+        rsqrtf(scratch[head_dim] / static_cast<float>(head_dim) + eps);
+    scratch[dim] = pooled * inverse_rms * k_norm[dim];
+    __syncthreads();
+    const float key = qwen38_rope_value(scratch, dim, rotary_dim, token, theta);
+    float score = 0.0f;
+    for (std::uint32_t head = 0; head < heads; ++head) {
+        float dot = query[static_cast<std::size_t>(head) * head_dim + dim] * key;
+        dot = block_sum(dot);
+        if (threadIdx.x == 0) {
+            score += fmaxf(dot, 0.0f);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scores[block] = score * rsqrtf(static_cast<float>(head_dim));
+    }
+}
+
+__global__ void qwen38_qsa_select_blocks_kernel(
+    const float* scores,
+    std::uint8_t* selected_blocks,
+    std::uint32_t complete_blocks,
+    std::uint32_t selected_complete_blocks,
+    std::uint32_t tail_tokens) {
+    if (complete_blocks <= selected_complete_blocks) {
+        for (std::uint32_t block = threadIdx.x; block < complete_blocks;
+             block += blockDim.x) {
+            selected_blocks[block] = 1;
+        }
+        if (tail_tokens != 0 && threadIdx.x == 0) {
+            selected_blocks[complete_blocks] = 1;
+        }
+        return;
+    }
+
+    __shared__ std::uint32_t prefix;
+    __shared__ std::uint32_t rank;
+    __shared__ std::uint32_t count;
+    __shared__ std::uint32_t tie_cutoff;
+    if (threadIdx.x == 0) {
+        prefix = 0;
+        rank = selected_complete_blocks;
+    }
+    __syncthreads();
+    for (int bit = 31; bit >= 0; --bit) {
+        std::uint32_t local = 0;
+        const std::uint32_t higher_mask = bit == 31 ? 0u : ~((1u << (bit + 1)) - 1u);
+        for (std::uint32_t block = threadIdx.x; block < complete_blocks;
+             block += blockDim.x) {
+            const float score = isfinite(scores[block]) ? fmaxf(scores[block], 0.0f) : 0.0f;
+            const std::uint32_t bits = __float_as_uint(score);
+            local += ((bits & higher_mask) == (prefix & higher_mask) &&
+                      (bits & (1u << bit)) != 0u);
+        }
+        local = static_cast<std::uint32_t>(block_sum(static_cast<float>(local)));
+        if (threadIdx.x == 0) {
+            count = local;
+            if (count >= rank) {
+                prefix |= 1u << bit;
+            } else {
+                rank -= count;
+            }
+        }
+        __syncthreads();
+    }
+
+    std::uint32_t local_greater = 0;
+    for (std::uint32_t block = threadIdx.x; block < complete_blocks;
+         block += blockDim.x) {
+        const float score = isfinite(scores[block]) ? fmaxf(scores[block], 0.0f) : 0.0f;
+        local_greater += __float_as_uint(score) > prefix;
+    }
+    local_greater = static_cast<std::uint32_t>(
+        block_sum(static_cast<float>(local_greater)));
+    if (threadIdx.x == 0) {
+        count = selected_complete_blocks - local_greater;
+        std::uint32_t seen = 0;
+        tie_cutoff = 0;
+        for (std::uint32_t block = 0; block < complete_blocks; ++block) {
+            const float score =
+                isfinite(scores[block]) ? fmaxf(scores[block], 0.0f) : 0.0f;
+            if (__float_as_uint(score) == prefix && ++seen == count) {
+                tie_cutoff = block;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    for (std::uint32_t block = threadIdx.x; block < complete_blocks;
+         block += blockDim.x) {
+        const float score = isfinite(scores[block]) ? fmaxf(scores[block], 0.0f) : 0.0f;
+        const std::uint32_t bits = __float_as_uint(score);
+        const bool selected = bits > prefix || (bits == prefix && block <= tie_cutoff);
+        selected_blocks[block] = selected ? 1 : 0;
+    }
+    if (tail_tokens != 0 && threadIdx.x == 0) {
+        selected_blocks[complete_blocks] = 1;
+    }
+}
+
+__global__ void qwen38_qsa_build_tile_mask_kernel(
+    const std::uint8_t* selected_blocks,
+    std::uint8_t* selected_tiles,
+    std::uint32_t visible_blocks) {
+    const std::uint32_t tile = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t block_start = tile * 16;
+    if (block_start >= visible_blocks) {
+        return;
+    }
+    bool selected = false;
+    for (std::uint32_t block = block_start;
+         block < min(block_start + 16, visible_blocks); ++block) {
+        selected |= selected_blocks[block] != 0;
+    }
+    selected_tiles[tile] = selected ? 1 : 0;
+}
+
 __global__ void qwen38_hc_norm_kernel(const float* input,
                                       const float* delta_weight,
                                       float* output,
@@ -339,5 +569,88 @@ extern "C" cudaError_t infer_qwen38_ple_conv_update_f32_on_stream(
         kernel,
         dilation,
         history);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
+        const float* projection,
+        const float* q_norm,
+        const float* k_norm,
+        std::uint16_t* key_pool_bf16,
+        const std::uint32_t* page_table,
+        float* query,
+        float* scores,
+        std::uint8_t* selected_blocks,
+        std::uint8_t* selected_tiles,
+        std::uint32_t slot,
+        std::uint32_t page_offset,
+        std::uint32_t cache_len,
+        std::uint32_t max_tokens,
+        std::uint32_t page_tokens,
+        std::uint32_t page_slots,
+        std::uint32_t heads,
+        std::uint32_t head_dim,
+        std::uint32_t rotary_dim,
+        std::uint32_t compress_ratio,
+        std::uint32_t budget,
+        float eps,
+        float theta,
+        cudaStream_t stream) {
+    if (projection == nullptr || q_norm == nullptr || k_norm == nullptr ||
+        key_pool_bf16 == nullptr || page_table == nullptr || query == nullptr ||
+        scores == nullptr || selected_blocks == nullptr || selected_tiles == nullptr ||
+        cache_len == 0 || cache_len > max_tokens || page_tokens == 0 ||
+        page_slots == 0 || slot >= page_slots || page_offset >= page_tokens ||
+        heads == 0 || head_dim == 0 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0 || rotary_dim == 0 ||
+        rotary_dim > head_dim || (rotary_dim % 2) != 0 ||
+        compress_ratio != 4 || budget == 0 || (budget % compress_ratio) != 0 ||
+        eps <= 0.0f || !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t complete_blocks = cache_len / compress_ratio;
+    const std::uint32_t tail_tokens = cache_len % compress_ratio;
+    const std::uint32_t visible_blocks = complete_blocks + (tail_tokens != 0);
+    const std::uint32_t max_blocks = (max_tokens + compress_ratio - 1) / compress_ratio;
+    const std::uint32_t max_tiles = (max_tokens + 63) / 64;
+    cudaError_t status = cudaMemsetAsync(selected_blocks, 0, max_blocks, stream);
+    if (status != cudaSuccess) return status;
+    status = cudaMemsetAsync(selected_tiles, 0, max_tiles, stream);
+    if (status != cudaSuccess) return status;
+
+    qwen38_qsa_prepare_query_kernel<<<
+        heads, head_dim, head_dim * sizeof(float), stream>>>(
+        projection, q_norm, query, heads, head_dim, rotary_dim,
+        cache_len - 1, eps, theta);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    constexpr std::uint32_t kAppendThreads = 128;
+    qwen38_qsa_append_key_kernel<<<
+        (head_dim + kAppendThreads - 1) / kAppendThreads, kAppendThreads, 0, stream>>>(
+        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16), slot,
+        page_offset, page_tokens, heads, head_dim);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    if (complete_blocks != 0) {
+        qwen38_qsa_score_blocks_kernel<<<
+            complete_blocks, head_dim, 2 * head_dim * sizeof(float), stream>>>(
+            query, reinterpret_cast<const __nv_bfloat16*>(key_pool_bf16),
+            page_table, k_norm, scores, complete_blocks, page_tokens, heads,
+            head_dim, rotary_dim, eps, theta);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    constexpr std::uint32_t kSelectThreads = 256;
+    const std::uint32_t selected_complete_blocks =
+        min(complete_blocks, budget / compress_ratio);
+    qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
+        scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    constexpr std::uint32_t kTileThreads = 256;
+    const std::uint32_t visible_tiles = (cache_len + 63) / 64;
+    qwen38_qsa_build_tile_mask_kernel<<<
+        (visible_tiles + kTileThreads - 1) / kTileThreads, kTileThreads, 0, stream>>>(
+        selected_blocks, selected_tiles, visible_blocks);
     return cudaGetLastError();
 }

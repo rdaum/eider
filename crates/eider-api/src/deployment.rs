@@ -144,7 +144,7 @@ const CATALOGUE: &[ModelSpec] = &[
         artifact_estimate_bytes: 0,
         defaults: ServingDefaults {
             served_model_name: "eider-qwen3.8-flash-next",
-            max_context_tokens: 2_048,
+            max_context_tokens: 262_144,
             prefill_token_capacity: 64,
             step_expert_capacity: 240,
         },
@@ -655,7 +655,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 "bitnet" => 4_096,
                 "bailing_hybrid" => 4_096,
                 "bonsai" => 65_536,
-                "qwen3_8_flash_next" => 2_048,
+                "qwen3_8_flash_next" => 262_144,
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
@@ -907,14 +907,14 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_pins_qwen38_flash_next_reference_checkpoint() {
+    fn catalogue_pins_qwen38_flash_next_checkpoint() {
         let model = catalogue_model("qwen3.8-flash-next").unwrap();
         assert_eq!(model.model_type, "qwen3_8_flash_next");
         assert_eq!(model.repository, "Inferact/Qwen3.8-Flash-Next-NVFP4");
         assert_eq!(model.revision, "129972269565f7f4f664fdf8dd42268d3bbda9fd");
         assert_eq!(model.artifact_kind, ArtifactKind::None);
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8-flash-next");
-        assert_eq!(model.defaults.max_context_tokens, 2_048);
+        assert_eq!(model.defaults.max_context_tokens, 262_144);
         assert_eq!(model.defaults.prefill_token_capacity, 64);
     }
 

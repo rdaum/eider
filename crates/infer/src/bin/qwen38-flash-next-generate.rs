@@ -1,6 +1,9 @@
 use infer::nvfp4::{Error, Result};
 use infer::qwen38_flash_next::Qwen38FlashNextModel;
 use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
+use infer::runtime::qwen38_flash_next_sequence::{
+    Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
+};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
@@ -70,12 +73,13 @@ fn main() -> Result<()> {
             ),
         })?
         .min(model.config().max_position_embeddings);
-    let mut state = model.new_decode_state(capacity)?;
+    let mut cache = new_qwen38_flash_next_sequence_cache(&model, 1, capacity)?;
+    let mut sequence = Qwen38FlashNextSequence::admit(&model, &mut cache, capacity)?;
 
     let prefill_started = Instant::now();
     let mut next = None;
     for &token in &rendered.token_ids {
-        next = Some(model.decode_token(&mut state, token)?);
+        next = Some(sequence.decode_token(&mut model, &mut cache, token)?);
     }
     eprintln!(
         "prefilled {} tokens in {:.2}s",
@@ -99,9 +103,10 @@ fn main() -> Result<()> {
         print!("{text}");
         std::io::stdout().flush().ok();
         if generated + 1 < max_new_tokens {
-            next = Some(model.decode_token(&mut state, token.id)?);
+            next = Some(sequence.decode_token(&mut model, &mut cache, token.id)?);
         }
     }
+    sequence.finish(&mut cache)?;
     println!();
     eprintln!(
         "generated up to {max_new_tokens} tokens in {:.2}s",
@@ -120,5 +125,5 @@ fn default_artifact_dir() -> Result<PathBuf> {
         })?;
         PathBuf::from(home).join(".cache")
     };
-    Ok(root.join("eider/qwen38-flash-next-reference"))
+    Ok(root.join("eider/qwen38-flash-next-native"))
 }

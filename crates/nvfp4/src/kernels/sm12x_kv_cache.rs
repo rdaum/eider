@@ -2090,6 +2090,114 @@ impl Sm12xKvAttentionWorkspace {
         )
     }
 
+    /// Enqueues QSA-selected compact attention through a stable device page table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_sparse_offsets_into_on_stream(
+        &mut self,
+        pool: &Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        cache_len: usize,
+        selected_blocks: &DeviceBuffer<u8>,
+        selected_tiles: &DeviceBuffer<u8>,
+        selected_tokens: usize,
+        query: &DeviceBuffer<f32>,
+        query_offset: usize,
+        mut output: DeviceOutput<'_, f32>,
+        output_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_capacity = page_table
+            .len()
+            .checked_mul(SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged sparse KV capacity",
+                expected: "page-table capacity without overflow".to_string(),
+                actual: page_table.len().to_string(),
+            })?;
+        let required_blocks = logical_capacity.div_ceil(4);
+        let required_tiles = logical_capacity.div_ceil(64);
+        if cache_len == 0
+            || cache_len > logical_capacity
+            || logical_capacity > self.max_tokens
+            || selected_tokens == 0
+            || selected_tokens > cache_len
+            || selected_blocks.len() < required_blocks
+            || selected_tiles.len() < required_tiles
+            || pool.kv_heads != self.kv_heads
+            || pool.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged sparse KV attention cache",
+                expected: format!(
+                    "cache within {logical_capacity}, selected masks >= {required_blocks}/{required_tiles}, workspace max >= capacity, kv_heads={}, head_dim={}",
+                    self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "cache_len={cache_len} selected_tokens={selected_tokens} masks={}/{} workspace_max={} pool_shape={}/{}",
+                    selected_blocks.len(),
+                    selected_tiles.len(),
+                    self.max_tokens,
+                    pool.kv_heads,
+                    pool.head_dim
+                ),
+            });
+        }
+        let query_width = self.q_heads * self.head_dim;
+        if query_offset
+            .checked_add(query_width)
+            .is_none_or(|end| end > query.len())
+            || output_offset
+                .checked_add(query_width)
+                .is_none_or(|end| end > output.len())
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged sparse KV attention offsets",
+                expected: format!("{query_width} readable/writable values at row offsets"),
+                actual: format!(
+                    "query_len={} query_offset={query_offset} output_len={} output_offset={output_offset}",
+                    query.len(),
+                    output.len()
+                ),
+            });
+        }
+        let layout = &pool.layout;
+        let pv_splits = pv_split_count(cache_len);
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_paged_sparse_attention_on_stream",
+                crate::ffi::infer_sm12x_kv_paged_sparse_attention_on_stream(
+                    query.as_const_ptr().cast::<f32>().add(query_offset),
+                    pool.component_ptr(layout.key_values),
+                    pool.component_ptr(layout.key_scales),
+                    pool.component_ptr(layout.key_tail).cast(),
+                    pool.component_ptr(layout.value_values),
+                    pool.component_ptr(layout.value_scales),
+                    pool.component_ptr(layout.value_tail).cast(),
+                    page_table.as_const_ptr().cast(),
+                    selected_blocks.as_const_ptr().cast(),
+                    selected_tiles.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast::<f32>().add(output_offset),
+                    cache_len as u32,
+                    selected_tokens as u32,
+                    logical_capacity as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    layout.total_bytes as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    pv_splits as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Enqueues compact windowed attention through a stable device page table.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_paged_window_offsets_into_on_stream(
@@ -2585,6 +2693,27 @@ mod tests {
                     &stream,
                 )
                 .expect("paged attention");
+            let selected_blocks =
+                DeviceBuffer::from_host(&vec![1u8; CAPACITY.div_ceil(4)]).expect("selected blocks");
+            let selected_tiles =
+                DeviceBuffer::from_host(&vec![1u8; CAPACITY.div_ceil(64)]).expect("selected tiles");
+            let mut sparse_output =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("sparse output");
+            workspace
+                .attention_paged_sparse_offsets_into_on_stream(
+                    &pool,
+                    &page_table,
+                    cache_len,
+                    &selected_blocks,
+                    &selected_tiles,
+                    cache_len,
+                    &query,
+                    0,
+                    sparse_output.output(),
+                    0,
+                    &stream,
+                )
+                .expect("sparse attention");
             assert_eq!(
                 paged_output
                     .copy_to_host(&stream)
@@ -2593,6 +2722,15 @@ mod tests {
                     .copy_to_host(&stream)
                     .expect("contiguous output read"),
                 "cache_len={cache_len}"
+            );
+            assert_eq!(
+                sparse_output
+                    .copy_to_host(&stream)
+                    .expect("sparse output read"),
+                paged_output
+                    .copy_to_host(&stream)
+                    .expect("paged output read"),
+                "sparse cache_len={cache_len}"
             );
             let window_start = cache_len.saturating_sub(17);
             let mut contiguous_window =
@@ -2629,6 +2767,58 @@ mod tests {
                     .copy_to_host(&stream)
                     .expect("contiguous window output read"),
                 "windowed cache_len={cache_len} window_start={window_start}"
+            );
+
+            let sparse_window_start = cache_len.saturating_sub(65) / 4 * 4;
+            let mut sparse_blocks = vec![0u8; CAPACITY.div_ceil(4)];
+            let mut sparse_tiles = vec![0u8; CAPACITY.div_ceil(64)];
+            for block in sparse_window_start / 4..cache_len.div_ceil(4) {
+                sparse_blocks[block] = 1;
+                sparse_tiles[(block * 4) / 64] = 1;
+            }
+            let sparse_blocks =
+                DeviceBuffer::from_host(&sparse_blocks).expect("sparse window blocks");
+            let sparse_tiles = DeviceBuffer::from_host(&sparse_tiles).expect("sparse window tiles");
+            let mut paged_sparse_window =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("paged sparse window output");
+            workspace
+                .attention_paged_sparse_offsets_into_on_stream(
+                    &pool,
+                    &page_table,
+                    cache_len,
+                    &sparse_blocks,
+                    &sparse_tiles,
+                    cache_len - sparse_window_start,
+                    &query,
+                    0,
+                    paged_sparse_window.output(),
+                    0,
+                    &stream,
+                )
+                .expect("paged sparse window attention");
+            let mut paged_aligned_window =
+                DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("paged aligned window output");
+            workspace
+                .attention_paged_window_offsets_into_on_stream(
+                    &pool,
+                    &page_table,
+                    cache_len,
+                    &query,
+                    0,
+                    paged_aligned_window.output(),
+                    0,
+                    sparse_window_start,
+                    &stream,
+                )
+                .expect("paged aligned window attention");
+            assert_eq!(
+                paged_sparse_window
+                    .copy_to_host(&stream)
+                    .expect("paged sparse window output read"),
+                paged_aligned_window
+                    .copy_to_host(&stream)
+                    .expect("paged aligned window output read"),
+                "sparse window cache_len={cache_len} window_start={sparse_window_start}"
             );
         }
 

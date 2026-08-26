@@ -17,6 +17,11 @@ pub struct Sm12xPage {
 }
 
 impl Sm12xPage {
+    #[cfg(test)]
+    pub(crate) fn from_slot(slot: u32) -> Self {
+        Self { slot }
+    }
+
     /// Returns the backend pool slot used by this page bundle.
     pub fn slot(self) -> usize {
         self.slot as usize

@@ -68,7 +68,7 @@
         },
         {
           "id": "eider-qwen3.8-flash-next",
-          "name": "Qwen3.8 Flash Next NVFP4 with paged BF16 PLE",
+          "name": "Qwen3.8 Flash Next NVFP4 with native QSA and paged BF16 PLE",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -79,7 +79,7 @@
             "xhigh": "xhigh"
           },
           "input": ["text"],
-          "contextWindow": 2048,
+          "contextWindow": 262144,
           "maxTokens": 1024,
           "cost": {
             "input": 0,
@@ -304,7 +304,7 @@
         },
         {
           "id": "eider-qwen3.8-flash-next",
-          "name": "Qwen3.8 Flash Next NVFP4 with paged BF16 PLE",
+          "name": "Qwen3.8 Flash Next NVFP4 with native QSA and paged BF16 PLE",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": "none",
@@ -315,7 +315,7 @@
             "xhigh": "xhigh"
           },
           "input": ["text"],
-          "contextWindow": 2048,
+          "contextWindow": 262144,
           "maxTokens": 1024,
           "cost": {
             "input": 0,

@@ -11,7 +11,7 @@ exec cargo run --release \
   -- \
   "$model" \
   --offline \
-  --max-context-tokens 2048 \
+  --max-context-tokens 262144 \
   --prefill-token-capacity 64 \
   --max-active-sequences 1 \
   --decode-capacity 1 \

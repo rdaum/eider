@@ -208,6 +208,17 @@ impl Qwen38PleWorkspace {
         })
     }
 
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.embeddings.device_bytes()
+            + self.key.device_bytes()
+            + self.value.device_bytes()
+            + self.key_normed.device_bytes()
+            + self.query_normed.device_bytes()
+            + self.gated.device_bytes()
+            + self.conv_normed.device_bytes()
+            + self.output.device_bytes()
+    }
+
     fn require(&self, weights: &Qwen38PleWeights, tokens: usize) -> Result<()> {
         if tokens == 0
             || tokens > self.token_capacity

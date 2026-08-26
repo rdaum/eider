@@ -4,6 +4,7 @@ mod config;
 mod hyperconnection;
 mod model;
 mod ple;
+mod qsa;
 mod transform;
 
 pub use config::Qwen38FlashNextConfig;
@@ -11,9 +12,6 @@ pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWor
 pub use model::{Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38NextToken};
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};
-
-/// Largest context for which dense attention matches the released QSA selection budget.
-pub const DENSE_QSA_REFERENCE_MAX_CONTEXT: usize = 2_048;
 
 #[cfg(test)]
 mod tests {
@@ -25,6 +23,9 @@ mod tests {
     use crate::qwen3::qwen36::{
         Qwen36LinearAttentionState, Qwen36LinearAttentionWorkspace, Qwen36MoeWeights,
         load_hybrid_linear_attention,
+    };
+    use crate::runtime::qwen38_flash_next_sequence::{
+        Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
     };
 
     #[test]
@@ -83,19 +84,23 @@ mod tests {
     }
 
     #[test]
-    fn released_checkpoint_runs_one_reference_token() {
+    fn released_checkpoint_runs_one_native_qsa_token() {
         let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_FULL_MODEL_DIR") else {
             return;
         };
         let artifact_dir =
             std::env::temp_dir().join(format!("eider-qwen38-full-{}", std::process::id()));
         let mut model = Qwen38FlashNextModel::open(&model_dir, artifact_dir).expect("full model");
-        let mut state = model.new_decode_state(16).expect("decode state");
-        let token = model
-            .decode_token(&mut state, model.config().eos_token_id)
-            .expect("one reference token");
+        let mut cache =
+            new_qwen38_flash_next_sequence_cache(&model, 1, 16).expect("sequence cache");
+        let mut sequence =
+            Qwen38FlashNextSequence::admit(&model, &mut cache, 16).expect("sequence");
+        let eos = model.config().eos_token_id;
+        let token = sequence
+            .decode_token(&mut model, &mut cache, eos)
+            .expect("one native QSA token");
         assert!((token.id as usize) < model.config().vocab);
         assert!(token.value.is_finite());
-        assert_eq!(state.position(), 1);
+        assert_eq!(sequence.position(), 1);
     }
 }

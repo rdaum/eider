@@ -190,6 +190,14 @@ impl Qwen38HyperConnectionWorkspace {
         &self.mixed
     }
 
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.normed.device_bytes()
+            + self.lowrank.device_bytes()
+            + self.gate_logits.device_bytes()
+            + self.inject_logits.device_bytes()
+            + self.mixed.device_bytes()
+    }
+
     fn require(&self, weights: &Qwen38HyperConnectionWeights, tokens: usize) -> Result<()> {
         if tokens == 0
             || tokens > self.token_capacity

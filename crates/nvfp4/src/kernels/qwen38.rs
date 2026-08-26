@@ -1,8 +1,262 @@
 //! Qwen3.8 Flash Next hyperconnection elementwise kernels.
 
+use crate::SM12X_KV_PAGE_TOKENS;
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+use std::mem::size_of;
+
+/// Stable-slot BF16 storage for the raw QSA index key emitted for each token.
+pub struct Qwen38QsaIndexPool {
+    values: DeviceBuffer<u16>,
+    page_slots: usize,
+    head_dim: usize,
+}
+
+/// Reusable GPU workspace for QSA scoring and exact micro-block selection.
+pub struct Qwen38QsaSelectionWorkspace {
+    query: DeviceBuffer<f32>,
+    scores: DeviceBuffer<f32>,
+    selected_blocks: DeviceBuffer<u8>,
+    selected_tiles: DeviceBuffer<u8>,
+    max_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    compress_ratio: usize,
+    budget: usize,
+}
+
+/// Sparse masks and effective token count produced for one QSA query.
+pub struct Qwen38QsaSelection<'a> {
+    /// One byte per four-token QSA micro-block.
+    pub selected_blocks: &'a DeviceBuffer<u8>,
+    /// One byte per 64-token compact-attention tile.
+    pub selected_tiles: &'a DeviceBuffer<u8>,
+    /// Number of visible tokens selected by QSA, including the incomplete tail.
+    pub selected_tokens: usize,
+}
+
+impl Qwen38QsaIndexPool {
+    /// Preallocates raw index-key pages using the compact KV pool's slot geometry.
+    pub fn new(page_slots: usize, head_dim: usize) -> Result<Self> {
+        if page_slots == 0 || head_dim == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA index-key pool",
+                expected: "positive page slots and head dimension".to_string(),
+                actual: format!("page_slots={page_slots} head_dim={head_dim}"),
+            });
+        }
+        let values = page_slots
+            .checked_mul(SM12X_KV_PAGE_TOKENS)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 QSA index-key pool",
+                expected: "pool value count without overflow".to_string(),
+                actual: format!("page_slots={page_slots} head_dim={head_dim}"),
+            })?;
+        Ok(Self {
+            values: DeviceBuffer::uninitialized(values)?,
+            page_slots,
+            head_dim,
+        })
+    }
+
+    /// Returns the bytes occupied by one physical page slot.
+    pub fn page_bytes(&self) -> usize {
+        SM12X_KV_PAGE_TOKENS * self.head_dim * size_of::<u16>()
+    }
+
+    /// Returns total bytes in the preallocated pool.
+    pub fn device_bytes(&self) -> usize {
+        self.values.device_bytes()
+    }
+
+    /// Copies one physical page slot on the explicit CUDA stream.
+    pub fn copy_page_on_stream(
+        &mut self,
+        source_slot: usize,
+        destination_slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if source_slot >= self.page_slots || destination_slot >= self.page_slots {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA index-key page copy",
+                expected: format!("slots below {}", self.page_slots),
+                actual: format!("source={source_slot} destination={destination_slot}"),
+            });
+        }
+        let bytes = self.page_bytes();
+        let source_offset = source_slot * bytes;
+        let destination_offset = destination_slot * bytes;
+        unsafe {
+            check_cuda(
+                "cudaMemcpyAsync(D2D QSA index-key page)",
+                ffi::cudaMemcpyAsync(
+                    self.values.ptr.cast::<u8>().add(destination_offset).cast(),
+                    self.values.ptr.cast::<u8>().add(source_offset).cast(),
+                    bytes,
+                    ffi::CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+}
+
+impl Qwen38QsaSelectionWorkspace {
+    /// Allocates selection scratch for the released QSA geometry.
+    pub fn new(
+        max_tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        budget: usize,
+    ) -> Result<Self> {
+        if max_tokens == 0
+            || heads == 0
+            || head_dim == 0
+            || compress_ratio != 4
+            || budget == 0
+            || !budget.is_multiple_of(compress_ratio)
+            || [max_tokens, heads, head_dim, budget]
+                .into_iter()
+                .any(|value| value > u32::MAX as usize)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA selection workspace",
+                expected: "positive u32 dimensions, four-token compression, and divisible budget"
+                    .to_string(),
+                actual: format!(
+                    "max_tokens={max_tokens} heads={heads} head_dim={head_dim} compress={compress_ratio} budget={budget}"
+                ),
+            });
+        }
+        let blocks = max_tokens.div_ceil(compress_ratio);
+        let tiles = max_tokens.div_ceil(64);
+        Ok(Self {
+            query: DeviceBuffer::zeroed(heads * head_dim)?,
+            scores: DeviceBuffer::zeroed(blocks)?,
+            selected_blocks: DeviceBuffer::zeroed(blocks)?,
+            selected_tiles: DeviceBuffer::zeroed(tiles)?,
+            max_tokens,
+            heads,
+            head_dim,
+            compress_ratio,
+            budget,
+        })
+    }
+
+    /// Appends the raw index key and selects the visible QSA micro-blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_and_select_on_stream<'a>(
+        &'a mut self,
+        projection: &DeviceBuffer<f32>,
+        q_norm: &DeviceBuffer<f32>,
+        k_norm: &DeviceBuffer<f32>,
+        pool: &mut Qwen38QsaIndexPool,
+        page_table: &DeviceBuffer<u32>,
+        slot: usize,
+        page_offset: usize,
+        cache_len: usize,
+        rotary_dim: usize,
+        eps: f32,
+        theta: f32,
+        stream: &CudaStream,
+    ) -> Result<Qwen38QsaSelection<'a>> {
+        let projection_values = (self.heads + 1) * self.head_dim;
+        let logical_pages = cache_len.div_ceil(SM12X_KV_PAGE_TOKENS);
+        if projection.len() != projection_values
+            || q_norm.len() != self.head_dim
+            || k_norm.len() != self.head_dim
+            || pool.head_dim != self.head_dim
+            || slot >= pool.page_slots
+            || page_offset >= SM12X_KV_PAGE_TOKENS
+            || cache_len == 0
+            || cache_len > self.max_tokens
+            || page_table.len() < logical_pages
+            || rotary_dim == 0
+            || rotary_dim > self.head_dim
+            || !rotary_dim.is_multiple_of(2)
+            || eps <= 0.0
+            || !theta.is_finite()
+            || theta <= 0.0
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA selection",
+                expected: format!(
+                    "projection={projection_values}, norms={}, valid pool/page/cache/RoPE geometry",
+                    self.head_dim
+                ),
+                actual: format!(
+                    "projection={} q_norm={} k_norm={} slot={slot}/{} page_offset={page_offset} cache_len={cache_len}/{} pages={} needed={logical_pages} rotary_dim={rotary_dim} eps={eps} theta={theta}",
+                    projection.len(),
+                    q_norm.len(),
+                    k_norm.len(),
+                    pool.page_slots,
+                    self.max_tokens,
+                    page_table.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_qwen38_qsa_prepare_and_select_on_stream",
+                ffi::infer_qwen38_qsa_prepare_and_select_on_stream(
+                    projection.ptr,
+                    q_norm.ptr,
+                    k_norm.ptr,
+                    pool.values.ptr,
+                    page_table.as_const_ptr().cast(),
+                    self.query.ptr,
+                    self.scores.ptr,
+                    self.selected_blocks.ptr,
+                    self.selected_tiles.ptr,
+                    slot as u32,
+                    page_offset as u32,
+                    cache_len as u32,
+                    self.max_tokens as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    pool.page_slots as u32,
+                    self.heads as u32,
+                    self.head_dim as u32,
+                    rotary_dim as u32,
+                    self.compress_ratio as u32,
+                    self.budget as u32,
+                    eps,
+                    theta,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        let complete_blocks = cache_len / self.compress_ratio;
+        let tail = cache_len % self.compress_ratio;
+        let selected_tokens =
+            complete_blocks.min(self.budget / self.compress_ratio) * self.compress_ratio + tail;
+        Ok(Qwen38QsaSelection {
+            selected_blocks: &self.selected_blocks,
+            selected_tiles: &self.selected_tiles,
+            selected_tokens,
+        })
+    }
+
+    /// Returns the normalized, RoPE'd index query for focused validation.
+    pub fn query(&self) -> &DeviceBuffer<f32> {
+        &self.query
+    }
+
+    /// Returns block scores for focused validation.
+    pub fn scores(&self) -> &DeviceBuffer<f32> {
+        &self.scores
+    }
+
+    /// Returns the exact bytes owned by selection scratch.
+    pub fn device_bytes(&self) -> usize {
+        self.query.device_bytes()
+            + self.scores.device_bytes()
+            + self.selected_blocks.device_bytes()
+            + self.selected_tiles.device_bytes()
+    }
+}
 
 /// Applies per-branch Gemma-style RMSNorm to Qwen hyperconnection streams.
 #[allow(clippy::too_many_arguments)]
@@ -374,12 +628,199 @@ fn validate_dims(tokens: usize, hidden: usize, hc_count: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        qwen38_hc_collapse_f32_into_on_stream, qwen38_hc_combine_f32_into_on_stream,
-        qwen38_hc_norm_f32_into_on_stream, qwen38_hc_silu_scale_f32_in_place_on_stream,
-        qwen38_ple_conv_update_f32_into_on_stream, qwen38_ple_gate_value_f32_into_on_stream,
+        Qwen38QsaIndexPool, Qwen38QsaSelectionWorkspace, qwen38_hc_collapse_f32_into_on_stream,
+        qwen38_hc_combine_f32_into_on_stream, qwen38_hc_norm_f32_into_on_stream,
+        qwen38_hc_silu_scale_f32_in_place_on_stream, qwen38_ple_conv_update_f32_into_on_stream,
+        qwen38_ple_gate_value_f32_into_on_stream,
     };
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{CudaStream, DeviceBuffer};
+
+    #[test]
+    fn qsa_paged_selector_matches_released_micro_block_formula() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 128;
+        const ROTARY_DIM: usize = 64;
+        const COMPRESS: usize = 4;
+        const BUDGET: usize = 2_048;
+        const CACHE_LEN: usize = 2_059;
+        const MAX_TOKENS: usize = 2_176;
+        const EPS: f32 = 1e-6;
+        const THETA: f32 = 10_000_000.0;
+
+        let logical_pages = MAX_TOKENS.div_ceil(crate::SM12X_KV_PAGE_TOKENS);
+        let slots = (0..logical_pages)
+            .map(|page| ((page * 7) % logical_pages) as u32)
+            .collect::<Vec<_>>();
+        let page_table = DeviceBuffer::from_host(&slots).expect("page table");
+        let mut pool = Qwen38QsaIndexPool::new(logical_pages, HEAD_DIM).expect("index pool");
+        let mut physical = vec![0u16; logical_pages * crate::SM12X_KV_PAGE_TOKENS * HEAD_DIM];
+        let mut logical = vec![0u16; CACHE_LEN * HEAD_DIM];
+        for token in 0..CACHE_LEN {
+            for dim in 0..HEAD_DIM {
+                let value = (((token * 17 + dim * 13) % 257) as f32 - 128.0) / 96.0;
+                let encoded = f32_to_bf16(value);
+                logical[token * HEAD_DIM + dim] = encoded;
+                let slot = slots[token / crate::SM12X_KV_PAGE_TOKENS] as usize;
+                let page_offset = token % crate::SM12X_KV_PAGE_TOKENS;
+                physical[(slot * crate::SM12X_KV_PAGE_TOKENS + page_offset) * HEAD_DIM + dim] =
+                    encoded;
+            }
+        }
+        pool.values
+            .copy_from_host(&physical)
+            .expect("populate index pool");
+
+        let projection_host = (0..(HEADS + 1) * HEAD_DIM)
+            .map(|index| ((index * 29 % 251) as f32 - 125.0) / 80.0)
+            .collect::<Vec<_>>();
+        for dim in 0..HEAD_DIM {
+            logical[(CACHE_LEN - 1) * HEAD_DIM + dim] =
+                f32_to_bf16(projection_host[HEADS * HEAD_DIM + dim]);
+        }
+        let projection = DeviceBuffer::from_host(&projection_host).expect("projection");
+        let q_norm_host = (0..HEAD_DIM)
+            .map(|dim| 0.75 + dim as f32 / 512.0)
+            .collect::<Vec<_>>();
+        let k_norm_host = (0..HEAD_DIM)
+            .map(|dim| 0.85 + dim as f32 / 640.0)
+            .collect::<Vec<_>>();
+        let q_norm = DeviceBuffer::from_host(&q_norm_host).expect("q norm");
+        let k_norm = DeviceBuffer::from_host(&k_norm_host).expect("k norm");
+        let mut workspace =
+            Qwen38QsaSelectionWorkspace::new(MAX_TOKENS, HEADS, HEAD_DIM, COMPRESS, BUDGET)
+                .expect("selector");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let last_page = CACHE_LEN - 1;
+        let last_slot = slots[last_page / crate::SM12X_KV_PAGE_TOKENS] as usize;
+        let selected_tokens = workspace
+            .prepare_and_select_on_stream(
+                &projection,
+                &q_norm,
+                &k_norm,
+                &mut pool,
+                &page_table,
+                last_slot,
+                last_page % crate::SM12X_KV_PAGE_TOKENS,
+                CACHE_LEN,
+                ROTARY_DIM,
+                EPS,
+                THETA,
+                &stream,
+            )
+            .expect("select")
+            .selected_tokens;
+        assert_eq!(selected_tokens, BUDGET + CACHE_LEN % COMPRESS);
+
+        let query_actual = workspace
+            .query()
+            .copy_to_host(&stream)
+            .expect("query readback");
+        let scores_actual = workspace
+            .scores()
+            .copy_to_host(&stream)
+            .expect("score readback");
+        let blocks_actual = workspace
+            .selected_blocks
+            .copy_to_host(&stream)
+            .expect("block mask readback");
+        let tiles_actual = workspace
+            .selected_tiles
+            .copy_to_host(&stream)
+            .expect("tile mask readback");
+
+        let mut query_expected = vec![0.0; HEADS * HEAD_DIM];
+        for head in 0..HEADS {
+            let source = &projection_host[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+            let normalized = rms_norm(source, &q_norm_host, EPS);
+            query_expected[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&rope(
+                &normalized,
+                ROTARY_DIM,
+                CACHE_LEN - 1,
+                THETA,
+            ));
+        }
+        assert_close(&query_actual, &query_expected, 5e-4);
+
+        let complete_blocks = CACHE_LEN / COMPRESS;
+        let mut scores_expected = vec![0.0f32; complete_blocks];
+        for block in 0..complete_blocks {
+            let mut pooled = vec![0.0; HEAD_DIM];
+            for dim in 0..HEAD_DIM {
+                let mean = (0..COMPRESS)
+                    .map(|row| bf16_to_f32(logical[(block * COMPRESS + row) * HEAD_DIM + dim]))
+                    .sum::<f32>()
+                    / COMPRESS as f32;
+                pooled[dim] = bf16_to_f32(f32_to_bf16(mean));
+            }
+            let key = rope(
+                &rms_norm(&pooled, &k_norm_host, EPS),
+                ROTARY_DIM,
+                block * COMPRESS,
+                THETA,
+            );
+            scores_expected[block] = (0..HEADS)
+                .map(|head| {
+                    query_expected[head * HEAD_DIM..(head + 1) * HEAD_DIM]
+                        .iter()
+                        .zip(&key)
+                        .map(|(q, k)| q * k)
+                        .sum::<f32>()
+                        .max(0.0)
+                })
+                .sum::<f32>()
+                / (HEAD_DIM as f32).sqrt();
+        }
+        assert_close(&scores_actual[..complete_blocks], &scores_expected, 2e-3);
+
+        let mut ranking = (0..complete_blocks).collect::<Vec<_>>();
+        ranking.sort_by(|&left, &right| {
+            scores_expected[right]
+                .total_cmp(&scores_expected[left])
+                .then_with(|| left.cmp(&right))
+        });
+        let mut blocks_expected = vec![0u8; MAX_TOKENS.div_ceil(COMPRESS)];
+        for &block in &ranking[..BUDGET / COMPRESS] {
+            blocks_expected[block] = 1;
+        }
+        if !CACHE_LEN.is_multiple_of(COMPRESS) {
+            blocks_expected[complete_blocks] = 1;
+        }
+        assert_eq!(&*blocks_actual, &blocks_expected);
+        let mut tiles_expected = vec![0u8; MAX_TOKENS.div_ceil(64)];
+        for (block, &selected) in blocks_expected.iter().enumerate() {
+            if selected != 0 {
+                tiles_expected[block / 16] = 1;
+            }
+        }
+        assert_eq!(&*tiles_actual, &tiles_expected);
+    }
+
+    fn rms_norm(values: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+        let inverse = (values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32
+            + eps)
+            .sqrt()
+            .recip();
+        values
+            .iter()
+            .zip(weight)
+            .map(|(value, weight)| value * inverse * weight)
+            .collect()
+    }
+
+    fn rope(values: &[f32], rotary_dim: usize, position: usize, theta: f32) -> Vec<f32> {
+        let mut output = values.to_vec();
+        let half = rotary_dim / 2;
+        for pair in 0..half {
+            let angle = position as f32 * theta.powf(-2.0 * pair as f32 / rotary_dim as f32);
+            let (sine, cosine) = angle.sin_cos();
+            let first = values[pair];
+            let second = values[pair + half];
+            output[pair] = first * cosine - second * sine;
+            output[pair + half] = second * cosine + first * sine;
+        }
+        output
+    }
 
     #[test]
     fn hyperconnection_elementwise_kernels_match_cpu_formula() {

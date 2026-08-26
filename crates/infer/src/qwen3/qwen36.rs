@@ -22,9 +22,10 @@ use crate::nvfp4::{
     ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear,
     MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
     SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm121W4A16GateUp, Sm121W4A16HostWeight,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
+    Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
@@ -882,6 +883,115 @@ impl Qwen36FullAttentionWeights {
         })
     }
 
+    /// Runs one token against a page-table cache restricted by a sparse token mask.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_one_token_paged_sparse<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36FullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        selected_blocks: &DeviceBuffer<u8>,
+        selected_tiles: &DeviceBuffer<u8>,
+        selected_tokens: usize,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        position: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<Qwen36FullAttentionStep<'a>> {
+        let capacity = page_table
+            .len()
+            .checked_mul(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 paged sparse attention capacity",
+                expected: "page table capacity without overflow".to_string(),
+                actual: page_table.len().to_string(),
+            })?;
+        if position >= capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.6 paged sparse attention position",
+                expected: format!("position < {capacity}"),
+                actual: position.to_string(),
+            });
+        }
+        self.run_qkv_projections(workspace, hidden, stream)?;
+        qwen36_full_attn_prep_f32_into_on_stream(
+            &workspace.q_proj_output,
+            &workspace.k,
+            &self.q_norm_weight,
+            &self.k_norm_weight,
+            workspace.q_normed.output(),
+            workspace.gate.output(),
+            workspace.k_normed.output(),
+            manifest.q_heads,
+            manifest.kv_heads,
+            manifest.head_dim,
+            manifest.rms_eps,
+            stream,
+        )?;
+        apply_rope(
+            manifest,
+            manifest.q_heads,
+            &workspace.q_normed,
+            &mut workspace.q_rope,
+            position,
+            stream,
+        )?;
+        apply_rope(
+            manifest,
+            manifest.kv_heads,
+            &workspace.k_normed,
+            &mut workspace.k_rope,
+            position,
+            stream,
+        )?;
+        pool.append_at_offsets_on_stream(
+            slot,
+            page_offset,
+            &workspace.k_rope,
+            0,
+            &workspace.v,
+            0,
+            stream,
+        )?;
+        workspace
+            .compact_attention
+            .attention_paged_sparse_offsets_into_on_stream(
+                pool,
+                page_table,
+                position + 1,
+                selected_blocks,
+                selected_tiles,
+                selected_tokens,
+                &workspace.q_rope,
+                0,
+                workspace.attn.output(),
+                0,
+                stream,
+            )?;
+        sigmoid_mul_f32_into_on_stream(
+            &workspace.gate,
+            &workspace.attn,
+            workspace.gated_attn.output(),
+            stream,
+        )?;
+        self.o.run_into(
+            &workspace.gated_attn,
+            &mut workspace.output,
+            &mut workspace.fp8_dynamic_input,
+            &mut workspace.fp8_dynamic_input_scale,
+            stream,
+        )?;
+        Ok(Qwen36FullAttentionStep {
+            q_proj_output: &workspace.q_proj_output,
+            q_rope: &workspace.q_rope,
+            attn: &workspace.attn,
+            gated_attn: &workspace.gated_attn,
+            output: &workspace.output,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_one_token_indexed<'a>(
         &'a self,
@@ -1541,6 +1651,25 @@ impl Qwen36LinearAttentionWorkspace {
             output: DeviceBuffer::zeroed(manifest.hidden)?,
         })
     }
+
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.fp8_dynamic_input.device_bytes()
+            + self.fp8_dynamic_input_scale.device_bytes()
+            + self.fp8_value_input.device_bytes()
+            + self.fp8_value_input_scale.device_bytes()
+            + self.qkv_output.device_bytes()
+            + self.z_output.device_bytes()
+            + self.alpha.device_bytes()
+            + self.beta_input.device_bytes()
+            + self.gate.device_bytes()
+            + self.beta.device_bytes()
+            + self.q.device_bytes()
+            + self.k.device_bytes()
+            + self.v.device_bytes()
+            + self.gdn_output.device_bytes()
+            + self.normed.device_bytes()
+            + self.output.device_bytes()
+    }
 }
 
 impl Qwen36LinearAttentionState {
@@ -1587,7 +1716,7 @@ impl Qwen36LinearAttentionState {
         )
     }
 
-    fn device_bytes(&self) -> usize {
+    pub(crate) fn device_bytes(&self) -> usize {
         self.conv_state.device_bytes() + self.recurrent_state.device_bytes()
     }
 }
@@ -2999,6 +3128,18 @@ impl Sm12xGateUpWorkspace {
             d: DeviceBuffer::from_host(&d_ptrs)?,
             groups,
         })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.b_tiles.device_bytes()
+            + self.b_scales.device_bytes()
+            + self
+                ._outputs
+                .iter()
+                .map(F32Matrix::device_bytes)
+                .sum::<usize>()
+            + self.c.device_bytes()
+            + self.d.device_bytes()
     }
 }
 
@@ -5320,6 +5461,56 @@ impl Qwen36MoeWorkspace {
         Self::new_for_paths(manifest, enable_grouped, enable_sm12x_down)
     }
 
+    pub(crate) fn device_bytes(&self) -> usize {
+        let grouped_down_bytes = self.grouped_down.as_ref().map_or(0, |workspace| {
+            workspace.gemv.device_bytes()
+                + workspace
+                    .inputs
+                    .iter()
+                    .map(Nvfp4Matrix::device_bytes)
+                    .sum::<usize>()
+                + workspace
+                    .input_simple_scales
+                    .iter()
+                    .map(DeviceBuffer::device_bytes)
+                    .sum::<usize>()
+                + workspace.input_values.device_bytes()
+                + workspace.input_scales.device_bytes()
+                + workspace.input_values_mut.device_bytes()
+                + workspace.input_scales_mut.device_bytes()
+        });
+        self.router_logits.device_bytes()
+            + self.route.indices.device_bytes()
+            + self.route.weights.device_bytes()
+            + self.gate_up_input.device_bytes()
+            + self.gate_up_input_simple_scales.device_bytes()
+            + self
+                .grouped_gate_up
+                .as_ref()
+                .map_or(0, GroupedGemvWorkspace::device_bytes)
+            + self.w4a16_gate_up_output.device_bytes()
+            + self.w4a16_gate_up_table.device_bytes()
+            + self.fp8_hidden_input.device_bytes()
+            + self.fp8_hidden_input_scale.device_bytes()
+            + self.fp8_down_input.device_bytes()
+            + self.fp8_down_input_scales.device_bytes()
+            + self.fp8_shared_input.device_bytes()
+            + self.fp8_shared_input_scale.device_bytes()
+            + self.sm12x_down.device_bytes()
+            + grouped_down_bytes
+            + self.fallback_gate_up_out.device_bytes()
+            + self.fallback_down_input.device_bytes()
+            + self.fallback_down_out.device_bytes()
+            + self.shared_gate_up_output.device_bytes()
+            + self.shared_activated.device_bytes()
+            + self.shared_output.device_bytes()
+            + self.shared_gate_logits.device_bytes()
+            + self.shared_gated.device_bytes()
+            + self.moe_out.device_bytes()
+            + self.ffn_out.device_bytes()
+            + self.ffn_residual.device_bytes()
+    }
+
     fn new_for_paths(
         manifest: &QwenModelManifest,
         enable_grouped: bool,
@@ -6738,7 +6929,7 @@ impl Qwen36LmHeadWorkspace {
         Ok((index[0], value[0]))
     }
 
-    fn device_bytes(&self) -> usize {
+    pub(crate) fn device_bytes(&self) -> usize {
         self.logits.device_bytes()
             + self.dynamic_input.device_bytes()
             + self.dynamic_input_scale.device_bytes()

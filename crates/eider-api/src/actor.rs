@@ -12,7 +12,7 @@ use infer::metrics::metrics as infer_metrics;
 use infer::muse_glimmer::MuseGlimmerModel;
 use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
-use infer::qwen38_flash_next::{DENSE_QSA_REFERENCE_MAX_CONTEXT, Qwen38FlashNextModel};
+use infer::qwen38_flash_next::Qwen38FlashNextModel;
 use infer::runtime::bitnet_serving::{
     BitNetAdmissionProgress, BitNetCancelOutcome, BitNetChatService, BitNetRequestId,
 };
@@ -529,8 +529,8 @@ fn actor_main(
             info!(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
-                attention_backend = "dense-qsa-reference",
-                max_context_tokens = DENSE_QSA_REFERENCE_MAX_CONTEXT,
+                attention_backend = "native-qsa",
+                max_context_tokens = scheduler.max_context_tokens,
                 "loading Qwen3.8 Flash Next model"
             );
             let model = match Qwen38FlashNextModel::open(&model_dir, &artifact_dir) {
@@ -540,7 +540,7 @@ fn actor_main(
                     return;
                 }
             };
-            let reference_scheduler = SchedulerConfig {
+            let qsa_scheduler = SchedulerConfig {
                 decode_capacity: 1,
                 prefill_sequence_capacity: 1,
                 max_active_sequences: 1,
@@ -550,17 +550,16 @@ fn actor_main(
                 speculative_drafts: 0,
                 ..scheduler
             };
-            let service =
-                match Qwen38FlashNextChatService::new(model, &template, reference_scheduler) {
-                    Ok(service) => service,
-                    Err(error) => {
-                        let _ = ready.send(Err(error.to_string()));
-                        return;
-                    }
-                };
+            let service = match Qwen38FlashNextChatService::new(model, &template, qsa_scheduler) {
+                Ok(service) => service,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
             info!(
-                attention_backend = "dense-qsa-reference",
-                max_context_tokens = reference_scheduler.max_context_tokens,
+                attention_backend = "native-qsa",
+                max_context_tokens = qsa_scheduler.max_context_tokens,
                 "loaded Qwen3.8 Flash Next text model"
             );
             let mut service = Qwen38FlashNextActorService::new(service);

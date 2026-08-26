@@ -1,3 +1,4 @@
+use super::qsa::{Qwen38QsaWeights, Qwen38QsaWorkspace};
 use super::{
     Qwen38FlashNextConfig, Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace,
     Qwen38PagedPle, Qwen38PleState, Qwen38PleTokenWindow, Qwen38PleWeights, Qwen38PleWorkspace,
@@ -8,26 +9,39 @@ use crate::nvfp4::{
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
-    Qwen36Embedding, Qwen36FullAttentionState, Qwen36FullAttentionWeights,
-    Qwen36FullAttentionWorkspace, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
+    Qwen36Embedding, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
     Qwen36LinearAttentionWorkspace, Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36MoeWeights,
     Qwen36MoeWorkspace, load_hybrid_full_attention, load_hybrid_linear_attention,
 };
+use crate::runtime::qwen38_flash_next_sequence::{
+    Qwen38FlashNextSequenceCache, qwen38_flash_next_cache_error,
+};
+use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
+use seqcache::{AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
 
 enum Qwen38AttentionWeights {
     Linear(Qwen36LinearAttentionWeights),
-    DenseQsaOracle(Qwen36FullAttentionWeights),
+    Qsa(Qwen38QsaWeights),
 }
 
 enum Qwen38AttentionWorkspace {
     Linear(Qwen36LinearAttentionWorkspace),
-    DenseQsaOracle(Qwen36FullAttentionWorkspace),
+    Qsa(Qwen38QsaWorkspace),
+}
+
+impl Qwen38AttentionWorkspace {
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Linear(workspace) => workspace.device_bytes(),
+            Self::Qsa(workspace) => workspace.device_bytes(),
+        }
+    }
 }
 
 enum Qwen38AttentionState {
     Linear(Qwen36LinearAttentionState),
-    DenseQsaOracle(Qwen36FullAttentionState),
+    Qsa,
 }
 
 struct Qwen38Layer {
@@ -75,7 +89,7 @@ pub struct Qwen38FlashNextDecodeState {
     max_tokens: usize,
 }
 
-/// Greedy next-token result from the reference decode path.
+/// Greedy next-token result from the native decode path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen38NextToken {
     /// Argmax token identifier.
@@ -120,9 +134,16 @@ impl Qwen38FlashNextModel {
                 QwenLayerKind::LinearAttention => Qwen38AttentionWeights::Linear(
                     load_hybrid_linear_attention(&checkpoint, &manifest, &artifact_dir, layer)?,
                 ),
-                QwenLayerKind::FullAttention => Qwen38AttentionWeights::DenseQsaOracle(
-                    load_hybrid_full_attention(&checkpoint, &manifest, &artifact_dir, layer)?,
-                ),
+                QwenLayerKind::FullAttention => {
+                    let attention =
+                        load_hybrid_full_attention(&checkpoint, &manifest, &artifact_dir, layer)?;
+                    Qwen38AttentionWeights::Qsa(Qwen38QsaWeights::load(
+                        &checkpoint,
+                        &config,
+                        layer,
+                        attention,
+                    )?)
+                }
             };
             let moe = Qwen36MoeWeights::load_checkpoint_layout(
                 &checkpoint,
@@ -166,7 +187,7 @@ impl Qwen38FlashNextModel {
         })
     }
 
-    /// Allocates state for one sequence. Full-attention layers use dense QSA-oracle caches.
+    /// Allocates private recurrent state and one-token workspaces for a sequence.
     pub fn new_decode_state(&self, max_tokens: usize) -> Result<Qwen38FlashNextDecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_position_embeddings {
             return Err(Error::Shape {
@@ -197,13 +218,11 @@ impl Qwen38FlashNextModel {
                     rollback_linear_states
                         .push(Some(Qwen36LinearAttentionState::new(linear, weights)?));
                 }
-                Qwen38AttentionWeights::DenseQsaOracle(weights) => {
-                    attention_workspaces.push(Qwen38AttentionWorkspace::DenseQsaOracle(
-                        Qwen36FullAttentionWorkspace::new(&self.manifest, weights, max_tokens)?,
+                Qwen38AttentionWeights::Qsa(weights) => {
+                    attention_workspaces.push(Qwen38AttentionWorkspace::Qsa(
+                        Qwen38QsaWorkspace::new(&self.config, &self.manifest, weights, max_tokens)?,
                     ));
-                    attention_states.push(Qwen38AttentionState::DenseQsaOracle(
-                        Qwen36FullAttentionState::new(&self.manifest, max_tokens)?,
-                    ));
+                    attention_states.push(Qwen38AttentionState::Qsa);
                     rollback_linear_states.push(None);
                 }
             }
@@ -239,6 +258,9 @@ impl Qwen38FlashNextModel {
     pub fn decode_token(
         &mut self,
         state: &mut Qwen38FlashNextDecodeState,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        cache_id: SequenceId,
+        page_table: &mut Sm12xPageTable,
         token: u32,
     ) -> Result<Qwen38NextToken> {
         if state.position >= state.max_tokens {
@@ -248,22 +270,81 @@ impl Qwen38FlashNextModel {
                 actual: state.position.to_string(),
             });
         }
-        state.begin_append()?;
+        let reservation = cache
+            .reserve_append(
+                cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        if let Err(error) = state.begin_append() {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
         if let Err(error) = self
             .ple_pager
             .begin_read_tokens(&mut state.ple_window, &[token])
         {
             state.abort_append()?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
             return Err(error);
         }
-        let result = self.decode_token_inner(state, token);
+        let result = self.decode_token_inner(state, cache, &reservation, page_table, token);
         match result {
             Ok(next) => {
+                if let Err(error) = cache.commit_append(
+                    reservation.clone(),
+                    1,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                ) {
+                    let rollback = state.abort_append().err();
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: &state.stream,
+                                page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                    return Err(rollback.unwrap_or_else(|| qwen38_flash_next_cache_error(error)));
+                }
                 state.commit_append()?;
                 Ok(next)
             }
             Err(error) => {
                 state.abort_append()?;
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &state.stream,
+                            page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
                 Err(error)
             }
         }
@@ -272,6 +353,9 @@ impl Qwen38FlashNextModel {
     fn decode_token_inner(
         &mut self,
         state: &mut Qwen38FlashNextDecodeState,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        reservation: &AppendReservation,
+        page_table: &Sm12xPageTable,
         token: u32,
     ) -> Result<Qwen38NextToken> {
         state.token_id.copy_from_host(&[token])?;
@@ -337,21 +421,37 @@ impl Qwen38FlashNextModel {
                         .output
                 }
                 (
-                    Qwen38AttentionWeights::DenseQsaOracle(weights),
-                    Qwen38AttentionWorkspace::DenseQsaOracle(workspace),
-                    Qwen38AttentionState::DenseQsaOracle(sequence),
-                ) => {
-                    weights
-                        .run_one_token(
+                    Qwen38AttentionWeights::Qsa(weights),
+                    Qwen38AttentionWorkspace::Qsa(workspace),
+                    Qwen38AttentionState::Qsa,
+                ) => cache
+                    .with_append_pages(reservation, |backend, pages| {
+                        let page = pages.iter().next().ok_or_else(|| Error::Format {
+                            label: "Qwen3.8 QSA append",
+                            detail: "one-token reservation contains no physical page".to_string(),
+                        })?;
+                        if pages.iter().count() != 1 || page.segment().rows() != 1 {
+                            return Err(Error::Format {
+                                label: "Qwen3.8 QSA append",
+                                detail: "decode reservation does not cover exactly one row"
+                                    .to_string(),
+                            });
+                        }
+                        weights.run_one_token(
                             workspace,
-                            sequence,
+                            backend,
+                            page_table.device(),
+                            page.page(),
+                            page.segment().page_offset(),
+                            &self.config,
                             &self.manifest,
                             state.attention_hyper.mixed(),
+                            layer_index,
                             state.position,
                             &state.stream,
-                        )?
-                        .output
-                }
+                        )
+                    })
+                    .map_err(qwen38_flash_next_cache_error)?,
                 _ => {
                     return Err(Error::Format {
                         label: "Qwen3.8 Flash Next attention",
@@ -411,18 +511,61 @@ impl Qwen38FlashNextModel {
         &self.config
     }
 
+    pub(crate) fn manifest(&self) -> &QwenModelManifest {
+        &self.manifest
+    }
+
     /// Checkpoint retained by the loaded runtime.
     pub fn checkpoint(&self) -> &ModelOptCheckpoint {
         &self.checkpoint
     }
 
-    /// Derived-artifact root reserved for later QSA kernels and layouts.
+    /// Derived-artifact root used by converted expert weights.
     pub fn artifact_dir(&self) -> &Path {
         &self.artifact_dir
     }
 }
 
 impl Qwen38FlashNextDecodeState {
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    /// Returns the exact device bytes owned outside shared QSA pages.
+    pub fn device_bytes(&self) -> usize {
+        self.token_id.device_bytes()
+            + self.streams_a.device_bytes()
+            + self.streams_b.device_bytes()
+            + self.hidden.device_bytes()
+            + self.zero_hidden.device_bytes()
+            + self.attention_hyper.device_bytes()
+            + self.mlp_hyper.device_bytes()
+            + self.final_hyper.device_bytes()
+            + self
+                .attention_workspaces
+                .iter()
+                .map(Qwen38AttentionWorkspace::device_bytes)
+                .sum::<usize>()
+            + self
+                .attention_states
+                .iter()
+                .map(|state| match state {
+                    Qwen38AttentionState::Linear(state) => state.device_bytes(),
+                    Qwen38AttentionState::Qsa => 0,
+                })
+                .sum::<usize>()
+            + self
+                .rollback_linear_states
+                .iter()
+                .flatten()
+                .map(Qwen36LinearAttentionState::device_bytes)
+                .sum::<usize>()
+            + self.moe.device_bytes()
+            + self.ple_state.device_bytes()
+            + self.ple_workspace.device_bytes()
+            + self.lm_head.device_bytes()
+    }
+
     fn begin_append(&mut self) -> Result<()> {
         self.ple_window.begin_append()?;
         if let Err(error) = self.ple_state.begin_append(&self.stream) {
@@ -502,9 +645,16 @@ mod tests {
             QwenLayerKind::LinearAttention => Qwen38AttentionWeights::Linear(
                 load_hybrid_linear_attention(&checkpoint, &manifest, &artifact_dir, layer_index)?,
             ),
-            QwenLayerKind::FullAttention => Qwen38AttentionWeights::DenseQsaOracle(
-                load_hybrid_full_attention(&checkpoint, &manifest, &artifact_dir, layer_index)?,
-            ),
+            QwenLayerKind::FullAttention => {
+                let full =
+                    load_hybrid_full_attention(&checkpoint, &manifest, &artifact_dir, layer_index)?;
+                Qwen38AttentionWeights::Qsa(Qwen38QsaWeights::load(
+                    &checkpoint,
+                    &config,
+                    layer_index,
+                    full,
+                )?)
+            }
         };
         let moe = Qwen36MoeWeights::load_checkpoint_layout(
             &checkpoint,
@@ -573,20 +723,37 @@ mod tests {
                 sync(&stream, "linear attention")?;
                 output.copy_to_host(&stream)?.into_vec()
             }
-            Qwen38AttentionWeights::DenseQsaOracle(weights) => {
-                let mut workspace = Qwen36FullAttentionWorkspace::new(&manifest, &weights, 16)?;
-                let mut state = Qwen36FullAttentionState::new(&manifest, 16)?;
-                let output = weights
-                    .run_one_token(
-                        &mut workspace,
-                        &mut state,
-                        &manifest,
-                        attention_hc_workspace.mixed(),
-                        0,
-                        &stream,
-                    )?
-                    .output;
-                sync(&stream, "dense QSA oracle")?;
+            Qwen38AttentionWeights::Qsa(weights) => {
+                let capacity = crate::nvfp4::SM12X_KV_PAGE_TOKENS;
+                let mut workspace =
+                    Qwen38QsaWorkspace::new(&config, &manifest, &weights, capacity)?;
+                let mut backend =
+                    crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
+                        manifest
+                            .layer_kinds
+                            .iter()
+                            .map(|kind| *kind == QwenLayerKind::FullAttention),
+                        1,
+                        manifest.kv_heads,
+                        manifest.head_dim,
+                        config.indexer_head_dim,
+                    )?;
+                let page_table = DeviceBuffer::from_host(&[0u32])?;
+                let page = crate::runtime::sm12x_sequence_cache::Sm12xPage::from_slot(0);
+                let output = weights.run_one_token(
+                    &mut workspace,
+                    &mut backend,
+                    &page_table,
+                    &page,
+                    0,
+                    &config,
+                    &manifest,
+                    attention_hc_workspace.mixed(),
+                    layer_index,
+                    0,
+                    &stream,
+                )?;
+                sync(&stream, "native QSA")?;
                 output.copy_to_host(&stream)?.into_vec()
             }
         };
