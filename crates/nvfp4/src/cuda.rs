@@ -124,6 +124,132 @@ impl<T> Drop for PinnedHostBuffer<T> {
     }
 }
 
+/// Page-aligned system memory that CUDA kernels can access through host page tables.
+///
+/// This allocation is intended for coherent unified-memory systems such as GB10.
+/// It remains pageable and CPU-writable, unlike [`DeviceBuffer`], so storage I/O
+/// can populate its final kernel-visible representation directly.
+pub struct PageableHostBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    bytes: usize,
+}
+
+// The allocation has unique ownership and may move between host threads when
+// its element type may also move safely.
+unsafe impl<T: Send> Send for PageableHostBuffer<T> {}
+
+impl<T: Copy> PageableHostBuffer<T> {
+    /// Allocates a zero-filled, page-aligned system-memory region.
+    pub fn zeroed(len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::Shape {
+                label: "pageable host allocation",
+                expected: "at least one value".to_string(),
+                actual: "0 values".to_string(),
+            });
+        }
+        require_pageable_host_page_tables()?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "pageable host allocation",
+                expected: "len * element size without overflow".to_string(),
+                actual: format!("len={len} element_size={}", size_of::<T>()),
+            })?;
+        let raw = unsafe {
+            libc::mmap(
+                null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(Error::Format {
+                label: "pageable host allocation",
+                detail: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        Ok(Self {
+            ptr: raw.cast(),
+            len,
+            bytes,
+        })
+    }
+
+    /// Returns the allocation as a host-readable slice.
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Returns the allocation as a host-writable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Returns the stable address used by CUDA kernels.
+    pub(crate) fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    /// Returns the number of bytes in this allocation.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl<T> Drop for PageableHostBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = libc::munmap(self.ptr.cast(), self.bytes);
+            }
+        }
+    }
+}
+
+fn require_pageable_host_page_tables() -> Result<()> {
+    static SUPPORTED: OnceLock<()> = OnceLock::new();
+    if SUPPORTED.get().is_some() {
+        return Ok(());
+    }
+    let mut device = 0;
+    let mut pageable_access = 0;
+    let mut host_page_tables = 0;
+    unsafe {
+        check_cuda("cudaGetDevice", ffi::cudaGetDevice(&mut device))?;
+        check_cuda(
+            "cudaDeviceGetAttribute(pageable memory access)",
+            ffi::cudaDeviceGetAttribute(
+                &mut pageable_access,
+                ffi::CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS,
+                device,
+            ),
+        )?;
+        check_cuda(
+            "cudaDeviceGetAttribute(pageable memory host page tables)",
+            ffi::cudaDeviceGetAttribute(
+                &mut host_page_tables,
+                ffi::CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES,
+                device,
+            ),
+        )?;
+    }
+    if pageable_access == 0 || host_page_tables == 0 {
+        return Err(Error::Format {
+            label: "pageable CUDA host memory",
+            detail: format!(
+                "device {device} reports pageable_access={pageable_access} host_page_tables={host_page_tables}"
+            ),
+        });
+    }
+    let _ = SUPPORTED.set(());
+    Ok(())
+}
+
 /// Borrowed device input role.
 pub struct DeviceInput<'a, T> {
     buffer: &'a DeviceBuffer<T>,

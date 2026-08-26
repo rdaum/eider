@@ -1,7 +1,7 @@
 //! Bounded raw-NVFP4 linear slots for exact expert paging.
 
 use crate::cuda::{
-    CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, check_cuda,
+    CudaStream, DeviceBuffer, DeviceOutput, PageableHostBuffer, PinnedHostBuffer, check_cuda,
     max_shared_memory_per_block,
 };
 use crate::error::{Error, Result};
@@ -15,14 +15,24 @@ use std::ops::Range;
 /// remapped slot indices, so a missing logical expert cannot silently fall back
 /// to a lower-precision weight.
 pub struct Nvfp4LinearSlots {
-    packed_weight: DeviceBuffer<u8>,
-    weight_scale: DeviceBuffer<u8>,
-    weight_scale_2: DeviceBuffer<f32>,
+    packed_weight: PageableHostBuffer<u8>,
+    weight_scale: PageableHostBuffer<u8>,
+    weight_scale_2: PageableHostBuffer<f32>,
     packed_weight_table: DeviceBuffer<*const u8>,
     weight_scale_table: DeviceBuffer<*const u8>,
     capacity: usize,
     rows: usize,
     cols: usize,
+}
+
+/// CPU-writable ranges for one GPU-readable NVFP4 matrix slot.
+pub struct Nvfp4LinearSlotMut<'a> {
+    /// Packed E2M1 matrix values.
+    pub packed_weight: &'a mut [u8],
+    /// Per-block UE4M3 scales.
+    pub weight_scale: &'a mut [u8],
+    /// Global matrix scale.
+    pub weight_scale_2: &'a mut f32,
 }
 
 impl Nvfp4LinearSlots {
@@ -51,27 +61,20 @@ impl Nvfp4LinearSlots {
                 expected: "rows * cols / 16 without overflow".to_string(),
                 actual: format!("rows={rows} cols={cols}"),
             })?;
-        let packed_weight = DeviceBuffer::zeroed(capacity * packed_per_slot)?;
-        let weight_scale = DeviceBuffer::zeroed(capacity * scales_per_slot)?;
-        let weight_scale_2 = DeviceBuffer::from_host(&vec![1.0; capacity])?;
+        let packed_weight: PageableHostBuffer<u8> =
+            PageableHostBuffer::zeroed(capacity * packed_per_slot)?;
+        let weight_scale: PageableHostBuffer<u8> =
+            PageableHostBuffer::zeroed(capacity * scales_per_slot)?;
+        let mut weight_scale_2: PageableHostBuffer<f32> = PageableHostBuffer::zeroed(capacity)?;
+        weight_scale_2.as_mut_slice().fill(1.0);
         let packed_weight_table = DeviceBuffer::from_host(
             &(0..capacity)
-                .map(|slot| unsafe {
-                    packed_weight
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * packed_per_slot)
-                })
+                .map(|slot| unsafe { packed_weight.as_ptr().add(slot * packed_per_slot) })
                 .collect::<Vec<_>>(),
         )?;
         let weight_scale_table = DeviceBuffer::from_host(
             &(0..capacity)
-                .map(|slot| unsafe {
-                    weight_scale
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * scales_per_slot)
-                })
+                .map(|slot| unsafe { weight_scale.as_ptr().add(slot * scales_per_slot) })
                 .collect::<Vec<_>>(),
         )?;
         Ok(Self {
@@ -86,7 +89,10 @@ impl Nvfp4LinearSlots {
         })
     }
 
-    /// Uploads one matrix from ranges in a pinned prepared record.
+    /// Copies one matrix from ranges in a pinned prepared record.
+    ///
+    /// This compatibility helper synchronizes before writing GPU-readable
+    /// system memory. Paging callers should read directly into [`Self::slots_mut`].
     pub fn load_slot_from_pinned_record_on_stream(
         &mut self,
         slot: usize,
@@ -119,22 +125,43 @@ impl Nvfp4LinearSlots {
                 ),
             });
         }
-        self.packed_weight.copy_bytes_from_pinned_range_on_stream(
-            slot * packed_per_slot,
-            record,
-            packed_range.start,
-            packed_per_slot,
-            stream,
-        )?;
-        self.weight_scale.copy_bytes_from_pinned_range_on_stream(
-            slot * scales_per_slot,
-            record,
-            scale_range.start,
-            scales_per_slot,
-            stream,
-        )?;
-        self.weight_scale_2
-            .copy_range_from_pinned_on_stream(slot, weight_scale_2, stream)
+        stream.synchronize()?;
+        self.packed_weight.as_mut_slice()[slot * packed_per_slot..(slot + 1) * packed_per_slot]
+            .copy_from_slice(&record.as_slice()[packed_range]);
+        self.weight_scale.as_mut_slice()[slot * scales_per_slot..(slot + 1) * scales_per_slot]
+            .copy_from_slice(&record.as_slice()[scale_range]);
+        self.weight_scale_2.as_mut_slice()[slot] = weight_scale_2.as_slice()[0];
+        Ok(())
+    }
+
+    /// Returns disjoint CPU-writable destinations for sorted unique slot indices.
+    pub fn slots_mut(&mut self, slots: &[usize]) -> Result<Vec<Nvfp4LinearSlotMut<'_>>> {
+        if slots.windows(2).any(|pair| pair[0] >= pair[1])
+            || slots.last().is_some_and(|&slot| slot >= self.capacity)
+        {
+            return Err(Error::Shape {
+                label: "NVFP4 writable linear slots",
+                expected: format!("sorted unique slot indices below {}", self.capacity),
+                actual: format!("{slots:?}"),
+            });
+        }
+        let packed_per_slot = self.rows * self.cols / 2;
+        let scales_per_slot = self.rows * self.cols / 16;
+        let packed = selected_chunks_mut(self.packed_weight.as_mut_slice(), packed_per_slot, slots);
+        let scales = selected_chunks_mut(self.weight_scale.as_mut_slice(), scales_per_slot, slots);
+        let global_scales = selected_chunks_mut(self.weight_scale_2.as_mut_slice(), 1, slots);
+        Ok(packed
+            .into_iter()
+            .zip(scales)
+            .zip(global_scales)
+            .map(
+                |((packed_weight, weight_scale), weight_scale_2)| Nvfp4LinearSlotMut {
+                    packed_weight,
+                    weight_scale,
+                    weight_scale_2: &mut weight_scale_2[0],
+                },
+            )
+            .collect())
     }
 
     /// Runs route-major W4A16 matvecs through already-resolved slot indices.
@@ -234,7 +261,7 @@ impl Nvfp4LinearSlots {
                     input.as_const_ptr().cast(),
                     self.packed_weight_table.as_const_ptr().cast(),
                     self.weight_scale_table.as_const_ptr().cast(),
-                    self.weight_scale_2.as_const_ptr().cast(),
+                    self.weight_scale_2.as_ptr(),
                     output.as_mut_ptr().cast(),
                     self.capacity as u32,
                     routes as u32,
@@ -265,14 +292,26 @@ impl Nvfp4LinearSlots {
         self.cols
     }
 
-    /// Exact device bytes retained by all slots and pointer tables.
+    /// GPU-addressable bytes retained by all slots and pointer tables.
     pub fn device_bytes(&self) -> usize {
-        self.packed_weight.device_bytes()
-            + self.weight_scale.device_bytes()
-            + self.weight_scale_2.device_bytes()
+        self.packed_weight.bytes()
+            + self.weight_scale.bytes()
+            + self.weight_scale_2.bytes()
             + self.packed_weight_table.device_bytes()
             + self.weight_scale_table.device_bytes()
     }
+}
+
+fn selected_chunks_mut<'a, T>(
+    values: &'a mut [T],
+    chunk_len: usize,
+    slots: &[usize],
+) -> Vec<&'a mut [T]> {
+    values
+        .chunks_exact_mut(chunk_len)
+        .enumerate()
+        .filter_map(|(slot, chunk)| slots.binary_search(&slot).is_ok().then_some(chunk))
+        .collect()
 }
 
 #[cfg(test)]

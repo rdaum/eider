@@ -41,12 +41,13 @@ pub use cublaslt::{
 };
 pub use cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
-    HostRead, PinnedHostBuffer, device_memory_info, set_cuda_device, synchronize_device,
+    HostRead, PageableHostBuffer, PinnedHostBuffer, device_memory_info, set_cuda_device,
+    synchronize_device,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
 pub use error::{Error, Result};
-pub use expert_slots::Nvfp4LinearSlots;
+pub use expert_slots::{Nvfp4LinearSlotMut, Nvfp4LinearSlots};
 pub use kernels::deepseek4::{
     Deepseek4AttentionBatch, Deepseek4CausalAttentionBatch, INDEXER_SCORE_SLAB,
     arithmetic_positions_u32_into_on_stream, attention_f32_batch_into_on_stream,

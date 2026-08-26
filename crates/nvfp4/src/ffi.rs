@@ -29,6 +29,8 @@ pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
 pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
+pub(crate) const CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS: i32 = 88;
+pub(crate) const CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: i32 = 100;
 #[allow(non_camel_case_types)]
 pub(crate) type cublasStatus_t = i32;
 #[allow(non_camel_case_types)]

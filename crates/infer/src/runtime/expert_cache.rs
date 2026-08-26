@@ -199,6 +199,18 @@ impl ExpertSlotCache {
             .copy_range_from_pinned_on_stream(0, &self.map_staging, stream)
     }
 
+    /// Removes planned misses after their backing records failed to load.
+    pub fn discard_misses(&mut self, misses: &[ExpertSlotMiss]) {
+        for miss in misses {
+            if self.expert_to_slot[miss.expert] == Some(miss.slot) {
+                self.expert_to_slot[miss.expert] = None;
+            }
+            if self.slot_to_expert[miss.slot] == Some(miss.expert) {
+                self.slot_to_expert[miss.slot] = None;
+            }
+        }
+    }
+
     pub fn remap_on_stream(
         &mut self,
         expert_ids: &DeviceBuffer<u32>,
@@ -303,6 +315,17 @@ impl ExpertUploadCoordinator {
         self.upload_started.record_on_stream(&self.stream)
     }
 
+    /// Waits on the host until inference has released slots that the CPU will overwrite.
+    pub fn wait_for_host_slot_write(&self, inference_stream: &CudaStream) -> Result<()> {
+        self.slots_released.record_on_stream(inference_stream)?;
+        self.slots_released.synchronize()
+    }
+
+    /// Starts timing CUDA work submitted after a direct host slot write.
+    pub fn begin_after_host_slot_write(&self) -> Result<()> {
+        self.upload_started.record_on_stream(&self.stream)
+    }
+
     pub fn stream(&self) -> &CudaStream {
         &self.stream
     }
@@ -357,6 +380,17 @@ mod tests {
         assert_eq!(third.misses.len(), 2);
         assert_eq!(third.evictions, 2);
         assert_eq!(third.resident_slots, 4);
+    }
+
+    #[test]
+    fn failed_misses_are_removed_from_the_host_mapping() {
+        let mut cache = ExpertSlotCache::new(8, 2, 2).expect("cache");
+        let failed = cache.plan(&[0, 1]).expect("failed plan");
+        cache.discard_misses(&failed.misses);
+        let retry = cache.plan(&[0, 1]).expect("retry plan");
+        assert_eq!(retry.hits, 0);
+        assert_eq!(retry.misses.len(), 2);
+        assert_eq!(retry.evictions, 0);
     }
 
     #[test]

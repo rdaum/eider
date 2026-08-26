@@ -94,13 +94,13 @@ pub struct InferMetrics {
     #[help = "Wall time spent reading one batch of routed-expert page-ins in microseconds"]
     pub expert_page_read_us: Histogram,
 
-    #[help = "CUDA time spent uploading one batch of routed-expert page-ins in microseconds"]
+    #[help = "CUDA time spent publishing one batch of routed-expert page-ins in microseconds"]
     pub expert_page_upload_us: Histogram,
 
     #[help = "Wall time spent resolving one batch of routed-expert page-ins in microseconds"]
     pub expert_page_resolve_us: Histogram,
 
-    #[help = "Host time blocked waiting to reuse routed-expert staging buffers in microseconds"]
+    #[help = "Host time blocked waiting to reuse routed-expert page-in buffers in microseconds"]
     pub expert_staging_wait_us: Histogram,
 
     #[help = "Wall time spent allocating Gemma 4 active sequence state in microseconds"]

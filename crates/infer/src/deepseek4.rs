@@ -24,13 +24,13 @@ pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek
 use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, MoeSortedRoutes,
-    Nvfp4LinearSlots, PinnedHostBuffer, Q3ExpertTable, Q3ExpertTableCacheInfo,
+    Nvfp4LinearSlotMut, Nvfp4LinearSlots, Q3ExpertTable, Q3ExpertTableCacheInfo,
     Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result, SafeTensorShard,
     gather_sorted_route_rows_f32_into_on_stream, routed_accumulate_f32_batch_into_on_stream,
     routed_accumulate_sorted_f32_batch_into_on_stream,
     silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
-use crate::runtime::expert_cache::{ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator};
+use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, IoSliceMut, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -311,11 +312,11 @@ impl Deepseek4HotExpertCache {
         Ok(self.cached_experts(layer)?.len().max(1))
     }
 
-    fn read_record_direct(
+    fn read_record_into_slot(
         &self,
         layer: usize,
         expert: usize,
-        destination: &mut PinnedHostBuffer<u8>,
+        destination: Deepseek4PagedExpertDestination<'_>,
     ) -> Result<()> {
         validate_layer_expert(&self.manifest, layer, expert)?;
         let path = hot_expert_path(&self.root, layer, expert);
@@ -324,11 +325,31 @@ impl Deepseek4HotExpertCache {
                 label: "DeepSeek V4 NVFP4 expert record",
                 detail: "record size does not fit usize".to_string(),
             })?;
-        if destination.as_slice().len() != expected_bytes {
+        let Deepseek4PagedExpertDestination { w1, w3, w2, layout } = destination;
+        if expected_bytes != layout.record_bytes
+            || w1.packed_weight.len() != layout.packed_bytes
+            || w1.weight_scale.len() != layout.scale_bytes
+            || w3.packed_weight.len() != layout.packed_bytes
+            || w3.weight_scale.len() != layout.scale_bytes
+            || w2.packed_weight.len() != layout.packed_bytes
+            || w2.weight_scale.len() != layout.scale_bytes
+        {
             return Err(Error::Shape {
-                label: "DeepSeek V4 NVFP4 expert staging",
-                expected: format!("{expected_bytes} bytes"),
-                actual: format!("{} bytes", destination.as_slice().len()),
+                label: "DeepSeek V4 NVFP4 expert destination",
+                expected: format!(
+                    "record={expected_bytes} packed={} scales={}",
+                    layout.packed_bytes, layout.scale_bytes
+                ),
+                actual: format!(
+                    "record={} w1={}/{} w3={}/{} w2={}/{}",
+                    layout.record_bytes,
+                    w1.packed_weight.len(),
+                    w1.weight_scale.len(),
+                    w3.packed_weight.len(),
+                    w3.weight_scale.len(),
+                    w2.packed_weight.len(),
+                    w2.weight_scale.len(),
+                ),
             });
         }
         let file = File::open(&path).map_err(hot_cache_io(&path))?;
@@ -342,10 +363,76 @@ impl Deepseek4HotExpertCache {
                 ),
             });
         }
-        BufReader::new(file)
-            .read_exact(destination.as_mut_slice())
-            .map_err(hot_cache_io(&path))
+        let mut header = [0u8; HOT_EXPERT_HEADER_BYTES as usize];
+        let mut destinations = [
+            IoSliceMut::new(&mut header),
+            IoSliceMut::new(w1.packed_weight),
+            IoSliceMut::new(w1.weight_scale),
+            IoSliceMut::new(w3.packed_weight),
+            IoSliceMut::new(w3.weight_scale),
+            IoSliceMut::new(w2.packed_weight),
+            IoSliceMut::new(w2.weight_scale),
+        ];
+        read_exact_vectored_at(&file, &mut destinations, 0).map_err(hot_cache_io(&path))?;
+        validate_hot_record_header(&header, &self.manifest, layer, expert)?;
+        *w1.weight_scale_2 = read_record_f32(&header, 28)?;
+        *w3.weight_scale_2 = read_record_f32(&header, 36)?;
+        *w2.weight_scale_2 = read_record_f32(&header, 44)?;
+        Ok(())
     }
+}
+
+struct Deepseek4PagedExpertDestination<'a> {
+    w1: Nvfp4LinearSlotMut<'a>,
+    w3: Nvfp4LinearSlotMut<'a>,
+    w2: Nvfp4LinearSlotMut<'a>,
+    layout: Deepseek4Nvfp4RecordLayout,
+}
+
+fn read_exact_vectored_at(
+    file: &File,
+    mut destinations: &mut [IoSliceMut<'_>],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    const MAX_DESTINATIONS: usize = 7;
+    while !destinations.is_empty() {
+        if destinations.len() > MAX_DESTINATIONS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "too many DeepSeek expert record destinations",
+            ));
+        }
+        let mut vectors: [libc::iovec; MAX_DESTINATIONS] = std::array::from_fn(|_| libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        });
+        for (vector, destination) in vectors.iter_mut().zip(destinations.iter_mut()) {
+            vector.iov_base = destination.as_mut_ptr().cast();
+            vector.iov_len = destination.len();
+        }
+        let bytes = unsafe {
+            libc::preadv(
+                file.as_raw_fd(),
+                vectors.as_ptr(),
+                destinations.len() as i32,
+                offset as libc::off_t,
+            )
+        };
+        if bytes == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        if bytes < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let bytes = bytes as usize;
+        offset = offset.saturating_add(bytes as u64);
+        IoSliceMut::advance_slices(&mut destinations, bytes);
+    }
+    Ok(())
 }
 
 /// Mutable output storage for one routed-expert layer.
@@ -456,12 +543,6 @@ struct Deepseek4Nvfp4RecordLayout {
     record_bytes: usize,
     packed_bytes: usize,
     scale_bytes: usize,
-    w1_packed: usize,
-    w1_scale: usize,
-    w3_packed: usize,
-    w3_scale: usize,
-    w2_packed: usize,
-    w2_scale: usize,
 }
 
 impl Deepseek4Nvfp4RecordLayout {
@@ -510,50 +591,7 @@ impl Deepseek4Nvfp4RecordLayout {
             record_bytes,
             packed_bytes,
             scale_bytes,
-            w1_packed,
-            w1_scale,
-            w3_packed,
-            w3_scale,
-            w2_packed,
-            w2_scale,
         })
-    }
-}
-
-struct Deepseek4PagedExpertStaging {
-    slot: usize,
-    record: PinnedHostBuffer<u8>,
-    w1_scale_2: PinnedHostBuffer<f32>,
-    w3_scale_2: PinnedHostBuffer<f32>,
-    w2_scale_2: PinnedHostBuffer<f32>,
-}
-
-impl Deepseek4PagedExpertStaging {
-    fn new(layout: Deepseek4Nvfp4RecordLayout) -> Result<Self> {
-        Ok(Self {
-            slot: 0,
-            record: PinnedHostBuffer::zeroed(layout.record_bytes)?,
-            w1_scale_2: PinnedHostBuffer::zeroed(1)?,
-            w3_scale_2: PinnedHostBuffer::zeroed(1)?,
-            w2_scale_2: PinnedHostBuffer::zeroed(1)?,
-        })
-    }
-
-    fn read(
-        &mut self,
-        source: &Deepseek4HotExpertCache,
-        layer: usize,
-        miss: ExpertSlotMiss,
-    ) -> Result<()> {
-        source.read_record_direct(layer, miss.expert, &mut self.record)?;
-        validate_hot_record_header(self.record.as_slice(), &source.manifest, layer, miss.expert)?;
-        self.slot = miss.slot;
-        self.w1_scale_2
-            .copy_from_slice(&[read_record_f32(self.record.as_slice(), 28)?])?;
-        self.w3_scale_2
-            .copy_from_slice(&[read_record_f32(self.record.as_slice(), 36)?])?;
-        self.w2_scale_2
-            .copy_from_slice(&[read_record_f32(self.record.as_slice(), 44)?])
     }
 }
 
@@ -576,7 +614,6 @@ pub struct Deepseek4PagedExpertLayer {
     w2: Nvfp4LinearSlots,
     slots: ExpertSlotCache,
     uploads: ExpertUploadCoordinator,
-    staging: Vec<Deepseek4PagedExpertStaging>,
     stats: Deepseek4PagingStats,
     paging_metrics: ExpertPagingMetricHandle,
 }
@@ -608,9 +645,6 @@ impl Deepseek4PagedExpertLayer {
             .device_bytes()
             .saturating_add(w3.device_bytes())
             .saturating_add(w2.device_bytes());
-        let staging = (0..manifest.experts_per_token)
-            .map(|_| Deepseek4PagedExpertStaging::new(layout))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layer,
             manifest: manifest.clone(),
@@ -625,7 +659,6 @@ impl Deepseek4PagedExpertLayer {
                 manifest.experts_per_token,
             )?,
             uploads: ExpertUploadCoordinator::new()?,
-            staging,
             stats: Deepseek4PagingStats::default(),
             paging_metrics: ExpertPagingMetricHandle::new(capacity, device_bytes),
         })
@@ -684,7 +717,7 @@ impl Deepseek4PagedExpertLayer {
             })
             .collect::<Vec<_>>();
         let gate_up_stride = 2 * self.manifest.expert_intermediate;
-        for expert_group in active_experts.chunks(self.staging.len()) {
+        for expert_group in active_experts.chunks(self.manifest.experts_per_token) {
             let working_set = expert_group
                 .iter()
                 .map(|&(expert, _, _)| expert)
@@ -860,17 +893,34 @@ impl Deepseek4PagedExpertLayer {
         let misses = plan.misses.len();
         let resolve_started = (misses != 0).then(Instant::now);
         if misses != 0 {
-            self.uploads.begin(stream)?;
+            self.uploads.wait_for_host_slot_write(stream)?;
             let read_started = Instant::now();
-            std::thread::scope(|scope| {
-                let handles = self
-                    .staging
-                    .iter_mut()
-                    .zip(&plan.misses)
-                    .map(|(staging, &miss)| {
-                        let source = &self.source;
-                        let layer = self.layer;
-                        scope.spawn(move || staging.read(source, layer, miss))
+            let mut sorted_misses = plan.misses.clone();
+            sorted_misses.sort_unstable_by_key(|miss| miss.slot);
+            let slot_ids = sorted_misses
+                .iter()
+                .map(|miss| miss.slot)
+                .collect::<Vec<_>>();
+            let source = &self.source;
+            let layer = self.layer;
+            let layout = self.layout;
+            let w1_slots = self.w1.slots_mut(&slot_ids)?;
+            let w3_slots = self.w3.slots_mut(&slot_ids)?;
+            let w2_slots = self.w2.slots_mut(&slot_ids)?;
+            let read_result = std::thread::scope(|scope| {
+                let handles = sorted_misses
+                    .into_iter()
+                    .zip(w1_slots)
+                    .zip(w3_slots)
+                    .zip(w2_slots)
+                    .map(|(((miss, w1), w3), w2)| {
+                        scope.spawn(move || {
+                            source.read_record_into_slot(
+                                layer,
+                                miss.expert,
+                                Deepseek4PagedExpertDestination { w1, w3, w2, layout },
+                            )
+                        })
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
@@ -880,36 +930,21 @@ impl Deepseek4PagedExpertLayer {
                     })??;
                 }
                 Ok::<(), Error>(())
-            })?;
-            self.paging_metrics.record_page_read(read_started.elapsed());
-            for staging in self.staging.iter().take(misses) {
-                self.w1.load_slot_from_pinned_record_on_stream(
-                    staging.slot,
-                    &staging.record,
-                    self.layout.w1_packed..self.layout.w1_packed + self.layout.packed_bytes,
-                    self.layout.w1_scale..self.layout.w1_scale + self.layout.scale_bytes,
-                    &staging.w1_scale_2,
-                    self.uploads.stream(),
-                )?;
-                self.w3.load_slot_from_pinned_record_on_stream(
-                    staging.slot,
-                    &staging.record,
-                    self.layout.w3_packed..self.layout.w3_packed + self.layout.packed_bytes,
-                    self.layout.w3_scale..self.layout.w3_scale + self.layout.scale_bytes,
-                    &staging.w3_scale_2,
-                    self.uploads.stream(),
-                )?;
-                self.w2.load_slot_from_pinned_record_on_stream(
-                    staging.slot,
-                    &staging.record,
-                    self.layout.w2_packed..self.layout.w2_packed + self.layout.packed_bytes,
-                    self.layout.w2_scale..self.layout.w2_scale + self.layout.scale_bytes,
-                    &staging.w2_scale_2,
-                    self.uploads.stream(),
-                )?;
+            });
+            if let Err(error) = read_result {
+                self.slots.discard_misses(&plan.misses);
+                return Err(error);
             }
-            self.slots.enqueue_mapping_upload(self.uploads.stream())?;
-            self.uploads.finish(stream)?;
+            self.paging_metrics.record_page_read(read_started.elapsed());
+            let publish_result = (|| {
+                self.uploads.begin_after_host_slot_write()?;
+                self.slots.enqueue_mapping_upload(self.uploads.stream())?;
+                self.uploads.finish(stream)
+            })();
+            if let Err(error) = publish_result {
+                self.slots.discard_misses(&plan.misses);
+                return Err(error);
+            }
         }
         let bytes_read = misses.saturating_mul(self.layout.record_bytes);
         self.stats.hits = self.stats.hits.saturating_add(plan.hits as u64);
@@ -2359,9 +2394,9 @@ fn write_manifest(artifact_dir: &Path, manifest: &Deepseek4Manifest) -> Result<(
 mod tests {
     use super::{
         Deepseek4ExpertLayer, Deepseek4ExpertWorkspace, Deepseek4HotExpert,
-        Deepseek4HotExpertCache, Deepseek4Manifest, finalise_thin_checkpoint,
-        hot_expert_expected_file_bytes, hot_expert_path, hot_layer_dir, inspect_thin_checkpoint,
-        layer_paths, prepare_thin_checkpoint_shard, write_hot_expert,
+        Deepseek4HotExpertCache, Deepseek4Manifest, Deepseek4PagedExpertLayer,
+        finalise_thin_checkpoint, hot_expert_expected_file_bytes, hot_expert_path, hot_layer_dir,
+        inspect_thin_checkpoint, layer_paths, prepare_thin_checkpoint_shard, write_hot_expert,
     };
     use crate::nvfp4::{
         CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q3ExpertTableCacheWriter, format,
@@ -2386,6 +2421,117 @@ mod tests {
             manifest.q3_expert_payload_bytes().expect("Q3 bytes"),
             108_213_043_200
         );
+    }
+
+    #[test]
+    fn paged_nvfp4_reads_records_directly_into_kernel_slots() {
+        let manifest = Deepseek4Manifest {
+            hidden: 128,
+            layers: 1,
+            routed_experts: 3,
+            experts_per_token: 2,
+            expert_intermediate: 128,
+            shared_experts: 1,
+            hash_layers: 0,
+            swiglu_limit: 10.0,
+        };
+        let hot_dir = std::env::temp_dir().join(format!(
+            "eider-deepseek4-paged-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(hot_layer_dir(&hot_dir, 0)).expect("hot layer directory");
+        let make_weight = |name: &str, value: f32| {
+            ModelOptNvfp4Linear::quantize_bf16(
+                name,
+                128,
+                128,
+                &vec![format::f32_to_bf16(value); 128 * 128],
+            )
+            .expect("NVFP4 weight")
+        };
+        let experts = (0..3)
+            .map(|expert| {
+                let multiplier = (expert + 1) as f32;
+                Deepseek4HotExpert {
+                    w1: make_weight("w1", multiplier * 0.03125),
+                    w3: make_weight("w3", multiplier * 0.015625),
+                    w2: make_weight("w2", multiplier * 0.0078125),
+                }
+            })
+            .collect::<Vec<_>>();
+        for (expert, weights) in experts.iter().enumerate() {
+            write_hot_expert(
+                &hot_expert_path(&hot_dir, 0, expert),
+                &manifest,
+                0,
+                expert,
+                weights,
+            )
+            .expect("write hot expert");
+        }
+
+        let mut layer =
+            Deepseek4PagedExpertLayer::load(&hot_dir, &manifest, 0, 2).expect("paged layer");
+        let mut workspace = Deepseek4ExpertWorkspace::new(&manifest).expect("workspace");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let input_host = vec![0.125f32; manifest.hidden];
+        let input = DeviceBuffer::from_host(&input_host).expect("input");
+        let route_weights_host = [0.25f32, 0.75];
+        let route_weights = DeviceBuffer::from_host(&route_weights_host).expect("route weights");
+
+        let matvec = |linear: &ModelOptNvfp4Linear, values: &[f32]| {
+            let weights = linear.dequantize_to_f32_col_major();
+            (0..linear.out_features)
+                .map(|row| {
+                    weights[row * linear.in_features..(row + 1) * linear.in_features]
+                        .iter()
+                        .zip(values)
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f32>()
+                        * linear.weight_scale_2
+                })
+                .collect::<Vec<_>>()
+        };
+        let expert_output = |expert: usize| {
+            let gate = matvec(&experts[expert].w1, &input_host);
+            let up = matvec(&experts[expert].w3, &input_host);
+            let activated = gate
+                .iter()
+                .zip(up)
+                .map(|(&gate, up)| {
+                    let gate = gate.min(manifest.swiglu_limit);
+                    let up = up.clamp(-manifest.swiglu_limit, manifest.swiglu_limit);
+                    gate / (1.0 + (-gate).exp()) * up
+                })
+                .collect::<Vec<_>>();
+            matvec(&experts[expert].w2, &activated)
+        };
+
+        for route in [[0u32, 2], [1, 2]] {
+            let indices = DeviceBuffer::from_host(&route).expect("indices");
+            layer
+                .run_rows(&mut workspace, &indices, &route_weights, &input, 1, &stream)
+                .expect("run paged expert");
+            let actual = workspace.output().copy_to_host(&stream).expect("output");
+            let left = expert_output(route[0] as usize);
+            let right = expert_output(route[1] as usize);
+            for ((&actual, left), right) in actual.iter().zip(left).zip(right) {
+                let expected = route_weights_host[0] * left + route_weights_host[1] * right;
+                let tolerance = 2.0e-4f32.max(expected.abs() * 2.0e-4);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "route={route:?} actual={actual} expected={expected}"
+                );
+            }
+        }
+        assert_eq!(layer.stats().hits, 1);
+        assert_eq!(layer.stats().misses, 3);
+        assert_eq!(
+            layer.stats().bytes_read,
+            3 * hot_expert_expected_file_bytes(&manifest).expect("record bytes")
+        );
+        std::fs::remove_dir_all(hot_dir).expect("remove hot directory");
     }
 
     #[test]
