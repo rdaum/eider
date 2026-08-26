@@ -824,6 +824,28 @@ impl Deepseek4PagedExpertLayer {
         Ok(&workspace.output)
     }
 
+    /// Loads every expert into a full-capacity layer before inference starts.
+    pub fn preload_all(&mut self, stream: &CudaStream) -> Result<()> {
+        if self.slots.capacity() != self.manifest.routed_experts {
+            return Err(Error::Shape {
+                label: "DeepSeek V4 expert preload",
+                expected: format!("capacity={}", self.manifest.routed_experts),
+                actual: self.slots.capacity().to_string(),
+            });
+        }
+        let experts = (0..self.manifest.routed_experts)
+            .map(|expert| expert as u32)
+            .collect::<Vec<_>>();
+        for group in experts.chunks(self.manifest.experts_per_token) {
+            self.resolve_working_set(group, stream)?;
+        }
+        if let Some(timing) = self.uploads.wait_for_staging_reuse()? {
+            self.paging_metrics.record_page_upload(timing.upload);
+            self.paging_metrics.record_staging_wait(timing.staging_wait);
+        }
+        stream.synchronize()
+    }
+
     fn run_single_row<'a>(
         &mut self,
         workspace: &'a mut Deepseek4ExpertWorkspace,

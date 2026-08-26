@@ -25,6 +25,8 @@ pub struct Deepseek4MtpSequence {
     pub(crate) page_table: Sm12xPageTable,
     pub(crate) state: crate::deepseek4::Deepseek4LayerSequenceState,
     pub(crate) previous_hidden: DeviceBuffer<f32>,
+    pub(crate) deferred_hidden: DeviceBuffer<f32>,
+    pub(crate) deferred_token: Option<u32>,
     pub(crate) position: usize,
 }
 
@@ -40,6 +42,8 @@ impl Deepseek4MtpSequence {
             page_table,
             state,
             previous_hidden: DeviceBuffer::zeroed(hidden_values)?,
+            deferred_hidden: DeviceBuffer::zeroed(hidden_values)?,
+            deferred_token: None,
             position: 0,
         })
     }
@@ -48,6 +52,7 @@ impl Deepseek4MtpSequence {
         self.state
             .device_bytes()
             .saturating_add(self.previous_hidden.device_bytes())
+            .saturating_add(self.deferred_hidden.device_bytes())
             .saturating_add(self.page_table.managed_bytes())
     }
 
@@ -203,6 +208,7 @@ pub fn new_deepseek4_mtp_sequence_cache(
     let private_bytes = config
         .hc_mult
         .checked_mul(config.hidden_size)
+        .and_then(|values| values.checked_mul(2))
         .and_then(|values| values.checked_mul(size_of::<f32>()))
         .ok_or_else(|| Error::Format {
             label: "DeepSeek V4 MTP sequence cache",

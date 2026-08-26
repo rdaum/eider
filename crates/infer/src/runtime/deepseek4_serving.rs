@@ -547,6 +547,7 @@ impl<'template> Deepseek4ChatService<'template> {
                 let private_state_bytes = state.device_bytes().saturating_add(
                     self.model.weights.config.hc_mult
                         * self.model.weights.config.hidden_size
+                        * 2
                         * std::mem::size_of::<f32>(),
                 );
                 let outcome = cache

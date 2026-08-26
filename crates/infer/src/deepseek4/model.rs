@@ -8,13 +8,13 @@ use super::{
 use crate::nvfp4::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, INDEXER_SCORE_SLAB,
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
-    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
-    arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
-    causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, hyper_apply_f32_batch_into_on_stream,
-    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-    indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
+    add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
+    block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
+    compress_windows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
+    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
+    lm_head_top1_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
     store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
@@ -159,6 +159,31 @@ impl Deepseek4Bf16Linear {
             input,
             &self.weight,
             output.output(),
+            batch_rows,
+            self.rows,
+            self.cols,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_top1_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        scratch_value: &DeviceBuffer<f32>,
+        scratch_index: &DeviceBuffer<u32>,
+        out_index: &DeviceBuffer<u32>,
+        out_value: &DeviceBuffer<f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        lm_head_top1_f32_batch_into_on_stream(
+            input,
+            &self.weight,
+            scratch_value,
+            scratch_index,
+            out_index,
+            out_value,
             batch_rows,
             self.rows,
             self.cols,
@@ -2917,13 +2942,15 @@ pub struct Deepseek4MtpWorkspace {
     final_streams: DeviceBuffer<f32>,
     final_hidden: DeviceBuffer<f32>,
     final_normed: DeviceBuffer<f32>,
-    logits: DeviceBuffer<f32>,
+    top1_scratch_values: DeviceBuffer<f32>,
+    top1_scratch_ids: DeviceBuffer<u32>,
     argmax_values: DeviceBuffer<f32>,
     argmax_ids: DeviceBuffer<u32>,
     verification_streams: DeviceBuffer<f32>,
     verification_hidden: DeviceBuffer<f32>,
     verification_normed: DeviceBuffer<f32>,
-    verification_logits: DeviceBuffer<f32>,
+    verification_top1_scratch_values: DeviceBuffer<f32>,
+    verification_top1_scratch_ids: DeviceBuffer<u32>,
     verification_argmax_values: DeviceBuffer<f32>,
     verification_argmax_ids: DeviceBuffer<u32>,
     layer: Deepseek4LayerWorkspace,
@@ -2947,13 +2974,15 @@ impl Deepseek4MtpWorkspace {
             .saturating_add(self.final_streams.device_bytes())
             .saturating_add(self.final_hidden.device_bytes())
             .saturating_add(self.final_normed.device_bytes())
-            .saturating_add(self.logits.device_bytes())
+            .saturating_add(self.top1_scratch_values.device_bytes())
+            .saturating_add(self.top1_scratch_ids.device_bytes())
             .saturating_add(self.argmax_values.device_bytes())
             .saturating_add(self.argmax_ids.device_bytes())
             .saturating_add(self.verification_streams.device_bytes())
             .saturating_add(self.verification_hidden.device_bytes())
             .saturating_add(self.verification_normed.device_bytes())
-            .saturating_add(self.verification_logits.device_bytes())
+            .saturating_add(self.verification_top1_scratch_values.device_bytes())
+            .saturating_add(self.verification_top1_scratch_ids.device_bytes())
             .saturating_add(self.verification_argmax_values.device_bytes())
             .saturating_add(self.verification_argmax_ids.device_bytes())
             .saturating_add(self.layer.device_bytes())
@@ -3001,7 +3030,6 @@ impl Deepseek4MtpWeights {
     fn load(
         model_dir: &Path,
         expert_store_dir: &Path,
-        capacity: usize,
         config: &Deepseek4ModelConfig,
     ) -> Result<Self> {
         if config.nextn_predict_layers != 1 {
@@ -3021,6 +3049,18 @@ impl Deepseek4MtpWeights {
         let prefix = "mtp.0";
         let mut manifest = Deepseek4Manifest::from(config);
         manifest.layers += 1;
+        let mut routed_experts = Deepseek4PagedExpertLayer::load(
+            expert_store_dir,
+            &manifest,
+            layer_index,
+            manifest.routed_experts,
+        )?;
+        let preload_stream = CudaStream::new_blocking()?;
+        routed_experts.preload_all(&preload_stream)?;
+        info!(
+            experts = manifest.routed_experts,
+            "preloaded DeepSeek V4 MTP routed experts"
+        );
         Ok(Self {
             embedding_norm: Deepseek4RmsNorm::load(
                 &checkpoint,
@@ -3052,14 +3092,7 @@ impl Deepseek4MtpWeights {
                 layer_index,
                 prefix,
             )?,
-            routed_experts: Deepseek4RoutedExpertLayer::PagedNvfp4(Box::new(
-                Deepseek4PagedExpertLayer::load(
-                    expert_store_dir,
-                    &manifest,
-                    layer_index,
-                    capacity,
-                )?,
-            )),
+            routed_experts: Deepseek4RoutedExpertLayer::PagedNvfp4(Box::new(routed_experts)),
             hyper_head: Deepseek4HyperHead::load_at_prefix(
                 &checkpoint,
                 config,
@@ -3201,7 +3234,6 @@ impl Deepseek4TextModel {
         model.mtp = Some(Deepseek4MtpWeights::load(
             model_dir,
             expert_store_dir,
-            capacity_per_layer,
             &model.weights.config,
         )?);
         Ok(model)
@@ -3326,6 +3358,7 @@ impl Deepseek4TextModel {
         let hidden = config.hidden_size;
         let stream_width = HYPER_STREAMS * hidden;
         let verification_rows = sequence_capacity * 2;
+        let top1_scratch_per_row = config.vocab_size.div_ceil(8);
         Ok(Deepseek4MtpWorkspace {
             token_ids: DeviceBuffer::zeroed(token_capacity)?,
             host_token_ids: vec![0; token_capacity],
@@ -3341,13 +3374,19 @@ impl Deepseek4TextModel {
             final_streams: DeviceBuffer::zeroed(sequence_capacity * stream_width)?,
             final_hidden: DeviceBuffer::zeroed(sequence_capacity * hidden)?,
             final_normed: DeviceBuffer::zeroed(sequence_capacity * hidden)?,
-            logits: DeviceBuffer::zeroed(sequence_capacity * config.vocab_size)?,
+            top1_scratch_values: DeviceBuffer::zeroed(sequence_capacity * top1_scratch_per_row)?,
+            top1_scratch_ids: DeviceBuffer::zeroed(sequence_capacity * top1_scratch_per_row)?,
             argmax_values: DeviceBuffer::zeroed(sequence_capacity)?,
             argmax_ids: DeviceBuffer::zeroed(sequence_capacity)?,
             verification_streams: DeviceBuffer::zeroed(verification_rows * stream_width)?,
             verification_hidden: DeviceBuffer::zeroed(verification_rows * hidden)?,
             verification_normed: DeviceBuffer::zeroed(verification_rows * hidden)?,
-            verification_logits: DeviceBuffer::zeroed(verification_rows * config.vocab_size)?,
+            verification_top1_scratch_values: DeviceBuffer::zeroed(
+                verification_rows * top1_scratch_per_row,
+            )?,
+            verification_top1_scratch_ids: DeviceBuffer::zeroed(
+                verification_rows * top1_scratch_per_row,
+            )?,
             verification_argmax_values: DeviceBuffer::zeroed(verification_rows)?,
             verification_argmax_ids: DeviceBuffer::zeroed(verification_rows)?,
             layer: mtp.layer.allocate_layer_workspace(config, token_capacity)?,
@@ -3491,24 +3530,53 @@ impl Deepseek4TextModel {
         mtp_cache: &mut Deepseek4MtpSequenceCache,
     ) -> Result<Vec<u32>> {
         let stream_width = HYPER_STREAMS * self.weights.config.hidden_size;
-        for (sequence, row) in rows.iter().enumerate() {
-            if row.token_ids.len() != 1 || row.sequence.position == 0 {
+        let mut token_offset = 0;
+        for row in rows.iter() {
+            if row.sequence.position == 0 {
                 return Err(Error::Format {
                     label: "DeepSeek V4 MTP draft",
-                    detail: "draft rows require one token and a prefetched MTP state".to_string(),
+                    detail: "draft rows require a prefetched MTP state".to_string(),
                 });
             }
-            workspace.streams.copy_range_from_device_on_stream(
-                sequence * stream_width,
-                &row.sequence.previous_hidden,
-                0,
-                stream_width,
-                &workspace.stream,
-            )?;
+            match (row.token_ids, row.sequence.deferred_token) {
+                ([token], None) => {
+                    let _ = token;
+                    workspace.streams.copy_range_from_device_on_stream(
+                        token_offset * stream_width,
+                        &row.sequence.previous_hidden,
+                        0,
+                        stream_width,
+                        &workspace.stream,
+                    )?;
+                }
+                ([deferred, _], Some(expected)) if *deferred == expected => {
+                    for row_offset in 0..2 {
+                        workspace.streams.copy_range_from_device_on_stream(
+                            (token_offset + row_offset) * stream_width,
+                            &row.sequence.deferred_hidden,
+                            0,
+                            stream_width,
+                            &workspace.stream,
+                        )?;
+                    }
+                }
+                _ => {
+                    return Err(Error::Format {
+                        label: "DeepSeek V4 MTP draft",
+                        detail: "deferred catch-up token is not aligned with the draft row"
+                            .to_string(),
+                    });
+                }
+            }
+            token_offset += row.token_ids.len();
         }
-        Ok(self
+        let drafts = self
             .append_mtp_from_target(mtp_workspace, workspace, rows, mtp_cache, true)?
-            .expect("MTP argmax was requested"))
+            .expect("MTP argmax was requested");
+        for row in rows {
+            row.sequence.deferred_token = None;
+        }
+        Ok(drafts)
     }
 
     /// Runs one exact greedy native-MTP proposal and target-verification cycle.
@@ -3548,7 +3616,11 @@ impl Deepseek4TextModel {
         }
         let draft_rows_storage = input_tokens
             .iter()
-            .map(|token| [*token])
+            .zip(mtp_sequences.iter())
+            .map(|(&token, sequence)| match sequence.deferred_token {
+                Some(deferred) => vec![deferred, token],
+                None => vec![token],
+            })
             .collect::<Vec<_>>();
         let mut draft_rows = draft_rows_storage
             .iter()
@@ -3601,18 +3673,13 @@ impl Deepseek4TextModel {
             verification_rows,
             &workspace.stream,
         )?;
-        self.weights.lm_head.run_rows(
+        self.weights.lm_head.run_top1_rows(
             &mtp_workspace.verification_normed,
-            &mut mtp_workspace.verification_logits,
+            &mtp_workspace.verification_top1_scratch_values,
+            &mtp_workspace.verification_top1_scratch_ids,
+            &mtp_workspace.verification_argmax_ids,
+            &mtp_workspace.verification_argmax_values,
             verification_rows,
-            &workspace.stream,
-        )?;
-        argmax_f32_batch_into_on_stream(
-            &mtp_workspace.verification_logits,
-            mtp_workspace.verification_argmax_ids.output(),
-            mtp_workspace.verification_argmax_values.output(),
-            verification_rows,
-            config.vocab_size,
             &workspace.stream,
         )?;
         workspace.stream.synchronize()?;
@@ -3693,32 +3760,20 @@ impl Deepseek4TextModel {
                     stream_width,
                     &workspace.stream,
                 )?;
-        }
-        let accepted_indices = accepted
-            .iter()
-            .enumerate()
-            .filter_map(|(index, accepted)| accepted.then_some(index))
-            .collect::<Vec<_>>();
-        for &sequence in &accepted_indices {
-            workspace.streams.copy_range_from_device_on_stream(
-                0,
-                &mtp_workspace.verification_streams,
-                (sequence * 2 + 1) * stream_width,
-                stream_width,
-                &workspace.stream,
-            )?;
-            let token = [drafts[sequence]];
-            let mut catchup_row = [Deepseek4MtpBatchRow {
-                token_ids: &token,
-                sequence: &mut *mtp_sequences[sequence],
-            }];
-            self.append_mtp_from_target(
-                mtp_workspace,
-                workspace,
-                &mut catchup_row,
-                mtp_cache,
-                false,
-            )?;
+            if accepted[sequence] {
+                mtp_sequence
+                    .deferred_hidden
+                    .copy_range_from_device_on_stream(
+                        0,
+                        &mtp_workspace.verification_streams,
+                        (sequence * 2 + 1) * stream_width,
+                        stream_width,
+                        &workspace.stream,
+                    )?;
+                mtp_sequence.deferred_token = Some(drafts[sequence]);
+            } else {
+                mtp_sequence.deferred_token = None;
+            }
         }
         workspace.stream.synchronize()?;
         Ok(Deepseek4SpeculativeCycleResult {
@@ -3964,18 +4019,13 @@ impl Deepseek4TextModel {
                     rows.len(),
                     &target_workspace.stream,
                 )?;
-                self.weights.lm_head.run_rows(
+                self.weights.lm_head.run_top1_rows(
                     &workspace.final_normed,
-                    &mut workspace.logits,
+                    &workspace.top1_scratch_values,
+                    &workspace.top1_scratch_ids,
+                    &workspace.argmax_ids,
+                    &workspace.argmax_values,
                     rows.len(),
-                    &target_workspace.stream,
-                )?;
-                argmax_f32_batch_into_on_stream(
-                    &workspace.logits,
-                    workspace.argmax_ids.output(),
-                    workspace.argmax_values.output(),
-                    rows.len(),
-                    config.vocab_size,
                     &target_workspace.stream,
                 )?;
             }
