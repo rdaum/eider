@@ -1,9 +1,9 @@
 use super::{
-    Fp8Linear, Qwen36Attention, Qwen36DownStorage, Qwen36FullAttentionWeights, Qwen36GateUpStorage,
-    Qwen36LayerBlock, Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState,
-    Qwen36LinearAttentionWeights, Qwen36LmHead, Qwen36MoeWeights, Qwen36MtpDraftWorkspace,
-    Qwen36MtpSequenceState, Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState,
-    Qwen36SharedExpertStorage, Qwen36TextModel, maybe_round_device_f32_to_bf16,
+    Fp8Linear, Qwen36Attention, Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock,
+    Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
+    Qwen36LmHead, Qwen36MoeWeights, Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState,
+    Qwen36NextToken, Qwen36ParallelMoe, Qwen36SequenceState, Qwen36SharedExpertStorage,
+    Qwen36TextModel, maybe_round_device_f32_to_bf16,
 };
 use std::collections::HashMap;
 
@@ -23,8 +23,9 @@ use crate::nvfp4::{
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
-    lm_head_top1_f32_batch_into_on_stream, mask_logits_f32_batch_in_place_on_stream,
-    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
+    mask_logits_f32_batch_in_place_on_stream, moe_topk_f32_batch_into_on_stream,
+    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, quantize_fp8_e4m3_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
@@ -42,6 +43,72 @@ const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
 const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
+
+pub(crate) trait Qwen36BatchModel {
+    fn batch_lt(&self) -> &crate::nvfp4::CublasLt;
+    fn batch_manifest(&self) -> &super::QwenModelManifest;
+    fn batch_layer_count(&self) -> usize;
+    fn batch_linear_layers(&self) -> Vec<bool>;
+}
+
+impl Qwen36BatchModel for Qwen36TextModel {
+    fn batch_lt(&self) -> &crate::nvfp4::CublasLt {
+        &self.lt
+    }
+
+    fn batch_manifest(&self) -> &super::QwenModelManifest {
+        &self.manifest
+    }
+
+    fn batch_layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn batch_linear_layers(&self) -> Vec<bool> {
+        self.layers
+            .iter()
+            .map(|layer| matches!(layer.attention, Qwen36Attention::LinearAttention(_)))
+            .collect()
+    }
+}
+
+pub(crate) struct Qwen36BatchModelView<'a> {
+    lt: &'a crate::nvfp4::CublasLt,
+    manifest: &'a super::QwenModelManifest,
+    linear_layers: &'a [bool],
+}
+
+impl<'a> Qwen36BatchModelView<'a> {
+    pub(crate) fn new(
+        lt: &'a crate::nvfp4::CublasLt,
+        manifest: &'a super::QwenModelManifest,
+        linear_layers: &'a [bool],
+    ) -> Self {
+        Self {
+            lt,
+            manifest,
+            linear_layers,
+        }
+    }
+}
+
+impl Qwen36BatchModel for Qwen36BatchModelView<'_> {
+    fn batch_lt(&self) -> &crate::nvfp4::CublasLt {
+        self.lt
+    }
+
+    fn batch_manifest(&self) -> &super::QwenModelManifest {
+        self.manifest
+    }
+
+    fn batch_layer_count(&self) -> usize {
+        self.linear_layers.len()
+    }
+
+    fn batch_linear_layers(&self) -> Vec<bool> {
+        self.linear_layers.to_vec()
+    }
+}
 
 /// One scheduler-selected prompt chunk for batched prefill.
 pub struct Qwen36PrefillRow<'tokens, 'sequence> {
@@ -326,7 +393,7 @@ fn prepare_fp8_batch_input(
 
 impl BatchFp8LinearPlan {
     pub(super) fn new(
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         linear: &Fp8Linear,
         capacity: usize,
     ) -> Result<Self> {
@@ -334,7 +401,7 @@ impl BatchFp8LinearPlan {
         plans.insert(
             capacity,
             Fp8TnMatmulPlan::new(
-                &model.lt,
+                model.batch_lt(),
                 GemmShape::new(linear.rows, capacity, linear.cols),
                 8 << 20,
             )?,
@@ -343,7 +410,7 @@ impl BatchFp8LinearPlan {
             plans.insert(
                 1,
                 Fp8TnMatmulPlan::new(
-                    &model.lt,
+                    model.batch_lt(),
                     GemmShape::new(linear.rows, 1, linear.cols),
                     8 << 20,
                 )?,
@@ -375,12 +442,16 @@ struct BatchBf16LinearPlan {
 }
 
 impl BatchBf16LinearPlan {
-    fn new(model: &Qwen36TextModel, linear: &super::Bf16Linear, capacity: usize) -> Result<Self> {
+    fn new(
+        model: &dyn Qwen36BatchModel,
+        linear: &super::Bf16Linear,
+        capacity: usize,
+    ) -> Result<Self> {
         let mut plans = HashMap::new();
         plans.insert(
             capacity,
             Bf16TnMatmulPlan::new(
-                &model.lt,
+                model.batch_lt(),
                 GemmShape::new(linear.rows, capacity, linear.cols),
                 8 << 20,
             )?,
@@ -414,7 +485,7 @@ struct BatchLinearPlanSet {
 
 impl BatchLinearPlanSet {
     fn new<'a>(
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         linears: impl IntoIterator<Item = &'a Qwen36Linear>,
         capacity: usize,
     ) -> Result<Self> {
@@ -485,13 +556,13 @@ impl BatchLinearPlan {
 }
 
 fn new_nvfp4_batch_linear_plan(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &super::Nvfp4DeviceLinear,
     capacity: usize,
 ) -> Result<BatchNvfp4LinearPlan> {
     let activation = Nvfp4Matrix::zeroed_col_major(linear.in_features, capacity)?;
     let plan = Fp4TnMatmulPlan::new_f32_output_for_shape(
-        &model.lt,
+        model.batch_lt(),
         GemmShape::new(linear.out_features, capacity, linear.in_features),
         Nvfp4TnInputs::new(linear.cublaslt_weight.matrix(), &activation),
         8 << 20,
@@ -502,7 +573,7 @@ fn new_nvfp4_batch_linear_plan(
 }
 
 fn new_batch_linear_plan(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &Qwen36Linear,
     capacity: usize,
 ) -> Result<Option<BatchLinearPlan>> {
@@ -521,7 +592,7 @@ fn new_batch_linear_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_fp8_batch(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &Fp8Linear,
     plan: &mut BatchFp8LinearPlan,
     _raw_input: &DeviceBuffer<f32>,
@@ -560,7 +631,7 @@ pub(super) fn run_fp8_batch(
     if byte_identical && rows > 1 {
         if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(1) {
             entry.insert(Fp8TnMatmulPlan::new(
-                &model.lt,
+                model.batch_lt(),
                 GemmShape::new(linear.rows, 1, linear.cols),
                 8 << 20,
             )?);
@@ -569,7 +640,7 @@ pub(super) fn run_fp8_batch(
         let plan1 = &plan.plans[&1];
         for row in 0..rows {
             plan1.run_with_alpha_offsets_on_stream(
-                &model.lt,
+                model.batch_lt(),
                 &linear.weight,
                 input,
                 row * linear.cols,
@@ -601,14 +672,14 @@ pub(super) fn run_fp8_batch(
 
     if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(rows) {
         entry.insert(Fp8TnMatmulPlan::new(
-            &model.lt,
+            model.batch_lt(),
             GemmShape::new(linear.rows, rows, linear.cols),
             8 << 20,
         )?);
     }
     if let Some(alpha) = static_alpha {
         plan.plans[&rows].run_with_alpha_on_stream(
-            &model.lt,
+            model.batch_lt(),
             &linear.weight,
             input,
             output.output(),
@@ -618,7 +689,7 @@ pub(super) fn run_fp8_batch(
         return maybe_round_device_f32_to_bf16(output, stream);
     }
     plan.plans[&rows].run_with_alpha_on_stream(
-        &model.lt,
+        model.batch_lt(),
         &linear.weight,
         input,
         output.output(),
@@ -644,7 +715,7 @@ pub(super) fn run_fp8_batch(
 }
 
 fn run_nvfp4_batch(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &super::Nvfp4DeviceLinear,
     plan: &mut BatchNvfp4LinearPlan,
     input: &DeviceBuffer<f32>,
@@ -665,7 +736,7 @@ fn run_nvfp4_batch(
 }
 
 fn run_nvfp4_batch_quantized(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &super::Nvfp4DeviceLinear,
     plan: &mut BatchNvfp4LinearPlan,
     output: &mut DeviceBuffer<f32>,
@@ -677,7 +748,7 @@ fn run_nvfp4_batch_quantized(
         plan.plans.insert(
             rows,
             Fp4TnMatmulPlan::new_f32_output_for_shape(
-                &model.lt,
+                model.batch_lt(),
                 GemmShape::new(linear.out_features, rows, linear.in_features),
                 Nvfp4TnInputs::new(linear.cublaslt_weight.matrix(), &plan.activation),
                 8 << 20,
@@ -685,7 +756,7 @@ fn run_nvfp4_batch_quantized(
         );
     }
     plan.plans[&rows].run_with_alpha_beta_f32_inout_buffer_on_stream(
-        &model.lt,
+        model.batch_lt(),
         Nvfp4TnInputs::new(linear.cublaslt_weight.matrix(), &plan.activation),
         output.inout(),
         linear.weight_scale_2 * linear.input_scale,
@@ -697,7 +768,7 @@ fn run_nvfp4_batch_quantized(
 
 #[allow(clippy::too_many_arguments)]
 fn run_bf16_batch(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &super::Bf16Linear,
     plan: &mut BatchBf16LinearPlan,
     input: &DeviceBuffer<f32>,
@@ -710,7 +781,7 @@ fn run_bf16_batch(
     if byte_identical && rows > 1 {
         if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(1) {
             entry.insert(Bf16TnMatmulPlan::new(
-                &model.lt,
+                model.batch_lt(),
                 GemmShape::new(linear.rows, 1, linear.cols),
                 8 << 20,
             )?);
@@ -718,7 +789,7 @@ fn run_bf16_batch(
         let plan1 = &plan.plans[&1];
         for row in 0..rows {
             plan1.run_offsets_on_stream(
-                &model.lt,
+                model.batch_lt(),
                 &linear.weight,
                 0,
                 &plan.input,
@@ -732,13 +803,13 @@ fn run_bf16_batch(
     }
     if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(rows) {
         entry.insert(Bf16TnMatmulPlan::new(
-            &model.lt,
+            model.batch_lt(),
             GemmShape::new(linear.rows, rows, linear.cols),
             8 << 20,
         )?);
     }
     plan.plans[&rows].run_on_stream(
-        &model.lt,
+        model.batch_lt(),
         &linear.weight,
         &plan.input,
         output.output(),
@@ -749,7 +820,7 @@ fn run_bf16_batch(
 
 #[allow(clippy::too_many_arguments)]
 fn run_linear_batch(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &Qwen36Linear,
     plan: &mut Option<BatchLinearPlan>,
     raw_input: &DeviceBuffer<f32>,
@@ -847,7 +918,7 @@ fn run_linear_batch(
 
 #[allow(clippy::too_many_arguments)]
 fn run_linear_batch_from_set(
-    model: &Qwen36TextModel,
+    model: &dyn Qwen36BatchModel,
     linear: &Qwen36Linear,
     plans: &mut BatchLinearPlanSet,
     raw_input: &DeviceBuffer<f32>,
@@ -963,21 +1034,21 @@ struct BatchLinearAttentionStateSnapshots {
 
 impl BatchLinearAttentionStateSnapshots {
     fn new(
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         state_table_stride: usize,
         slots: usize,
         conv_values: usize,
         recurrent_values: usize,
     ) -> Result<Self> {
-        let mut layer_slots = Vec::with_capacity(model.layers.len());
+        let linear_layer_mask = model.batch_linear_layers();
+        let mut layer_slots = Vec::with_capacity(linear_layer_mask.len());
         let mut linear_layers = 0usize;
-        for block in &model.layers {
-            match &block.attention {
-                Qwen36Attention::LinearAttention(_) => {
-                    layer_slots.push(Some(linear_layers));
-                    linear_layers += 1;
-                }
-                Qwen36Attention::FullAttention(_) => layer_slots.push(None),
+        for is_linear in linear_layer_mask {
+            if is_linear {
+                layer_slots.push(Some(linear_layers));
+                linear_layers += 1;
+            } else {
+                layer_slots.push(None);
             }
         }
         let state_rows =
@@ -1278,25 +1349,25 @@ impl BatchChunkedGdnWorkspace {
 
 impl BatchLinearAttentionWorkspace {
     fn new(
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         weights: &Qwen36LinearAttentionWeights,
         row_capacity: usize,
         state_capacity: usize,
         chunked_prefill: bool,
     ) -> Result<Self> {
         let linear = model
-            .manifest
+            .batch_manifest()
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
-        let state_table_len = model.layers.len() * state_capacity;
+        let state_table_len = model.batch_layer_count() * state_capacity;
         let nulls = vec![std::ptr::null_mut(); state_table_len];
         let mut padding_states = Vec::with_capacity(state_capacity);
         for _ in 0..state_capacity {
             padding_states.push(Qwen36LinearAttentionState::new(linear, weights)?);
         }
         Ok(Self {
-            hidden_quantized: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
+            hidden_quantized: DeviceBuffer::zeroed(row_capacity * model.batch_manifest().hidden)?,
             hidden_scale: DeviceBuffer::zeroed(row_capacity)?,
             value_quantized: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             value_scale: DeviceBuffer::zeroed(row_capacity)?,
@@ -1323,7 +1394,7 @@ impl BatchLinearAttentionWorkspace {
             state_snapshots: None,
             gdn_output: DeviceBuffer::zeroed(row_capacity * value_dim)?,
             normed: DeviceBuffer::zeroed(row_capacity * value_dim)?,
-            output: DeviceBuffer::zeroed(row_capacity * model.manifest.hidden)?,
+            output: DeviceBuffer::zeroed(row_capacity * model.batch_manifest().hidden)?,
             qkv_plan: new_batch_linear_plan(model, &weights.qkv, row_capacity)?,
             z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
             out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
@@ -1371,7 +1442,7 @@ impl BatchLinearAttentionWorkspace {
             .copy_from_host(&self.recurrent_state_ptrs)
     }
 
-    fn enable_state_snapshots(&mut self, model: &Qwen36TextModel, slots: usize) -> Result<()> {
+    fn enable_state_snapshots(&mut self, model: &dyn Qwen36BatchModel, slots: usize) -> Result<()> {
         let state = self
             .padding_states
             .first()
@@ -1427,6 +1498,43 @@ impl BatchLinearAttentionWorkspace {
                     .cast::<f32>();
             }
         }
+        self.conv_state_table
+            .copy_from_host(&self.conv_state_ptrs)?;
+        self.recurrent_state_table
+            .copy_from_host(&self.recurrent_state_ptrs)
+    }
+
+    fn begin_single_prefill(&mut self, tokens: usize) -> Result<()> {
+        self.conv_state_ptrs.fill(std::ptr::null_mut());
+        self.recurrent_state_ptrs.fill(std::ptr::null_mut());
+        if let Some(chunked) = self.chunked_gdn.as_mut() {
+            chunked.prepare(&[tokens as u32])?;
+        }
+        Ok(())
+    }
+
+    fn bind_single_prefill_state(
+        &mut self,
+        layer_idx: usize,
+        state: &mut Qwen36LinearAttentionState,
+    ) -> Result<()> {
+        if layer_idx >= self.conv_state_ptrs.len() {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen hybrid GDN layer",
+                expected: format!("layer < {}", self.conv_state_ptrs.len()),
+                actual: layer_idx.to_string(),
+            });
+        }
+        self.conv_state_ptrs[layer_idx] = state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
+        self.recurrent_state_ptrs[layer_idx] = state
+            .recurrent_state
+            .as_const_ptr()
+            .cast_mut()
+            .cast::<f32>();
+        Ok(())
+    }
+
+    fn upload_single_prefill_states(&mut self) -> Result<()> {
         self.conv_state_table
             .copy_from_host(&self.conv_state_ptrs)?;
         self.recurrent_state_table
@@ -1512,22 +1620,22 @@ struct BatchFullAttentionWorkspace {
 
 impl BatchFullAttentionWorkspace {
     fn new(
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         weights: &Qwen36FullAttentionWeights,
         capacity: usize,
         max_context_tokens: usize,
     ) -> Result<Self> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
-        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
+        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
+        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
         let compact_attention = Sm12xKvAttentionWorkspace::new_gqa_batched(
             max_context_tokens,
-            model.manifest.q_heads,
-            model.manifest.kv_heads,
-            model.manifest.head_dim,
+            model.batch_manifest().q_heads,
+            model.batch_manifest().kv_heads,
+            model.batch_manifest().head_dim,
             8,
         )?;
         Ok(Self {
-            hidden_quantized: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
+            hidden_quantized: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
             hidden_scale: DeviceBuffer::zeroed(capacity)?,
             value_quantized: DeviceBuffer::zeroed(capacity * q_width)?,
             value_scale: DeviceBuffer::zeroed(capacity)?,
@@ -1541,7 +1649,7 @@ impl BatchFullAttentionWorkspace {
             k_rope: DeviceBuffer::zeroed(capacity * kv_width)?,
             attention: DeviceBuffer::zeroed(capacity * q_width)?,
             gated_attention: DeviceBuffer::zeroed(capacity * q_width)?,
-            output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
+            output: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
             compact_attention,
             q_plan: new_batch_linear_plan(model, &weights.q, capacity)?,
             k_plan: new_batch_linear_plan(model, &weights.k, capacity)?,
@@ -1596,8 +1704,8 @@ struct BatchMoeWorkspace {
     shared_output: DeviceBuffer<f32>,
     shared_gate: DeviceBuffer<f32>,
     shared_gate_plan: BatchBf16LinearPlan,
-    shared_gate_up_plan: BatchNvfp4LinearPlan,
-    shared_down_plan: BatchNvfp4LinearPlan,
+    shared_gate_up_plan: Option<BatchNvfp4LinearPlan>,
+    shared_down_plan: Option<BatchNvfp4LinearPlan>,
     grouped: BatchGroupedMoeWorkspace,
     output: DeviceBuffer<f32>,
 }
@@ -1636,7 +1744,7 @@ struct BatchGroupedMoeWorkspace {
 }
 
 impl BatchGroupedMoeWorkspace {
-    fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, rows: usize) -> Result<Self> {
+    fn new(model: &dyn Qwen36BatchModel, weights: &Qwen36MoeWeights, rows: usize) -> Result<Self> {
         let routes_per_row = weights.experts_per_token;
         let routes = rows * routes_per_row;
         let experts = weights.num_experts;
@@ -1648,7 +1756,7 @@ impl BatchGroupedMoeWorkspace {
                 rows,
                 routes_per_row,
                 experts,
-                model.manifest.hidden,
+                model.batch_manifest().hidden,
             )?,
             down_input: MoeSortedNvfp4Rows::new(
                 rows,
@@ -1659,20 +1767,20 @@ impl BatchGroupedMoeWorkspace {
             gate_up_plan: CutlassFp4GroupedGemmPlan::new(
                 weights.expert_intermediate * 2,
                 routes,
-                model.manifest.hidden,
+                model.batch_manifest().hidden,
                 experts,
             )?,
             down_plan: CutlassFp4GroupedGemmPlan::new(
-                model.manifest.hidden,
+                model.batch_manifest().hidden,
                 routes,
                 weights.expert_intermediate,
                 experts,
             )?,
             gate_up: DeviceBuffer::zeroed(routes * weights.expert_intermediate * 2)?,
-            down: DeviceBuffer::zeroed(routes * model.manifest.hidden)?,
+            down: DeviceBuffer::zeroed(routes * model.batch_manifest().hidden)?,
             gate_up_output_table: DeviceBuffer::zeroed(experts)?,
             down_output_table: DeviceBuffer::zeroed(experts)?,
-            routed_output: DeviceBuffer::zeroed(rows * model.manifest.hidden)?,
+            routed_output: DeviceBuffer::zeroed(rows * model.batch_manifest().hidden)?,
         })
     }
 
@@ -1855,7 +1963,11 @@ impl Qwen36PrefillBatchWorkspace {
 }
 
 impl BatchMoeWorkspace {
-    fn new(model: &Qwen36TextModel, weights: &Qwen36MoeWeights, capacity: usize) -> Result<Self> {
+    fn new(
+        model: &dyn Qwen36BatchModel,
+        weights: &Qwen36MoeWeights,
+        capacity: usize,
+    ) -> Result<Self> {
         if !matches!(weights.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
             return Err(crate::nvfp4::Error::Format {
                 label: "Qwen3.6 batched routed gate/up",
@@ -1868,19 +1980,25 @@ impl BatchMoeWorkspace {
                 detail: "grouped W4A4 expert weights are unavailable".to_string(),
             });
         }
-        if weights.storage_plan.down != Qwen36DownStorage::Sm12x {
-            return Err(crate::nvfp4::Error::Format {
-                label: "Qwen3.6 batched routed down",
-                detail: "the current model does not use the SM12x routed-down path".to_string(),
-            });
-        }
         let routes = capacity * weights.experts_per_token;
         let gate_up_width = weights.expert_intermediate * 2;
-        let Qwen36SharedExpertStorage::Nvfp4(shared) = &weights.shared else {
-            return Err(crate::nvfp4::Error::Format {
-                label: "Qwen3.6 batched shared expert",
-                detail: "the current model does not use NVFP4 shared experts".to_string(),
-            });
+        let (shared_gate_up_plan, shared_down_plan) = match &weights.shared {
+            Qwen36SharedExpertStorage::Nvfp4(shared) => (
+                Some(new_nvfp4_batch_linear_plan(
+                    model,
+                    &shared.gate_up,
+                    capacity,
+                )?),
+                Some(new_nvfp4_batch_linear_plan(model, &shared.down, capacity)?),
+            ),
+            Qwen36SharedExpertStorage::Bf16 { .. } => (None, None),
+            Qwen36SharedExpertStorage::Fp8 { .. } => {
+                return Err(crate::nvfp4::Error::Format {
+                    label: "Qwen3.6 batched shared expert",
+                    detail: "FP8 shared experts are not supported by the grouped batch path"
+                        .to_string(),
+                });
+            }
         };
         let grouped = BatchGroupedMoeWorkspace::new(model, weights, capacity)?;
         Ok(Self {
@@ -1890,13 +2008,13 @@ impl BatchMoeWorkspace {
             route_weights: DeviceBuffer::zeroed(routes)?,
             shared_gate_up: DeviceBuffer::zeroed(capacity * gate_up_width)?,
             shared_activated: DeviceBuffer::zeroed(capacity * weights.expert_intermediate)?,
-            shared_output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
+            shared_output: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
             shared_gate: DeviceBuffer::zeroed(capacity)?,
             shared_gate_plan: BatchBf16LinearPlan::new(model, &weights.shared_gate, capacity)?,
-            shared_gate_up_plan: new_nvfp4_batch_linear_plan(model, &shared.gate_up, capacity)?,
-            shared_down_plan: new_nvfp4_batch_linear_plan(model, &shared.down, capacity)?,
+            shared_gate_up_plan,
+            shared_down_plan,
             grouped,
-            output: DeviceBuffer::zeroed(capacity * model.manifest.hidden)?,
+            output: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
         })
     }
 
@@ -1910,22 +2028,133 @@ impl BatchMoeWorkspace {
             + self.shared_output.device_bytes()
             + self.shared_gate.device_bytes()
             + self.shared_gate_plan.device_bytes()
-            + self
-                .shared_gate_up_plan
-                .plans
-                .values()
-                .map(Fp4TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self.shared_gate_up_plan.activation.device_bytes()
-            + self
-                .shared_down_plan
-                .plans
-                .values()
-                .map(Fp4TnMatmulPlan::workspace_bytes)
-                .sum::<usize>()
-            + self.shared_down_plan.activation.device_bytes()
+            + self.shared_gate_up_plan.as_ref().map_or(0, |plan| {
+                plan.plans
+                    .values()
+                    .map(Fp4TnMatmulPlan::workspace_bytes)
+                    .sum::<usize>()
+                    + plan.activation.device_bytes()
+            })
+            + self.shared_down_plan.as_ref().map_or(0, |plan| {
+                plan.plans
+                    .values()
+                    .map(Fp4TnMatmulPlan::workspace_bytes)
+                    .sum::<usize>()
+                    + plan.activation.device_bytes()
+            })
             + self.grouped.device_bytes()
             + self.output.device_bytes()
+    }
+}
+
+/// Shared vectorized GDN and MoE scratch for hybrid-model prompt chunks.
+pub(crate) struct Qwen36HybridPrefillWorkspace {
+    token_capacity: usize,
+    sequence_offsets: DeviceBuffer<u32>,
+    sequence_lengths: DeviceBuffer<u32>,
+    linear: BatchLinearAttentionWorkspace,
+    moe: Box<BatchMoeWorkspace>,
+    zero_residual: DeviceBuffer<f32>,
+}
+
+impl Qwen36HybridPrefillWorkspace {
+    pub(crate) fn new(
+        model: &Qwen36BatchModelView<'_>,
+        linear: &Qwen36LinearAttentionWeights,
+        moe: &Qwen36MoeWeights,
+        token_capacity: usize,
+    ) -> Result<Self> {
+        let mut sequence_offsets = DeviceBuffer::zeroed(1)?;
+        sequence_offsets.copy_from_host(&[0])?;
+        Ok(Self {
+            token_capacity,
+            sequence_offsets,
+            sequence_lengths: DeviceBuffer::zeroed(1)?,
+            linear: BatchLinearAttentionWorkspace::new(model, linear, token_capacity, 1, true)?,
+            moe: Box::new(BatchMoeWorkspace::new(model, moe, token_capacity)?),
+            zero_residual: DeviceBuffer::zeroed(token_capacity * model.batch_manifest().hidden)?,
+        })
+    }
+
+    pub(crate) fn run_gdn<'a>(
+        &'a mut self,
+        model: &Qwen36BatchModelView<'_>,
+        weights: &Qwen36LinearAttentionWeights,
+        hidden: &DeviceBuffer<f32>,
+        layer: usize,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.require_tokens(tokens)?;
+        weights.enqueue_prefill_chunks(
+            model,
+            &mut self.linear,
+            hidden,
+            &self.sequence_offsets,
+            &self.sequence_lengths,
+            &[tokens as u32],
+            layer,
+            1,
+            1,
+            tokens,
+            tokens,
+            false,
+            false,
+            true,
+            stream,
+        )?;
+        Ok(&self.linear.output)
+    }
+
+    pub(crate) fn begin_gdn_prefill(&mut self, tokens: usize) -> Result<()> {
+        self.require_tokens(tokens)?;
+        self.sequence_lengths.copy_from_host(&[tokens as u32])?;
+        self.linear.begin_single_prefill(tokens)
+    }
+
+    pub(crate) fn bind_gdn_state(
+        &mut self,
+        layer: usize,
+        state: &mut Qwen36LinearAttentionState,
+    ) -> Result<()> {
+        self.linear.bind_single_prefill_state(layer, state)
+    }
+
+    pub(crate) fn finish_gdn_prefill(&mut self) -> Result<()> {
+        self.linear.upload_single_prefill_states()
+    }
+
+    pub(crate) fn run_moe<'a>(
+        &'a mut self,
+        model: &Qwen36BatchModelView<'_>,
+        weights: &Qwen36MoeWeights,
+        hidden: &DeviceBuffer<f32>,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.require_tokens(tokens)?;
+        weights.run_batch(
+            model,
+            &mut self.moe,
+            hidden,
+            &self.zero_residual,
+            tokens,
+            false,
+            stream,
+            None,
+        )?;
+        Ok(&self.moe.output)
+    }
+
+    fn require_tokens(&self, tokens: usize) -> Result<()> {
+        if tokens == 0 || tokens > self.token_capacity {
+            return Err(crate::nvfp4::Error::Shape {
+                label: "Qwen hybrid prefill tokens",
+                expected: format!("1..={} tokens", self.token_capacity),
+                actual: tokens.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2206,7 +2435,7 @@ impl Qwen36LayerBlock {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_batch_tail(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         ffn: &mut BatchFfnWorkspace,
         hidden: &DeviceBuffer<f32>,
         attention_output: &DeviceBuffer<f32>,
@@ -2221,16 +2450,16 @@ impl Qwen36LayerBlock {
             hidden,
             attention_output,
             attn_residual.output(),
-            capacity * model.manifest.hidden,
+            capacity * model.batch_manifest().hidden,
             stream,
         )?;
         rms_norm_f32_into_on_stream(
             capacity,
-            model.manifest.hidden,
+            model.batch_manifest().hidden,
             attn_residual,
             &self.post_attn_norm,
             ffn_norm.output(),
-            model.manifest.rms_eps,
+            model.batch_manifest().rms_eps,
             stream,
         )?;
         self.moe.run_batch(
@@ -2676,6 +2905,7 @@ impl Qwen36TextModel {
                         total_tokens,
                         workspace.serial_linear_attention_projections,
                         workspace.serial_linear_attention_recurrence,
+                        false,
                         stream,
                     )?;
                     &workspace.linear.output
@@ -2797,6 +3027,7 @@ impl Qwen36TextModel {
                             *token_capacity,
                             *serial_linear_attention_projections,
                             *serial_linear_attention_recurrence,
+                            false,
                             stream,
                         )?;
                         block.enqueue_batch_tail(
@@ -4298,7 +4529,7 @@ mod tests {
 impl Qwen36LinearAttentionWeights {
     fn enqueue_batch(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchLinearAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
         layer_idx: usize,
@@ -4306,7 +4537,7 @@ impl Qwen36LinearAttentionWeights {
         stream: &CudaStream,
     ) -> Result<()> {
         let linear = model
-            .manifest
+            .batch_manifest()
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
@@ -4316,7 +4547,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.hidden_quantized,
             &mut workspace.hidden_scale,
             capacity,
-            model.manifest.hidden,
+            model.batch_manifest().hidden,
             stream,
         )?;
         run_linear_batch(
@@ -4406,7 +4637,7 @@ impl Qwen36LinearAttentionWeights {
                 &workspace.z_output,
                 &self.norm_weight,
                 &mut plan.activation,
-                model.manifest.rms_eps,
+                model.batch_manifest().rms_eps,
                 out.input_scale,
                 stream,
             )?;
@@ -4426,7 +4657,7 @@ impl Qwen36LinearAttentionWeights {
             workspace.normed.output(),
             capacity * linear.value_heads,
             linear.value_head_dim,
-            model.manifest.rms_eps,
+            model.batch_manifest().rms_eps,
             stream,
         )?;
         let value_quantization = prepare_fp8_batch_input(
@@ -4457,7 +4688,7 @@ impl Qwen36LinearAttentionWeights {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_prefill_chunks(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchLinearAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
         sequence_offsets: &DeviceBuffer<u32>,
@@ -4470,10 +4701,11 @@ impl Qwen36LinearAttentionWeights {
         row_capacity: usize,
         serial_projections: bool,
         serial_recurrence: bool,
+        sigmoid_output_gate: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         let linear = model
-            .manifest
+            .batch_manifest()
             .linear_attention
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
@@ -4483,7 +4715,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.hidden_quantized,
             &mut workspace.hidden_scale,
             row_capacity,
-            model.manifest.hidden,
+            model.batch_manifest().hidden,
             stream,
         )?;
         run_linear_batch(
@@ -4787,16 +5019,29 @@ impl Qwen36LinearAttentionWeights {
                 stream,
             )?;
         }
-        gated_rms_norm_f32_into_on_stream(
-            &workspace.gdn_output,
-            &workspace.z_output,
-            &self.norm_weight,
-            workspace.normed.output(),
-            row_capacity * linear.value_heads,
-            linear.value_head_dim,
-            model.manifest.rms_eps,
-            stream,
-        )?;
+        if sigmoid_output_gate {
+            ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
+                &workspace.gdn_output,
+                &workspace.z_output,
+                &self.norm_weight,
+                workspace.normed.output(),
+                row_capacity * linear.value_heads,
+                linear.value_head_dim,
+                model.batch_manifest().rms_eps,
+                stream,
+            )?;
+        } else {
+            gated_rms_norm_f32_into_on_stream(
+                &workspace.gdn_output,
+                &workspace.z_output,
+                &self.norm_weight,
+                workspace.normed.output(),
+                row_capacity * linear.value_heads,
+                linear.value_head_dim,
+                model.batch_manifest().rms_eps,
+                stream,
+            )?;
+        }
         let value_quantization = prepare_fp8_batch_input(
             &[&self.out],
             &workspace.normed,
@@ -4827,7 +5072,7 @@ impl Qwen36FullAttentionWeights {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_batch_pre(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchFullAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
         positions: &DeviceBuffer<u32>,
@@ -4840,7 +5085,7 @@ impl Qwen36FullAttentionWeights {
             &mut workspace.hidden_quantized,
             &mut workspace.hidden_scale,
             capacity,
-            model.manifest.hidden,
+            model.batch_manifest().hidden,
             stream,
         )?;
         run_linear_batch(
@@ -4894,15 +5139,15 @@ impl Qwen36FullAttentionWeights {
             workspace.gate.output(),
             workspace.k.output(),
             capacity,
-            model.manifest.q_heads,
-            model.manifest.kv_heads,
-            model.manifest.head_dim,
-            model.manifest.rms_eps,
+            model.batch_manifest().q_heads,
+            model.batch_manifest().kv_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rms_eps,
             stream,
         )?;
         let sections =
             model
-                .manifest
+                .batch_manifest()
                 .mrope_sections
                 .ok_or_else(|| crate::nvfp4::Error::Format {
                     label: "Qwen3.6 batched IMRoPE",
@@ -4916,26 +5161,26 @@ impl Qwen36FullAttentionWeights {
         };
         rope_imrope_text_batch_f32_into_on_stream(
             capacity,
-            model.manifest.q_heads,
-            model.manifest.head_dim,
-            model.manifest.rotary_dim,
+            model.batch_manifest().q_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
             sections,
             positions,
             &workspace.q,
             workspace.q_rope.output(),
-            model.manifest.rope_theta,
+            model.batch_manifest().rope_theta,
             stream,
         )?;
         rope_imrope_text_batch_f32_into_on_stream(
             capacity,
-            model.manifest.kv_heads,
-            model.manifest.head_dim,
-            model.manifest.rotary_dim,
+            model.batch_manifest().kv_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
             sections,
             positions,
             &workspace.k,
             workspace.k_rope.output(),
-            model.manifest.rope_theta,
+            model.batch_manifest().rope_theta,
             stream,
         )
     }
@@ -4943,7 +5188,7 @@ impl Qwen36FullAttentionWeights {
     #[allow(clippy::too_many_arguments)]
     fn enqueue_batch_cache(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchFullAttentionWorkspace,
         rows: &mut [Qwen36DecodeStateRow<'_>],
         layer_idx: usize,
@@ -4952,8 +5197,8 @@ impl Qwen36FullAttentionWeights {
         cache: &mut Qwen36SequenceCache,
         appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
-        let kv_width = model.manifest.kv_heads * model.manifest.head_dim;
+        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
+        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
         for (row, (decode_row, append)) in
             rows.iter_mut().zip(appends).enumerate().take(active_rows)
         {
@@ -5082,12 +5327,12 @@ impl Qwen36FullAttentionWeights {
 
     fn enqueue_batch_post(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchFullAttentionWorkspace,
         capacity: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let q_width = model.manifest.q_heads * model.manifest.head_dim;
+        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
         sigmoid_mul_f32_prefix_into_on_stream(
             &workspace.gate,
             &workspace.attention,
@@ -5125,7 +5370,7 @@ impl Qwen36LayerFfnWeights {
     #[allow(clippy::too_many_arguments)]
     fn run_batch(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchFfnWorkspace,
         ffn_norm: &DeviceBuffer<f32>,
         residual: &DeviceBuffer<f32>,
@@ -5203,7 +5448,7 @@ impl Qwen36LayerFfnWeights {
                     residual,
                     &workspace.down,
                     workspace.output.output(),
-                    capacity * model.manifest.hidden,
+                    capacity * model.batch_manifest().hidden,
                     stream,
                 )?;
                 round_f32_to_bf16_in_place_on_stream(workspace.output.inout(), stream)
@@ -5219,7 +5464,7 @@ impl Qwen36LayerFfnWeights {
 impl Qwen36MoeWeights {
     fn enqueue_shared_batch(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchMoeWorkspace,
         ffn_norm: &DeviceBuffer<f32>,
         capacity: usize,
@@ -5227,10 +5472,16 @@ impl Qwen36MoeWeights {
     ) -> Result<()> {
         match &self.shared {
             Qwen36SharedExpertStorage::Nvfp4(shared) => {
+                let gate_up_plan = workspace.shared_gate_up_plan.as_mut().ok_or_else(|| {
+                    crate::nvfp4::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "NVFP4 shared gate/up has no batch plan".to_string(),
+                    }
+                })?;
                 run_nvfp4_batch(
                     model,
                     &shared.gate_up,
-                    &mut workspace.shared_gate_up_plan,
+                    gate_up_plan,
                     ffn_norm,
                     &mut workspace.shared_gate_up,
                     capacity,
@@ -5243,10 +5494,16 @@ impl Qwen36MoeWeights {
                     self.expert_intermediate,
                     stream,
                 )?;
+                let down_plan = workspace.shared_down_plan.as_mut().ok_or_else(|| {
+                    crate::nvfp4::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "NVFP4 shared down has no batch plan".to_string(),
+                    }
+                })?;
                 run_nvfp4_batch(
                     model,
                     &shared.down,
-                    &mut workspace.shared_down_plan,
+                    down_plan,
                     &workspace.shared_activated,
                     &mut workspace.shared_output,
                     capacity,
@@ -5296,7 +5553,7 @@ impl Qwen36MoeWeights {
     #[allow(clippy::too_many_arguments)]
     fn run_batch(
         &self,
-        model: &Qwen36TextModel,
+        model: &dyn Qwen36BatchModel,
         workspace: &mut BatchMoeWorkspace,
         ffn_norm: &DeviceBuffer<f32>,
         residual: &DeviceBuffer<f32>,
@@ -5383,7 +5640,7 @@ impl Qwen36MoeWeights {
                 &grouped.sorted_routes,
                 &mut grouped.down,
                 &mut grouped.down_output_table,
-                model.manifest.hidden,
+                model.batch_manifest().hidden,
                 stream,
             )?;
             grouped.down_plan.run_on_stream(
@@ -5403,7 +5660,7 @@ impl Qwen36MoeWeights {
                 grouped.routed_output.output(),
                 capacity,
                 self.experts_per_token,
-                model.manifest.hidden,
+                model.batch_manifest().hidden,
                 stream,
             )?;
         }
@@ -5422,7 +5679,7 @@ impl Qwen36MoeWeights {
             residual,
             workspace.output.output(),
             capacity,
-            model.manifest.hidden,
+            model.batch_manifest().hidden,
             stream,
         )?;
         Ok(())

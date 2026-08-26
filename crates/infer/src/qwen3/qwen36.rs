@@ -4,6 +4,7 @@ mod batch;
 mod dflash2;
 mod mtp;
 
+pub(crate) use batch::{Qwen36BatchModelView, Qwen36HybridPrefillWorkspace};
 pub use batch::{
     Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow,
     Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,

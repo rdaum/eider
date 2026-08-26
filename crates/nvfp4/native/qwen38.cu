@@ -353,7 +353,8 @@ __global__ void qwen38_repeat_streams_kernel(const float* input,
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x
         + threadIdx.x;
     if (index < count) {
-        output[index] = input[index % hidden];
+        const std::size_t token = index / (static_cast<std::size_t>(hc_count) * hidden);
+        output[index] = input[token * hidden + index % hidden];
     }
 }
 
@@ -506,13 +507,14 @@ extern "C" cudaError_t infer_qwen38_hc_combine_f32_on_stream(
 extern "C" cudaError_t infer_qwen38_repeat_streams_f32_on_stream(
         const float* input,
         float* output,
+        std::uint32_t tokens,
         std::uint32_t hidden,
         std::uint32_t hc_count,
         cudaStream_t stream) {
-    if (input == nullptr || output == nullptr || hidden == 0 || hc_count == 0) {
+    if (input == nullptr || output == nullptr || tokens == 0 || hidden == 0 || hc_count == 0) {
         return cudaErrorInvalidValue;
     }
-    const std::size_t count = static_cast<std::size_t>(hidden) * hc_count;
+    const std::size_t count = static_cast<std::size_t>(tokens) * hidden * hc_count;
     constexpr int threads = 256;
     const unsigned int blocks = static_cast<unsigned int>((count + threads - 1) / threads);
     qwen38_repeat_streams_kernel<<<blocks, threads, 0, stream>>>(

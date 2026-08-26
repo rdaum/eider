@@ -112,6 +112,54 @@ impl Qwen38QsaWeights {
         )?;
         Ok(step.output)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_prefill_row(
+        &self,
+        workspace: &mut Qwen38QsaWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page_table: &DeviceBuffer<u32>,
+        page: &Sm12xPage,
+        page_offset: usize,
+        config: &Qwen38FlashNextConfig,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        row_hidden: &mut DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        row: usize,
+        layer: usize,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let hidden_width = config.hidden;
+        row_hidden.copy_range_from_device_on_stream(
+            0,
+            hidden,
+            row * hidden_width,
+            hidden_width,
+            stream,
+        )?;
+        let row_output = self.run_one_token(
+            workspace,
+            backend,
+            page_table,
+            page,
+            page_offset,
+            config,
+            manifest,
+            row_hidden,
+            layer,
+            position,
+            stream,
+        )?;
+        output.copy_range_from_device_on_stream(
+            row * hidden_width,
+            row_output,
+            0,
+            hidden_width,
+            stream,
+        )
+    }
 }
 
 impl Qwen38QsaWorkspace {

@@ -442,20 +442,22 @@ pub fn qwen38_hc_combine_f32_into_on_stream(
     }
 }
 
-/// Repeats one hidden vector into the initial hyperconnection streams.
+/// Repeats each hidden row into its initial hyperconnection streams.
 pub fn qwen38_repeat_streams_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
     mut output: DeviceOutput<'_, f32>,
+    tokens: usize,
     hidden: usize,
     hc_count: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    validate_dims(1, hidden, hc_count)?;
-    let count = checked_values(hidden, hc_count, "Qwen3.8 initial streams")?;
-    if input.len() != hidden || output.len() < count {
+    validate_dims(tokens, hidden, hc_count)?;
+    let input_count = checked_values(tokens, hidden, "Qwen3.8 initial hidden")?;
+    let count = checked_values(input_count, hc_count, "Qwen3.8 initial streams")?;
+    if input.len() < input_count || output.len() < count {
         return Err(Error::Shape {
             label: "Qwen3.8 initial streams",
-            expected: format!("input={hidden}, output>={count}"),
+            expected: format!("input>={input_count}, output>={count}"),
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
@@ -465,6 +467,7 @@ pub fn qwen38_repeat_streams_f32_into_on_stream(
             ffi::infer_qwen38_repeat_streams_f32_on_stream(
                 input.ptr,
                 output.buffer_mut().ptr,
+                tokens as u32,
                 hidden as u32,
                 hc_count as u32,
                 stream.as_raw(),
@@ -631,7 +634,7 @@ mod tests {
         Qwen38QsaIndexPool, Qwen38QsaSelectionWorkspace, qwen38_hc_collapse_f32_into_on_stream,
         qwen38_hc_combine_f32_into_on_stream, qwen38_hc_norm_f32_into_on_stream,
         qwen38_hc_silu_scale_f32_in_place_on_stream, qwen38_ple_conv_update_f32_into_on_stream,
-        qwen38_ple_gate_value_f32_into_on_stream,
+        qwen38_ple_gate_value_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
     };
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{CudaStream, DeviceBuffer};
@@ -828,6 +831,28 @@ mod tests {
         const HIDDEN: usize = 4;
         const HC: usize = 2;
         const EPS: f32 = 1e-6;
+        let hidden_host = (0..TOKENS * HIDDEN)
+            .map(|index| (index as f32 - 3.0) / 5.0)
+            .collect::<Vec<_>>();
+        let hidden = DeviceBuffer::from_host(&hidden_host).expect("hidden");
+        let mut repeated = DeviceBuffer::zeroed(TOKENS * HIDDEN * HC).expect("repeated");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        qwen38_repeat_streams_f32_into_on_stream(
+            &hidden,
+            repeated.output(),
+            TOKENS,
+            HIDDEN,
+            HC,
+            &stream,
+        )
+        .expect("repeat streams");
+        let repeated_host = repeated.copy_to_host(&stream).expect("repeat readback");
+        let repeated_expected = hidden_host
+            .chunks_exact(HIDDEN)
+            .flat_map(|row| std::iter::repeat_n(row, HC).flatten().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(repeated_host, repeated_expected);
+
         let input_host = (0..TOKENS * HIDDEN * HC)
             .map(|index| (index as f32 - 5.0) / 4.0)
             .collect::<Vec<_>>();
@@ -837,7 +862,6 @@ mod tests {
         let input = DeviceBuffer::from_host(&input_host).expect("input");
         let delta = DeviceBuffer::from_host(&delta_host).expect("delta");
         let mut normed = DeviceBuffer::zeroed(input_host.len()).expect("normed");
-        let stream = CudaStream::new_non_blocking().expect("stream");
         qwen38_hc_norm_f32_into_on_stream(
             &input,
             &delta,

@@ -8,7 +8,9 @@ use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::nvfp4::{DeviceBuffer, Error, GpuSamplingRow, GpuTokenSampler, Result};
-use crate::qwen38_flash_next::{Qwen38FlashNextModel, Qwen38LogitsMode};
+use crate::qwen38_flash_next::{
+    Qwen38FlashNextModel, Qwen38FlashNextPrefillWorkspace, Qwen38LogitsMode,
+};
 use crate::runtime::qwen38_flash_next_sequence::{
     Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
     new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
@@ -98,6 +100,7 @@ struct ActiveRequest<'tokenizer> {
 /// Decode-first multi-session service for the native QSA runtime.
 pub struct Qwen38FlashNextChatService<'template> {
     model: Qwen38FlashNextModel,
+    prefill_workspace: Qwen38FlashNextPrefillWorkspace,
     sequence_cache: Qwen38FlashNextSequenceCache,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -140,6 +143,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 actual: config.speculative_drafts.to_string(),
             });
         }
+        let prefill_workspace = model.new_prefill_workspace(config.prefill_token_capacity)?;
         let sequence_cache = new_qwen38_flash_next_sequence_cache_with_config(
             &model,
             config.max_active_sequences,
@@ -149,6 +153,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let gpu_sampler = GpuTokenSampler::new(1, model.config().vocab)?;
         Ok(Self {
             model,
+            prefill_workspace,
             sequence_cache,
             template,
             config,
@@ -419,17 +424,21 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             .as_deref_mut()
             .expect("request is admitted");
         let start = request.prompt_position;
-        for (offset, &token) in request.prompt[start..end].iter().enumerate() {
-            let final_prompt_token = start + offset + 1 == request.prompt.len();
-            let logits = if !final_prompt_token {
-                Qwen38LogitsMode::None
-            } else if request.sampler.config().uses_fast_argmax() {
-                Qwen38LogitsMode::Top1
-            } else {
-                Qwen38LogitsMode::Full
-            };
-            sequence.forward_token(&mut self.model, &mut self.sequence_cache, token, logits)?;
-        }
+        let final_prompt_chunk = end == request.prompt.len();
+        let logits = if !final_prompt_chunk {
+            Qwen38LogitsMode::None
+        } else if request.sampler.config().uses_fast_argmax() {
+            Qwen38LogitsMode::Top1
+        } else {
+            Qwen38LogitsMode::Full
+        };
+        sequence.forward_tokens(
+            &mut self.model,
+            &mut self.prefill_workspace,
+            &mut self.sequence_cache,
+            &request.prompt[start..end],
+            logits,
+        )?;
         request.prompt_position = end;
         request.prompt_logits_ready = end == request.prompt.len();
         Self::retain_request_checkpoint(&self.model, &mut self.sequence_cache, request);

@@ -6,8 +6,8 @@ use super::sm12x_sequence_cache::{
 use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
 use crate::qwen3::infer::QwenLayerKind;
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
-    Qwen38LogitsMode, Qwen38NextToken,
+    Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextPrefillWorkspace,
+    Qwen38FlashNextSequenceSnapshot, Qwen38LogitsMode, Qwen38NextToken,
 };
 use crate::runtime::cache_config::SequenceCacheConfig;
 use seqcache::{
@@ -163,6 +163,26 @@ impl Qwen38FlashNextSequence {
             self.cache_id,
             &mut self.page_table,
             token,
+            logits,
+        )
+    }
+
+    /// Commits one vectorized prompt chunk with optional final-row logits.
+    pub(crate) fn forward_tokens(
+        &mut self,
+        model: &mut Qwen38FlashNextModel,
+        workspace: &mut Qwen38FlashNextPrefillWorkspace,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        tokens: &[u32],
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
+        model.forward_tokens(
+            &mut self.state,
+            workspace,
+            cache,
+            self.cache_id,
+            &mut self.page_table,
+            tokens,
             logits,
         )
     }

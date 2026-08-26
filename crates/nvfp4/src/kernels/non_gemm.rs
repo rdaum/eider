@@ -11419,7 +11419,7 @@ pub fn ling3_kda_128_f32_chunks_into_on_stream(
     }
 }
 
-/// Applies per-row RMSNorm and Ling's sigmoid output gate.
+/// Applies per-row RMSNorm and Ling's sigmoid output gate to a buffer prefix.
 #[allow(clippy::too_many_arguments)]
 pub fn ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
@@ -11436,16 +11436,16 @@ pub fn ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
         || cols == 0
         || rows > u32::MAX as usize
         || cols > u32::MAX as usize
-        || input.len() != len
-        || gate.len() != len
+        || input.len() < len
+        || gate.len() < len
         || weight.len() != cols
-        || output.len() != len
+        || output.len() < len
         || !eps.is_finite()
         || eps < 0.0
     {
         return Err(Error::Shape {
             label: "Ling 3 sigmoid-gated RMSNorm buffers",
-            expected: format!("input/gate/output={len} weight={cols}"),
+            expected: format!("input/gate/output>={len} weight={cols}"),
             actual: format!(
                 "input={} gate={} weight={} output={} rows={rows} cols={cols} eps={eps}",
                 input.len(),

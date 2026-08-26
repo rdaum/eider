@@ -3401,6 +3401,7 @@ unsafe extern "C" {
     pub(crate) fn infer_qwen38_repeat_streams_f32_on_stream(
         input: *const f32,
         output: *mut f32,
+        tokens: u32,
         hidden: u32,
         hc_count: u32,
         stream: cudaStream_t,

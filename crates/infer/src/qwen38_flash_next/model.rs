@@ -9,9 +9,10 @@ use crate::nvfp4::{
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
-    Qwen36Embedding, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
-    Qwen36LinearAttentionWorkspace, Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36MoeWeights,
-    Qwen36MoeWorkspace, load_hybrid_full_attention, load_hybrid_linear_attention,
+    Qwen36BatchModelView, Qwen36Embedding, Qwen36HybridPrefillWorkspace,
+    Qwen36LinearAttentionState, Qwen36LinearAttentionWeights, Qwen36LinearAttentionWorkspace,
+    Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36MoeWeights, Qwen36MoeWorkspace,
+    load_hybrid_full_attention, load_hybrid_linear_attention,
 };
 use crate::runtime::qwen38_flash_next_sequence::{
     Qwen38FlashNextSequenceCache, qwen38_flash_next_cache_error,
@@ -92,6 +93,23 @@ pub struct Qwen38FlashNextDecodeState {
     lm_head: Qwen36LmHeadWorkspace,
     position: usize,
     max_tokens: usize,
+}
+
+/// Shared vectorized workspace for one scheduler-selected prompt chunk.
+pub(crate) struct Qwen38FlashNextPrefillWorkspace {
+    token_capacity: usize,
+    token_ids: DeviceBuffer<u32>,
+    streams_a: DeviceBuffer<f32>,
+    streams_b: DeviceBuffer<f32>,
+    hidden: DeviceBuffer<f32>,
+    qsa_output: DeviceBuffer<f32>,
+    qsa_row_hidden: DeviceBuffer<f32>,
+    attention_hyper: Qwen38HyperConnectionWorkspace,
+    mlp_hyper: Qwen38HyperConnectionWorkspace,
+    ple_pager: Qwen38PagedPle,
+    ple: Qwen38PleWorkspace,
+    hybrid: Qwen36HybridPrefillWorkspace,
+    linear_layers: Vec<bool>,
 }
 
 /// Immutable page-aligned snapshot of Flash Next's non-pageable sequence state.
@@ -295,6 +313,64 @@ impl Qwen38FlashNextModel {
         })
     }
 
+    /// Allocates one shared prompt workspace for vectorized scheduler chunks.
+    pub(crate) fn new_prefill_workspace(
+        &self,
+        token_capacity: usize,
+    ) -> Result<Qwen38FlashNextPrefillWorkspace> {
+        if token_capacity == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next prefill capacity",
+                expected: "positive token capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let linear_layers = self
+            .layers
+            .iter()
+            .map(|layer| matches!(layer.attention, Qwen38AttentionWeights::Linear(_)))
+            .collect::<Vec<_>>();
+        let first_linear = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Qwen38AttentionWeights::Linear(weights) => Some(weights),
+                Qwen38AttentionWeights::Qsa(_) => None,
+            })
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next prefill",
+                detail: "model has no GDN layer".to_string(),
+            })?;
+        let first_moe = &self
+            .layers
+            .first()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next prefill",
+                detail: "model has no transformer layers".to_string(),
+            })?
+            .moe;
+        let hybrid = {
+            let model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &linear_layers);
+            Qwen36HybridPrefillWorkspace::new(&model, first_linear, first_moe, token_capacity)?
+        };
+        let hc_dim = self.config.hidden * self.config.hc_count;
+        Ok(Qwen38FlashNextPrefillWorkspace {
+            token_capacity,
+            token_ids: DeviceBuffer::zeroed(token_capacity)?,
+            streams_a: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            streams_b: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            hidden: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
+            qsa_output: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
+            qsa_row_hidden: DeviceBuffer::zeroed(self.config.hidden)?,
+            attention_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, token_capacity)?,
+            mlp_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, token_capacity)?,
+            ple_pager: Qwen38PagedPle::open(&self.checkpoint, &self.config, token_capacity)?,
+            ple: Qwen38PleWorkspace::new(&self.config, token_capacity)?,
+            hybrid,
+            linear_layers,
+        })
+    }
+
     /// Copies recurrent GDN and PLE state for a retained prompt prefix.
     pub(crate) fn snapshot_sequence(
         &self,
@@ -417,6 +493,340 @@ impl Qwen38FlashNextModel {
         })
     }
 
+    /// Evaluates and transactionally commits one contiguous prompt chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tokens(
+        &mut self,
+        state: &mut Qwen38FlashNextDecodeState,
+        workspace: &mut Qwen38FlashNextPrefillWorkspace,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        cache_id: SequenceId,
+        page_table: &mut Sm12xPageTable,
+        tokens: &[u32],
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
+        if tokens.is_empty() || tokens.len() > workspace.token_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next prefill tokens",
+                expected: format!("1..={} tokens", workspace.token_capacity),
+                actual: tokens.len().to_string(),
+            });
+        }
+        let end = state
+            .position
+            .checked_add(tokens.len())
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next prefill position",
+                expected: "position + tokens without overflow".to_string(),
+                actual: format!("position={} tokens={}", state.position, tokens.len()),
+            })?;
+        if end > state.max_tokens {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next prefill position",
+                expected: format!("end <= {}", state.max_tokens),
+                actual: end.to_string(),
+            });
+        }
+        if let Some(token) = tokens
+            .iter()
+            .find(|&&token| token as usize >= self.config.vocab)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next prefill token",
+                expected: format!("token < {}", self.config.vocab),
+                actual: token.to_string(),
+            });
+        }
+        let reservation = cache
+            .reserve_append(
+                cache_id,
+                tokens.len(),
+                &mut Sm12xCacheContext {
+                    stream: &state.stream,
+                    page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        if let Err(error) = state.begin_append() {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        if let Err(error) = workspace
+            .ple_pager
+            .begin_read_tokens(&mut state.ple_window, tokens)
+        {
+            state.abort_append()?;
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        let result = self.prefill_tokens_inner(
+            state,
+            workspace,
+            cache,
+            &reservation,
+            page_table,
+            tokens,
+            logits,
+        );
+        match result {
+            Ok(next) => {
+                if let Err(error) = cache.commit_append(
+                    reservation.clone(),
+                    tokens.len(),
+                    &mut Sm12xCacheContext {
+                        stream: &state.stream,
+                        page_table,
+                    },
+                ) {
+                    let rollback = state.abort_append().err();
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: &state.stream,
+                                page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                    return Err(rollback.unwrap_or_else(|| qwen38_flash_next_cache_error(error)));
+                }
+                state.commit_append(tokens.len())?;
+                Ok(next)
+            }
+            Err(error) => {
+                state.abort_append()?;
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &state.stream,
+                            page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_tokens_inner(
+        &mut self,
+        state: &mut Qwen38FlashNextDecodeState,
+        workspace: &mut Qwen38FlashNextPrefillWorkspace,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        reservation: &AppendReservation,
+        page_table: &Sm12xPageTable,
+        tokens: &[u32],
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
+        let token_count = tokens.len();
+        workspace.token_ids.copy_prefix_from_host(tokens)?;
+        self.embedding.gather_prefix(
+            self.config.vocab,
+            self.config.hidden,
+            &workspace.token_ids,
+            workspace.hidden.output(),
+            token_count,
+            &state.stream,
+        )?;
+        qwen38_repeat_streams_f32_into_on_stream(
+            &workspace.hidden,
+            workspace.streams_a.output(),
+            token_count,
+            self.config.hidden,
+            self.config.hc_count,
+            &state.stream,
+        )?;
+
+        let model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &workspace.linear_layers);
+        workspace.hybrid.begin_gdn_prefill(token_count)?;
+        for (layer, attention_state) in state.attention_states.iter_mut().enumerate() {
+            if let Qwen38AttentionState::Linear(linear_state) = attention_state {
+                workspace.hybrid.bind_gdn_state(layer, linear_state)?;
+            }
+        }
+        workspace.hybrid.finish_gdn_prefill()?;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            if layer_index == self.config.ple_layer {
+                let (ple, _) = self.ple_weights.run(
+                    &mut workspace.ple_pager,
+                    &workspace.streams_a,
+                    &mut state.ple_state,
+                    &mut workspace.ple,
+                    token_count,
+                    &state.stream,
+                )?;
+                add_f32_into_on_stream(
+                    &workspace.streams_a,
+                    ple,
+                    workspace.streams_b.output(),
+                    &state.stream,
+                )?;
+                std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+            }
+
+            layer.attention_hyper.mix(
+                &workspace.streams_a,
+                &mut workspace.attention_hyper,
+                token_count,
+                &state.stream,
+            )?;
+            let attention_output = match (
+                &layer.attention,
+                &mut state.attention_workspaces[layer_index],
+                &mut state.attention_states[layer_index],
+            ) {
+                (
+                    Qwen38AttentionWeights::Linear(weights),
+                    Qwen38AttentionWorkspace::Linear(_),
+                    Qwen38AttentionState::Linear(_),
+                ) => workspace.hybrid.run_gdn(
+                    &model,
+                    weights,
+                    workspace.attention_hyper.mixed(),
+                    layer_index,
+                    token_count,
+                    &state.stream,
+                )?,
+                (
+                    Qwen38AttentionWeights::Qsa(weights),
+                    Qwen38AttentionWorkspace::Qsa(qsa_workspace),
+                    Qwen38AttentionState::Qsa,
+                ) => {
+                    let mixed = workspace.attention_hyper.mixed();
+                    let qsa_output = &mut workspace.qsa_output;
+                    let row_hidden = &mut workspace.qsa_row_hidden;
+                    cache
+                        .with_append_pages(reservation, |backend, pages| {
+                            for page in pages.iter() {
+                                let segment = page.segment();
+                                for offset in 0..segment.rows() {
+                                    let row = segment.input_offset() + offset;
+                                    weights.run_prefill_row(
+                                        qsa_workspace,
+                                        backend,
+                                        page_table.device(),
+                                        page.page(),
+                                        segment.page_offset() + offset,
+                                        &self.config,
+                                        &self.manifest,
+                                        mixed,
+                                        row_hidden,
+                                        qsa_output,
+                                        row,
+                                        layer_index,
+                                        state.position + row,
+                                        &state.stream,
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        })
+                        .map_err(qwen38_flash_next_cache_error)?;
+                    &workspace.qsa_output
+                }
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.8 Flash Next prefill attention",
+                        detail: format!("layer {layer_index} state topology mismatch"),
+                    });
+                }
+            };
+            layer.attention_hyper.combine(
+                &workspace.streams_a,
+                attention_output,
+                &mut workspace.attention_hyper,
+                &mut workspace.streams_b,
+                token_count,
+                &state.stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+
+            layer.mlp_hyper.mix(
+                &workspace.streams_a,
+                &mut workspace.mlp_hyper,
+                token_count,
+                &state.stream,
+            )?;
+            let ffn = workspace.hybrid.run_moe(
+                &model,
+                &layer.moe,
+                workspace.mlp_hyper.mixed(),
+                token_count,
+                &state.stream,
+            )?;
+            layer.mlp_hyper.combine(
+                &workspace.streams_a,
+                ffn,
+                &mut workspace.mlp_hyper,
+                &mut workspace.streams_b,
+                token_count,
+                &state.stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+        }
+
+        if logits == Qwen38LogitsMode::None {
+            state.stream.synchronize()?;
+            return Ok(None);
+        }
+        let hc_dim = self.config.hidden * self.config.hc_count;
+        state.streams_a.copy_range_from_device_on_stream(
+            0,
+            &workspace.streams_a,
+            (token_count - 1) * hc_dim,
+            hc_dim,
+            &state.stream,
+        )?;
+        self.final_mixer
+            .mix(&state.streams_a, &mut state.final_hyper, 1, &state.stream)?;
+        state.hidden.copy_prefix_from_device_on_stream(
+            state.final_hyper.mixed(),
+            self.config.hidden,
+            &state.stream,
+        )?;
+        match logits {
+            Qwen38LogitsMode::None => unreachable!("no-logits mode returned before final mix"),
+            Qwen38LogitsMode::Top1 => {
+                self.lm_head.run_top1(
+                    &self.lt,
+                    &state.hidden,
+                    &mut state.lm_head,
+                    &state.stream,
+                )?;
+                let (id, value) = state.lm_head.read_top1(&state.stream)?;
+                Ok(Some(Qwen38NextToken { id, value }))
+            }
+            Qwen38LogitsMode::Full => {
+                self.lm_head.run_logits(
+                    &self.lt,
+                    &state.hidden,
+                    &mut state.lm_head,
+                    &state.stream,
+                )?;
+                state.stream.synchronize()?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Evaluates and commits one token with the requested vocabulary-head work.
     pub(crate) fn forward_token(
         &mut self,
@@ -495,7 +905,7 @@ impl Qwen38FlashNextModel {
                         .map_err(qwen38_flash_next_cache_error)?;
                     return Err(rollback.unwrap_or_else(|| qwen38_flash_next_cache_error(error)));
                 }
-                state.commit_append()?;
+                state.commit_append(1)?;
                 Ok(next)
             }
             Err(error) => {
@@ -535,6 +945,7 @@ impl Qwen38FlashNextModel {
         qwen38_repeat_streams_f32_into_on_stream(
             &state.hidden,
             state.streams_a.output(),
+            1,
             self.config.hidden,
             self.config.hc_count,
             &state.stream,
@@ -801,10 +1212,10 @@ impl Qwen38FlashNextDecodeState {
         Ok(())
     }
 
-    fn commit_append(&mut self) -> Result<()> {
+    fn commit_append(&mut self, tokens: usize) -> Result<()> {
         self.ple_window.commit_append()?;
         self.ple_state.commit_append()?;
-        self.position += 1;
+        self.position += tokens;
         Ok(())
     }
 
@@ -891,6 +1302,7 @@ mod tests {
         qwen38_repeat_streams_f32_into_on_stream(
             &input,
             streams_a.output(),
+            1,
             config.hidden,
             config.hc_count,
             &stream,
@@ -1066,5 +1478,270 @@ mod tests {
         };
         run_released_layer(Path::new(&model_dir), 0).expect("released linear layer");
         run_released_layer(Path::new(&model_dir), 3).expect("released full layer");
+    }
+
+    #[test]
+    fn released_layer_batch_primitives_match_serial_tokens() {
+        let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_MODEL_DIR") else {
+            return;
+        };
+        let config = Qwen38FlashNextConfig::load(&model_dir).expect("config");
+        let manifest = config.qwen_manifest();
+        let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
+        let artifact_dir =
+            std::env::temp_dir().join(format!("eider-qwen38-batch-{}", std::process::id()));
+        let linear = load_hybrid_linear_attention(&checkpoint, &manifest, &artifact_dir, 0)
+            .expect("linear weights");
+        let moe =
+            Qwen36MoeWeights::load_checkpoint_layout(&checkpoint, &manifest, &artifact_dir, 0)
+                .expect("MoE weights");
+        let lt = CublasLt::new().expect("cuBLASLt");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        const TOKENS: usize = 4;
+        let input_host = (0..TOKENS * config.hidden)
+            .map(|index| (index as f32 % 31.0 - 15.0) / 32.0)
+            .collect::<Vec<_>>();
+        let batch_input = DeviceBuffer::from_host(&input_host).expect("batch input");
+        let linear_config = manifest.linear_attention.expect("linear config");
+
+        let mut serial_linear_workspace =
+            Qwen36LinearAttentionWorkspace::new(&manifest, linear_config, &linear)
+                .expect("serial linear workspace");
+        let mut serial_linear_state =
+            Qwen36LinearAttentionState::new(linear_config, &linear).expect("serial linear state");
+        let mut serial_linear = Vec::with_capacity(TOKENS * config.hidden);
+        for row in 0..TOKENS {
+            let input = DeviceBuffer::from_host(
+                &input_host[row * config.hidden..(row + 1) * config.hidden],
+            )
+            .expect("serial input");
+            serial_linear.extend_from_slice(
+                &linear
+                    .run_one_token_sigmoid_output_gate(
+                        &mut serial_linear_workspace,
+                        &mut serial_linear_state,
+                        &input,
+                        config.rms_eps(),
+                        &stream,
+                    )
+                    .expect("serial linear")
+                    .output
+                    .copy_to_host(&stream)
+                    .expect("serial linear readback"),
+            );
+        }
+
+        let linear_layers = manifest
+            .layer_kinds
+            .iter()
+            .map(|kind| *kind == QwenLayerKind::LinearAttention)
+            .collect::<Vec<_>>();
+        let model = Qwen36BatchModelView::new(&lt, &manifest, &linear_layers);
+        let mut batch = Qwen36HybridPrefillWorkspace::new(&model, &linear, &moe, TOKENS)
+            .expect("batch workspace");
+        let mut batch_linear_state =
+            Qwen36LinearAttentionState::new(linear_config, &linear).expect("batch linear state");
+        batch.begin_gdn_prefill(TOKENS).expect("begin GDN");
+        batch
+            .bind_gdn_state(0, &mut batch_linear_state)
+            .expect("bind GDN");
+        batch.finish_gdn_prefill().expect("finish GDN setup");
+        let batch_linear = batch
+            .run_gdn(&model, &linear, &batch_input, 0, TOKENS, &stream)
+            .expect("batch linear")
+            .copy_to_host(&stream)
+            .expect("batch linear readback");
+        let linear_error = serial_linear
+            .iter()
+            .zip(batch_linear.iter())
+            .map(|(serial, batch)| (serial - batch).abs())
+            .fold(0.0f32, f32::max);
+        let (linear_dot, linear_serial_norm, linear_batch_norm, linear_squared_error) =
+            serial_linear.iter().zip(batch_linear.iter()).fold(
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                |sum, (&serial, &batch)| {
+                    let serial = serial as f64;
+                    let batch = batch as f64;
+                    (
+                        sum.0 + serial * batch,
+                        sum.1 + serial * serial,
+                        sum.2 + batch * batch,
+                        sum.3 + (serial - batch) * (serial - batch),
+                    )
+                },
+            );
+        let linear_cosine = linear_dot / (linear_serial_norm * linear_batch_norm).sqrt();
+        let linear_relative_rmse = (linear_squared_error / linear_serial_norm).sqrt();
+        assert!(
+            linear_cosine >= 0.98 && linear_relative_rmse <= 0.2,
+            "batch GDN maximum_error={linear_error} cosine={linear_cosine} relative_rmse={linear_relative_rmse}"
+        );
+
+        let zero = DeviceBuffer::zeroed(config.hidden).expect("zero residual");
+        let mut serial_moe_workspace = Qwen36MoeWorkspace::new(&manifest).expect("serial MoE");
+        let mut serial_moe = Vec::with_capacity(TOKENS * config.hidden);
+        for row in 0..TOKENS {
+            let input = DeviceBuffer::from_host(
+                &input_host[row * config.hidden..(row + 1) * config.hidden],
+            )
+            .expect("serial input");
+            serial_moe.extend_from_slice(
+                &moe.run_one_token(
+                    &lt,
+                    &mut serial_moe_workspace,
+                    &manifest,
+                    &input,
+                    &zero,
+                    &stream,
+                    None,
+                    None,
+                )
+                .expect("serial MoE")
+                .ffn_out
+                .copy_to_host(&stream)
+                .expect("serial MoE readback"),
+            );
+        }
+        let batch_moe = batch
+            .run_moe(&model, &moe, &batch_input, TOKENS, &stream)
+            .expect("batch MoE")
+            .copy_to_host(&stream)
+            .expect("batch MoE readback");
+        let moe_error = serial_moe
+            .iter()
+            .zip(batch_moe.iter())
+            .map(|(serial, batch)| (serial - batch).abs())
+            .fold(0.0f32, f32::max);
+        let (moe_dot, moe_serial_norm, moe_batch_norm, moe_squared_error) =
+            serial_moe.iter().zip(batch_moe.iter()).fold(
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                |sum, (&serial, &batch)| {
+                    let serial = serial as f64;
+                    let batch = batch as f64;
+                    (
+                        sum.0 + serial * batch,
+                        sum.1 + serial * serial,
+                        sum.2 + batch * batch,
+                        sum.3 + (serial - batch) * (serial - batch),
+                    )
+                },
+            );
+        let moe_cosine = moe_dot / (moe_serial_norm * moe_batch_norm).sqrt();
+        let moe_relative_rmse = (moe_squared_error / moe_serial_norm).sqrt();
+        assert!(
+            moe_error <= 0.02 && moe_cosine >= 0.9 && moe_relative_rmse <= 0.4,
+            "batch MoE maximum_error={moe_error} cosine={moe_cosine} relative_rmse={moe_relative_rmse}"
+        );
+    }
+
+    #[test]
+    fn released_qsa_prefill_rows_match_serial_tokens() {
+        let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_MODEL_DIR") else {
+            return;
+        };
+        const TOKENS: usize = 4;
+        const LAYER: usize = 3;
+        let config = Qwen38FlashNextConfig::load(&model_dir).expect("config");
+        let manifest = config.qwen_manifest();
+        let checkpoint = ModelOptCheckpoint::open(&model_dir).expect("checkpoint");
+        let artifact_dir =
+            std::env::temp_dir().join(format!("eider-qwen38-qsa-{}", std::process::id()));
+        let attention = load_hybrid_full_attention(&checkpoint, &manifest, &artifact_dir, LAYER)
+            .expect("attention weights");
+        let weights =
+            Qwen38QsaWeights::load(&checkpoint, &config, LAYER, attention).expect("QSA weights");
+        let layer_mask = manifest
+            .layer_kinds
+            .iter()
+            .map(|kind| *kind == QwenLayerKind::FullAttention)
+            .collect::<Vec<_>>();
+        let input_host = (0..TOKENS * config.hidden)
+            .map(|index| (index as f32 % 37.0 - 18.0) / 32.0)
+            .collect::<Vec<_>>();
+        let batch_input = DeviceBuffer::from_host(&input_host).expect("batch input");
+        let page_table = DeviceBuffer::from_host(&[0u32]).expect("page table");
+        let page = crate::runtime::sm12x_sequence_cache::Sm12xPage::from_slot(0);
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        let mut serial_backend =
+            crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
+                layer_mask.clone(),
+                1,
+                manifest.kv_heads,
+                manifest.head_dim,
+                config.indexer_head_dim,
+            )
+            .expect("serial backend");
+        let mut serial_workspace =
+            Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("serial workspace");
+        let mut serial_output = Vec::with_capacity(TOKENS * config.hidden);
+        for row in 0..TOKENS {
+            let input = DeviceBuffer::from_host(
+                &input_host[row * config.hidden..(row + 1) * config.hidden],
+            )
+            .expect("serial input");
+            serial_output.extend_from_slice(
+                &weights
+                    .run_one_token(
+                        &mut serial_workspace,
+                        &mut serial_backend,
+                        &page_table,
+                        &page,
+                        row,
+                        &config,
+                        &manifest,
+                        &input,
+                        LAYER,
+                        row,
+                        &stream,
+                    )
+                    .expect("serial QSA")
+                    .copy_to_host(&stream)
+                    .expect("serial QSA readback"),
+            );
+        }
+
+        let mut batch_backend =
+            crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
+                layer_mask,
+                1,
+                manifest.kv_heads,
+                manifest.head_dim,
+                config.indexer_head_dim,
+            )
+            .expect("batch backend");
+        let mut batch_workspace =
+            Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("batch workspace");
+        let mut row_hidden = DeviceBuffer::zeroed(config.hidden).expect("row hidden");
+        let mut batch_output = DeviceBuffer::zeroed(TOKENS * config.hidden).expect("batch output");
+        for row in 0..TOKENS {
+            weights
+                .run_prefill_row(
+                    &mut batch_workspace,
+                    &mut batch_backend,
+                    &page_table,
+                    &page,
+                    row,
+                    &config,
+                    &manifest,
+                    &batch_input,
+                    &mut row_hidden,
+                    &mut batch_output,
+                    row,
+                    LAYER,
+                    row,
+                    &stream,
+                )
+                .expect("batch QSA");
+        }
+        let batch_output = batch_output
+            .copy_to_host(&stream)
+            .expect("batch QSA readback");
+        let max_error = serial_output
+            .iter()
+            .zip(batch_output.iter())
+            .map(|(serial, batch)| (serial - batch).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error <= 1e-5, "batch QSA maximum error {max_error}");
     }
 }
