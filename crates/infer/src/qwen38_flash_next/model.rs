@@ -4,8 +4,8 @@ use super::{
     Qwen38PagedPle, Qwen38PleState, Qwen38PleTokenWindow, Qwen38PleWeights, Qwen38PleWorkspace,
 };
 use crate::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    qwen38_repeat_streams_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
+    ModelOptCheckpoint, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
@@ -64,7 +64,6 @@ pub struct Qwen38FlashNextModel {
     lt: CublasLt,
     embedding: Qwen36Embedding,
     layers: Vec<Qwen38Layer>,
-    ple_pager: Qwen38PagedPle,
     ple_weights: Qwen38PleWeights,
     final_mixer: Qwen38HyperConnectionWeights,
     lm_head: Qwen36LmHead,
@@ -86,6 +85,7 @@ pub struct Qwen38FlashNextDecodeState {
     attention_states: Vec<Qwen38AttentionState>,
     rollback_linear_states: Vec<Option<Qwen36LinearAttentionState>>,
     moe: Qwen36MoeWorkspace,
+    ple_pager: Qwen38PagedPle,
     ple_window: Qwen38PleTokenWindow,
     ple_state: Qwen38PleState,
     ple_workspace: Qwen38PleWorkspace,
@@ -127,6 +127,17 @@ pub struct Qwen38NextToken {
     pub value: f32,
 }
 
+/// Vocabulary-head work requested for one committed token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen38LogitsMode {
+    /// Skip the vocabulary projection for an intermediate prompt token.
+    None,
+    /// Compute logits and their device-side argmax.
+    Top1,
+    /// Compute full logits for top-k/top-p sampling.
+    Full,
+}
+
 impl Qwen38FlashNextModel {
     /// Loads the released Inferact checkpoint without materializing the PLE table.
     pub fn open(model_dir: impl AsRef<Path>, artifact_dir: impl Into<PathBuf>) -> Result<Self> {
@@ -142,7 +153,6 @@ impl Qwen38FlashNextModel {
             config.vocab,
             config.hidden,
         )?;
-        let ple_pager = Qwen38PagedPle::open(&checkpoint, &config, 1)?;
         let ple_weights = Qwen38PleWeights::load(&checkpoint, &config)?;
         let mut layers = Vec::with_capacity(config.layers);
         for layer in 0..config.layers {
@@ -210,7 +220,6 @@ impl Qwen38FlashNextModel {
             lt,
             embedding,
             layers,
-            ple_pager,
             ple_weights,
             final_mixer,
             lm_head,
@@ -273,6 +282,7 @@ impl Qwen38FlashNextModel {
             attention_states,
             rollback_linear_states,
             moe: Qwen36MoeWorkspace::new(&self.manifest)?,
+            ple_pager: Qwen38PagedPle::open(&self.checkpoint, &self.config, 1)?,
             ple_window: Qwen38PleTokenWindow::new(
                 self.config.ngram_size,
                 self.config.eos_token_id,
@@ -393,6 +403,30 @@ impl Qwen38FlashNextModel {
         page_table: &mut Sm12xPageTable,
         token: u32,
     ) -> Result<Qwen38NextToken> {
+        self.forward_token(
+            state,
+            cache,
+            cache_id,
+            page_table,
+            token,
+            Qwen38LogitsMode::Top1,
+        )?
+        .ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next decode",
+            detail: "top-1 decode produced no token".to_string(),
+        })
+    }
+
+    /// Evaluates and commits one token with the requested vocabulary-head work.
+    pub(crate) fn forward_token(
+        &mut self,
+        state: &mut Qwen38FlashNextDecodeState,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        cache_id: SequenceId,
+        page_table: &mut Sm12xPageTable,
+        token: u32,
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
         if state.position >= state.max_tokens {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next decode position",
@@ -422,7 +456,7 @@ impl Qwen38FlashNextModel {
                 .map_err(qwen38_flash_next_cache_error)?;
             return Err(error);
         }
-        if let Err(error) = self
+        if let Err(error) = state
             .ple_pager
             .begin_read_tokens(&mut state.ple_window, &[token])
         {
@@ -438,7 +472,7 @@ impl Qwen38FlashNextModel {
                 .map_err(qwen38_flash_next_cache_error)?;
             return Err(error);
         }
-        let result = self.decode_token_inner(state, cache, &reservation, page_table, token);
+        let result = self.decode_token_inner(state, cache, &reservation, page_table, token, logits);
         match result {
             Ok(next) => {
                 if let Err(error) = cache.commit_append(
@@ -487,7 +521,8 @@ impl Qwen38FlashNextModel {
         reservation: &AppendReservation,
         page_table: &Sm12xPageTable,
         token: u32,
-    ) -> Result<Qwen38NextToken> {
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
         state.token_id.copy_from_host(&[token])?;
         self.embedding.gather_prefix(
             self.config.vocab,
@@ -508,7 +543,7 @@ impl Qwen38FlashNextModel {
         for (layer_index, layer) in self.layers.iter().enumerate() {
             if layer_index == self.config.ple_layer {
                 let (ple, _) = self.ple_weights.run(
-                    &mut self.ple_pager,
+                    &mut state.ple_pager,
                     &state.streams_a,
                     &mut state.ple_state,
                     &mut state.ple_workspace,
@@ -623,6 +658,10 @@ impl Qwen38FlashNextModel {
             std::mem::swap(&mut state.streams_a, &mut state.streams_b);
         }
 
+        if logits == Qwen38LogitsMode::None {
+            state.stream.synchronize()?;
+            return Ok(None);
+        }
         self.final_mixer
             .mix(&state.streams_a, &mut state.final_hyper, 1, &state.stream)?;
         state.hidden.copy_prefix_from_device_on_stream(
@@ -630,10 +669,58 @@ impl Qwen38FlashNextModel {
             self.config.hidden,
             &state.stream,
         )?;
-        self.lm_head
-            .run_top1(&self.lt, &state.hidden, &mut state.lm_head, &state.stream)?;
+        match logits {
+            Qwen38LogitsMode::None => unreachable!("no-logits mode returned before final mix"),
+            Qwen38LogitsMode::Top1 => {
+                self.lm_head.run_top1(
+                    &self.lt,
+                    &state.hidden,
+                    &mut state.lm_head,
+                    &state.stream,
+                )?;
+                let (id, value) = state.lm_head.read_top1(&state.stream)?;
+                Ok(Some(Qwen38NextToken { id, value }))
+            }
+            Qwen38LogitsMode::Full => {
+                self.lm_head.run_logits(
+                    &self.lt,
+                    &state.hidden,
+                    &mut state.lm_head,
+                    &state.stream,
+                )?;
+                state.stream.synchronize()?;
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn read_top1(&self, state: &Qwen38FlashNextDecodeState) -> Result<Qwen38NextToken> {
         let (id, value) = state.lm_head.read_top1(&state.stream)?;
         Ok(Qwen38NextToken { id, value })
+    }
+
+    pub(crate) fn sample_logits_gpu(
+        &self,
+        state: &Qwen38FlashNextDecodeState,
+        sampler: &mut GpuTokenSampler,
+        row: &mut GpuSamplingRow<'_>,
+    ) -> Result<GpuSampledToken> {
+        sampler
+            .sample(
+                state.lm_head.logits(),
+                std::slice::from_mut(row),
+                self.config.vocab,
+                &state.stream,
+            )?
+            .pop()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next GPU sampling",
+                detail: "sampler returned no token".to_string(),
+            })
+    }
+
+    pub(crate) fn logits_to_host(&self, state: &Qwen38FlashNextDecodeState) -> Result<Vec<f32>> {
+        state.lm_head.read_logits(&state.stream)
     }
 
     /// Parsed released-model configuration.

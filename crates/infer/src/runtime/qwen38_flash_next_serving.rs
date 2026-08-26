@@ -1,13 +1,14 @@
-//! Serial chat serving for the Qwen3.8 Flash Next native QSA path.
+//! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
 use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
-use crate::nvfp4::{Error, Result};
-use crate::qwen38_flash_next::{Qwen38FlashNextModel, Qwen38NextToken};
+use crate::nvfp4::{DeviceBuffer, Error, GpuSamplingRow, GpuTokenSampler, Result};
+use crate::qwen38_flash_next::{Qwen38FlashNextModel, Qwen38LogitsMode};
 use crate::runtime::qwen38_flash_next_sequence::{
     Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
     new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
@@ -83,15 +84,18 @@ struct ActiveRequest<'tokenizer> {
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
-    pending_next: Option<Qwen38NextToken>,
+    prompt_logits_ready: bool,
     sequence: Option<Box<Qwen38FlashNextSequence>>,
+    sampler: Sampler,
+    history: TokenHistory,
+    device_token_counts: Option<DeviceBuffer<u32>>,
     sequence_device_bytes: usize,
     output: ChatOutputCodec<'tokenizer>,
     filter: ResponseFilter,
     usage: ChatUsage,
 }
 
-/// Decode-first, single-sequence service for the native QSA runtime.
+/// Decode-first multi-session service for the native QSA runtime.
 pub struct Qwen38FlashNextChatService<'template> {
     model: Qwen38FlashNextModel,
     sequence_cache: Qwen38FlashNextSequenceCache,
@@ -99,8 +103,11 @@ pub struct Qwen38FlashNextChatService<'template> {
     config: SchedulerConfig,
     next_id: u64,
     waiting: VecDeque<Qwen38FlashNextRequestId>,
+    prefilling: VecDeque<Qwen38FlashNextRequestId>,
+    decoding: VecDeque<Qwen38FlashNextRequestId>,
     requests: BTreeMap<Qwen38FlashNextRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
+    gpu_sampler: GpuTokenSampler,
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
@@ -126,21 +133,6 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 actual: format!("{} tokens", config.max_context_tokens),
             });
         }
-        if config.max_active_sequences != 1
-            || config.decode_capacity != 1
-            || config.prefill_sequence_capacity != 1
-        {
-            return Err(Error::Shape {
-                label: "Qwen3.8 Flash Next scheduler",
-                expected: "one active, decode, and prefill sequence".to_string(),
-                actual: format!(
-                    "active={} decode={} prefill={}",
-                    config.max_active_sequences,
-                    config.decode_capacity,
-                    config.prefill_sequence_capacity
-                ),
-            });
-        }
         if config.speculative_drafts != 0 {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next speculative decoding",
@@ -154,6 +146,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             config.max_context_tokens,
             cache_config,
         )?;
+        let gpu_sampler = GpuTokenSampler::new(1, model.config().vocab)?;
         Ok(Self {
             model,
             sequence_cache,
@@ -161,19 +154,16 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             config,
             next_id: 1,
             waiting: VecDeque::new(),
+            prefilling: VecDeque::new(),
+            decoding: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
+            gpu_sampler,
         })
     }
 
     pub fn add_request(&mut self, request: ChatRequest) -> Result<Qwen38FlashNextAdmission> {
         request.generation.validate()?;
-        if !request.generation.sampling.uses_fast_argmax() {
-            return Err(Error::Format {
-                label: "Qwen3.8 Flash Next sampling",
-                detail: "the native QSA server currently supports greedy decoding only".to_string(),
-            });
-        }
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
                 label: "chat stop sequences",
@@ -221,6 +211,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let prompt_tokens = prompt.token_ids.len();
         let prefix_target = retained_prompt_prefix_tokens(prompt_tokens);
         let max_output_tokens = request.generation.max_new_tokens;
+        let sampler = Sampler::new(request.generation.sampling)?;
+        let history = TokenHistory::from_tokens(prompt.token_ids.iter().copied());
         self.requests.insert(
             id,
             ActiveRequest {
@@ -231,8 +223,11 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 generation: request.generation,
                 generated_tokens: 0,
                 last_token: None,
-                pending_next: None,
+                prompt_logits_ready: false,
                 sequence: None,
+                sampler,
+                history,
+                device_token_counts: None,
                 sequence_device_bytes: 0,
                 output: ChatOutputCodec::new(
                     self.template.tokenizer(),
@@ -265,26 +260,36 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         self.admit(&mut tick, started, on_lifecycle)?;
         let mut terminal = BTreeMap::new();
 
-        let decode_id = self.requests.iter().find_map(|(&id, request)| {
-            (request.sequence.is_some()
-                && request.prompt_position == request.prompt.len()
-                && request.generated_tokens < request.generation.max_new_tokens)
-                .then_some(id)
-        });
-        if let Some(id) = decode_id
-            && let Some(reason) = self.generate_one(id, &mut tick)?
-        {
-            terminal.insert(id, reason);
+        let decode_count = self.decoding.len().min(self.config.decode_capacity);
+        for _ in 0..decode_count {
+            let id = self.decoding.pop_front().expect("decode request exists");
+            if let Some(reason) = self.generate_one(id, &mut tick)? {
+                terminal.insert(id, reason);
+            } else {
+                self.decoding.push_back(id);
+            }
         }
 
-        let prefill_id = self.requests.iter().find_map(|(&id, request)| {
-            (request.sequence.is_some()
-                && request.generation.max_new_tokens != 0
-                && request.prompt_position < request.prompt.len())
-            .then_some(id)
-        });
-        if let Some(id) = prefill_id {
-            self.prefill(id, &mut tick, on_lifecycle)?;
+        let prefill_count = self
+            .prefilling
+            .len()
+            .min(self.config.prefill_sequence_capacity);
+        let mut token_budget = self.config.prefill_token_capacity;
+        for slot in 0..prefill_count {
+            if token_budget == 0 {
+                break;
+            }
+            let id = self.prefilling.pop_front().expect("prefill request exists");
+            let slots_left = prefill_count - slot;
+            let fair_share = token_budget.div_ceil(slots_left);
+            let consumed = self.prefill(id, fair_share, &mut tick, on_lifecycle)?;
+            token_budget -= consumed;
+            let request = self.requests.get(&id).expect("prefill request remains");
+            if request.prompt_position == request.prompt.len() {
+                self.decoding.push_back(id);
+            } else {
+                self.prefilling.push_back(id);
+            }
         }
         for (&id, request) in &self.requests {
             if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
@@ -303,6 +308,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             return Qwen38FlashNextCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
+        self.prefilling.retain(|&prefilling| prefilling != id);
+        self.decoding.retain(|&decoding| decoding != id);
         if let Some(sequence) = request.sequence.take() {
             let _ = sequence.finish(&mut self.sequence_cache);
             self.active_sequences -= 1;
@@ -324,52 +331,79 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
         ),
     ) -> Result<()> {
-        if self.active_sequences != 0 {
-            return Ok(());
+        while self.active_sequences < self.config.max_active_sequences {
+            let Some(id) = self.waiting.pop_front() else {
+                break;
+            };
+            let allocation_started = Instant::now();
+            let request = self.requests.get_mut(&id).expect("waiting request exists");
+            let capacity = request.prompt.len() + request.generation.max_new_tokens;
+            let device_token_counts = if request.generation.sampling.supports_gpu_sampling()
+                && request.generation.sampling.uses_history_penalties()
+            {
+                Some(DeviceBuffer::from_host(
+                    &request.history.dense_counts(self.model.config().vocab),
+                )?)
+            } else {
+                None
+            };
+            let sampling_bytes = device_token_counts
+                .as_ref()
+                .map_or(0, DeviceBuffer::device_bytes);
+            let sequence = Qwen38FlashNextSequence::admit_with_prefix_and_private_bytes(
+                &self.model,
+                &mut self.sequence_cache,
+                capacity.max(1),
+                &request.prompt,
+                sampling_bytes,
+            )?;
+            let sequence_device_bytes = sequence
+                .device_bytes()
+                .checked_add(sampling_bytes)
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 Flash Next admitted bytes",
+                    expected: "sequence and sampling bytes without overflow".to_string(),
+                    actual: format!(
+                        "sequence={} sampling={sampling_bytes}",
+                        sequence.device_bytes()
+                    ),
+                })?;
+            let cached_prompt_tokens = sequence.position();
+            let progress = Qwen38FlashNextAdmissionProgress {
+                request_id: id,
+                sequence_device_bytes,
+                cached_prompt_tokens,
+                allocation_duration: allocation_started.elapsed(),
+                admitted_after_tick_start: started.elapsed(),
+            };
+            request.prompt_position = cached_prompt_tokens;
+            request.prefix_retained =
+                cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
+            request.sequence = Some(Box::new(sequence));
+            request.device_token_counts = device_token_counts;
+            request.sequence_device_bytes = sequence_device_bytes;
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
+            self.active_sequences += 1;
+            if request.generation.max_new_tokens != 0 {
+                self.prefilling.push_back(id);
+            }
+            on_lifecycle(RequestLifecycleEvent::Admitted(progress));
+            tick.admitted.push(progress);
         }
-        let Some(id) = self.waiting.pop_front() else {
-            return Ok(());
-        };
-        let allocation_started = Instant::now();
-        let request = self.requests.get_mut(&id).expect("waiting request exists");
-        let capacity = request.prompt.len() + request.generation.max_new_tokens;
-        let sequence = Qwen38FlashNextSequence::admit_with_prefix(
-            &self.model,
-            &mut self.sequence_cache,
-            capacity.max(1),
-            &request.prompt,
-        )?;
-        let sequence_device_bytes = sequence.device_bytes();
-        let cached_prompt_tokens = sequence.position();
-        let progress = Qwen38FlashNextAdmissionProgress {
-            request_id: id,
-            sequence_device_bytes,
-            cached_prompt_tokens,
-            allocation_duration: allocation_started.elapsed(),
-            admitted_after_tick_start: started.elapsed(),
-        };
-        request.prompt_position = cached_prompt_tokens;
-        request.prefix_retained =
-            cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-        request.sequence = Some(Box::new(sequence));
-        request.sequence_device_bytes = sequence_device_bytes;
-        self.active_sequences = 1;
-        on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-        tick.admitted.push(progress);
         Ok(())
     }
 
     fn prefill(
         &mut self,
         id: Qwen38FlashNextRequestId,
+        token_capacity: usize,
         tick: &mut Qwen38FlashNextTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
         ),
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let request = self.requests.get_mut(&id).expect("prefill request exists");
-        let mut end = (request.prompt_position + self.config.prefill_token_capacity)
-            .min(request.prompt.len());
+        let mut end = (request.prompt_position + token_capacity).min(request.prompt.len());
         if !request.prefix_retained
             && request.prompt_position < request.prefix_target
             && end > request.prefix_target
@@ -377,24 +411,33 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             end = request.prefix_target;
         }
         if end == request.prompt_position {
-            return Ok(());
+            return Ok(0);
         }
         on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
         let sequence = request
             .sequence
             .as_deref_mut()
             .expect("request is admitted");
-        for &token in &request.prompt[request.prompt_position..end] {
-            request.pending_next =
-                Some(sequence.decode_token(&mut self.model, &mut self.sequence_cache, token)?);
+        let start = request.prompt_position;
+        for (offset, &token) in request.prompt[start..end].iter().enumerate() {
+            let final_prompt_token = start + offset + 1 == request.prompt.len();
+            let logits = if !final_prompt_token {
+                Qwen38LogitsMode::None
+            } else if request.sampler.config().uses_fast_argmax() {
+                Qwen38LogitsMode::Top1
+            } else {
+                Qwen38LogitsMode::Full
+            };
+            sequence.forward_token(&mut self.model, &mut self.sequence_cache, token, logits)?;
         }
         request.prompt_position = end;
+        request.prompt_logits_ready = end == request.prompt.len();
         Self::retain_request_checkpoint(&self.model, &mut self.sequence_cache, request);
         tick.prefilled.push(Qwen38FlashNextPrefillProgress {
             request_id: id,
             prompt_position: end,
         });
-        Ok(())
+        Ok(end - start)
     }
 
     fn retain_request_checkpoint(
@@ -448,31 +491,75 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         tick: &mut Qwen38FlashNextTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
-        let next = match request.pending_next.take() {
-            Some(next) => next,
-            None => {
-                let token = request
-                    .last_token
-                    .expect("generated token exists after prompt logits");
-                request
-                    .sequence
-                    .as_deref_mut()
-                    .expect("request is admitted")
-                    .decode_token(&mut self.model, &mut self.sequence_cache, token)?
+        let sampling = request.sampler.config();
+        if request.prompt_logits_ready {
+            request.prompt_logits_ready = false;
+        } else {
+            let token = request
+                .last_token
+                .expect("generated token exists after prompt logits");
+            let logits = if sampling.uses_fast_argmax() {
+                Qwen38LogitsMode::Top1
+            } else {
+                Qwen38LogitsMode::Full
+            };
+            request
+                .sequence
+                .as_deref_mut()
+                .expect("request is admitted")
+                .forward_token(&mut self.model, &mut self.sequence_cache, token, logits)?;
+        }
+        let sequence = request
+            .sequence
+            .as_deref()
+            .expect("decode request is admitted");
+        let sampled = if sampling.uses_fast_argmax() {
+            let next = self.model.read_top1(&sequence.state)?;
+            SampledToken {
+                id: next.id,
+                logit: next.value,
+                adjusted_logit: next.value,
             }
+        } else if sampling.supports_gpu_sampling() {
+            let draw = if sampling.temperature == 0.0 || sampling.top_k == 1 {
+                0.0
+            } else {
+                request.sampler.next_gpu_draw()
+            };
+            let mut row = GpuSamplingRow {
+                temperature: sampling.temperature,
+                top_k: sampling.top_k,
+                top_p: sampling.top_p,
+                presence_penalty: sampling.presence_penalty,
+                frequency_penalty: sampling.frequency_penalty,
+                draw,
+                token_counts: request.device_token_counts.as_mut(),
+            };
+            let sampled =
+                self.model
+                    .sample_logits_gpu(&sequence.state, &mut self.gpu_sampler, &mut row)?;
+            SampledToken {
+                id: sampled.id,
+                logit: sampled.logit,
+                adjusted_logit: sampled.adjusted_logit,
+            }
+        } else {
+            let logits = self.model.logits_to_host(&sequence.state)?;
+            request.sampler.sample(&logits, &request.history)?
         };
         request.generated_tokens += 1;
-        request.last_token = Some(next.id);
+        request.last_token = Some(sampled.id);
+        request.history.push(sampled.id);
         request.usage.completion_tokens += 1;
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
         tick.generated.push(id);
-        let events = request.output.push_token(next.id)?;
+        let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
         }
-        if request.generation.eos_token_ids.contains(&next.id) {
+        if request.generation.eos_token_ids.contains(&sampled.id) {
             return Ok(Some(ChatFinishReason::Eos));
         }
         if request.generated_tokens == request.generation.max_new_tokens {
@@ -503,6 +590,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
+        self.prefilling.retain(|&prefilling| prefilling != id);
+        self.decoding.retain(|&decoding| decoding != id);
         if let Some(sequence) = request.sequence.take() {
             sequence.finish(&mut self.sequence_cache)?;
         }

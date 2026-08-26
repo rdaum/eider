@@ -13,8 +13,8 @@ exec cargo run --release \
   --offline \
   --max-context-tokens 262144 \
   --prefill-token-capacity 64 \
-  --max-active-sequences 1 \
-  --decode-capacity 1 \
-  --prefill-sequence-capacity 1 \
+  --max-active-sequences 2 \
+  --decode-capacity 2 \
+  --prefill-sequence-capacity 2 \
   --speculative-drafts 0 \
   "$@"

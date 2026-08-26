@@ -6847,6 +6847,22 @@ impl Qwen36LmHead {
         }
     }
 
+    pub(crate) fn run_logits(
+        &self,
+        lt: &CublasLt,
+        input: &DeviceBuffer<f32>,
+        workspace: &mut Qwen36LmHeadWorkspace,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        match self {
+            Self::Nvfp4(linear) => linear.run_f32_into(input, &mut workspace.logits, stream),
+            Self::Bf16(linear) => linear.run_into(input, &mut workspace.logits, stream),
+            Self::Fp8 { linear, plan } => {
+                Self::run_fp8_logits(lt, linear, plan.as_deref(), input, workspace, stream)
+            }
+        }
+    }
+
     fn run_fp8_logits(
         lt: &CublasLt,
         linear: &Fp8Linear,
@@ -6927,6 +6943,14 @@ impl Qwen36LmHeadWorkspace {
         let index = self.next_index.copy_to_host(stream)?;
         let value = self.next_value.copy_to_host(stream)?;
         Ok((index[0], value[0]))
+    }
+
+    pub(crate) fn logits(&self) -> &DeviceBuffer<f32> {
+        &self.logits
+    }
+
+    pub(crate) fn read_logits(&self, stream: &CudaStream) -> Result<Vec<f32>> {
+        Ok(self.logits.copy_to_host(stream)?.into_vec())
     }
 
     pub(crate) fn device_bytes(&self) -> usize {

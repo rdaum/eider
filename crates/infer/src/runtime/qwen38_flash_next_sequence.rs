@@ -7,7 +7,7 @@ use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePoo
 use crate::qwen3::infer::QwenLayerKind;
 use crate::qwen38_flash_next::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
-    Qwen38NextToken,
+    Qwen38LogitsMode, Qwen38NextToken,
 };
 use crate::runtime::cache_config::SequenceCacheConfig;
 use seqcache::{
@@ -50,6 +50,16 @@ impl Qwen38FlashNextSequence {
         max_tokens: usize,
         prompt_tokens: &[u32],
     ) -> Result<Self> {
+        Self::admit_with_prefix_and_private_bytes(model, cache, max_tokens, prompt_tokens, 0)
+    }
+
+    pub(crate) fn admit_with_prefix_and_private_bytes(
+        model: &Qwen38FlashNextModel,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        max_tokens: usize,
+        prompt_tokens: &[u32],
+        additional_private_bytes: usize,
+    ) -> Result<Self> {
         let prefix = cache.lookup_prefix(prompt_tokens);
         let mut page_table = Sm12xPageTable::new(max_tokens)?;
         let logical_capacity = page_table
@@ -62,7 +72,17 @@ impl Qwen38FlashNextSequence {
             })?;
         let mut state = model.new_decode_state(logical_capacity)?;
         let cache_stream = CudaStream::new_blocking()?;
-        let private_state_bytes = state.device_bytes();
+        let private_state_bytes = state
+            .device_bytes()
+            .checked_add(additional_private_bytes)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next private state",
+                expected: "state and sampling bytes without overflow".to_string(),
+                actual: format!(
+                    "state={} sampling={additional_private_bytes}",
+                    state.device_bytes()
+                ),
+            })?;
         let outcome = cache
             .admit(
                 prefix,
@@ -129,6 +149,24 @@ impl Qwen38FlashNextSequence {
         )
     }
 
+    /// Commits one token while selecting how much vocabulary-head work to run.
+    pub(crate) fn forward_token(
+        &mut self,
+        model: &mut Qwen38FlashNextModel,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        token: u32,
+        logits: Qwen38LogitsMode,
+    ) -> Result<Option<Qwen38NextToken>> {
+        model.forward_token(
+            &mut self.state,
+            cache,
+            self.cache_id,
+            &mut self.page_table,
+            token,
+            logits,
+        )
+    }
+
     /// Finishes the active sequence and releases its page ownership.
     pub fn finish(self, cache: &mut Qwen38FlashNextSequenceCache) -> Result<()> {
         let mut page_table = self.page_table;
@@ -182,7 +220,24 @@ pub fn new_qwen38_flash_next_sequence_cache_with_config(
             expected: "page-aligned context without overflow".to_string(),
             actual: max_context_tokens.to_string(),
         })?;
-    let private_state_bytes = model.new_decode_state(max_sequence_tokens)?.device_bytes();
+    let sampling_bytes = model
+        .config()
+        .vocab
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next sampling bytes",
+            expected: "vocabulary byte count without overflow".to_string(),
+            actual: model.config().vocab.to_string(),
+        })?;
+    let private_state_bytes = model
+        .new_decode_state(max_sequence_tokens)?
+        .device_bytes()
+        .checked_add(sampling_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next private-state bytes",
+            expected: "state and sampling byte count without overflow".to_string(),
+            actual: sampling_bytes.to_string(),
+        })?;
     let active_page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {

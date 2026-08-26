@@ -524,8 +524,6 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Qwen38FlashNext => {
-            let mut defaults = defaults;
-            defaults.sampling.temperature = 0.0;
             info!(
                 model_dir = %model_dir.display(),
                 artifact_dir = %artifact_dir.display(),
@@ -541,9 +539,6 @@ fn actor_main(
                 }
             };
             let qsa_scheduler = SchedulerConfig {
-                decode_capacity: 1,
-                prefill_sequence_capacity: 1,
-                max_active_sequences: 1,
                 max_context_tokens: scheduler
                     .max_context_tokens
                     .min(model.config().max_position_embeddings),

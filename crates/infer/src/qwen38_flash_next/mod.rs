@@ -11,7 +11,7 @@ pub use config::Qwen38FlashNextConfig;
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
-    Qwen38NextToken,
+    Qwen38LogitsMode, Qwen38NextToken,
 };
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};
