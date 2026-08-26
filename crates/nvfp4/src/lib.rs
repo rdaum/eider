@@ -23,6 +23,7 @@ mod ffi;
 mod kernels;
 mod matrix;
 mod modelopt;
+mod ngram;
 mod q2;
 mod q3;
 mod safetensors;
@@ -217,6 +218,10 @@ pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
 pub use modelopt::{
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear,
     ModelOptNvfp4Activation, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt,
+};
+pub use ngram::{
+    NgramEmbeddingBank, NgramEmbeddingFormat, NgramFp8Rows, NgramNvfp4Rows,
+    fused_ngram_embedding_reference,
 };
 pub use q2::{
     Q2_BLOCK_SIZE, Q2ExpertTable, Q2ExpertTableCacheInfo, Q2ExpertTableCacheWriter, Q2Matrix,

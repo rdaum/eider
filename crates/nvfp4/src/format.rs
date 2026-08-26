@@ -166,6 +166,22 @@ pub fn ue4m3_code(value: f32) -> u8 {
     best_code
 }
 
+/// Encodes a finite signed value as E4M3 with saturation.
+///
+/// Non-finite values encode as zero. Ties use the same even-mantissa rule as
+/// [`ue4m3_code`].
+pub fn e4m3_code(value: f32) -> u8 {
+    if !value.is_finite() || value == 0.0 {
+        return 0;
+    }
+    let magnitude = ue4m3_code(value.abs());
+    if value.is_sign_negative() {
+        magnitude | 0x80
+    } else {
+        magnitude
+    }
+}
+
 /// Returns CUDA's E4M3 saturating conversion result for host-side cross-checks.
 pub fn cuda_e4m3_code(value: f32) -> u8 {
     unsafe { crate::ffi::infer_cuda_e4m3_satfinite(value) }
@@ -457,6 +473,15 @@ mod tests {
                 "UE4M3 mismatch for value={value}"
             );
         }
+    }
+
+    #[test]
+    fn signed_e4m3_encoder_round_trips_sign() {
+        for value in [-448.0, -3.5, -0.25, 0.0, 0.25, 3.5, 448.0] {
+            let code = e4m3_code(value);
+            assert_eq!(e4m3_value(code), value);
+        }
+        assert_eq!(e4m3_code(f32::NAN), 0);
     }
 
     #[test]

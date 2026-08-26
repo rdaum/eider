@@ -69,6 +69,7 @@ fn main() {
     let bitnet_object = format!("{out_dir}/bitnet.o");
     let ternary_g64_object = format!("{out_dir}/ternary_g64.o");
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
+    let ngram_object = format!("{out_dir}/ngram.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
@@ -188,6 +189,27 @@ fn main() {
     assert!(
         deepseek4_status.success(),
         "nvcc failed to build DeepSeek V4 kernels"
+    );
+
+    let mut ngram_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    ngram_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-arch=sm_121",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/ngram.cu",
+        "-o",
+        &ngram_object,
+    ]);
+    let ngram_status = ngram_nvcc
+        .status()
+        .expect("failed to run nvcc for n-gram embedding kernels");
+    assert!(
+        ngram_status.success(),
+        "nvcc failed to build n-gram embedding kernels"
     );
 
     let mut qwen36_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
@@ -416,6 +438,7 @@ fn main() {
             &bitnet_object,
             &ternary_g64_object,
             &deepseek4_object,
+            &ngram_object,
             &qwen36_gdn_object,
             &gemma4_attention_object,
             &sm12x_mma_object,
@@ -442,6 +465,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/bitnet.cu");
     println!("cargo:rerun-if-changed=native/ternary_g64.cu");
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
+    println!("cargo:rerun-if-changed=native/ngram.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");

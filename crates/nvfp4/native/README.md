@@ -10,6 +10,7 @@ entrypoints called by those wrappers.
 | File | Responsibility |
 | --- | --- |
 | `non_gemm.cu` | Elementwise, quantization, RoPE, attention, MoE routing, lm-head, FP8, GDN, and W4A16 kernels. |
+| `ngram.cu` | Rowwise BF16, FP8, and NVFP4 n-gram gathers plus fused input projection. |
 | `sm12x_mma.cu` | Experimental and production SM12x NVFP4 MMA/GEMV kernels. |
 | `sm121_w4a16.cu` | Eider-owned SM121 W4A16 routed and dense tensor-core kernels. |
 | `cutlass_gemv.cu` | Optional CUTLASS SM12x GEMV implementation. |

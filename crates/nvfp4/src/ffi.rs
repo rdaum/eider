@@ -1966,6 +1966,76 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_ngram_gather_bf16_on_stream(
+        values: *const u16,
+        bank_rows: u32,
+        row_ids: *const u32,
+        output: *mut f32,
+        row_count: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ngram_gather_fp8_on_stream(
+        values: *const u8,
+        row_scales: *const f32,
+        bank_rows: u32,
+        row_ids: *const u32,
+        output: *mut f32,
+        row_count: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ngram_gather_nvfp4_on_stream(
+        packed_values: *const u8,
+        scales: *const u8,
+        bank_rows: u32,
+        row_ids: *const u32,
+        output: *mut f32,
+        row_count: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ngram_fused_bf16_on_stream(
+        values: *const u16,
+        bank_rows: u32,
+        word_embeddings: *const f32,
+        row_ids: *const u32,
+        projections: *const u16,
+        output: *mut f32,
+        token_rows: u32,
+        table_count: u32,
+        embedding_dim: u32,
+        hidden_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ngram_fused_fp8_on_stream(
+        values: *const u8,
+        row_scales: *const f32,
+        bank_rows: u32,
+        word_embeddings: *const f32,
+        row_ids: *const u32,
+        projections: *const u16,
+        output: *mut f32,
+        token_rows: u32,
+        table_count: u32,
+        embedding_dim: u32,
+        hidden_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_ngram_fused_nvfp4_on_stream(
+        packed_values: *const u8,
+        scales: *const u8,
+        bank_rows: u32,
+        word_embeddings: *const f32,
+        row_ids: *const u32,
+        projections: *const u16,
+        output: *mut f32,
+        token_rows: u32,
+        table_count: u32,
+        embedding_dim: u32,
+        hidden_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_quantize_nvfp4_col_major_f32(
         input: *const f32,
         packed: *mut u8,
