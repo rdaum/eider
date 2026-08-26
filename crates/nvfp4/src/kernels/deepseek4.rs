@@ -2057,6 +2057,89 @@ mod tests {
     }
 
     #[test]
+    fn indexer_block_selection_matches_tokenwise_selection() {
+        const ROWS: usize = 3;
+        const HEADS: usize = 4;
+        const DIM: usize = 8;
+        const RATIO: usize = 2;
+        const TOP_K: usize = 4;
+        let query_host = test_rows(ROWS * HEADS, DIM, -0.35);
+        let weights_host = test_rows(ROWS, HEADS, 0.2);
+        let compressed_host = (0..ROWS)
+            .map(|row| test_rows(7 - row, DIM, -0.5 + row as f32 * 0.3))
+            .collect::<Vec<_>>();
+        let lengths = [7u32, 6, 5];
+        let positions = [11u32, 8, 5];
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let weights = DeviceBuffer::from_host(&weights_host).expect("head weights");
+        let compressed = compressed_host
+            .iter()
+            .map(|values| DeviceBuffer::from_host(values).expect("compressed"))
+            .collect::<Vec<_>>();
+        let tables = DeviceBuffer::from_host(
+            &compressed
+                .iter()
+                .map(|values| values.input().as_const_ptr().cast::<f32>())
+                .collect::<Vec<_>>(),
+        )
+        .expect("tables");
+        let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
+        let positions_device = DeviceBuffer::from_host(&positions).expect("positions");
+        let mut block = DeviceBuffer::zeroed(ROWS * TOP_K).expect("block selected");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        indexer_topk_f32_batch_into_on_stream(
+            &query,
+            &weights,
+            &tables,
+            &lengths_device,
+            &positions_device,
+            block.output(),
+            ROWS,
+            HEADS,
+            DIM,
+            RATIO,
+            TOP_K,
+            &stream,
+        )
+        .expect("block selection");
+        let block = block.copy_to_host(&stream).expect("block host");
+
+        for row in 0..ROWS {
+            let query =
+                DeviceBuffer::from_host(&query_host[row * HEADS * DIM..(row + 1) * HEADS * DIM])
+                    .expect("row query");
+            let weights = DeviceBuffer::from_host(&weights_host[row * HEADS..(row + 1) * HEADS])
+                .expect("row weights");
+            let table =
+                DeviceBuffer::from_host(&[compressed[row].input().as_const_ptr().cast::<f32>()])
+                    .expect("row table");
+            let length = DeviceBuffer::from_host(&lengths[row..=row]).expect("row length");
+            let position = DeviceBuffer::from_host(&positions[row..=row]).expect("row position");
+            let mut token = DeviceBuffer::zeroed(TOP_K).expect("token selected");
+            indexer_topk_f32_batch_into_on_stream(
+                &query,
+                &weights,
+                &table,
+                &length,
+                &position,
+                token.output(),
+                1,
+                HEADS,
+                DIM,
+                RATIO,
+                TOP_K,
+                &stream,
+            )
+            .expect("token selection");
+            assert_eq!(
+                &block[row * TOP_K..(row + 1) * TOP_K],
+                token.copy_to_host(&stream).expect("token host").as_slice(),
+                "row {row}"
+            );
+        }
+    }
+
+    #[test]
     fn learned_and_hash_routers_match_sqrtsoftplus_reference() {
         const BATCH: usize = 2;
         const EXPERTS: usize = 8;
