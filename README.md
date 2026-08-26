@@ -14,7 +14,76 @@ Eider has three priorities:
 - It provides a practical platform for experiments and for learning how
   inference systems work.
 
-## Qwen3.8 quick start
+## Qwen3.8 Flash Next
+
+Eider served [Qwen3.8 Flash
+Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
+day, August 26, 2026. See performance numbers below, but the TLDR is
+right now about ~80 tok/sec prefil and ~12 tok/sec decode. Acceptable
+for a coding session.
+
+The server current runs the [Inferact NVFP4
+checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)
+on one DGX Spark. As new NVFP4 checkpoints become available we'll
+evaluate.
+
+This path only serves the complete text model. It includes native Qwen
+Sparse Attention (QSA), Gated DeltaNet (GDN), hyperconnections, all
+512 MoE experts, and the 51B-parameter BF16 PLE n-gram table. Eider
+pages the selected n-gram rows directly from NVMe. The model has a
+native 262,144-token context. Eider does not serve the vision tower
+yet.
+
+The pinned checkpoint contains about 170 GiB of safetensors. Fetch it before
+you use the offline launcher:
+
+```sh
+hf download Inferact/Qwen3.8-Flash-Next-NVFP4 \
+  --revision 129972269565f7f4f664fdf8dd42268d3bbda9fd
+scripts/run-eider-qwen38-flash-next.sh
+```
+
+In a second terminal, start Pi:
+
+```sh
+scripts/run-pi-eider-qwen38-flash-next.sh
+```
+
+### Release-day performance
+
+These results come from an active Pi tool-use session on one DGX
+Spark. The server used target-only decoding without MTP speculation
+(the checkpoint includes native MTP weights, support for them isn't
+there yet; coming next.)
+
+More performance work will follow as we profile longer sessions.
+
+| Measurement | Result | Workload |
+| --- | ---: | --- |
+| Short-prompt time to first token | 368 ms | 512 output tokens |
+| Short-prompt decode | 12.1 tokens/sec | Same request |
+| Cold Pi prefill | 83.8 tokens/sec | 5,801 prompt tokens, no cached prefix |
+| Cold Pi time to first token | 69.2 sec | Same first Pi turn |
+| Cached Pi time to first token | 2.03–2.60 sec | 154–196 new prompt tokens |
+| Pi decode | 11.7–11.8 tokens/sec | Three completed tool turns |
+| Resident memory | 98 GiB | Active Pi use |
+
+The cached turns restored 5,760 and 5,888 prompt tokens. They completed with
+tool calls and preserved the shared model state between requests.
+
+These values are server telemetry, not isolated kernel rates. The PLE n-gram
+table remains on NVMe, while the complete neural body stays resident in
+unified memory.
+
+Send a Responses API request directly:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"eider-qwen3.8-flash-next","input":"What is 2+2?","max_output_tokens":64}'
+```
+
+## Qwen3.8 27B
 
 Qwen3.8 27B is the primary dense model in Eider. The standard launcher uses
 the [Unsloth Dynamic NVFP4 checkpoint](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)
@@ -116,6 +185,7 @@ second column.
 
 | Catalogue ID | API model | Runtime path |
 | --- | --- | --- |
+| [`qwen3.8-flash-next`](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4) | `eider-qwen3.8-flash-next` | 125B/6B-active MoE, native QSA and GDN, NVMe-paged BF16 n-gram table, 262K text context |
 | [`qwen3.8-27b`](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) | `eider-qwen3.8` | Dense hybrid, mixed NVFP4/FP8, DFlash2, compact FP4 KV, 262K model context |
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE and compact FP4 KV |
 | [`ornith-1.5-35b-a3b`](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4) | `eider-ornith-1.5-35b-a3b` | Text path, W4A16 MoE, and compact FP4 KV; vision and the MoE MTP block are not served |
@@ -213,6 +283,7 @@ cargo run --release -p eider-api --bin eider -- model list
 Start a catalogue model directly:
 
 ```sh
+eider-serve qwen3.8-flash-next --offline
 eider-serve qwen3.8-27b
 eider-serve qwen3.6-35b-a3b
 eider-serve ornith-1.5-35b-a3b
@@ -248,6 +319,7 @@ The Pi launchers use `pi/agent/models.json` from this repository. They do not
 change the global Pi configuration.
 
 ```sh
+scripts/run-pi-eider-qwen38-flash-next.sh
 scripts/run-pi-eider-qwen38.sh
 scripts/run-pi-eider-qwen.sh
 scripts/run-pi-eider-ornith.sh
@@ -293,7 +365,9 @@ models can keep selected experts resident and page the remaining experts from
 disk.
 
 Each model keeps its native sequence state. Nemotron Mamba state does not use a
-KV-cache abstraction. Qwen3.8 target state and DFlash2 state advance together.
+KV-cache abstraction. Flash Next keeps GDN, QSA, PLE, and hyperconnection state
+in one exact sequence snapshot. Qwen3.8 27B target and DFlash2 state advance
+together.
 
 This narrow hardware target keeps performance decisions visible. It also makes
 the runtime useful as a place to study modern inference systems.
