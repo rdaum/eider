@@ -3,21 +3,22 @@
 use super::sm12x_sequence_cache::{
     Sm12xAppendTransaction, Sm12xCacheContext, Sm12xPage, Sm12xPageBackend, Sm12xPageTable,
 };
-use crate::nvfp4::{Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
+use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
 use crate::qwen3::infer::QwenLayerKind;
-use crate::qwen38_flash_next::{Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38NextToken};
+use crate::qwen38_flash_next::{
+    Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
+    Qwen38NextToken,
+};
+use crate::runtime::cache_config::SequenceCacheConfig;
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
     CacheError, PageAllocation, PageBackend, RetainedSnapshot, RetireError, RetireOutcome,
     SequenceCache, SequenceId,
 };
 
-/// QSA prefixes are disabled until the recurrent GDN and PLE snapshot is integrated.
-pub struct Qwen38FlashNextSequenceSnapshot;
-
 impl RetainedSnapshot for Qwen38FlashNextSequenceSnapshot {
     fn retained_bytes(&self) -> usize {
-        0
+        self.device_bytes()
     }
 }
 
@@ -39,6 +40,17 @@ impl Qwen38FlashNextSequence {
         cache: &mut Qwen38FlashNextSequenceCache,
         max_tokens: usize,
     ) -> Result<Self> {
+        Self::admit_with_prefix(model, cache, max_tokens, &[])
+    }
+
+    /// Admits a sequence, restoring the longest retained prompt prefix on a hit.
+    pub fn admit_with_prefix(
+        model: &Qwen38FlashNextModel,
+        cache: &mut Qwen38FlashNextSequenceCache,
+        max_tokens: usize,
+        prompt_tokens: &[u32],
+    ) -> Result<Self> {
+        let prefix = cache.lookup_prefix(prompt_tokens);
         let mut page_table = Sm12xPageTable::new(max_tokens)?;
         let logical_capacity = page_table
             .page_capacity()
@@ -48,11 +60,12 @@ impl Qwen38FlashNextSequence {
                 expected: "page-aligned capacity without overflow".to_string(),
                 actual: max_tokens.to_string(),
             })?;
-        let state = model.new_decode_state(logical_capacity)?;
+        let mut state = model.new_decode_state(logical_capacity)?;
+        let cache_stream = CudaStream::new_blocking()?;
         let private_state_bytes = state.device_bytes();
         let outcome = cache
             .admit(
-                None,
+                prefix,
                 AdmissionRequest {
                     max_position: max_tokens,
                     private_state_bytes,
@@ -60,12 +73,18 @@ impl Qwen38FlashNextSequence {
                     allow_emergency: false,
                 },
                 &mut Sm12xCacheContext {
-                    stream: state.stream(),
+                    stream: &cache_stream,
                     page_table: &mut page_table,
                 },
                 |snapshot, position| {
-                    debug_assert!(snapshot.is_none());
-                    debug_assert_eq!(position, 0);
+                    if let Some(snapshot) = snapshot {
+                        model.restore_sequence_snapshot(snapshot, &mut state)?;
+                    } else if position != 0 {
+                        return Err(Error::Format {
+                            label: "Qwen3.8 Flash Next sequence-cache restore",
+                            detail: "nonzero prefix has no recurrent snapshot".to_string(),
+                        });
+                    }
                     Ok(())
                 },
             )
@@ -76,7 +95,7 @@ impl Qwen38FlashNextSequence {
                 detail: "configured cache has insufficient capacity".to_string(),
             });
         };
-        state.stream().synchronize()?;
+        cache_stream.synchronize()?;
         Ok(Self {
             cache_id,
             page_table,
@@ -131,6 +150,23 @@ pub fn new_qwen38_flash_next_sequence_cache(
     sequence_capacity: usize,
     max_context_tokens: usize,
 ) -> Result<Qwen38FlashNextSequenceCache> {
+    new_qwen38_flash_next_sequence_cache_with_config(
+        model,
+        sequence_capacity,
+        max_context_tokens,
+        SequenceCacheConfig {
+            max_retained_bytes: 0,
+        },
+    )
+}
+
+/// Allocates active QSA pages plus the configured retained-prefix budget.
+pub fn new_qwen38_flash_next_sequence_cache_with_config(
+    model: &Qwen38FlashNextModel,
+    sequence_capacity: usize,
+    max_context_tokens: usize,
+    cache_config: SequenceCacheConfig,
+) -> Result<Qwen38FlashNextSequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {
             label: "Qwen3.8 Flash Next sequence cache",
@@ -147,7 +183,7 @@ pub fn new_qwen38_flash_next_sequence_cache(
             actual: max_context_tokens.to_string(),
         })?;
     let private_state_bytes = model.new_decode_state(max_sequence_tokens)?.device_bytes();
-    let page_slots = sequence_capacity
+    let active_page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {
             label: "Qwen3.8 Flash Next sequence-cache pages",
@@ -162,14 +198,14 @@ pub fn new_qwen38_flash_next_sequence_cache(
         .iter()
         .map(|kind| *kind == QwenLayerKind::FullAttention)
         .collect::<Vec<_>>();
-    let backend = Qwen38FlashNextPageBackend::new(
-        qsa_layers,
-        page_slots,
+    let probe_backend = Qwen38FlashNextPageBackend::new(
+        qsa_layers.iter().copied(),
+        1,
         model.manifest().kv_heads,
         model.manifest().head_dim,
         model.config().indexer_head_dim,
     )?;
-    let page_bytes = backend.page_bytes();
+    let page_bytes = probe_backend.page_bytes();
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
     let table_budget = table_bytes
         .checked_mul(sequence_capacity)
@@ -185,23 +221,53 @@ pub fn new_qwen38_flash_next_sequence_cache(
             expected: "private-state byte count without overflow".to_string(),
             actual: format!("state_bytes={private_state_bytes} sequences={sequence_capacity}"),
         })?;
-    let managed_bytes = page_bytes
-        .checked_mul(page_slots)
-        .and_then(|bytes| bytes.checked_add(table_budget))
+    let active_page_bytes =
+        page_bytes
+            .checked_mul(active_page_slots)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next active page bytes",
+                expected: "page byte count without overflow".to_string(),
+                actual: format!("page_bytes={page_bytes} page_slots={active_page_slots}"),
+            })?;
+    let active_managed_bytes = active_page_bytes
+        .checked_add(table_budget)
         .and_then(|bytes| bytes.checked_add(private_budget))
         .ok_or_else(|| Error::Shape {
             label: "Qwen3.8 Flash Next sequence-cache bytes",
             expected: "page, table, and private bytes without overflow".to_string(),
             actual: format!(
-                "page_bytes={page_bytes} page_slots={page_slots} table_bytes={table_bytes} private_bytes={private_state_bytes}"
+                "page_bytes={page_bytes} page_slots={active_page_slots} table_bytes={table_bytes} private_bytes={private_state_bytes}"
             ),
         })?;
+    let retained_bytes = cache_config.max_retained_bytes;
+    let snapshot_capacity = retained_bytes / 4;
+    let page_slots = active_page_slots
+        .checked_add(retained_bytes.saturating_sub(snapshot_capacity) / page_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next retained page slots",
+            expected: "page count without overflow".to_string(),
+            actual: format!("active={active_page_slots} retained={retained_bytes}"),
+        })?;
+    let managed_bytes = active_managed_bytes
+        .checked_add(retained_bytes)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next retained cache bytes",
+            expected: "active and retained byte count without overflow".to_string(),
+            actual: format!("active={active_managed_bytes} retained={retained_bytes}"),
+        })?;
+    let backend = Qwen38FlashNextPageBackend::new(
+        qsa_layers,
+        page_slots,
+        model.manifest().kv_heads,
+        model.manifest().head_dim,
+        model.config().indexer_head_dim,
+    )?;
     Qwen38FlashNextSequenceCache::new(
         CacheConfig {
             page_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
-            max_snapshot_bytes: 0,
-            max_prefix_entries: Some(0),
+            max_snapshot_bytes: snapshot_capacity,
+            max_prefix_entries: (retained_bytes == 0).then_some(0),
             emergency_bytes: 0,
         },
         backend,

@@ -308,6 +308,40 @@ impl Qwen38PleState {
         2 * self.channels * self.history * std::mem::size_of::<f32>()
     }
 
+    /// Copies committed convolution history for a retained prompt prefix.
+    pub(crate) fn snapshot_on_stream(&self, stream: &CudaStream) -> Result<DeviceBuffer<f32>> {
+        if self.append_pending {
+            return Err(Error::Format {
+                label: "Qwen3.8 PLE convolution snapshot",
+                detail: "an append transaction is active".to_string(),
+            });
+        }
+        let mut snapshot = DeviceBuffer::zeroed(self.conv.len())?;
+        snapshot.copy_prefix_from_device_on_stream(&self.conv, self.conv.len(), stream)?;
+        Ok(snapshot)
+    }
+
+    /// Restores committed convolution history from a retained prompt prefix.
+    pub(crate) fn restore_from_on_stream(
+        &mut self,
+        snapshot: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if self.append_pending || snapshot.len() != self.conv.len() {
+            return Err(Error::Shape {
+                label: "Qwen3.8 PLE convolution restore",
+                expected: format!("idle state with {} values", self.conv.len()),
+                actual: format!(
+                    "pending={} snapshot_values={}",
+                    self.append_pending,
+                    snapshot.len()
+                ),
+            });
+        }
+        self.conv
+            .copy_prefix_from_device_on_stream(snapshot, snapshot.len(), stream)
+    }
+
     fn require(&self, weights: &Qwen38PleWeights) -> Result<()> {
         let expected_history = (weights.conv_kernel - 1) * weights.conv_dilation;
         if self.channels != weights.hidden * weights.hc_count || self.history != expected_history {

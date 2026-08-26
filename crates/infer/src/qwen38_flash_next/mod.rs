@@ -9,7 +9,10 @@ mod transform;
 
 pub use config::Qwen38FlashNextConfig;
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
-pub use model::{Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38NextToken};
+pub use model::{
+    Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
+    Qwen38NextToken,
+};
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};
 
@@ -24,9 +27,12 @@ mod tests {
         Qwen36LinearAttentionState, Qwen36LinearAttentionWorkspace, Qwen36MoeWeights,
         load_hybrid_linear_attention,
     };
+    use crate::runtime::cache_config::SequenceCacheConfig;
     use crate::runtime::qwen38_flash_next_sequence::{
         Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
+        new_qwen38_flash_next_sequence_cache_with_config,
     };
+    use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 
     #[test]
     fn released_checkpoint_loads_paging_and_resident_scaffolding() {
@@ -102,5 +108,66 @@ mod tests {
         assert!((token.id as usize) < model.config().vocab);
         assert!(token.value.is_finite());
         assert_eq!(sequence.position(), 1);
+    }
+
+    #[test]
+    fn released_checkpoint_restores_shared_qsa_and_recurrent_prefix() {
+        let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_FULL_MODEL_DIR") else {
+            return;
+        };
+        let artifact_dir =
+            std::env::temp_dir().join(format!("eider-qwen38-prefix-{}", std::process::id()));
+        let mut model = Qwen38FlashNextModel::open(&model_dir, artifact_dir).expect("full model");
+        let mut cache = new_qwen38_flash_next_sequence_cache_with_config(
+            &model,
+            1,
+            256,
+            SequenceCacheConfig {
+                max_retained_bytes: 1024 * 1024 * 1024,
+            },
+        )
+        .expect("retained sequence cache");
+        let prompt = vec![model.config().eos_token_id; 129];
+        let mut original =
+            Qwen38FlashNextSequence::admit(&model, &mut cache, 256).expect("original sequence");
+        for &token in &prompt[..128] {
+            original
+                .decode_token(&mut model, &mut cache, token)
+                .expect("prefix token");
+        }
+        let snapshot = model
+            .snapshot_sequence(&original.state)
+            .expect("recurrent snapshot");
+        cache
+            .retain_prefix(
+                original.cache_id,
+                &prompt,
+                snapshot,
+                &mut Sm12xCacheContext {
+                    stream: original.state.stream(),
+                    page_table: &mut original.page_table,
+                },
+            )
+            .expect("retain prefix");
+        let expected = original
+            .decode_token(&mut model, &mut cache, prompt[128])
+            .expect("original continuation");
+        original.finish(&mut cache).expect("finish original");
+
+        let mut restored =
+            Qwen38FlashNextSequence::admit_with_prefix(&model, &mut cache, 256, &prompt)
+                .expect("restored sequence");
+        assert_eq!(restored.position(), 128);
+        let actual = restored
+            .decode_token(&mut model, &mut cache, prompt[128])
+            .expect("restored continuation");
+        assert_eq!(actual.id, expected.id);
+        let logit_scale = expected.value.abs().max(actual.value.abs()).max(1.0);
+        assert!(
+            (actual.value - expected.value).abs() <= logit_scale * 0.01,
+            "restored logit {} differs from original {}",
+            actual.value,
+            expected.value
+        );
     }
 }

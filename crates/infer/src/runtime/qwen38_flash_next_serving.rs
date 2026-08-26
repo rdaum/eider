@@ -1,5 +1,6 @@
 //! Serial chat serving for the Qwen3.8 Flash Next native QSA path.
 
+use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
@@ -8,10 +9,13 @@ use super::stop::StopBuffer;
 use crate::nvfp4::{Error, Result};
 use crate::qwen38_flash_next::{Qwen38FlashNextModel, Qwen38NextToken};
 use crate::runtime::qwen38_flash_next_sequence::{
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, new_qwen38_flash_next_sequence_cache,
+    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
+    new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
 };
+use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Qwen38FlashNextRequestId(u64);
@@ -74,6 +78,8 @@ pub enum Qwen38FlashNextCancelOutcome {
 struct ActiveRequest<'tokenizer> {
     prompt: Vec<u32>,
     prompt_position: usize,
+    prefix_target: usize,
+    prefix_retained: bool,
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
@@ -102,6 +108,15 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         model: Qwen38FlashNextModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
+    ) -> Result<Self> {
+        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
+    }
+
+    pub fn new_with_cache_config(
+        model: Qwen38FlashNextModel,
+        template: &'template CheckpointChatTemplate,
+        config: SchedulerConfig,
+        cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
         if config.max_context_tokens > model.config().max_position_embeddings {
@@ -133,10 +148,11 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 actual: config.speculative_drafts.to_string(),
             });
         }
-        let sequence_cache = new_qwen38_flash_next_sequence_cache(
+        let sequence_cache = new_qwen38_flash_next_sequence_cache_with_config(
             &model,
             config.max_active_sequences,
             config.max_context_tokens,
+            cache_config,
         )?;
         Ok(Self {
             model,
@@ -203,12 +219,15 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
+        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens);
         let max_output_tokens = request.generation.max_new_tokens;
         self.requests.insert(
             id,
             ActiveRequest {
                 prompt: prompt.token_ids,
                 prompt_position: 0,
+                prefix_target,
+                prefix_retained: false,
                 generation: request.generation,
                 generated_tokens: 0,
                 last_token: None,
@@ -314,16 +333,24 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let allocation_started = Instant::now();
         let request = self.requests.get_mut(&id).expect("waiting request exists");
         let capacity = request.prompt.len() + request.generation.max_new_tokens;
-        let sequence =
-            Qwen38FlashNextSequence::admit(&self.model, &mut self.sequence_cache, capacity.max(1))?;
+        let sequence = Qwen38FlashNextSequence::admit_with_prefix(
+            &self.model,
+            &mut self.sequence_cache,
+            capacity.max(1),
+            &request.prompt,
+        )?;
         let sequence_device_bytes = sequence.device_bytes();
+        let cached_prompt_tokens = sequence.position();
         let progress = Qwen38FlashNextAdmissionProgress {
             request_id: id,
             sequence_device_bytes,
-            cached_prompt_tokens: 0,
+            cached_prompt_tokens,
             allocation_duration: allocation_started.elapsed(),
             admitted_after_tick_start: started.elapsed(),
         };
+        request.prompt_position = cached_prompt_tokens;
+        request.prefix_retained =
+            cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
         request.sequence = Some(Box::new(sequence));
         request.sequence_device_bytes = sequence_device_bytes;
         self.active_sequences = 1;
@@ -341,8 +368,14 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         ),
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("prefill request exists");
-        let end = (request.prompt_position + self.config.prefill_token_capacity)
+        let mut end = (request.prompt_position + self.config.prefill_token_capacity)
             .min(request.prompt.len());
+        if !request.prefix_retained
+            && request.prompt_position < request.prefix_target
+            && end > request.prefix_target
+        {
+            end = request.prefix_target;
+        }
         if end == request.prompt_position {
             return Ok(());
         }
@@ -356,11 +389,57 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 Some(sequence.decode_token(&mut self.model, &mut self.sequence_cache, token)?);
         }
         request.prompt_position = end;
+        Self::retain_request_checkpoint(&self.model, &mut self.sequence_cache, request);
         tick.prefilled.push(Qwen38FlashNextPrefillProgress {
             request_id: id,
             prompt_position: end,
         });
         Ok(())
+    }
+
+    fn retain_request_checkpoint(
+        model: &Qwen38FlashNextModel,
+        sequence_cache: &mut Qwen38FlashNextSequenceCache,
+        request: &mut ActiveRequest<'template>,
+    ) {
+        if request.prefix_retained || request.prefix_target == 0 {
+            return;
+        }
+        if sequence_cache.config().max_prefix_entries == Some(0) {
+            request.prefix_retained = true;
+            return;
+        }
+        let Some(sequence) = request.sequence.as_deref_mut() else {
+            return;
+        };
+        if sequence.position() != request.prefix_target {
+            return;
+        }
+        if sequence_cache.contains_prefix(&request.prompt, request.prefix_target) {
+            request.prefix_retained = true;
+            return;
+        }
+        let snapshot = match model.snapshot_sequence(&sequence.state) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(%error, "failed to copy Qwen3.8 recurrent prompt-prefix snapshot");
+                request.prefix_retained = true;
+                return;
+            }
+        };
+        if let Err(error) = sequence_cache.retain_prefix(
+            sequence.cache_id,
+            &request.prompt,
+            snapshot,
+            &mut Sm12xCacheContext {
+                stream: sequence.state.stream(),
+                page_table: &mut sequence.page_table,
+            },
+        ) {
+            let error = qwen38_flash_next_cache_error(error);
+            warn!(%error, "failed to retain shared Qwen3.8 prompt prefix");
+        }
+        request.prefix_retained = true;
     }
 
     fn generate_one(

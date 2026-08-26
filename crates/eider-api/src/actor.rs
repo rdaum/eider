@@ -550,7 +550,12 @@ fn actor_main(
                 speculative_drafts: 0,
                 ..scheduler
             };
-            let service = match Qwen38FlashNextChatService::new(model, &template, qsa_scheduler) {
+            let service = match Qwen38FlashNextChatService::new_with_cache_config(
+                model,
+                &template,
+                qsa_scheduler,
+                sequence_cache,
+            ) {
                 Ok(service) => service,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));

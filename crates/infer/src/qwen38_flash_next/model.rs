@@ -19,6 +19,9 @@ use crate::runtime::qwen38_flash_next_sequence::{
 use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
 use seqcache::{AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_QWEN38_FLASH_NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
 enum Qwen38AttentionWeights {
     Linear(Qwen36LinearAttentionWeights),
@@ -53,6 +56,7 @@ struct Qwen38Layer {
 
 /// Fully resident neural body with a direct-paged BF16 PLE table.
 pub struct Qwen38FlashNextModel {
+    model_id: u64,
     config: Qwen38FlashNextConfig,
     manifest: QwenModelManifest,
     checkpoint: ModelOptCheckpoint,
@@ -68,6 +72,7 @@ pub struct Qwen38FlashNextModel {
 
 /// Mutable one-sequence state and reusable single-token workspace.
 pub struct Qwen38FlashNextDecodeState {
+    model_id: u64,
     stream: CudaStream,
     token_id: DeviceBuffer<u32>,
     streams_a: DeviceBuffer<f32>,
@@ -87,6 +92,30 @@ pub struct Qwen38FlashNextDecodeState {
     lm_head: Qwen36LmHeadWorkspace,
     position: usize,
     max_tokens: usize,
+}
+
+/// Immutable page-aligned snapshot of Flash Next's non-pageable sequence state.
+///
+/// QSA K/V and index-key pages remain owned by the shared sequence cache.
+pub struct Qwen38FlashNextSequenceSnapshot {
+    model_id: u64,
+    position: usize,
+    linear_states: Vec<Option<Qwen36LinearAttentionState>>,
+    ple_window: Qwen38PleTokenWindow,
+    ple_conv: DeviceBuffer<f32>,
+    device_bytes: usize,
+}
+
+impl Qwen38FlashNextSequenceSnapshot {
+    /// Returns the page-aligned position represented by this snapshot.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns exact device bytes retained outside shared QSA pages.
+    pub fn device_bytes(&self) -> usize {
+        self.device_bytes
+    }
 }
 
 /// Greedy next-token result from the native decode path.
@@ -173,6 +202,7 @@ impl Qwen38FlashNextModel {
             });
         }
         Ok(Self {
+            model_id: NEXT_QWEN38_FLASH_NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             config,
             manifest,
             checkpoint,
@@ -229,6 +259,7 @@ impl Qwen38FlashNextModel {
         }
         let hc_dim = self.config.hidden * self.config.hc_count;
         Ok(Qwen38FlashNextDecodeState {
+            model_id: self.model_id,
             stream: CudaStream::new_non_blocking()?,
             token_id: DeviceBuffer::zeroed(1)?,
             streams_a: DeviceBuffer::zeroed(hc_dim)?,
@@ -252,6 +283,105 @@ impl Qwen38FlashNextModel {
             position: 0,
             max_tokens,
         })
+    }
+
+    /// Copies recurrent GDN and PLE state for a retained prompt prefix.
+    pub(crate) fn snapshot_sequence(
+        &self,
+        source: &Qwen38FlashNextDecodeState,
+    ) -> Result<Qwen38FlashNextSequenceSnapshot> {
+        if source.model_id != self.model_id
+            || source.position == 0
+            || !source
+                .position
+                .is_multiple_of(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next sequence snapshot",
+                expected: "matching model and nonzero page-aligned position".to_string(),
+                actual: format!(
+                    "model={} expected_model={} position={}",
+                    source.model_id, self.model_id, source.position
+                ),
+            });
+        }
+        let ple_window = source.ple_window.snapshot()?;
+        let ple_conv = source.ple_state.snapshot_on_stream(&source.stream)?;
+        let mut linear_states = Vec::with_capacity(source.attention_states.len());
+        let mut device_bytes = ple_conv.device_bytes();
+        for state in &source.attention_states {
+            match state {
+                Qwen38AttentionState::Linear(linear_source) => {
+                    let mut destination = Qwen36LinearAttentionState {
+                        conv_state: DeviceBuffer::zeroed(linear_source.conv_state.len())?,
+                        recurrent_state: DeviceBuffer::zeroed(linear_source.recurrent_state.len())?,
+                    };
+                    destination.copy_from_on_stream(linear_source, &source.stream)?;
+                    device_bytes = device_bytes
+                        .checked_add(destination.device_bytes())
+                        .ok_or_else(|| Error::Shape {
+                            label: "Qwen3.8 Flash Next snapshot bytes",
+                            expected: "byte total without overflow".to_string(),
+                            actual: device_bytes.to_string(),
+                        })?;
+                    linear_states.push(Some(destination));
+                }
+                Qwen38AttentionState::Qsa => linear_states.push(None),
+            }
+        }
+        source.stream.synchronize()?;
+        Ok(Qwen38FlashNextSequenceSnapshot {
+            model_id: self.model_id,
+            position: source.position,
+            linear_states,
+            ple_window,
+            ple_conv,
+            device_bytes,
+        })
+    }
+
+    /// Restores a retained recurrent snapshot into an empty sequence state.
+    pub(crate) fn restore_sequence_snapshot(
+        &self,
+        snapshot: &Qwen38FlashNextSequenceSnapshot,
+        destination: &mut Qwen38FlashNextDecodeState,
+    ) -> Result<()> {
+        if snapshot.model_id != self.model_id
+            || destination.model_id != self.model_id
+            || destination.position != 0
+            || snapshot.position > destination.max_tokens
+            || snapshot.linear_states.len() != destination.attention_states.len()
+        {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next sequence snapshot restore",
+                detail: "snapshot and empty destination are incompatible".to_string(),
+            });
+        }
+        for (layer_snapshot, layer_destination) in snapshot
+            .linear_states
+            .iter()
+            .zip(&mut destination.attention_states)
+        {
+            match (layer_snapshot, layer_destination) {
+                (Some(source), Qwen38AttentionState::Linear(linear_destination)) => {
+                    linear_destination.copy_from_on_stream(source, &destination.stream)?;
+                }
+                (None, Qwen38AttentionState::Qsa) => {}
+                _ => {
+                    return Err(Error::Format {
+                        label: "Qwen3.8 Flash Next sequence snapshot restore",
+                        detail: "snapshot layer kinds differ from destination".to_string(),
+                    });
+                }
+            }
+        }
+        destination
+            .ple_state
+            .restore_from_on_stream(&snapshot.ple_conv, &destination.stream)?;
+        destination.ple_window.restore_from(&snapshot.ple_window)?;
+        destination.stream.synchronize()?;
+        destination.position = snapshot.position;
+        Ok(())
     }
 
     /// Evaluates one token and commits all recurrent state only after success.

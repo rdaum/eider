@@ -232,6 +232,33 @@ impl Qwen38PleTokenWindow {
         Ok(())
     }
 
+    /// Copies committed token history for a retained prompt prefix.
+    pub(crate) fn snapshot(&self) -> Result<Self> {
+        if self.rollback.is_some() {
+            return Err(Error::Format {
+                label: "Qwen3.8 PLE token-window snapshot",
+                detail: "an append transaction is active".to_string(),
+            });
+        }
+        Ok(self.clone())
+    }
+
+    /// Restores committed token history into an empty compatible window.
+    pub(crate) fn restore_from(&mut self, source: &Self) -> Result<()> {
+        if self.rollback.is_some()
+            || source.rollback.is_some()
+            || self.previous.len() != source.previous.len()
+            || self.eos_token_id != source.eos_token_id
+        {
+            return Err(Error::Format {
+                label: "Qwen3.8 PLE token-window restore",
+                detail: "source and destination windows are incompatible".to_string(),
+            });
+        }
+        self.previous.clone_from(&source.previous);
+        Ok(())
+    }
+
     fn push(&mut self, token: u32) {
         if token == self.eos_token_id {
             self.previous.fill(self.eos_token_id);
@@ -520,5 +547,29 @@ mod tests {
         window.abort_append().expect("rollback");
         let reset = Qwen38PleTokenWindow::new(3, 99).expect("reset window");
         assert_eq!(window, reset);
+    }
+
+    #[test]
+    fn retained_window_restores_committed_history() {
+        let mut window = Qwen38PleTokenWindow::new(3, 99).expect("window");
+        window.begin_append().expect("first transaction");
+        window.push(7);
+        window.commit_append().expect("first commit");
+        let snapshot = window.snapshot().expect("snapshot");
+
+        window.begin_append().expect("second transaction");
+        window.push(11);
+        window.commit_append().expect("second commit");
+        assert_ne!(window, snapshot);
+
+        window.restore_from(&snapshot).expect("restore");
+        assert_eq!(window, snapshot);
+    }
+
+    #[test]
+    fn retained_window_rejects_an_active_append() {
+        let mut window = Qwen38PleTokenWindow::new(3, 99).expect("window");
+        window.begin_append().expect("transaction");
+        assert!(window.snapshot().is_err());
     }
 }
