@@ -57,8 +57,11 @@ record_bytes=$((52 + 3 * (weights_per_matrix / 2 + weights_per_matrix / 16)))
 required_bytes=$((layers * experts * record_bytes))
 prepared_bytes="$(du -sb "$artifact_dir" 2>/dev/null | awk '{print $1}')"
 prepared_bytes="${prepared_bytes:-0}"
-reclaimable_bytes="$(du -sb "$legacy_q3_dir" 2>/dev/null | awk '{print $1}')"
-reclaimable_bytes="${reclaimable_bytes:-0}"
+if [[ -d "$legacy_q3_dir" ]]; then
+    reclaimable_bytes="$(du -sb "$legacy_q3_dir" | awk '{print $1}')"
+else
+    reclaimable_bytes=0
+fi
 available_bytes="$(df --output=avail -B1 "$artifact_dir" | tail -1 | tr -d ' ')"
 reserve_bytes=$((5 * 1024 * 1024 * 1024))
 missing_bytes=$((required_bytes > prepared_bytes ? required_bytes - prepared_bytes : 0))
