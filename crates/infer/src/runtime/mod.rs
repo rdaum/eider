@@ -24,6 +24,7 @@ pub mod muse_glimmer_serving;
 pub mod nemotron3_sequence_cache;
 pub mod nemotron3_serving;
 pub mod qwen36_sequence;
+pub mod qwen38_flash_next_serving;
 pub mod sampling;
 pub mod scheduler;
 pub mod serving;

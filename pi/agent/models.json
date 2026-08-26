@@ -67,6 +67,28 @@
           }
         },
         {
+          "id": "eider-qwen3.8-flash-next",
+          "name": "Qwen3.8 Flash Next NVFP4 with paged BF16 PLE",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh"
+          },
+          "input": ["text"],
+          "contextWindow": 2048,
+          "maxTokens": 1024,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "eider-ternary-bonsai-8b",
           "name": "Ternary Bonsai 8B Q2_0 g64",
           "reasoning": false,
@@ -273,6 +295,28 @@
           "input": ["text"],
           "contextWindow": 32768,
           "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "eider-qwen3.8-flash-next",
+          "name": "Qwen3.8 Flash Next NVFP4 with paged BF16 PLE",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh"
+          },
+          "input": ["text"],
+          "contextWindow": 2048,
+          "maxTokens": 1024,
           "cost": {
             "input": 0,
             "output": 0,

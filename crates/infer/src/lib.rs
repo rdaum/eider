@@ -28,6 +28,9 @@ pub mod gguf_quant;
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;
 
+/// Qwen3.8 Flash Next text-model loading and inference.
+pub mod qwen38_flash_next;
+
 /// Hashed n-gram embedding identifiers and transactional token-window state.
 pub mod ngram;
 

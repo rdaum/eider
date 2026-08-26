@@ -315,6 +315,10 @@ impl BenchModel {
                 };
                 Ok(Self::Qwen36(Box::new(model)))
             }
+            QwenArchitecture::Qwen38FlashNext => Err(infer::nvfp4::Error::Format {
+                label: "Qwen benchmark model",
+                detail: "Qwen3.8 Flash Next uses its dedicated runtime".to_string(),
+            }),
         }
     }
 

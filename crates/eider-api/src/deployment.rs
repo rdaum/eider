@@ -136,6 +136,20 @@ const CATALOGUE: &[ModelSpec] = &[
         },
     },
     ModelSpec {
+        id: "qwen3.8-flash-next",
+        repository: "Inferact/Qwen3.8-Flash-Next-NVFP4",
+        revision: "129972269565f7f4f664fdf8dd42268d3bbda9fd",
+        model_type: "qwen3_8_flash_next",
+        artifact_kind: ArtifactKind::None,
+        artifact_estimate_bytes: 0,
+        defaults: ServingDefaults {
+            served_model_name: "eider-qwen3.8-flash-next",
+            max_context_tokens: 2_048,
+            prefill_token_capacity: 64,
+            step_expert_capacity: 240,
+        },
+    },
+    ModelSpec {
         id: "agents-a1",
         repository: "r0b0tlab/Agents-A1-NVFP4",
         revision: "68a7ff18c006927cbf3a97f76f293452ca14e016",
@@ -614,6 +628,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             | "bonsai"
             | "qwen3_5"
             | "qwen3_5_moe"
+            | "qwen3_8_flash_next"
             | "step3p7"
             | "nemotron_h"
             | "nemotron_h_puzzle"
@@ -640,11 +655,13 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
                 "bitnet" => 4_096,
                 "bailing_hybrid" => 4_096,
                 "bonsai" => 65_536,
+                "qwen3_8_flash_next" => 2_048,
                 _ => 32_768,
             },
             prefill_token_capacity: match model_type.as_str() {
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
+                "qwen3_8_flash_next" => 64,
                 _ => 2_048,
             },
             step_expert_capacity: 240,
@@ -887,6 +904,18 @@ mod tests {
             QWEN38_DFLASH2_REVISION,
             "50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
         );
+    }
+
+    #[test]
+    fn catalogue_pins_qwen38_flash_next_reference_checkpoint() {
+        let model = catalogue_model("qwen3.8-flash-next").unwrap();
+        assert_eq!(model.model_type, "qwen3_8_flash_next");
+        assert_eq!(model.repository, "Inferact/Qwen3.8-Flash-Next-NVFP4");
+        assert_eq!(model.revision, "129972269565f7f4f664fdf8dd42268d3bbda9fd");
+        assert_eq!(model.artifact_kind, ArtifactKind::None);
+        assert_eq!(model.defaults.served_model_name, "eider-qwen3.8-flash-next");
+        assert_eq!(model.defaults.max_context_tokens, 2_048);
+        assert_eq!(model.defaults.prefill_token_capacity, 64);
     }
 
     #[test]

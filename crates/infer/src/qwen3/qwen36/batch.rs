@@ -5259,6 +5259,27 @@ impl Qwen36MoeWeights {
                     detail: "the current model does not use NVFP4 shared experts".to_string(),
                 });
             }
+            Qwen36SharedExpertStorage::Bf16 { gate_up, down } => {
+                gate_up.run_batch_into(
+                    ffn_norm,
+                    &mut workspace.shared_gate_up,
+                    capacity,
+                    stream,
+                )?;
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &workspace.shared_gate_up,
+                    workspace.shared_activated.output(),
+                    capacity,
+                    self.expert_intermediate,
+                    stream,
+                )?;
+                down.run_batch_into(
+                    &workspace.shared_activated,
+                    &mut workspace.shared_output,
+                    capacity,
+                    stream,
+                )?;
+            }
         }
         run_bf16_batch(
             model,

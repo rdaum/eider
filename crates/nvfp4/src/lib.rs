@@ -24,6 +24,7 @@ mod kernels;
 mod matrix;
 mod modelopt;
 mod ngram;
+mod paged_rows;
 mod q2;
 mod q3;
 mod safetensors;
@@ -168,8 +169,8 @@ pub use kernels::non_gemm::{
     rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream,
-    rope_neox_inv_freq_sequence_f32_into_on_stream, rope_neox_partial_f32_into_on_stream,
-    rope_neox_proportional_f32_into_on_stream,
+    rope_neox_inv_freq_sequence_f32_into_on_stream, rope_neox_partial_f32_indexed_into_on_stream,
+    rope_neox_partial_f32_into_on_stream, rope_neox_proportional_f32_into_on_stream,
     rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
     rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
@@ -193,6 +194,12 @@ pub use kernels::non_gemm::{
     unpack_heads_quantize_nvfp4_col_major_f32_at_offset_into_on_stream,
 };
 pub use kernels::qwen36_gdn::Qwen36ChunkedGdn;
+pub use kernels::qwen38::{
+    qwen38_hc_collapse_f32_into_on_stream, qwen38_hc_combine_f32_into_on_stream,
+    qwen38_hc_norm_f32_into_on_stream, qwen38_hc_silu_scale_f32_in_place_on_stream,
+    qwen38_ple_conv_update_f32_into_on_stream, qwen38_ple_gate_value_f32_into_on_stream,
+    qwen38_repeat_streams_f32_into_on_stream,
+};
 pub use kernels::sm12x_kv_cache::{
     SM12X_KV_PAGE_TOKENS, Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool,
     Sm12xKvTailSnapshot,
@@ -223,6 +230,9 @@ pub use modelopt::{
 pub use ngram::{
     NgramEmbeddingBank, NgramEmbeddingFormat, NgramFp8Rows, NgramNvfp4Rows,
     fused_ngram_embedding_reference,
+};
+pub use paged_rows::{
+    PagedBf16ReadStats, PagedBf16RowBatch, PagedBf16RowReader, PagedBf16RowSource,
 };
 pub use q2::{
     Q2_BLOCK_SIZE, Q2ExpertTable, Q2ExpertTableCacheInfo, Q2ExpertTableCacheWriter, Q2Matrix,

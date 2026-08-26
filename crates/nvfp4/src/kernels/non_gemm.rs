@@ -3402,6 +3402,51 @@ pub fn rope_neox_partial_f32_into_on_stream(
     }
 }
 
+/// Enqueues indexed partial NeoX RoPE for a device-resident position.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_partial_f32_indexed_into_on_stream(
+    rows: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    position: &DeviceBuffer<u32>,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    validate_rope_neox_f32(rows, head_dim, input, &output, None, theta)?;
+    if rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || rotary_dim > u32::MAX as usize
+        || position.len() != 1
+    {
+        return Err(Error::Shape {
+            label: "indexed partial RoPE dimensions",
+            expected: "non-zero even rotary_dim <= head_dim and one position".to_string(),
+            actual: format!(
+                "rotary_dim={rotary_dim} head_dim={head_dim} positions={}",
+                position.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rope_neox_partial_f32_indexed_on_stream",
+            ffi::infer_rope_neox_partial_f32_indexed_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                head_dim as u32,
+                rotary_dim as u32,
+                position.ptr,
+                theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues proportional partial NeoX RoPE for one position.
 ///
 /// `rotary_dim / 2` leading frequency pairs are rotated using ordinary

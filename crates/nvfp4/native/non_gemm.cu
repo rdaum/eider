@@ -3987,6 +3987,58 @@ extern "C" cudaError_t infer_rope_neox_partial_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_rope_neox_partial_f32_indexed_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    const std::uint32_t* position,
+    float theta) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = rows * head_dim;
+    if (idx >= len) return;
+    const std::uint32_t dim = idx % head_dim;
+    if (dim >= rotary_dim) {
+        output[idx] = input[idx];
+        return;
+    }
+    const std::uint32_t half = rotary_dim / 2;
+    if (dim >= half) return;
+    const std::uint32_t row_start = (idx / head_dim) * head_dim;
+    const float inv_freq =
+        powf(theta, -2.0f * static_cast<float>(dim) / static_cast<float>(rotary_dim));
+    float sin_value;
+    float cos_value;
+    sincosf(static_cast<float>(position[0]) * inv_freq, &sin_value, &cos_value);
+    const float a = input[row_start + dim];
+    const float b = input[row_start + dim + half];
+    output[row_start + dim] = a * cos_value - b * sin_value;
+    output[row_start + dim + half] = a * sin_value + b * cos_value;
+}
+
+extern "C" cudaError_t infer_rope_neox_partial_f32_indexed_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    const std::uint32_t* position,
+    float theta,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || position == nullptr || rows == 0 ||
+        head_dim == 0 || rotary_dim == 0 || rotary_dim > head_dim ||
+        (rotary_dim % 2) != 0 || !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint32_t len = rows * head_dim;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_rope_neox_partial_f32_indexed_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, rows, head_dim, rotary_dim, position, theta);
+    return cudaGetLastError();
+}
+
 // Proportional partial RoPE keeps the ordinary NeoX pair stride and frequency
 // denominator, but rotates only the leading fraction of frequency pairs. This
 // is the layout used by Gemma 4 full attention: pair i is (i, i+head_dim/2),

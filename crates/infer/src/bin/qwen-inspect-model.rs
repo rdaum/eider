@@ -88,6 +88,7 @@ fn arch_label(architecture: QwenArchitecture) -> &'static str {
     match architecture {
         QwenArchitecture::Qwen3 => "qwen3",
         QwenArchitecture::Qwen35Hybrid => "qwen3_5 hybrid",
+        QwenArchitecture::Qwen38FlashNext => "qwen3_8_flash_next",
     }
 }
 

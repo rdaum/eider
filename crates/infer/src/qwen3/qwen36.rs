@@ -23,8 +23,8 @@ use crate::nvfp4::{
     MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
     SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm121W4A16GateUp, Sm121W4A16HostWeight,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    bf16_linear_pair_logits_f32_into_on_stream,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
@@ -34,6 +34,7 @@ use crate::nvfp4::{
     fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
     gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
+    ling3_sigmoid_gated_rms_norm_f32_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
     nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
@@ -42,6 +43,7 @@ use crate::nvfp4::{
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
     qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
+    rope_neox_partial_f32_indexed_into_on_stream, rope_neox_partial_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
     scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
@@ -322,7 +324,7 @@ impl Qwen36LinearFp8Execution {
     }
 }
 
-struct Bf16Linear {
+pub(crate) struct Bf16Linear {
     weight: DeviceBuffer<u16>,
     rows: usize,
     cols: usize,
@@ -1439,10 +1441,76 @@ impl Qwen36LinearAttentionWeights {
         })
     }
 
+    /// Runs one token with the sigmoid output gate used by Qwen4-Exp.
+    pub(crate) fn run_one_token_sigmoid_output_gate<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36LinearAttentionWorkspace,
+        state: &mut Qwen36LinearAttentionState,
+        hidden: &DeviceBuffer<f32>,
+        rms_eps: f32,
+        stream: &CudaStream,
+    ) -> Result<Qwen36LinearAttentionStep<'a>> {
+        self.enqueue_pre_gdn(workspace, state, hidden, stream)?;
+        self.enqueue_gdn(workspace, state, stream)?;
+        ling3_sigmoid_gated_rms_norm_f32_into_on_stream(
+            &workspace.gdn_output,
+            &workspace.z_output,
+            &self.norm_weight,
+            workspace.normed.output(),
+            workspace.linear.value_heads,
+            workspace.linear.value_head_dim,
+            rms_eps,
+            stream,
+        )?;
+        self.run_output_projection(workspace, stream)?;
+        Ok(Qwen36LinearAttentionStep {
+            qkv_output: &workspace.qkv_output,
+            z_output: &workspace.z_output,
+            gdn_output: &workspace.gdn_output,
+            output: &workspace.output,
+        })
+    }
+
     /// Returns output width.
     pub fn output_width(&self) -> usize {
         self.out.rows()
     }
+}
+
+/// Loads the reusable GDN portion of a Qwen hybrid layer for another text runtime.
+pub(crate) fn load_hybrid_linear_attention(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    artifact_dir: &std::path::Path,
+    layer: usize,
+) -> Result<Qwen36LinearAttentionWeights> {
+    let cache = Qwen36Fp8Nvfp4Cache::new(checkpoint, artifact_dir)?;
+    Qwen36LinearAttentionWeights::load(
+        checkpoint,
+        manifest,
+        layer,
+        Qwen36Bf16Storage::Bf16,
+        Qwen36Fp8Storage::Nvfp4,
+        &cache,
+    )
+}
+
+/// Loads the dense-oracle full-attention portion of a Qwen hybrid layer.
+pub(crate) fn load_hybrid_full_attention(
+    checkpoint: &ModelOptCheckpoint,
+    manifest: &QwenModelManifest,
+    artifact_dir: &std::path::Path,
+    layer: usize,
+) -> Result<Qwen36FullAttentionWeights> {
+    let cache = Qwen36Fp8Nvfp4Cache::new(checkpoint, artifact_dir)?;
+    Qwen36FullAttentionWeights::load(
+        checkpoint,
+        manifest,
+        layer,
+        Qwen36Bf16Storage::Bf16,
+        Qwen36Fp8Storage::Nvfp4,
+        &cache,
+    )
 }
 
 impl Qwen36LinearAttentionWorkspace {
@@ -1487,6 +1555,36 @@ impl Qwen36LinearAttentionState {
                 linear.value_heads * linear.value_head_dim * linear.value_head_dim,
             )?,
         })
+    }
+
+    pub(crate) fn copy_from_on_stream(&mut self, source: &Self, stream: &CudaStream) -> Result<()> {
+        if self.conv_state.len() != source.conv_state.len()
+            || self.recurrent_state.len() != source.recurrent_state.len()
+        {
+            return Err(Error::Shape {
+                label: "Qwen linear-attention state copy",
+                expected: format!(
+                    "conv={} recurrent={}",
+                    self.conv_state.len(),
+                    self.recurrent_state.len()
+                ),
+                actual: format!(
+                    "conv={} recurrent={}",
+                    source.conv_state.len(),
+                    source.recurrent_state.len()
+                ),
+            });
+        }
+        self.conv_state.copy_prefix_from_device_on_stream(
+            &source.conv_state,
+            source.conv_state.len(),
+            stream,
+        )?;
+        self.recurrent_state.copy_prefix_from_device_on_stream(
+            &source.recurrent_state,
+            source.recurrent_state.len(),
+            stream,
+        )
     }
 
     fn device_bytes(&self) -> usize {
@@ -1978,7 +2076,12 @@ impl Qwen36Linear {
 }
 
 impl Bf16Linear {
-    fn load(checkpoint: &ModelOptCheckpoint, name: &str, rows: usize, cols: usize) -> Result<Self> {
+    pub(crate) fn load(
+        checkpoint: &ModelOptCheckpoint,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
         Ok(Self {
             weight: read_bf16_matrix_device(checkpoint, name, rows, cols)?,
             rows,
@@ -1994,7 +2097,7 @@ impl Bf16Linear {
         })
     }
 
-    fn run_into(
+    pub(crate) fn run_into(
         &self,
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
@@ -2004,6 +2107,24 @@ impl Bf16Linear {
             input,
             &self.weight,
             output.output(),
+            self.rows,
+            self.cols,
+            stream,
+        )
+    }
+
+    pub(crate) fn run_batch_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch_size: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        bf16_linear_logits_f32_batch_into_on_stream(
+            input,
+            &self.weight,
+            output.output(),
+            batch_size,
             self.rows,
             self.cols,
             stream,
@@ -2026,7 +2147,7 @@ fn read_bf16_matrix_device(
     )
 }
 
-fn read_bf16_vector_as_f32_device(
+pub(crate) fn read_bf16_vector_as_f32_device(
     checkpoint: &ModelOptCheckpoint,
     name: &str,
     len: usize,
@@ -2042,7 +2163,7 @@ fn read_bf16_vector_as_f32_device(
     )
 }
 
-fn read_bf16_vector_delta_as_f32_device(
+pub(crate) fn read_bf16_vector_delta_as_f32_device(
     checkpoint: &ModelOptCheckpoint,
     name: &str,
     len: usize,
@@ -2058,7 +2179,7 @@ fn read_bf16_vector_delta_as_f32_device(
     )
 }
 
-fn read_bf16_flat_host(
+pub(crate) fn read_bf16_flat_host(
     checkpoint: &ModelOptCheckpoint,
     name: &str,
     len: usize,
@@ -2355,10 +2476,18 @@ fn apply_rope(
     position: usize,
     stream: &CudaStream,
 ) -> Result<()> {
-    let sections = manifest.mrope_sections.ok_or_else(|| Error::Format {
-        label: "Qwen3.6 IMRoPE",
-        detail: "mrope_sections not set in manifest".to_string(),
-    })?;
+    let Some(sections) = manifest.mrope_sections else {
+        return rope_neox_partial_f32_into_on_stream(
+            rows,
+            manifest.head_dim,
+            manifest.rotary_dim,
+            input,
+            output.output(),
+            position,
+            manifest.rope_theta,
+            stream,
+        );
+    };
     rope_imrope_f32_into_on_stream(
         rows,
         manifest.head_dim,
@@ -2385,10 +2514,18 @@ fn apply_rope_indexed(
     position: &DeviceBuffer<u32>,
     stream: &CudaStream,
 ) -> Result<()> {
-    let sections = manifest.mrope_sections.ok_or_else(|| Error::Format {
-        label: "Qwen3.6 indexed IMRoPE",
-        detail: "mrope_sections not set in manifest".to_string(),
-    })?;
+    let Some(sections) = manifest.mrope_sections else {
+        return rope_neox_partial_f32_indexed_into_on_stream(
+            rows,
+            manifest.head_dim,
+            manifest.rotary_dim,
+            input,
+            output.output(),
+            position,
+            manifest.rope_theta,
+            stream,
+        );
+    };
     rope_imrope_f32_indexed_into_on_stream(
         rows,
         manifest.head_dim,
@@ -2606,7 +2743,14 @@ struct Qwen36Fp8Experts {
 
 enum Qwen36SharedExpertStorage {
     Nvfp4(Qwen36SharedExpert),
-    Fp8 { gate_up: Fp8Linear, down: Fp8Linear },
+    Fp8 {
+        gate_up: Fp8Linear,
+        down: Fp8Linear,
+    },
+    Bf16 {
+        gate_up: Bf16Linear,
+        down: Bf16Linear,
+    },
 }
 
 struct Qwen36GroupedMoeWeights {
@@ -3193,6 +3337,34 @@ impl Qwen36MoeWeights {
         layer: usize,
         cache_prepared: bool,
     ) -> Result<Self> {
+        Self::load_with_down_storage(
+            checkpoint,
+            manifest,
+            artifact_root,
+            layer,
+            cache_prepared,
+            true,
+        )
+    }
+
+    /// Loads resident experts once in checkpoint layout without an SM12x down duplicate.
+    pub(crate) fn load_checkpoint_layout(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        artifact_root: &std::path::Path,
+        layer: usize,
+    ) -> Result<Self> {
+        Self::load_with_down_storage(checkpoint, manifest, artifact_root, layer, false, false)
+    }
+
+    fn load_with_down_storage(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        artifact_root: &std::path::Path,
+        layer: usize,
+        cache_prepared: bool,
+        request_sm12x_down: bool,
+    ) -> Result<Self> {
         let (experts, experts_per_token, expert_intermediate, norm_topk_prob) = match manifest.ffn {
             QwenFfnConfig::Moe {
                 experts,
@@ -3234,10 +3406,14 @@ impl Qwen36MoeWeights {
                 norm_topk_prob,
             );
         }
-        let sm12x_cache_dir = if cache_prepared {
-            prepared_layer_dir(artifact_root, layer)
+        let sm12x_cache_dir = if request_sm12x_down {
+            if cache_prepared {
+                prepared_layer_dir(artifact_root, layer)
+            } else {
+                ensure_layer_cache(checkpoint, manifest, artifact_root, layer)?
+            }
         } else {
-            ensure_layer_cache(checkpoint, manifest, artifact_root, layer)?
+            PathBuf::new()
         };
 
         let mut lazy_experts = Vec::with_capacity(experts);
@@ -3252,7 +3428,6 @@ impl Qwen36MoeWeights {
             });
         }
 
-        let request_sm12x_down = true;
         let sm12x_down_cache_complete = request_sm12x_down
             && (0..experts).all(|expert_idx| down_path(&sm12x_cache_dir, expert_idx).is_file());
         let storage_plan =
@@ -3291,12 +3466,11 @@ impl Qwen36MoeWeights {
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
-                    let weight = expert.get_down_w4a16()?;
+                    let weight =
+                        checkpoint.load_nvfp4_linear(&format!("{}.down_proj", expert.prefix))?;
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
-                    down_grouped_value_ptrs[expert_idx] =
-                        weight.packed_weight.as_const_ptr().cast();
-                    down_grouped_scale_ptrs[expert_idx] = weight.weight_scale.as_const_ptr().cast();
+                    grouped_down.push(weight.as_cublaslt_weight()?);
                 }
                 Qwen36DownStorage::Sm12x => {
                     let weight =
@@ -3325,6 +3499,10 @@ impl Qwen36MoeWeights {
             gate_up_grouped_value_ptrs[expert_idx] = weight.matrix().values_ptr();
             gate_up_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_ptr();
         }
+        for (expert_idx, weight) in grouped_down.iter().enumerate() {
+            down_grouped_value_ptrs[expert_idx] = weight.matrix().values_ptr();
+            down_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_ptr();
+        }
         let gate_up_storage = Qwen36GateUpStorage::CutlassW4A4;
         let grouped = if grouped_gate_up.len() == experts && grouped_down.len() == experts {
             Some(Qwen36GroupedMoeWeights::new(grouped_gate_up, grouped_down)?)
@@ -3346,38 +3524,7 @@ impl Qwen36MoeWeights {
             gate_up_alphas: DeviceBuffer::from_host(&gate_up_alphas)?,
         };
 
-        let shared_gate_up = load_concat_gate_up(
-            checkpoint,
-            &format!("{prefix}.shared_expert.gate_proj"),
-            &format!("{prefix}.shared_expert.up_proj"),
-            "Qwen3.6 shared expert gate/up",
-        )?;
-        let shared_down =
-            checkpoint.load_nvfp4_linear(&format!("{prefix}.shared_expert.down_proj"))?;
-        let shared_intermediate = shared_gate_up.out_features / 2;
-        if shared_gate_up.in_features != manifest.hidden
-            || shared_down.in_features != shared_intermediate
-            || shared_down.out_features != manifest.hidden
-        {
-            return Err(Error::Shape {
-                label: "Qwen3.6 shared expert",
-                expected: format!(
-                    "gate_up in={} out=2*{} down in={} out={}",
-                    manifest.hidden, shared_intermediate, shared_intermediate, manifest.hidden
-                ),
-                actual: format!(
-                    "gate_up in={} out={} down in={} out={}",
-                    shared_gate_up.in_features,
-                    shared_gate_up.out_features,
-                    shared_down.in_features,
-                    shared_down.out_features
-                ),
-            });
-        }
-        let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
-            gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
-            down: Nvfp4DeviceLinear::from_host(&shared_down)?,
-        });
+        let (shared, _) = load_shared_expert(checkpoint, &prefix, manifest.hidden)?;
 
         let shared_gate = Bf16Linear::load(
             checkpoint,
@@ -3471,38 +3618,7 @@ impl Qwen36MoeWeights {
             cache_prepared,
         )?;
 
-        let shared_gate_up = load_concat_gate_up(
-            checkpoint,
-            &format!("{prefix}.shared_expert.gate_proj"),
-            &format!("{prefix}.shared_expert.up_proj"),
-            "Qwen3.6 shared expert gate/up",
-        )?;
-        let shared_down =
-            checkpoint.load_nvfp4_linear(&format!("{prefix}.shared_expert.down_proj"))?;
-        let shared_intermediate = shared_gate_up.out_features / 2;
-        if shared_gate_up.in_features != manifest.hidden
-            || shared_down.in_features != shared_intermediate
-            || shared_down.out_features != manifest.hidden
-        {
-            return Err(Error::Shape {
-                label: "Qwen3.6 shared expert",
-                expected: format!(
-                    "gate_up in={} out=2*{} down in={} out={}",
-                    manifest.hidden, shared_intermediate, shared_intermediate, manifest.hidden
-                ),
-                actual: format!(
-                    "gate_up in={} out={} down in={} out={}",
-                    shared_gate_up.in_features,
-                    shared_gate_up.out_features,
-                    shared_down.in_features,
-                    shared_down.out_features
-                ),
-            });
-        }
-        let shared = Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
-            gate_up: Nvfp4DeviceLinear::from_host(&shared_gate_up)?,
-            down: Nvfp4DeviceLinear::from_host(&shared_down)?,
-        });
+        let (shared, _) = load_shared_expert(checkpoint, &prefix, manifest.hidden)?;
         let shared_gate = Bf16Linear::load(
             checkpoint,
             &format!("{prefix}.shared_expert_gate.weight"),
@@ -4157,6 +4273,9 @@ impl Qwen36MoeWeights {
                 &mut workspace.fp8_shared_input_scale,
                 stream,
             ),
+            Qwen36SharedExpertStorage::Bf16 { gate_up, .. } => {
+                gate_up.run_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+            }
         }
     }
 
@@ -4176,6 +4295,11 @@ impl Qwen36MoeWeights {
                 &mut workspace.shared_output,
                 &mut workspace.fp8_shared_input,
                 &mut workspace.fp8_shared_input_scale,
+                stream,
+            ),
+            Qwen36SharedExpertStorage::Bf16 { down, .. } => down.run_into(
+                &workspace.shared_activated,
+                &mut workspace.shared_output,
                 stream,
             ),
         }
@@ -5282,6 +5406,102 @@ impl Qwen36MoeWorkspace {
     }
 }
 
+fn load_shared_expert(
+    checkpoint: &ModelOptCheckpoint,
+    mlp_prefix: &str,
+    hidden: usize,
+) -> Result<(Qwen36SharedExpertStorage, usize)> {
+    let gate_prefix = format!("{mlp_prefix}.shared_expert.gate_proj");
+    let up_prefix = format!("{mlp_prefix}.shared_expert.up_proj");
+    let down_prefix = format!("{mlp_prefix}.shared_expert.down_proj");
+    let uses_nvfp4 = checkpoint.contains_tensor(&format!("{gate_prefix}.weight_scale_2"))
+        || checkpoint.contains_tensor(&format!("{gate_prefix}.weight_global_scale"));
+    if uses_nvfp4 {
+        let gate_up = load_concat_gate_up(
+            checkpoint,
+            &gate_prefix,
+            &up_prefix,
+            "Qwen shared expert gate/up",
+        )?;
+        let down = checkpoint.load_nvfp4_linear(&down_prefix)?;
+        let intermediate = gate_up.out_features / 2;
+        if gate_up.in_features != hidden
+            || !gate_up.out_features.is_multiple_of(2)
+            || down.in_features != intermediate
+            || down.out_features != hidden
+        {
+            return Err(Error::Shape {
+                label: "Qwen shared NVFP4 expert",
+                expected: format!(
+                    "gate_up in={hidden} out=2*intermediate, down in=intermediate out={hidden}"
+                ),
+                actual: format!(
+                    "gate_up in={} out={} down in={} out={}",
+                    gate_up.in_features, gate_up.out_features, down.in_features, down.out_features
+                ),
+            });
+        }
+        return Ok((
+            Qwen36SharedExpertStorage::Nvfp4(Qwen36SharedExpert {
+                gate_up: Nvfp4DeviceLinear::from_host(&gate_up)?,
+                down: Nvfp4DeviceLinear::from_host(&down)?,
+            }),
+            intermediate,
+        ));
+    }
+
+    let gate_name = format!("{gate_prefix}.weight");
+    let up_name = format!("{up_prefix}.weight");
+    let down_name = format!("{down_prefix}.weight");
+    let gate_info = checkpoint.tensor_info(&gate_name)?;
+    let up_info = checkpoint.tensor_info(&up_name)?;
+    let down_info = checkpoint.tensor_info(&down_name)?;
+    let [intermediate, gate_hidden] = gate_info.shape.as_slice() else {
+        return Err(shape_error(
+            "Qwen shared BF16 gate",
+            &gate_info,
+            "two-dimensional weight".to_string(),
+        ));
+    };
+    if gate_info.dtype != "BF16"
+        || up_info.dtype != "BF16"
+        || down_info.dtype != "BF16"
+        || up_info.shape != [*intermediate, *gate_hidden]
+        || down_info.shape != [hidden, *intermediate]
+        || *gate_hidden != hidden
+    {
+        return Err(Error::Shape {
+            label: "Qwen shared BF16 expert",
+            expected: format!(
+                "gate/up dtype=BF16 shape=[intermediate,{hidden}], down dtype=BF16 shape=[{hidden},intermediate]"
+            ),
+            actual: format!(
+                "gate dtype={} shape={:?}, up dtype={} shape={:?}, down dtype={} shape={:?}",
+                gate_info.dtype,
+                gate_info.shape,
+                up_info.dtype,
+                up_info.shape,
+                down_info.dtype,
+                down_info.shape
+            ),
+        });
+    }
+    let mut gate_up = read_bf16_matrix_host(checkpoint, &gate_name, *intermediate, hidden)?;
+    gate_up.extend(read_bf16_matrix_host(
+        checkpoint,
+        &up_name,
+        *intermediate,
+        hidden,
+    )?);
+    Ok((
+        Qwen36SharedExpertStorage::Bf16 {
+            gate_up: Bf16Linear::from_host(&gate_up, 2 * intermediate, hidden)?,
+            down: Bf16Linear::load(checkpoint, &down_name, hidden, *intermediate)?,
+        },
+        *intermediate,
+    ))
+}
+
 fn load_concat_gate_up(
     checkpoint: &ModelOptCheckpoint,
     gate_prefix: &str,
@@ -6248,7 +6468,7 @@ pub struct Qwen36TextModel {
     fp8_nvfp4_cache: Qwen36Fp8Nvfp4Cache,
 }
 
-enum Qwen36Embedding {
+pub(crate) enum Qwen36Embedding {
     Bf16(DeviceBuffer<u16>),
     Fp8 {
         weight: DeviceBuffer<u8>,
@@ -6257,7 +6477,7 @@ enum Qwen36Embedding {
 }
 
 impl Qwen36Embedding {
-    fn load(
+    pub(crate) fn load(
         checkpoint: &ModelOptCheckpoint,
         prefix: &str,
         rows: usize,
@@ -6285,7 +6505,7 @@ impl Qwen36Embedding {
         })
     }
 
-    fn gather_prefix(
+    pub(crate) fn gather_prefix(
         &self,
         vocab: usize,
         hidden: usize,
@@ -6305,7 +6525,8 @@ impl Qwen36Embedding {
     }
 }
 
-enum Qwen36LmHead {
+#[allow(private_interfaces)]
+pub(crate) enum Qwen36LmHead {
     Nvfp4(Nvfp4DeviceLinear),
     Bf16(Bf16Linear),
     Fp8 {
@@ -6315,6 +6536,14 @@ enum Qwen36LmHead {
 }
 
 impl Qwen36LmHead {
+    pub(crate) fn load_bf16(
+        checkpoint: &ModelOptCheckpoint,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        Bf16Linear::load(checkpoint, "lm_head.weight", rows, cols).map(Self::Bf16)
+    }
+
     fn load(
         checkpoint: &ModelOptCheckpoint,
         lt: &CublasLt,
@@ -6377,7 +6606,7 @@ impl Qwen36LmHead {
         }
     }
 
-    fn shape(&self) -> (usize, usize) {
+    pub(crate) fn shape(&self) -> (usize, usize) {
         match self {
             Self::Nvfp4(linear) => (linear.out_features, linear.in_features),
             Self::Bf16(linear) => (linear.rows, linear.cols),
@@ -6385,7 +6614,7 @@ impl Qwen36LmHead {
         }
     }
 
-    fn run_top1(
+    pub(crate) fn run_top1(
         &self,
         lt: &CublasLt,
         input: &DeviceBuffer<f32>,
@@ -6480,7 +6709,7 @@ impl Qwen36LmHead {
     }
 }
 
-struct Qwen36LmHeadWorkspace {
+pub(crate) struct Qwen36LmHeadWorkspace {
     logits: DeviceBuffer<f32>,
     dynamic_input: DeviceBuffer<u8>,
     dynamic_input_scale: DeviceBuffer<f32>,
@@ -6491,6 +6720,24 @@ struct Qwen36LmHeadWorkspace {
 }
 
 impl Qwen36LmHeadWorkspace {
+    pub(crate) fn new(vocab: usize, hidden: usize) -> Result<Self> {
+        Ok(Self {
+            logits: DeviceBuffer::zeroed(vocab)?,
+            dynamic_input: DeviceBuffer::zeroed(hidden)?,
+            dynamic_input_scale: DeviceBuffer::zeroed(1)?,
+            scratch_value: DeviceBuffer::zeroed(vocab.div_ceil(8))?,
+            scratch_index: DeviceBuffer::zeroed(vocab.div_ceil(8))?,
+            next_index: DeviceBuffer::zeroed(1)?,
+            next_value: DeviceBuffer::zeroed(1)?,
+        })
+    }
+
+    pub(crate) fn read_top1(&self, stream: &CudaStream) -> Result<(u32, f32)> {
+        let index = self.next_index.copy_to_host(stream)?;
+        let value = self.next_value.copy_to_host(stream)?;
+        Ok((index[0], value[0]))
+    }
+
     fn device_bytes(&self) -> usize {
         self.logits.device_bytes()
             + self.dynamic_input.device_bytes()

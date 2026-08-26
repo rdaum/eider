@@ -1746,6 +1746,16 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_rope_neox_partial_f32_indexed_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        position: *const u32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_rope_neox_proportional_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1975,6 +1985,14 @@ unsafe extern "C" {
         values: *const u16,
         bank_rows: u32,
         row_ids: *const u32,
+        output: *mut f32,
+        row_count: u32,
+        cols: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_paged_bf16_rows_to_f32_on_stream(
+        pages: *const u8,
+        row_offsets: *const u32,
         output: *mut f32,
         row_count: u32,
         cols: u32,
@@ -3314,6 +3332,70 @@ unsafe extern "C" {
         beta: *mut u16,
         rows: u32,
         heads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_hc_norm_f32_on_stream(
+        input: *const f32,
+        delta_weight: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_hc_silu_scale_f32_on_stream(
+        values: *mut f32,
+        count: usize,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_hc_collapse_f32_on_stream(
+        normed: *const f32,
+        gate_logits: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_hc_combine_f32_on_stream(
+        residual: *const f32,
+        block_output: *const f32,
+        inject_logits: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_repeat_streams_f32_on_stream(
+        input: *const f32,
+        output: *mut f32,
+        hidden: u32,
+        hc_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_ple_gate_value_f32_on_stream(
+        key: *const f32,
+        query: *const f32,
+        value: *const f32,
+        gated: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_ple_conv_update_f32_on_stream(
+        normalized: *const f32,
+        gated: *const f32,
+        weight_bf16: *const u16,
+        state: *mut f32,
+        output: *mut f32,
+        tokens: u32,
+        channels: u32,
+        kernel: u32,
+        dilation: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub(crate) fn infer_gated_rms_norm_f32_on_stream(

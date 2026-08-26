@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// Metadata for one tensor inside a safetensors shard.
@@ -118,6 +119,28 @@ impl SafeTensorShard {
             label: "safetensors tensor lookup",
             detail: format!("missing tensor {name} in {}", self.path.display()),
         })
+    }
+
+    /// Returns the tensor payload's absolute byte range in the shard file.
+    pub fn tensor_file_range(&self, name: &str) -> Result<Range<u64>> {
+        let info = self.require_tensor(name)?;
+        let start = self
+            .data_start
+            .checked_add(info.data_begin)
+            .ok_or_else(|| Error::Shape {
+                label: "safetensors tensor file range",
+                expected: "data start + tensor offset without overflow".to_string(),
+                actual: format!("data_start={} offset={}", self.data_start, info.data_begin),
+            })?;
+        let end = self
+            .data_start
+            .checked_add(info.data_end)
+            .ok_or_else(|| Error::Shape {
+                label: "safetensors tensor file range",
+                expected: "data start + tensor end without overflow".to_string(),
+                actual: format!("data_start={} end={}", self.data_start, info.data_end),
+            })?;
+        Ok(start..end)
     }
 
     /// Reads the raw bytes for a named tensor.

@@ -63,6 +63,8 @@ pub enum QwenArchitecture {
     Qwen3,
     /// Hybrid Qwen3.5-family text architecture with Gated Delta Net layers.
     Qwen35Hybrid,
+    /// Qwen3.8 Flash Next text architecture with hyperconnections, PLE, and QSA.
+    Qwen38FlashNext,
 }
 
 /// Per-layer attention implementation used by the text stack.
@@ -244,6 +246,16 @@ impl QwenModelManifest {
                 })?;
                 (
                     QwenArchitecture::Qwen35Hybrid,
+                    text,
+                    "model.language_model".to_string(),
+                )
+            } else if root_model_type == "qwen3_8_flash_next" {
+                let text = json.get("text_config").ok_or_else(|| Error::Format {
+                    label: "Qwen config",
+                    detail: "qwen3_8_flash_next config missing text_config".to_string(),
+                })?;
+                (
+                    QwenArchitecture::Qwen38FlashNext,
                     text,
                     "model.language_model".to_string(),
                 )
@@ -561,7 +573,10 @@ fn parse_layer_kinds(
             })
             .collect();
     }
-    if architecture == QwenArchitecture::Qwen35Hybrid {
+    if matches!(
+        architecture,
+        QwenArchitecture::Qwen35Hybrid | QwenArchitecture::Qwen38FlashNext
+    ) {
         let interval = optional_usize(text, "full_attention_interval")?.unwrap_or(4);
         Ok((0..layers)
             .map(|idx| {

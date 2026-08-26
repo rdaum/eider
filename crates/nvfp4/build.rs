@@ -71,6 +71,7 @@ fn main() {
     let deepseek4_object = format!("{out_dir}/deepseek4.o");
     let ngram_object = format!("{out_dir}/ngram.o");
     let qwen36_gdn_object = format!("{out_dir}/qwen36_gdn.o");
+    let qwen38_object = format!("{out_dir}/qwen38.o");
     let gemma4_attention_object = format!("{out_dir}/gemma4_attention.o");
     let sm12x_mma_object = format!("{out_dir}/sm12x_mma.o");
     let sm121_w4a16_object = format!("{out_dir}/sm121_w4a16.o");
@@ -231,6 +232,27 @@ fn main() {
     assert!(
         qwen36_status.success(),
         "nvcc failed to build Qwen3.6 GDN kernels"
+    );
+
+    let mut qwen38_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+    qwen38_nvcc.args([
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-arch=sm_121",
+        "-I",
+        &cuda_include,
+        "-c",
+        "native/qwen38.cu",
+        "-o",
+        &qwen38_object,
+    ]);
+    let qwen38_status = qwen38_nvcc
+        .status()
+        .expect("failed to run nvcc for Qwen3.8 kernels");
+    assert!(
+        qwen38_status.success(),
+        "nvcc failed to build Qwen3.8 kernels"
     );
 
     let mut gemma4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
@@ -440,6 +462,7 @@ fn main() {
             &deepseek4_object,
             &ngram_object,
             &qwen36_gdn_object,
+            &qwen38_object,
             &gemma4_attention_object,
             &sm12x_mma_object,
             &sm121_w4a16_object,
@@ -467,6 +490,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/deepseek4.cu");
     println!("cargo:rerun-if-changed=native/ngram.cu");
     println!("cargo:rerun-if-changed=native/qwen36_gdn.cu");
+    println!("cargo:rerun-if-changed=native/qwen38.cu");
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");
     println!("cargo:rerun-if-changed=native/sm121_w4a16.cu");

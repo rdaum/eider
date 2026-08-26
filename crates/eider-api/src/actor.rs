@@ -12,6 +12,7 @@ use infer::metrics::metrics as infer_metrics;
 use infer::muse_glimmer::MuseGlimmerModel;
 use infer::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use infer::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
+use infer::qwen38_flash_next::{DENSE_QSA_REFERENCE_MAX_CONTEXT, Qwen38FlashNextModel};
 use infer::runtime::bitnet_serving::{
     BitNetAdmissionProgress, BitNetCancelOutcome, BitNetChatService, BitNetRequestId,
 };
@@ -41,6 +42,10 @@ use infer::runtime::muse_glimmer_serving::{
 };
 use infer::runtime::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
+};
+use infer::runtime::qwen38_flash_next_serving::{
+    Qwen38FlashNextAdmissionProgress, Qwen38FlashNextCancelOutcome, Qwen38FlashNextChatService,
+    Qwen38FlashNextRequestId,
 };
 use infer::runtime::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen38SpeculativeProgress,
@@ -518,6 +523,49 @@ fn actor_main(
             let mut service = QwenActorService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
+        CheckpointArchitecture::Qwen38FlashNext => {
+            let mut defaults = defaults;
+            defaults.sampling.temperature = 0.0;
+            info!(
+                model_dir = %model_dir.display(),
+                artifact_dir = %artifact_dir.display(),
+                attention_backend = "dense-qsa-reference",
+                max_context_tokens = DENSE_QSA_REFERENCE_MAX_CONTEXT,
+                "loading Qwen3.8 Flash Next model"
+            );
+            let model = match Qwen38FlashNextModel::open(&model_dir, &artifact_dir) {
+                Ok(model) => model,
+                Err(error) => {
+                    let _ = ready.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let reference_scheduler = SchedulerConfig {
+                decode_capacity: 1,
+                prefill_sequence_capacity: 1,
+                max_active_sequences: 1,
+                max_context_tokens: scheduler
+                    .max_context_tokens
+                    .min(model.config().max_position_embeddings),
+                speculative_drafts: 0,
+                ..scheduler
+            };
+            let service =
+                match Qwen38FlashNextChatService::new(model, &template, reference_scheduler) {
+                    Ok(service) => service,
+                    Err(error) => {
+                        let _ = ready.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+            info!(
+                attention_backend = "dense-qsa-reference",
+                max_context_tokens = reference_scheduler.max_context_tokens,
+                "loaded Qwen3.8 Flash Next text model"
+            );
+            let mut service = Qwen38FlashNextActorService::new(service);
+            run_actor_loop(&mut service, &mut commands, ready, defaults);
+        }
         CheckpointArchitecture::Step37 => {
             info!(
                 model_dir = %model_dir.display(),
@@ -718,6 +766,7 @@ enum CheckpointArchitecture {
     MuseGlimmer,
     Bonsai,
     Qwen36,
+    Qwen38FlashNext,
     Step37,
     Nemotron3,
     Gemma4,
@@ -742,6 +791,7 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
         "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
         "bonsai" => Ok(CheckpointArchitecture::Bonsai),
         "qwen3_5" | "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
+        "qwen3_8_flash_next" => Ok(CheckpointArchitecture::Qwen38FlashNext),
         "step3p7" => Ok(CheckpointArchitecture::Step37),
         "nemotron_h" | "nemotron_h_puzzle" => Ok(CheckpointArchitecture::Nemotron3),
         "gemma4" => Ok(CheckpointArchitecture::Gemma4),
@@ -932,6 +982,19 @@ fn deepseek_admission_progress(progress: Deepseek4AdmissionProgress) -> EngineAd
     }
 }
 
+fn qwen38_flash_next_admission_progress(
+    progress: Qwen38FlashNextAdmissionProgress,
+) -> EngineAdmissionProgress {
+    EngineAdmissionProgress {
+        request_id: progress.request_id.get(),
+        sequence_device_bytes: progress.sequence_device_bytes,
+        cached_prompt_tokens: progress.cached_prompt_tokens,
+        allocation_duration: progress.allocation_duration,
+        checkpoint_copy_duration: Duration::ZERO,
+        admitted_after_tick_start: progress.admitted_after_tick_start,
+    }
+}
+
 enum EngineLifecycleEvent {
     Admitted(EngineAdmissionProgress),
     PrefillStarted(u64),
@@ -1100,6 +1163,114 @@ impl ActorService for QwenActorService<'_, '_> {
             },
             Qwen36CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
             Qwen36CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
+}
+
+struct Qwen38FlashNextActorService<'template> {
+    inner: Qwen38FlashNextChatService<'template>,
+    ids: BTreeMap<u64, Qwen38FlashNextRequestId>,
+}
+
+impl<'template> Qwen38FlashNextActorService<'template> {
+    fn new(inner: Qwen38FlashNextChatService<'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl ActorService for Qwen38FlashNextActorService<'_> {
+    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> infer::nvfp4::Result<EngineTick> {
+        let mut observer = |event: RequestLifecycleEvent<
+            Qwen38FlashNextRequestId,
+            Qwen38FlashNextAdmissionProgress,
+        >| match event {
+            RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
+                EngineLifecycleEvent::Admitted(qwen38_flash_next_admission_progress(progress)),
+            ),
+            RequestLifecycleEvent::PrefillStarted(id) => {
+                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+            }
+        };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Qwen38FlashNextRequestId::get)
+                .collect(),
+            qwen38_speculative: Vec::new(),
+            dflash: Vec::new(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Qwen38FlashNextCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            Qwen38FlashNextCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
@@ -3078,6 +3249,15 @@ mod tests {
         assert_eq!(
             checkpoint_architecture(&directory).unwrap(),
             CheckpointArchitecture::Qwen36
+        );
+        fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"qwen3_8_flash_next"}"#,
+        )
+        .expect("write Flash Next config");
+        assert_eq!(
+            checkpoint_architecture(&directory).unwrap(),
+            CheckpointArchitecture::Qwen38FlashNext
         );
         fs::write(
             directory.join("config.json"),
