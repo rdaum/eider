@@ -55,14 +55,14 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn realistic_route_indices(rows: usize) -> Vec<u32> {
+fn realistic_route_indices(rows: usize, active_experts: usize) -> Vec<u32> {
     let mut routes = Vec::with_capacity(rows * TOP_K);
     for row in 0..rows {
         let start = routes.len();
         for slot in 0..TOP_K {
-            let mut expert = (mix64((row * TOP_K + slot) as u64) as usize) % EXPERTS;
+            let mut expert = (mix64((row * TOP_K + slot) as u64) as usize) % active_experts;
             while routes[start..].contains(&(expert as u32)) {
-                expert = (expert + 1) % EXPERTS;
+                expert = (expert + 1) % active_experts;
             }
             routes.push(expert as u32);
         }
@@ -102,11 +102,12 @@ struct Qwen38GroupedMoePrefillBench {
 impl Qwen38GroupedMoePrefillBench {
     fn new() -> Self {
         let rows = bench_rows();
+        let active_experts = bench_active_experts();
         let routes = rows * TOP_K;
         let stream = CudaStream::new_non_blocking().expect("stream");
         let hidden = DeviceBuffer::from_host(&vec![0.125f32; rows * HIDDEN]).expect("hidden");
-        let route_indices =
-            DeviceBuffer::from_host(&realistic_route_indices(rows)).expect("route indices");
+        let route_indices = DeviceBuffer::from_host(&realistic_route_indices(rows, active_experts))
+            .expect("route indices");
         let route_weights =
             DeviceBuffer::from_host(&vec![1.0 / TOP_K as f32; routes]).expect("route weights");
         let gate_up_weights = constant_nvfp4_experts(HIDDEN, INTERMEDIATE * 2, 1.0 / 64.0);
@@ -392,6 +393,22 @@ fn bench_rows() -> usize {
         .unwrap_or(DEFAULT_ROWS);
     assert!(rows > 0, "QWEN38_MOE_PREFILL_BENCH_ROWS must be positive");
     rows
+}
+
+fn bench_active_experts() -> usize {
+    let experts = std::env::var("QWEN38_MOE_PREFILL_ACTIVE_EXPERTS")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("QWEN38_MOE_PREFILL_ACTIVE_EXPERTS is an integer")
+        })
+        .unwrap_or(EXPERTS);
+    assert!(
+        (TOP_K..=EXPERTS).contains(&experts),
+        "QWEN38_MOE_PREFILL_ACTIVE_EXPERTS must be in {TOP_K}..={EXPERTS}"
+    );
+    experts
 }
 
 fn main() {
