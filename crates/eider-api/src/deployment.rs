@@ -149,7 +149,7 @@ const CATALOGUE: &[ModelSpec] = &[
         defaults: ServingDefaults {
             served_model_name: "eider-qwen3.8-flash-next",
             max_context_tokens: 262_144,
-            prefill_token_capacity: 64,
+            prefill_token_capacity: 512,
             step_expert_capacity: 240,
         },
     },
@@ -667,7 +667,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             prefill_token_capacity: match model_type.as_str() {
                 "bailing_hybrid" => 4,
                 "bonsai" => 256,
-                "qwen3_8_flash_next" => 64,
+                "qwen3_8_flash_next" => 512,
                 _ => 2_048,
             },
             step_expert_capacity: 240,
@@ -922,7 +922,7 @@ mod tests {
         assert_eq!(model.artifact_kind, ArtifactKind::None);
         assert_eq!(model.defaults.served_model_name, "eider-qwen3.8-flash-next");
         assert_eq!(model.defaults.max_context_tokens, 262_144);
-        assert_eq!(model.defaults.prefill_token_capacity, 64);
+        assert_eq!(model.defaults.prefill_token_capacity, 512);
         assert_eq!(default_speculative_drafts(model.model_type), 1);
         assert_eq!(default_speculative_drafts("qwen3_5"), 0);
     }

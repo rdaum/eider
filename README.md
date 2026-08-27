@@ -18,7 +18,7 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. A live Pi session reaches about 150 tokens/sec for cold
+day, August 26, 2026. A live Pi session reaches about 190 tokens/sec for cold
 prefill and 11–13 tokens/sec for MTP-assisted decode.
 
 The server runs the [Inferact NVFP4
@@ -54,15 +54,16 @@ tool-use session.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold Pi prefill | About 150 tokens/sec | 5.8K prompt tokens, no cached prefix |
-| Cold Pi time to first token | About 39 sec | Same first Pi turn |
+| Cold Pi prefill | About 190 tokens/sec | 5.7K prompt tokens, no cached prefix |
+| Cold Pi time to first token | About 30 sec | Same first Pi turn |
 | Cached Pi prefill | About 120–130 tokens/sec | 300–850 new prompt tokens |
 | Cached Pi time to first token | About 3–7 sec | 5.8K–7.2K cached prompt tokens |
 | Pi decode | About 11–13 tokens/sec | MTP-assisted tool turns |
 | Resident memory | 98 GiB | Active Pi use |
 
 The prefill path batches QSA projections and uses BF16 tensor cores for
-hyperconnection projections.
+hyperconnection projections. It processes up to 512 prompt tokens per prefill
+iteration to reuse routed expert weights.
 
 Eider serves one speculative draft by default from the checkpoint's QSA and
 MoE MTP block. Set `EIDER_SPECULATIVE_DRAFTS=0` for target-only decode.
@@ -409,6 +410,7 @@ correctness gate before it records timing data.
 
 ```sh
 cargo bench -p nvfp4 --bench qwen36_routed_moe_decode
+cargo bench -p nvfp4 --bench qwen38_grouped_moe_prefill
 cargo bench -p infer --bench qwen36_prefill
 cargo bench -p infer --bench step37_prefill
 cargo bench -p infer --bench laguna_prefill
