@@ -3472,6 +3472,17 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_qwen38_qsa_append_key_on_stream(
+        projection: *const f32,
+        key_pool_bf16: *mut u16,
+        slot: u32,
+        page_offset: u32,
+        page_tokens: u32,
+        page_slots: u32,
+        heads: u32,
+        head_dim: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_gated_rms_norm_f32_on_stream(
         input: *const f32,
         gate: *const f32,

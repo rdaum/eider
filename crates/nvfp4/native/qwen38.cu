@@ -656,3 +656,26 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
         selected_blocks, selected_tiles, visible_blocks);
     return cudaGetLastError();
 }
+
+extern "C" cudaError_t infer_qwen38_qsa_append_key_on_stream(
+        const float* projection,
+        std::uint16_t* key_pool_bf16,
+        std::uint32_t slot,
+        std::uint32_t page_offset,
+        std::uint32_t page_tokens,
+        std::uint32_t page_slots,
+        std::uint32_t heads,
+        std::uint32_t head_dim,
+        cudaStream_t stream) {
+    if (projection == nullptr || key_pool_bf16 == nullptr || page_tokens == 0 ||
+        page_slots == 0 || slot >= page_slots || page_offset >= page_tokens ||
+        heads == 0 || head_dim == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::uint32_t kThreads = 128;
+    qwen38_qsa_append_key_kernel<<<
+        (head_dim + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16), slot,
+        page_offset, page_tokens, heads, head_dim);
+    return cudaGetLastError();
+}

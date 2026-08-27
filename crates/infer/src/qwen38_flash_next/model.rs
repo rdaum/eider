@@ -116,6 +116,23 @@ pub(crate) struct Qwen38FlashNextMtpWorkspace {
     final_hyper: Qwen38HyperConnectionWorkspace,
     final_hidden: DeviceBuffer<f32>,
     lm_head: Qwen36LmHeadWorkspace,
+    prefill: Box<Qwen38FlashNextMtpPrefillWorkspace>,
+}
+
+/// Batched prompt-cache preparation for the released native MTP block.
+struct Qwen38FlashNextMtpPrefillWorkspace {
+    token_capacity: usize,
+    tokens: DeviceBuffer<u32>,
+    embedded: DeviceBuffer<f32>,
+    normed_embedding: DeviceBuffer<f32>,
+    projected_embedding: DeviceBuffer<f32>,
+    previous_target_streams: DeviceBuffer<f32>,
+    normed_hidden: DeviceBuffer<f32>,
+    projected_hidden: DeviceBuffer<f32>,
+    repeated_embedding: DeviceBuffer<f32>,
+    streams: DeviceBuffer<f32>,
+    attention_hyper: Qwen38HyperConnectionWorkspace,
+    attention: Qwen38QsaPrefillWorkspace,
 }
 
 /// Mutable one-sequence state and reusable single-token workspace.
@@ -655,6 +672,7 @@ impl Qwen38FlashNextModel {
     pub(crate) fn new_mtp_workspace(
         &self,
         max_tokens: usize,
+        prefill_token_capacity: usize,
     ) -> Result<Qwen38FlashNextMtpWorkspace> {
         let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
             label: "Qwen3.8 Flash Next MTP workspace",
@@ -662,6 +680,36 @@ impl Qwen38FlashNextModel {
         })?;
         let hidden = self.config.hidden;
         let hc_dim = hidden * self.config.hc_count;
+        if prefill_token_capacity == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill capacity",
+                expected: "positive token capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let mtp_model = Qwen36BatchModelView::new(&self.lt, &mtp.manifest, &[false]);
+        let prefill = Qwen38FlashNextMtpPrefillWorkspace {
+            token_capacity: prefill_token_capacity,
+            tokens: DeviceBuffer::zeroed(prefill_token_capacity)?,
+            embedded: DeviceBuffer::zeroed(prefill_token_capacity * hidden)?,
+            normed_embedding: DeviceBuffer::zeroed(prefill_token_capacity * hidden)?,
+            projected_embedding: DeviceBuffer::zeroed(prefill_token_capacity * hidden)?,
+            previous_target_streams: DeviceBuffer::zeroed(prefill_token_capacity * hc_dim)?,
+            normed_hidden: DeviceBuffer::zeroed(prefill_token_capacity * hc_dim)?,
+            projected_hidden: DeviceBuffer::zeroed(prefill_token_capacity * hc_dim)?,
+            repeated_embedding: DeviceBuffer::zeroed(prefill_token_capacity * hc_dim)?,
+            streams: DeviceBuffer::zeroed(prefill_token_capacity * hc_dim)?,
+            attention_hyper: Qwen38HyperConnectionWorkspace::new_prefill(
+                &self.config,
+                prefill_token_capacity,
+            )?,
+            attention: mtp.attention.new_prefill_workspace(
+                &mtp_model,
+                &self.config,
+                prefill_token_capacity,
+                1,
+            )?,
+        };
         Ok(Qwen38FlashNextMtpWorkspace {
             token: DeviceBuffer::zeroed(1)?,
             embedded: DeviceBuffer::zeroed(hidden)?,
@@ -686,6 +734,7 @@ impl Qwen38FlashNextModel {
             final_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
             final_hidden: DeviceBuffer::zeroed(hidden)?,
             lm_head: Qwen36LmHeadWorkspace::new(self.config.vocab, hidden)?,
+            prefill: Box::new(prefill),
         })
     }
 
@@ -1017,6 +1066,227 @@ impl Qwen38FlashNextModel {
                     .map_err(qwen38_flash_next_cache_error)?;
                 state.position += 1;
                 Ok(next)
+            }
+            Err(error) => {
+                cache
+                    .abort_append(
+                        reservation,
+                        &mut Sm12xCacheContext {
+                            stream,
+                            page_table: &mut state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Advances the native MTP prompt cache without evaluating discarded
+    /// attention and MoE outputs for every prompt row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mtp_prefill_tokens(
+        &self,
+        state: &mut Qwen38FlashNextMtpSequenceState,
+        workspace: &mut Qwen38FlashNextMtpWorkspace,
+        cache: &mut Qwen38FlashNextMtpSequenceCache,
+        tokens: &[u32],
+        target_prefill: &Qwen38FlashNextPrefillWorkspace,
+        initial_previous_target_streams: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next MTP prefill",
+            detail: "MTP weights are not enabled".to_string(),
+        })?;
+        let rows = tokens.len();
+        if rows == 0 || rows > workspace.prefill.token_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill tokens",
+                expected: format!("1..={} tokens", workspace.prefill.token_capacity),
+                actual: rows.to_string(),
+            });
+        }
+        let end = state
+            .position
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill position",
+                expected: "position + tokens without overflow".to_string(),
+                actual: format!("position={} tokens={rows}", state.position),
+            })?;
+        if end > state.max_tokens {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill position",
+                expected: format!("end <= {}", state.max_tokens),
+                actual: end.to_string(),
+            });
+        }
+        let hidden = self.config.hidden;
+        let hc_dim = hidden * self.config.hc_count;
+        if initial_previous_target_streams.len() < hc_dim {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill target streams",
+                expected: format!("at least {hc_dim} initial values"),
+                actual: initial_previous_target_streams.len().to_string(),
+            });
+        }
+        if target_prefill.streams_a.len() < rows * hc_dim {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP prefill target rows",
+                expected: format!("at least {} target values", rows * hc_dim),
+                actual: target_prefill.streams_a.len().to_string(),
+            });
+        }
+
+        let reservation = cache
+            .reserve_append(
+                state.cache_id,
+                rows,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let body = (|| -> Result<()> {
+            let prefill = workspace.prefill.as_mut();
+            prefill.tokens.copy_prefix_from_host(tokens)?;
+            self.embedding.gather_prefix(
+                self.config.vocab,
+                hidden,
+                &prefill.tokens,
+                prefill.embedded.output(),
+                rows,
+                stream,
+            )?;
+            rms_norm_f32_into_on_stream(
+                rows,
+                hidden,
+                &prefill.embedded,
+                &mtp.pre_fc_norm_embedding,
+                prefill.normed_embedding.output(),
+                self.config.rms_eps(),
+                stream,
+            )?;
+            mtp.fc_embedding.run_batch_into(
+                &prefill.normed_embedding,
+                &mut prefill.projected_embedding,
+                rows,
+                stream,
+            )?;
+            prefill
+                .previous_target_streams
+                .copy_range_from_device_on_stream(
+                    0,
+                    initial_previous_target_streams,
+                    0,
+                    hc_dim,
+                    stream,
+                )?;
+            if rows > 1 {
+                prefill
+                    .previous_target_streams
+                    .copy_range_from_device_on_stream(
+                        hc_dim,
+                        &target_prefill.streams_a,
+                        0,
+                        (rows - 1) * hc_dim,
+                        stream,
+                    )?;
+            }
+            rms_norm_f32_into_on_stream(
+                rows,
+                hc_dim,
+                &prefill.previous_target_streams,
+                &mtp.pre_fc_norm_hidden,
+                prefill.normed_hidden.output(),
+                self.config.rms_eps(),
+                stream,
+            )?;
+            mtp.fc_hidden.run_batch_into(
+                &prefill.normed_hidden,
+                &mut prefill.projected_hidden,
+                rows * self.config.hc_count,
+                stream,
+            )?;
+            qwen38_repeat_streams_f32_into_on_stream(
+                &prefill.projected_embedding,
+                prefill.repeated_embedding.output(),
+                rows,
+                hidden,
+                self.config.hc_count,
+                stream,
+            )?;
+            add_f32_into_on_stream(
+                &prefill.projected_hidden,
+                &prefill.repeated_embedding,
+                prefill.streams.output(),
+                stream,
+            )?;
+            mtp.attention_hyper.mix(
+                &prefill.streams,
+                &mut prefill.attention_hyper,
+                rows,
+                stream,
+            )?;
+            let mtp_model = Qwen36BatchModelView::new(&self.lt, &mtp.manifest, &[false]);
+            mtp.attention.prepare_prefill(
+                &mtp_model,
+                &mut prefill.attention,
+                &self.config,
+                prefill.attention_hyper.mixed(),
+                rows,
+                state.position,
+                stream,
+            )?;
+            cache
+                .with_append_pages(&reservation, |backend, pages| {
+                    for page in pages.iter() {
+                        let segment = page.segment();
+                        for offset in 0..segment.rows() {
+                            let row = segment.input_offset() + offset;
+                            mtp.attention.append_prepared_prefill_row(
+                                &mtp_model,
+                                &mut prefill.attention,
+                                &mut workspace.attention,
+                                backend,
+                                page.page(),
+                                segment.page_offset() + offset,
+                                &self.config,
+                                0,
+                                row,
+                                stream,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(qwen38_flash_next_cache_error)
+        })();
+        match body {
+            Ok(()) => {
+                if let Err(error) = cache.commit_append(
+                    reservation.clone(),
+                    rows,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut state.page_table,
+                    },
+                ) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream,
+                                page_table: &mut state.page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                    return Err(qwen38_flash_next_cache_error(error));
+                }
+                state.position = end;
+                Ok(())
             }
             Err(error) => {
                 cache

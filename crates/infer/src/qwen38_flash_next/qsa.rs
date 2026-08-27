@@ -287,6 +287,53 @@ impl Qwen38QsaWeights {
         )
     }
 
+    /// Appends one prepared row to the index and attention caches without
+    /// evaluating attention. MTP prompt catch-up only needs cache state; its
+    /// per-row block output is not carried into the next prompt row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_prepared_prefill_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        row_workspace: &mut Qwen38QsaWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page: &Sm12xPage,
+        page_offset: usize,
+        config: &Qwen38FlashNextConfig,
+        layer: usize,
+        row: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        row_workspace
+            .index_projection
+            .copy_range_from_device_on_stream(
+                0,
+                &workspace.index_projection,
+                row * projection_rows,
+                projection_rows,
+                stream,
+            )?;
+        let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
+        index_pool.append_key_on_stream(
+            &row_workspace.index_projection,
+            page.slot(),
+            page_offset,
+            config.indexer_heads,
+            stream,
+        )?;
+        self.attention.enqueue_qsa_prefill_append_row(
+            model,
+            &workspace.attention,
+            kv_pool,
+            row,
+            page.slot(),
+            page_offset,
+            stream,
+        )
+    }
+
     pub(crate) fn finish_prefill<'a>(
         &'a self,
         model: &Qwen36BatchModelView<'_>,

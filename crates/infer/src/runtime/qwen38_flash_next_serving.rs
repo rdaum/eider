@@ -192,7 +192,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             })
             .transpose()?;
         let mtp_workspace = (config.speculative_drafts == 1)
-            .then(|| model.new_mtp_workspace(config.max_context_tokens))
+            .then(|| {
+                model.new_mtp_workspace(config.max_context_tokens, config.prefill_token_capacity)
+            })
             .transpose()?;
         let speculative_workspace = (config.speculative_drafts == 1)
             .then(|| model.new_speculative_workspace(1))
@@ -560,23 +562,21 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 .mtp_workspace
                 .as_mut()
                 .expect("MTP workspace was allocated");
-            for (row, &token) in request.prompt[start..end].iter().enumerate() {
-                self.model.mtp_forward_token(
-                    mtp_sequence,
-                    mtp_workspace,
-                    mtp_cache,
-                    token,
-                    &frontier.previous_streams,
-                    false,
-                    sequence.state.stream(),
-                )?;
-                self.model.copy_prefill_target_streams(
-                    &self.prefill_workspace,
-                    row,
-                    &mut frontier.previous_streams,
-                    sequence.state.stream(),
-                )?;
-            }
+            self.model.mtp_prefill_tokens(
+                mtp_sequence,
+                mtp_workspace,
+                mtp_cache,
+                &request.prompt[start..end],
+                &self.prefill_workspace,
+                &frontier.previous_streams,
+                sequence.state.stream(),
+            )?;
+            self.model.copy_prefill_target_streams(
+                &self.prefill_workspace,
+                end - start - 1,
+                &mut frontier.previous_streams,
+                sequence.state.stream(),
+            )?;
             if final_prompt_chunk {
                 let next = self.model.read_top1(&sequence.state)?;
                 frontier.token = next.id;

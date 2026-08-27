@@ -5352,6 +5352,29 @@ impl Qwen36FullAttentionWeights {
             )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_qsa_prefill_append_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &BatchFullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        row: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
+        pool.append_at_offsets_on_stream(
+            slot,
+            page_offset,
+            &workspace.k_rope,
+            row * kv_width,
+            &workspace.v,
+            row * kv_width,
+            stream,
+        )
+    }
+
     pub(crate) fn enqueue_qsa_prefill_post<'a>(
         &'a self,
         model: &Qwen36BatchModelView<'_>,

@@ -18,8 +18,8 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. A live Pi session reaches about 190 tokens/sec for cold
-prefill and 11–13 tokens/sec for MTP-assisted decode.
+day, August 26, 2026. A controlled 7K-token prompt exceeds 300 tokens/sec for
+cold prefill. A live Pi session reaches 11–13 tokens/sec for MTP-assisted decode.
 
 The server runs the [Inferact NVFP4
 checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4). Eider
@@ -49,21 +49,22 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Performance
 
-These rounded results come from Eider server telemetry during a live Pi
-tool-use session.
+These rounded results come from Eider server telemetry. The workload column
+identifies controlled requests and live Pi requests.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold Pi prefill | About 190 tokens/sec | 5.7K prompt tokens, no cached prefix |
-| Cold Pi time to first token | About 30 sec | Same first Pi turn |
-| Cached Pi prefill | About 120–130 tokens/sec | 300–850 new prompt tokens |
-| Cached Pi time to first token | About 3–7 sec | 5.8K–7.2K cached prompt tokens |
+| Cold prefill | More than 300 tokens/sec | Controlled 7K-token prompt, no cached prefix |
+| Cold time to first token | About 22 sec | Same controlled request |
 | Pi decode | About 11–13 tokens/sec | MTP-assisted tool turns |
 | Resident memory | 98 GiB | Active Pi use |
 
 The prefill path batches QSA projections and uses BF16 tensor cores for
 hyperconnection projections. It processes up to 512 prompt tokens per prefill
 iteration to reuse routed expert weights.
+
+The MTP prompt path batches its input and QSA projections. It appends only the
+index and attention cache state that future drafts need.
 
 Eider serves one speculative draft by default from the checkpoint's QSA and
 MoE MTP block. Set `EIDER_SPECULATIVE_DRAFTS=0` for target-only decode.

@@ -101,6 +101,62 @@ impl Qwen38QsaIndexPool {
             )
         }
     }
+
+    /// Appends one raw index key without scoring or selecting historical rows.
+    pub fn append_key_on_stream(
+        &mut self,
+        projection: &DeviceBuffer<f32>,
+        slot: usize,
+        page_offset: usize,
+        heads: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_values =
+            (heads + 1)
+                .checked_mul(self.head_dim)
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 QSA index-key append",
+                    expected: "projection size without overflow".to_string(),
+                    actual: format!("heads={heads} head_dim={}", self.head_dim),
+                })?;
+        if projection.len() != projection_values
+            || slot >= self.page_slots
+            || page_offset >= SM12X_KV_PAGE_TOKENS
+            || heads == 0
+            || [slot, page_offset, heads, self.head_dim]
+                .into_iter()
+                .any(|value| value > u32::MAX as usize)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA index-key append",
+                expected: format!(
+                    "projection={projection_values}, valid slot/page offset, and positive heads"
+                ),
+                actual: format!(
+                    "projection={} slot={slot}/{} page_offset={page_offset} heads={heads} head_dim={}",
+                    projection.len(),
+                    self.page_slots,
+                    self.head_dim
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_qwen38_qsa_append_key_on_stream",
+                ffi::infer_qwen38_qsa_append_key_on_stream(
+                    projection.ptr,
+                    self.values.ptr,
+                    slot as u32,
+                    page_offset as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    self.page_slots as u32,
+                    heads as u32,
+                    self.head_dim as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
 }
 
 impl Qwen38QsaSelectionWorkspace {
@@ -797,6 +853,61 @@ mod tests {
             }
         }
         assert_eq!(&*tiles_actual, &tiles_expected);
+    }
+
+    #[test]
+    fn qsa_append_only_key_matches_selector_append() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 128;
+        let projection_host = (0..(HEADS + 1) * HEAD_DIM)
+            .map(|index| (index as f32 - 177.0) / 91.0)
+            .collect::<Vec<_>>();
+        let projection = DeviceBuffer::from_host(&projection_host).expect("projection");
+        let norm = DeviceBuffer::from_host(&vec![1.0f32; HEAD_DIM]).expect("norm");
+        let page_table = DeviceBuffer::from_host(&[0u32]).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut selected_pool = Qwen38QsaIndexPool::new(1, HEAD_DIM).expect("selected pool");
+        let mut append_pool = Qwen38QsaIndexPool::new(1, HEAD_DIM).expect("append pool");
+        let empty_page = vec![0u16; crate::SM12X_KV_PAGE_TOKENS * HEAD_DIM];
+        selected_pool
+            .values
+            .copy_from_host(&empty_page)
+            .expect("clear selected pool");
+        append_pool
+            .values
+            .copy_from_host(&empty_page)
+            .expect("clear append pool");
+        let mut selector =
+            Qwen38QsaSelectionWorkspace::new(128, HEADS, HEAD_DIM, 4, 128).expect("selector");
+        selector
+            .prepare_and_select_on_stream(
+                &projection,
+                &norm,
+                &norm,
+                &mut selected_pool,
+                &page_table,
+                0,
+                0,
+                1,
+                64,
+                1e-6,
+                10_000_000.0,
+                &stream,
+            )
+            .expect("selector append");
+        append_pool
+            .append_key_on_stream(&projection, 0, 0, HEADS, &stream)
+            .expect("append only");
+        assert_eq!(
+            selected_pool
+                .values
+                .copy_to_host(&stream)
+                .expect("selected pool readback"),
+            append_pool
+                .values
+                .copy_to_host(&stream)
+                .expect("append pool readback")
+        );
     }
 
     fn rms_norm(values: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
