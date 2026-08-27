@@ -15010,7 +15010,7 @@ mod tests {
     #[test]
     fn step37_sigmoid_top8_batch_matches_independent_rows() {
         const EXPERTS: usize = 288;
-        const ROWS: usize = 2;
+        const ROWS: usize = 3;
         let first = (0..EXPERTS)
             .map(|expert| ((expert * 37 % 101) as f32 - 50.0) * 0.03125)
             .collect::<Vec<_>>();
@@ -15091,6 +15091,102 @@ mod tests {
         assert_eq!(indices, [3, 7, 8, 9, 10, 11, 12, 19]);
         for weight in weights.iter() {
             assert!((*weight - 0.125).abs() < 1.0e-6, "weight={weight}");
+        }
+    }
+
+    #[test]
+    fn moe_top10_norm512_batch_matches_cpu_reference() {
+        const ROWS: usize = 2;
+        const EXPERTS: usize = 512;
+        const TOP_K: usize = 10;
+        let mut logits = (0..ROWS * EXPERTS)
+            .map(|index| {
+                let row = index / EXPERTS;
+                let expert = index % EXPERTS;
+                (((expert * 73 + row * 37) % 1009) as f32 - 504.0) * 0.03125
+            })
+            .collect::<Vec<_>>();
+        for expert in [3usize, 7, 8, 9, 10, 11, 12, 19, 241, 400, 501] {
+            logits[expert] = 20.0;
+        }
+        logits[EXPERTS + 17] = f32::NAN;
+        logits[EXPERTS + 33] = f32::INFINITY;
+        logits[2 * EXPERTS..].fill(f32::NEG_INFINITY);
+
+        let logits_device = DeviceBuffer::from_host(&logits).expect("logits upload");
+        let mut indices = DeviceBuffer::<u32>::zeroed(ROWS * TOP_K).expect("indices");
+        let mut weights = DeviceBuffer::<f32>::zeroed(ROWS * TOP_K).expect("weights");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        moe_topk_f32_batch_into_on_stream(
+            &logits_device,
+            indices.output(),
+            weights.output(),
+            ROWS,
+            EXPERTS,
+            TOP_K,
+            true,
+            &stream,
+        )
+        .expect("Qwen3.8 batch top-k");
+        let actual_indices = indices.copy_to_host(&stream).expect("indices download");
+        let actual_weights = weights.copy_to_host(&stream).expect("weights download");
+
+        for row in 0..ROWS {
+            let row_logits = &logits[row * EXPERTS..(row + 1) * EXPERTS];
+            let sanitized = row_logits
+                .iter()
+                .map(|&value| {
+                    if value.is_nan() {
+                        f32::NEG_INFINITY
+                    } else if value == f32::INFINITY {
+                        f32::MAX
+                    } else if value == 0.0 {
+                        0.0
+                    } else {
+                        value
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !sanitized.iter().any(|value| value.is_finite()) {
+                assert_eq!(
+                    &actual_indices[row * TOP_K..(row + 1) * TOP_K],
+                    &(0..TOP_K as u32).collect::<Vec<_>>()
+                );
+                assert_eq!(actual_weights[row * TOP_K], 1.0);
+                assert!(
+                    actual_weights[row * TOP_K + 1..(row + 1) * TOP_K]
+                        .iter()
+                        .all(|&weight| weight == 0.0)
+                );
+                continue;
+            }
+            let mut expected_indices = (0..EXPERTS).collect::<Vec<_>>();
+            expected_indices.sort_unstable_by(|&left, &right| {
+                sanitized[right]
+                    .total_cmp(&sanitized[left])
+                    .then_with(|| left.cmp(&right))
+            });
+            let expected_indices = &expected_indices[..TOP_K];
+            assert_eq!(
+                &actual_indices[row * TOP_K..(row + 1) * TOP_K],
+                expected_indices
+                    .iter()
+                    .map(|&expert| expert as u32)
+                    .collect::<Vec<_>>()
+            );
+            let selected_max = sanitized[expected_indices[0]];
+            let selected_sum = expected_indices
+                .iter()
+                .map(|&expert| (sanitized[expert] - selected_max).exp())
+                .sum::<f32>();
+            for (slot, &expert) in expected_indices.iter().enumerate() {
+                let expected = (sanitized[expert] - selected_max).exp() / selected_sum;
+                let actual = actual_weights[row * TOP_K + slot];
+                assert!(
+                    (actual - expected).abs() < 1.0e-6,
+                    "row={row} slot={slot} actual={actual} expected={expected}"
+                );
+            }
         }
     }
 

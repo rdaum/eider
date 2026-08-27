@@ -2257,6 +2257,81 @@ __global__ void infer_moe_top8_norm256_f32_kernel(const float* logits,
     }
 }
 
+__global__ void infer_moe_top10_norm512_f32_kernel(const float* logits,
+                                                         std::uint32_t* out_indices,
+                                                         float* out_weights) {
+    constexpr int kThreads = 256;
+    constexpr int kItems = 2;
+    constexpr int kTop = 10;
+    const std::uint32_t batch = blockIdx.x;
+    logits += batch * 512;
+    out_indices += batch * kTop;
+    out_weights += batch * kTop;
+
+    std::uint64_t keys[kItems];
+    float sorted_values[kItems];
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const std::uint32_t expert = threadIdx.x + item * kThreads;
+        float value = logits[expert];
+        if (isnan(value)) {
+            value = -INFINITY;
+        } else if (value == INFINITY) {
+            value = FLT_MAX;
+        } else if (value == 0.0f) {
+            value = 0.0f;
+        }
+        const std::uint32_t bits = __float_as_uint(value);
+        const std::uint32_t ordered =
+            (bits & 0x80000000u) != 0 ? ~bits : bits ^ 0x80000000u;
+        keys[item] = (static_cast<std::uint64_t>(ordered) << 32) |
+            static_cast<std::uint64_t>(UINT32_MAX - expert);
+        sorted_values[item] = value;
+    }
+
+    using BlockSort = cub::BlockRadixSort<std::uint64_t, kThreads, kItems, float>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    __shared__ float top_values[kTop];
+    __shared__ std::uint32_t top_indices[kTop];
+    BlockSort(sort_storage).SortDescending(keys, sorted_values);
+    __syncthreads();
+
+    #pragma unroll
+    for (int item = 0; item < kItems; ++item) {
+        const int rank = threadIdx.x * kItems + item;
+        if (rank < kTop) {
+            top_values[rank] = sorted_values[item];
+            top_indices[rank] = UINT32_MAX - static_cast<std::uint32_t>(keys[item]);
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        if (!isfinite(top_values[0])) {
+            #pragma unroll
+            for (int slot = 0; slot < kTop; ++slot) {
+                out_indices[slot] = slot;
+                out_weights[slot] = slot == 0 ? 1.0f : 0.0f;
+            }
+            return;
+        }
+
+        const float selected_max = top_values[0];
+        float selected_sum = 0.0f;
+        #pragma unroll
+        for (int slot = 0; slot < kTop; ++slot) {
+            const float probability = expf(top_values[slot] - selected_max);
+            top_values[slot] = probability;
+            selected_sum += probability;
+        }
+        #pragma unroll
+        for (int slot = 0; slot < kTop; ++slot) {
+            out_indices[slot] = top_indices[slot];
+            out_weights[slot] = top_values[slot] / selected_sum;
+        }
+    }
+}
+
 extern "C" cudaError_t infer_moe_topk_f32_on_stream(const float* logits,
                                                           std::uint32_t* out_indices,
                                                           float* out_weights,
@@ -2270,6 +2345,11 @@ extern "C" cudaError_t infer_moe_topk_f32_on_stream(const float* logits,
     }
     if (experts == 256 && k == 8 && norm_topk_prob != 0) {
         infer_moe_top8_norm256_f32_kernel<<<1, 256, 0, stream>>>(
+            logits, out_indices, out_weights);
+        return cudaGetLastError();
+    }
+    if (experts == 512 && k == 10 && norm_topk_prob != 0) {
+        infer_moe_top10_norm512_f32_kernel<<<1, 256, 0, stream>>>(
             logits, out_indices, out_weights);
         return cudaGetLastError();
     }
@@ -2376,6 +2456,11 @@ extern "C" cudaError_t infer_moe_topk_f32_batch_on_stream(
     }
     if (experts == 256 && k == 8 && norm_topk_prob != 0) {
         infer_moe_top8_norm256_f32_kernel<<<batch_size, 256, 0, stream>>>(
+            logits, out_indices, out_weights);
+        return cudaGetLastError();
+    }
+    if (experts == 512 && k == 10 && norm_topk_prob != 0) {
+        infer_moe_top10_norm512_f32_kernel<<<batch_size, 256, 0, stream>>>(
             logits, out_indices, out_weights);
         return cudaGetLastError();
     }
