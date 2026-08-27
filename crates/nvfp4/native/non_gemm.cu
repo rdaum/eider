@@ -4538,6 +4538,64 @@ extern "C" cudaError_t infer_rope_neox_sequence_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_rope_neox_partial_sequence_f32_kernel(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t start_position,
+    float theta) {
+    const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t len = tokens * heads * head_dim;
+    if (idx >= len) return;
+    const std::uint32_t dim = idx % head_dim;
+    if (dim >= rotary_dim) {
+        output[idx] = input[idx];
+        return;
+    }
+    const std::uint32_t half = rotary_dim / 2;
+    if (dim >= half) return;
+    const std::uint32_t row = idx / head_dim;
+    const std::uint32_t row_start = row * head_dim;
+    const std::uint32_t token = row / heads;
+    const std::uint32_t position = start_position + token;
+    const float inv_freq =
+        powf(theta, -2.0f * static_cast<float>(dim) / static_cast<float>(rotary_dim));
+    float sin_value;
+    float cos_value;
+    sincosf(static_cast<float>(position) * inv_freq, &sin_value, &cos_value);
+    const float a = input[row_start + dim];
+    const float b = input[row_start + dim + half];
+    output[row_start + dim] = a * cos_value - b * sin_value;
+    output[row_start + dim + half] = a * sin_value + b * cos_value;
+}
+
+extern "C" cudaError_t infer_rope_neox_partial_sequence_f32_on_stream(
+    const float* input,
+    float* output,
+    std::uint32_t tokens,
+    std::uint32_t heads,
+    std::uint32_t head_dim,
+    std::uint32_t rotary_dim,
+    std::uint32_t start_position,
+    float theta,
+    cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || tokens == 0 || heads == 0 ||
+        head_dim == 0 || rotary_dim == 0 || rotary_dim > head_dim ||
+        (rotary_dim % 2) != 0 || !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::uint64_t len =
+        static_cast<std::uint64_t>(tokens) * heads * head_dim;
+    const int blocks = static_cast<int>((len + kThreads - 1) / kThreads);
+    infer_rope_neox_partial_sequence_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+        input, output, tokens, heads, head_dim, rotary_dim, start_position, theta);
+    return cudaGetLastError();
+}
+
 __global__ void infer_rope_neox_inv_freq_sequence_f32_kernel(
     const float* input,
     const float* inv_freq,

@@ -17,7 +17,7 @@ use crate::nvfp4::{
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
     Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
-    add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
+    Sm12xKvPagePool, add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_two_rows_f32_into_on_stream,
     bf16_to_f32_prefix_into_on_stream, dflash2_capture_f32_into_on_stream,
     f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
@@ -33,10 +33,10 @@ use crate::nvfp4::{
     qwen36_gdn_gate_paired_batch_bf16_into_on_stream, qwen36_gdn_gate_paired_batch_into_on_stream,
     qwen36_gdn_prep_batch_into_on_stream, qwen36_gdn_prep_chunks_bf16_into_on_stream,
     qwen36_gdn_prep_chunks_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_imrope_text_batch_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    scale_channel_f32_device_row_scalar_in_place_on_stream, scatter_f32_pointer_rows_on_stream,
-    scatter_f32_pointer_rows_range_on_stream, sigmoid_mul_f32_prefix_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream,
+    rope_imrope_text_batch_f32_into_on_stream, rope_neox_partial_sequence_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_row_scalar_in_place_on_stream,
+    scatter_f32_pointer_rows_on_stream, scatter_f32_pointer_rows_range_on_stream,
+    sigmoid_mul_f32_prefix_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
 };
 
 const GDN_HEADS: usize = 32;
@@ -1620,7 +1620,7 @@ impl BatchLinearAttentionWorkspace {
     }
 }
 
-struct BatchFullAttentionWorkspace {
+pub(crate) struct BatchFullAttentionWorkspace {
     hidden_quantized: DeviceBuffer<u8>,
     hidden_scale: DeviceBuffer<f32>,
     value_quantized: DeviceBuffer<u8>,
@@ -1644,7 +1644,7 @@ struct BatchFullAttentionWorkspace {
 }
 
 impl BatchFullAttentionWorkspace {
-    fn new(
+    pub(crate) fn new(
         model: &dyn Qwen36BatchModel,
         weights: &Qwen36FullAttentionWeights,
         capacity: usize,
@@ -5147,12 +5147,11 @@ impl Qwen36LinearAttentionWeights {
 
 impl Qwen36FullAttentionWeights {
     #[allow(clippy::too_many_arguments)]
-    fn enqueue_batch_pre(
+    fn enqueue_batch_projections(
         &self,
         model: &dyn Qwen36BatchModel,
         workspace: &mut BatchFullAttentionWorkspace,
         hidden: &DeviceBuffer<f32>,
-        positions: &DeviceBuffer<u32>,
         capacity: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -5221,7 +5220,20 @@ impl Qwen36FullAttentionWeights {
             model.batch_manifest().head_dim,
             model.batch_manifest().rms_eps,
             stream,
-        )?;
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_batch_pre(
+        &self,
+        model: &dyn Qwen36BatchModel,
+        workspace: &mut BatchFullAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        capacity: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.enqueue_batch_projections(model, workspace, hidden, capacity, stream)?;
         let sections =
             model
                 .batch_manifest()
@@ -5260,6 +5272,95 @@ impl Qwen36FullAttentionWeights {
             model.batch_manifest().rope_theta,
             stream,
         )
+    }
+
+    pub(crate) fn enqueue_qsa_prefill_pre(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut BatchFullAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        tokens: usize,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.enqueue_batch_projections(model, workspace, hidden, tokens, stream)?;
+        rope_neox_partial_sequence_f32_into_on_stream(
+            tokens,
+            model.batch_manifest().q_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
+            &workspace.q,
+            workspace.q_rope.output(),
+            start_position,
+            model.batch_manifest().rope_theta,
+            stream,
+        )?;
+        rope_neox_partial_sequence_f32_into_on_stream(
+            tokens,
+            model.batch_manifest().kv_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
+            &workspace.k,
+            workspace.k_rope.output(),
+            start_position,
+            model.batch_manifest().rope_theta,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_qsa_prefill_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut BatchFullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        selected_blocks: &DeviceBuffer<u8>,
+        selected_tiles: &DeviceBuffer<u8>,
+        selected_tokens: usize,
+        row: usize,
+        position: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
+        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
+        pool.append_at_offsets_on_stream(
+            slot,
+            page_offset,
+            &workspace.k_rope,
+            row * kv_width,
+            &workspace.v,
+            row * kv_width,
+            stream,
+        )?;
+        workspace
+            .compact_attention
+            .attention_paged_sparse_offsets_into_on_stream(
+                pool,
+                page_table,
+                position + 1,
+                selected_blocks,
+                selected_tiles,
+                selected_tokens,
+                &workspace.q_rope,
+                row * q_width,
+                workspace.attention.output(),
+                row * q_width,
+                stream,
+            )
+    }
+
+    pub(crate) fn enqueue_qsa_prefill_post<'a>(
+        &'a self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &'a mut BatchFullAttentionWorkspace,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.enqueue_batch_post(model, workspace, tokens, stream)?;
+        Ok(&workspace.output)
     }
 
     #[allow(clippy::too_many_arguments)]

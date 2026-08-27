@@ -18,14 +18,12 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. On one DGX Spark, it reaches 83.8 tokens/sec for cold
-prefill and 11.7–12.1 tokens/sec for target-only decode during a live Pi
-session.
+day, August 26, 2026. A live Pi session reaches about 150 tokens/sec for cold
+prefill and 11–13 tokens/sec for MTP-assisted decode.
 
 The server runs the [Inferact NVFP4
-checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)
-on one DGX Spark. Eider will evaluate other NVFP4 checkpoints when they become
-available.
+checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4). Eider
+will evaluate other NVFP4 checkpoints when they become available.
 
 This path only serves the complete text model. It includes native Qwen
 Sparse Attention (QSA), Gated DeltaNet (GDN), hyperconnections, all
@@ -51,28 +49,27 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Performance
 
-These results come from Eider server telemetry on one DGX Spark. The table
-reports target-only decode so that it measures the target model directly.
+These rounded results come from Eider server telemetry during a live Pi
+tool-use session.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold Pi prefill | 83.8 tokens/sec | 5,801 prompt tokens, no cached prefix |
-| Cold Pi time to first token | 69.2 sec | Same first Pi turn |
-| Cached Pi prefill | 75.5–77.1 tokens/sec | 154–778 new prompt tokens |
-| Cached Pi time to first token | 2.03–10.0 sec | 5,760–6,016 cached prompt tokens |
-| Pi decode | 11.7–12.1 tokens/sec | Four completed tool turns, 58–512 output tokens |
+| Cold Pi prefill | About 150 tokens/sec | 5.8K prompt tokens, no cached prefix |
+| Cold Pi time to first token | About 39 sec | Same first Pi turn |
+| Cached Pi prefill | About 120–130 tokens/sec | 300–850 new prompt tokens |
+| Cached Pi time to first token | About 3–7 sec | 5.8K–7.2K cached prompt tokens |
+| Pi decode | About 11–13 tokens/sec | MTP-assisted tool turns |
 | Resident memory | 98 GiB | Active Pi use |
+
+The prefill path batches QSA projections and uses BF16 tensor cores for
+hyperconnection projections.
 
 Eider serves one speculative draft by default from the checkpoint's QSA and
 MoE MTP block. Set `EIDER_SPECULATIVE_DRAFTS=0` for target-only decode.
 
 The MTP path uses an exact two-row target verifier with transactional partial
-acceptance. Its fixed greedy probe matched 64 of 64 canonical target decisions
-and preserved recurrent state bitwise.
-
-The exact verifier processes 14.39–14.50 target rows/sec. In an end-to-end
-256-token request, MTP reached 11.47 output tokens/sec with 67.3% draft
-acceptance.
+acceptance. The fixed greedy probe matched every canonical target decision and
+preserved recurrent state bitwise.
 
 The shared radix cache retains the target prefix and the MTP QSA prefix. Pi
 follow-up turns keep MTP speculation after a prefix-cache hit.

@@ -1,5 +1,7 @@
 //! Qwen3.8 Flash Next text-model support.
 
+#[doc(hidden)]
+pub mod benchmark;
 mod config;
 mod hyperconnection;
 mod model;

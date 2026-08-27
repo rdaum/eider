@@ -4,7 +4,9 @@ mod batch;
 mod dflash2;
 mod mtp;
 
-pub(crate) use batch::{Qwen36BatchModelView, Qwen36HybridPrefillWorkspace};
+pub(crate) use batch::{
+    BatchFullAttentionWorkspace, Qwen36BatchModelView, Qwen36HybridPrefillWorkspace,
+};
 pub use batch::{
     Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeLayerTrace, Qwen36DecodeRow,
     Qwen36DecodedBatch, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow,
@@ -328,7 +330,7 @@ impl Qwen36LinearFp8Execution {
 }
 
 pub(crate) struct Bf16Linear {
-    weight: DeviceBuffer<u16>,
+    pub(crate) weight: DeviceBuffer<u16>,
     rows: usize,
     cols: usize,
 }

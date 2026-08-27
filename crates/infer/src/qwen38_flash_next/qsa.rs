@@ -2,12 +2,15 @@ use super::Qwen38FlashNextConfig;
 use crate::nvfp4::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
 use crate::qwen3::infer::QwenModelManifest;
 use crate::qwen3::qwen36::{
-    Bf16Linear, Qwen36FullAttentionWeights, Qwen36FullAttentionWorkspace,
-    read_bf16_vector_delta_as_f32_device,
+    BatchFullAttentionWorkspace, Bf16Linear, Qwen36BatchModelView, Qwen36FullAttentionWeights,
+    Qwen36FullAttentionWorkspace, read_bf16_vector_delta_as_f32_device,
 };
 use crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend;
 use crate::runtime::sm12x_sequence_cache::Sm12xPage;
-use nvfp4::{Qwen38QsaSelectionWorkspace, round_f32_to_bf16_in_place_on_stream};
+use nvfp4::{
+    Qwen38QsaSelectionWorkspace, round_f32_to_bf16_in_place_on_stream,
+    round_f32_to_bf16_prefix_in_place_on_stream,
+};
 
 /// Released QSA indexer and ordinary gated-attention weights.
 pub(crate) struct Qwen38QsaWeights {
@@ -22,6 +25,12 @@ pub(crate) struct Qwen38QsaWorkspace {
     index_projection: DeviceBuffer<f32>,
     selection: Qwen38QsaSelectionWorkspace,
     attention: Qwen36FullAttentionWorkspace,
+}
+
+/// Shared batched projection and attention storage for one QSA prompt chunk.
+pub(crate) struct Qwen38QsaPrefillWorkspace {
+    index_projection: DeviceBuffer<f32>,
+    attention: BatchFullAttentionWorkspace,
 }
 
 impl Qwen38QsaWeights {
@@ -168,6 +177,125 @@ impl Qwen38QsaWeights {
             hidden_width,
             stream,
         )
+    }
+
+    pub(crate) fn new_prefill_workspace(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        config: &Qwen38FlashNextConfig,
+        token_capacity: usize,
+        max_context_tokens: usize,
+    ) -> Result<Qwen38QsaPrefillWorkspace> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        Ok(Qwen38QsaPrefillWorkspace {
+            index_projection: DeviceBuffer::zeroed(token_capacity * projection_rows)?,
+            attention: BatchFullAttentionWorkspace::new(
+                model,
+                &self.attention,
+                token_capacity,
+                max_context_tokens,
+            )?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_prefill(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        config: &Qwen38FlashNextConfig,
+        hidden: &DeviceBuffer<f32>,
+        tokens: usize,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        self.index_qk
+            .run_batch_into(hidden, &mut workspace.index_projection, tokens, stream)?;
+        round_f32_to_bf16_prefix_in_place_on_stream(
+            workspace.index_projection.inout(),
+            tokens * projection_rows,
+            stream,
+        )?;
+        self.attention.enqueue_qsa_prefill_pre(
+            model,
+            &mut workspace.attention,
+            hidden,
+            tokens,
+            start_position,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_prepared_prefill_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        row_workspace: &mut Qwen38QsaWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page_table: &DeviceBuffer<u32>,
+        page: &Sm12xPage,
+        page_offset: usize,
+        config: &Qwen38FlashNextConfig,
+        row: usize,
+        layer: usize,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        row_workspace
+            .index_projection
+            .copy_range_from_device_on_stream(
+                0,
+                &workspace.index_projection,
+                row * projection_rows,
+                projection_rows,
+                stream,
+            )?;
+        let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
+        let selection = row_workspace.selection.prepare_and_select_on_stream(
+            &row_workspace.index_projection,
+            &self.q_norm,
+            &self.k_norm,
+            index_pool,
+            page_table,
+            page.slot(),
+            page_offset,
+            position + 1,
+            config.rotary_dim.min(config.indexer_head_dim),
+            config.rms_eps(),
+            config.rope_theta(),
+            stream,
+        )?;
+        self.attention.enqueue_qsa_prefill_row(
+            model,
+            &mut workspace.attention,
+            kv_pool,
+            page_table,
+            selection.selected_blocks,
+            selection.selected_tiles,
+            selection.selected_tokens,
+            row,
+            position,
+            page.slot(),
+            page_offset,
+            stream,
+        )
+    }
+
+    pub(crate) fn finish_prefill<'a>(
+        &'a self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &'a mut Qwen38QsaPrefillWorkspace,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.attention
+            .enqueue_qsa_prefill_post(model, &mut workspace.attention, tokens, stream)
     }
 }
 

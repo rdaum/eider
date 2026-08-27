@@ -4023,6 +4023,71 @@ pub fn rope_neox_sequence_f32_into_on_stream(
     }
 }
 
+/// Enqueues partial sequence Neox RoPE into an existing output buffer on `stream`.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_neox_partial_sequence_f32_into_on_stream(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    input: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    start_position: usize,
+    theta: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = tokens
+        .checked_mul(heads)
+        .and_then(|rows| rows.checked_mul(head_dim))
+        .ok_or_else(|| Error::Shape {
+            label: "partial sequence RoPE input",
+            expected: "tokens * heads * head_dim without overflow".to_string(),
+            actual: format!("tokens={tokens} heads={heads} head_dim={head_dim}"),
+        })?;
+    if input.len() < len
+        || output.len() < len
+        || tokens == 0
+        || heads == 0
+        || head_dim == 0
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || [tokens, heads, head_dim, rotary_dim, start_position]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || !theta.is_finite()
+        || theta <= 0.0
+    {
+        return Err(Error::Shape {
+            label: "partial sequence RoPE",
+            expected: format!(
+                "buffers >= {len}, positive u32 dimensions, even rotary_dim <= head_dim, and positive theta"
+            ),
+            actual: format!(
+                "input={} output={} tokens={tokens} heads={heads} head_dim={head_dim} rotary_dim={rotary_dim} start={start_position} theta={theta}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_rope_neox_partial_sequence_f32_on_stream",
+            ffi::infer_rope_neox_partial_sequence_f32_on_stream(
+                input.ptr,
+                output.buffer_mut().ptr,
+                tokens as u32,
+                heads as u32,
+                head_dim as u32,
+                rotary_dim as u32,
+                start_position as u32,
+                theta,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues sequence NeoX RoPE using a device-resident inverse-frequency table.
 #[allow(clippy::too_many_arguments)]
 pub fn rope_neox_inv_freq_sequence_f32_into_on_stream(
@@ -15163,6 +15228,58 @@ mod tests {
                 "sequence RoPE mismatch at {idx}: actual={actual} expected={expected} error={error}"
             );
         }
+    }
+
+    #[test]
+    fn rope_neox_partial_sequence_f32_matches_cpu_reference() {
+        let tokens = 3;
+        let heads = 2;
+        let head_dim = 12;
+        let rotary_dim = 4;
+        let start_position = 11;
+        let theta = 1_000_000.0;
+        let input = (0..tokens * heads * head_dim)
+            .map(|idx| ((idx % 31) as f32 - 15.0) * 0.05)
+            .collect::<Vec<_>>();
+
+        let input_device = DeviceBuffer::from_host(&input).expect("partial sequence RoPE input");
+        let mut output_device =
+            DeviceBuffer::zeroed(input.len()).expect("partial sequence RoPE output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        rope_neox_partial_sequence_f32_into_on_stream(
+            tokens,
+            heads,
+            head_dim,
+            rotary_dim,
+            &input_device,
+            output_device.output(),
+            start_position,
+            theta,
+            &stream,
+        )
+        .expect("partial sequence RoPE launch");
+
+        let mut expected = Vec::with_capacity(input.len());
+        for token in 0..tokens {
+            let start = token * heads * head_dim;
+            let end = start + heads * head_dim;
+            expected.extend(cpu_rope_neox_partial(
+                heads,
+                head_dim,
+                rotary_dim,
+                &input[start..end],
+                start_position + token,
+                theta,
+            ));
+        }
+        assert_close(
+            &output_device
+                .copy_to_host(&stream)
+                .expect("partial sequence RoPE download"),
+            &expected,
+            2.0e-6,
+            "partial sequence RoPE",
+        );
     }
 
     #[test]

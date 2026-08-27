@@ -1,10 +1,12 @@
 use super::Qwen38FlashNextConfig;
 use crate::nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    qwen38_hc_collapse_f32_into_on_stream, qwen38_hc_combine_f32_into_on_stream,
-    qwen38_hc_norm_f32_into_on_stream, qwen38_hc_silu_scale_f32_in_place_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmShape, ModelOptCheckpoint,
+    Result, f32_to_bf16_prefix_into_on_stream, qwen38_hc_collapse_f32_into_on_stream,
+    qwen38_hc_combine_f32_into_on_stream, qwen38_hc_norm_f32_into_on_stream,
+    qwen38_hc_silu_scale_f32_in_place_on_stream,
 };
 use crate::qwen3::qwen36::{Bf16Linear, read_bf16_vector_as_f32_device};
+use std::collections::HashMap;
 
 /// BF16 low-rank weights for one Qwen generalized residual block.
 pub struct Qwen38HyperConnectionWeights {
@@ -29,6 +31,33 @@ pub struct Qwen38HyperConnectionWorkspace {
     hidden: usize,
     hc_count: usize,
     lowrank_width: usize,
+    batch: Option<Qwen38HyperConnectionBatchWorkspace>,
+}
+
+struct Qwen38HyperConnectionBatchWorkspace {
+    lt: CublasLt,
+    normed: DeviceBuffer<u16>,
+    lowrank: DeviceBuffer<u16>,
+    mix_down: HashMap<usize, Bf16TnMatmulPlan>,
+    mix_up: HashMap<usize, Bf16TnMatmulPlan>,
+    inject: HashMap<usize, Bf16TnMatmulPlan>,
+}
+
+fn batch_plan<'a>(
+    plans: &'a mut HashMap<usize, Bf16TnMatmulPlan>,
+    lt: &CublasLt,
+    tokens: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<&'a Bf16TnMatmulPlan> {
+    if let std::collections::hash_map::Entry::Vacant(entry) = plans.entry(tokens) {
+        entry.insert(Bf16TnMatmulPlan::new(
+            lt,
+            GemmShape::new(rows, tokens, cols),
+            8 << 20,
+        )?);
+    }
+    Ok(&plans[&tokens])
 }
 
 impl Qwen38HyperConnectionWeights {
@@ -121,7 +150,28 @@ impl Qwen38HyperConnectionWeights {
             self.eps,
             stream,
         )?;
-        if exact_two_rows {
+        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+            f32_to_bf16_prefix_into_on_stream(
+                &workspace.normed,
+                batch.normed.output(),
+                tokens * self.hidden * self.hc_count,
+                stream,
+            )?;
+            batch_plan(
+                &mut batch.mix_down,
+                &batch.lt,
+                tokens,
+                self.lowrank,
+                self.hidden * self.hc_count,
+            )?
+            .run_on_stream(
+                &batch.lt,
+                &self.mix_down.weight,
+                &batch.normed,
+                workspace.lowrank.output(),
+                stream,
+            )?;
+        } else if exact_two_rows {
             self.mix_down.run_exact_two_rows_into(
                 &workspace.normed,
                 &mut workspace.lowrank,
@@ -141,7 +191,28 @@ impl Qwen38HyperConnectionWeights {
             self.hc_count,
             stream,
         )?;
-        if exact_two_rows {
+        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+            f32_to_bf16_prefix_into_on_stream(
+                &workspace.lowrank,
+                batch.lowrank.output(),
+                tokens * self.lowrank,
+                stream,
+            )?;
+            batch_plan(
+                &mut batch.mix_up,
+                &batch.lt,
+                tokens,
+                self.hidden * self.hc_count,
+                self.lowrank,
+            )?
+            .run_on_stream(
+                &batch.lt,
+                &self.mix_up.weight,
+                &batch.lowrank,
+                workspace.gate_logits.output(),
+                stream,
+            )?;
+        } else if exact_two_rows {
             self.mix_up.run_exact_two_rows_into(
                 &workspace.lowrank,
                 &mut workspace.gate_logits,
@@ -223,7 +294,22 @@ impl Qwen38HyperConnectionWeights {
             label: "Qwen3.8 hyperconnection combine",
             detail: "the final mixer has no block injection weight".to_string(),
         })?;
-        if exact_two_rows {
+        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+            batch_plan(
+                &mut batch.inject,
+                &batch.lt,
+                tokens,
+                self.hc_count,
+                self.hidden * self.hc_count,
+            )?
+            .run_on_stream(
+                &batch.lt,
+                &inject.weight,
+                &batch.normed,
+                workspace.inject_logits.output(),
+                stream,
+            )?;
+        } else if exact_two_rows {
             inject.run_exact_two_rows_into(
                 &workspace.normed,
                 &mut workspace.inject_logits,
@@ -271,7 +357,42 @@ impl Qwen38HyperConnectionWorkspace {
             hidden: config.hidden,
             hc_count: config.hc_count,
             lowrank_width: config.hc_lowrank,
+            batch: None,
         })
+    }
+
+    /// Allocates tensor-core BF16 plans for a fixed-size prompt chunk.
+    pub(crate) fn new_prefill(
+        config: &Qwen38FlashNextConfig,
+        token_capacity: usize,
+    ) -> Result<Self> {
+        let mut workspace = Self::new(config, token_capacity)?;
+        let hc_dim = config.hidden * config.hc_count;
+        let lt = CublasLt::new()?;
+        let mix_down = Bf16TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(config.hc_lowrank, token_capacity, hc_dim),
+            8 << 20,
+        )?;
+        let mix_up = Bf16TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(hc_dim, token_capacity, config.hc_lowrank),
+            8 << 20,
+        )?;
+        let inject = Bf16TnMatmulPlan::new(
+            &lt,
+            GemmShape::new(config.hc_count, token_capacity, hc_dim),
+            8 << 20,
+        )?;
+        workspace.batch = Some(Qwen38HyperConnectionBatchWorkspace {
+            lt,
+            normed: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            lowrank: DeviceBuffer::zeroed(token_capacity * config.hc_lowrank)?,
+            mix_down: HashMap::from([(token_capacity, mix_down)]),
+            mix_up: HashMap::from([(token_capacity, mix_up)]),
+            inject: HashMap::from([(token_capacity, inject)]),
+        });
+        Ok(workspace)
     }
 
     /// Most recent mixed `[tokens, hidden]` activation.
@@ -285,6 +406,25 @@ impl Qwen38HyperConnectionWorkspace {
             + self.gate_logits.device_bytes()
             + self.inject_logits.device_bytes()
             + self.mixed.device_bytes()
+            + self.batch.as_ref().map_or(0, |batch| {
+                batch.normed.device_bytes()
+                    + batch.lowrank.device_bytes()
+                    + batch
+                        .mix_down
+                        .values()
+                        .map(Bf16TnMatmulPlan::workspace_bytes)
+                        .sum::<usize>()
+                    + batch
+                        .mix_up
+                        .values()
+                        .map(Bf16TnMatmulPlan::workspace_bytes)
+                        .sum::<usize>()
+                    + batch
+                        .inject
+                        .values()
+                        .map(Bf16TnMatmulPlan::workspace_bytes)
+                        .sum::<usize>()
+            })
     }
 
     fn require(&self, weights: &Qwen38HyperConnectionWeights, tokens: usize) -> Result<()> {

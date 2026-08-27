@@ -1,4 +1,4 @@
-use super::qsa::{Qwen38QsaWeights, Qwen38QsaWorkspace};
+use super::qsa::{Qwen38QsaPrefillWorkspace, Qwen38QsaWeights, Qwen38QsaWorkspace};
 use super::{
     Qwen38ExactPleWorkspace, Qwen38FlashNextConfig, Qwen38HyperConnectionWeights,
     Qwen38HyperConnectionWorkspace, Qwen38PagedPle, Qwen38PleState, Qwen38PleTokenWindow,
@@ -150,8 +150,9 @@ pub(crate) struct Qwen38FlashNextPrefillWorkspace {
     streams_a: DeviceBuffer<f32>,
     streams_b: DeviceBuffer<f32>,
     hidden: DeviceBuffer<f32>,
-    qsa_output: DeviceBuffer<f32>,
-    qsa_row_hidden: DeviceBuffer<f32>,
+    qsa: Qwen38QsaPrefillWorkspace,
+    qsa_serial_output: DeviceBuffer<f32>,
+    qsa_serial_row_hidden: DeviceBuffer<f32>,
     attention_hyper: Qwen38HyperConnectionWorkspace,
     mlp_hyper: Qwen38HyperConnectionWorkspace,
     ple_pager: Qwen38PagedPle,
@@ -161,6 +162,7 @@ pub(crate) struct Qwen38FlashNextPrefillWorkspace {
     exact_gdn: Option<Qwen38ExactGdnPrefillWorkspace>,
     exact_moe: Option<Qwen38ExactMoePrefillWorkspace>,
     serial_gdn_projections: bool,
+    serial_qsa_rows: bool,
     canonical_moe_linears: bool,
     exact_hyper_projections: bool,
     layer_trace: Option<Vec<Qwen38LayerProbeTrace>>,
@@ -724,6 +726,7 @@ impl Qwen38FlashNextModel {
             .hybrid
             .enable_state_snapshots(&batch_model, rows - 1)?;
         verify.serial_gdn_projections = mode.serial_gdn_projections();
+        verify.serial_qsa_rows = true;
         if mode.serial_gdn_projections() {
             let first_linear = self
                 .layers
@@ -1566,10 +1569,26 @@ impl Qwen38FlashNextModel {
                 detail: "model has no transformer layers".to_string(),
             })?
             .moe;
-        let hybrid = {
-            let model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &linear_layers);
-            Qwen36HybridPrefillWorkspace::new(&model, first_linear, first_moe, token_capacity)?
-        };
+        let first_qsa = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Qwen38AttentionWeights::Linear(_) => None,
+                Qwen38AttentionWeights::Qsa(weights) => Some(weights),
+            })
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next prefill",
+                detail: "model has no QSA layer".to_string(),
+            })?;
+        let model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &linear_layers);
+        let hybrid =
+            Qwen36HybridPrefillWorkspace::new(&model, first_linear, first_moe, token_capacity)?;
+        let qsa = first_qsa.new_prefill_workspace(
+            &model,
+            &self.config,
+            token_capacity,
+            self.config.max_position_embeddings,
+        )?;
         let hc_dim = self.config.hidden * self.config.hc_count;
         Ok(Qwen38FlashNextPrefillWorkspace {
             token_capacity,
@@ -1577,10 +1596,14 @@ impl Qwen38FlashNextModel {
             streams_a: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
             streams_b: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
             hidden: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
-            qsa_output: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
-            qsa_row_hidden: DeviceBuffer::zeroed(self.config.hidden)?,
-            attention_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, token_capacity)?,
-            mlp_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, token_capacity)?,
+            qsa,
+            qsa_serial_output: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
+            qsa_serial_row_hidden: DeviceBuffer::zeroed(self.config.hidden)?,
+            attention_hyper: Qwen38HyperConnectionWorkspace::new_prefill(
+                &self.config,
+                token_capacity,
+            )?,
+            mlp_hyper: Qwen38HyperConnectionWorkspace::new_prefill(&self.config, token_capacity)?,
             ple_pager: Qwen38PagedPle::open(&self.checkpoint, &self.config, token_capacity)?,
             ple: Qwen38PleWorkspace::new(&self.config, token_capacity)?,
             exact_ple: None,
@@ -1588,6 +1611,7 @@ impl Qwen38FlashNextModel {
             exact_gdn: None,
             exact_moe: None,
             serial_gdn_projections: false,
+            serial_qsa_rows: false,
             canonical_moe_linears: false,
             exact_hyper_projections: false,
             layer_trace: None,
@@ -1998,36 +2022,77 @@ impl Qwen38FlashNextModel {
                     Qwen38AttentionState::Qsa,
                 ) => {
                     let mixed = workspace.attention_hyper.mixed();
-                    let qsa_output = &mut workspace.qsa_output;
-                    let row_hidden = &mut workspace.qsa_row_hidden;
-                    cache
-                        .with_append_pages(reservation, |backend, pages| {
-                            for page in pages.iter() {
-                                let segment = page.segment();
-                                for offset in 0..segment.rows() {
-                                    let row = segment.input_offset() + offset;
-                                    weights.run_prefill_row(
-                                        qsa_workspace,
-                                        backend,
-                                        page_table.device(),
-                                        page.page(),
-                                        segment.page_offset() + offset,
-                                        &self.config,
-                                        &self.manifest,
-                                        mixed,
-                                        row_hidden,
-                                        qsa_output,
-                                        row,
-                                        layer_index,
-                                        state.position + row,
-                                        &state.stream,
-                                    )?;
+                    if workspace.serial_qsa_rows {
+                        cache
+                            .with_append_pages(reservation, |backend, pages| {
+                                for page in pages.iter() {
+                                    let segment = page.segment();
+                                    for offset in 0..segment.rows() {
+                                        let row = segment.input_offset() + offset;
+                                        weights.run_prefill_row(
+                                            qsa_workspace,
+                                            backend,
+                                            page_table.device(),
+                                            page.page(),
+                                            segment.page_offset() + offset,
+                                            &self.config,
+                                            &self.manifest,
+                                            mixed,
+                                            &mut workspace.qsa_serial_row_hidden,
+                                            &mut workspace.qsa_serial_output,
+                                            row,
+                                            layer_index,
+                                            state.position + row,
+                                            &state.stream,
+                                        )?;
+                                    }
                                 }
-                            }
-                            Ok(())
-                        })
-                        .map_err(qwen38_flash_next_cache_error)?;
-                    &workspace.qsa_output
+                                Ok(())
+                            })
+                            .map_err(qwen38_flash_next_cache_error)?;
+                        &workspace.qsa_serial_output
+                    } else {
+                        weights.prepare_prefill(
+                            &model,
+                            &mut workspace.qsa,
+                            &self.config,
+                            mixed,
+                            token_count,
+                            state.position,
+                            &state.stream,
+                        )?;
+                        cache
+                            .with_append_pages(reservation, |backend, pages| {
+                                for page in pages.iter() {
+                                    let segment = page.segment();
+                                    for offset in 0..segment.rows() {
+                                        let row = segment.input_offset() + offset;
+                                        weights.run_prepared_prefill_row(
+                                            &model,
+                                            &mut workspace.qsa,
+                                            qsa_workspace,
+                                            backend,
+                                            page_table.device(),
+                                            page.page(),
+                                            segment.page_offset() + offset,
+                                            &self.config,
+                                            row,
+                                            layer_index,
+                                            state.position + row,
+                                            &state.stream,
+                                        )?;
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .map_err(qwen38_flash_next_cache_error)?;
+                        weights.finish_prefill(
+                            &model,
+                            &mut workspace.qsa,
+                            token_count,
+                            &state.stream,
+                        )?
+                    }
                 }
                 _ => {
                     return Err(Error::Format {
@@ -3352,7 +3417,7 @@ mod tests {
 
         let mut batch_backend =
             crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
-                layer_mask,
+                layer_mask.clone(),
                 1,
                 manifest.kv_heads,
                 manifest.head_dim,
@@ -3361,21 +3426,33 @@ mod tests {
             .expect("batch backend");
         let mut batch_workspace =
             Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("batch workspace");
-        let mut row_hidden = DeviceBuffer::zeroed(config.hidden).expect("row hidden");
-        let mut batch_output = DeviceBuffer::zeroed(TOKENS * config.hidden).expect("batch output");
+        let lt = CublasLt::new().expect("cuBLASLt");
+        let batch_model = Qwen36BatchModelView::new(&lt, &manifest, &layer_mask);
+        let mut prefill_workspace = weights
+            .new_prefill_workspace(&batch_model, &config, TOKENS, 128)
+            .expect("QSA prefill workspace");
+        weights
+            .prepare_prefill(
+                &batch_model,
+                &mut prefill_workspace,
+                &config,
+                &batch_input,
+                TOKENS,
+                0,
+                &stream,
+            )
+            .expect("prepare batch QSA");
         for row in 0..TOKENS {
             weights
-                .run_prefill_row(
+                .run_prepared_prefill_row(
+                    &batch_model,
+                    &mut prefill_workspace,
                     &mut batch_workspace,
                     &mut batch_backend,
                     &page_table,
                     &page,
                     row,
                     &config,
-                    &manifest,
-                    &batch_input,
-                    &mut row_hidden,
-                    &mut batch_output,
                     row,
                     LAYER,
                     row,
@@ -3383,7 +3460,9 @@ mod tests {
                 )
                 .expect("batch QSA");
         }
-        let batch_output = batch_output
+        let batch_output = weights
+            .finish_prefill(&batch_model, &mut prefill_workspace, TOKENS, &stream)
+            .expect("finish batch QSA")
             .copy_to_host(&stream)
             .expect("batch QSA readback");
         let max_error = serial_output
@@ -3391,6 +3470,29 @@ mod tests {
             .zip(batch_output.iter())
             .map(|(serial, batch)| (serial - batch).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_error <= 1e-5, "batch QSA maximum error {max_error}");
+        let dot = serial_output
+            .iter()
+            .zip(batch_output.iter())
+            .map(|(serial, batch)| serial * batch)
+            .sum::<f32>();
+        let serial_norm = serial_output.iter().map(|value| value * value).sum::<f32>();
+        let batch_norm = batch_output.iter().map(|value| value * value).sum::<f32>();
+        let squared_error = serial_output
+            .iter()
+            .zip(batch_output.iter())
+            .map(|(serial, batch)| {
+                let error = serial - batch;
+                error * error
+            })
+            .sum::<f32>();
+        let cosine = dot / (serial_norm * batch_norm).sqrt();
+        let relative_rmse = (squared_error / serial_norm).sqrt();
+        eprintln!(
+            "batch QSA maximum_error={max_error} cosine={cosine} relative_rmse={relative_rmse}"
+        );
+        assert!(
+            max_error <= 0.005 && cosine >= 0.999 && relative_rmse <= 0.01,
+            "batch QSA maximum_error={max_error} cosine={cosine} relative_rmse={relative_rmse}"
+        );
     }
 }
