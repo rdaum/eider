@@ -3,16 +3,16 @@
 use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::{ChatReasoningEffort, CheckpointChatTemplate};
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::laguna_sequence_cache::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use super::stop::StopBuffer;
 use crate::laguna::{
     HEAD_DIM, KV_HEADS, LAYERS, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace,
     LagunaPrefillRow,
 };
+use crate::laguna::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use nvfp4::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};

@@ -1,6 +1,7 @@
 use super::*;
-use crate::gguf::{GgufIndex, GgufValue};
-use crate::gguf_quant::{dequantize_to_bf16, quantized_byte_len};
+use eider_format::{
+    Error as FormatError, GgufIndex, GgufValue, dequantize_to_bf16, quantized_byte_len,
+};
 use nvfp4::{
     Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_prefix_into_on_stream,
     argmax_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
@@ -32,7 +33,7 @@ pub struct DFlashConfig {
 impl DFlashConfig {
     /// Reads and validates DFlash architecture metadata without loading tensors.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_index(&GgufIndex::open(path)?)
+        Self::from_index(&GgufIndex::open(path).map_err(format_error)?)
     }
 
     fn from_index(index: &GgufIndex) -> Result<Self> {
@@ -308,7 +309,7 @@ pub struct MuseGlimmerDFlashCycle {
 impl DFlashModel {
     /// Imports the official Q4_K/Q6_K companion weights into Eider NVFP4.
     pub fn load(path: impl AsRef<Path>, target: &MuseGlimmerConfig) -> Result<Self> {
-        let index = GgufIndex::open(path)?;
+        let index = GgufIndex::open(path).map_err(format_error)?;
         let config = DFlashConfig::from_index(&index)?;
         if config.hidden_size != target.hidden_size
             || config.context_length != target.max_position_embeddings
@@ -963,7 +964,7 @@ fn load_linear(
     out_features: usize,
     in_features: usize,
 ) -> Result<MuseNvfp4Linear> {
-    let tensor = index.tensor(tensor_name)?;
+    let tensor = index.tensor(tensor_name).map_err(format_error)?;
     if tensor.dimensions.as_slice() != [in_features as u64, out_features as u64] {
         return Err(Error::Shape {
             label: "DFlash linear tensor",
@@ -971,9 +972,12 @@ fn load_linear(
             actual: format!("{:?} for {tensor_name}", tensor.dimensions),
         });
     }
-    let elements = tensor.elements()?;
-    let bytes = index.read_tensor_bytes(tensor_name, quantized_byte_len(tensor.kind, elements)?)?;
-    let values = dequantize_to_bf16(tensor.kind, &bytes, elements)?;
+    let elements = tensor.elements().map_err(format_error)?;
+    let byte_len = quantized_byte_len(tensor.kind, elements).map_err(format_error)?;
+    let bytes = index
+        .read_tensor_bytes(tensor_name, byte_len)
+        .map_err(format_error)?;
+    let values = dequantize_to_bf16(tensor.kind, &bytes, elements).map_err(format_error)?;
     MuseNvfp4Linear::from_modelopt(
         tensor_name,
         ModelOptNvfp4Linear::quantize_bf16(tensor_name, out_features, in_features, &values)?,
@@ -981,7 +985,7 @@ fn load_linear(
 }
 
 fn load_norm(index: &GgufIndex, name: &str, width: usize, eps: f32) -> Result<MuseRmsNorm> {
-    let tensor = index.tensor(name)?;
+    let tensor = index.tensor(name).map_err(format_error)?;
     if tensor.kind != 0 || tensor.dimensions.as_slice() != [width as u64] {
         return Err(Error::Shape {
             label: "DFlash F32 norm",
@@ -992,7 +996,9 @@ fn load_norm(index: &GgufIndex, name: &str, width: usize, eps: f32) -> Result<Mu
             ),
         });
     }
-    let bytes = index.read_tensor_bytes(name, width * 4)?;
+    let bytes = index
+        .read_tensor_bytes(name, width * 4)
+        .map_err(format_error)?;
     let values = bytes
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -1030,5 +1036,12 @@ fn metadata_type(key: &str, expected: &str) -> Error {
     Error::Format {
         label: "DFlash GGUF metadata",
         detail: format!("{key} is not a {expected}"),
+    }
+}
+
+fn format_error(error: FormatError) -> Error {
+    Error::Format {
+        label: "DFlash GGUF import",
+        detail: error.to_string(),
     }
 }

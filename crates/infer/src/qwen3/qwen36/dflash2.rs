@@ -8,12 +8,13 @@ use super::batch::{BatchFp8InputQuantization, BatchFp8LinearPlan, run_fp8_batch}
 use super::{Qwen36LmHead, Qwen36TextModel};
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, GpuTokenSampler,
-    GpuTopKCandidate, ModelOptCheckpoint, PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
-    dflash2_hidden_projection_f32_into_on_stream, dflash2_noncausal_attention_f32_into_on_stream,
-    f32_to_bf16_prefix_into_on_stream, fill_f32_prefix_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_sequence_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    GpuTopKCandidate, ModelOptCheckpoint, PinnedHostBuffer, Result, RowMajor,
+    add_f32_prefix_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    dflash2_grouped_conv_f32_into_on_stream, dflash2_hidden_projection_f32_into_on_stream,
+    dflash2_noncausal_attention_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream,
+    fill_f32_prefix_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream,
 };
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use serde::Deserialize;
@@ -24,6 +25,87 @@ use std::path::Path;
 const DFLASH2_ARCHITECTURE: &str = "DFlash2DraftModel";
 const DFLASH2_CONTEXT_ROWS: usize = 128;
 const CUBLAS_WORKSPACE_LIMIT: u64 = 8 << 20;
+
+/// Retained DFlash2 prefix snapshots for one Qwen inference engine.
+///
+/// The cache owns device-backed snapshots, so it stays with the DFlash2
+/// execution implementation rather than the request scheduler.
+pub(crate) struct Qwen38DFlash2PrefixCache {
+    max_bytes: usize,
+    retained_bytes: usize,
+    clock: u64,
+    entries: Vec<Qwen38DFlash2PrefixEntry>,
+}
+
+struct Qwen38DFlash2PrefixEntry {
+    tokens: Box<[u32]>,
+    snapshot: Qwen38DFlash2SequenceSnapshot,
+    last_used: u64,
+}
+
+impl Qwen38DFlash2PrefixCache {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            retained_bytes: 0,
+            clock: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn get(&mut self, tokens: &[u32]) -> Option<&Qwen38DFlash2SequenceSnapshot> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens.as_ref() == tokens)?;
+        self.clock = self.clock.saturating_add(1);
+        self.entries[index].last_used = self.clock;
+        Some(&self.entries[index].snapshot)
+    }
+
+    pub(crate) fn can_retain(&self, bytes: usize) -> bool {
+        bytes != 0 && bytes <= self.max_bytes
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        tokens: &[u32],
+        snapshot: Qwen38DFlash2SequenceSnapshot,
+    ) -> bool {
+        let bytes = snapshot.device_bytes();
+        if bytes == 0 || bytes > self.max_bytes || snapshot.position() != tokens.len() {
+            return false;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens.as_ref() == tokens)
+        {
+            let replaced = self.entries.swap_remove(index);
+            self.retained_bytes -= replaced.snapshot.device_bytes();
+        }
+        while self.retained_bytes.saturating_add(bytes) > self.max_bytes {
+            let Some((index, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                return false;
+            };
+            let evicted = self.entries.swap_remove(index);
+            self.retained_bytes -= evicted.snapshot.device_bytes();
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.entries.push(Qwen38DFlash2PrefixEntry {
+            tokens: tokens.into(),
+            snapshot,
+            last_used: self.clock,
+        });
+        self.retained_bytes += bytes;
+        true
+    }
+}
 
 /// Validated configuration for an official Qwen3.8 DFlash2 companion.
 #[derive(Clone, Debug, PartialEq)]
@@ -1169,15 +1251,24 @@ impl Qwen38DFlash2 {
         }
         let projected_values = drafts * self.config.selector_rank;
         dflash2_hidden_projection_f32_into_on_stream(
-            &workspace.sample_hidden,
-            &self.selector_projection,
-            &mut workspace.selector_projected,
-            drafts,
-            self.config.hidden,
-            self.config.selector_rank,
+            workspace
+                .sample_hidden
+                .slice(0..drafts * self.config.hidden)?
+                .matrix::<RowMajor>(drafts, self.config.hidden, self.config.hidden)?,
+            self.selector_projection
+                .slice(0..self.config.selector_rank * self.config.hidden)?
+                .matrix::<RowMajor>(
+                    self.config.selector_rank,
+                    self.config.hidden,
+                    self.config.hidden,
+                )?,
+            workspace
+                .selector_projected
+                .slice_mut(0..projected_values)?
+                .matrix::<RowMajor>(drafts, self.config.selector_rank, self.config.selector_rank)?,
             stream,
         )?;
-        workspace
+        let projected = workspace
             .selector_projected
             .copy_prefix_to_pinned_on_stream(
                 &mut workspace.host_projected,
@@ -1191,9 +1282,10 @@ impl Qwen38DFlash2 {
             &mut workspace.selector_candidates,
             stream,
         )?;
+        let projected = projected.wait()?;
         self.selector.select(
             anchor_token,
-            &workspace.host_projected.as_slice()[..projected_values],
+            &projected.as_slice()[..projected_values],
             &workspace.selector_candidates,
             &mut workspace.drafts,
         )?;

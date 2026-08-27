@@ -4,10 +4,7 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
-use crate::runtime::step37_sequence_cache::{
-    Step37Append, Step37Sequence, Step37SequenceCache, step37_cache_error,
-};
+use crate::sm12x_cache::Sm12xCacheContext;
 use fs2::FileExt as Fs2FileExt;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
@@ -34,7 +31,10 @@ use std::time::Instant;
 use tracing::info;
 
 mod batch;
+mod sequence;
 pub use batch::{Step37PrefillBatchWorkspace, Step37PrefillRow};
+pub(crate) use sequence::{Step37Append, step37_cache_error};
+pub use sequence::{Step37Sequence, Step37SequenceCache, new_step37_sequence_cache};
 
 pub const LAYERS: usize = 42;
 pub const FIRST_MOE_LAYER: usize = 3;

@@ -2,15 +2,15 @@
 
 use super::model::{Qwen38LayerProbeStage, Qwen38LayerProbeTrace};
 use super::{
-    Qwen38FlashNextModel, Qwen38LogitsMode, Qwen38NextToken, Qwen38VectorVerifierProbeMode,
+    Qwen38FlashNextCacheConfig, Qwen38FlashNextModel, Qwen38LogitsMode, Qwen38NextToken,
+    Qwen38VectorVerifierProbeMode,
 };
 use crate::nvfp4::{Error, Result};
-use crate::runtime::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use crate::runtime::qwen38_flash_next_sequence::{
+use crate::qwen38_flash_next::{
     Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
     new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
 };
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use std::time::{Duration, Instant};
 
 /// First target-token disagreement between serial decode and verification.
@@ -119,7 +119,8 @@ pub fn probe_verification_paths(
         });
     }
 
-    let prefix_tokens = retained_prompt_prefix_tokens(prompt_tokens.len());
+    let prefix_tokens = prompt_tokens.len().saturating_sub(1) / crate::nvfp4::SM12X_KV_PAGE_TOKENS
+        * crate::nvfp4::SM12X_KV_PAGE_TOKENS;
     if prefix_tokens == 0 {
         return Err(Error::Shape {
             label: "Qwen3.8 Flash Next verification probe prompt",
@@ -134,7 +135,7 @@ pub fn probe_verification_paths(
         model,
         2,
         capacity,
-        SequenceCacheConfig {
+        Qwen38FlashNextCacheConfig {
             max_retained_bytes: 1024 * 1024 * 1024,
         },
     )?;

@@ -1,15 +1,14 @@
 //! Qwen3.8 Flash Next sequence state backed by shared QSA pages.
 
-use super::sm12x_sequence_cache::{
-    Sm12xAppendTransaction, Sm12xCacheContext, Sm12xPage, Sm12xPageBackend, Sm12xPageTable,
-};
-use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
-use crate::qwen3::infer::QwenLayerKind;
-use crate::qwen38_flash_next::{
+use super::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextPrefillWorkspace,
     Qwen38FlashNextSequenceSnapshot, Qwen38LogitsMode, Qwen38NextToken,
 };
-use crate::runtime::cache_config::SequenceCacheConfig;
+use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
+use crate::qwen3::infer::QwenLayerKind;
+use crate::sm12x_cache::{
+    Sm12xAppendTransaction, Sm12xCacheContext, Sm12xPage, Sm12xPageBackend, Sm12xPageTable,
+};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
     CacheError, PageAllocation, PageBackend, RetainedSnapshot, RetireError, RetireOutcome,
@@ -25,6 +24,13 @@ impl RetainedSnapshot for Qwen38FlashNextSequenceSnapshot {
 /// Shared QSA page manager for active Flash Next sequences.
 pub type Qwen38FlashNextSequenceCache =
     SequenceCache<Qwen38FlashNextPageBackend, Qwen38FlashNextSequenceSnapshot>;
+
+/// Retained-prefix budget for one Flash Next sequence cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Qwen38FlashNextCacheConfig {
+    /// Bytes reserved for retained prompt prefixes.
+    pub max_retained_bytes: usize,
+}
 
 /// Private one-layer QSA cache used by the native MTP drafter.
 pub(crate) type Qwen38FlashNextMtpSequenceCache =
@@ -224,7 +230,7 @@ pub fn new_qwen38_flash_next_sequence_cache(
         model,
         sequence_capacity,
         max_context_tokens,
-        SequenceCacheConfig {
+        Qwen38FlashNextCacheConfig {
             max_retained_bytes: 0,
         },
     )
@@ -235,7 +241,7 @@ pub fn new_qwen38_flash_next_sequence_cache_with_config(
     model: &Qwen38FlashNextModel,
     sequence_capacity: usize,
     max_context_tokens: usize,
-    cache_config: SequenceCacheConfig,
+    cache_config: Qwen38FlashNextCacheConfig,
 ) -> Result<Qwen38FlashNextSequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {

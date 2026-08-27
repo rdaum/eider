@@ -10,12 +10,12 @@ use super::nemotron3_sequence_cache::{
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::sm12x_sequence_cache::Sm12xPageTable;
 use super::stop::StopBuffer;
 use crate::nemotron3::{
     Nemotron3BlockWorkspace, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3SpeculativeCycleWorkspace,
 };
+use crate::sm12x_cache::Sm12xPageTable;
 use nvfp4::{DeviceBuffer, Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

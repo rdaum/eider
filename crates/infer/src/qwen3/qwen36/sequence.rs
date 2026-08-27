@@ -1,33 +1,30 @@
-//! Shared paged sequence storage for Laguna-S-2.1.
+//! Qwen3.6 sequence state backed by shared SM12x KV pages.
 
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use crate::laguna::{HEAD_DIM, KV_HEADS, LAYERS, LagunaDecodeState, LagunaModel};
-use nvfp4::{CudaStream, Error, Result};
+use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
+use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
-    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
+    AdmissionOutcome, AdmissionRequest, AppendReservation, CacheConfig, CacheError, PageBackend,
+    SequenceCache, SequenceId,
 };
 
-/// Service-owned Laguna shared KV manager.
-pub type LagunaSequenceCache = SequenceCache<Sm12xPageBackend, ()>;
+pub type Qwen36SequenceCache = SequenceCache<Sm12xPageBackend, Qwen36SequenceSnapshot>;
 
-/// Per-row append capability and stable page table passed into model execution.
-pub(crate) struct LagunaAppend<'a> {
+pub(crate) struct Qwen36Append<'a> {
     pub(crate) reservation: &'a AppendReservation,
-    pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
+    pub(crate) page_table: &'a DeviceBuffer<u32>,
 }
 
-/// One admitted Laguna sequence and all request-private execution state.
-pub struct LagunaSequence {
+pub struct Qwen36Sequence {
     pub(crate) cache_id: SequenceId,
     pub(crate) page_table: Sm12xPageTable,
-    pub(crate) state: LagunaDecodeState,
+    pub(crate) state: Qwen36SequenceState,
 }
 
-impl LagunaSequence {
-    /// Admits an empty sequence into a non-retaining cache.
+impl Qwen36Sequence {
     pub fn admit(
-        model: &LagunaModel,
-        cache: &mut LagunaSequenceCache,
+        model: &Qwen36TextModel,
+        cache: &mut Qwen36SequenceCache,
         max_tokens: usize,
         stream: &CudaStream,
     ) -> Result<Self> {
@@ -52,10 +49,10 @@ impl LagunaSequence {
                     Ok(())
                 },
             )
-            .map_err(laguna_cache_error)?;
+            .map_err(qwen36_cache_error)?;
         let AdmissionOutcome::Admitted(cache_id) = outcome else {
             return Err(Error::Format {
-                label: "Laguna sequence admission",
+                label: "Qwen3.6 sequence admission",
                 detail: "configured cache has insufficient capacity".to_string(),
             });
         };
@@ -70,7 +67,7 @@ impl LagunaSequence {
     pub(crate) fn from_admission(
         cache_id: SequenceId,
         page_table: Sm12xPageTable,
-        state: LagunaDecodeState,
+        state: Qwen36SequenceState,
     ) -> Self {
         Self {
             cache_id,
@@ -80,7 +77,7 @@ impl LagunaSequence {
     }
 
     pub fn position(&self) -> usize {
-        self.state.len()
+        self.state.position()
     }
 
     pub fn max_tokens(&self) -> usize {
@@ -91,7 +88,7 @@ impl LagunaSequence {
         self.state.device_bytes() + self.page_table.managed_bytes()
     }
 
-    pub fn finish(self, cache: &mut LagunaSequenceCache, stream: &CudaStream) -> Result<()> {
+    pub fn finish(self, cache: &mut Qwen36SequenceCache, stream: &CudaStream) -> Result<()> {
         let mut page_table = self.page_table;
         cache
             .finish(
@@ -101,46 +98,50 @@ impl LagunaSequence {
                     page_table: &mut page_table,
                 },
             )
-            .map_err(laguna_cache_error)
+            .map_err(qwen36_cache_error)
     }
 }
 
-pub fn new_laguna_sequence_cache(
-    model: &LagunaModel,
+pub fn new_qwen36_sequence_cache(
+    model: &Qwen36TextModel,
     sequence_capacity: usize,
     max_context_tokens: usize,
-) -> Result<LagunaSequenceCache> {
+) -> Result<Qwen36SequenceCache> {
     if sequence_capacity == 0 || max_context_tokens == 0 {
         return Err(Error::Shape {
-            label: "Laguna sequence cache",
+            label: "Qwen3.6 sequence cache",
             expected: "positive sequence and context capacities".to_string(),
             actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
         });
     }
-    let pages_per_sequence = max_context_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS);
+    let pages_per_sequence = max_context_tokens.div_ceil(SM12X_KV_PAGE_TOKENS);
     let page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {
-            label: "Laguna sequence cache pages",
+            label: "Qwen3.6 sequence cache pages",
             expected: "page count without overflow".to_string(),
             actual: format!(
                 "sequences={sequence_capacity} pages_per_sequence={pages_per_sequence}"
             ),
         })?;
     let backend = Sm12xPageBackend::new(
-        std::iter::repeat_n(true, LAYERS),
+        model
+            .manifest()
+            .layer_kinds
+            .iter()
+            .map(|kind| *kind == crate::qwen3::infer::QwenLayerKind::FullAttention),
         page_slots,
-        KV_HEADS,
-        HEAD_DIM,
+        model.manifest().kv_heads,
+        model.manifest().head_dim,
     )?;
-    let page_bytes = seqcache::PageBackend::page_bytes(&backend);
+    let page_bytes = backend.page_bytes();
     let private_bytes = model.new_sequence_state(max_context_tokens)?.device_bytes();
     let table_bytes = Sm12xPageTable::new(max_context_tokens)?.managed_bytes();
     let fixed_bytes = private_bytes
         .checked_add(table_bytes)
         .and_then(|bytes| bytes.checked_mul(sequence_capacity))
         .ok_or_else(|| Error::Shape {
-            label: "Laguna sequence cache private bytes",
+            label: "Qwen3.6 sequence cache private bytes",
             expected: "private byte count without overflow".to_string(),
             actual: format!(
                 "private={private_bytes} table={table_bytes} sequences={sequence_capacity}"
@@ -150,13 +151,13 @@ pub fn new_laguna_sequence_cache(
         .checked_mul(page_slots)
         .and_then(|bytes| bytes.checked_add(fixed_bytes))
         .ok_or_else(|| Error::Shape {
-            label: "Laguna sequence cache bytes",
+            label: "Qwen3.6 sequence cache managed bytes",
             expected: "managed byte count without overflow".to_string(),
             actual: format!("page_bytes={page_bytes} page_slots={page_slots}"),
         })?;
-    LagunaSequenceCache::new(
-        seqcache::CacheConfig {
-            page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+    Qwen36SequenceCache::new(
+        CacheConfig {
+            page_tokens: SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
             max_prefix_entries: Some(0),
@@ -164,12 +165,12 @@ pub fn new_laguna_sequence_cache(
         },
         backend,
     )
-    .map_err(laguna_cache_error)
+    .map_err(qwen36_cache_error)
 }
 
-pub(crate) fn laguna_cache_error(error: CacheError<Error>) -> Error {
+pub(crate) fn qwen36_cache_error(error: CacheError<Error>) -> Error {
     Error::Format {
-        label: "Laguna sequence cache",
+        label: "Qwen3.6 sequence cache",
         detail: error.to_string(),
     }
 }

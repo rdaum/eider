@@ -1,8 +1,6 @@
 use infer::nvfp4::CudaStream;
-use infer::runtime::step37_sequence_cache::{
-    Step37Sequence, Step37SequenceCache, new_step37_sequence_cache,
-};
 use infer::step37::{Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel};
+use infer::step37::{Step37Sequence, Step37SequenceCache, new_step37_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

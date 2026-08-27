@@ -4,10 +4,7 @@
 //! routed experts. The checkpoint's dense, attention, shared-expert, embedding,
 //! and LM-head weights remain BF16.
 
-use crate::runtime::laguna_sequence_cache::{
-    LagunaSequence, LagunaSequenceCache, laguna_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use nvfp4::{
     CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
     GpuSamplingRow, GpuTokenSampler, ModelOptCheckpoint, ModelOptCublasLtWeight,
@@ -30,7 +27,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::info;
 
 mod batch;
+mod sequence;
 pub use batch::{LagunaPrefillBatchWorkspace, LagunaPrefillRow};
+pub(crate) use sequence::{LagunaAppend, laguna_cache_error};
+pub use sequence::{LagunaSequence, LagunaSequenceCache, new_laguna_sequence_cache};
 
 const HIDDEN: usize = 3_072;
 pub(crate) const LAYERS: usize = 48;
@@ -1764,8 +1764,7 @@ mod tests {
         let final_token = 9707;
         let cache_stream = CudaStream::new_blocking().expect("cache stream");
         let mut cache =
-            crate::runtime::laguna_sequence_cache::new_laguna_sequence_cache(&model, 2, 96)
-                .expect("sequence cache");
+            crate::laguna::new_laguna_sequence_cache(&model, 2, 96).expect("sequence cache");
         let mut batched = LagunaSequence::admit(&model, &mut cache, 32, &cache_stream)
             .expect("whole validation sequence");
         let mut workspace = model

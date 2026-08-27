@@ -1,10 +1,10 @@
 //! Shared paged backbone-attention storage for Nemotron 3.
 
-use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::nemotron3::{
     Nemotron3DecodeState, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3Model,
     Nemotron3SequenceSnapshot,
 };
+use crate::sm12x_cache::Sm12xPageTable;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS, Sm12xKvPagePool,
     Sm12xKvTailSnapshot,

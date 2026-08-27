@@ -1,6 +1,6 @@
-use infer::muse_glimmer::MuseGlimmerModel;
-use infer::runtime::muse_glimmer_sequence_cache::{
-    MuseGlimmerSequence, MuseGlimmerSequenceCache, new_muse_glimmer_sequence_cache,
+use infer::muse_glimmer::{
+    MuseGlimmerModel, MuseGlimmerSequence, MuseGlimmerSequenceCache,
+    new_muse_glimmer_sequence_cache,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,

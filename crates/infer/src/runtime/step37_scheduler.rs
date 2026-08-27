@@ -5,11 +5,11 @@ use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{
     RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use super::step37_sequence_cache::{Step37Sequence, Step37SequenceCache, step37_cache_error};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::step37::{
     HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
 };
+use crate::step37::{Step37Sequence, Step37SequenceCache, step37_cache_error};
 use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};

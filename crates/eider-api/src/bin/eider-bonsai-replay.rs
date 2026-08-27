@@ -1,10 +1,10 @@
 //! Deterministically replays one Responses request through Bonsai.
 
 use eider_api::protocol::ResponseRequest;
+use eider_format::{GgufIndex, GgufValue};
 use infer::bonsai::{BonsaiModel, BonsaiPrefillMode};
-use infer::gguf::{GgufIndex, GgufValue};
+use infer::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
 use infer::nvfp4::{Error, Result};
-use infer::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
 use infer::runtime::chat::{ChatMessage, CheckpointChatTemplate};
 use infer::runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use infer::runtime::generation::GenerationConfig;
@@ -181,7 +181,10 @@ fn parse_mode(value: &str) -> Option<BonsaiPrefillMode> {
 
 fn bonsai_chat_template(model_dir: &std::path::Path) -> Result<CheckpointChatTemplate> {
     let gguf = model_dir.join(GGUF_NAME);
-    let index = GgufIndex::open(&gguf)?;
+    let index = GgufIndex::open(&gguf).map_err(|error| Error::Format {
+        label: "Bonsai GGUF import",
+        detail: error.to_string(),
+    })?;
     let source = index
         .metadata()
         .get("tokenizer.chat_template")

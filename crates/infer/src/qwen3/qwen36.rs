@@ -2,7 +2,9 @@
 
 mod batch;
 mod dflash2;
+mod execution;
 mod mtp;
+mod sequence;
 
 pub(crate) use batch::{
     BatchFullAttentionWorkspace, Qwen36BatchModelView, Qwen36HybridPrefillWorkspace,
@@ -14,9 +16,15 @@ pub use batch::{
 };
 pub use dflash2::{DFlash2Config, inspect_dflash2_config, validate_dflash2_checkpoint};
 pub(crate) use dflash2::{
-    Qwen38DFlash2SequenceSnapshot, Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
+    Qwen38DFlash2PrefixCache, Qwen38DFlash2SequenceState, Qwen38DFlash2Workspace,
 };
+#[cfg(test)]
+pub(crate) use execution::decode_capacity_classes;
+pub(crate) use execution::{Qwen36ExecutionConfig, Qwen36ExecutionState};
 pub use mtp::{Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36MtpWeights};
+pub use sequence::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
+
+pub(crate) use sequence::{Qwen36Append, qwen36_cache_error};
 
 use crate::metrics::ExpertPagingMetricHandle;
 use crate::nvfp4::{

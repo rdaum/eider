@@ -1,10 +1,8 @@
 use super::*;
+use crate::laguna::{LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use crate::metrics::metrics;
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
-use crate::runtime::laguna_sequence_cache::{
-    LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, GemmShape, MoeSortedNvfp4Rows,
     MoeSortedRoutes, add_f32_prefix_into_on_stream,

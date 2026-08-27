@@ -4,10 +4,7 @@
 //! converts the checkpoint's BF16 attention gates and language head to NVFP4
 //! during loading. Embeddings and normalization vectors remain BF16.
 
-use crate::runtime::muse_glimmer_sequence_cache::{
-    MuseGlimmerAppend, MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use nvfp4::{
     CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
     ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
@@ -26,8 +23,15 @@ use tracing::info;
 
 mod batch;
 mod dflash;
+mod sequence;
 
 pub use dflash::{DFlashConfig, DFlashModel, MuseGlimmerDFlashCycle};
+pub(crate) use sequence::{
+    MuseGlimmerAppend, muse_glimmer_cache_error, new_muse_glimmer_sequence_cache_with_budget,
+};
+pub use sequence::{
+    MuseGlimmerSequence, MuseGlimmerSequenceCache, new_muse_glimmer_sequence_cache,
+};
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1732,9 +1736,7 @@ mod tests {
     #[test]
     #[ignore = "requires the local Muse Glimmer NVFP4 checkpoint and an SM121 GPU"]
     fn local_checkpoint_greedy_continuation_is_stable() {
-        use crate::runtime::muse_glimmer_sequence_cache::{
-            MuseGlimmerSequence, new_muse_glimmer_sequence_cache,
-        };
+        use crate::muse_glimmer::{MuseGlimmerSequence, new_muse_glimmer_sequence_cache};
 
         let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -1761,10 +1763,10 @@ mod tests {
     #[test]
     #[ignore = "requires the local Muse Glimmer NVFP4 and DFlash checkpoints and an SM121 GPU"]
     fn dflash_checkpoint_restore_preserves_the_next_speculative_cycle() {
-        use crate::runtime::muse_glimmer_sequence_cache::{
+        use crate::muse_glimmer::{
             MuseGlimmerSequence, new_muse_glimmer_sequence_cache_with_budget,
         };
-        use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
+        use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
         use seqcache::{AdmissionOutcome, AdmissionRequest};
 
         let model_dir = std::env::var_os("MUSE_GLIMMER_MODEL")

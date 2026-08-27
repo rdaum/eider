@@ -4,11 +4,52 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::mem::size_of;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::OnceLock;
+
+pub(crate) mod device_repr {
+    pub trait Sealed {}
+}
+
+/// A Rust type with a stable, bit-valid representation in CUDA-visible memory.
+///
+/// # Safety
+///
+/// Every bit pattern for this type must be valid to read as a Rust value. The
+/// type must not have invalid padding, references, or drop behaviour. CUDA may
+/// write arbitrary bytes into a [`DeviceBuffer`] before a host readback.
+///
+/// This trait is sealed. Eider implements it only for primitive wire values,
+/// raw device addresses, and reviewed `repr(C)` kernel records.
+#[allow(private_bounds)]
+pub unsafe trait DeviceRepr: device_repr::Sealed + Copy {}
+
+macro_rules! primitive_device_repr {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl device_repr::Sealed for $ty {}
+            unsafe impl DeviceRepr for $ty {}
+        )+
+    };
+}
+
+primitive_device_repr!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+impl<T: ?Sized> device_repr::Sealed for *const T {}
+
+// Raw pointers have no invalid bit patterns. Pointer tables remain an internal
+// CUDA implementation detail and will move behind plan types.
+unsafe impl<T: ?Sized> DeviceRepr for *const T {}
+
+impl<T: ?Sized> device_repr::Sealed for *mut T {}
+
+// Raw pointers have no invalid bit patterns. Pointer tables remain an internal
+// CUDA implementation detail and will move behind plan types.
+unsafe impl<T: ?Sized> DeviceRepr for *mut T {}
 
 /// Host-side view of a device-buffer readback.
 ///
@@ -18,6 +59,43 @@ use std::sync::OnceLock;
 pub struct HostRead<'a, T> {
     values: Vec<T>,
     _device: PhantomData<&'a DeviceBuffer<T>>,
+}
+
+/// An asynchronous device-to-host copy into pinned memory.
+///
+/// This value retains the source allocation and the mutable pinned destination
+/// until the copy completes. Call [`Self::wait`] before reading the destination.
+/// Dropping a pending copy synchronizes its stream. The process aborts if that
+/// synchronisation fails, because Rust cannot safely release the destination
+/// while CUDA might still write to it.
+pub struct PendingHostRead<'a, T> {
+    _device: &'a DeviceBuffer<T>,
+    output: &'a mut PinnedHostBuffer<T>,
+    stream: &'a CudaStream,
+}
+
+impl<'a, T> PendingHostRead<'a, T> {
+    /// Waits for the copy and returns the reusable pinned destination.
+    pub fn wait(self) -> Result<&'a mut PinnedHostBuffer<T>> {
+        self.stream.synchronize()?;
+        let pending = ManuallyDrop::new(self);
+        // SAFETY: the stream completed successfully, so CUDA no longer uses
+        // the destination. ManuallyDrop suppresses PendingHostRead::drop while
+        // the mutable loan moves out of the completed transfer.
+        Ok(unsafe {
+            std::ptr::read(&(*(&pending as *const ManuallyDrop<Self> as *const Self)).output)
+        })
+    }
+}
+
+impl<T> Drop for PendingHostRead<'_, T> {
+    fn drop(&mut self) {
+        if self.stream.synchronize().is_err() {
+            // Releasing `output` after an unknown CUDA completion state would
+            // permit a host and device data race through a safe API.
+            std::process::abort();
+        }
+    }
 }
 
 /// Page-locked host allocation suitable for asynchronous CUDA transfers.
@@ -31,7 +109,7 @@ pub struct PinnedHostBuffer<T> {
 // a Vec<T> when T is Send.
 unsafe impl<T: Send> Send for PinnedHostBuffer<T> {}
 
-impl<T: Copy> PinnedHostBuffer<T> {
+impl<T: DeviceRepr> PinnedHostBuffer<T> {
     /// Allocates `len` zero-initialized values in pinned host memory.
     pub fn zeroed(len: usize) -> Result<Self> {
         if len == 0 {
@@ -139,7 +217,7 @@ pub struct PageableHostBuffer<T> {
 // its element type may also move safely.
 unsafe impl<T: Send> Send for PageableHostBuffer<T> {}
 
-impl<T: Copy> PageableHostBuffer<T> {
+impl<T: DeviceRepr> PageableHostBuffer<T> {
     /// Allocates a zero-filled, page-aligned system-memory region.
     pub fn zeroed(len: usize) -> Result<Self> {
         if len == 0 {
@@ -263,6 +341,64 @@ pub struct DeviceOutput<'a, T> {
 /// Borrowed device in-place role.
 pub struct DeviceInOut<'a, T> {
     buffer: &'a mut DeviceBuffer<T>,
+}
+
+/// A borrowed contiguous range of a device allocation.
+pub struct DeviceSlice<'a, T> {
+    buffer: &'a DeviceBuffer<T>,
+    offset: usize,
+    len: usize,
+}
+
+impl<T> Copy for DeviceSlice<'_, T> {}
+
+impl<T> Clone for DeviceSlice<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// A borrowed mutable contiguous range of a device allocation.
+pub struct DeviceSliceMut<'a, T> {
+    buffer: &'a mut DeviceBuffer<T>,
+    offset: usize,
+    len: usize,
+}
+
+/// A row-major device-matrix layout marker.
+pub enum RowMajor {}
+
+/// A column-major device-matrix layout marker.
+pub enum ColumnMajor {}
+
+/// A ModelOpt NVFP4 checkpoint-layout marker.
+pub enum ModelOptNvfp4 {}
+
+/// A cuBLASLt VEC16 UE4M3 scale-layout marker.
+pub enum CublasLtVec16 {}
+
+/// An SM12x native-MMA layout marker.
+pub enum Sm12xMma {}
+
+/// A paged K/V-cache layout marker.
+pub enum PagedKv {}
+
+/// A borrowed device matrix with a named physical layout.
+pub struct DeviceMatrix<'a, T, Layout> {
+    values: DeviceSlice<'a, T>,
+    rows: usize,
+    cols: usize,
+    stride: usize,
+    _layout: PhantomData<Layout>,
+}
+
+/// A borrowed mutable device matrix with a named physical layout.
+pub struct DeviceMatrixMut<'a, T, Layout> {
+    values: DeviceSliceMut<'a, T>,
+    rows: usize,
+    cols: usize,
+    stride: usize,
+    _layout: PhantomData<Layout>,
 }
 
 impl<T> HostRead<'_, T> {
@@ -420,6 +556,150 @@ impl<'a, T> DeviceInOut<'a, T> {
     pub fn buffer_mut(&mut self) -> &mut DeviceBuffer<T> {
         self.buffer
     }
+}
+
+impl<'a, T> DeviceSlice<'a, T> {
+    /// Returns the number of values in this range.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when this range contains no values.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Interprets this range as a strided matrix with layout `Layout`.
+    pub fn matrix<Layout>(
+        self,
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<DeviceMatrix<'a, T, Layout>> {
+        validate_matrix_shape(self.len, rows, cols, stride)?;
+        Ok(DeviceMatrix {
+            values: self,
+            rows,
+            cols,
+            stride,
+            _layout: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_const_ptr(&self) -> *const c_void {
+        // SAFETY: DeviceBuffer::slice validates that offset is within the
+        // allocation. The immutable borrow retains the allocation.
+        unsafe { self.buffer.ptr.add(self.offset).cast() }
+    }
+}
+
+impl<'a, T> DeviceSliceMut<'a, T> {
+    /// Returns the number of values in this range.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true when this range contains no values.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Interprets this range as a mutable strided matrix with layout `Layout`.
+    pub fn matrix<Layout>(
+        self,
+        rows: usize,
+        cols: usize,
+        stride: usize,
+    ) -> Result<DeviceMatrixMut<'a, T, Layout>> {
+        validate_matrix_shape(self.len, rows, cols, stride)?;
+        Ok(DeviceMatrixMut {
+            values: self,
+            rows,
+            cols,
+            stride,
+            _layout: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
+        // SAFETY: DeviceBuffer::slice_mut validates that offset is within the
+        // allocation. The mutable borrow retains exclusive access.
+        unsafe { self.buffer.ptr.add(self.offset).cast() }
+    }
+}
+
+impl<'a, T, Layout> DeviceMatrix<'a, T, Layout> {
+    /// Returns the matrix row count.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Returns the matrix column count.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Returns the element distance between adjacent rows.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Returns the matrix storage range.
+    pub fn values(&self) -> DeviceSlice<'_, T> {
+        self.values
+    }
+}
+
+impl<'a, T, Layout> DeviceMatrixMut<'a, T, Layout> {
+    /// Returns the matrix row count.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Returns the matrix column count.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Returns the element distance between adjacent rows.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Returns the matrix storage range.
+    pub fn values(&self) -> DeviceSlice<'_, T> {
+        DeviceSlice {
+            buffer: &*self.values.buffer,
+            offset: self.values.offset,
+            len: self.values.len,
+        }
+    }
+
+    /// Returns the mutable matrix storage range.
+    pub fn values_mut(&mut self) -> DeviceSliceMut<'_, T> {
+        DeviceSliceMut {
+            buffer: &mut *self.values.buffer,
+            offset: self.values.offset,
+            len: self.values.len,
+        }
+    }
+}
+
+fn validate_matrix_shape(len: usize, rows: usize, cols: usize, stride: usize) -> Result<()> {
+    let required = rows.checked_mul(stride).ok_or_else(|| Error::Shape {
+        label: "device matrix",
+        expected: "rows * stride without overflow".to_string(),
+        actual: format!("rows={rows} stride={stride}"),
+    })?;
+    if rows == 0 || cols == 0 || stride < cols || required > len {
+        return Err(Error::Shape {
+            label: "device matrix",
+            expected: "positive rows and columns, stride >= columns, storage >= rows * stride"
+                .to_string(),
+            actual: format!("values={len} rows={rows} cols={cols} stride={stride}"),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn check_cuda(call: &'static str, status: ffi::cudaError_t) -> Result<()> {
@@ -646,6 +926,46 @@ impl Drop for CudaGraphExec {
     }
 }
 
+/// A CUDA graph paired with the resources whose addresses it captured.
+///
+/// CUDA graphs retain device addresses, not Rust owners. This type keeps those
+/// owners alive for every graph launch. Include borrowed immutable weights in
+/// `R` when the graph reads them.
+pub struct CapturedGraph<R> {
+    exec: CudaGraphExec,
+    resources: R,
+}
+
+impl<R> CapturedGraph<R> {
+    /// Captures work that uses `resources` and retains them with the graph.
+    pub fn capture(
+        resources: R,
+        stream: &CudaStream,
+        capture: impl FnOnce(&mut R, &CudaStream) -> Result<()>,
+    ) -> Result<Self> {
+        let mut resources = resources;
+        let exec = stream.capture(|stream| capture(&mut resources, stream))?;
+        Ok(Self { exec, resources })
+    }
+
+    /// Launches the captured graph on `stream`.
+    pub fn launch(&self, stream: &CudaStream) -> Result<()> {
+        self.exec.launch(stream)
+    }
+
+    /// Returns the resources retained by this graph.
+    pub fn resources(&self) -> &R {
+        &self.resources
+    }
+
+    /// Destroys the graph and returns its retained resources.
+    pub fn into_resources(self) -> R {
+        let Self { exec, resources } = self;
+        drop(exec);
+        resources
+    }
+}
+
 /// CUDA event used for device-side timing.
 pub struct CudaEvent {
     event: ffi::cudaEvent_t,
@@ -731,12 +1051,19 @@ impl Drop for CudaEvent {
 /// The buffer frees its allocation with `cudaFree` on drop. It is intentionally
 /// small: allocation, host-to-device initialization, zero initialization, and
 /// device-to-host copy are enough for the current cuBLASLt experiments.
+///
+/// ```compile_fail
+/// use nvfp4::DeviceBuffer;
+/// use std::num::NonZeroU32;
+///
+/// let _ = DeviceBuffer::<NonZeroU32>::zeroed(1);
+/// ```
 pub struct DeviceBuffer<T> {
     pub(crate) ptr: *mut T,
     len: usize,
 }
 
-impl<T: Copy> DeviceBuffer<T> {
+impl<T: DeviceRepr> DeviceBuffer<T> {
     /// Allocates device memory without initializing its contents.
     ///
     /// This is crate-private because callers must ensure every element is
@@ -845,12 +1172,15 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 
     /// Enqueues a device prefix copy into reusable page-locked host memory.
-    pub fn copy_prefix_to_pinned_on_stream(
-        &self,
-        output: &mut PinnedHostBuffer<T>,
+    ///
+    /// The returned loan prevents access to `self` and `output` until
+    /// [`PendingHostRead::wait`] completes the copy.
+    pub fn copy_prefix_to_pinned_on_stream<'a>(
+        &'a self,
+        output: &'a mut PinnedHostBuffer<T>,
         len: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
+        stream: &'a CudaStream,
+    ) -> Result<PendingHostRead<'a, T>> {
         if len > self.len || len > output.len {
             return Err(Error::Shape {
                 label: "device prefix copy to pinned host memory",
@@ -868,8 +1198,13 @@ impl<T: Copy> DeviceBuffer<T> {
                     ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
                     stream.as_raw(),
                 ),
-            )
+            )?;
         }
+        Ok(PendingHostRead {
+            _device: self,
+            output,
+            stream,
+        })
     }
 
     /// Copies host values into this existing device allocation.
@@ -1235,6 +1570,26 @@ impl<T: Copy> DeviceBuffer<T> {
         self.len == 0
     }
 
+    /// Borrows a checked contiguous range from this allocation.
+    pub fn slice(&self, range: Range<usize>) -> Result<DeviceSlice<'_, T>> {
+        validate_device_range(self.len, &range, "device slice")?;
+        Ok(DeviceSlice {
+            buffer: self,
+            offset: range.start,
+            len: range.end - range.start,
+        })
+    }
+
+    /// Borrows a checked mutable contiguous range from this allocation.
+    pub fn slice_mut(&mut self, range: Range<usize>) -> Result<DeviceSliceMut<'_, T>> {
+        validate_device_range(self.len, &range, "device mutable slice")?;
+        Ok(DeviceSliceMut {
+            buffer: self,
+            offset: range.start,
+            len: range.end - range.start,
+        })
+    }
+
     /// Returns the raw device pointer as an immutable C pointer.
     pub fn as_const_ptr(&self) -> *const c_void {
         self.ptr.cast()
@@ -1261,6 +1616,17 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 }
 
+fn validate_device_range(len: usize, range: &Range<usize>, label: &'static str) -> Result<()> {
+    if range.start > range.end || range.end > len {
+        return Err(Error::Shape {
+            label,
+            expected: format!("0 <= start <= end <= {len}"),
+            actual: format!("{}..{}", range.start, range.end),
+        });
+    }
+    Ok(())
+}
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -1273,7 +1639,7 @@ impl<T> Drop for DeviceBuffer<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaStream, DeviceBuffer, PinnedHostBuffer};
+    use super::{CapturedGraph, CudaStream, DeviceBuffer, PinnedHostBuffer};
     use crate::fill_f32_into_on_stream;
 
     #[test]
@@ -1313,13 +1679,31 @@ mod tests {
         let device = DeviceBuffer::from_host(&[1u32, 2, 3, 4]).expect("device buffer");
         let mut host = PinnedHostBuffer::zeroed(4).expect("pinned host buffer");
 
-        device
+        let host = device
             .copy_prefix_to_pinned_on_stream(&mut host, 2, &stream)
             .expect("pinned prefix copy");
-        stream.synchronize().expect("pinned prefix copy completion");
+        let host = host.wait().expect("pinned prefix copy completion");
 
         assert_eq!(&host.as_slice()[..2], [1, 2]);
         assert_eq!(&host.as_slice()[2..], [0, 0]);
+    }
+
+    #[test]
+    fn captured_graph_retains_its_device_buffer() {
+        let stream = CudaStream::new_non_blocking().expect("CUDA stream");
+        let graph = CapturedGraph::capture(
+            DeviceBuffer::zeroed(1).expect("device buffer"),
+            &stream,
+            |output, stream| fill_f32_into_on_stream(output.output(), 3.0, stream),
+        )
+        .expect("capture graph");
+
+        graph.launch(&stream).expect("launch graph");
+        let values = graph
+            .resources()
+            .copy_prefix_to_host(1, &stream)
+            .expect("read graph output");
+        assert_eq!(values.as_slice(), [3.0]);
     }
 
     #[test]

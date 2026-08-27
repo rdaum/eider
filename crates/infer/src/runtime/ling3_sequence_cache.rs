@@ -1,7 +1,7 @@
 //! Shared paged MLA storage for Ling 3 sequences.
 
-use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::ling3::{Ling3Model, Ling3ModelState, Ling3ModelWorkspace};
+use crate::sm12x_cache::Sm12xPageTable;
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,

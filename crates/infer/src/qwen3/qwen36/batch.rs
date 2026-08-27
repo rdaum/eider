@@ -7,10 +7,9 @@ use super::{
 };
 use std::collections::HashMap;
 
-use crate::runtime::qwen36_sequence::{
-    Qwen36Append, Qwen36Sequence, Qwen36SequenceCache, qwen36_cache_error as cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
+
+use super::{Qwen36Append, Qwen36Sequence, Qwen36SequenceCache, qwen36_cache_error as cache_error};
 
 use crate::nvfp4::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,

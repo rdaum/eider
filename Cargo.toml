@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/eider-api",
+    "crates/eider-format",
     "crates/infer",
     "crates/nvfp4",
 ]
@@ -20,6 +21,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nvfp4 = { path = "crates/nvfp4" }
+eider-format = { path = "crates/eider-format" }
 
 clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"

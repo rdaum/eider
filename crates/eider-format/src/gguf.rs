@@ -5,7 +5,7 @@
 //! vocabularies, are skipped in place so opening a checkpoint does not
 //! duplicate them in host memory.
 
-use nvfp4::{Error, Result};
+use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};

@@ -4,10 +4,7 @@
 //! tensors are converted during loading without materializing a whole expert
 //! stack on the host.
 
-use crate::runtime::gemma4_sequence_cache::{
-    Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use nvfp4::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
     ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
@@ -26,7 +23,12 @@ use std::fs;
 use std::path::Path;
 
 mod batch;
+mod sequence;
 pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow};
+pub(crate) use sequence::{
+    Gemma4Append, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
+};
+pub use sequence::{Gemma4Sequence, Gemma4SequenceCache, new_gemma4_sequence_cache};
 
 fn default_rms_norm_eps() -> f32 {
     1.0e-6
@@ -2613,12 +2615,8 @@ mod tests {
         let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
         let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
         let stream = CudaStream::new_blocking().expect("stream");
-        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
-            &model,
-            2,
-            prompt.len() + 1,
-        )
-        .expect("sequence cache");
+        let mut cache = crate::gemma4::new_gemma4_sequence_cache(&model, 2, prompt.len() + 1)
+            .expect("sequence cache");
         let mut serial = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
             .expect("serial sequence");
         let mut batched = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
@@ -2690,12 +2688,8 @@ mod tests {
         let prompt = [2, 2364, 107, 496, 603, 563, 506, 236881];
         let next_input = 107;
         let stream = CudaStream::new_blocking().expect("stream");
-        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
-            &model,
-            2,
-            prompt.len() + 1,
-        )
-        .expect("sequence cache");
+        let mut cache = crate::gemma4::new_gemma4_sequence_cache(&model, 2, prompt.len() + 1)
+            .expect("sequence cache");
         let mut serial = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)
             .expect("serial sequence");
         let mut batched = Gemma4Sequence::admit(&model, &mut cache, prompt.len() + 1, &stream)

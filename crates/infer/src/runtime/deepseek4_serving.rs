@@ -11,12 +11,12 @@ use super::deepseek4_sequence_cache::{
 use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::sm12x_sequence_cache::Sm12xPageTable;
 use super::stop::StopBuffer;
 use crate::deepseek4::{
     Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4LayerSequenceState, Deepseek4MtpBatchRow,
     Deepseek4MtpWorkspace, Deepseek4TextModel,
 };
+use crate::sm12x_cache::Sm12xPageTable;
 use nvfp4::{Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

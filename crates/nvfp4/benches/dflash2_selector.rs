@@ -4,7 +4,7 @@ use micromeasure::{
 };
 use nvfp4::{
     CudaStream, DeviceBuffer, GpuTokenSampler, GpuTopKCandidate, PinnedHostBuffer, Result,
-    dflash2_hidden_projection_f32_into_on_stream,
+    RowMajor, dflash2_hidden_projection_f32_into_on_stream,
 };
 use std::time::{Duration, Instant};
 
@@ -60,21 +60,23 @@ impl SelectorBench {
         let mut device_projected = DeviceBuffer::zeroed(ROWS * RANK)?;
         let mut host_projected = PinnedHostBuffer::zeroed(ROWS * RANK)?;
         dflash2_hidden_projection_f32_into_on_stream(
-            &device_hidden,
-            &device_projection,
-            &mut device_projected,
-            ROWS,
-            HIDDEN,
-            RANK,
+            device_hidden
+                .slice(0..ROWS * HIDDEN)?
+                .matrix::<RowMajor>(ROWS, HIDDEN, HIDDEN)?,
+            device_projection
+                .slice(0..RANK * HIDDEN)?
+                .matrix::<RowMajor>(RANK, HIDDEN, HIDDEN)?,
+            device_projected
+                .slice_mut(0..ROWS * RANK)?
+                .matrix::<RowMajor>(ROWS, RANK, RANK)?,
             &stream,
         )?;
-        device_projected.copy_prefix_to_pinned_on_stream(
+        let projected = device_projected.copy_prefix_to_pinned_on_stream(
             &mut host_projected,
             ROWS * RANK,
             &stream,
         )?;
-        stream.synchronize()?;
-        validate_projection(host_projected.as_slice(), &cpu_projected);
+        validate_projection(projected.wait()?.as_slice(), &cpu_projected);
         Ok(Self {
             stream,
             host_logits,
@@ -252,16 +254,28 @@ fn gpu_projection_sample(
     let started = Instant::now();
     for _ in 0..chunk_size {
         dflash2_hidden_projection_f32_into_on_stream(
-            &context.device_hidden,
-            &context.device_projection,
-            &mut context.device_projected,
-            ROWS,
-            HIDDEN,
-            RANK,
+            context
+                .device_hidden
+                .slice(0..ROWS * HIDDEN)
+                .expect("hidden matrix")
+                .matrix::<RowMajor>(ROWS, HIDDEN, HIDDEN)
+                .expect("hidden matrix"),
+            context
+                .device_projection
+                .slice(0..RANK * HIDDEN)
+                .expect("weight matrix")
+                .matrix::<RowMajor>(RANK, HIDDEN, HIDDEN)
+                .expect("weight matrix"),
+            context
+                .device_projected
+                .slice_mut(0..ROWS * RANK)
+                .expect("output matrix")
+                .matrix::<RowMajor>(ROWS, RANK, RANK)
+                .expect("output matrix"),
             &context.stream,
         )
         .expect("device DFlash2 projection");
-        context
+        let projected = context
             .device_projected
             .copy_prefix_to_pinned_on_stream(
                 &mut context.host_projected,
@@ -269,8 +283,8 @@ fn gpu_projection_sample(
                 &context.stream,
             )
             .expect("copy DFlash2 projection");
-        context.stream.synchronize().expect("DFlash2 projection");
-        black_box(context.host_projected.as_slice());
+        let projected = projected.wait().expect("DFlash2 projection");
+        black_box(projected.as_slice());
     }
     BenchSampleResult::operations(chunk_size as u64).push_metric(MetricValue::duration_ms(
         "projection_ms",

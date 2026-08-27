@@ -3,9 +3,7 @@ use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36TextModel,
 };
-use infer::runtime::qwen36_sequence::{
-    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
-};
+use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

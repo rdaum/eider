@@ -10,16 +10,17 @@ use super::stop::StopBuffer;
 use crate::nvfp4::{DeviceBuffer, Error, GpuSamplingRow, GpuTokenSampler, Result};
 use crate::qwen3::infer::QwenLayerKind;
 use crate::qwen38_flash_next::{
+    Qwen38FlashNextCacheConfig, Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSnapshot,
+    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
+    new_qwen38_flash_next_mtp_sequence_cache, new_qwen38_flash_next_sequence_cache_with_config,
+    qwen38_flash_next_cache_error,
+};
+use crate::qwen38_flash_next::{
     Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace,
     Qwen38FlashNextPrefillWorkspace, Qwen38FlashNextSpeculativeFrontier,
     Qwen38FlashNextSpeculativeWorkspace, Qwen38LogitsMode, Qwen38NextToken,
 };
-use crate::runtime::qwen38_flash_next_sequence::{
-    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSnapshot, Qwen38FlashNextSequence,
-    Qwen38FlashNextSequenceCache, new_qwen38_flash_next_mtp_sequence_cache,
-    new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -171,7 +172,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             &model,
             config.max_active_sequences,
             config.max_context_tokens,
-            cache_config,
+            Qwen38FlashNextCacheConfig {
+                max_retained_bytes: cache_config.max_retained_bytes,
+            },
         )?;
         let gpu_sampler = GpuTokenSampler::new(1, model.config().vocab)?;
         let mtp_sequence_cache = (config.speculative_drafts == 1)

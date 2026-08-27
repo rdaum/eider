@@ -6,7 +6,7 @@ use super::{
     Deepseek4SequenceState,
 };
 use crate::nvfp4::{
-    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, Error, INDEXER_SCORE_SLAB,
+    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, DeviceRepr, Error, INDEXER_SCORE_SLAB,
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
     add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
@@ -1265,12 +1265,12 @@ struct Deepseek4CompressedMetadata {
     lengths: StagedMetadata<u32>,
 }
 
-struct StagedMetadata<T: Copy> {
+struct StagedMetadata<T: DeviceRepr> {
     host: PinnedHostBuffer<T>,
     device: DeviceBuffer<T>,
 }
 
-impl<T: Copy> StagedMetadata<T> {
+impl<T: DeviceRepr> StagedMetadata<T> {
     fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             host: PinnedHostBuffer::zeroed(capacity)?,
@@ -4500,7 +4500,7 @@ mod tests {
         Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
         deepseek4_cache_error,
     };
-    use crate::runtime::sm12x_sequence_cache::Sm12xPageTable;
+    use crate::sm12x_cache::Sm12xPageTable;
     use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache};
 
     const CONFIG: &str = r#"{

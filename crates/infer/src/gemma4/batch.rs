@@ -1,9 +1,7 @@
 use super::*;
+use crate::gemma4::{Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error};
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
-use crate::runtime::gemma4_sequence_cache::{
-    Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 use nvfp4::{
     CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape, MoeSortedNvfp4Rows,
     MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
@@ -1394,12 +1392,8 @@ mod tests {
             .join("models/gemma-4-26b-a4b-nvfp4");
         let model = Gemma4Model::load(model_dir).expect("load Gemma 4");
         let tokens = [2, 3, 2, 3];
-        let mut cache = crate::runtime::gemma4_sequence_cache::new_gemma4_sequence_cache(
-            &model,
-            2,
-            tokens.len(),
-        )
-        .expect("sequence cache");
+        let mut cache = crate::gemma4::new_gemma4_sequence_cache(&model, 2, tokens.len())
+            .expect("sequence cache");
         let mut exact = model
             .new_prefill_batch_workspace(1, tokens.len(), tokens.len())
             .expect("exact workspace");

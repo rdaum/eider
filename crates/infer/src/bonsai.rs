@@ -1,11 +1,8 @@
 //! Ternary Bonsai dense Qwen3 inference from mainline `Q2_0_g64` GGUF files.
 
-use crate::gguf::{GgufIndex, GgufValue};
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
-use crate::runtime::bonsai_sequence_cache::{
-    BonsaiSequence, BonsaiSequenceCache, bonsai_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
+use eider_format::{Error as FormatError, GgufIndex, GgufValue};
 use nvfp4::{
     Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape,
     Nvfp4Matrix, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool, TERNARY_G64_GROUP_SIZE,
@@ -17,6 +14,10 @@ use nvfp4::{
 use seqcache::AppendPages;
 use std::f32::consts::PI;
 use std::path::Path;
+
+mod sequence;
+pub(crate) use sequence::bonsai_cache_error;
+pub use sequence::{BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cache};
 
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_Q2_0_G64: u32 = 42;
@@ -265,7 +266,7 @@ impl BonsaiModel {
         gguf_path: &Path,
         prefill_mode: BonsaiPrefillMode,
     ) -> Result<Self> {
-        let index = GgufIndex::open(gguf_path)?;
+        let index = GgufIndex::open(gguf_path).map_err(format_error)?;
         let config = BonsaiConfig::from_index(&index)?;
         let embeddings = load_q2_matrix(&index, "token_embd.weight", config.vocab, config.hidden)?;
         let lm_head = load_q2_matrix(&index, "output.weight", config.vocab, config.hidden)?;
@@ -993,7 +994,7 @@ impl BonsaiPrefillWorkspace {
         config: BonsaiConfig,
         weights: &BonsaiLayer,
         pool: &mut Sm12xKvPagePool,
-        pages: AppendPages<'_, crate::runtime::sm12x_sequence_cache::Sm12xPage>,
+        pages: AppendPages<'_, crate::sm12x_cache::Sm12xPage>,
         page_table: &DeviceBuffer<u32>,
         start_position: usize,
         rope_inv_freq: &DeviceBuffer<f32>,
@@ -1496,13 +1497,17 @@ fn load_q2_packed(
             label: "Bonsai tensor shape",
             detail: format!("{name} byte count overflow"),
         })?;
-    let bytes = index.read_tensor_bytes(name, byte_len)?;
+    let bytes = index
+        .read_tensor_bytes(name, byte_len)
+        .map_err(format_error)?;
     TernaryG64PackedLinear::from_gguf_q2_0_g64(name, rows, cols, &bytes)
 }
 
 fn load_f32_vector(index: &GgufIndex, name: &str, width: usize) -> Result<DeviceBuffer<f32>> {
     require_f32_vector(index, name, width)?;
-    let bytes = index.read_tensor_bytes(name, width * 4)?;
+    let bytes = index
+        .read_tensor_bytes(name, width * 4)
+        .map_err(format_error)?;
     let values = bytes
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four byte chunk")))
@@ -1517,7 +1522,7 @@ fn load_f32_vector(index: &GgufIndex, name: &str, width: usize) -> Result<Device
 }
 
 fn require_q2_matrix(index: &GgufIndex, name: &str, rows: usize, cols: usize) -> Result<()> {
-    let tensor = index.tensor(name)?;
+    let tensor = index.tensor(name).map_err(format_error)?;
     if tensor.kind != GGML_TYPE_Q2_0_G64 || tensor.dimensions != [cols as u64, rows as u64] {
         return Err(Error::Shape {
             label: "Bonsai Q2_0_g64 tensor",
@@ -1529,7 +1534,7 @@ fn require_q2_matrix(index: &GgufIndex, name: &str, rows: usize, cols: usize) ->
 }
 
 fn require_f32_vector(index: &GgufIndex, name: &str, width: usize) -> Result<()> {
-    let tensor = index.tensor(name)?;
+    let tensor = index.tensor(name).map_err(format_error)?;
     if tensor.kind != GGML_TYPE_F32 || tensor.dimensions != [width as u64] {
         return Err(Error::Shape {
             label: "Bonsai F32 tensor",
@@ -1541,7 +1546,7 @@ fn require_f32_vector(index: &GgufIndex, name: &str, width: usize) -> Result<()>
 }
 
 fn tensor_rows(index: &GgufIndex, name: &str, cols: usize) -> Result<usize> {
-    let tensor = index.tensor(name)?;
+    let tensor = index.tensor(name).map_err(format_error)?;
     if tensor.kind != GGML_TYPE_Q2_0_G64 || tensor.dimensions.first().copied() != Some(cols as u64)
     {
         return Err(Error::Shape {
@@ -1594,6 +1599,13 @@ fn require_string(index: &GgufIndex, key: &str, expected: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn format_error(error: FormatError) -> Error {
+    Error::Format {
+        label: "GGUF import",
+        detail: error.to_string(),
+    }
 }
 
 fn yarn_inverse_frequencies(config: BonsaiConfig) -> Vec<f32> {
@@ -1738,7 +1750,7 @@ mod tests {
     #[test]
     #[ignore = "requires EIDER_BONSAI_GGUF with the pinned real checkpoint"]
     fn real_bonsai_multi_page_prefill_matches_serial_decode() {
-        use crate::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
+        use crate::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
 
         let path = std::env::var_os("EIDER_BONSAI_GGUF").expect("EIDER_BONSAI_GGUF");
         let model = BonsaiModel::load(Path::new(&path)).expect("load Bonsai model");

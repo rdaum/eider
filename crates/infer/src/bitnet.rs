@@ -1,9 +1,6 @@
 //! BitNet b1.58 dense decoder using checkpoint-exact ternary GPU linears.
 
-use crate::runtime::bitnet_sequence_cache::{
-    BitNetSequence, BitNetSequenceCache, bitnet_cache_error,
-};
-use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+use crate::sm12x_cache::Sm12xCacheContext;
 
 use nvfp4::{
     BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt, CudaStream,
@@ -18,6 +15,10 @@ use nvfp4::{
 use seqcache::AppendPages;
 use serde_json::Value;
 use std::path::Path;
+
+mod sequence;
+pub(crate) use sequence::bitnet_cache_error;
+pub use sequence::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
 
 /// Validated BitNet text-model configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -957,7 +958,7 @@ impl BitNetPrefillWorkspace {
         config: BitNetConfig,
         weights: &BitNetLayer,
         pool: &mut Sm12xKvPagePool,
-        pages: AppendPages<'_, crate::runtime::sm12x_sequence_cache::Sm12xPage>,
+        pages: AppendPages<'_, crate::sm12x_cache::Sm12xPage>,
         page_table: &DeviceBuffer<u32>,
         start_position: usize,
         stream: &CudaStream,

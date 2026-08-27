@@ -1,7 +1,5 @@
 use infer::bitnet::{BitNetModel, BitNetPrefillWorkspace};
-use infer::runtime::bitnet_sequence_cache::{
-    BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache,
-};
+use infer::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

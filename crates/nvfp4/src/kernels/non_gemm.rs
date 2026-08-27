@@ -3,8 +3,8 @@
 //! CUDA kernels for non-GEMM decode operations.
 
 use crate::cuda::{
-    CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, PinnedHostBuffer, check_cuda,
-    max_shared_memory_per_block,
+    CudaStream, DeviceBuffer, DeviceInOut, DeviceMatrix, DeviceMatrixMut, DeviceOutput, DeviceRepr,
+    PinnedHostBuffer, RowMajor, check_cuda, max_shared_memory_per_block,
 };
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -7212,6 +7212,12 @@ struct DeviceSamplingParams {
     token_counts: u64,
 }
 
+impl crate::cuda::device_repr::Sealed for DeviceSamplingParams {}
+
+// This repr(C) kernel record contains only DeviceRepr fields. CUDA cannot
+// create an invalid Rust value by writing its fields.
+unsafe impl DeviceRepr for DeviceSamplingParams {}
+
 /// One compact token result produced by device-resident sampling.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7225,6 +7231,12 @@ pub struct GpuSampledToken {
     status: u32,
 }
 
+impl crate::cuda::device_repr::Sealed for GpuSampledToken {}
+
+// This repr(C) kernel record contains only DeviceRepr fields. CUDA cannot
+// create an invalid Rust value by writing its fields.
+unsafe impl DeviceRepr for GpuSampledToken {}
+
 /// One vocabulary candidate returned by a device top-k reduction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuTopKCandidate {
@@ -7236,50 +7248,50 @@ pub struct GpuTopKCandidate {
 
 /// Projects DFlash2 hidden rows through its row-major BF16 selector matrix.
 pub fn dflash2_hidden_projection_f32_into_on_stream(
-    hidden: &DeviceBuffer<f32>,
-    weight_bf16: &DeviceBuffer<u16>,
-    projected: &mut DeviceBuffer<f32>,
-    rows: usize,
-    hidden_size: usize,
-    rank: usize,
+    hidden: DeviceMatrix<'_, f32, RowMajor>,
+    weight_bf16: DeviceMatrix<'_, u16, RowMajor>,
+    mut projected: DeviceMatrixMut<'_, f32, RowMajor>,
     stream: &CudaStream,
 ) -> Result<()> {
-    let hidden_values = rows.checked_mul(hidden_size);
-    let weight_values = rank.checked_mul(hidden_size);
-    let projected_values = rows.checked_mul(rank);
-    if rows == 0
-        || hidden_size == 0
-        || rank == 0
+    let rows = hidden.rows();
+    let hidden_size = hidden.cols();
+    let rank = weight_bf16.rows();
+    if hidden.stride() != hidden_size
+        || weight_bf16.stride() != hidden_size
+        || projected.stride() != rank
+        || projected.rows() != rows
+        || projected.cols() != rank
         || rows > u32::MAX as usize
         || hidden_size > u32::MAX as usize
         || rank > u32::MAX as usize
-        || hidden_values.is_none_or(|values| hidden.len() < values)
-        || weight_values != Some(weight_bf16.len())
-        || projected_values.is_none_or(|values| projected.len() < values)
     {
         return Err(Error::Shape {
             label: "DFlash2 hidden projection",
             expected: format!(
-                "hidden={} weight={} projected>={} values",
-                rows.saturating_mul(hidden_size),
-                rank.saturating_mul(hidden_size),
-                rows.saturating_mul(rank)
+                "contiguous hidden [{rows}, {hidden_size}], weight [{rank}, {hidden_size}], projected [{rows}, {rank}]"
             ),
             actual: format!(
-                "hidden={} weight={} projected={} rows={rows} hidden_size={hidden_size} rank={rank}",
-                hidden.len(),
-                weight_bf16.len(),
-                projected.len()
+                "hidden stride={} weight={}x{} stride={} projected={}x{} stride={}",
+                hidden.stride(),
+                weight_bf16.rows(),
+                weight_bf16.cols(),
+                weight_bf16.stride(),
+                projected.rows(),
+                projected.cols(),
+                projected.stride(),
             ),
         });
     }
+    let hidden = hidden.values();
+    let weight_bf16 = weight_bf16.values();
+    let mut projected = projected.values_mut();
     unsafe {
         check_cuda(
             "infer_dflash2_hidden_projection_f32_on_stream",
             ffi::infer_dflash2_hidden_projection_f32_on_stream(
-                hidden.ptr,
-                weight_bf16.ptr,
-                projected.ptr,
+                hidden.as_const_ptr().cast(),
+                weight_bf16.as_const_ptr().cast(),
+                projected.as_mut_ptr().cast(),
                 rows as u32,
                 hidden_size as u32,
                 rank as u32,
@@ -7542,17 +7554,16 @@ impl GpuTokenSampler {
             )?;
         }
         let active_keys = rows * GPU_SAMPLING_MAX_TOP_K;
-        self.top_keys.copy_prefix_to_pinned_on_stream(
+        let top_keys = self.top_keys.copy_prefix_to_pinned_on_stream(
             &mut self.host_top_keys,
             active_keys,
             stream,
         )?;
-        stream.synchronize()?;
+        let top_keys = top_keys.wait()?;
 
         output.clear();
         output.reserve(rows * top_k);
-        for row in self.host_top_keys.as_slice()[..active_keys].chunks_exact(GPU_SAMPLING_MAX_TOP_K)
-        {
+        for row in top_keys.as_slice()[..active_keys].chunks_exact(GPU_SAMPLING_MAX_TOP_K) {
             for &key in &row[..top_k] {
                 if key == 0 {
                     return Err(Error::Format {
@@ -14593,12 +14604,21 @@ mod tests {
         let mut actual = DeviceBuffer::zeroed(ROWS * RANK).expect("projected");
         let stream = CudaStream::new_non_blocking().expect("stream");
         dflash2_hidden_projection_f32_into_on_stream(
-            &hidden,
-            &weight,
-            &mut actual,
-            ROWS,
-            HIDDEN,
-            RANK,
+            hidden
+                .slice(0..ROWS * HIDDEN)
+                .expect("hidden range")
+                .matrix::<RowMajor>(ROWS, HIDDEN, HIDDEN)
+                .expect("hidden matrix"),
+            weight
+                .slice(0..RANK * HIDDEN)
+                .expect("weight range")
+                .matrix::<RowMajor>(RANK, HIDDEN, HIDDEN)
+                .expect("weight matrix"),
+            actual
+                .slice_mut(0..ROWS * RANK)
+                .expect("output range")
+                .matrix::<RowMajor>(ROWS, RANK, RANK)
+                .expect("output matrix"),
             &stream,
         )
         .expect("DFlash2 projection");

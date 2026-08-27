@@ -8,8 +8,8 @@ use crate::nvfp4::{
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{Qwen36BatchModelView, load_hybrid_full_attention};
-use crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend;
-use crate::runtime::sm12x_sequence_cache::Sm12xPage;
+use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
+use crate::sm12x_cache::Sm12xPage;
 use std::path::Path;
 
 /// Numerical comparison between serial and batched QSA layer outputs.

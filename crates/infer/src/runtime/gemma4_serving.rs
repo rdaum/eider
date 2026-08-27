@@ -3,18 +3,18 @@
 use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::gemma4_sequence_cache::{
-    Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
-};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
 use super::stop::StopBuffer;
 use crate::gemma4::{
     Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
 };
+use crate::gemma4::{
+    Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
+};
 use crate::metrics::{duration_us, metrics};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use nvfp4::{CudaStream, Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

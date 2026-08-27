@@ -41,9 +41,10 @@ pub use cublaslt::{
     Int8TnMatmulPlan, Nvfp4TnInputs,
 };
 pub use cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceInOut, DeviceInput, DeviceOutput,
-    HostRead, PageableHostBuffer, PinnedHostBuffer, device_memory_info, set_cuda_device,
-    synchronize_device,
+    CapturedGraph, ColumnMajor, CublasLtVec16, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer,
+    DeviceInOut, DeviceMatrix, DeviceMatrixMut, DeviceOutput, DeviceRepr, DeviceSlice,
+    DeviceSliceMut, HostRead, ModelOptNvfp4, PageableHostBuffer, PagedKv, PendingHostRead,
+    PinnedHostBuffer, RowMajor, Sm12xMma, device_memory_info, set_cuda_device, synchronize_device,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};

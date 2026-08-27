@@ -5,8 +5,8 @@ use crate::qwen3::qwen36::{
     BatchFullAttentionWorkspace, Bf16Linear, Qwen36BatchModelView, Qwen36FullAttentionWeights,
     Qwen36FullAttentionWorkspace, read_bf16_vector_delta_as_f32_device,
 };
-use crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend;
-use crate::runtime::sm12x_sequence_cache::Sm12xPage;
+use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
+use crate::sm12x_cache::Sm12xPage;
 use nvfp4::{
     Qwen38QsaSelectionWorkspace, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream,

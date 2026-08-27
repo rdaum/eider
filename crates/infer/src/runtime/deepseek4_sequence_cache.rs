@@ -1,7 +1,7 @@
 //! Shared paged sliding-attention storage for DeepSeek V4 sequences.
 
-use super::sm12x_sequence_cache::Sm12xPageTable;
 use crate::deepseek4::{Deepseek4SequenceCheckpoint, Deepseek4SequenceState, Deepseek4TextModel};
+use crate::sm12x_cache::Sm12xPageTable;
 use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
     BackendAppendCommit, BackendAppendPage, CacheConfig, CacheError, PageAllocation, PageBackend,

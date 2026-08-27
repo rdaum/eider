@@ -847,6 +847,7 @@ dependencies = [
  "async-stream",
  "axum",
  "clap",
+ "eider-format",
  "fast-telemetry",
  "fast-telemetry-export",
  "fs2",
@@ -860,6 +861,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "eider-format"
+version = "0.1.0"
 
 [[package]]
 name = "either"
@@ -1554,6 +1559,7 @@ name = "infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "eider-format",
  "fast-telemetry",
  "fs2",
  "libc",

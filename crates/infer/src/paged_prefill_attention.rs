@@ -1,9 +1,9 @@
 //! Shared tensor-core prompt attention over compact paged K/V storage.
 
 use nvfp4::{
-    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, GemmShape, Result, Sm12xKvPagePool,
-    causal_window_softmax_f32_to_bf16_on_stream, pack_token_heads_bf16_at_offset_into_on_stream,
-    unpack_heads_f32_at_offset_into_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, DeviceRepr, GemmShape, Result,
+    Sm12xKvPagePool, causal_window_softmax_f32_to_bf16_on_stream,
+    pack_token_heads_bf16_at_offset_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,
 };
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -69,7 +69,7 @@ impl PagedTensorCorePrefillAttention {
                 .sum::<usize>()
     }
 
-    fn grow<T: Copy>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
+    fn grow<T: DeviceRepr>(buffer: &mut DeviceBuffer<T>, required: usize) -> Result<()> {
         if buffer.len() < required {
             *buffer = DeviceBuffer::zeroed(required)?;
         }

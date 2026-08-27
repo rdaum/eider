@@ -1,6 +1,6 @@
 use infer::bonsai::BonsaiModel;
+use infer::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
 use infer::nvfp4::{Error, Result};
-use infer::runtime::bonsai_sequence_cache::{BonsaiSequence, new_bonsai_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

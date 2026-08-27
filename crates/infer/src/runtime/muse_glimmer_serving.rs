@@ -3,16 +3,16 @@
 use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::muse_glimmer_sequence_cache::{
-    MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
-    new_muse_glimmer_sequence_cache_with_budget,
-};
 use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
 use super::stop::StopBuffer;
 use crate::muse_glimmer::{MuseGlimmerDFlashCycle, MuseGlimmerModel};
+use crate::muse_glimmer::{
+    MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
+    new_muse_glimmer_sequence_cache_with_budget,
+};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use nvfp4::{Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

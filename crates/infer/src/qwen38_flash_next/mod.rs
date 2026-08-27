@@ -8,6 +8,7 @@ mod model;
 mod ple;
 mod probe;
 mod qsa;
+mod sequence;
 mod transform;
 
 pub use config::Qwen38FlashNextConfig;
@@ -25,6 +26,15 @@ pub use probe::{
     Qwen38LayerDivergence, Qwen38VerificationMismatch, Qwen38VerificationProbeReport,
     Qwen38VerificationStreamDifference, probe_verification_paths,
 };
+pub use sequence::{
+    Qwen38FlashNextCacheConfig, Qwen38FlashNextPageBackend, Qwen38FlashNextSequence,
+    Qwen38FlashNextSequenceCache, new_qwen38_flash_next_sequence_cache,
+    new_qwen38_flash_next_sequence_cache_with_config,
+};
+pub(crate) use sequence::{
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSnapshot,
+    new_qwen38_flash_next_mtp_sequence_cache, qwen38_flash_next_cache_error,
+};
 pub(crate) use transform::Qwen38ExactPleWorkspace;
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};
 
@@ -40,12 +50,11 @@ mod tests {
         Qwen36LinearAttentionState, Qwen36LinearAttentionWorkspace, Qwen36MoeWeights,
         load_hybrid_linear_attention,
     };
-    use crate::runtime::cache_config::SequenceCacheConfig;
-    use crate::runtime::qwen38_flash_next_sequence::{
-        Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
+    use crate::qwen38_flash_next::{
+        Qwen38FlashNextCacheConfig, Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
         new_qwen38_flash_next_sequence_cache_with_config,
     };
-    use crate::runtime::sm12x_sequence_cache::Sm12xCacheContext;
+    use crate::sm12x_cache::Sm12xCacheContext;
 
     #[test]
     fn released_checkpoint_loads_paging_and_resident_scaffolding() {
@@ -292,7 +301,7 @@ mod tests {
             &model,
             1,
             256,
-            SequenceCacheConfig {
+            Qwen38FlashNextCacheConfig {
                 max_retained_bytes: 1024 * 1024 * 1024,
             },
         )

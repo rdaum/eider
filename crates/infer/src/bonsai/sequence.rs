@@ -1,7 +1,7 @@
 //! Shared paged sequence storage for Bonsai.
 
-use super::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use crate::bonsai::{BonsaiDecodeState, BonsaiModel};
+use super::{BonsaiDecodeState, BonsaiModel};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use nvfp4::{Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheError, SequenceCache, SequenceId};
 

@@ -1,10 +1,10 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
 use infer::nvfp4::{CudaStream, Error, Result};
-use infer::runtime::step37_sequence_cache::{Step37Sequence, new_step37_sequence_cache};
 use infer::step37::{
     Step37Bf16Storage, Step37Bf16StorageConfig, Step37PagingStats, Step37TextModel,
 };
+use infer::step37::{Step37Sequence, new_step37_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 

@@ -1,6 +1,6 @@
 use infer::bitnet::BitNetModel;
+use infer::bitnet::{BitNetSequence, new_bitnet_sequence_cache};
 use infer::nvfp4::{Error, Result};
-use infer::runtime::bitnet_sequence_cache::{BitNetSequence, new_bitnet_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

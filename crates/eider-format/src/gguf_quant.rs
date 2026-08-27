@@ -1,7 +1,7 @@
 //! Import-time decoding for the GGML K-quantized tensor formats used by
 //! official companion checkpoints.
 
-use nvfp4::{Error, Result};
+use crate::{Error, Result};
 
 /// GGML tensor type identifier for Q4_K.
 pub const GGML_TYPE_Q4_K: u32 = 12;
@@ -56,7 +56,7 @@ pub fn dequantize_to_bf16(kind: u32, bytes: &[u8], elements: usize) -> Result<Ve
         GGML_TYPE_Q4_K => {
             for block in bytes.chunks_exact(Q4_K_BLOCK_BYTES) {
                 dequantize_q4_k_block(block, |value| {
-                    values.push(nvfp4::format::f32_to_bf16(value));
+                    values.push(f32_to_bf16(value));
                 });
             }
         }
@@ -133,7 +133,18 @@ fn dequantize_q6_k_block(block: &[u8], output: &mut [u16]) {
 
 fn encode_scaled_q6(delta: f32, scale: u8, quant: i32) -> u16 {
     let scale = i8::from_ne_bytes([scale]);
-    nvfp4::format::f32_to_bf16(delta * f32::from(scale) * quant as f32)
+    f32_to_bf16(delta * f32::from(scale) * quant as f32)
+}
+
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding_bias = ((bits >> 16) & 1) + 0x7fff;
+    bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16
+}
+
+#[cfg(test)]
+fn bf16_to_f32(value: u16) -> f32 {
+    f32::from_bits(u32::from(value) << 16)
 }
 
 fn f16_to_f32(value: u16) -> f32 {
@@ -159,10 +170,7 @@ mod tests {
     use super::*;
 
     fn decode_bf16(values: &[u16]) -> Vec<f32> {
-        values
-            .iter()
-            .map(|&value| nvfp4::format::bf16_to_f32(value))
-            .collect()
+        values.iter().map(|&value| bf16_to_f32(value)).collect()
     }
 
     #[test]

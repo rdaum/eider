@@ -1,8 +1,8 @@
 //! Minimal Laguna load and greedy-decode probe.
 
 use infer::laguna::LagunaModel;
+use infer::laguna::{LagunaSequence, new_laguna_sequence_cache};
 use infer::nvfp4::{CudaStream, Error, Result};
-use infer::runtime::laguna_sequence_cache::{LagunaSequence, new_laguna_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;

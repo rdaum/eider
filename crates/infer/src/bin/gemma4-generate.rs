@@ -1,6 +1,6 @@
 use infer::gemma4::Gemma4Model;
+use infer::gemma4::{Gemma4Sequence, new_gemma4_sequence_cache};
 use infer::nvfp4::{CudaStream, Error, Result};
-use infer::runtime::gemma4_sequence_cache::{Gemma4Sequence, new_gemma4_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

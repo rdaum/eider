@@ -9,6 +9,9 @@ pub use nvfp4;
 
 mod paged_prefill_attention;
 
+/// Physical SM12x KV-page storage shared by inference model state.
+pub mod sm12x_cache;
+
 /// Runtime state and device-resident KV cache storage.
 pub mod runtime;
 pub use runtime::kv_cache;
@@ -18,12 +21,6 @@ pub mod bitnet;
 
 /// Ternary Bonsai dense Qwen3 model loading and inference.
 pub mod bonsai;
-
-/// Minimal GGUF v3 checkpoint indexing.
-pub mod gguf;
-
-/// CPU import support for GGML K-quantized tensors.
-pub mod gguf_quant;
 
 /// Qwen3 model loading and decode experiments.
 pub mod qwen3;

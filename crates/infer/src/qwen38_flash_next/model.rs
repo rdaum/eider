@@ -17,11 +17,11 @@ use crate::qwen3::qwen36::{
     Qwen36MoeWeights, Qwen36MoeWorkspace, load_hybrid_full_attention, load_hybrid_linear_attention,
     read_bf16_vector_delta_as_f32_device,
 };
-use crate::runtime::qwen38_flash_next_sequence::{
+use crate::qwen38_flash_next::{
     Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
     qwen38_flash_next_cache_error,
 };
-use crate::runtime::sm12x_sequence_cache::{Sm12xCacheContext, Sm12xPageTable};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use seqcache::{AdmissionOutcome, AdmissionRequest, AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3212,19 +3212,18 @@ mod tests {
                 let capacity = crate::nvfp4::SM12X_KV_PAGE_TOKENS;
                 let mut workspace =
                     Qwen38QsaWorkspace::new(&config, &manifest, &weights, capacity)?;
-                let mut backend =
-                    crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
-                        manifest
-                            .layer_kinds
-                            .iter()
-                            .map(|kind| *kind == QwenLayerKind::FullAttention),
-                        1,
-                        manifest.kv_heads,
-                        manifest.head_dim,
-                        config.indexer_head_dim,
-                    )?;
+                let mut backend = crate::qwen38_flash_next::Qwen38FlashNextPageBackend::new(
+                    manifest
+                        .layer_kinds
+                        .iter()
+                        .map(|kind| *kind == QwenLayerKind::FullAttention),
+                    1,
+                    manifest.kv_heads,
+                    manifest.head_dim,
+                    config.indexer_head_dim,
+                )?;
                 let page_table = DeviceBuffer::from_host(&[0u32])?;
-                let page = crate::runtime::sm12x_sequence_cache::Sm12xPage::from_slot(0);
+                let page = crate::sm12x_cache::Sm12xPage::from_slot(0);
                 let output = weights.run_one_token(
                     &mut workspace,
                     &mut backend,
@@ -3644,18 +3643,17 @@ mod tests {
             .collect::<Vec<_>>();
         let batch_input = DeviceBuffer::from_host(&input_host).expect("batch input");
         let page_table = DeviceBuffer::from_host(&[0u32]).expect("page table");
-        let page = crate::runtime::sm12x_sequence_cache::Sm12xPage::from_slot(0);
+        let page = crate::sm12x_cache::Sm12xPage::from_slot(0);
         let stream = CudaStream::new_non_blocking().expect("stream");
 
-        let mut serial_backend =
-            crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
-                layer_mask.clone(),
-                1,
-                manifest.kv_heads,
-                manifest.head_dim,
-                config.indexer_head_dim,
-            )
-            .expect("serial backend");
+        let mut serial_backend = crate::qwen38_flash_next::Qwen38FlashNextPageBackend::new(
+            layer_mask.clone(),
+            1,
+            manifest.kv_heads,
+            manifest.head_dim,
+            config.indexer_head_dim,
+        )
+        .expect("serial backend");
         let mut serial_workspace =
             Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("serial workspace");
         let mut serial_output = Vec::with_capacity(TOKENS * config.hidden);
@@ -3685,15 +3683,14 @@ mod tests {
             );
         }
 
-        let mut batch_backend =
-            crate::runtime::qwen38_flash_next_sequence::Qwen38FlashNextPageBackend::new(
-                layer_mask.clone(),
-                1,
-                manifest.kv_heads,
-                manifest.head_dim,
-                config.indexer_head_dim,
-            )
-            .expect("batch backend");
+        let mut batch_backend = crate::qwen38_flash_next::Qwen38FlashNextPageBackend::new(
+            layer_mask.clone(),
+            1,
+            manifest.kv_heads,
+            manifest.head_dim,
+            config.indexer_head_dim,
+        )
+        .expect("batch backend");
         let mut batch_workspace =
             Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("batch workspace");
         let lt = CublasLt::new().expect("cuBLASLt");

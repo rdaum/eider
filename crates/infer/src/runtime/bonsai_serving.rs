@@ -1,8 +1,5 @@
 //! Multi-session chat serving for Bonsai.
 
-use super::bonsai_sequence_cache::{
-    BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cache,
-};
 use super::chat::CheckpointChatTemplate;
 use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::sampling::{Sampler, TokenHistory};
@@ -10,6 +7,7 @@ use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::stop::StopBuffer;
 use crate::bonsai::{BonsaiModel, BonsaiPrefillWorkspace};
+use crate::bonsai::{BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cache};
 use nvfp4::{Error, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};

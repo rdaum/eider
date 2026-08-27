@@ -818,11 +818,15 @@ fn bonsai_chat_template(
     model_dir: &std::path::Path,
 ) -> infer::nvfp4::Result<CheckpointChatTemplate> {
     let gguf = bonsai_gguf_path(model_dir);
-    let index = infer::gguf::GgufIndex::open(&gguf)?;
+    let index =
+        eider_format::GgufIndex::open(&gguf).map_err(|error| infer::nvfp4::Error::Format {
+            label: "Bonsai GGUF import",
+            detail: error.to_string(),
+        })?;
     let source = index
         .metadata()
         .get("tokenizer.chat_template")
-        .and_then(infer::gguf::GgufValue::as_str)
+        .and_then(eider_format::GgufValue::as_str)
         .ok_or_else(|| infer::nvfp4::Error::Format {
             label: "Bonsai chat template",
             detail: format!("{} has no tokenizer.chat_template string", gguf.display()),
