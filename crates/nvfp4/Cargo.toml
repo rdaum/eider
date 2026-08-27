@@ -119,6 +119,10 @@ name = "ngram_embedding"
 harness = false
 
 [[bench]]
+name = "dflash2_selector"
+harness = false
+
+[[bench]]
 name = "deepseek4_indexer"
 harness = false
 

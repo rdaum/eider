@@ -137,9 +137,9 @@ The session used a release build on August 22, 2026.
 The three completed turns had 5.8K to 10.3K prompt tokens. The shared prefix
 cache restored state from each previous turn.
 
-A separate correctness-gated 4K benchmark measures 12.6 tokens/sec for the
-target alone. DFlash2 reaches 25.2 effective tokens/sec on that synthetic
-sequence.
+A separate correctness-gated 4K benchmark measures about 13 tokens/sec for the
+target alone. DFlash2 reaches about 26 effective tokens/sec on the same
+synthetic sequence.
 
 These numbers are API results, not isolated kernel rates. Context length,
 sampling, tool grammar, prefix reuse, and draft acceptance change the result.

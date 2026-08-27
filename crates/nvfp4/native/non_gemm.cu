@@ -7175,6 +7175,50 @@ extern "C" cudaError_t infer_speculative_accept_argmax_f32_on_stream(
     return cudaGetLastError();
 }
 
+__global__ void infer_dflash2_hidden_projection_f32_kernel(
+    const float* hidden,
+    const std::uint16_t* weight_bf16,
+    float* projected,
+    std::uint32_t hidden_size,
+    std::uint32_t rank) {
+    const std::uint32_t output = blockIdx.x;
+    const std::uint32_t row = output / rank;
+    const std::uint32_t component = output % rank;
+    const float* input = hidden + static_cast<std::size_t>(row) * hidden_size;
+    const std::uint16_t* weight =
+        weight_bf16 + static_cast<std::size_t>(component) * hidden_size;
+    float sum = 0.0f;
+    for (std::uint32_t feature = threadIdx.x; feature < hidden_size;
+         feature += blockDim.x) {
+        const float value = __bfloat162float(
+            *reinterpret_cast<const __nv_bfloat16*>(weight + feature));
+        sum = __fmaf_rn(input[feature], value, sum);
+    }
+    sum = infer_block_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        projected[output] = sum;
+    }
+}
+
+extern "C" cudaError_t infer_dflash2_hidden_projection_f32_on_stream(
+    const float* hidden,
+    const std::uint16_t* weight_bf16,
+    float* projected,
+    std::uint32_t rows,
+    std::uint32_t hidden_size,
+    std::uint32_t rank,
+    cudaStream_t stream) {
+    if (hidden == nullptr || weight_bf16 == nullptr || projected == nullptr ||
+        rows == 0 || hidden_size == 0 || rank == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    infer_dflash2_hidden_projection_f32_kernel<<<
+        rows * rank, kThreads, 0, stream>>>(
+        hidden, weight_bf16, projected, hidden_size, rank);
+    return cudaGetLastError();
+}
+
 // =============================================================================
 // Device-resident token sampling.
 

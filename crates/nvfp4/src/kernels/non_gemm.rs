@@ -3,7 +3,8 @@
 //! CUDA kernels for non-GEMM decode operations.
 
 use crate::cuda::{
-    CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda, max_shared_memory_per_block,
+    CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, PinnedHostBuffer, check_cuda,
+    max_shared_memory_per_block,
 };
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -7224,6 +7225,70 @@ pub struct GpuSampledToken {
     status: u32,
 }
 
+/// One vocabulary candidate returned by a device top-k reduction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuTopKCandidate {
+    /// Vocabulary ID.
+    pub id: u32,
+    /// Original model logit.
+    pub logit: f32,
+}
+
+/// Projects DFlash2 hidden rows through its row-major BF16 selector matrix.
+pub fn dflash2_hidden_projection_f32_into_on_stream(
+    hidden: &DeviceBuffer<f32>,
+    weight_bf16: &DeviceBuffer<u16>,
+    projected: &mut DeviceBuffer<f32>,
+    rows: usize,
+    hidden_size: usize,
+    rank: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let hidden_values = rows.checked_mul(hidden_size);
+    let weight_values = rank.checked_mul(hidden_size);
+    let projected_values = rows.checked_mul(rank);
+    if rows == 0
+        || hidden_size == 0
+        || rank == 0
+        || rows > u32::MAX as usize
+        || hidden_size > u32::MAX as usize
+        || rank > u32::MAX as usize
+        || hidden_values.is_none_or(|values| hidden.len() < values)
+        || weight_values != Some(weight_bf16.len())
+        || projected_values.is_none_or(|values| projected.len() < values)
+    {
+        return Err(Error::Shape {
+            label: "DFlash2 hidden projection",
+            expected: format!(
+                "hidden={} weight={} projected>={} values",
+                rows.saturating_mul(hidden_size),
+                rank.saturating_mul(hidden_size),
+                rows.saturating_mul(rank)
+            ),
+            actual: format!(
+                "hidden={} weight={} projected={} rows={rows} hidden_size={hidden_size} rank={rank}",
+                hidden.len(),
+                weight_bf16.len(),
+                projected.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_dflash2_hidden_projection_f32_on_stream",
+            ffi::infer_dflash2_hidden_projection_f32_on_stream(
+                hidden.ptr,
+                weight_bf16.ptr,
+                projected.ptr,
+                rows as u32,
+                hidden_size as u32,
+                rank as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Per-row sampling inputs consumed by [`GpuTokenSampler`].
 pub struct GpuSamplingRow<'a> {
     /// Softmax temperature. Zero selects the adjusted argmax.
@@ -7251,6 +7316,7 @@ pub struct GpuTokenSampler {
     stage_one_keys: DeviceBuffer<u64>,
     stage_two_keys: DeviceBuffer<u64>,
     top_keys: DeviceBuffer<u64>,
+    host_top_keys: PinnedHostBuffer<u64>,
     results: DeviceBuffer<GpuSampledToken>,
 }
 
@@ -7287,6 +7353,7 @@ impl GpuTokenSampler {
             stage_one_keys: DeviceBuffer::zeroed(capacity * stage_one_count)?,
             stage_two_keys: DeviceBuffer::zeroed(capacity * stage_two_count)?,
             top_keys: DeviceBuffer::zeroed(capacity * GPU_SAMPLING_MAX_TOP_K)?,
+            host_top_keys: PinnedHostBuffer::zeroed(capacity * GPU_SAMPLING_MAX_TOP_K)?,
             results: DeviceBuffer::zeroed(capacity)?,
         })
     }
@@ -7416,6 +7483,97 @@ impl GpuTokenSampler {
             });
         }
         Ok(results)
+    }
+
+    /// Returns the highest-logit candidates for each active row.
+    ///
+    /// Candidates are row-major and sorted by descending logit, with the
+    /// lower token ID first when logits are equal. `output` is reused.
+    pub fn top_k_candidates_into(
+        &mut self,
+        logits: &DeviceBuffer<f32>,
+        rows: usize,
+        top_k: usize,
+        output: &mut Vec<GpuTopKCandidate>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || rows > self.capacity
+            || top_k == 0
+            || top_k > GPU_SAMPLING_MAX_TOP_K
+            || logits.len() != self.capacity.saturating_mul(self.vocab)
+            || rows > u32::MAX as usize
+            || self.vocab > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "GPU token top-k buffers",
+                expected: format!(
+                    "rows=1..={} top_k=1..={GPU_SAMPLING_MAX_TOP_K} logits={}",
+                    self.capacity,
+                    self.capacity.saturating_mul(self.vocab)
+                ),
+                actual: format!("rows={rows} top_k={top_k} logits={}", logits.len()),
+            });
+        }
+        self.host_params.fill(DeviceSamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            draw: 0.0,
+            top_k: top_k as u32,
+            token_counts: 0,
+        });
+        self.params.copy_from_host(&self.host_params)?;
+        unsafe {
+            check_cuda(
+                "infer_sample_topk_topp_f32_batch_on_stream",
+                ffi::infer_sample_topk_topp_f32_batch_on_stream(
+                    logits.ptr,
+                    self.params.ptr.cast(),
+                    self.stage_one_keys.ptr,
+                    self.stage_two_keys.ptr,
+                    self.top_keys.ptr,
+                    self.results.ptr.cast(),
+                    rows as u32,
+                    self.vocab as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        let active_keys = rows * GPU_SAMPLING_MAX_TOP_K;
+        self.top_keys.copy_prefix_to_pinned_on_stream(
+            &mut self.host_top_keys,
+            active_keys,
+            stream,
+        )?;
+        stream.synchronize()?;
+
+        output.clear();
+        output.reserve(rows * top_k);
+        for row in self.host_top_keys.as_slice()[..active_keys].chunks_exact(GPU_SAMPLING_MAX_TOP_K)
+        {
+            for &key in &row[..top_k] {
+                if key == 0 {
+                    return Err(Error::Format {
+                        label: "GPU token top-k",
+                        detail: "logit row has fewer finite candidates than requested".to_string(),
+                    });
+                }
+                let id = u32::MAX - key as u32;
+                let ordered = (key >> 32) as u32;
+                let bits = if ordered & 0x8000_0000 != 0 {
+                    ordered ^ 0x8000_0000
+                } else {
+                    !ordered
+                };
+                output.push(GpuTopKCandidate {
+                    id,
+                    logit: f32::from_bits(bits),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -14363,6 +14521,93 @@ mod tests {
         let counts = counts.copy_to_host(&stream).expect("counts readback");
         assert_eq!(counts[1], 1);
         assert_eq!(counts[2], 2);
+    }
+
+    #[test]
+    fn gpu_token_top_k_candidates_match_cpu_ordering() {
+        let vocab = 35_000usize;
+        let mut logits = vec![-100.0f32; 2 * vocab];
+        for row in 0..2 {
+            for slot in 0..16 {
+                let token = 31 + slot * 2_111 + row * 7;
+                logits[row * vocab + token] = 8.0 - (slot / 2) as f32 * 0.25;
+            }
+        }
+        let expected = logits
+            .chunks_exact(vocab)
+            .flat_map(|row| {
+                let mut candidates = row
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(id, logit)| GpuTopKCandidate {
+                        id: id as u32,
+                        logit,
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|left, right| {
+                    right
+                        .logit
+                        .total_cmp(&left.logit)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                candidates.truncate(16);
+                candidates
+            })
+            .collect::<Vec<_>>();
+        let logits = DeviceBuffer::from_host(&logits).expect("logits");
+        let mut sampler = GpuTokenSampler::new(2, vocab).expect("sampler");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut actual = Vec::new();
+        sampler
+            .top_k_candidates_into(&logits, 2, 16, &mut actual, &stream)
+            .expect("top-k candidates");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn dflash2_hidden_projection_matches_cpu_reference() {
+        const ROWS: usize = 2;
+        const HIDDEN: usize = 64;
+        const RANK: usize = 5;
+        let hidden = (0..ROWS * HIDDEN)
+            .map(|index| ((index * 13 % 47) as f32 - 23.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let weight = (0..RANK * HIDDEN)
+            .map(|index| f32_to_bf16(((index * 17 % 61) as f32 - 30.0) * 0.015625))
+            .collect::<Vec<_>>();
+        let expected = (0..ROWS)
+            .flat_map(|row| {
+                let hidden = &hidden[row * HIDDEN..(row + 1) * HIDDEN];
+                (0..RANK).map(|component| {
+                    hidden
+                        .iter()
+                        .zip(&weight[component * HIDDEN..(component + 1) * HIDDEN])
+                        .map(|(&value, &weight)| value * bf16_to_f32(weight))
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let hidden = DeviceBuffer::from_host(&hidden).expect("hidden");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(ROWS * RANK).expect("projected");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dflash2_hidden_projection_f32_into_on_stream(
+            &hidden,
+            &weight,
+            &mut actual,
+            ROWS,
+            HIDDEN,
+            RANK,
+            &stream,
+        )
+        .expect("DFlash2 projection");
+        assert_close(
+            &actual.copy_to_host(&stream).expect("projection readback"),
+            &expected,
+            1.0e-5,
+            "DFlash2 hidden projection",
+        );
     }
 
     #[test]

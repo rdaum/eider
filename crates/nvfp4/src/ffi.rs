@@ -2417,6 +2417,15 @@ unsafe extern "C" {
         vocab_size: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_dflash2_hidden_projection_f32_on_stream(
+        hidden: *const f32,
+        weight_bf16: *const u16,
+        projected: *mut f32,
+        rows: u32,
+        hidden_size: u32,
+        rank: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sample_topk_topp_f32_batch_on_stream(
         logits: *const f32,
         params: *const c_void,

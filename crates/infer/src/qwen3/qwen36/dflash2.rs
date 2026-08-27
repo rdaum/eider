@@ -7,13 +7,13 @@
 use super::batch::{BatchFp8InputQuantization, BatchFp8LinearPlan, run_fp8_batch};
 use super::{Qwen36LmHead, Qwen36TextModel};
 use crate::nvfp4::{
-    Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, ModelOptCheckpoint,
-    PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
+    Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, GpuTokenSampler,
+    GpuTopKCandidate, ModelOptCheckpoint, PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
-    dflash2_noncausal_attention_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_prefix_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream,
+    dflash2_hidden_projection_f32_into_on_stream, dflash2_noncausal_attention_f32_into_on_stream,
+    f32_to_bf16_prefix_into_on_stream, fill_f32_prefix_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_sequence_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
 };
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use serde::Deserialize;
@@ -91,11 +91,9 @@ impl DFlash2Config {
 }
 
 struct DFlash2GreedySelector {
-    hidden: usize,
     vocab: usize,
     rank: usize,
     top_k: usize,
-    hidden_projection: Vec<u16>,
     predecessor_codebook: Vec<u16>,
     successor_codebook: Vec<u16>,
 }
@@ -103,15 +101,9 @@ struct DFlash2GreedySelector {
 impl DFlash2GreedySelector {
     fn load(checkpoint: &ModelOptCheckpoint, config: &DFlash2Config) -> Result<Self> {
         Ok(Self {
-            hidden: config.hidden,
             vocab: config.vocab,
             rank: config.selector_rank,
             top_k: config.selector_top_k,
-            hidden_projection: read_bf16_host(
-                checkpoint,
-                "candidate_selector.hidden_projection.weight",
-                &[config.selector_rank, config.hidden],
-            )?,
             predecessor_codebook: read_bf16_host(
                 checkpoint,
                 "candidate_selector.predecessor_codebook",
@@ -129,62 +121,42 @@ impl DFlash2GreedySelector {
     fn select(
         &self,
         anchor_token: u32,
-        hidden_states: &[f32],
-        unary_logits: &[f32],
+        projected: &[f32],
+        candidates: &[GpuTopKCandidate],
         drafts: &mut Vec<u32>,
-        projected: &mut Vec<f32>,
-        candidates: &mut Vec<(u32, f32)>,
     ) -> Result<()> {
         if anchor_token as usize >= self.vocab
-            || hidden_states.is_empty()
-            || !hidden_states.len().is_multiple_of(self.hidden)
+            || projected.is_empty()
+            || !projected.len().is_multiple_of(self.rank)
         {
             return Err(Error::Shape {
                 label: "DFlash2 selector",
-                expected: "valid anchor and complete hidden rows".to_string(),
-                actual: format!(
-                    "anchor={anchor_token} hidden_values={}",
-                    hidden_states.len()
-                ),
+                expected: "valid anchor and complete projected rows".to_string(),
+                actual: format!("anchor={anchor_token} projected_values={}", projected.len()),
             });
         }
-        let steps = hidden_states.len() / self.hidden;
-        if unary_logits.len() != steps * self.vocab {
+        let steps = projected.len() / self.rank;
+        if candidates.len() != steps * self.top_k {
             return Err(Error::Shape {
-                label: "DFlash2 selector logits",
-                expected: format!("{} values", steps * self.vocab),
-                actual: format!("{} values", unary_logits.len()),
+                label: "DFlash2 selector candidates",
+                expected: format!("{} candidates", steps * self.top_k),
+                actual: format!("{} candidates", candidates.len()),
             });
-        }
-
-        projected.clear();
-        projected.resize(steps * self.rank, 0.0);
-        for step in 0..steps {
-            let hidden = &hidden_states[step * self.hidden..(step + 1) * self.hidden];
-            for rank in 0..self.rank {
-                let weights = &self.hidden_projection[rank * self.hidden..(rank + 1) * self.hidden];
-                projected[step * self.rank + rank] = hidden
-                    .iter()
-                    .zip(weights)
-                    .map(|(&value, &weight)| value * bf16_to_f32(weight))
-                    .sum();
-            }
         }
 
         drafts.clear();
         drafts.reserve(steps);
         let mut predecessor = anchor_token as usize;
         for step in 0..steps {
-            vocabulary_top_k(
-                &unary_logits[step * self.vocab..(step + 1) * self.vocab],
-                self.top_k,
-                candidates,
-            );
             let predecessor_code =
                 &self.predecessor_codebook[predecessor * self.rank..(predecessor + 1) * self.rank];
             let hidden = &projected[step * self.rank..(step + 1) * self.rank];
             let mut best = None;
-            for &(candidate, unary) in candidates.iter() {
+            for &GpuTopKCandidate {
+                id: candidate,
+                logit: unary,
+            } in &candidates[step * self.top_k..(step + 1) * self.top_k]
+            {
                 let successor = &self.successor_codebook
                     [candidate as usize * self.rank..(candidate as usize + 1) * self.rank];
                 let transition = predecessor_code
@@ -243,6 +215,7 @@ fn f32_to_bf16(value: f32) -> u16 {
     (bits.wrapping_add(rounding) >> 16) as u16
 }
 
+#[cfg(test)]
 fn vocabulary_top_k(logits: &[f32], k: usize, output: &mut Vec<(u32, f32)>) {
     output.clear();
     for (token, &score) in logits.iter().enumerate() {
@@ -388,6 +361,7 @@ pub(crate) struct Qwen38DFlash2 {
     hidden_norm: DeviceBuffer<f32>,
     layers: Vec<DFlash2Layer>,
     norm: DeviceBuffer<f32>,
+    selector_projection: DeviceBuffer<u16>,
     selector: DFlash2GreedySelector,
 }
 
@@ -451,10 +425,10 @@ pub(crate) struct Qwen38DFlash2Workspace {
     lm_head_quantized: DeviceBuffer<u8>,
     lm_head_scale: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
-    host_hidden: PinnedHostBuffer<f32>,
-    host_logits: PinnedHostBuffer<f32>,
-    projected: Vec<f32>,
-    candidates: Vec<(u32, f32)>,
+    selector_projected: DeviceBuffer<f32>,
+    host_projected: PinnedHostBuffer<f32>,
+    selector_sampler: GpuTokenSampler,
+    selector_candidates: Vec<GpuTopKCandidate>,
     drafts: Vec<u32>,
 }
 
@@ -581,6 +555,11 @@ impl Qwen38DFlash2 {
             );
         }
         let norm = load_bf16_f32(&checkpoint, "norm.weight", &[config.hidden])?;
+        let selector_projection = DeviceBuffer::from_host(&read_bf16_host(
+            &checkpoint,
+            "candidate_selector.hidden_projection.weight",
+            &[config.selector_rank, config.hidden],
+        )?)?;
         let selector = DFlash2GreedySelector::load(&checkpoint, &config)?;
         Ok(Self {
             config,
@@ -588,6 +567,7 @@ impl Qwen38DFlash2 {
             hidden_norm,
             layers,
             norm,
+            selector_projection,
             selector,
         })
     }
@@ -753,10 +733,10 @@ impl Qwen38DFlash2 {
             lm_head_quantized: DeviceBuffer::zeroed(draft_tokens * hidden)?,
             lm_head_scale: DeviceBuffer::zeroed(draft_tokens)?,
             logits: DeviceBuffer::zeroed(draft_tokens * self.config.vocab)?,
-            host_hidden: PinnedHostBuffer::zeroed(draft_tokens * hidden)?,
-            host_logits: PinnedHostBuffer::zeroed(draft_tokens * self.config.vocab)?,
-            projected: Vec::with_capacity(draft_tokens * self.config.selector_rank),
-            candidates: Vec::with_capacity(self.config.selector_top_k),
+            selector_projected: DeviceBuffer::zeroed(draft_tokens * self.config.selector_rank)?,
+            host_projected: PinnedHostBuffer::zeroed(draft_tokens * self.config.selector_rank)?,
+            selector_sampler: GpuTokenSampler::new(draft_tokens, self.config.vocab)?,
+            selector_candidates: Vec::with_capacity(draft_tokens * self.config.selector_top_k),
             drafts: Vec::with_capacity(self.config.draft_tokens()),
         })
     }
@@ -1187,26 +1167,35 @@ impl Qwen38DFlash2 {
                 )?;
             }
         }
-        let hidden_values = drafts * self.config.hidden;
-        let logit_values = drafts * self.config.vocab;
-        workspace.sample_hidden.copy_prefix_to_pinned_on_stream(
-            &mut workspace.host_hidden,
-            hidden_values,
+        let projected_values = drafts * self.config.selector_rank;
+        dflash2_hidden_projection_f32_into_on_stream(
+            &workspace.sample_hidden,
+            &self.selector_projection,
+            &mut workspace.selector_projected,
+            drafts,
+            self.config.hidden,
+            self.config.selector_rank,
             stream,
         )?;
-        workspace.logits.copy_prefix_to_pinned_on_stream(
-            &mut workspace.host_logits,
-            logit_values,
+        workspace
+            .selector_projected
+            .copy_prefix_to_pinned_on_stream(
+                &mut workspace.host_projected,
+                projected_values,
+                stream,
+            )?;
+        workspace.selector_sampler.top_k_candidates_into(
+            &workspace.logits,
+            drafts,
+            self.config.selector_top_k,
+            &mut workspace.selector_candidates,
             stream,
         )?;
-        stream.synchronize()?;
         self.selector.select(
             anchor_token,
-            &workspace.host_hidden.as_slice()[..hidden_values],
-            &workspace.host_logits.as_slice()[..logit_values],
+            &workspace.host_projected.as_slice()[..projected_values],
+            &workspace.selector_candidates,
             &mut workspace.drafts,
-            &mut workspace.projected,
-            &mut workspace.candidates,
         )?;
         Ok(&workspace.drafts)
     }
@@ -1753,6 +1742,7 @@ mod tests {
         DFlash2GreedySelector, expected_tensors, f32_to_bf16, inspect_dflash2_config,
         validate_dflash2_checkpoint, vocabulary_top_k,
     };
+    use crate::nvfp4::GpuTopKCandidate;
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;
@@ -1841,26 +1831,27 @@ mod tests {
     fn selector_follows_the_selected_predecessor() {
         let b = |values: &[f32]| values.iter().copied().map(f32_to_bf16).collect();
         let selector = DFlash2GreedySelector {
-            hidden: 2,
             vocab: 4,
             rank: 1,
             top_k: 2,
-            hidden_projection: b(&[1.0, 0.0]),
             predecessor_codebook: b(&[2.0, -2.0, -3.0, 0.0]),
             successor_codebook: b(&[0.0, -1.0, 1.0, 0.0]),
         };
-        let hidden = [1.0, 0.0, 1.0, 0.0];
+        let projected = [1.0, 1.0];
         let logits = [0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, -1.0];
+        let mut candidates = Vec::new();
+        for row in logits.chunks_exact(4) {
+            let mut row_candidates = Vec::new();
+            vocabulary_top_k(row, 2, &mut row_candidates);
+            candidates.extend(
+                row_candidates
+                    .into_iter()
+                    .map(|(id, logit)| GpuTopKCandidate { id, logit }),
+            );
+        }
         let mut drafts = Vec::new();
         selector
-            .select(
-                0,
-                &hidden,
-                &logits,
-                &mut drafts,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
+            .select(0, &projected, &candidates, &mut drafts)
             .unwrap();
         assert_eq!(drafts, [2, 1]);
     }

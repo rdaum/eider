@@ -67,9 +67,9 @@ pub use kernels::deepseek4::{
 pub use kernels::gemma4_attention::Gemma4LocalPrefillAttention;
 pub use kernels::non_gemm::{
     ArgmaxResult, GPU_SAMPLING_MAX_TOP_K, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    GroupedGemvPointerBuffers, GroupedGemvPointerTableBuffers, MoeSiluQuantizeSlotBuffers,
-    MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, add_f32_into_on_stream,
-    add_f32_prefix_into_on_stream, append_ragged_kv_f32_into_on_stream,
+    GpuTopKCandidate, GroupedGemvPointerBuffers, GroupedGemvPointerTableBuffers,
+    MoeSiluQuantizeSlotBuffers, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections,
+    add_f32_into_on_stream, add_f32_prefix_into_on_stream, append_ragged_kv_f32_into_on_stream,
     append_ragged_paged_kv_f32_into_on_stream, append_rows_f32_indexed_into_on_stream,
     append_rows_f32_into_on_stream, argmax_f32_batch_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_argmax_f32, bf16_linear_argmax_f32_into_on_stream,
@@ -84,7 +84,8 @@ pub use kernels::non_gemm::{
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_f32_rows_into_columns_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
     dflash2_capture_f32_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
-    dflash2_noncausal_attention_f32_into_on_stream, dual_rms_norm_add_f32_into_on_stream,
+    dflash2_hidden_projection_f32_into_on_stream, dflash2_noncausal_attention_f32_into_on_stream,
+    dual_rms_norm_add_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
     dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
     f32_to_bf16_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,

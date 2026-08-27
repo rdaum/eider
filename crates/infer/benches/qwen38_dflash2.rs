@@ -1,4 +1,6 @@
-use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36TextModel};
+use infer::qwen3::qwen36::{
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel,
+};
 use infer::runtime::cache_config::SequenceCacheConfig;
 use infer::runtime::sampling::SamplingConfig;
 use infer::runtime::scheduler::{Qwen36Scheduler, RequestConfig, RequestState, SchedulerConfig};
@@ -206,6 +208,9 @@ fn main() {
     let dflash2_dir = std::env::var_os("QWEN38_DFLASH2")
         .map(PathBuf::from)
         .expect("set QWEN38_DFLASH2 to the companion checkpoint");
+    let artifact_dir = std::env::var_os("QWEN38_ARTIFACT")
+        .map(PathBuf::from)
+        .expect("set QWEN38_ARTIFACT to a writable Eider artifact directory");
     let max_context_tokens = env_usize("QWEN38_DFLASH2_CONTEXT", DEFAULT_CONTEXT_TOKENS);
     let start_position = env_usize("QWEN38_DFLASH2_START_POSITION", DEFAULT_START_POSITION);
     let drafts = env_usize("QWEN38_DFLASH2_DRAFTS", DEFAULT_DRAFTS);
@@ -215,8 +220,13 @@ fn main() {
         bf16_storage("QWEN36_BF16_ATTENTION"),
         bf16_storage("QWEN36_BF16_LM_HEAD"),
     );
-    let mut model =
-        Qwen36TextModel::open_with_bf16_storage(model_dir, storage).expect("load Qwen3.8 target");
+    let mut model = Qwen36TextModel::open_with_storage_and_artifact_dir(
+        model_dir,
+        artifact_dir,
+        storage,
+        Qwen36Fp8Storage::Nvfp4,
+    )
+    .expect("load Qwen3.8 target");
     model
         .enable_dflash2(dflash2_dir)
         .expect("load Qwen3.8 DFlash2 companion");
