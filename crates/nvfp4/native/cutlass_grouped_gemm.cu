@@ -31,7 +31,7 @@ using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::ColumnMajor;
 using ClusterShape = Shape<_1, _1, _1>;
-using MmaTileShape = Shape<_128, _128, _256>;
+using MmaTileShape = Shape<_128, _64, _256>;
 
 constexpr int kAlignmentA = 32;
 constexpr int kAlignmentB = 32;
