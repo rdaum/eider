@@ -18,8 +18,9 @@ use crate::nvfp4::{
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
     Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_to_f32_prefix_into_on_stream,
-    dflash2_capture_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_two_rows_f32_into_on_stream,
+    bf16_to_f32_prefix_into_on_stream, dflash2_capture_f32_into_on_stream,
+    f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
@@ -777,6 +778,16 @@ fn run_bf16_batch(
     byte_identical: bool,
     stream: &CudaStream,
 ) -> Result<()> {
+    if byte_identical && rows == 2 {
+        return bf16_linear_two_rows_f32_into_on_stream(
+            input,
+            &linear.weight,
+            output.output(),
+            linear.rows,
+            linear.cols,
+            stream,
+        );
+    }
     f32_to_bf16_prefix_into_on_stream(input, plan.input.output(), rows * linear.cols, stream)?;
     if byte_identical && rows > 1 {
         if let std::collections::hash_map::Entry::Vacant(entry) = plan.plans.entry(1) {
@@ -1470,6 +1481,20 @@ impl BatchLinearAttentionWorkspace {
         )
     }
 
+    fn capture_state_snapshot(
+        &mut self,
+        layer: usize,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let snapshots = self
+            .state_snapshots
+            .as_mut()
+            .expect("Qwen speculative workspace has state snapshots");
+        snapshots.capture_conv(&self.conv_state_table, layer, 0, slot, stream)?;
+        snapshots.capture_recurrent(&self.recurrent_state_table, layer, 0, slot, stream)
+    }
+
     fn update_prefill_state_tables(
         &mut self,
         rows: &mut [Qwen36PrefillStateRow<'_, '_>],
@@ -2076,6 +2101,7 @@ impl Qwen36HybridPrefillWorkspace {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_gdn<'a>(
         &'a mut self,
         model: &Qwen36BatchModelView<'_>,
@@ -2083,6 +2109,7 @@ impl Qwen36HybridPrefillWorkspace {
         hidden: &DeviceBuffer<f32>,
         layer: usize,
         tokens: usize,
+        serial_projections: bool,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         self.require_tokens(tokens)?;
@@ -2099,7 +2126,7 @@ impl Qwen36HybridPrefillWorkspace {
             1,
             tokens,
             tokens,
-            false,
+            serial_projections,
             serial_recurrence,
             true,
             stream,
@@ -2133,7 +2160,20 @@ impl Qwen36HybridPrefillWorkspace {
         self.linear.enable_state_snapshots(model, slots)
     }
 
-    pub(crate) fn restore_state_snapshot(&self, slot: usize, stream: &CudaStream) -> Result<()> {
+    pub(crate) fn capture_gdn_state_snapshot(
+        &mut self,
+        layer: usize,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.linear.capture_state_snapshot(layer, slot, stream)
+    }
+
+    pub(crate) fn restore_gdn_state_snapshot(
+        &self,
+        slot: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
         self.linear.restore_state_snapshot(slot, stream)
     }
 
@@ -2153,6 +2193,30 @@ impl Qwen36HybridPrefillWorkspace {
             &self.zero_residual,
             tokens,
             false,
+            false,
+            stream,
+            None,
+        )?;
+        Ok(&self.moe.output)
+    }
+
+    pub(crate) fn run_moe_with_canonical_linears<'a>(
+        &'a mut self,
+        model: &Qwen36BatchModelView<'_>,
+        weights: &Qwen36MoeWeights,
+        hidden: &DeviceBuffer<f32>,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.require_tokens(tokens)?;
+        weights.run_batch(
+            model,
+            &mut self.moe,
+            hidden,
+            &self.zero_residual,
+            tokens,
+            false,
+            true,
             stream,
             None,
         )?;
@@ -5075,7 +5139,7 @@ impl Qwen36LinearAttentionWeights {
             &mut workspace.output,
             row_capacity,
             256,
-            false,
+            serial_projections,
             stream,
         )
     }
@@ -5400,6 +5464,7 @@ impl Qwen36LayerFfnWeights {
                 residual,
                 capacity,
                 stabilise_router_logits,
+                false,
                 stream,
                 parallel_moe,
             ),
@@ -5481,6 +5546,7 @@ impl Qwen36MoeWeights {
         workspace: &mut BatchMoeWorkspace,
         ffn_norm: &DeviceBuffer<f32>,
         capacity: usize,
+        canonical_linears: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         match &self.shared {
@@ -5558,7 +5624,7 @@ impl Qwen36MoeWeights {
             ffn_norm,
             &mut workspace.shared_gate,
             capacity,
-            false,
+            canonical_linears,
             stream,
         )
     }
@@ -5572,6 +5638,7 @@ impl Qwen36MoeWeights {
         residual: &DeviceBuffer<f32>,
         capacity: usize,
         stabilise_router_logits: bool,
+        canonical_linears: bool,
         stream: &CudaStream,
         parallel_moe: Option<Qwen36ParallelMoe<'_>>,
     ) -> Result<()> {
@@ -5583,6 +5650,7 @@ impl Qwen36MoeWeights {
                 workspace,
                 ffn_norm,
                 capacity,
+                canonical_linears,
                 parallel_moe.shared_stream,
             )?;
         }
@@ -5594,7 +5662,7 @@ impl Qwen36MoeWeights {
             ffn_norm,
             &mut workspace.router_logits,
             capacity,
-            false,
+            canonical_linears,
             stream,
         )?;
         if stabilise_router_logits {
@@ -5683,7 +5751,14 @@ impl Qwen36MoeWeights {
                 .record_on_stream(parallel_moe.shared_stream)?;
             stream.wait_event(parallel_moe.join)?;
         } else {
-            self.enqueue_shared_batch(model, workspace, ffn_norm, capacity, stream)?;
+            self.enqueue_shared_batch(
+                model,
+                workspace,
+                ffn_norm,
+                capacity,
+                canonical_linears,
+                stream,
+            )?;
         }
         qwen36_ffn_finalize_batch_f32_into_on_stream(
             &workspace.grouped.routed_output,

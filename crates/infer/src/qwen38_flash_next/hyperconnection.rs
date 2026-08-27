@@ -90,6 +90,26 @@ impl Qwen38HyperConnectionWeights {
         tokens: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
+        self.mix_inner(streams, workspace, tokens, false, stream)
+    }
+
+    pub(crate) fn mix_exact_two_rows<'a>(
+        &self,
+        streams: &DeviceBuffer<f32>,
+        workspace: &'a mut Qwen38HyperConnectionWorkspace,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        self.mix_inner(streams, workspace, 2, true, stream)
+    }
+
+    fn mix_inner<'a>(
+        &self,
+        streams: &DeviceBuffer<f32>,
+        workspace: &'a mut Qwen38HyperConnectionWorkspace,
+        tokens: usize,
+        exact_two_rows: bool,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
         workspace.require(self, tokens)?;
         qwen38_hc_norm_f32_into_on_stream(
             streams,
@@ -101,20 +121,40 @@ impl Qwen38HyperConnectionWeights {
             self.eps,
             stream,
         )?;
-        self.mix_down
-            .run_batch_into(&workspace.normed, &mut workspace.lowrank, tokens, stream)?;
+        if exact_two_rows {
+            self.mix_down.run_exact_two_rows_into(
+                &workspace.normed,
+                &mut workspace.lowrank,
+                stream,
+            )?;
+        } else {
+            self.mix_down.run_batch_into(
+                &workspace.normed,
+                &mut workspace.lowrank,
+                tokens,
+                stream,
+            )?;
+        }
         qwen38_hc_silu_scale_f32_in_place_on_stream(
             workspace.lowrank.inout(),
             tokens * self.lowrank,
             self.hc_count,
             stream,
         )?;
-        self.mix_up.run_batch_into(
-            &workspace.lowrank,
-            &mut workspace.gate_logits,
-            tokens,
-            stream,
-        )?;
+        if exact_two_rows {
+            self.mix_up.run_exact_two_rows_into(
+                &workspace.lowrank,
+                &mut workspace.gate_logits,
+                stream,
+            )?;
+        } else {
+            self.mix_up.run_batch_into(
+                &workspace.lowrank,
+                &mut workspace.gate_logits,
+                tokens,
+                stream,
+            )?;
+        }
         qwen38_hc_collapse_f32_into_on_stream(
             &workspace.normed,
             &workspace.gate_logits,
@@ -137,17 +177,66 @@ impl Qwen38HyperConnectionWeights {
         tokens: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        self.combine_inner(
+            residual_streams,
+            block_output,
+            workspace,
+            output_streams,
+            tokens,
+            false,
+            stream,
+        )
+    }
+
+    pub(crate) fn combine_exact_two_rows(
+        &self,
+        residual_streams: &DeviceBuffer<f32>,
+        block_output: &DeviceBuffer<f32>,
+        workspace: &mut Qwen38HyperConnectionWorkspace,
+        output_streams: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.combine_inner(
+            residual_streams,
+            block_output,
+            workspace,
+            output_streams,
+            2,
+            true,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn combine_inner(
+        &self,
+        residual_streams: &DeviceBuffer<f32>,
+        block_output: &DeviceBuffer<f32>,
+        workspace: &mut Qwen38HyperConnectionWorkspace,
+        output_streams: &mut DeviceBuffer<f32>,
+        tokens: usize,
+        exact_two_rows: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
         workspace.require(self, tokens)?;
         let inject = self.inject.as_ref().ok_or_else(|| Error::Format {
             label: "Qwen3.8 hyperconnection combine",
             detail: "the final mixer has no block injection weight".to_string(),
         })?;
-        inject.run_batch_into(
-            &workspace.normed,
-            &mut workspace.inject_logits,
-            tokens,
-            stream,
-        )?;
+        if exact_two_rows {
+            inject.run_exact_two_rows_into(
+                &workspace.normed,
+                &mut workspace.inject_logits,
+                stream,
+            )?;
+        } else {
+            inject.run_batch_into(
+                &workspace.normed,
+                &mut workspace.inject_logits,
+                tokens,
+                stream,
+            )?;
+        }
         qwen38_hc_combine_f32_into_on_stream(
             residual_streams,
             block_output,

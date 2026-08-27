@@ -2991,6 +2991,14 @@ impl GroupedGemvWorkspace {
             + self.zero.device_bytes()
     }
 
+    pub(crate) fn copy_outputs_to_host(&self, stream: &CudaStream) -> Result<Vec<f32>> {
+        let mut host = Vec::new();
+        for output in &self.outputs {
+            host.extend_from_slice(&output.data().copy_to_host(stream)?);
+        }
+        Ok(host)
+    }
+
     pub fn run_indexed_gate_up_device_route(
         &self,
         route: &MoeRouteWorkspace,

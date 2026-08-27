@@ -40,6 +40,15 @@ pub struct Qwen38PleWorkspace {
     ple_dim: usize,
 }
 
+/// Two-row PLE verifier workspace with canonical row-serial transforms.
+pub(crate) struct Qwen38ExactPleWorkspace {
+    gathered: DeviceBuffer<f32>,
+    row_query: DeviceBuffer<f32>,
+    row: Qwen38PleWorkspace,
+    output: DeviceBuffer<f32>,
+    frontier_conv: DeviceBuffer<f32>,
+}
+
 /// Per-sequence causal PLE convolution state with transactional rollback.
 pub struct Qwen38PleState {
     conv: DeviceBuffer<f32>,
@@ -179,6 +188,151 @@ impl Qwen38PleWeights {
         )?;
         Ok((&workspace.output, read))
     }
+
+    pub(crate) fn run_exact_two_rows<'a>(
+        &self,
+        pager: &mut Qwen38PagedPle,
+        query_streams: &DeviceBuffer<f32>,
+        state: &mut Qwen38PleState,
+        workspace: &'a mut Qwen38ExactPleWorkspace,
+        stream: &CudaStream,
+    ) -> Result<(&'a DeviceBuffer<f32>, PagedBf16ReadStats)> {
+        let read = pager.gather_into_on_stream(workspace.gathered.output(), stream)?;
+        let hc_dim = self.hidden * self.hc_count;
+        for row in 0..2 {
+            workspace.row.embeddings.copy_range_from_device_on_stream(
+                0,
+                &workspace.gathered,
+                row * self.ple_dim,
+                self.ple_dim,
+                stream,
+            )?;
+            workspace.row_query.copy_range_from_device_on_stream(
+                0,
+                query_streams,
+                row * hc_dim,
+                hc_dim,
+                stream,
+            )?;
+            self.key.run_batch_into(
+                &workspace.row.embeddings,
+                &mut workspace.row.key,
+                1,
+                stream,
+            )?;
+            self.value.run_batch_into(
+                &workspace.row.embeddings,
+                &mut workspace.row.value,
+                1,
+                stream,
+            )?;
+            qwen38_hc_norm_f32_into_on_stream(
+                &workspace.row.key,
+                &self.key_norm_delta,
+                workspace.row.key_normed.output(),
+                1,
+                self.hidden,
+                self.hc_count,
+                self.eps,
+                stream,
+            )?;
+            qwen38_hc_norm_f32_into_on_stream(
+                &workspace.row_query,
+                &self.query_norm_delta,
+                workspace.row.query_normed.output(),
+                1,
+                self.hidden,
+                self.hc_count,
+                self.eps,
+                stream,
+            )?;
+            qwen38_ple_gate_value_f32_into_on_stream(
+                &workspace.row.key_normed,
+                &workspace.row.query_normed,
+                &workspace.row.value,
+                workspace.row.gated.output(),
+                1,
+                self.hidden,
+                self.hc_count,
+                stream,
+            )?;
+            qwen38_hc_norm_f32_into_on_stream(
+                &workspace.row.gated,
+                &self.conv_norm_delta,
+                workspace.row.conv_normed.output(),
+                1,
+                self.hidden,
+                self.hc_count,
+                self.eps,
+                stream,
+            )?;
+            qwen38_ple_conv_update_f32_into_on_stream(
+                &workspace.row.conv_normed,
+                &workspace.row.gated,
+                &self.conv_weight,
+                &mut state.conv,
+                workspace.row.output.output(),
+                1,
+                hc_dim,
+                self.conv_kernel,
+                self.conv_dilation,
+                stream,
+            )?;
+            if row == 0 {
+                workspace.frontier_conv.copy_prefix_from_device_on_stream(
+                    &state.conv,
+                    state.conv.len(),
+                    stream,
+                )?;
+            }
+            workspace.output.copy_range_from_device_on_stream(
+                row * hc_dim,
+                &workspace.row.output,
+                0,
+                hc_dim,
+                stream,
+            )?;
+        }
+        Ok((&workspace.output, read))
+    }
+}
+
+impl Qwen38ExactPleWorkspace {
+    pub(crate) fn new(config: &Qwen38FlashNextConfig) -> Result<Self> {
+        let hc_dim = config.hidden * config.hc_count;
+        Ok(Self {
+            gathered: DeviceBuffer::zeroed(2 * config.ple_embedding_dim)?,
+            row_query: DeviceBuffer::zeroed(hc_dim)?,
+            row: Qwen38PleWorkspace::new(config, 1)?,
+            output: DeviceBuffer::zeroed(2 * hc_dim)?,
+            frontier_conv: DeviceBuffer::zeroed(
+                hc_dim * (config.ple_conv_kernel - 1) * config.ngram_size,
+            )?,
+        })
+    }
+
+    pub(crate) fn restore_frontier_state(
+        &self,
+        state: &mut Qwen38PleState,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if !state.append_pending || self.frontier_conv.len() != state.conv.len() {
+            return Err(Error::Shape {
+                label: "Qwen3.8 exact PLE frontier state",
+                expected: format!("pending state with {} values", self.frontier_conv.len()),
+                actual: format!(
+                    "pending={} state_values={}",
+                    state.append_pending,
+                    state.conv.len()
+                ),
+            });
+        }
+        state.conv.copy_prefix_from_device_on_stream(
+            &self.frontier_conv,
+            self.frontier_conv.len(),
+            stream,
+        )
+    }
 }
 
 impl Qwen38PleWorkspace {
@@ -283,41 +437,6 @@ impl Qwen38PleState {
             });
         }
         self.append_pending = false;
-        Ok(())
-    }
-
-    /// Restores the pre-append state and advances it through an accepted prefix.
-    pub(crate) fn restore_append_prefix(
-        &mut self,
-        weights: &Qwen38PleWeights,
-        workspace: &mut Qwen38PleWorkspace,
-        tokens: usize,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if !self.append_pending || tokens == 0 || tokens > workspace.token_capacity {
-            return Err(Error::Shape {
-                label: "Qwen3.8 PLE partial commit",
-                expected: format!("pending append and 1..={} tokens", workspace.token_capacity),
-                actual: format!("pending={} tokens={tokens}", self.append_pending),
-            });
-        }
-        self.conv.copy_prefix_from_device_on_stream(
-            &self.rollback,
-            self.channels * self.history,
-            stream,
-        )?;
-        qwen38_ple_conv_update_f32_into_on_stream(
-            &workspace.conv_normed,
-            &workspace.gated,
-            &weights.conv_weight,
-            &mut self.conv,
-            workspace.output.output(),
-            tokens,
-            self.channels,
-            weights.conv_kernel,
-            weights.conv_dilation,
-            stream,
-        )?;
         Ok(())
     }
 

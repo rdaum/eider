@@ -815,12 +815,16 @@ extern "C" cudaError_t infer_cutlass_fp4_grouped_gemv_f32_indexed_a_tiled_scales
     using ElementCompute = float;
     static constexpr int kVectorSize = 16;
     static constexpr int kElementsPerAccess = 128 / cutlass::sizeof_bits<ElementA>::value;
-    using ThreadShape = cutlass::gemm::GemmShape<16, 8>;
+    // GemvBlockScaled pipelines four K tiles at a time without predicating
+    // individual stages in its final group. Four K threads make one pipeline
+    // group 512 elements wide, which divides the model hidden widths used by
+    // the indexed routed gate/up path (including Flash Next K=2560).
+    using ThreadShape = cutlass::gemm::GemmShape<32, 4>;
     using EpilogueOp = SparkInferGemvF32Epilogue<
         kVectorSize, ThreadShape, ElementCompute, ElementAccumulator, ElementC, ElementC, LayoutC>;
     using BaseKernel = cutlass::gemm::kernel::GemvBlockScaled<
         ElementA, LayoutA, ElementB, ElementC, ElementAccumulatorMainloop, EpilogueOp,
-        kElementsPerAccess, 0, 0, cutlass::float_ue4m3_t, cutlass::float_ue4m3_t, 16>;
+        kElementsPerAccess, 128, 4, cutlass::float_ue4m3_t, cutlass::float_ue4m3_t, 16>;
     using IndexedKernel = SparkInferIndexedAGemvBlockScaled<BaseKernel>;
 
     typename EpilogueOp::Params epilogue{

@@ -24,10 +24,10 @@ use crate::nvfp4::{
     MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
     SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
-    Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    bf16_linear_pair_logits_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
+    bf16_linear_two_rows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
@@ -38,8 +38,9 @@ use crate::nvfp4::{
     gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
+    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
@@ -2260,6 +2261,22 @@ impl Bf16Linear {
             stream,
         )
     }
+
+    pub(crate) fn run_exact_two_rows_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        bf16_linear_two_rows_f32_into_on_stream(
+            input,
+            &self.weight,
+            output.output(),
+            self.rows,
+            self.cols,
+            stream,
+        )
+    }
 }
 
 fn read_bf16_matrix_device(
@@ -3004,6 +3021,33 @@ pub struct Qwen36MoeWorkspace {
     pub moe_out: DeviceBuffer<f32>,
     pub ffn_out: DeviceBuffer<f32>,
     pub ffn_residual: DeviceBuffer<f32>,
+}
+
+/// Two-row MoE verifier workspace that retains canonical per-row expert math.
+pub(crate) struct Qwen36ExactMoePairWorkspace {
+    inputs: Vec<DeviceBuffer<f32>>,
+    rows: Vec<Qwen36MoeWorkspace>,
+    router_logits: DeviceBuffer<f32>,
+    route_indices: DeviceBuffer<u32>,
+    route_weights: DeviceBuffer<f32>,
+    zero_hidden: DeviceBuffer<f32>,
+    output: DeviceBuffer<f32>,
+}
+
+pub(crate) struct Qwen36MoeProbeSnapshot {
+    pub(crate) router_logits: Vec<f32>,
+    pub(crate) route_indices: Vec<u32>,
+    pub(crate) route_weights: Vec<f32>,
+    pub(crate) gate_up_input_values: Vec<u8>,
+    pub(crate) gate_up_input_scales: Vec<u8>,
+    pub(crate) routed_output: Vec<f32>,
+    pub(crate) routed_gate_up: Vec<f32>,
+    pub(crate) repeated_routed_gate_up: Option<Vec<f32>>,
+    pub(crate) oracle_routed_gate_up: Option<Vec<f32>>,
+    pub(crate) routed_down_slots: Vec<f32>,
+    pub(crate) shared_gate_logits: Vec<f32>,
+    pub(crate) shared_output: Vec<f32>,
+    pub(crate) final_output: Vec<f32>,
 }
 
 /// Device-ready dense SwiGLU feed-forward weights used by Qwen3.8.
@@ -4568,6 +4612,192 @@ impl Qwen36MoeWeights {
         )
     }
 
+    /// Runs two rows with one exact router/top-k batch and canonical per-row
+    /// routed and shared expert kernels.
+    pub(crate) fn run_exact_pair<'a>(
+        &self,
+        workspace: &'a mut Qwen36ExactMoePairWorkspace,
+        manifest: &QwenModelManifest,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        if ffn_norm.len() < 2 * manifest.hidden
+            || self.storage_plan.down != Qwen36DownStorage::Legacy
+            || !matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4)
+            || self.grouped.is_none()
+            || self.expert_pager.borrow().is_some()
+        {
+            return Err(Error::Format {
+                label: "Qwen exact MoE pair",
+                detail: "requires two rows of resident W4A4 experts with legacy down storage"
+                    .to_string(),
+            });
+        }
+
+        bf16_linear_two_rows_f32_into_on_stream(
+            ffn_norm,
+            &self.router.weight,
+            workspace.router_logits.output(),
+            self.num_experts,
+            manifest.hidden,
+            stream,
+        )?;
+        moe_topk_f32_batch_into_on_stream(
+            &workspace.router_logits,
+            workspace.route_indices.output(),
+            workspace.route_weights.output(),
+            2,
+            self.num_experts,
+            self.experts_per_token,
+            self.norm_topk_prob,
+            stream,
+        )?;
+
+        for row in 0..2 {
+            let row_workspace = &mut workspace.rows[row];
+            workspace.inputs[row].copy_range_from_device_on_stream(
+                0,
+                ffn_norm,
+                row * manifest.hidden,
+                manifest.hidden,
+                stream,
+            )?;
+            row_workspace
+                .route
+                .indices
+                .copy_range_from_device_on_stream(
+                    0,
+                    &workspace.route_indices,
+                    row * self.experts_per_token,
+                    self.experts_per_token,
+                    stream,
+                )?;
+            row_workspace
+                .route
+                .weights
+                .copy_range_from_device_on_stream(
+                    0,
+                    &workspace.route_weights,
+                    row * self.experts_per_token,
+                    self.experts_per_token,
+                    stream,
+                )?;
+            quantize_nvfp4_col_major_f32_device_into_on_stream(
+                manifest.hidden,
+                1,
+                &workspace.inputs[row],
+                &mut row_workspace.gate_up_input,
+                1.0,
+                stream,
+            )?;
+            self.run_grouped_gate_up_only(row_workspace, stream)?;
+            let gate_up_table = &row_workspace
+                .grouped_gate_up
+                .as_ref()
+                .expect("resident W4A4 gate/up workspace")
+                .c;
+            let grouped_down = row_workspace
+                .grouped_down
+                .as_mut()
+                .expect("resident W4A4 down workspace");
+            crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+                MoeSiluQuantizeSlotBuffers {
+                    indices: &row_workspace.route.indices,
+                    gate_up_table,
+                    packed_table: grouped_down.input_values_mut.output(),
+                    scales_table: grouped_down.input_scales_mut.output(),
+                    input_scale_table: &self.expert_ptrs.down_input_scales,
+                    gate_up_alpha_table: &self.gate_up_unity_alphas,
+                },
+                grouped_down.inputs[0].rows,
+                stream,
+            )?;
+            fill_f32_into_on_stream(row_workspace.moe_out.output(), 0.0, stream)?;
+            if !grouped_down.run_prequantized_device_route(
+                &row_workspace.route,
+                &self.expert_ptrs,
+                &mut row_workspace.moe_out,
+                stream,
+            )? {
+                return Err(Error::Format {
+                    label: "Qwen exact MoE pair",
+                    detail: "grouped down rejected a canonical route".to_string(),
+                });
+            }
+            self.run_shared_gate_up(row_workspace, &workspace.inputs[row], stream)?;
+            silu_mul_halves_f32_into_on_stream(
+                &row_workspace.shared_gate_up_output,
+                row_workspace.shared_activated.output(),
+                self.expert_intermediate,
+                stream,
+            )?;
+            self.run_shared_down(row_workspace, stream)?;
+            self.shared_gate.run_into(
+                &workspace.inputs[row],
+                &mut row_workspace.shared_gate_logits,
+                stream,
+            )?;
+            qwen36_ffn_finalize_f32_into_on_stream(
+                &row_workspace.moe_out,
+                &row_workspace.shared_gate_logits,
+                &row_workspace.shared_output,
+                &workspace.zero_hidden,
+                row_workspace.ffn_residual.output(),
+                stream,
+            )?;
+            std::mem::swap(&mut row_workspace.ffn_out, &mut row_workspace.ffn_residual);
+            workspace.output.copy_range_from_device_on_stream(
+                row * manifest.hidden,
+                &row_workspace.ffn_out,
+                0,
+                manifest.hidden,
+                stream,
+            )?;
+        }
+        Ok(&workspace.output)
+    }
+
+    pub(crate) fn probe_repeat_exact_pair_gate_up(
+        &self,
+        workspace: &mut Qwen36ExactMoePairWorkspace,
+        stream: &CudaStream,
+    ) -> Result<Vec<Qwen36MoeProbeSnapshot>> {
+        let mut snapshots = workspace.probe_snapshots(
+            self.num_experts,
+            self.experts_per_token,
+            workspace.inputs[0].len(),
+            stream,
+        )?;
+        for (row, snapshot) in snapshots.iter_mut().enumerate() {
+            self.run_grouped_gate_up_only(&mut workspace.rows[row], stream)?;
+            snapshot.repeated_routed_gate_up = Some(
+                workspace.rows[row]
+                    .grouped_gate_up
+                    .as_ref()
+                    .expect("exact pair grouped gate/up")
+                    .copy_outputs_to_host(stream)?,
+            );
+        }
+        Ok(snapshots)
+    }
+
+    pub(crate) fn probe_repeat_workspace_gate_up(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        stream: &CudaStream,
+    ) -> Result<Qwen36MoeProbeSnapshot> {
+        let mut snapshot = workspace.probe_snapshot(stream)?;
+        self.run_grouped_gate_up_only(workspace, stream)?;
+        snapshot.repeated_routed_gate_up = Some(
+            workspace
+                .grouped_gate_up
+                .as_ref()
+                .expect("grouped gate/up workspace")
+                .copy_outputs_to_host(stream)?,
+        );
+        Ok(snapshot)
+    }
+
     /// Runs one token through the MoE + shared-expert FFN.
     ///
     /// `ffn_norm` is the post-attention-norm hidden vector; `residual` is the
@@ -5594,6 +5824,94 @@ impl Qwen36MoeWorkspace {
             moe_out: DeviceBuffer::zeroed(hidden)?,
             ffn_out: DeviceBuffer::zeroed(hidden)?,
             ffn_residual: DeviceBuffer::zeroed(hidden)?,
+        })
+    }
+}
+
+impl Qwen36ExactMoePairWorkspace {
+    pub(crate) fn new(manifest: &QwenModelManifest) -> Result<Self> {
+        let (experts, routes) = match manifest.ffn {
+            QwenFfnConfig::Moe {
+                experts,
+                experts_per_token,
+                ..
+            } => (experts, experts_per_token),
+            QwenFfnConfig::Dense => {
+                return Err(Error::Format {
+                    label: "Qwen exact MoE pair workspace",
+                    detail: "manifest is not MoE".to_string(),
+                });
+            }
+        };
+        Ok(Self {
+            inputs: (0..2)
+                .map(|_| DeviceBuffer::zeroed(manifest.hidden))
+                .collect::<Result<Vec<_>>>()?,
+            rows: (0..2)
+                .map(|_| Qwen36MoeWorkspace::new(manifest))
+                .collect::<Result<Vec<_>>>()?,
+            router_logits: DeviceBuffer::zeroed(2 * experts)?,
+            route_indices: DeviceBuffer::zeroed(2 * routes)?,
+            route_weights: DeviceBuffer::zeroed(2 * routes)?,
+            zero_hidden: DeviceBuffer::zeroed(manifest.hidden)?,
+            output: DeviceBuffer::zeroed(2 * manifest.hidden)?,
+        })
+    }
+
+    pub(crate) fn output(&self) -> &DeviceBuffer<f32> {
+        &self.output
+    }
+
+    pub(crate) fn probe_snapshots(
+        &self,
+        experts: usize,
+        routes: usize,
+        hidden: usize,
+        stream: &CudaStream,
+    ) -> Result<Vec<Qwen36MoeProbeSnapshot>> {
+        let router_logits = self.router_logits.copy_to_host(stream)?;
+        let route_indices = self.route_indices.copy_to_host(stream)?;
+        let route_weights = self.route_weights.copy_to_host(stream)?;
+        let output = self.output.copy_to_host(stream)?;
+        (0..2)
+            .map(|row| {
+                let mut snapshot = self.rows[row].probe_snapshot(stream)?;
+                snapshot.router_logits = router_logits[row * experts..(row + 1) * experts].to_vec();
+                snapshot.route_indices = route_indices[row * routes..(row + 1) * routes].to_vec();
+                snapshot.route_weights = route_weights[row * routes..(row + 1) * routes].to_vec();
+                snapshot.final_output = output[row * hidden..(row + 1) * hidden].to_vec();
+                Ok(snapshot)
+            })
+            .collect()
+    }
+}
+
+impl Qwen36MoeWorkspace {
+    pub(crate) fn probe_snapshot(&self, stream: &CudaStream) -> Result<Qwen36MoeProbeSnapshot> {
+        Ok(Qwen36MoeProbeSnapshot {
+            router_logits: self.router_logits.copy_to_host(stream)?.into_vec(),
+            route_indices: self.route.indices.copy_to_host(stream)?.into_vec(),
+            route_weights: self.route.weights.copy_to_host(stream)?.into_vec(),
+            gate_up_input_values: self.gate_up_input.copy_values_to_host(stream)?.into_vec(),
+            gate_up_input_scales: self.gate_up_input.copy_scales_to_host(stream)?.into_vec(),
+            routed_output: self.moe_out.copy_to_host(stream)?.into_vec(),
+            routed_gate_up: self
+                .grouped_gate_up
+                .as_ref()
+                .map(|workspace| workspace.copy_outputs_to_host(stream))
+                .transpose()?
+                .unwrap_or_default(),
+            repeated_routed_gate_up: None,
+            oracle_routed_gate_up: None,
+            routed_down_slots: self
+                .grouped_down
+                .as_ref()
+                .map(|workspace| workspace.gemv.copy_outputs_to_host(stream))
+                .transpose()?
+                .unwrap_or_default(),
+            shared_gate_logits: self.shared_gate_logits.copy_to_host(stream)?.into_vec(),
+            shared_output: self.shared_output.copy_to_host(stream)?.into_vec(),
+            final_output: self.ffn_out.copy_to_host(stream)?.into_vec(),
         })
     }
 }
@@ -6890,6 +7208,38 @@ impl Qwen36LmHead {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn run_bf16_exact_two_rows_top1(
+        &self,
+        input: &DeviceBuffer<f32>,
+        logits: &mut DeviceBuffer<f32>,
+        output_indices: &mut DeviceBuffer<u32>,
+        output_values: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let Self::Bf16(linear) = self else {
+            return Err(Error::Format {
+                label: "Qwen exact two-row lm_head",
+                detail: "the loaded vocabulary head is not BF16".to_string(),
+            });
+        };
+        bf16_linear_two_rows_f32_into_on_stream(
+            input,
+            &linear.weight,
+            logits.output(),
+            linear.rows,
+            linear.cols,
+            stream,
+        )?;
+        argmax_f32_batch_into_on_stream(
+            logits,
+            output_indices.output(),
+            output_values.output(),
+            2,
+            linear.rows,
+            stream,
+        )
     }
 
     pub(crate) fn run_logits(

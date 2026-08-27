@@ -18,8 +18,9 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. On one DGX Spark, it reaches 77 tokens/sec for cold
-prefill and 16–21 tokens/sec for decode with native MTP.
+day, August 26, 2026. On one DGX Spark, it reaches 83.8 tokens/sec for cold
+prefill and 11.7–12.1 tokens/sec for target-only decode during a live Pi
+session.
 
 The server runs the [Inferact NVFP4
 checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)
@@ -50,26 +51,31 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Performance
 
-These results come from Eider server telemetry on one DGX Spark. Eider uses one
-native MTP draft per target pass by default.
+These results come from Eider server telemetry on one DGX Spark. The table
+reports target-only decode so that it measures the target model directly.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold prefill | 77.0 tokens/sec | 1,822 prompt tokens, no cached prefix |
-| Short-prompt decode | 19.3 tokens/sec | 32 output tokens, 16/16 drafts accepted |
-| Mixed-acceptance decode | 16.6 tokens/sec | 128 output tokens, 53/74 drafts accepted |
-| Cached-prefix decode | 20.9 tokens/sec | 1,792 cached prompt tokens, 4/4 drafts accepted |
-| Cached-prefix time to first token | 598 ms | 30 uncached prompt tokens |
+| Cold Pi prefill | 83.8 tokens/sec | 5,801 prompt tokens, no cached prefix |
+| Cold Pi time to first token | 69.2 sec | Same first Pi turn |
+| Cached Pi prefill | 75.5–77.1 tokens/sec | 154–778 new prompt tokens |
+| Cached Pi time to first token | 2.03–10.0 sec | 5,760–6,016 cached prompt tokens |
+| Pi decode | 11.7–12.1 tokens/sec | Four completed tool turns, 58–512 output tokens |
 | Resident memory | 98 GiB | Active Pi use |
 
-Eider serves the QSA and MoE MTP block from the same checkpoint. The target
-model verifies each draft before Eider commits it. The 32-token comparison
-matched the target-only output exactly.
+Eider serves one speculative draft by default from the checkpoint's QSA and
+MoE MTP block. Set `EIDER_SPECULATIVE_DRAFTS=0` for target-only decode.
 
-The shared radix cache retains the target prefix and the MTP QSA prefix. Thus,
-Pi follow-up turns keep MTP speculation after a prefix-cache hit.
+The MTP path uses an exact two-row target verifier with transactional partial
+acceptance. Its fixed greedy probe matched 64 of 64 canonical target decisions
+and preserved recurrent state bitwise.
 
-Set `EIDER_SPECULATIVE_DRAFTS=0` to measure target-only decoding.
+The exact verifier processes 14.39–14.50 target rows/sec. In an end-to-end
+256-token request, MTP reached 11.47 output tokens/sec with 67.3% draft
+acceptance.
+
+The shared radix cache retains the target prefix and the MTP QSA prefix. Pi
+follow-up turns keep MTP speculation after a prefix-cache hit.
 
 These values are server telemetry, not isolated kernel rates. The PLE n-gram
 table remains on NVMe, while the complete neural body stays resident in

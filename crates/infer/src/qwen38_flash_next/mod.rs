@@ -4,6 +4,7 @@ mod config;
 mod hyperconnection;
 mod model;
 mod ple;
+mod probe;
 mod qsa;
 mod transform;
 
@@ -11,13 +12,18 @@ pub use config::Qwen38FlashNextConfig;
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
-    Qwen38LogitsMode, Qwen38NextToken,
+    Qwen38LogitsMode, Qwen38NextToken, Qwen38VectorVerifierProbeMode,
 };
 pub(crate) use model::{
     Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace, Qwen38FlashNextPrefillWorkspace,
     Qwen38FlashNextSpeculativeFrontier, Qwen38FlashNextSpeculativeWorkspace,
 };
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
+pub use probe::{
+    Qwen38LayerDivergence, Qwen38VerificationMismatch, Qwen38VerificationProbeReport,
+    Qwen38VerificationStreamDifference, probe_verification_paths,
+};
+pub(crate) use transform::Qwen38ExactPleWorkspace;
 pub use transform::{Qwen38PleState, Qwen38PleWeights, Qwen38PleWorkspace};
 
 #[cfg(test)]

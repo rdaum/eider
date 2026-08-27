@@ -7678,6 +7678,67 @@ pub fn bf16_linear_logits_f32_batch_into_on_stream(
     }
 }
 
+/// Enqueues one BF16-weight projection for exactly two f32 input rows.
+///
+/// Each output uses the same accumulation and reduction order as two separate
+/// one-row projections. The kernel shares weight reads across the two rows.
+pub fn bf16_linear_two_rows_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
+    mut logits: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = 2usize.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "two-row BF16 linear input",
+        expected: "2 * cols without overflow".to_string(),
+        actual: format!("cols={cols}"),
+    })?;
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "two-row BF16 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let output_len = 2usize.checked_mul(rows).ok_or_else(|| Error::Shape {
+        label: "two-row BF16 linear output",
+        expected: "2 * rows without overflow".to_string(),
+        actual: format!("rows={rows}"),
+    })?;
+    if rows == 0
+        || cols == 0
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() < input_len
+        || weight.len() != weight_len
+        || logits.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "two-row BF16 linear buffers",
+            expected: format!("input={input_len} weight={weight_len} output={output_len}"),
+            actual: format!(
+                "input={} weight={} output={}",
+                input.len(),
+                weight.len(),
+                logits.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_bf16_linear_two_rows_f32_on_stream",
+            ffi::infer_bf16_linear_two_rows_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                logits.buffer_mut().ptr,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues two BF16-weight projections over the same f32 input as one CUDA grid.
 #[allow(clippy::too_many_arguments)]
 pub fn bf16_linear_pair_logits_f32_into_on_stream(
@@ -17726,6 +17787,100 @@ mod tests {
                 &expected.copy_to_host(&stream).expect("expected download"),
                 1.0e-6,
                 "batched BF16 linear",
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_linear_two_rows_matches_independent_rows_bitwise() {
+        let rows = 7usize;
+        let cols = 20usize;
+        let input = (0..2 * cols)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 37) as f32 - 18.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(2 * rows).expect("actual");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        bf16_linear_two_rows_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("two-row projection");
+        let actual = actual.copy_to_host(&stream).expect("actual download");
+        for input_row in 0..2 {
+            let row_input =
+                DeviceBuffer::from_host(&input[input_row * cols..(input_row + 1) * cols])
+                    .expect("row input");
+            let mut expected = DeviceBuffer::zeroed(rows).expect("expected");
+            bf16_linear_logits_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                &stream,
+            )
+            .expect("independent projection");
+            let expected = expected.copy_to_host(&stream).expect("expected download");
+            assert_eq!(
+                &actual[input_row * rows..(input_row + 1) * rows],
+                expected.as_slice(),
+                "two-row BF16 projection row {input_row}",
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_linear_two_rows_matches_qwen_router_shape_bitwise() {
+        let rows = 512usize;
+        let cols = 2_560usize;
+        let input = (0..2 * cols)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 37) as f32 - 18.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(2 * rows).expect("actual");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        bf16_linear_two_rows_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("two-row projection");
+        let actual = actual.copy_to_host(&stream).expect("actual download");
+        for input_row in 0..2 {
+            let row_input =
+                DeviceBuffer::from_host(&input[input_row * cols..(input_row + 1) * cols])
+                    .expect("row input");
+            let mut expected = DeviceBuffer::zeroed(rows).expect("expected");
+            bf16_linear_logits_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                &stream,
+            )
+            .expect("independent projection");
+            let expected = expected.copy_to_host(&stream).expect("expected download");
+            assert_eq!(
+                &actual[input_row * rows..(input_row + 1) * rows],
+                expected.as_slice(),
+                "Qwen router projection row {input_row}",
             );
         }
     }

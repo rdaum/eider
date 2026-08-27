@@ -222,16 +222,12 @@ impl Qwen38PleTokenWindow {
         Ok(())
     }
 
-    /// Commits only the accepted prefix of the tokens hashed in this append.
-    pub(crate) fn restore_append_prefix(&mut self, tokens: &[u32]) -> Result<()> {
-        let previous = self
-            .rollback
-            .as_ref()
-            .ok_or_else(|| Error::Format {
-                label: "Qwen3.8 PLE append",
-                detail: "no append transaction is active".to_string(),
-            })?
-            .clone();
+    /// Commits only a prefix of the tokens staged in the current transaction.
+    pub(crate) fn commit_append_prefix(&mut self, tokens: &[u32]) -> Result<()> {
+        let previous = self.rollback.take().ok_or_else(|| Error::Format {
+            label: "Qwen3.8 PLE append",
+            detail: "no append transaction is active".to_string(),
+        })?;
         self.previous = previous;
         for &token in tokens {
             self.push(token);
@@ -537,8 +533,8 @@ mod tests {
         let mut rows = Vec::new();
         plan.hash_and_append(&mut window, 2, &mut rows)
             .expect("first token");
-        let bigram = 2u64 * 3 ^ 99u64 * 5;
-        let trigram = bigram ^ 99u64 * 7;
+        let bigram = (2u64 * 3) ^ (99u64 * 5);
+        let trigram = bigram ^ (99u64 * 7);
         for head in 0..8 {
             assert_eq!(
                 rows[head] as u64,
@@ -558,7 +554,7 @@ mod tests {
         rows.clear();
         plan.hash_and_append(&mut window, 4, &mut rows)
             .expect("new segment");
-        let reset_bigram = 4u64 * 3 ^ 99u64 * 5;
+        let reset_bigram = (4u64 * 3) ^ (99u64 * 5);
         assert_eq!(rows[0] as u64, offsets[0] + reset_bigram % vocab_sizes[0]);
 
         window.abort_append().expect("rollback");
@@ -581,6 +577,22 @@ mod tests {
 
         window.restore_from(&snapshot).expect("restore");
         assert_eq!(window, snapshot);
+    }
+
+    #[test]
+    fn partial_append_commits_only_the_accepted_prefix() {
+        let mut partial = Qwen38PleTokenWindow::new(3, 99).expect("partial window");
+        partial.begin_append().expect("partial transaction");
+        partial.push(7);
+        partial.push(11);
+        partial.commit_append_prefix(&[7]).expect("partial commit");
+
+        let mut serial = Qwen38PleTokenWindow::new(3, 99).expect("serial window");
+        serial.begin_append().expect("serial transaction");
+        serial.push(7);
+        serial.commit_append().expect("serial commit");
+
+        assert_eq!(partial, serial);
     }
 
     #[test]

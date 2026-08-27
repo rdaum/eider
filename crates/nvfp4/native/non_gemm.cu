@@ -6737,6 +6737,84 @@ __global__ void infer_bf16_matvec_logits_batch_kernel(
     if (threadIdx.x == 0) logits[batch * rows + row] = partial[0];
 }
 
+// Projects two independent input rows while loading each BF16 weight once.
+// Both accumulators use the one-row kernel's operation and reduction order.
+__global__ void infer_bf16_matvec_two_rows_kernel(
+    const float* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    float* __restrict__ logits,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    extern __shared__ float shared[];
+    const std::uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    float* partial0 = shared;
+    float* partial1 = partial0 + blockDim.x;
+    float* input0 = partial1 + blockDim.x;
+    float* input1 = input0 + cols;
+    for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        input0[col] = input[col];
+        input1[col] = input[cols + col];
+    }
+    __syncthreads();
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const std::uint16_t* row_weight = weight + static_cast<std::size_t>(row) * cols;
+    if ((cols & 1u) == 0u) {
+        const std::uint32_t cols_aligned = cols & ~std::uint32_t(3u);
+        for (std::uint32_t col = threadIdx.x * 4; col < cols_aligned; col += blockDim.x * 4) {
+            const __nv_bfloat162 w0 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col);
+            const __nv_bfloat162 w1 =
+                *reinterpret_cast<const __nv_bfloat162*>(row_weight + col + 2);
+            const float w0x = __bfloat162float(__low2bfloat16(w0));
+            const float w0y = __bfloat162float(__high2bfloat16(w0));
+            const float w1x = __bfloat162float(__low2bfloat16(w1));
+            const float w1y = __bfloat162float(__high2bfloat16(w1));
+            acc0 = __fmaf_rn(w0x, input0[col], acc0);
+            acc0 = __fmaf_rn(w0y, input0[col + 1], acc0);
+            acc0 = __fmaf_rn(w1x, input0[col + 2], acc0);
+            acc0 = __fmaf_rn(w1y, input0[col + 3], acc0);
+            acc1 = __fmaf_rn(w0x, input1[col], acc1);
+            acc1 = __fmaf_rn(w0y, input1[col + 1], acc1);
+            acc1 = __fmaf_rn(w1x, input1[col + 2], acc1);
+            acc1 = __fmaf_rn(w1y, input1[col + 3], acc1);
+        }
+        for (std::uint32_t col = cols_aligned + threadIdx.x; col < cols;
+             col += blockDim.x) {
+            const __nv_bfloat16 w =
+                *reinterpret_cast<const __nv_bfloat16*>(row_weight + col);
+            const float value = __bfloat162float(w);
+            acc0 = __fmaf_rn(value, input0[col], acc0);
+            acc1 = __fmaf_rn(value, input1[col], acc1);
+        }
+    } else {
+        for (std::uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+            const __nv_bfloat16 w =
+                *reinterpret_cast<const __nv_bfloat16*>(row_weight + col);
+            const float value = __bfloat162float(w);
+            acc0 = __fmaf_rn(value, input0[col], acc0);
+            acc1 = __fmaf_rn(value, input1[col], acc1);
+        }
+    }
+    partial0[threadIdx.x] = acc0;
+    partial1[threadIdx.x] = acc1;
+    __syncthreads();
+    for (std::uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial0[threadIdx.x] += partial0[threadIdx.x + stride];
+            partial1[threadIdx.x] += partial1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        logits[row] = partial0[0];
+        logits[rows + row] = partial1[0];
+    }
+}
+
 __global__ void infer_argmax_f32_kernel(const float* values,
                                               std::uint32_t* out_index,
                                               float* out_value,
@@ -7709,6 +7787,31 @@ extern "C" cudaError_t infer_bf16_linear_logits_f32_batch_on_stream(
     infer_bf16_matvec_logits_reuse_weights_batch_kernel<<<
         dim3((rows + warps - 1) / warps, (batch_size + kBatchTile - 1) / kBatchTile),
         kThreads, 0, stream>>>(input, weight, logits, batch_size, rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_bf16_linear_two_rows_f32_on_stream(
+    const float* input,
+    const std::uint16_t* weight,
+    float* logits,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || logits == nullptr || rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::size_t shmem =
+        (2 * kThreads + 2 * static_cast<std::size_t>(cols)) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_bf16_matvec_two_rows_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shmem));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
+    infer_bf16_matvec_two_rows_kernel<<<rows, kThreads, shmem, stream>>>(
+        input, weight, logits, rows, cols);
     return cudaGetLastError();
 }
 
