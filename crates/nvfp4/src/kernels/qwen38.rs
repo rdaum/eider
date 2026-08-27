@@ -697,25 +697,28 @@ mod tests {
 
     #[test]
     fn qsa_paged_selector_matches_released_micro_block_formula() {
+        assert_qsa_paged_selector(2_059, 2_176);
+        assert_qsa_paged_selector(16_515, 16_640);
+    }
+
+    fn assert_qsa_paged_selector(cache_len: usize, max_tokens: usize) {
         const HEADS: usize = 4;
         const HEAD_DIM: usize = 128;
         const ROTARY_DIM: usize = 64;
         const COMPRESS: usize = 4;
         const BUDGET: usize = 2_048;
-        const CACHE_LEN: usize = 2_059;
-        const MAX_TOKENS: usize = 2_176;
         const EPS: f32 = 1e-6;
         const THETA: f32 = 10_000_000.0;
 
-        let logical_pages = MAX_TOKENS.div_ceil(crate::SM12X_KV_PAGE_TOKENS);
+        let logical_pages = max_tokens.div_ceil(crate::SM12X_KV_PAGE_TOKENS);
         let slots = (0..logical_pages)
             .map(|page| ((page * 7) % logical_pages) as u32)
             .collect::<Vec<_>>();
         let page_table = DeviceBuffer::from_host(&slots).expect("page table");
         let mut pool = Qwen38QsaIndexPool::new(logical_pages, HEAD_DIM).expect("index pool");
         let mut physical = vec![0u16; logical_pages * crate::SM12X_KV_PAGE_TOKENS * HEAD_DIM];
-        let mut logical = vec![0u16; CACHE_LEN * HEAD_DIM];
-        for token in 0..CACHE_LEN {
+        let mut logical = vec![0u16; cache_len * HEAD_DIM];
+        for token in 0..cache_len {
             for dim in 0..HEAD_DIM {
                 let value = (((token * 17 + dim * 13) % 257) as f32 - 128.0) / 96.0;
                 let encoded = f32_to_bf16(value);
@@ -734,7 +737,7 @@ mod tests {
             .map(|index| ((index * 29 % 251) as f32 - 125.0) / 80.0)
             .collect::<Vec<_>>();
         for dim in 0..HEAD_DIM {
-            logical[(CACHE_LEN - 1) * HEAD_DIM + dim] =
+            logical[(cache_len - 1) * HEAD_DIM + dim] =
                 f32_to_bf16(projection_host[HEADS * HEAD_DIM + dim]);
         }
         let projection = DeviceBuffer::from_host(&projection_host).expect("projection");
@@ -747,10 +750,10 @@ mod tests {
         let q_norm = DeviceBuffer::from_host(&q_norm_host).expect("q norm");
         let k_norm = DeviceBuffer::from_host(&k_norm_host).expect("k norm");
         let mut workspace =
-            Qwen38QsaSelectionWorkspace::new(MAX_TOKENS, HEADS, HEAD_DIM, COMPRESS, BUDGET)
+            Qwen38QsaSelectionWorkspace::new(max_tokens, HEADS, HEAD_DIM, COMPRESS, BUDGET)
                 .expect("selector");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        let last_page = CACHE_LEN - 1;
+        let last_page = cache_len - 1;
         let last_slot = slots[last_page / crate::SM12X_KV_PAGE_TOKENS] as usize;
         let selected_tokens = workspace
             .prepare_and_select_on_stream(
@@ -761,7 +764,7 @@ mod tests {
                 &page_table,
                 last_slot,
                 last_page % crate::SM12X_KV_PAGE_TOKENS,
-                CACHE_LEN,
+                cache_len,
                 ROTARY_DIM,
                 EPS,
                 THETA,
@@ -769,7 +772,7 @@ mod tests {
             )
             .expect("select")
             .selected_tokens;
-        assert_eq!(selected_tokens, BUDGET + CACHE_LEN % COMPRESS);
+        assert_eq!(selected_tokens, BUDGET + cache_len % COMPRESS);
 
         let query_actual = workspace
             .query()
@@ -795,13 +798,14 @@ mod tests {
             query_expected[head * HEAD_DIM..(head + 1) * HEAD_DIM].copy_from_slice(&rope(
                 &normalized,
                 ROTARY_DIM,
-                CACHE_LEN - 1,
+                cache_len - 1,
                 THETA,
             ));
         }
-        assert_close(&query_actual, &query_expected, 5e-4);
+        let rope_tolerance = if cache_len <= 4_096 { 5e-4 } else { 5e-3 };
+        assert_close(&query_actual, &query_expected, rope_tolerance);
 
-        let complete_blocks = CACHE_LEN / COMPRESS;
+        let complete_blocks = cache_len / COMPRESS;
         let mut scores_expected = vec![0.0f32; complete_blocks];
         for block in 0..complete_blocks {
             let mut pooled = vec![0.0; HEAD_DIM];
@@ -838,15 +842,15 @@ mod tests {
                 .total_cmp(&scores_expected[left])
                 .then_with(|| left.cmp(&right))
         });
-        let mut blocks_expected = vec![0u8; MAX_TOKENS.div_ceil(COMPRESS)];
+        let mut blocks_expected = vec![0u8; max_tokens.div_ceil(COMPRESS)];
         for &block in &ranking[..BUDGET / COMPRESS] {
             blocks_expected[block] = 1;
         }
-        if !CACHE_LEN.is_multiple_of(COMPRESS) {
+        if !cache_len.is_multiple_of(COMPRESS) {
             blocks_expected[complete_blocks] = 1;
         }
         assert_eq!(&*blocks_actual, &blocks_expected);
-        let mut tiles_expected = vec![0u8; MAX_TOKENS.div_ceil(64)];
+        let mut tiles_expected = vec![0u8; max_tokens.div_ceil(64)];
         for (block, &selected) in blocks_expected.iter().enumerate() {
             if selected != 0 {
                 tiles_expected[block / 16] = 1;

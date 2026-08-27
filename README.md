@@ -56,9 +56,9 @@ session. The server used the native 262K context profile.
 | --- | ---: | --- |
 | Cold prefill | About 200 tokens/sec | 5.8K prompt tokens, no cached prefix |
 | Cold time to first token | About 29 sec | Same first turn |
-| Cached prefill | About 170 tokens/sec | 1.2K new tokens after a 5.8K-token cache hit |
-| Cached time to first token | About 7 sec | Same follow-up turn |
-| Decode | About 12–14 tokens/sec | MTP-assisted tool turns |
+| Cached prefill | About 170 tokens/sec | About 200 new tokens after a 5.8K-token cache hit |
+| Cached time to first token | About 1 sec | Same follow-up turn |
+| Decode | About 13 tokens/sec | MTP-assisted follow-up turn |
 | Resident memory | About 95 GiB | Active Pi use |
 
 The prefill path batches QSA projections and uses BF16 tensor cores for

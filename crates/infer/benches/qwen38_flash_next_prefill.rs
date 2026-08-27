@@ -48,8 +48,13 @@ impl BenchContext for HyperPrefillBench {
 
 impl BenchContext for QsaPrefillBench {
     fn prepare(_num_chunks: usize) -> Self {
-        let mut qsa = Qwen38QsaPrefillMicrobench::open(model_dir(), bench_tokens())
-            .expect("load Qwen3.8 QSA layer");
+        let mut qsa = Qwen38QsaPrefillMicrobench::open_with_context(
+            model_dir(),
+            bench_tokens(),
+            qsa_start_position(),
+            qsa_max_context_tokens(),
+        )
+        .expect("load Qwen3.8 QSA layer");
         let quality = qsa.validate().expect("validate batched QSA prefill");
         assert!(
             quality.max_abs_error <= 0.005
@@ -210,8 +215,37 @@ fn bench_tokens() -> usize {
         .unwrap_or(64)
 }
 
+fn qsa_max_context_tokens() -> usize {
+    std::env::var("QWEN38_QSA_BENCH_MAX_CONTEXT")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("QWEN38_QSA_BENCH_MAX_CONTEXT is an integer")
+        })
+        .unwrap_or(nvfp4::SM12X_KV_PAGE_TOKENS)
+}
+
+fn qsa_start_position() -> usize {
+    std::env::var("QWEN38_QSA_BENCH_START_POSITION")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("QWEN38_QSA_BENCH_START_POSITION is an integer")
+        })
+        .unwrap_or(0)
+}
+
 fn main() {
     let tokens = bench_tokens();
+    let qsa_max_context = qsa_max_context_tokens();
+    let qsa_group = match qsa_max_context {
+        128 => "Qwen3.8 Flash Next QSA prefill context 128",
+        16_384 => "Qwen3.8 Flash Next QSA prefill context 16K",
+        262_144 => "Qwen3.8 Flash Next QSA prefill context 262K",
+        _ => "Qwen3.8 Flash Next QSA prefill custom context",
+    };
     run_benchmark_main(
         BenchmarkMainOptions {
             suite: Some("qwen38-flash-next-prefill".to_string()),
@@ -226,7 +260,7 @@ fn main() {
             ..BenchmarkMainOptions::default()
         },
         |runner| {
-            runner.group::<QsaPrefillBench>("Qwen3.8 Flash Next QSA prefill", |group| {
+            runner.group::<QsaPrefillBench>(qsa_group, |group| {
                 let group = group
                     .throughput(Throughput::per_operation(tokens as u64, "tokens"))
                     .measurement_domain(MeasurementDomain::Gpu);

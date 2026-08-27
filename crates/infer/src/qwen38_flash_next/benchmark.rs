@@ -30,6 +30,7 @@ pub struct Qwen38QsaPrefillMicrobench {
     layer_mask: Vec<bool>,
     layer: usize,
     tokens: usize,
+    start_position: usize,
     lt: CublasLt,
     stream: CudaStream,
     weights: Qwen38QsaWeights,
@@ -170,11 +171,41 @@ impl Qwen38HyperPrefillMicrobench {
 impl Qwen38QsaPrefillMicrobench {
     /// Loads the first QSA layer and allocates one-page serial and batched fixtures.
     pub fn open(model_dir: impl AsRef<Path>, tokens: usize) -> Result<Self> {
-        if tokens == 0 || tokens > SM12X_KV_PAGE_TOKENS {
+        Self::open_with_context(model_dir, tokens, 0, SM12X_KV_PAGE_TOKENS)
+    }
+
+    /// Loads one QSA layer with an explicit logical context capacity.
+    pub fn open_with_max_context(
+        model_dir: impl AsRef<Path>,
+        tokens: usize,
+        max_context_tokens: usize,
+    ) -> Result<Self> {
+        Self::open_with_context(model_dir, tokens, 0, max_context_tokens)
+    }
+
+    /// Loads one QSA layer at an explicit prompt position and context capacity.
+    pub fn open_with_context(
+        model_dir: impl AsRef<Path>,
+        tokens: usize,
+        start_position: usize,
+        max_context_tokens: usize,
+    ) -> Result<Self> {
+        if tokens == 0
+            || tokens > SM12X_KV_PAGE_TOKENS
+            || start_position
+                .checked_add(tokens)
+                .is_none_or(|end| end > max_context_tokens)
+            || !start_position.is_multiple_of(SM12X_KV_PAGE_TOKENS)
+            || !max_context_tokens.is_multiple_of(SM12X_KV_PAGE_TOKENS)
+        {
             return Err(crate::nvfp4::Error::Shape {
                 label: "Qwen3.8 QSA prefill microbenchmark tokens",
-                expected: format!("1..={SM12X_KV_PAGE_TOKENS}"),
-                actual: tokens.to_string(),
+                expected: format!(
+                    "tokens in 1..={SM12X_KV_PAGE_TOKENS} and page-aligned context >= tokens"
+                ),
+                actual: format!(
+                    "tokens={tokens} start={start_position} context={max_context_tokens}"
+                ),
             });
         }
         let model_dir = model_dir.as_ref();
@@ -201,7 +232,7 @@ impl Qwen38QsaPrefillMicrobench {
         let lt = CublasLt::new()?;
         let model = Qwen36BatchModelView::new(&lt, &manifest, &layer_mask);
         let batched_workspace =
-            weights.new_prefill_workspace(&model, &config, tokens, SM12X_KV_PAGE_TOKENS)?;
+            weights.new_prefill_workspace(&model, &config, tokens, max_context_tokens)?;
         let input_host = (0..tokens * config.hidden)
             .map(|index| {
                 let row = index / config.hidden;
@@ -225,17 +256,20 @@ impl Qwen38QsaPrefillMicrobench {
                 &config,
                 &manifest,
                 &weights,
-                SM12X_KV_PAGE_TOKENS,
+                max_context_tokens,
             )?,
             serial_backend: new_backend()?,
             batched_row_workspace: Qwen38QsaWorkspace::new(
                 &config,
                 &manifest,
                 &weights,
-                SM12X_KV_PAGE_TOKENS,
+                max_context_tokens,
             )?,
             batched_backend: new_backend()?,
-            page_table: DeviceBuffer::from_host(&[0])?,
+            page_table: DeviceBuffer::from_host(&vec![
+                0;
+                max_context_tokens / SM12X_KV_PAGE_TOKENS
+            ])?,
             page: Sm12xPage::from_slot(0),
             input: DeviceBuffer::from_host(&input_host)?,
             config,
@@ -243,6 +277,7 @@ impl Qwen38QsaPrefillMicrobench {
             layer_mask,
             layer,
             tokens,
+            start_position,
             lt,
             stream: CudaStream::new_non_blocking()?,
             weights,
@@ -265,12 +300,12 @@ impl Qwen38QsaPrefillMicrobench {
                 &mut self.serial_backend,
                 &self.page_table,
                 &self.page,
-                row,
+                (self.start_position + row) % SM12X_KV_PAGE_TOKENS,
                 &self.config,
                 &self.manifest,
                 &self.row_input,
                 self.layer,
-                row,
+                self.start_position + row,
                 &self.stream,
             )?;
             self.serial_output.copy_range_from_device_on_stream(
@@ -293,7 +328,7 @@ impl Qwen38QsaPrefillMicrobench {
             &self.config,
             &self.input,
             self.tokens,
-            0,
+            self.start_position,
             &self.stream,
         )?;
         for row in 0..self.tokens {
@@ -304,11 +339,11 @@ impl Qwen38QsaPrefillMicrobench {
                 &mut self.batched_backend,
                 &self.page_table,
                 &self.page,
-                row,
+                (self.start_position + row) % SM12X_KV_PAGE_TOKENS,
                 &self.config,
                 row,
                 self.layer,
-                row,
+                self.start_position + row,
                 &self.stream,
             )?;
         }

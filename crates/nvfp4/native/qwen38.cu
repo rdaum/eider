@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include <cstddef>
 #include <cstdint>
@@ -160,6 +161,43 @@ __global__ void qwen38_qsa_score_blocks_kernel(
     }
 }
 
+template <int ItemsPerThread>
+__global__ void qwen38_qsa_sort_blocks_kernel(
+    const float* scores,
+    std::uint8_t* selected_blocks,
+    std::uint32_t complete_blocks,
+    std::uint32_t selected_complete_blocks,
+    std::uint32_t tail_tokens) {
+    using BlockSort = cub::BlockRadixSort<unsigned long long, 256, ItemsPerThread>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    unsigned long long keys[ItemsPerThread];
+    #pragma unroll
+    for (int item = 0; item < ItemsPerThread; ++item) {
+        const std::uint32_t block = threadIdx.x * ItemsPerThread + item;
+        if (block < complete_blocks) {
+            const float score = isfinite(scores[block])
+                ? fmaxf(scores[block], 0.0f)
+                : 0.0f;
+            keys[item] =
+                static_cast<unsigned long long>(__float_as_uint(score)) << 32 |
+                static_cast<unsigned long long>(~block);
+        } else {
+            keys[item] = 0;
+        }
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+    #pragma unroll
+    for (int item = 0; item < ItemsPerThread; ++item) {
+        const std::uint32_t rank = threadIdx.x * ItemsPerThread + item;
+        if (rank < selected_complete_blocks) {
+            selected_blocks[~static_cast<std::uint32_t>(keys[item])] = 1;
+        }
+    }
+    if (tail_tokens != 0 && threadIdx.x == 0) {
+        selected_blocks[complete_blocks] = 1;
+    }
+}
+
 __global__ void qwen38_qsa_select_blocks_kernel(
     const float* scores,
     std::uint8_t* selected_blocks,
@@ -177,6 +215,7 @@ __global__ void qwen38_qsa_select_blocks_kernel(
         return;
     }
 
+    __shared__ std::uint32_t histogram[256];
     __shared__ std::uint32_t prefix;
     __shared__ std::uint32_t rank;
     __shared__ std::uint32_t count;
@@ -186,23 +225,31 @@ __global__ void qwen38_qsa_select_blocks_kernel(
         rank = selected_complete_blocks;
     }
     __syncthreads();
-    for (int bit = 31; bit >= 0; --bit) {
-        std::uint32_t local = 0;
-        const std::uint32_t higher_mask = bit == 31 ? 0u : ~((1u << (bit + 1)) - 1u);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        histogram[threadIdx.x] = 0;
+        __syncthreads();
+        const std::uint32_t higher_mask = shift == 24
+            ? 0u
+            : ~((1u << (shift + 8)) - 1u);
         for (std::uint32_t block = threadIdx.x; block < complete_blocks;
              block += blockDim.x) {
             const float score = isfinite(scores[block]) ? fmaxf(scores[block], 0.0f) : 0.0f;
             const std::uint32_t bits = __float_as_uint(score);
-            local += ((bits & higher_mask) == (prefix & higher_mask) &&
-                      (bits & (1u << bit)) != 0u);
+            if ((bits & higher_mask) == prefix) {
+                atomicAdd(&histogram[(bits >> shift) & 0xffu], 1u);
+            }
         }
-        local = static_cast<std::uint32_t>(block_sum(static_cast<float>(local)));
+        __syncthreads();
         if (threadIdx.x == 0) {
-            count = local;
-            if (count >= rank) {
-                prefix |= 1u << bit;
-            } else {
-                rank -= count;
+            std::uint32_t higher = 0;
+            for (int byte = 255; byte >= 0; --byte) {
+                const std::uint32_t next = higher + histogram[byte];
+                if (rank <= next) {
+                    prefix |= static_cast<std::uint32_t>(byte) << shift;
+                    rank -= higher;
+                    break;
+                }
+                higher = next;
             }
         }
         __syncthreads();
@@ -645,8 +692,19 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
     constexpr std::uint32_t kSelectThreads = 256;
     const std::uint32_t selected_complete_blocks =
         min(complete_blocks, budget / compress_ratio);
-    qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
-        scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    if (complete_blocks <= selected_complete_blocks) {
+        qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    } else if (complete_blocks <= 2048) {
+        qwen38_qsa_sort_blocks_kernel<8><<<1, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    } else if (complete_blocks <= 4096) {
+        qwen38_qsa_sort_blocks_kernel<16><<<1, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    } else {
+        qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+    }
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     constexpr std::uint32_t kTileThreads = 256;
