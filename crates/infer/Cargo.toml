@@ -80,3 +80,7 @@ harness = false
 [[bench]]
 name = "qwen38_flash_next_prefill"
 harness = false
+
+[[bench]]
+name = "qwen38_flash_next_ple"
+harness = false

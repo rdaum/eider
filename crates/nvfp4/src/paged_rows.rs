@@ -63,11 +63,27 @@ impl PagedBf16RowSource {
         shard_count: usize,
         cols: usize,
     ) -> Result<Self> {
-        if shard_count == 0 || cols == 0 {
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_DIRECT_IO_WORKERS);
+        Self::open_numbered_with_workers(shard, prefix, suffix, shard_count, cols, workers)
+    }
+
+    /// Opens numbered tensors with an explicit direct-I/O worker count.
+    pub fn open_numbered_with_workers(
+        shard: &SafeTensorShard,
+        prefix: &str,
+        suffix: &str,
+        shard_count: usize,
+        cols: usize,
+        workers: usize,
+    ) -> Result<Self> {
+        if shard_count == 0 || cols == 0 || workers == 0 {
             return Err(Error::Shape {
                 label: "paged BF16 row source",
-                expected: "positive shard count and columns".to_string(),
-                actual: format!("shards={shard_count} cols={cols}"),
+                expected: "positive shard count, columns, and workers".to_string(),
+                actual: format!("shards={shard_count} cols={cols} workers={workers}"),
             });
         }
         let row_bytes = cols.checked_mul(2).ok_or_else(|| Error::Shape {
@@ -126,10 +142,6 @@ impl PagedBf16RowSource {
             .custom_flags(libc::O_DIRECT)
             .open(&path)
             .map_err(|error| row_io_error("open direct", &path, error))?;
-        let workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .min(MAX_DIRECT_IO_WORKERS);
         Ok(Self {
             readers: DirectRowReaderPool::new(direct_file, path, workers)?,
             shards,

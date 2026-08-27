@@ -5,6 +5,7 @@ use nvfp4::{
 };
 
 const TEXT_PREFIX: &str = "model.language_model";
+const MAX_PLE_IO_WORKERS: usize = 32;
 
 /// Exact Qwen PLE hash parameters loaded from the checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,6 +315,26 @@ impl Qwen38PagedPle {
         config: &Qwen38FlashNextConfig,
         token_capacity: usize,
     ) -> Result<Self> {
+        Self::open_inner(checkpoint, config, token_capacity, None)
+    }
+
+    /// Opens the PLE table with an explicit direct-I/O worker count.
+    #[doc(hidden)]
+    pub fn open_with_io_workers(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Qwen38FlashNextConfig,
+        token_capacity: usize,
+        io_workers: usize,
+    ) -> Result<Self> {
+        Self::open_inner(checkpoint, config, token_capacity, Some(io_workers))
+    }
+
+    fn open_inner(
+        checkpoint: &ModelOptCheckpoint,
+        config: &Qwen38FlashNextConfig,
+        token_capacity: usize,
+        io_workers: Option<usize>,
+    ) -> Result<Self> {
         if token_capacity == 0 {
             return Err(Error::Shape {
                 label: "Qwen3.8 paged PLE",
@@ -322,15 +343,26 @@ impl Qwen38PagedPle {
             });
         }
         let hash = Qwen38PleHashPlan::load(checkpoint, config)?;
+        let row_capacity =
+            token_capacity
+                .checked_mul(hash.heads())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 paged PLE row capacity",
+                    expected: "tokens * heads without overflow".to_string(),
+                    actual: format!("tokens={token_capacity} heads={}", hash.heads()),
+                })?;
         let prefix = ple_embedding_prefix(config.ple_layer);
         let first_tensor = format!("{prefix}.ngram_embedding.shard_0.weight");
         let shard = checkpoint.open_shard_for_tensor(&first_tensor)?;
-        let source = PagedBf16RowSource::open_numbered(
+        let tensor_prefix = format!("{prefix}.ngram_embedding.shard_");
+        let io_workers = io_workers.unwrap_or(row_capacity.min(MAX_PLE_IO_WORKERS));
+        let source = PagedBf16RowSource::open_numbered_with_workers(
             &shard,
-            &format!("{prefix}.ngram_embedding.shard_"),
+            &tensor_prefix,
             ".weight",
             config.ngram_shards,
             config.ngram_head_dim(),
+            io_workers,
         )?;
         let expected_rows = align_up(hash.table_rows(), config.ngram_vocab_alignment)?;
         if source.rows() != expected_rows {
@@ -340,14 +372,6 @@ impl Qwen38PagedPle {
                 actual: source.rows().to_string(),
             });
         }
-        let row_capacity =
-            token_capacity
-                .checked_mul(hash.heads())
-                .ok_or_else(|| Error::Shape {
-                    label: "Qwen3.8 paged PLE row capacity",
-                    expected: "tokens * heads without overflow".to_string(),
-                    actual: format!("tokens={token_capacity} heads={}", hash.heads()),
-                })?;
         Ok(Self {
             hash,
             reader: PagedBf16RowReader::new(source, row_capacity)?,
