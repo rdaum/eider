@@ -19,7 +19,7 @@ mod engine_config;
 pub use engine_config::InferenceEngineConfig;
 
 mod deployment;
-pub use deployment::{CheckpointArchitecture, checkpoint_architecture};
+pub use deployment::{CheckpointArchitecture, checkpoint_architecture, with_loaded_engine};
 
 mod paged_prefill_attention;
 
