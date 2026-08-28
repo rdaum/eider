@@ -115,14 +115,6 @@ impl<T> device_repr::Sealed for DeviceAddress<T> {}
 // constructs an address only from an owned CUDA-visible allocation.
 unsafe impl<T> DeviceRepr for DeviceAddress<T> {}
 
-// Legacy pointer tables still use raw pointer elements. New CUDA plans must
-// use DeviceAddress; these implementations remain only until their callers
-// migrate in the same architectural series.
-impl<T: ?Sized> device_repr::Sealed for *const T {}
-unsafe impl<T: ?Sized> DeviceRepr for *const T {}
-impl<T: ?Sized> device_repr::Sealed for *mut T {}
-unsafe impl<T: ?Sized> DeviceRepr for *mut T {}
-
 /// Host-side view of a device-buffer readback.
 ///
 /// This value keeps the source device buffer borrowed for as long as the host
@@ -1149,6 +1141,12 @@ impl Drop for CudaEvent {
 /// use std::num::NonZeroU32;
 ///
 /// let _ = DeviceBuffer::<NonZeroU32>::zeroed(1);
+/// ```
+///
+/// ```compile_fail
+/// use eider_cuda::DeviceBuffer;
+///
+/// let _ = DeviceBuffer::<*const u8>::zeroed(1);
 /// ```
 ///
 /// ```compile_fail

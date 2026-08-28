@@ -12,33 +12,10 @@ use crate::format;
 use crate::matrix::{Bf16Matrix, Nvfp4Matrix};
 use std::mem::size_of;
 
-/// Builds a pointer table in stream order, repeating each input row `repeats` times.
-pub fn repeat_row_pointer_table_f32_into_on_stream(
-    input: &DeviceBuffer<f32>,
-    table: DeviceOutput<'_, *const f32>,
-    routes: usize,
-    repeats: usize,
-    row_stride: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    repeat_row_pointer_table_f32_impl(input, table, routes, repeats, row_stride, stream)
-}
-
 /// Builds a repeated input-row table with typed device addresses.
 pub fn repeat_row_address_table_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
-    table: DeviceOutput<'_, DeviceAddress<f32>>,
-    routes: usize,
-    repeats: usize,
-    row_stride: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    repeat_row_pointer_table_f32_impl(input, table, routes, repeats, row_stride, stream)
-}
-
-fn repeat_row_pointer_table_f32_impl<T: DeviceRepr>(
-    input: &DeviceBuffer<f32>,
-    mut table: DeviceOutput<'_, T>,
+    mut table: DeviceOutput<'_, DeviceAddress<f32>>,
     routes: usize,
     repeats: usize,
     row_stride: usize,
@@ -57,7 +34,7 @@ fn repeat_row_pointer_table_f32_impl<T: DeviceRepr>(
         || table.len() < routes
     {
         return Err(Error::Shape {
-            label: "repeated row pointer table",
+            label: "repeated row address table",
             expected: format!(
                 "routes divisible by repeats, input>={} and table>={routes}",
                 routes
