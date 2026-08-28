@@ -2821,32 +2821,6 @@ fn moe_weighted_accumulate_slots_f32_impl<T: DeviceRepr>(
     }
 }
 
-/// Writes one weighted sum of per-slot expert outputs for every dense row.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
-    indices: &DeviceBuffer<u32>,
-    route_weights: &DeviceBuffer<f32>,
-    inputs: &DeviceBuffer<*const f32>,
-    alpha_table: &DeviceBuffer<f32>,
-    output: DeviceInOut<'_, f32>,
-    rows: usize,
-    groups: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    let len = output.len().checked_div(rows).unwrap_or(0);
-    moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
-        indices,
-        route_weights,
-        inputs,
-        alpha_table,
-        output,
-        rows,
-        groups,
-        len,
-        stream,
-    )
-}
-
 /// Writes one typed-address weighted routed-expert sum for every dense row.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
@@ -2861,32 +2835,6 @@ pub fn moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
 ) -> Result<()> {
     let len = output.len().checked_div(rows).unwrap_or(0);
     moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
-        indices,
-        route_weights,
-        inputs,
-        alpha_table,
-        output,
-        rows,
-        groups,
-        len,
-        stream,
-    )
-}
-
-/// Writes a weighted sum for an active prefix of dense rows.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
-    indices: &DeviceBuffer<u32>,
-    route_weights: &DeviceBuffer<f32>,
-    inputs: &DeviceBuffer<*const f32>,
-    alpha_table: &DeviceBuffer<f32>,
-    output: DeviceInOut<'_, f32>,
-    rows: usize,
-    groups: usize,
-    len: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    moe_weighted_accumulate_slots_f32_batch_prefix_impl(
         indices,
         route_weights,
         inputs,
@@ -2984,34 +2932,6 @@ fn moe_weighted_accumulate_slots_f32_batch_prefix_impl<T: DeviceRepr>(
             ),
         )
     }
-}
-
-/// Writes weighted row sums from expert-major F32 route outputs.
-#[allow(clippy::too_many_arguments)]
-pub fn moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
-    routes: &MoeSortedRoutes,
-    indices: &DeviceBuffer<u32>,
-    route_weights: &DeviceBuffer<f32>,
-    sorted_inputs: &DeviceBuffer<*const f32>,
-    alpha_table: &DeviceBuffer<f32>,
-    output: DeviceInOut<'_, f32>,
-    rows: usize,
-    groups: usize,
-    features: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    moe_weighted_accumulate_sorted_slots_f32_batch_impl(
-        routes,
-        indices,
-        route_weights,
-        sorted_inputs,
-        alpha_table,
-        output,
-        rows,
-        groups,
-        features,
-        stream,
-    )
 }
 
 /// Writes weighted row sums from expert-major F32 outputs addressed by a typed
@@ -3292,71 +3212,6 @@ pub fn qwen36_ffn_finalize_batch_f32_into_on_stream(
     }
 }
 
-/// Accumulates routed slot outputs, applies the shared-expert gate, adds the
-/// residual, and writes BF16-rounded F32 output in one kernel.
-#[allow(clippy::too_many_arguments)]
-pub fn qwen36_ffn_finalize_routed_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    route_weights: &DeviceBuffer<f32>,
-    routed_outputs: &DeviceBuffer<*const f32>,
-    alpha_table: &DeviceBuffer<f32>,
-    shared_gate_logit: &DeviceBuffer<f32>,
-    shared_output: &DeviceBuffer<f32>,
-    residual: &DeviceBuffer<f32>,
-    mut output: DeviceOutput<'_, f32>,
-    stream: &CudaStream,
-) -> Result<()> {
-    let groups = indices.len();
-    let len = residual.len();
-    if len == 0
-        || len > u32::MAX as usize
-        || groups == 0
-        || groups > u32::MAX as usize
-        || route_weights.len() != groups
-        || routed_outputs.len() != groups
-        || alpha_table.is_empty()
-        || shared_gate_logit.len() != 1
-        || shared_output.len() != len
-        || output.len() != len
-    {
-        return Err(Error::Shape {
-            label: "Qwen3.6 routed FFN finalize",
-            expected:
-                "matching routed groups, non-empty FFN/residual buffers, and one shared gate logit"
-                    .to_string(),
-            actual: format!(
-                "indices={} weights={} routed={} alphas={} gate={} shared={} residual={} output={}",
-                indices.len(),
-                route_weights.len(),
-                routed_outputs.len(),
-                alpha_table.len(),
-                shared_gate_logit.len(),
-                shared_output.len(),
-                residual.len(),
-                output.len()
-            ),
-        });
-    }
-    unsafe {
-        check_cuda(
-            "infer_qwen36_ffn_finalize_routed_f32_on_stream",
-            ffi::infer_qwen36_ffn_finalize_routed_f32_on_stream(
-                indices.ptr,
-                route_weights.ptr,
-                routed_outputs.ptr,
-                alpha_table.ptr,
-                shared_gate_logit.ptr,
-                shared_output.ptr,
-                residual.ptr,
-                output.buffer_mut().ptr,
-                len as u32,
-                groups as u32,
-                stream.as_raw(),
-            ),
-        )
-    }
-}
-
 /// Accumulates typed routed-output addresses, applies the shared-expert gate,
 /// adds the residual, and writes BF16-rounded F32 output in one kernel.
 #[allow(clippy::too_many_arguments)]
@@ -3424,10 +3279,10 @@ pub fn qwen36_ffn_finalize_routed_addresses_f32_into_on_stream(
 
 /// Finalizes routed and shared FFNs for independent batch rows.
 #[allow(clippy::too_many_arguments)]
-pub fn qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
+pub fn qwen36_ffn_finalize_routed_batch_addresses_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
     route_weights: &DeviceBuffer<f32>,
-    routed_outputs: &DeviceBuffer<*const f32>,
+    routed_outputs: &DeviceBuffer<DeviceAddress<f32>>,
     alpha_table: &DeviceBuffer<f32>,
     shared_gate_logit: &DeviceBuffer<f32>,
     shared_output: &DeviceBuffer<f32>,
@@ -3476,7 +3331,7 @@ pub fn qwen36_ffn_finalize_routed_batch_f32_into_on_stream(
             ffi::infer_qwen36_ffn_finalize_routed_batch_f32_on_stream(
                 indices.ptr,
                 route_weights.ptr,
-                routed_outputs.ptr,
+                routed_outputs.ptr.cast(),
                 alpha_table.ptr,
                 shared_gate_logit.ptr,
                 shared_output.ptr,
@@ -16898,18 +16753,18 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("sorted routed addresses");
-        let unsorted_ptrs = DeviceBuffer::from_host(
+        let unsorted_addresses = DeviceBuffer::from_host(
             &routed
                 .iter()
-                .map(|values| values.as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
-        .expect("unsorted routed pointers");
+        .expect("unsorted routed addresses");
         let mut expected = DeviceBuffer::zeroed(ROWS * LEN).expect("reference output");
-        moe_weighted_accumulate_slots_f32_batch_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
             &indices_device,
             &weights_device,
-            &unsorted_ptrs,
+            &unsorted_addresses,
             &alphas_device,
             expected.inout(),
             ROWS,
