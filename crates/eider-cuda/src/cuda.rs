@@ -97,6 +97,16 @@ impl<T> DeviceAddress<T> {
     pub(crate) fn as_const_ptr(self) -> *const T {
         self.pointer
     }
+
+    /// Changes the element type used by a CUDA-internal kernel ABI.
+    ///
+    /// The address remains opaque and cannot be dereferenced on the host.
+    pub(crate) fn cast<U>(self) -> DeviceAddress<U> {
+        DeviceAddress {
+            pointer: self.pointer.cast(),
+            _values: PhantomData,
+        }
+    }
 }
 
 impl<T> device_repr::Sealed for DeviceAddress<T> {}

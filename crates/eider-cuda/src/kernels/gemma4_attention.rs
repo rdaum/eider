@@ -137,18 +137,18 @@ impl Gemma4LocalPrefillAttention {
             });
         }
 
-        let parts = cache.compact_parts();
+        let parts = cache.compact_parts()?;
         unsafe {
             check_cuda(
                 "infer_gemma4_local_attention_compact_on_stream",
                 ffi::infer_gemma4_local_attention_compact_on_stream(
                     query.as_const_ptr().cast(),
-                    parts.key_values,
-                    parts.key_scales,
-                    parts.value_values,
-                    parts.value_scales,
-                    parts.key_tail,
-                    parts.value_tail,
+                    parts.key_values.as_const_ptr(),
+                    parts.key_scales.as_const_ptr(),
+                    parts.value_values.as_const_ptr(),
+                    parts.value_scales.as_const_ptr(),
+                    parts.key_tail.as_const_ptr(),
+                    parts.value_tail.as_const_ptr(),
                     output.as_mut_ptr().cast(),
                     query_tokens as u32,
                     cache.len() as u32,

@@ -1,7 +1,7 @@
 //! Compact SM12x FP4 cache storage and append-time quantization.
 
 use crate::cuda::check_cuda;
-use crate::{CudaStream, DeviceBuffer, DeviceOutput, Error, Result};
+use crate::{CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, Error, Result};
 use std::mem::{align_of, size_of};
 
 const K_TOKEN_TILE: usize = 8;
@@ -110,12 +110,12 @@ struct Sm12xKvCacheLayout {
 }
 
 pub(crate) struct Sm12xKvCacheParts {
-    pub key_values: *const u8,
-    pub key_scales: *const u8,
-    pub value_values: *const u8,
-    pub value_scales: *const u8,
-    pub key_tail: *const f32,
-    pub value_tail: *const f32,
+    pub key_values: DeviceAddress<u8>,
+    pub key_scales: DeviceAddress<u8>,
+    pub value_values: DeviceAddress<u8>,
+    pub value_scales: DeviceAddress<u8>,
+    pub key_tail: DeviceAddress<f32>,
+    pub value_tail: DeviceAddress<f32>,
 }
 
 /// Reusable device workspace for compact-cache FP4 attention.
@@ -262,15 +262,16 @@ impl Sm12xKvCache {
         self.storage.device_bytes()
     }
 
-    pub(crate) fn compact_parts(&self) -> Sm12xKvCacheParts {
-        Sm12xKvCacheParts {
-            key_values: self.key_values_ptr(),
-            key_scales: self.key_scales_ptr(),
-            value_values: self.value_values_ptr(),
-            value_scales: self.value_scales_ptr(),
-            key_tail: self.key_tail_ptr(),
-            value_tail: self.value_tail_ptr(),
-        }
+    pub(crate) fn compact_parts(&self) -> Result<Sm12xKvCacheParts> {
+        let base = self.storage.cuda_address();
+        Ok(Sm12xKvCacheParts {
+            key_values: base.offset(self.layout.key_values)?,
+            key_scales: base.offset(self.layout.key_scales)?,
+            value_values: base.offset(self.layout.value_values)?,
+            value_scales: base.offset(self.layout.value_scales)?,
+            key_tail: base.offset(self.layout.key_tail)?.cast(),
+            value_tail: base.offset(self.layout.value_tail)?.cast(),
+        })
     }
 
     /// Returns the device bytes this cache shape would allocate at another capacity.
