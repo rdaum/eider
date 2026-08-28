@@ -42,9 +42,9 @@ use eider_cuda::{
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
     fp8_linear_f32_into_on_stream, fp8_linear_pair_configured_f32_into_on_stream,
     fp8_linear_triple_configured_f32_into_on_stream, fp8_linear_w8a8_f32_into_on_stream,
-    fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
-    gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
-    gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
+    fp8_moe_grouped_down_addressed_f32_into_on_stream,
+    fp8_moe_grouped_gate_up_addressed_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
+    gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
@@ -2888,8 +2888,8 @@ struct Qwen36SharedExpert {
 struct Qwen36Fp8ExpertTable {
     _weights: DeviceBuffer<u8>,
     _scales: DeviceBuffer<f32>,
-    weights: DeviceBuffer<*const u8>,
-    scales: DeviceBuffer<*const f32>,
+    weights: DeviceBuffer<DeviceAddress<u8>>,
+    scales: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 struct Qwen36Fp8Experts {
@@ -4041,7 +4041,7 @@ impl Qwen36MoeWeights {
                     &mut workspace.fp8_hidden_input_scale,
                     stream,
                 )?;
-                fp8_moe_grouped_gate_up_f32_into_on_stream(
+                fp8_moe_grouped_gate_up_addressed_f32_into_on_stream(
                     &workspace.route.indices,
                     &workspace.fp8_hidden_input,
                     &workspace.fp8_hidden_input_scale,
@@ -4923,7 +4923,7 @@ impl Qwen36MoeWeights {
                     &mut workspace.fp8_hidden_input_scale,
                     stream,
                 )?;
-                fp8_moe_grouped_gate_up_f32_into_on_stream(
+                fp8_moe_grouped_gate_up_addressed_f32_into_on_stream(
                     &workspace.route.indices,
                     &workspace.fp8_hidden_input,
                     &workspace.fp8_hidden_input_scale,
@@ -4966,7 +4966,7 @@ impl Qwen36MoeWeights {
             let sm12x_down = &workspace.sm12x_down;
             if let Some(profile) = profile.as_deref_mut() {
                 let (_, gemv_ms) = timed_cuda(stream, || {
-                    fp8_moe_grouped_down_f32_into_on_stream(
+                    fp8_moe_grouped_down_addressed_f32_into_on_stream(
                         &workspace.route.indices,
                         &workspace.fp8_down_input,
                         &workspace.fp8_down_input_scales,
@@ -4993,7 +4993,7 @@ impl Qwen36MoeWeights {
                 profile.qwen36_routed_down_accum_ms += accum_ms;
                 profile.qwen36_routed_down_ms += gemv_ms + accum_ms;
             } else {
-                fp8_moe_grouped_down_f32_into_on_stream(
+                fp8_moe_grouped_down_addressed_f32_into_on_stream(
                     &workspace.route.indices,
                     &workspace.fp8_down_input,
                     &workspace.fp8_down_input_scales,
@@ -5681,19 +5681,17 @@ impl Qwen36Fp8ExpertTable {
         }
         let weights = DeviceBuffer::from_host(&host_weights)?;
         let scales = DeviceBuffer::from_host(&host_scales)?;
-        let weight_base = weights.as_const_ptr().cast::<u8>();
-        let scale_base = scales.as_const_ptr().cast::<f32>();
-        let weight_ptrs = (0..experts)
-            .map(|expert| unsafe { weight_base.add(expert * matrix_len) })
-            .collect::<Vec<_>>();
-        let scale_ptrs = (0..experts)
-            .map(|expert| unsafe { scale_base.add(expert * rows) })
-            .collect::<Vec<_>>();
+        let weight_addresses = (0..experts)
+            .map(|expert| weights.address_at(expert * matrix_len))
+            .collect::<Result<Vec<_>>>()?;
+        let scale_addresses = (0..experts)
+            .map(|expert| scales.address_at(expert * rows))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             _weights: weights,
             _scales: scales,
-            weights: DeviceBuffer::from_host(&weight_ptrs)?,
-            scales: DeviceBuffer::from_host(&scale_ptrs)?,
+            weights: DeviceBuffer::from_host(&weight_addresses)?,
+            scales: DeviceBuffer::from_host(&scale_addresses)?,
         })
     }
 }

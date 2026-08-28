@@ -9750,6 +9750,75 @@ pub fn fp8_moe_grouped_gate_up_f32_into_on_stream(
     gate_scales: &DeviceBuffer<*const f32>,
     up_weights: &DeviceBuffer<*const u8>,
     up_scales: &DeviceBuffer<*const f32>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    fp8_moe_grouped_gate_up_f32_impl(
+        indices,
+        input,
+        input_scale,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        output,
+        rows,
+        cols,
+        slots,
+        stream,
+    )
+}
+
+/// Enqueues device-routed FP8 gate and up projections using typed expert
+/// weight and channel-scale address tables.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_moe_grouped_gate_up_addressed_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    gate_weights: &DeviceBuffer<DeviceAddress<u8>>,
+    gate_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    up_weights: &DeviceBuffer<DeviceAddress<u8>>,
+    up_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    fp8_moe_grouped_gate_up_f32_impl(
+        indices,
+        input,
+        input_scale,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        output,
+        rows,
+        cols,
+        slots,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_moe_grouped_gate_up_f32_impl<
+    GateWeight: DeviceRepr,
+    GateScale: DeviceRepr,
+    UpWeight: DeviceRepr,
+    UpScale: DeviceRepr,
+>(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<u8>,
+    input_scale: &DeviceBuffer<f32>,
+    gate_weights: &DeviceBuffer<GateWeight>,
+    gate_scales: &DeviceBuffer<GateScale>,
+    up_weights: &DeviceBuffer<UpWeight>,
+    up_scales: &DeviceBuffer<UpScale>,
     mut output: DeviceOutput<'_, f32>,
     rows: usize,
     cols: usize,
@@ -9797,10 +9866,10 @@ pub fn fp8_moe_grouped_gate_up_f32_into_on_stream(
                 indices.ptr,
                 input.ptr,
                 input_scale.ptr,
-                gate_weights.ptr,
-                gate_scales.ptr,
-                up_weights.ptr,
-                up_scales.ptr,
+                gate_weights.ptr.cast(),
+                gate_scales.ptr.cast(),
+                up_weights.ptr.cast(),
+                up_scales.ptr.cast(),
                 output.buffer_mut().ptr,
                 rows as u32,
                 cols as u32,
@@ -9870,6 +9939,62 @@ pub fn fp8_moe_grouped_down_f32_into_on_stream(
     slots: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    fp8_moe_grouped_down_f32_impl(
+        indices,
+        inputs,
+        input_scales,
+        weights,
+        weight_scales,
+        outputs,
+        rows,
+        cols,
+        slots,
+        stream,
+    )
+}
+
+/// Enqueues device-routed FP8 down projections using typed expert weight and
+/// channel-scale address tables.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_moe_grouped_down_addressed_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    inputs: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    outputs: &DeviceBuffer<*mut f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    fp8_moe_grouped_down_f32_impl(
+        indices,
+        inputs,
+        input_scales,
+        weights,
+        weight_scales,
+        outputs,
+        rows,
+        cols,
+        slots,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_moe_grouped_down_f32_impl<Weight: DeviceRepr, Scale: DeviceRepr>(
+    indices: &DeviceBuffer<u32>,
+    inputs: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<Weight>,
+    weight_scales: &DeviceBuffer<Scale>,
+    outputs: &DeviceBuffer<*mut f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let input_len = cols.saturating_mul(slots);
     if rows == 0
         || cols == 0
@@ -9907,8 +10032,8 @@ pub fn fp8_moe_grouped_down_f32_into_on_stream(
                 indices.ptr,
                 inputs.ptr,
                 input_scales.ptr,
-                weights.ptr,
-                weight_scales.ptr,
+                weights.ptr.cast(),
+                weight_scales.ptr.cast(),
                 outputs.ptr,
                 rows as u32,
                 cols as u32,
