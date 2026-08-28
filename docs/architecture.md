@@ -55,6 +55,13 @@ The `eider-api` package has no direct CUDA dependency.
 Both `eider-api` and `eider-runtime` forbid unsafe code at their crate
 boundaries.
 `eider-cuda` denies unchecked unsafe operations inside unsafe functions.
+CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
+`DeviceAddress` values in their device pointer tables instead of raw pointers.
+Model sources and focused benchmarks import host ModelOpt records directly
+from `eider-format`; `eider-cuda` exports only CUDA preparation and execution
+types.
+`InferenceError` now preserves format failures separately from CUDA failures
+at the actor-service boundary.
 
 ## Decision
 

@@ -1,13 +1,13 @@
 use eider_cuda::{
     CublasLt, CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan,
     DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, GemmShape, ModelOptCublasLtWeight,
-    ModelOptNvfp4Linear, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, Result,
-    Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, format,
-    moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, Result, Sm121W4A16GateUp,
+    Sm121W4A16GateUpBatchWorkspace, format, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_silu_quantize_bf16_sorted_slots_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
 };
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -80,7 +80,7 @@ impl LagunaRoutedGateUpBench {
         let w4a16_workspace = w4a16.new_batch_workspace(ROWS)?;
         let grouped_weights = weights
             .iter()
-            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
+            .map(ModelOptCublasLtWeight::from_modelopt)
             .collect::<Result<Vec<_>>>()?;
         let grouped_weight_values = DeviceBuffer::from_host(
             &grouped_weights

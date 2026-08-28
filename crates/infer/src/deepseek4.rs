@@ -33,14 +33,13 @@ use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, MoeSortedRoutes,
-    Nvfp4LinearSlotMut, Nvfp4LinearSlots, Q3ExpertTable, Q3ExpertTableCacheInfo,
-    Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result,
-    gather_sorted_route_rows_f32_into_on_stream, routed_accumulate_f32_batch_into_on_stream,
-    routed_accumulate_sorted_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, MoeSortedRoutes, Nvfp4LinearSlotMut, Nvfp4LinearSlots,
+    Q3ExpertTable, Q3ExpertTableCacheInfo, Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay,
+    QuantizedQ3, Result, gather_sorted_route_rows_f32_into_on_stream,
+    routed_accumulate_f32_batch_into_on_stream, routed_accumulate_sorted_f32_batch_into_on_stream,
     silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
-use eider_format::SafeTensorShard;
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, SafeTensorShard};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2741,9 +2740,9 @@ mod tests {
         prepare_thin_checkpoint_shard, write_hot_expert, write_nvfp4_expert_layer,
     };
     use eider_cuda::{
-        CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q3ExpertTableCacheWriter, format,
-        quantize_q3_row_major,
+        CudaStream, DeviceBuffer, Q3ExpertTableCacheWriter, format, quantize_q3_row_major,
     };
+    use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
     use serde_json::json;
     use std::io::Write;
 
@@ -3201,8 +3200,7 @@ mod tests {
             inspect_thin_checkpoint(&thin_dir).expect("inspect thin checkpoint"),
             info
         );
-        let checkpoint =
-            eider_cuda::ModelOptCheckpoint::open(&thin_dir).expect("open thin checkpoint");
+        let checkpoint = ModelOptCheckpoint::open(&thin_dir).expect("open thin checkpoint");
         assert!(checkpoint.contains_tensor(retained));
         assert!(checkpoint.contains_tensor(mtp_retained));
         assert!(!checkpoint.contains_tensor(routed));

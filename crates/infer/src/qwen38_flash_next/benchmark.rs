@@ -7,9 +7,8 @@ use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{Qwen36BatchModelView, load_hybrid_full_attention};
 use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
 use crate::sm12x_cache::Sm12xPage;
-use eider_cuda::{
-    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, SM12X_KV_PAGE_TOKENS,
-};
+use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result, SM12X_KV_PAGE_TOKENS};
+use eider_format::ModelOptCheckpoint;
 use std::path::Path;
 
 /// Numerical comparison between serial and batched QSA layer outputs.

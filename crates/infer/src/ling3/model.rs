@@ -5,12 +5,13 @@ use super::moe::{Ling3Moe, Ling3MoeWorkspace};
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
 use super::{Ling3CacheContext, Ling3Sequence, Ling3SequenceCache, ling3_cache_error};
 use eider_cuda::{
-    CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    add_f32_into_on_stream, add_f32_prefix_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    CudaGraphExec, CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    add_f32_prefix_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_row_f32_into_on_stream, rms_norm_f32_into_on_stream, set_cuda_device,
     silu_mul_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use std::path::Path;
 
 struct DenseMlp {

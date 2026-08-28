@@ -12,10 +12,7 @@ use crate::kernels::non_gemm::{
 use crate::matrix::Nvfp4Matrix;
 use crate::{CudaStream, DeviceBuffer};
 
-pub use eider_format::{
-    ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    modelopt_scales_to_cublaslt,
-};
+use eider_format::ModelOptNvfp4Linear;
 
 /// cuBLASLt-ready CUDA preparation of one ModelOpt NVFP4 weight.
 pub struct ModelOptCublasLtWeight {

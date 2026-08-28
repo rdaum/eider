@@ -1,10 +1,11 @@
 use super::linear::load_bf16_host;
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    nemotron3_sigmoid_topk_f32_batch_into_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
+    nemotron3_sigmoid_topk_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 /// Device-resident router for one Nemotron 3 MoE layer.
 pub struct Nemotron3Router {

@@ -9,14 +9,14 @@ use super::{Qwen36LmHead, Qwen36TextModel};
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use eider_cuda::{
     Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, GpuTokenSampler,
-    GpuTopKCandidate, ModelOptCheckpoint, PinnedHostBuffer, Result, RowMajor,
-    add_f32_prefix_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    dflash2_grouped_conv_f32_into_on_stream, dflash2_hidden_projection_f32_into_on_stream,
-    dflash2_noncausal_attention_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_prefix_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream,
+    GpuTopKCandidate, PinnedHostBuffer, Result, RowMajor, add_f32_prefix_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
+    dflash2_hidden_projection_f32_into_on_stream, dflash2_noncausal_attention_f32_into_on_stream,
+    f32_to_bf16_prefix_into_on_stream, fill_f32_prefix_into_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_sequence_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use serde::Deserialize;
 use std::fs;
 use std::mem::size_of;

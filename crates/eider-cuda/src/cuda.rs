@@ -24,7 +24,7 @@ pub(crate) mod device_repr {
 /// write arbitrary bytes into a [`DeviceBuffer`] before a host readback.
 ///
 /// This trait is sealed. Eider implements it only for primitive wire values,
-/// raw device addresses, and reviewed `repr(C)` kernel records.
+/// opaque CUDA addresses, and reviewed `repr(C)` kernel records.
 #[allow(private_bounds)]
 pub unsafe trait DeviceRepr: device_repr::Sealed + Copy {}
 
@@ -39,16 +39,69 @@ macro_rules! primitive_device_repr {
 
 primitive_device_repr!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
 
+/// An opaque CUDA-visible address for values of type `T`.
+///
+/// This value is suitable for device pointer tables, including GB10 pageable
+/// host memory that CUDA accesses through host page tables. It is not a Rust
+/// reference and cannot be dereferenced on the host. Only CUDA internals can
+/// expose its raw address to a kernel launch.
+#[repr(transparent)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeviceAddress<T> {
+    pointer: *mut T,
+    _values: PhantomData<T>,
+}
+
+impl<T> Copy for DeviceAddress<T> {}
+
+impl<T> Clone for DeviceAddress<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> DeviceAddress<T> {
+    /// Returns an address advanced by `elements` values.
+    pub fn offset(self, elements: usize) -> Result<Self> {
+        let byte_offset = elements
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| Error::Shape {
+                label: "CUDA address offset",
+                expected: "element offset that fits in bytes".to_string(),
+                actual: format!("elements={elements} element_size={}", size_of::<T>()),
+            })?;
+        let address = self
+            .pointer
+            .addr()
+            .checked_add(byte_offset)
+            .ok_or_else(|| Error::Shape {
+                label: "CUDA address offset",
+                expected: "address and offset without overflow".to_string(),
+                actual: format!("address={:?} offset={elements}", self.pointer),
+            })?;
+        Ok(Self {
+            pointer: self.pointer.map_addr(|_| address),
+            _values: PhantomData,
+        })
+    }
+
+    pub(crate) fn as_const_ptr(self) -> *const T {
+        self.pointer
+    }
+}
+
+impl<T> device_repr::Sealed for DeviceAddress<T> {}
+
+// CUDA stores addresses as opaque bits in device pointer tables. The safe API
+// constructs an address only from an owned CUDA-visible allocation.
+unsafe impl<T> DeviceRepr for DeviceAddress<T> {}
+
+// Legacy pointer tables still use raw pointer elements. New CUDA plans must
+// use DeviceAddress; these implementations remain only until their callers
+// migrate in the same architectural series.
 impl<T: ?Sized> device_repr::Sealed for *const T {}
-
-// Raw pointers have no invalid bit patterns. Pointer tables remain an internal
-// CUDA implementation detail and will move behind plan types.
 unsafe impl<T: ?Sized> DeviceRepr for *const T {}
-
 impl<T: ?Sized> device_repr::Sealed for *mut T {}
-
-// Raw pointers have no invalid bit patterns. Pointer tables remain an internal
-// CUDA implementation detail and will move behind plan types.
 unsafe impl<T: ?Sized> DeviceRepr for *mut T {}
 
 /// Host-side view of a device-buffer readback.
@@ -268,7 +321,17 @@ impl<T: DeviceRepr> PageableHostBuffer<T> {
         unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    /// Returns the stable address used by CUDA kernels.
+    /// Returns the stable CUDA-visible address of this pageable allocation.
+    ///
+    /// The returned value can populate a CUDA pointer table, but cannot be
+    /// dereferenced by safe host code.
+    pub fn cuda_address(&self) -> DeviceAddress<T> {
+        DeviceAddress {
+            pointer: self.ptr,
+            _values: PhantomData,
+        }
+    }
+
     pub(crate) fn as_ptr(&self) -> *const T {
         self.ptr
     }
@@ -1563,6 +1626,17 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
     /// Returns the number of device bytes owned by this allocation.
     pub fn device_bytes(&self) -> usize {
         self.len * size_of::<T>()
+    }
+
+    /// Returns this allocation's opaque CUDA-visible base address.
+    ///
+    /// The address is valid while this buffer is retained. It is intended for
+    /// CUDA-owned pointer-table plans, not host dereferencing.
+    pub fn cuda_address(&self) -> DeviceAddress<T> {
+        DeviceAddress {
+            pointer: self.ptr,
+            _values: PhantomData,
+        }
     }
 
     /// Returns true when this allocation contains no elements.

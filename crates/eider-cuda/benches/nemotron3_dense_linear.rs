@@ -1,10 +1,10 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_into_on_stream,
-    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_into_on_stream,
+    fp8_linear_channel_scaled_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream,
     quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

@@ -2,14 +2,14 @@ use super::layer::{Ling3Linear, load_bf16_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
 use super::{Ling3MlaPagePool, Ling3Page};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    arithmetic_positions_u32_into_on_stream, ling3_mla_attention_f32_into_on_stream,
-    ling3_mla_pack_f32_batch_into_on_stream, ling3_mla_pack_f32_into_on_stream,
-    ling3_mla_paged_attention_f32_into_on_stream, ling3_mla_paged_causal_rows_f32_into_on_stream,
-    ling3_mla_split_kv_a_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_interleaved_trailing_f32_indexed_in_place_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, arithmetic_positions_u32_into_on_stream,
+    ling3_mla_attention_f32_into_on_stream, ling3_mla_pack_f32_batch_into_on_stream,
+    ling3_mla_pack_f32_into_on_stream, ling3_mla_paged_attention_f32_into_on_stream,
+    ling3_mla_paged_causal_rows_f32_into_on_stream, ling3_mla_split_kv_a_f32_batch_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     sigmoid_scale_heads_f32_into_on_stream, sigmoid_scale_heads_f32_prefix_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use seqcache::AppendPages;
 
 /// One checkpoint-backed Ling 3 multi-head latent attention layer.

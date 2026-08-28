@@ -9,13 +9,13 @@ use super::{
 };
 use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
-    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
-    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
-    speculative_accept_argmax_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
+    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
+    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
+    select_bf16_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use std::path::Path;
 use tracing::info;
 

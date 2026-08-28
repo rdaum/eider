@@ -1,4 +1,5 @@
-use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, format};
+use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Error, Result, format};
+use eider_format::ModelOptCheckpoint;
 use eider_inference::qwen3::qwen36::{Qwen36AttentionWorkspace, Qwen36LayerBlock, Qwen36Model};
 use std::env;
 use std::path::{Path, PathBuf};

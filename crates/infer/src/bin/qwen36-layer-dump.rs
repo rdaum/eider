@@ -1,4 +1,5 @@
 use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
+use eider_format::ModelOptCheckpoint;
 use eider_inference::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model};
 use std::env;
 use std::path::PathBuf;
@@ -110,7 +111,7 @@ fn main() -> Result<()> {
 }
 
 fn load_bf16_row(
-    checkpoint: &eider_cuda::ModelOptCheckpoint,
+    checkpoint: &ModelOptCheckpoint,
     name: &str,
     _rows: usize,
     cols: usize,

@@ -30,14 +30,13 @@ use crate::metrics::ExpertPagingMetricHandle;
 use eider_cuda::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace,
-    Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight, add_f32_into_on_stream,
-    argmax_f32_batch_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    bf16_linear_pair_logits_f32_into_on_stream, bf16_linear_two_rows_f32_into_on_stream,
-    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    ModelOptCublasLtWeight, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
+    PinnedHostBuffer, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
+    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
+    Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
+    bf16_linear_two_rows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
@@ -62,6 +61,7 @@ use eider_cuda::{
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
 };
 use eider_format::SafeTensorInfo;
+use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
 use super::infer::{
     GroupedGemvWorkspace, MoeExpertPointerTables, MoeGroupedDownWorkspace, MoeRouteWorkspace,
@@ -8338,7 +8338,8 @@ mod tests {
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
         reorder_fp8_v_cols, reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
-    use eider_cuda::{CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear};
+    use eider_cuda::{CudaStream, DeviceBuffer};
+    use eider_format::{ModelOptFp8Linear, ModelOptNvfp4Linear};
 
     #[test]
     fn recurrent_append_transaction_restores_and_commits_explicitly() {

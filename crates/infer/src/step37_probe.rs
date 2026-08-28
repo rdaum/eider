@@ -1,10 +1,9 @@
 //! Focused Step-3.7 text-layer validation against the checkpoint's Python model.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
-    copy_row_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream, copy_row_f32_into_on_stream,
 };
-use eider_format::SafeTensorShard;
+use eider_format::{ModelOptCheckpoint, SafeTensorShard};
 use std::path::Path;
 
 use crate::step37::{

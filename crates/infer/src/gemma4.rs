@@ -6,9 +6,8 @@
 
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
-    add_f32_into_on_stream, bf16_linear_argmax_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, ModelOptCublasLtWeight, Result, Sm12xKvAttentionWorkspace,
+    Sm12xKvPagePool, add_f32_into_on_stream, bf16_linear_argmax_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, gather_indexed_mul_f32_into_on_stream,
     gelu_tanh_mul_f32_into_on_stream, lm_head_top1_f32_into_on_stream, moe_topk_f32_into_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,
@@ -18,6 +17,7 @@ use eider_cuda::{
     rope_neox_f32_into_on_stream, rope_neox_proportional_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;

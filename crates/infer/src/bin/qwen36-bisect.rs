@@ -1,9 +1,9 @@
 use eider_cuda::{
-    CublasLt, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, append_rows_f32_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, format, nvfp4_w4a16_matvec_f32_into_on_stream,
-    rms_norm_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
+    append_rows_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream, format,
+    nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use eider_inference::qwen3::qwen36::{
     Qwen36Attention, Qwen36AttentionWorkspace, Qwen36LayerBlock, Qwen36Model,
 };
@@ -1550,10 +1550,7 @@ struct ConcatNvfp4 {
     in_features: usize,
 }
 
-fn concat_nvfp4(
-    gate: &eider_cuda::ModelOptNvfp4Linear,
-    up: &eider_cuda::ModelOptNvfp4Linear,
-) -> ConcatNvfp4 {
+fn concat_nvfp4(gate: &ModelOptNvfp4Linear, up: &ModelOptNvfp4Linear) -> ConcatNvfp4 {
     let mut pw = Vec::with_capacity(gate.packed_weight.len() + up.packed_weight.len());
     pw.extend_from_slice(&gate.packed_weight);
     pw.extend_from_slice(&up.packed_weight);

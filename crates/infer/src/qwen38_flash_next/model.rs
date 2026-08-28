@@ -19,9 +19,10 @@ use crate::qwen38_flash_next::{
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    ModelOptCheckpoint, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
+    Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use seqcache::{AdmissionOutcome, AdmissionRequest, AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

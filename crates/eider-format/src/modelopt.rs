@@ -611,9 +611,11 @@ impl ModelOptNvfp4Linear {
                                 .filter(|value| value.is_finite())
                                 .map(f32::abs)
                                 .fold(0.0f32, f32::max);
-                            let scale_code = (max_abs != 0.0)
-                                .then(|| ue4m3_code(max_abs / 6.0))
-                                .unwrap_or(0);
+                            let scale_code = if max_abs != 0.0 {
+                                ue4m3_code(max_abs / 6.0)
+                            } else {
+                                0
+                            };
                             let scale = e4m3_value(scale_code);
                             scales[row * blocks_per_row + block] = scale_code;
                             for offset in 0..16 {

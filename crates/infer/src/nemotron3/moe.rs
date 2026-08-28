@@ -4,13 +4,13 @@ use super::{
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    add_f32_into_on_stream, moe_weighted_accumulate_slots_f32_batch_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    moe_weighted_accumulate_slots_f32_batch_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream, relu_squared_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 
 /// Device-resident weights for one latent Nemotron 3 MoE layer.
 pub struct Nemotron3MoeLayer {

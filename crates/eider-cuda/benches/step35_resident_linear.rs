@@ -1,9 +1,9 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
-    Sm12xFp4TileSet, gemv_row_scales_residual2_splitk_batch_on_stream,
-    modelopt_m16_k64_row_scale_words, nvfp4_w4a16_matvec_f32_into_on_stream,
-    quantize_dynamic_vectors_residual2_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, Result, Sm12xFp4TileSet,
+    gemv_row_scales_residual2_splitk_batch_on_stream, modelopt_m16_k64_row_scale_words,
+    nvfp4_w4a16_matvec_f32_into_on_stream, quantize_dynamic_vectors_residual2_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

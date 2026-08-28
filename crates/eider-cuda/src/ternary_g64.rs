@@ -12,7 +12,8 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::kernels::non_gemm::f32_to_bf16_into_on_stream;
 use crate::matrix::Nvfp4Matrix;
-use crate::modelopt_device::{ModelOptCublasLtWeight, ModelOptNvfp4Linear};
+use crate::modelopt_device::ModelOptCublasLtWeight;
+use eider_format::ModelOptNvfp4Linear;
 
 /// Number of input values represented by one GGUF scale block.
 pub const TERNARY_G64_GROUP_SIZE: usize = 64;

@@ -1,8 +1,9 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
-    indexed_gemv_on_stream, quantize_fixed_scale_vector_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, indexed_gemv_on_stream,
+    quantize_fixed_scale_vector_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

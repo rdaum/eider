@@ -1,11 +1,11 @@
 use eider_cuda::{
     CublasLt, CudaEvent, CudaStream, DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, Fp8TnMatmulPlan,
-    GemmShape, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear, Nvfp4Matrix,
-    Nvfp4TnInputs, nvfp4_w4a16_matvec_f32_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    GemmShape, ModelOptCublasLtWeight, Nvfp4Matrix, Nvfp4TnInputs,
+    nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
     scale_channel_f32_device_row_scalar_in_place_on_stream,
 };
+use eider_format::{ModelOptFp8Linear, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

@@ -6,14 +6,15 @@
 
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
-    ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, copy_f32_rows_into_columns_on_stream,
-    quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream, set_cuda_device,
-    sigmoid_mul_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCublasLtWeight,
+    Nvfp4Matrix, Nvfp4TnInputs, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    copy_f32_rows_into_columns_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, set_cuda_device, sigmoid_mul_f32_into_on_stream,
+    silu_mul_f32_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use seqcache::RetainedSnapshot;
 use serde::Deserialize;
 use std::fs;

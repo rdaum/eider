@@ -1,7 +1,8 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear, Sm121W4A16Linear,
-    Sm121W4A16LinearBatchWorkspace, format, silu_mul_halves_f32_batch_into_on_stream,
+    CudaEvent, CudaStream, DeviceBuffer, Sm121W4A16Linear, Sm121W4A16LinearBatchWorkspace, format,
+    silu_mul_halves_f32_batch_into_on_stream,
 };
+use eider_format::{ModelOptFp8Linear, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

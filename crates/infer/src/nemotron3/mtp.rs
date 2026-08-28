@@ -6,10 +6,11 @@ use super::{
 };
 use crate::runtime::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, argmax_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, argmax_f32_batch_into_on_stream,
     concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     increment_u32_in_place_on_stream, rms_norm_f32_into_on_stream, store_u32_column_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 const SPECULATIVE_DRAFT_TOKENS: usize = 3;
 

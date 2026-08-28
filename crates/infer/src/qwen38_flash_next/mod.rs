@@ -56,7 +56,8 @@ mod tests {
         new_qwen38_flash_next_sequence_cache_with_config,
     };
     use crate::sm12x_cache::Sm12xCacheContext;
-    use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
+    use eider_cuda::{CudaStream, DeviceBuffer};
+    use eider_format::ModelOptCheckpoint;
 
     #[test]
     fn released_checkpoint_loads_paging_and_resident_scaffolding() {

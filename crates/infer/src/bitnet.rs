@@ -4,14 +4,15 @@ use crate::sm12x_cache::Sm12xCacheContext;
 
 use eider_cuda::{
     BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt, CudaStream,
-    DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, ModelOptCheckpoint, Result,
-    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, Result, Sm12xKvAttentionWorkspace,
+    Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     relu_squared_mul_halves_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream, set_cuda_device,
     split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use seqcache::AppendPages;
 use serde_json::Value;
 use std::path::Path;

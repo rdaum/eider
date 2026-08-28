@@ -7,18 +7,19 @@ use crate::runtime::expert_cache::{
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    ModelOptCheckpoint, ModelOptNvfp4Linear, PinnedHostBuffer, Result, Sm12xFp4TileSet,
-    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight,
-    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gemv_row_scales_residual2_batch_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
-    modelopt_m16_k64_row_scale_words, moe_silu_quantize_slots_residual_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
-    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
-    silu_mul_halves_f32_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
+    PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
+    Sm121W4A16GateUp, Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, gemv_row_scales_residual2_batch_on_stream,
+    indexed_grouped_gemv_row_scales_residual_on_stream, modelopt_m16_k64_row_scale_words,
+    moe_silu_quantize_slots_residual_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    quantize_dynamic_vectors_residual2_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_inv_freq_sequence_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
+    silu_mul_halves_clamped_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
+    step37_sigmoid_top8_f32_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use fs2::FileExt as Fs2FileExt;
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};

@@ -1,9 +1,9 @@
 use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, CudaEvent, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, GemmShape,
-    ModelOptNvfp4Linear, Nvfp4Matrix, TernaryG64ActivationWorkspace, TernaryG64Matrix,
-    TernaryG64PackedLinear, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream,
+    Nvfp4Matrix, TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
+    nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
 };
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

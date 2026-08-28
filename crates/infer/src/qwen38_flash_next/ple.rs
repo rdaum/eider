@@ -1,8 +1,9 @@
 use super::Qwen38FlashNextConfig;
 use eider_cuda::{
-    CudaStream, DeviceOutput, Error, ModelOptCheckpoint, PagedBf16ReadStats, PagedBf16RowReader,
-    PagedBf16RowSource, Result,
+    CudaStream, DeviceOutput, Error, PagedBf16ReadStats, PagedBf16RowReader, PagedBf16RowSource,
+    Result,
 };
+use eider_format::ModelOptCheckpoint;
 
 const TEXT_PREFIX: &str = "model.language_model";
 const MAX_PLE_IO_WORKERS: usize = 32;

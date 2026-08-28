@@ -1,10 +1,7 @@
 use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
-use eider_cuda::{
-    Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result, Sm12xFp4GemmWeight,
-    Sm121W4A16HostWeight,
-};
-use eider_format::Nvfp4Artifact;
+use eider_cuda::{Error, Result, Sm12xFp4GemmWeight, Sm121W4A16HostWeight};
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, Nvfp4Artifact};
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -462,7 +459,7 @@ fn cache_fs_error(action: &'static str, path: &Path, error: std::io::Error) -> E
 #[cfg(test)]
 mod tests {
     use super::{artifact_from_modelopt, modelopt_from_artifact};
-    use eider_cuda::ModelOptNvfp4Linear;
+    use eider_format::ModelOptNvfp4Linear;
 
     #[test]
     fn modelopt_artifact_conversion_preserves_host_representation() {

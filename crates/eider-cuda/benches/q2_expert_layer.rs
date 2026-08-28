@@ -1,9 +1,10 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q2ExpertTable, Q2Nvfp4ExpertOverlay,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Q2ExpertTable, Q2Nvfp4ExpertOverlay,
     QuantizedQ2, format, moe_weighted_accumulate_slots_f32_on_stream,
     nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
 };
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -86,10 +87,13 @@ impl Nvfp4Table {
 struct LayerWorkspace {
     gate_up: Vec<DeviceBuffer<f32>>,
     gate_up_table: DeviceBuffer<*mut f32>,
+    q2_gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
     activated: Vec<DeviceBuffer<f32>>,
     activated_table: DeviceBuffer<*const f32>,
+    q2_activated_table: DeviceBuffer<DeviceAddress<f32>>,
     _down: Vec<DeviceBuffer<f32>>,
     down_table: DeviceBuffer<*mut f32>,
+    q2_down_table: DeviceBuffer<DeviceAddress<f32>>,
     down_const_table: DeviceBuffer<*const f32>,
     output: DeviceBuffer<f32>,
 }
@@ -106,6 +110,13 @@ impl LayerWorkspace {
                 .collect::<Vec<_>>(),
         )
         .expect("gate/up table");
+        let q2_gate_up_table = DeviceBuffer::from_host(
+            &gate_up
+                .iter()
+                .map(DeviceBuffer::cuda_address)
+                .collect::<Vec<_>>(),
+        )
+        .expect("Q2 gate/up table");
         let activated = (0..TOP_K)
             .map(|_| DeviceBuffer::<f32>::zeroed(INTERMEDIATE).expect("activation"))
             .collect::<Vec<_>>();
@@ -116,6 +127,13 @@ impl LayerWorkspace {
                 .collect::<Vec<_>>(),
         )
         .expect("activation table");
+        let q2_activated_table = DeviceBuffer::from_host(
+            &activated
+                .iter()
+                .map(DeviceBuffer::cuda_address)
+                .collect::<Vec<_>>(),
+        )
+        .expect("Q2 activation table");
         let down = (0..TOP_K)
             .map(|_| DeviceBuffer::<f32>::zeroed(HIDDEN).expect("down output"))
             .collect::<Vec<_>>();
@@ -126,6 +144,13 @@ impl LayerWorkspace {
                 .collect::<Vec<_>>(),
         )
         .expect("down table");
+        let q2_down_table = DeviceBuffer::from_host(
+            &down
+                .iter()
+                .map(DeviceBuffer::cuda_address)
+                .collect::<Vec<_>>(),
+        )
+        .expect("Q2 down table");
         let down_const_table = DeviceBuffer::from_host(
             &down
                 .iter()
@@ -136,10 +161,13 @@ impl LayerWorkspace {
         Self {
             gate_up,
             gate_up_table,
+            q2_gate_up_table,
             activated,
             activated_table,
+            q2_activated_table,
             _down: down,
             down_table,
+            q2_down_table,
             down_const_table,
             output: DeviceBuffer::zeroed(HIDDEN).expect("layer output"),
         }
@@ -184,7 +212,7 @@ impl Q2ExpertLayerBench {
             .run_grouped(
                 &self.indices,
                 &self.input,
-                &self.q2_workspace.gate_up_table,
+                &self.q2_workspace.q2_gate_up_table,
                 &self.stream,
             )
             .expect("Q2 gate/up");
@@ -192,8 +220,8 @@ impl Q2ExpertLayerBench {
         self.q2_down
             .run_grouped_inputs(
                 &self.indices,
-                &self.q2_workspace.activated_table,
-                &self.q2_workspace.down_table,
+                &self.q2_workspace.q2_activated_table,
+                &self.q2_workspace.q2_down_table,
                 &self.stream,
             )
             .expect("Q2 down");
@@ -221,7 +249,7 @@ impl Q2ExpertLayerBench {
             .run_grouped(
                 &self.indices,
                 &self.input,
-                &self.mixed_workspace.gate_up_table,
+                &self.mixed_workspace.q2_gate_up_table,
                 &self.stream,
             )
             .expect("mixed gate/up");
@@ -229,8 +257,8 @@ impl Q2ExpertLayerBench {
         self.mixed_down
             .run_grouped_inputs(
                 &self.indices,
-                &self.mixed_workspace.activated_table,
-                &self.mixed_workspace.down_table,
+                &self.mixed_workspace.q2_activated_table,
+                &self.mixed_workspace.q2_down_table,
                 &self.stream,
             )
             .expect("mixed down");

@@ -1,4 +1,5 @@
-use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
+use eider_cuda::{CudaStream, DeviceBuffer};
+use eider_format::ModelOptCheckpoint;
 use eider_inference::nemotron3::{Nemotron3AttentionLayer, Nemotron3Manifest};
 use std::path::PathBuf;
 

@@ -1,7 +1,7 @@
 //! Compare Ling 3 Tiny mixed FP8/NVFP4 layer zero with the CPU artifact.
 
-use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
-use eider_format::SafeTensorShard;
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
+use eider_format::{ModelOptCheckpoint, SafeTensorShard};
 use eider_inference::ling3::{Ling3KdaDenseLayer, Ling3Manifest};
 use std::path::PathBuf;
 

@@ -6,11 +6,12 @@ use crate::qwen3::qwen36::{
 };
 use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
 use crate::sm12x_cache::Sm12xPage;
-use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
 use eider_cuda::{
     Qwen38QsaSelectionWorkspace, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 /// Released QSA indexer and ordinary gated-attention weights.
 pub(crate) struct Qwen38QsaWeights {

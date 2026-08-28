@@ -1,4 +1,4 @@
-use eider_cuda::ModelOptCheckpoint;
+use eider_format::ModelOptCheckpoint;
 use eider_inference::nemotron3::{Nemotron3LayerKind, Nemotron3Manifest};
 use std::path::PathBuf;
 

@@ -1,7 +1,8 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, F32Matrix, ModelOptNvfp4Linear, Q2Matrix, format,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, F32Matrix, Q2Matrix, format,
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream, q2_w2a16_grouped_matvec_f32_into_on_stream,
 };
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -22,10 +23,10 @@ struct Q2ExpertOverlayBench {
     input: DeviceBuffer<f32>,
     indices: DeviceBuffer<u32>,
     q2_weights: Vec<Q2Matrix>,
-    q2_values: DeviceBuffer<*const u8>,
-    q2_scales: DeviceBuffer<*const u16>,
+    q2_values: DeviceBuffer<DeviceAddress<u8>>,
+    q2_scales: DeviceBuffer<DeviceAddress<u16>>,
     q2_outputs: Vec<F32Matrix>,
-    q2_output_table: DeviceBuffer<*mut f32>,
+    q2_output_table: DeviceBuffer<DeviceAddress<f32>>,
     q4_values_storage: Vec<DeviceBuffer<u8>>,
     q4_scales_storage: Vec<DeviceBuffer<u8>>,
     q4_values: DeviceBuffer<*const u8>,
@@ -134,8 +135,8 @@ impl BenchContext for Q2ExpertOverlayBench {
         let mut q2_outputs = Vec::with_capacity(TOP_K);
         let mut q2_output_ptrs = Vec::with_capacity(TOP_K);
         for _ in 0..TOP_K {
-            let mut output = F32Matrix::zeroed(GATE_UP, 1).expect("Q2 output");
-            q2_output_ptrs.push(output.data_mut_ptr());
+            let output = F32Matrix::zeroed(GATE_UP, 1).expect("Q2 output");
+            q2_output_ptrs.push(output.data().cuda_address());
             q2_outputs.push(output);
         }
         let q2_output_table = DeviceBuffer::from_host(&q2_output_ptrs).expect("Q2 output table");

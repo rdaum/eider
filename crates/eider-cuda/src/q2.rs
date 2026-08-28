@@ -4,11 +4,11 @@
 //! checkpoint convention. Four signed mid-rise levels are packed into two bits
 //! per weight and share one BF16 scale per 64 consecutive input channels.
 
-use crate::cuda::{CudaStream, DeviceBuffer, check_cuda};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format;
-use crate::modelopt_device::ModelOptNvfp4Linear;
+use eider_format::ModelOptNvfp4Linear;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -636,13 +636,13 @@ impl Q2Matrix {
     }
 
     /// Device pointer to packed two-bit values.
-    pub fn values_ptr(&self) -> *const u8 {
-        self.packed_values.ptr
+    pub fn values_ptr(&self) -> DeviceAddress<u8> {
+        self.packed_values.cuda_address()
     }
 
     /// Device pointer to block scales.
-    pub fn scales_ptr(&self) -> *const u16 {
-        self.scales.ptr
+    pub fn scales_ptr(&self) -> DeviceAddress<u16> {
+        self.scales.cuda_address()
     }
 }
 
@@ -653,8 +653,8 @@ pub struct Q2ExpertTable {
     experts: usize,
     packed_values: DeviceBuffer<u8>,
     scales: DeviceBuffer<u16>,
-    value_table: DeviceBuffer<*const u8>,
-    scale_table: DeviceBuffer<*const u16>,
+    value_table: DeviceBuffer<DeviceAddress<u8>>,
+    scale_table: DeviceBuffer<DeviceAddress<u16>>,
 }
 
 impl Q2ExpertTable {
@@ -784,23 +784,17 @@ impl Q2ExpertTable {
         }
         let value_table = DeviceBuffer::from_host(
             &(0..experts)
-                .map(|expert| unsafe {
+                .map(|expert| {
                     packed_values
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(expert * values_per_expert)
+                        .cuda_address()
+                        .offset(expert * values_per_expert)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let scale_table = DeviceBuffer::from_host(
             &(0..experts)
-                .map(|expert| unsafe {
-                    scales
-                        .as_const_ptr()
-                        .cast::<u16>()
-                        .add(expert * scales_per_expert)
-                })
-                .collect::<Vec<_>>(),
+                .map(|expert| scales.cuda_address().offset(expert * scales_per_expert))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         Ok(Self {
             rows,
@@ -848,7 +842,7 @@ impl Q2ExpertTable {
         &self,
         indices: &DeviceBuffer<u32>,
         input: &DeviceBuffer<f32>,
-        output_table: &DeviceBuffer<*mut f32>,
+        output_table: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
         q2_w2a16_grouped_matvec_f32_into_on_stream(
@@ -867,8 +861,8 @@ impl Q2ExpertTable {
     pub fn run_grouped_inputs(
         &self,
         indices: &DeviceBuffer<u32>,
-        input_table: &DeviceBuffer<*const f32>,
-        output_table: &DeviceBuffer<*mut f32>,
+        input_table: &DeviceBuffer<DeviceAddress<f32>>,
+        output_table: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
         q2_w2a16_grouped_inputs_matvec_f32_into_on_stream(
@@ -906,11 +900,11 @@ impl Q2ExpertTable {
             + self.scale_table.device_bytes()
     }
 
-    fn value_table(&self) -> &DeviceBuffer<*const u8> {
+    fn value_table(&self) -> &DeviceBuffer<DeviceAddress<u8>> {
         &self.value_table
     }
 
-    fn scale_table(&self) -> &DeviceBuffer<*const u16> {
+    fn scale_table(&self) -> &DeviceBuffer<DeviceAddress<u16>> {
         &self.scale_table
     }
 }
@@ -925,9 +919,9 @@ pub struct Q2Nvfp4ExpertOverlay {
     hot_packed_values: DeviceBuffer<u8>,
     hot_scales: DeviceBuffer<u8>,
     hot_scale_2: DeviceBuffer<f32>,
-    hot_value_table: DeviceBuffer<*const u8>,
-    hot_scale_table: DeviceBuffer<*const u8>,
-    hot_scale_2_table: DeviceBuffer<*const f32>,
+    hot_value_table: DeviceBuffer<DeviceAddress<u8>>,
+    hot_scale_table: DeviceBuffer<DeviceAddress<u8>>,
+    hot_scale_2_table: DeviceBuffer<DeviceAddress<f32>>,
     expert_to_hot: DeviceBuffer<u32>,
     expert_to_hot_host: Vec<u32>,
     slot_to_expert: Vec<Option<usize>>,
@@ -950,33 +944,22 @@ impl Q2Nvfp4ExpertOverlay {
         let hot_scale_2 = DeviceBuffer::from_host(&vec![1.0f32; hot_capacity * cold.rows])?;
         let hot_value_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
+                .map(|slot| {
                     hot_packed_values
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * values_per_expert)
+                        .cuda_address()
+                        .offset(slot * values_per_expert)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let hot_scale_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
-                    hot_scales
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * scales_per_expert)
-                })
-                .collect::<Vec<_>>(),
+                .map(|slot| hot_scales.cuda_address().offset(slot * scales_per_expert))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let hot_scale_2_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
-                    hot_scale_2
-                        .as_const_ptr()
-                        .cast::<f32>()
-                        .add(slot * cold.rows)
-                })
-                .collect::<Vec<_>>(),
+                .map(|slot| hot_scale_2.cuda_address().offset(slot * cold.rows))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let expert_to_hot_host = vec![u32::MAX; cold.experts];
         let expert_to_hot = DeviceBuffer::from_host(&expert_to_hot_host)?;
@@ -1174,7 +1157,7 @@ impl Q2Nvfp4ExpertOverlay {
         &self,
         indices: &DeviceBuffer<u32>,
         input: &DeviceBuffer<f32>,
-        output_table: &DeviceBuffer<*mut f32>,
+        output_table: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
         q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream(
@@ -1197,8 +1180,8 @@ impl Q2Nvfp4ExpertOverlay {
     pub fn run_grouped_inputs(
         &self,
         indices: &DeviceBuffer<u32>,
-        input_table: &DeviceBuffer<*const f32>,
-        output_table: &DeviceBuffer<*mut f32>,
+        input_table: &DeviceBuffer<DeviceAddress<f32>>,
+        output_table: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
         q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream(
@@ -1297,9 +1280,9 @@ impl Q2Nvfp4ExpertOverlay {
 pub fn q2_w2a16_grouped_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
     input: &DeviceBuffer<f32>,
-    packed_weight_table: &DeviceBuffer<*const u8>,
-    weight_scale_table: &DeviceBuffer<*const u16>,
-    output_table: &DeviceBuffer<*mut f32>,
+    packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     out_features: usize,
     in_features: usize,
     stream: &CudaStream,
@@ -1339,9 +1322,9 @@ pub fn q2_w2a16_grouped_matvec_f32_into_on_stream(
             ffi::infer_q2_w2a16_grouped_matvec_f32_on_stream(
                 indices.ptr,
                 input.ptr,
-                packed_weight_table.ptr,
-                weight_scale_table.ptr,
-                output_table.ptr,
+                packed_weight_table.as_const_ptr().cast(),
+                weight_scale_table.as_const_ptr().cast(),
+                output_table.as_const_ptr().cast(),
                 table_len as u32,
                 groups as u32,
                 out_features as u32,
@@ -1356,10 +1339,10 @@ pub fn q2_w2a16_grouped_matvec_f32_into_on_stream(
 #[allow(clippy::too_many_arguments)]
 pub fn q2_w2a16_grouped_inputs_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
-    input_table: &DeviceBuffer<*const f32>,
-    packed_weight_table: &DeviceBuffer<*const u8>,
-    weight_scale_table: &DeviceBuffer<*const u16>,
-    output_table: &DeviceBuffer<*mut f32>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
+    packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     out_features: usize,
     in_features: usize,
     stream: &CudaStream,
@@ -1398,10 +1381,10 @@ pub fn q2_w2a16_grouped_inputs_matvec_f32_into_on_stream(
             "infer_q2_w2a16_grouped_inputs_matvec_f32_on_stream",
             ffi::infer_q2_w2a16_grouped_inputs_matvec_f32_on_stream(
                 indices.ptr,
-                input_table.ptr,
-                packed_weight_table.ptr,
-                weight_scale_table.ptr,
-                output_table.ptr,
+                input_table.as_const_ptr().cast(),
+                packed_weight_table.as_const_ptr().cast(),
+                weight_scale_table.as_const_ptr().cast(),
+                output_table.as_const_ptr().cast(),
                 table_len as u32,
                 groups as u32,
                 out_features as u32,
@@ -1420,13 +1403,13 @@ pub fn q2_w2a16_grouped_inputs_matvec_f32_into_on_stream(
 pub fn q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
     input: &DeviceBuffer<f32>,
-    q2_packed_weight_table: &DeviceBuffer<*const u8>,
-    q2_weight_scale_table: &DeviceBuffer<*const u16>,
+    q2_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    q2_weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
     expert_to_hot: &DeviceBuffer<u32>,
-    hot_packed_weight_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_2_table: &DeviceBuffer<*const f32>,
-    output_table: &DeviceBuffer<*mut f32>,
+    hot_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_2_table: &DeviceBuffer<DeviceAddress<f32>>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     out_features: usize,
     in_features: usize,
     stream: &CudaStream,
@@ -1475,13 +1458,13 @@ pub fn q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream(
             ffi::infer_q2_nvfp4_mixed_grouped_matvec_f32_on_stream(
                 indices.ptr,
                 input.ptr,
-                q2_packed_weight_table.ptr,
-                q2_weight_scale_table.ptr,
+                q2_packed_weight_table.as_const_ptr().cast(),
+                q2_weight_scale_table.as_const_ptr().cast(),
                 expert_to_hot.ptr,
-                hot_packed_weight_table.ptr,
-                hot_weight_scale_table.ptr,
-                hot_weight_scale_2_table.ptr,
-                output_table.ptr,
+                hot_packed_weight_table.as_const_ptr().cast(),
+                hot_weight_scale_table.as_const_ptr().cast(),
+                hot_weight_scale_2_table.as_const_ptr().cast(),
+                output_table.as_const_ptr().cast(),
                 experts as u32,
                 hot_capacity as u32,
                 groups as u32,
@@ -1497,14 +1480,14 @@ pub fn q2_nvfp4_mixed_grouped_matvec_f32_into_on_stream(
 #[allow(clippy::too_many_arguments)]
 pub fn q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
-    input_table: &DeviceBuffer<*const f32>,
-    q2_packed_weight_table: &DeviceBuffer<*const u8>,
-    q2_weight_scale_table: &DeviceBuffer<*const u16>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
+    q2_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    q2_weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
     expert_to_hot: &DeviceBuffer<u32>,
-    hot_packed_weight_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_2_table: &DeviceBuffer<*const f32>,
-    output_table: &DeviceBuffer<*mut f32>,
+    hot_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_2_table: &DeviceBuffer<DeviceAddress<f32>>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     out_features: usize,
     in_features: usize,
     stream: &CudaStream,
@@ -1552,14 +1535,14 @@ pub fn q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream(
             "infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_on_stream",
             ffi::infer_q2_nvfp4_mixed_grouped_inputs_matvec_f32_on_stream(
                 indices.ptr,
-                input_table.ptr,
-                q2_packed_weight_table.ptr,
-                q2_weight_scale_table.ptr,
+                input_table.as_const_ptr().cast(),
+                q2_packed_weight_table.as_const_ptr().cast(),
+                q2_weight_scale_table.as_const_ptr().cast(),
                 expert_to_hot.ptr,
-                hot_packed_weight_table.ptr,
-                hot_weight_scale_table.ptr,
-                hot_weight_scale_2_table.ptr,
-                output_table.ptr,
+                hot_packed_weight_table.as_const_ptr().cast(),
+                hot_weight_scale_table.as_const_ptr().cast(),
+                hot_weight_scale_2_table.as_const_ptr().cast(),
+                output_table.as_const_ptr().cast(),
                 experts as u32,
                 hot_capacity as u32,
                 groups as u32,
@@ -1576,12 +1559,12 @@ pub fn q2_nvfp4_mixed_grouped_inputs_matvec_f32_into_on_stream(
 pub fn q2_nvfp4_mixed_routed_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
     input: &DeviceBuffer<f32>,
-    q2_packed_weight_table: &DeviceBuffer<*const u8>,
-    q2_weight_scale_table: &DeviceBuffer<*const u16>,
+    q2_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    q2_weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
     expert_to_hot: &DeviceBuffer<u32>,
-    hot_packed_weight_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_2_table: &DeviceBuffer<*const f32>,
+    hot_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_2_table: &DeviceBuffer<DeviceAddress<f32>>,
     output: &mut DeviceBuffer<f32>,
     input_rows: usize,
     routes_per_input: usize,
@@ -1643,12 +1626,12 @@ pub fn q2_nvfp4_mixed_routed_matvec_f32_into_on_stream(
             ffi::infer_q2_nvfp4_mixed_routed_matvec_f32_on_stream(
                 indices.ptr,
                 input.ptr,
-                q2_packed_weight_table.ptr,
-                q2_weight_scale_table.ptr,
+                q2_packed_weight_table.as_const_ptr().cast(),
+                q2_weight_scale_table.as_const_ptr().cast(),
                 expert_to_hot.ptr,
-                hot_packed_weight_table.ptr,
-                hot_weight_scale_table.ptr,
-                hot_weight_scale_2_table.ptr,
+                hot_packed_weight_table.as_const_ptr().cast(),
+                hot_weight_scale_table.as_const_ptr().cast(),
+                hot_weight_scale_2_table.as_const_ptr().cast(),
                 output.as_mut_ptr().cast(),
                 experts as u32,
                 hot_capacity as u32,
@@ -1851,7 +1834,7 @@ mod tests {
         let output_table = DeviceBuffer::from_host(
             &outputs
                 .iter()
-                .map(|output| output.as_const_ptr().cast::<f32>().cast_mut())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("output table");
@@ -1902,7 +1885,7 @@ mod tests {
         let indices = DeviceBuffer::from_host(&[0u32]).expect("indices");
         let values = DeviceBuffer::from_host(&[weight.values_ptr()]).expect("values table");
         let scales = DeviceBuffer::from_host(&[weight.scales_ptr()]).expect("scales table");
-        let outputs = DeviceBuffer::from_host(&[output.ptr]).expect("output table");
+        let outputs = DeviceBuffer::from_host(&[output.cuda_address()]).expect("output table");
         q2_w2a16_grouped_matvec_f32_into_on_stream(
             &indices, &input, &values, &scales, &outputs, rows, cols, &stream,
         )
@@ -1941,13 +1924,13 @@ mod tests {
         let stream = CudaStream::new_non_blocking().expect("stream");
         let input = DeviceBuffer::from_host(&input_host).expect("input");
         let indices = DeviceBuffer::from_host(&[0u32, 1, 2]).expect("indices");
-        let mut outputs = (0..EXPERTS)
+        let outputs = (0..EXPERTS)
             .map(|_| DeviceBuffer::<f32>::zeroed(ROWS).expect("output"))
             .collect::<Vec<_>>();
         let output_table = DeviceBuffer::from_host(
             &outputs
-                .iter_mut()
-                .map(|output| output.as_mut_ptr().cast::<f32>())
+                .iter()
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("output table");
@@ -2056,9 +2039,7 @@ mod tests {
         let input = DeviceBuffer::from_host(&input_host).expect("input");
         let indices = DeviceBuffer::from_host(&[0u32]).expect("indices");
         let output = DeviceBuffer::<f32>::zeroed(5).expect("output");
-        let output_table =
-            DeviceBuffer::from_host(&[output.as_const_ptr().cast::<f32>().cast_mut()])
-                .expect("output table");
+        let output_table = DeviceBuffer::from_host(&[output.cuda_address()]).expect("output table");
         overlay
             .run_grouped(&indices, &input, &output_table, &stream)
             .expect("mixed matvec");

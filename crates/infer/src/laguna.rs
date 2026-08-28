@@ -7,18 +7,18 @@
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
     CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
-    GpuSamplingRow, GpuTokenSampler, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptNvfp4Linear, Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
-    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, fill_f32_into_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
+    GpuSamplingRow, GpuTokenSampler, ModelOptCublasLtWeight, Nvfp4Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
+    add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    fill_f32_into_on_stream, indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_into_on_stream,
     softplus_scale_heads_f32_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use serde::Deserialize;
 use std::f32::consts::PI;
 use std::fs;

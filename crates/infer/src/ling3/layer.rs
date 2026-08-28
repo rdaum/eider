@@ -1,7 +1,6 @@
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, add_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     block_fp8_linear_f32_batch_into_on_stream, block_fp8_linear_f32_into_on_stream,
     ling3_kda_128_f32_into_on_stream, ling3_kda_gate_f32_into_on_stream,
@@ -9,6 +8,7 @@ use eider_cuda::{
     nvfp4_w4a16_matvec_f32_batch_into_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
     rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
+use eider_format::{ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, ModelOptNvfp4Linear};
 
 const HEAD_DIM: usize = 128;
 

@@ -1,9 +1,9 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp, indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

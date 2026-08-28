@@ -1,6 +1,6 @@
 use eider_cuda::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Fp8TnMatmulPlan, GemmShape,
-    ModelOptCheckpoint, Result, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    Result, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     bf16_linear_pair_logits_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_f32_into_on_stream,
     fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream,
@@ -12,6 +12,7 @@ use eider_cuda::{
     fp8_linear_w8a8_f32_into_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_fp8_e4m3_f32_into_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, black_box, run_benchmark_main,

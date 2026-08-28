@@ -1,11 +1,11 @@
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
-    Result, bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    fp8_linear_channel_scaled_f32_batch_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_batch_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_f32_batch_into_on_stream,
     fp8_linear_f32_into_on_stream, nvfp4_w4a16_matvec_f32_batch_into_on_stream,
     nvfp4_w4a16_matvec_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
 /// Device format used when the checkpoint stores a dense linear in BF16.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

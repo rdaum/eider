@@ -1,14 +1,14 @@
 mod support;
 
 use eider_cuda::{
-    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, F32Matrix, ModelOptCheckpoint,
-    ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, Result, Sm12xFp4DeviceGemmWeight,
-    Sm12xFp4GemmWeight, format, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slots_nvfp4_simple_scales_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_fixed_scale_vector_on_stream,
-    upload_grouped_nvfp4,
+    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, F32Matrix, MoeSiluQuantizeSlotBuffers,
+    Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, format, indexed_gemv_on_stream,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_silu_quantize_slots_nvfp4_simple_scales_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_silu_quantize_slots_reference_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    quantize_fixed_scale_vector_on_stream, upload_grouped_nvfp4,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

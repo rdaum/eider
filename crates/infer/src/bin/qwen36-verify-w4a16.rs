@@ -1,7 +1,8 @@
 use eider_cuda::{
-    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, format,
-    nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceBuffer, Result, format, nvfp4_w4a16_matvec_f32_into_on_stream,
+    rms_norm_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use eider_inference::qwen3::qwen36::{
     Qwen36DecodeRow, Qwen36LayerBlock, Qwen36Model, Qwen36TextModel,
 };

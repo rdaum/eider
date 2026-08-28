@@ -6,13 +6,12 @@ use crate::kv_cache::KvCache;
 use eider_cuda::{
     ArgmaxResult, CublasLt, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemvF32Plan,
     DeviceBuffer, Error, F32Matrix, Fp4TnMatmulPlan, GemmShape, GroupedGemvPointerBuffers,
-    GroupedGemvPointerTableBuffers, ModelOptCheckpoint, ModelOptCublasLtWeight,
-    ModelOptNvfp4Activation, ModelOptNvfp4Linear, MoeSiluQuantizeSlotBuffers, Nvfp4Matrix,
-    Nvfp4TnInputs, Result, add_f32_into_on_stream, append_rows_f32_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_argmax_f32, bf16_linear_logits_f32_into_on_stream,
-    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    fill_f32_into_on_stream, format, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
-    gather_nvfp4_grouped_gemv_ptrs_on_stream,
+    GroupedGemvPointerTableBuffers, ModelOptCublasLtWeight, ModelOptNvfp4Activation,
+    MoeSiluQuantizeSlotBuffers, Nvfp4Matrix, Nvfp4TnInputs, Result, add_f32_into_on_stream,
+    append_rows_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_argmax_f32,
+    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
+    copy_row_f32_into_on_stream, fill_f32_into_on_stream, format,
+    gather_nvfp4_grouped_gemv_ptr_tables_on_stream, gather_nvfp4_grouped_gemv_ptrs_on_stream,
     moe_silu_quantize_slots_nvfp4_simple_scales_on_stream, moe_topk_f32_into_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
@@ -21,7 +20,7 @@ use eider_cuda::{
     silu_mul_halves_quantize_nvfp4_col_major_f32_into_on_stream, split_qkv_f32_into_on_stream,
     synchronize_device,
 };
-use eider_format::SafeTensorInfo;
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear, SafeTensorInfo};
 use serde_json::Value;
 use std::cell::{Ref, RefCell};
 use std::path::Path;

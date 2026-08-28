@@ -1,7 +1,8 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Result,
     nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_configured_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

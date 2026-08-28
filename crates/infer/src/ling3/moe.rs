@@ -1,7 +1,7 @@
 use super::Ling3Manifest;
 use super::layer::{Ling3Linear, load_float_as_f32};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Result, add_f32_into_on_stream,
     moe_weighted_accumulate_slots_f32_batch_prefix_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
     nemotron3_sigmoid_topk_f32_into_on_stream,
@@ -10,6 +10,7 @@ use eider_cuda::{
     nvfp4_w4a16_grouped_matvec_f32_into_on_stream, repeat_row_pointer_table_f32_into_on_stream,
     silu_mul_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 struct Expert {
     gate: Ling3Linear,

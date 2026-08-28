@@ -1,12 +1,13 @@
 use eider_cuda::{
     CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan, DeviceBuffer,
-    F32Matrix, ModelOptCublasLtWeight, ModelOptNvfp4Linear, MoeSortedNvfp4Rows, MoeSortedRoutes,
-    Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    F32Matrix, ModelOptCublasLtWeight, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp, indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
 };
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -142,7 +143,7 @@ impl Qwen36RoutedMoeDecodeBench {
         let w4a16_gate_up = Sm121W4A16GateUp::new_with_top_k(&gate_up_host, TOP_K)?;
         let w4a4_gate_up_weights = gate_up_host
             .iter()
-            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
+            .map(ModelOptCublasLtWeight::from_modelopt)
             .collect::<Result<Vec<_>>>()?;
         let w4a4_gate_up_values = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
@@ -212,7 +213,7 @@ impl Qwen36RoutedMoeDecodeBench {
         )?;
         let grouped_down_weights = down_host
             .iter()
-            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
+            .map(ModelOptCublasLtWeight::from_modelopt)
             .collect::<Result<Vec<_>>>()?;
         let grouped_down_values = DeviceBuffer::from_host(
             &grouped_down_weights

@@ -5,11 +5,11 @@
 //! input channels. The format is internal to Eider and is not an external
 //! checkpoint convention.
 
-use crate::cuda::{CudaStream, DeviceBuffer, check_cuda};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format;
-use crate::modelopt_device::ModelOptNvfp4Linear;
+use eider_format::ModelOptNvfp4Linear;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -479,8 +479,8 @@ pub struct Q3ExpertTable {
     experts: usize,
     packed_values: DeviceBuffer<u8>,
     scales: DeviceBuffer<u16>,
-    value_table: DeviceBuffer<*const u8>,
-    scale_table: DeviceBuffer<*const u16>,
+    value_table: DeviceBuffer<DeviceAddress<u8>>,
+    scale_table: DeviceBuffer<DeviceAddress<u16>>,
 }
 
 impl Q3ExpertTable {
@@ -537,23 +537,17 @@ impl Q3ExpertTable {
 
         let value_table = DeviceBuffer::from_host(
             &(0..info.experts)
-                .map(|expert| unsafe {
+                .map(|expert| {
                     packed_values
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(expert * values_per_expert)
+                        .cuda_address()
+                        .offset(expert * values_per_expert)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let scale_table = DeviceBuffer::from_host(
             &(0..info.experts)
-                .map(|expert| unsafe {
-                    scales
-                        .as_const_ptr()
-                        .cast::<u16>()
-                        .add(expert * scales_per_expert)
-                })
-                .collect::<Vec<_>>(),
+                .map(|expert| scales.cuda_address().offset(expert * scales_per_expert))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         Ok(Self {
             rows: info.rows,
@@ -581,9 +575,9 @@ pub struct Q3Nvfp4ExpertOverlay {
     hot_packed_values: DeviceBuffer<u8>,
     hot_scales: DeviceBuffer<u8>,
     hot_scale_2: DeviceBuffer<f32>,
-    hot_value_table: DeviceBuffer<*const u8>,
-    hot_scale_table: DeviceBuffer<*const u8>,
-    hot_scale_2_table: DeviceBuffer<*const f32>,
+    hot_value_table: DeviceBuffer<DeviceAddress<u8>>,
+    hot_scale_table: DeviceBuffer<DeviceAddress<u8>>,
+    hot_scale_2_table: DeviceBuffer<DeviceAddress<f32>>,
     expert_to_hot: DeviceBuffer<u32>,
     expert_to_hot_host: Vec<u32>,
     slot_to_expert: Vec<Option<usize>>,
@@ -606,33 +600,22 @@ impl Q3Nvfp4ExpertOverlay {
         let hot_scale_2 = DeviceBuffer::from_host(&vec![1.0f32; hot_capacity * cold.rows])?;
         let hot_value_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
+                .map(|slot| {
                     hot_packed_values
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * values_per_expert)
+                        .cuda_address()
+                        .offset(slot * values_per_expert)
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let hot_scale_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
-                    hot_scales
-                        .as_const_ptr()
-                        .cast::<u8>()
-                        .add(slot * scales_per_expert)
-                })
-                .collect::<Vec<_>>(),
+                .map(|slot| hot_scales.cuda_address().offset(slot * scales_per_expert))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let hot_scale_2_table = DeviceBuffer::from_host(
             &(0..hot_capacity)
-                .map(|slot| unsafe {
-                    hot_scale_2
-                        .as_const_ptr()
-                        .cast::<f32>()
-                        .add(slot * cold.rows)
-                })
-                .collect::<Vec<_>>(),
+                .map(|slot| hot_scale_2.cuda_address().offset(slot * cold.rows))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let expert_to_hot_host = vec![u32::MAX; cold.experts];
         let expert_to_hot = DeviceBuffer::from_host(&expert_to_hot_host)?;
@@ -870,12 +853,12 @@ impl Q3Nvfp4ExpertOverlay {
 pub fn q3_nvfp4_mixed_routed_matvec_f32_into_on_stream(
     indices: &DeviceBuffer<u32>,
     input: &DeviceBuffer<f32>,
-    q3_packed_weight_table: &DeviceBuffer<*const u8>,
-    q3_weight_scale_table: &DeviceBuffer<*const u16>,
+    q3_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    q3_weight_scale_table: &DeviceBuffer<DeviceAddress<u16>>,
     expert_to_hot: &DeviceBuffer<u32>,
-    hot_packed_weight_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_table: &DeviceBuffer<*const u8>,
-    hot_weight_scale_2_table: &DeviceBuffer<*const f32>,
+    hot_packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    hot_weight_scale_2_table: &DeviceBuffer<DeviceAddress<f32>>,
     output: &mut DeviceBuffer<f32>,
     input_rows: usize,
     routes_per_input: usize,
@@ -937,12 +920,12 @@ pub fn q3_nvfp4_mixed_routed_matvec_f32_into_on_stream(
             ffi::infer_q3_nvfp4_mixed_routed_matvec_f32_on_stream(
                 indices.ptr,
                 input.ptr,
-                q3_packed_weight_table.ptr,
-                q3_weight_scale_table.ptr,
+                q3_packed_weight_table.as_const_ptr().cast(),
+                q3_weight_scale_table.as_const_ptr().cast(),
                 expert_to_hot.ptr,
-                hot_packed_weight_table.ptr,
-                hot_weight_scale_table.ptr,
-                hot_weight_scale_2_table.ptr,
+                hot_packed_weight_table.as_const_ptr().cast(),
+                hot_weight_scale_table.as_const_ptr().cast(),
+                hot_weight_scale_2_table.as_const_ptr().cast(),
                 output.as_mut_ptr().cast(),
                 experts as u32,
                 hot_capacity as u32,

@@ -1,7 +1,7 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
@@ -9,6 +9,7 @@ use eider_cuda::{
     nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_state_update_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 /// Device-resident weights for one Nemotron 3 Mamba-2 layer.
 pub struct Nemotron3MambaLayer {

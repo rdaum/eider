@@ -1,10 +1,11 @@
 use crate::kv_cache::{KvCache, LayerKvCache};
 use eider_cuda::{
-    Bf16Matrix, CublasLt, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
-    ModelOptCublasLtWeight, ModelOptNvfp4Activation, ModelOptNvfp4Linear, Nvfp4TnInputs, Result,
-    add_f32_into_on_stream, format, rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
-    silu_mul_f32_into_on_stream, synchronize_device,
+    Bf16Matrix, CublasLt, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, GemmShape,
+    ModelOptCublasLtWeight, ModelOptNvfp4Activation, Nvfp4TnInputs, Result, add_f32_into_on_stream,
+    format, rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    synchronize_device,
 };
+use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use std::path::Path;
 
 /// Default local path used by the layer-0 smoke binary.

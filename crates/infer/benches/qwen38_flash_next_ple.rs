@@ -1,4 +1,5 @@
-use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint, PagedBf16ReadStats};
+use eider_cuda::{CudaStream, DeviceBuffer, PagedBf16ReadStats};
+use eider_format::ModelOptCheckpoint;
 use eider_inference::qwen38_flash_next::{
     Qwen38FlashNextConfig, Qwen38PagedPle, Qwen38PleTokenWindow,
 };

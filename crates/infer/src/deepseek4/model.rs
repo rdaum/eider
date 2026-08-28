@@ -8,18 +8,19 @@ use super::{
 };
 use eider_cuda::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, DeviceRepr, Error, INDEXER_SCORE_SLAB,
-    ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
-    add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, block_fp8_grouped_linear_f32_batch_into_on_stream,
-    block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
-    compress_windows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
-    hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
-    hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
-    lm_head_top1_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
-    rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
-    router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
-    store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
+    PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
+    arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
+    causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, hyper_apply_f32_batch_into_on_stream,
+    hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
+    indexer_topk_f32_batch_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
+    repeat_hyper_streams_f32_into_on_stream, rms_norm_f32_into_on_stream,
+    rope_interleaved_trailing_f32_indexed_in_place_on_stream, router_hash_f32_batch_into_on_stream,
+    router_topk_f32_batch_into_on_stream, store_compression_overlap_f32_into_on_stream,
+    swiglu_pair_f32_batch_into_on_stream,
 };
+use eider_format::{ModelOptBlockScaledFp8Linear, ModelOptCheckpoint};
 use std::path::Path;
 use tracing::info;
 
@@ -4488,10 +4489,10 @@ mod tests {
     };
     use crate::sm12x_cache::Sm12xPageTable;
     use eider_cuda::{
-        CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
-        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, format,
+        CudaStream, DeviceBuffer, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, format,
         repeat_hyper_streams_f32_into_on_stream,
     };
+    use eider_format::{ModelOptBlockScaledFp8Linear, ModelOptCheckpoint};
     use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache};
 
     const CONFIG: &str = r#"{

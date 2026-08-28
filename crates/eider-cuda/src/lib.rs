@@ -41,10 +41,11 @@ pub use cublaslt::{
     Int8TnMatmulPlan, Nvfp4TnInputs,
 };
 pub use cuda::{
-    CapturedGraph, ColumnMajor, CublasLtVec16, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer,
-    DeviceInOut, DeviceMatrix, DeviceMatrixMut, DeviceOutput, DeviceRepr, DeviceSlice,
-    DeviceSliceMut, HostRead, ModelOptNvfp4, PageableHostBuffer, PagedKv, PendingHostRead,
-    PinnedHostBuffer, RowMajor, Sm12xMma, device_memory_info, set_cuda_device, synchronize_device,
+    CapturedGraph, ColumnMajor, CublasLtVec16, CudaEvent, CudaGraphExec, CudaStream, DeviceAddress,
+    DeviceBuffer, DeviceInOut, DeviceMatrix, DeviceMatrixMut, DeviceOutput, DeviceRepr,
+    DeviceSlice, DeviceSliceMut, HostRead, ModelOptNvfp4, PageableHostBuffer, PagedKv,
+    PendingHostRead, PinnedHostBuffer, RowMajor, Sm12xMma, device_memory_info, set_cuda_device,
+    synchronize_device,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
@@ -227,11 +228,7 @@ pub use kernels::sm121_w4a16::{
     Sm121W4A16LinearBatchWorkspace,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
-pub use modelopt_device::{
-    ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear,
-    ModelOptNvfp4Activation, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt,
-    upload_grouped_nvfp4,
-};
+pub use modelopt_device::{ModelOptCublasLtWeight, ModelOptNvfp4Activation, upload_grouped_nvfp4};
 pub use ngram::{
     NgramEmbeddingBank, NgramEmbeddingFormat, NgramFp8Rows, NgramNvfp4Rows,
     fused_ngram_embedding_reference,

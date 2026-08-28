@@ -1,12 +1,12 @@
 use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host, load_float_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
-    ling3_kda_128_f32_chunks_into_on_stream, ling3_kda_128_f32_into_on_stream,
-    ling3_kda_gate_f32_batch_into_on_stream, ling3_kda_gate_f32_into_on_stream,
-    ling3_kda_prep_into_on_stream, ling3_kda_prep_rows_into_on_stream,
-    ling3_sigmoid_gated_rms_norm_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, ling3_kda_128_f32_chunks_into_on_stream,
+    ling3_kda_128_f32_into_on_stream, ling3_kda_gate_f32_batch_into_on_stream,
+    ling3_kda_gate_f32_into_on_stream, ling3_kda_prep_into_on_stream,
+    ling3_kda_prep_rows_into_on_stream, ling3_sigmoid_gated_rms_norm_f32_into_on_stream,
 };
+use eider_format::ModelOptCheckpoint;
 
 const HEAD_DIM: usize = 128;
 

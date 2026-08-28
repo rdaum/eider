@@ -1,8 +1,8 @@
 //! Bounded raw-NVFP4 linear slots for exact expert paging.
 
 use crate::cuda::{
-    CudaStream, DeviceBuffer, DeviceOutput, PageableHostBuffer, PinnedHostBuffer, check_cuda,
-    max_shared_memory_per_block,
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, PageableHostBuffer, PinnedHostBuffer,
+    check_cuda, max_shared_memory_per_block,
 };
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -18,8 +18,8 @@ pub struct Nvfp4LinearSlots {
     packed_weight: PageableHostBuffer<u8>,
     weight_scale: PageableHostBuffer<u8>,
     weight_scale_2: PageableHostBuffer<f32>,
-    packed_weight_table: DeviceBuffer<*const u8>,
-    weight_scale_table: DeviceBuffer<*const u8>,
+    packed_weight_table: DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     capacity: usize,
     rows: usize,
     cols: usize,
@@ -69,13 +69,13 @@ impl Nvfp4LinearSlots {
         weight_scale_2.as_mut_slice().fill(1.0);
         let packed_weight_table = DeviceBuffer::from_host(
             &(0..capacity)
-                .map(|slot| unsafe { packed_weight.as_ptr().add(slot * packed_per_slot) })
-                .collect::<Vec<_>>(),
+                .map(|slot| packed_weight.cuda_address().offset(slot * packed_per_slot))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let weight_scale_table = DeviceBuffer::from_host(
             &(0..capacity)
-                .map(|slot| unsafe { weight_scale.as_ptr().add(slot * scales_per_slot) })
-                .collect::<Vec<_>>(),
+                .map(|slot| weight_scale.cuda_address().offset(slot * scales_per_slot))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         Ok(Self {
             packed_weight,
@@ -261,7 +261,7 @@ impl Nvfp4LinearSlots {
                     input.as_const_ptr().cast(),
                     self.packed_weight_table.as_const_ptr().cast(),
                     self.weight_scale_table.as_const_ptr().cast(),
-                    self.weight_scale_2.as_ptr(),
+                    self.weight_scale_2.cuda_address().as_const_ptr(),
                     output.as_mut_ptr().cast(),
                     self.capacity as u32,
                     routes as u32,
@@ -317,7 +317,8 @@ fn selected_chunks_mut<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::Nvfp4LinearSlots;
-    use crate::{CudaStream, DeviceBuffer, ModelOptNvfp4Linear, PinnedHostBuffer, format};
+    use crate::{CudaStream, DeviceBuffer, PinnedHostBuffer, format};
+    use eider_format::ModelOptNvfp4Linear;
 
     #[test]
     fn pinned_slot_upload_matches_modelopt_matvec() {

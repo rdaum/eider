@@ -1,4 +1,5 @@
-use eider_cuda::{Error, ModelOptCheckpoint, Result};
+use eider_cuda::{Error, Result};
+use eider_format::ModelOptCheckpoint;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
