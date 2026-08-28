@@ -29,6 +29,8 @@ Bonsai follows the same ownership rule for its sequence state and decode
 workspace access.
 Ling 3 retains its MLA and recurrent sequence state behind an opaque identity
 and leases it for prefill and decode.
+Nemotron 3 retains its hybrid attention and Mamba sequence state behind opaque
+identities, with a batch lease for its batched prefill and speculative decode.
 Muse Glimmer retains its sequence, including DFlash device state, behind an
 opaque identity and leases it for prefill, prefix retention, and decode.
 `eider-format` now owns GGUF indexing, GGML K-quant decoding, the

@@ -2,8 +2,9 @@
 
 use crate::nemotron3::{
     Nemotron3BlockWorkspace, Nemotron3CacheContext, Nemotron3Model, Nemotron3MtpWorkspace,
-    Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3SpeculativeCycleWorkspace,
-    nemotron3_cache_error, new_nemotron3_sequence_cache_with_budget,
+    Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3SequenceId, Nemotron3SequencePool,
+    Nemotron3SpeculativeCycleWorkspace, nemotron3_cache_error,
+    new_nemotron3_sequence_cache_with_budget,
 };
 use crate::sm12x_cache::Sm12xPageTable;
 use eider_cuda::{DeviceBuffer, Error, Result};
@@ -94,7 +95,7 @@ struct ActiveRequest<'tokenizer> {
     generation: RequestConfig,
     generated_tokens: usize,
     last_token: Option<u32>,
-    sequence: Option<Nemotron3Sequence>,
+    sequence_id: Option<Nemotron3SequenceId>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -140,7 +141,7 @@ pub struct Nemotron3ChatService<'model, 'template> {
     next_id: u64,
     waiting: VecDeque<Nemotron3RequestId>,
     requests: BTreeMap<Nemotron3RequestId, ActiveRequest<'template>>,
-    active_sequences: usize,
+    sequences: Nemotron3SequencePool,
     sequence_cache: Nemotron3SequenceCache,
     retain_prefixes: bool,
     mtp_token_workspace: Option<Nemotron3MtpWorkspace>,
@@ -180,7 +181,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
-            active_sequences: 0,
+            sequences: Nemotron3SequencePool::new(),
             sequence_cache,
             retain_prefixes,
             mtp_token_workspace: model
@@ -250,7 +251,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             generation: request.generation.clone(),
             generated_tokens: 0,
             last_token: None,
-            sequence: None,
+            sequence_id: None,
             sampler: Sampler::new(request.generation.sampling)?,
             history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
             output: ChatOutputCodec::new(
@@ -302,7 +303,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.prompt_position + 1 >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -334,7 +335,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position + 1 < request.prompt.len()
             })
@@ -344,14 +345,14 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         self.prefill_blocks(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
-            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.active_sequences;
+        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -362,15 +363,15 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         };
         self.waiting.retain(|&waiting| waiting != id);
         let released = request
-            .sequence
-            .as_ref()
-            .map_or(0, Nemotron3Sequence::device_bytes);
-        if let Some(sequence) = request.sequence {
-            if let Err(error) = sequence.finish(self.model, &mut self.sequence_cache) {
-                warn!(%error, request_id = id.get(), "failed to release cancelled Nemotron sequence");
-            }
-            self.active_sequences -= 1;
-        }
+            .sequence_id
+            .and_then(|sequence_id| self.sequences.release(sequence_id).ok())
+            .map_or(0, |sequence| {
+                let bytes = sequence.device_bytes();
+                if let Err(error) = sequence.finish(self.model, &mut self.sequence_cache) {
+                    warn!(%error, request_id = id.get(), "failed to release cancelled Nemotron sequence");
+                }
+                bytes
+            });
         Nemotron3CancelOutcome::Cancelled {
             released_sequence_device_bytes: released,
         }
@@ -378,7 +379,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     /// Returns the number of requests currently owning device sequence state.
     pub fn active_sequence_count(&self) -> usize {
-        self.active_sequences
+        self.sequences.len()
     }
 
     fn admit(
@@ -389,7 +390,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.active_sequences < self.config.max_active_sequences {
+        while self.sequences.len() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
@@ -441,8 +442,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence = Some(sequence);
-            self.active_sequences += 1;
+            request.sequence_id = Some(self.sequences.insert(sequence)?);
             let progress = Nemotron3AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
@@ -545,53 +545,67 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .iter()
             .map(|(_, start, _)| *start)
             .collect::<Vec<_>>();
-        let mut states = requests
-            .iter_mut()
-            .map(|(_, request)| {
-                request
-                    .sequence
-                    .as_mut()
-                    .expect("prefill request has sequence")
-            })
+        let sequence_ids = requests
+            .iter()
+            .map(|(_, request)| request.sequence_id.expect("prefill request has sequence"))
             .collect::<Vec<_>>();
         for &(id, _, _) in &selected {
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
         }
-        self.model
-            .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
-        self.model.forward_block(
-            &mut states,
-            &chunks,
-            &mut workspace.target,
-            &mut self.sequence_cache,
-        )?;
-        if let (Some(mtp), Some(mtp_hidden)) = (&mut workspace.mtp, &mut workspace.mtp_hidden) {
-            let offsets = selected
-                .iter()
-                .scan(0usize, |offset, (_, _, chunk)| {
-                    let current = *offset;
-                    *offset += chunk.len();
-                    Some(u32::try_from(current).expect("prefill row offsets fit u32"))
-                })
-                .collect::<Vec<_>>();
-            self.model.append_mtp_prompt_block(
+        let result = (|| -> Result<()> {
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
+            let mut states = sequences.sequences_mut().collect::<Vec<_>>();
+            self.model
+                .capture_final_hidden_rows(&states, &mut workspace.previous_hidden)?;
+            self.model.forward_block(
                 &mut states,
                 &chunks,
-                &starts,
-                &offsets,
-                &workspace.previous_hidden,
-                workspace.target.final_hidden(),
-                mtp_hidden,
-                mtp,
+                &mut workspace.target,
+                &mut self.sequence_cache,
             )?;
-        }
-        drop(states);
-        for ((id, mut request), (_, _, chunk)) in requests.into_iter().zip(&selected) {
-            request.prompt_position += chunk.len();
-            let retain_prefix = request.prompt_position == request.prefix_target;
-            if retain_prefix {
-                self.retain_request_prefix(&mut request);
+            if let (Some(mtp), Some(mtp_hidden)) = (&mut workspace.mtp, &mut workspace.mtp_hidden) {
+                let offsets = selected
+                    .iter()
+                    .scan(0usize, |offset, (_, _, chunk)| {
+                        let current = *offset;
+                        *offset += chunk.len();
+                        Some(u32::try_from(current).expect("prefill row offsets fit u32"))
+                    })
+                    .collect::<Vec<_>>();
+                self.model.append_mtp_prompt_block(
+                    &mut states,
+                    &chunks,
+                    &starts,
+                    &offsets,
+                    &workspace.previous_hidden,
+                    workspace.target.final_hidden(),
+                    mtp_hidden,
+                    mtp,
+                )?;
             }
+            drop(states);
+            for (index, ((_, request), (_, _, chunk))) in
+                requests.iter_mut().zip(&selected).enumerate()
+            {
+                request.prompt_position += chunk.len();
+                if request.prompt_position == request.prefix_target {
+                    Self::retain_request_prefix(
+                        self.model,
+                        &mut self.sequence_cache,
+                        request,
+                        sequences.sequence_mut(index),
+                    );
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (id, request) in requests {
+                self.requests.insert(id, request);
+            }
+            return Err(error);
+        }
+        for (id, request) in requests {
             tick.prefilled.push(Nemotron3PrefillProgress {
                 request_id: id,
                 prompt_position: request.prompt_position,
@@ -601,28 +615,27 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         Ok(())
     }
 
-    fn retain_request_prefix(&mut self, request: &mut ActiveRequest<'template>) {
+    fn retain_request_prefix(
+        model: &Nemotron3Model,
+        sequence_cache: &mut Nemotron3SequenceCache,
+        request: &mut ActiveRequest<'template>,
+        sequence: &mut Nemotron3Sequence,
+    ) {
         if request.prefix_retained || request.prefix_target == 0 {
             return;
         }
-        let Some(sequence) = request.sequence.as_mut() else {
-            return;
-        };
         if sequence.position() != request.prefix_target {
             return;
         }
-        if !self
-            .sequence_cache
-            .contains_prefix(&request.prompt, request.prefix_target)
-        {
-            match self.model.snapshot_sequence(&sequence.state) {
+        if !sequence_cache.contains_prefix(&request.prompt, request.prefix_target) {
+            match model.snapshot_sequence(&sequence.state) {
                 Ok(snapshot) => {
-                    if let Err(error) = self.sequence_cache.retain_prefix(
+                    if let Err(error) = sequence_cache.retain_prefix(
                         sequence.cache_id,
                         &request.prompt,
                         snapshot,
                         &mut Nemotron3CacheContext {
-                            stream: self.model.stream(),
+                            stream: model.stream(),
                             page_table: &mut sequence.page_table,
                         },
                     ) {
@@ -644,10 +657,10 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         let input = request
             .last_token
             .unwrap_or(request.prompt[request.prompt.len() - 1]);
-        let sequence = request
-            .sequence
-            .as_mut()
-            .expect("admitted request has sequence");
+        let mut sequence = self
+            .sequences
+            .lease(request.sequence_id.expect("admitted request has sequence"))?;
+        let sequence = sequence.sequence_mut();
         if let Some(workspace) = self.mtp_token_workspace.as_mut() {
             self.model
                 .append_mtp_prompt_token(sequence, input, workspace)?;
@@ -695,7 +708,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut selected = ids
+        let selected = ids
             .iter()
             .map(|id| {
                 (
@@ -714,7 +727,11 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                     .expect("speculative request has input token")
             })
             .collect::<Vec<_>>();
-        let result = {
+        let sequence_ids = selected
+            .iter()
+            .map(|(_, request)| request.sequence_id.expect("selected request has sequence"))
+            .collect::<Vec<_>>();
+        let result = (|| -> Result<_> {
             if !self.speculative_workspaces.contains_key(&selected.len()) {
                 let workspace = self.model.speculative_cycle_workspace(selected.len())?;
                 self.speculative_workspaces
@@ -724,22 +741,15 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 .speculative_workspaces
                 .get_mut(&selected.len())
                 .expect("speculative workspace was inserted");
-            let mut states = selected
-                .iter_mut()
-                .map(|(_, request)| {
-                    request
-                        .sequence
-                        .as_mut()
-                        .expect("selected request has sequence")
-                })
-                .collect::<Vec<_>>();
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
+            let mut states = sequences.sequences_mut().collect::<Vec<_>>();
             self.model.speculative_cycle_argmax(
                 &mut states,
                 &inputs,
                 workspace,
                 &mut self.sequence_cache,
             )
-        };
+        })();
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -801,13 +811,14 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let sequence = request
-            .sequence
-            .take()
-            .expect("terminal request is admitted");
+        let sequence = self.sequences.release(
+            request
+                .sequence_id
+                .take()
+                .expect("terminal request is admitted"),
+        )?;
         let released = sequence.device_bytes();
         sequence.finish(self.model, &mut self.sequence_cache)?;
-        self.active_sequences -= 1;
         tick.finished.push(Nemotron3Finished {
             request_id: id,
             finish_reason: reason,

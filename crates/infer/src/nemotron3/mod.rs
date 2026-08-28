@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 mod attention;
+mod execution;
 mod linear;
 mod mamba;
 mod model;
@@ -19,6 +20,7 @@ pub use attention::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
     Nemotron3AttentionWorkspace,
 };
+pub(crate) use execution::{Nemotron3SequenceId, Nemotron3SequencePool};
 pub use linear::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
 };
