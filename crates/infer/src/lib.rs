@@ -15,6 +15,9 @@ mod system_io;
 mod error;
 pub use error::{InferenceError, InferenceResult};
 
+mod engine_config;
+pub use engine_config::InferenceEngineConfig;
+
 mod paged_prefill_attention;
 
 /// Physical SM12x KV-page storage shared by inference model state.

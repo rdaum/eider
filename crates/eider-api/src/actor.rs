@@ -2,7 +2,6 @@
 
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
-use eider_inference::InferenceError;
 use eider_inference::bitnet::BitNetModel;
 use eider_inference::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use eider_inference::deepseek4::Deepseek4TextModel;
@@ -26,11 +25,11 @@ use eider_inference::laguna::LagunaModel;
 use eider_inference::ling3::Ling3Model;
 use eider_inference::metrics::metrics as infer_metrics;
 use eider_inference::muse_glimmer::MuseGlimmerModel;
-use eider_inference::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
-use eider_inference::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
+use eider_inference::nemotron3::Nemotron3Model;
+use eider_inference::qwen3::qwen36::Qwen36TextModel;
 use eider_inference::qwen38_flash_next::Qwen38FlashNextModel;
-use eider_inference::step37::{Step37Bf16StorageConfig, Step37TextModel};
-use eider_runtime::cache::SequenceCacheConfig;
+use eider_inference::step37::Step37TextModel;
+use eider_inference::{InferenceEngineConfig, InferenceError};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::engine::{
     EngineCancelOutcome, EngineDraftStats, EngineFinished, EngineLifecycleEvent, EngineService,
@@ -51,48 +50,8 @@ use tracing::{error, info, warn};
 
 const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Model and scheduler configuration loaded by the actor thread.
-#[derive(Clone, Debug)]
-pub struct InferenceActorConfig {
-    pub model_dir: PathBuf,
-    pub artifact_dir: PathBuf,
-    pub dflash_gguf: Option<PathBuf>,
-    pub dflash2_dir: Option<PathBuf>,
-    pub scheduler: SchedulerConfig,
-    pub sequence_cache: SequenceCacheConfig,
-    pub qwen_bf16_storage: Qwen36Bf16StorageConfig,
-    pub qwen_fp8_attention_storage: Qwen36Fp8Storage,
-    pub qwen_fp8_dense_mlp_storage: Qwen36Fp8Storage,
-    pub qwen_fp8_lm_head_storage: Qwen36Fp8Storage,
-    pub step_expert_capacity: usize,
-    pub deepseek_expert_capacity: usize,
-    pub step_bf16_storage: Step37Bf16StorageConfig,
-    pub nemotron_storage: Nemotron3StorageConfig,
-    pub event_capacity: usize,
-}
-
-impl InferenceActorConfig {
-    pub fn new(model_dir: impl Into<PathBuf>) -> Self {
-        let model_dir = model_dir.into();
-        Self {
-            artifact_dir: model_dir.join(".eider-cache"),
-            dflash_gguf: None,
-            dflash2_dir: None,
-            model_dir,
-            scheduler: SchedulerConfig::default(),
-            sequence_cache: SequenceCacheConfig::default(),
-            qwen_bf16_storage: Qwen36Bf16StorageConfig::default(),
-            qwen_fp8_attention_storage: Qwen36Fp8Storage::default(),
-            qwen_fp8_dense_mlp_storage: Qwen36Fp8Storage::default(),
-            qwen_fp8_lm_head_storage: Qwen36Fp8Storage::default(),
-            step_expert_capacity: 240,
-            deepseek_expert_capacity: 8,
-            step_bf16_storage: Step37Bf16StorageConfig::default(),
-            nemotron_storage: Nemotron3StorageConfig::default(),
-            event_capacity: 256,
-        }
-    }
-}
+/// Compatibility name for the inference-owned engine configuration.
+pub type InferenceActorConfig = InferenceEngineConfig;
 
 /// Actor-local request identity used for cancellation from async clients.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
