@@ -6,9 +6,7 @@ use eider_inference::bitnet::BitNetModel;
 use eider_inference::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use eider_inference::deepseek4::Deepseek4TextModel;
 use eider_inference::execution::bitnet_serving::{BitNetChatService, BitNetEngineService};
-use eider_inference::execution::bonsai_serving::{
-    BonsaiAdmissionProgress, BonsaiCancelOutcome, BonsaiChatService, BonsaiRequestId,
-};
+use eider_inference::execution::bonsai_serving::{BonsaiChatService, BonsaiEngineService};
 use eider_inference::execution::deepseek4_serving::{
     Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
     Deepseek4SpeculativeProgress,
@@ -453,7 +451,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = BonsaiActorService::new(service);
+            let mut service = BonsaiEngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Qwen36 => {
@@ -865,17 +863,6 @@ fn muse_dflash_progress(progress: MuseGlimmerDFlashProgress) -> EngineDraftProgr
             target_position: progress.stats.target_position,
             draft_position: progress.stats.dflash_position,
         },
-    }
-}
-
-fn bonsai_admission_progress(progress: BonsaiAdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: Duration::ZERO,
-        checkpoint_copy_duration: Duration::ZERO,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
     }
 }
 
@@ -1712,113 +1699,6 @@ impl EngineService for MuseGlimmerActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             MuseGlimmerCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
-    }
-}
-
-struct BonsaiActorService<'model, 'template> {
-    inner: BonsaiChatService<'model, 'template>,
-    ids: BTreeMap<u64, BonsaiRequestId>,
-}
-
-impl<'model, 'template> BonsaiActorService<'model, 'template> {
-    fn new(inner: BonsaiChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for BonsaiActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer =
-            |event: RequestLifecycleEvent<BonsaiRequestId, BonsaiAdmissionProgress>| match event {
-                RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
-                    EngineLifecycleEvent::Admitted(bonsai_admission_progress(progress)),
-                ),
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-                }
-            };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(BonsaiRequestId::get)
-                .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            BonsaiCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            } => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            },
-            BonsaiCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
