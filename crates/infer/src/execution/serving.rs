@@ -1,8 +1,7 @@
 //! Structured chat serving over the Qwen3.6 continuous scheduler.
 
 use super::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
-    Qwen36Scheduler, Qwen38SpeculativeProgress,
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen36Scheduler,
 };
 use crate::qwen3::qwen36::Qwen36TextModel;
 use eider_cuda::{Error, Result};
@@ -27,15 +26,6 @@ use eider_runtime::tool_grammar::QwenXmlGrammarFactory;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// One request-scoped structured output delta.
-#[derive(Clone, Debug, PartialEq)]
-struct Qwen36ChatDelta {
-    /// Scheduler request that owns the output.
-    pub request_id: Qwen36RequestId,
-    /// Reasoning, visible text, or a completed tool call.
-    pub event: ChatOutputEvent,
-}
-
 /// Request metadata known after rendering and CPU queueing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qwen36ChatAdmission {
@@ -45,37 +35,6 @@ struct Qwen36ChatAdmission {
     pub prompt_tokens: usize,
     /// Maximum completion tokens requested.
     pub max_output_tokens: usize,
-}
-
-/// Terminal request metadata emitted exactly once by the serving bridge.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Qwen36ChatFinished {
-    /// Finished scheduler request.
-    pub request_id: Qwen36RequestId,
-    /// API-facing reason for stopping generation.
-    pub finish_reason: ChatFinishReason,
-    /// Final prompt and completion token counts.
-    pub usage: ChatUsage,
-    /// Persistent sequence-state bytes released at termination.
-    pub released_sequence_device_bytes: usize,
-}
-
-/// Observable work and output from one decode-first scheduler iteration.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Qwen36ChatTick {
-    /// Requests receiving persistent device sequence state during the tick.
-    /// Requests selected for model work, preserving scheduler order.
-    pub scheduled: Vec<Qwen36RequestId>,
-    /// Chunked prompt progress made during the tick.
-    pub prefilled: Vec<Qwen36PrefillProgress>,
-    /// One entry for each completion token selected during the tick.
-    pub generated: Vec<Qwen36RequestId>,
-    /// Qwen3.8 draft acceptance observed during the tick.
-    pub speculative: Vec<Qwen38SpeculativeProgress>,
-    /// Structured output safe to stream to API clients.
-    pub output: Vec<Qwen36ChatDelta>,
-    /// Requests reaching a serving-level terminal state.
-    pub finished: Vec<Qwen36ChatFinished>,
 }
 
 struct ActiveChatRequest<'tokenizer> {
@@ -103,7 +62,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     #[cfg(test)]
-    fn tick(&mut self) -> Result<Qwen36ChatTick> {
+    fn tick(&mut self) -> Result<EngineTick> {
         self.tick_with_lifecycle(&mut |_| {})
     }
 
@@ -181,7 +140,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
         ),
-    ) -> Result<Qwen36ChatTick> {
+    ) -> Result<EngineTick> {
         let scheduled = self.scheduler.tick_with_lifecycle(on_lifecycle)?;
         for admission in &scheduled.admitted {
             self.requests
@@ -190,16 +149,31 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 .usage
                 .cached_prompt_tokens = admission.cached_prompt_tokens;
         }
-        let mut tick = Qwen36ChatTick {
-            scheduled: scheduled.scheduled,
-            prefilled: scheduled.prefilled,
-            speculative: scheduled.speculative,
-            ..Qwen36ChatTick::default()
+        let mut tick = EngineTick {
+            prefilled: scheduled
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: EngineRequestId::new(progress.request_id.get()),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            verification: scheduled
+                .speculative
+                .into_iter()
+                .map(|progress| EngineVerificationProgress {
+                    request_id: EngineRequestId::new(progress.request_id.get()),
+                    cycles: progress.cycles,
+                    accepted_drafts: progress.accepted_drafts,
+                })
+                .collect(),
+            ..EngineTick::default()
         };
         let mut terminal = BTreeMap::new();
 
         for token in scheduled.generated {
-            tick.generated.push(token.request_id);
+            tick.generated
+                .push(EngineRequestId::new(token.request_id.get()));
             let request =
                 self.requests
                     .get_mut(&token.request_id)
@@ -259,8 +233,8 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
                 .requests
                 .remove(&id)
                 .expect("terminal chat request remains retained");
-            tick.finished.push(Qwen36ChatFinished {
-                request_id: id,
+            tick.finished.push(EngineFinished {
+                request_id: EngineRequestId::new(id.get()),
                 finish_reason: reason,
                 usage: request.usage,
                 released_sequence_device_bytes,
@@ -361,52 +335,7 @@ impl EngineService for Qwen36ChatService<'_, '_> {
                     EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
                 ),
             };
-        let tick = Qwen36ChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: tick
-                .speculative
-                .into_iter()
-                .map(|progress| EngineVerificationProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    cycles: progress.cycles,
-                    accepted_drafts: progress.accepted_drafts,
-                })
-                .collect(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Qwen36ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
         match Qwen36ChatService::cancel_request(self, Qwen36RequestId::from_u64(id.get())) {
@@ -439,18 +368,21 @@ impl ResponseFilter {
         &mut self,
         request_id: Qwen36RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Qwen36ChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => output.push(Qwen36ChatDelta { request_id, event }),
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Qwen36ChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -460,7 +392,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Qwen36ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -473,11 +408,11 @@ impl ResponseFilter {
         self.saw_tool_calls
     }
 
-    fn flush(&mut self, request_id: Qwen36RequestId, output: &mut Vec<Qwen36ChatDelta>) {
+    fn flush(&mut self, request_id: Qwen36RequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Qwen36ChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

@@ -75,38 +75,6 @@ struct Deepseek4AdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-struct Deepseek4PrefillProgress {
-    pub request_id: Deepseek4RequestId,
-    pub prompt_position: usize,
-}
-
-struct Deepseek4ChatDelta {
-    pub request_id: Deepseek4RequestId,
-    pub event: ChatOutputEvent,
-}
-
-struct Deepseek4Finished {
-    pub request_id: Deepseek4RequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-struct Deepseek4SpeculativeProgress {
-    pub request_id: Deepseek4RequestId,
-    pub cycles: usize,
-    pub accepted_drafts: usize,
-}
-
-#[derive(Default)]
-struct Deepseek4Tick {
-    pub prefilled: Vec<Deepseek4PrefillProgress>,
-    pub generated: Vec<Deepseek4RequestId>,
-    pub speculative: Vec<Deepseek4SpeculativeProgress>,
-    pub output: Vec<Deepseek4ChatDelta>,
-    pub finished: Vec<Deepseek4Finished>,
-}
-
 enum Deepseek4CancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
@@ -309,9 +277,9 @@ impl<'template> Deepseek4ChatService<'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
         ),
-    ) -> Result<Deepseek4Tick> {
+    ) -> Result<EngineTick> {
         let tick_started = Instant::now();
-        let mut tick = Deepseek4Tick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
 
         let mut terminal = BTreeMap::new();
@@ -404,7 +372,7 @@ impl<'template> Deepseek4ChatService<'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut Deepseek4Tick,
+        _tick: &mut EngineTick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
@@ -543,7 +511,7 @@ impl<'template> Deepseek4ChatService<'template> {
     fn prefill(
         &mut self,
         ids: &[Deepseek4RequestId],
-        tick: &mut Deepseek4Tick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
         ),
@@ -670,8 +638,8 @@ impl<'template> Deepseek4ChatService<'template> {
                 return Err(error);
             }
             for (request, (id, _)) in requests.into_iter().zip(selected) {
-                tick.prefilled.push(Deepseek4PrefillProgress {
-                    request_id: id,
+                tick.prefilled.push(EnginePrefillProgress {
+                    request_id: EngineRequestId::new(id.get()),
                     prompt_position: request.prompt_position,
                 });
                 self.requests.insert(id, request);
@@ -792,8 +760,8 @@ impl<'template> Deepseek4ChatService<'template> {
                     &mut sequence.sequence_mut().sequence,
                 );
             }
-            tick.prefilled.push(Deepseek4PrefillProgress {
-                request_id: id,
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(id.get()),
                 prompt_position: request.prompt_position,
             });
             self.requests.insert(id, request);
@@ -839,7 +807,7 @@ impl<'template> Deepseek4ChatService<'template> {
     fn generate(
         &mut self,
         ids: &[Deepseek4RequestId],
-        tick: &mut Deepseek4Tick,
+        tick: &mut EngineTick,
     ) -> Result<Vec<(Deepseek4RequestId, ChatFinishReason)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -925,7 +893,7 @@ impl<'template> Deepseek4ChatService<'template> {
     fn generate_speculative(
         &mut self,
         ids: &[Deepseek4RequestId],
-        tick: &mut Deepseek4Tick,
+        tick: &mut EngineTick,
         terminal: &mut BTreeMap<Deepseek4RequestId, ChatFinishReason>,
     ) -> Result<()> {
         if ids.is_empty() {
@@ -987,8 +955,8 @@ impl<'template> Deepseek4ChatService<'template> {
         for (sequence, ((mut request, &id), accepted)) in
             requests.into_iter().zip(ids).zip(accepted).enumerate()
         {
-            tick.speculative.push(Deepseek4SpeculativeProgress {
-                request_id: id,
+            tick.verification.push(EngineVerificationProgress {
+                request_id: EngineRequestId::new(id.get()),
                 cycles: 1,
                 accepted_drafts: accepted as usize,
             });
@@ -1012,7 +980,7 @@ impl<'template> Deepseek4ChatService<'template> {
         &mut self,
         id: Deepseek4RequestId,
         mut reason: ChatFinishReason,
-        tick: &mut Deepseek4Tick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -1042,8 +1010,8 @@ impl<'template> Deepseek4ChatService<'template> {
             &mut self.sequence_cache,
             self.mtp_sequence_cache.as_mut(),
         )?;
-        tick.finished.push(Deepseek4Finished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes: released,
@@ -1056,7 +1024,7 @@ fn apply_sample(
     request: &mut ActiveRequest<'_>,
     id: Deepseek4RequestId,
     sampled: SampledToken,
-    tick: &mut Deepseek4Tick,
+    tick: &mut EngineTick,
 ) -> Result<Option<ChatFinishReason>> {
     request.generated_tokens += 1;
     request.last_token = Some(sampled.id);
@@ -1065,7 +1033,7 @@ fn apply_sample(
     if request.output.is_reasoning() {
         request.usage.reasoning_tokens += 1;
     }
-    tick.generated.push(id);
+    tick.generated.push(EngineRequestId::new(id.get()));
     let events = request.output.push_token(sampled.id)?;
     if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
         return Ok(Some(reason));
@@ -1121,52 +1089,7 @@ impl EngineService for Deepseek4ChatService<'_> {
                 EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
             ),
         };
-        let tick = Deepseek4ChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: tick
-                .speculative
-                .into_iter()
-                .map(|progress| EngineVerificationProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    cycles: progress.cycles,
-                    accepted_drafts: progress.accepted_drafts,
-                })
-                .collect(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Deepseek4ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
 
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
@@ -1201,21 +1124,24 @@ impl ResponseFilter {
         &mut self,
         request_id: Deepseek4RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Deepseek4ChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         let mut emitted_tool_call = false;
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Reasoning(_) => {
-                    output.push(Deepseek4ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                 }
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Deepseek4ChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -1225,7 +1151,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Deepseek4ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     emitted_tool_call = true;
                 }
@@ -1234,11 +1163,11 @@ impl ResponseFilter {
         emitted_tool_call.then_some(ChatFinishReason::ToolCalls)
     }
 
-    fn flush(&mut self, request_id: Deepseek4RequestId, output: &mut Vec<Deepseek4ChatDelta>) {
+    fn flush(&mut self, request_id: Deepseek4RequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Deepseek4ChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

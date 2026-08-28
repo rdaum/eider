@@ -1,8 +1,7 @@
 //! Structured chat serving over the multi-session Step-3.7 scheduler.
 
 use super::step37_scheduler::{
-    Step37AdmissionProgress, Step37CancelOutcome, Step37PrefillProgress, Step37RequestId,
-    Step37Scheduler,
+    Step37AdmissionProgress, Step37CancelOutcome, Step37RequestId, Step37Scheduler,
 };
 use crate::step37::Step37TextModel;
 use eider_cuda::{Error, Result};
@@ -22,34 +21,11 @@ use eider_runtime::stop::StopBuffer;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq)]
-struct Step37ChatDelta {
-    pub request_id: Step37RequestId,
-    pub event: ChatOutputEvent,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Step37ChatAdmission {
     pub request_id: Step37RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Step37ChatFinished {
-    pub request_id: Step37RequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Step37ChatTick {
-    pub scheduled: Vec<Step37RequestId>,
-    pub prefilled: Vec<Step37PrefillProgress>,
-    pub generated: Vec<Step37RequestId>,
-    pub output: Vec<Step37ChatDelta>,
-    pub finished: Vec<Step37ChatFinished>,
 }
 
 struct ActiveChatRequest<'tokenizer> {
@@ -124,7 +100,7 @@ impl<'template> Step37ChatService<'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
         ),
-    ) -> Result<Step37ChatTick> {
+    ) -> Result<EngineTick> {
         let scheduled = self.scheduler.tick_with_lifecycle(on_lifecycle)?;
         for admission in &scheduled.admitted {
             self.requests
@@ -133,15 +109,22 @@ impl<'template> Step37ChatService<'template> {
                 .usage
                 .cached_prompt_tokens = admission.cached_prompt_tokens;
         }
-        let mut tick = Step37ChatTick {
-            scheduled: scheduled.scheduled,
-            prefilled: scheduled.prefilled,
-            ..Step37ChatTick::default()
+        let mut tick = EngineTick {
+            prefilled: scheduled
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: EngineRequestId::new(progress.request_id.get()),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            ..EngineTick::default()
         };
         let mut terminal = BTreeMap::new();
 
         for token in scheduled.generated {
-            tick.generated.push(token.request_id);
+            tick.generated
+                .push(EngineRequestId::new(token.request_id.get()));
             let request =
                 self.requests
                     .get_mut(&token.request_id)
@@ -197,8 +180,8 @@ impl<'template> Step37ChatService<'template> {
                 .requests
                 .remove(&id)
                 .expect("terminal request retained");
-            tick.finished.push(Step37ChatFinished {
-                request_id: id,
+            tick.finished.push(EngineFinished {
+                request_id: EngineRequestId::new(id.get()),
                 finish_reason: reason,
                 usage: request.usage,
                 released_sequence_device_bytes,
@@ -283,44 +266,7 @@ impl EngineService for Step37ChatService<'_> {
                     EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
                 ),
             };
-        let tick = Step37ChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: Vec::new(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Step37ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
         match Step37ChatService::cancel_request(self, Step37RequestId::from_u64(id.get())) {
@@ -353,18 +299,21 @@ impl ResponseFilter {
         &mut self,
         request_id: Step37RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Step37ChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => output.push(Step37ChatDelta { request_id, event }),
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Step37ChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -374,7 +323,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Step37ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -387,11 +339,11 @@ impl ResponseFilter {
         self.saw_tool_calls
     }
 
-    fn flush(&mut self, request_id: Step37RequestId, output: &mut Vec<Step37ChatDelta>) {
+    fn flush(&mut self, request_id: Step37RequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Step37ChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

@@ -63,20 +63,20 @@ struct MuseGlimmerAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-/// Prompt progress completed during one tick.
 struct MuseGlimmerPrefillProgress {
-    /// Request whose prompt advanced.
     pub request_id: MuseGlimmerRequestId,
-    /// Total prompt position after this tick.
     pub prompt_position: usize,
 }
 
-/// One structured output delta.
 struct MuseGlimmerChatDelta {
-    /// Request owning this delta.
     pub request_id: MuseGlimmerRequestId,
-    /// Reasoning, visible text, or tool-call output.
     pub event: ChatOutputEvent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MuseGlimmerDFlashProgress {
+    pub request_id: MuseGlimmerRequestId,
+    pub stats: MuseGlimmerDFlashStats,
 }
 
 /// Cumulative DFlash work retained for one request.
@@ -98,15 +98,6 @@ struct MuseGlimmerDFlashStats {
     pub dflash_position: usize,
 }
 
-/// Updated cumulative DFlash statistics produced by one service tick.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MuseGlimmerDFlashProgress {
-    /// Request owning the speculative state.
-    pub request_id: MuseGlimmerRequestId,
-    /// Cumulative statistics after the latest cycle.
-    pub stats: MuseGlimmerDFlashStats,
-}
-
 impl MuseGlimmerDFlashStats {
     fn record_cycle(
         &mut self,
@@ -124,30 +115,19 @@ impl MuseGlimmerDFlashStats {
     }
 }
 
-/// Terminal request metadata.
 struct MuseGlimmerFinished {
-    /// Finished request.
     pub request_id: MuseGlimmerRequestId,
-    /// API-facing finish reason.
     pub finish_reason: ChatFinishReason,
-    /// Final token usage.
     pub usage: ChatUsage,
-    /// Sequence device bytes released at completion.
     pub released_sequence_device_bytes: usize,
 }
 
-/// Work and output from one service iteration.
 #[derive(Default)]
 struct MuseGlimmerTick {
-    /// Prompt progress during this tick.
     pub prefilled: Vec<MuseGlimmerPrefillProgress>,
-    /// Requests producing a token during this tick.
     pub generated: Vec<MuseGlimmerRequestId>,
-    /// Requests completing a DFlash draft-and-verify cycle.
     pub dflash: Vec<MuseGlimmerDFlashProgress>,
-    /// Structured streaming deltas.
     pub output: Vec<MuseGlimmerChatDelta>,
-    /// Requests completing during this tick.
     pub finished: Vec<MuseGlimmerFinished>,
 }
 

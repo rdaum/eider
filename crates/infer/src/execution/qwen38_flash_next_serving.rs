@@ -49,39 +49,6 @@ struct Qwen38FlashNextAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-struct Qwen38FlashNextPrefillProgress {
-    pub request_id: Qwen38FlashNextRequestId,
-    pub prompt_position: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Qwen38FlashNextSpeculativeProgress {
-    pub request_id: Qwen38FlashNextRequestId,
-    pub cycles: usize,
-    pub accepted_drafts: usize,
-}
-
-struct Qwen38FlashNextChatDelta {
-    pub request_id: Qwen38FlashNextRequestId,
-    pub event: ChatOutputEvent,
-}
-
-struct Qwen38FlashNextFinished {
-    pub request_id: Qwen38FlashNextRequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-#[derive(Default)]
-struct Qwen38FlashNextTick {
-    pub prefilled: Vec<Qwen38FlashNextPrefillProgress>,
-    pub generated: Vec<Qwen38FlashNextRequestId>,
-    pub speculative: Vec<Qwen38FlashNextSpeculativeProgress>,
-    pub output: Vec<Qwen38FlashNextChatDelta>,
-    pub finished: Vec<Qwen38FlashNextFinished>,
-}
-
 enum Qwen38FlashNextCancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
@@ -260,9 +227,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
         ),
-    ) -> Result<Qwen38FlashNextTick> {
+    ) -> Result<EngineTick> {
         let started = Instant::now();
-        let mut tick = Qwen38FlashNextTick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
         let mut terminal = BTreeMap::new();
 
@@ -337,7 +304,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut Qwen38FlashNextTick,
+        _tick: &mut EngineTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
@@ -471,7 +438,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         &mut self,
         id: Qwen38FlashNextRequestId,
         token_capacity: usize,
-        tick: &mut Qwen38FlashNextTick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
         ),
@@ -554,8 +521,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             request,
             sequence,
         );
-        tick.prefilled.push(Qwen38FlashNextPrefillProgress {
-            request_id: id,
+        tick.prefilled.push(EnginePrefillProgress {
+            request_id: EngineRequestId::new(id.get()),
             prompt_position: end,
         });
         Ok(end - start)
@@ -627,7 +594,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
     fn generate_one(
         &mut self,
         id: Qwen38FlashNextRequestId,
-        tick: &mut Qwen38FlashNextTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         if self.requests[&id].uses_speculative {
             return self.generate_speculative(id, tick);
@@ -700,7 +667,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
     fn generate_speculative(
         &mut self,
         id: Qwen38FlashNextRequestId,
-        tick: &mut Qwen38FlashNextTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         let mut sequence = self.execution.sequences.lease(
@@ -752,8 +719,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                     .as_mut()
                     .expect("MTP cache was allocated"),
             )?;
-            tick.speculative.push(Qwen38FlashNextSpeculativeProgress {
-                request_id: id,
+            tick.verification.push(EngineVerificationProgress {
+                request_id: EngineRequestId::new(id.get()),
                 cycles: 1,
                 accepted_drafts: outcome.accepted_drafts,
             });
@@ -776,7 +743,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         request: &mut ActiveRequest<'template>,
         id: Qwen38FlashNextRequestId,
         sampled: SampledToken,
-        tick: &mut Qwen38FlashNextTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         request.generated_tokens += 1;
         request.last_token = Some(sampled.id);
@@ -785,7 +752,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
-        tick.generated.push(id);
+        tick.generated.push(EngineRequestId::new(id.get()));
         let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
@@ -803,7 +770,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         &mut self,
         id: Qwen38FlashNextRequestId,
         mut reason: ChatFinishReason,
-        tick: &mut Qwen38FlashNextTick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -834,8 +801,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             &mut self.execution.sequence_cache,
             self.execution.mtp_sequence_cache.as_mut(),
         )?;
-        tick.finished.push(Qwen38FlashNextFinished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes,
@@ -877,52 +844,8 @@ impl EngineService for Qwen38FlashNextChatService<'_> {
                 EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
             ),
         };
-        let tick = Qwen38FlashNextChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: tick
-                .speculative
-                .into_iter()
-                .map(|progress| EngineVerificationProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    cycles: progress.cycles,
-                    accepted_drafts: progress.accepted_drafts,
-                })
-                .collect(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Qwen38FlashNextChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
         match Qwen38FlashNextChatService::cancel_request(self, Qwen38FlashNextRequestId(id.get())) {
@@ -956,20 +879,21 @@ impl ResponseFilter {
         &mut self,
         request_id: Qwen38FlashNextRequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Qwen38FlashNextChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => {
-                    output.push(Qwen38FlashNextChatDelta { request_id, event })
-                }
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Qwen38FlashNextChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -979,7 +903,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Qwen38FlashNextChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -988,15 +915,11 @@ impl ResponseFilter {
         None
     }
 
-    fn flush(
-        &mut self,
-        request_id: Qwen38FlashNextRequestId,
-        output: &mut Vec<Qwen38FlashNextChatDelta>,
-    ) {
+    fn flush(&mut self, request_id: Qwen38FlashNextRequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() && !self.saw_tool_calls {
-            output.push(Qwen38FlashNextChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

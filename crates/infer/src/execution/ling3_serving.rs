@@ -45,35 +45,6 @@ struct Ling3AdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-/// Prompt progress completed during one tick.
-struct Ling3PrefillProgress {
-    pub request_id: Ling3RequestId,
-    pub prompt_position: usize,
-}
-
-/// One structured output delta.
-struct Ling3ChatDelta {
-    pub request_id: Ling3RequestId,
-    pub event: ChatOutputEvent,
-}
-
-/// Terminal request metadata.
-struct Ling3Finished {
-    pub request_id: Ling3RequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-/// Work and output from one service iteration.
-#[derive(Default)]
-struct Ling3Tick {
-    pub prefilled: Vec<Ling3PrefillProgress>,
-    pub generated: Vec<Ling3RequestId>,
-    pub output: Vec<Ling3ChatDelta>,
-    pub finished: Vec<Ling3Finished>,
-}
-
 /// Outcome of cancelling a queued or active request.
 enum Ling3CancelOutcome {
     Cancelled {
@@ -231,9 +202,9 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
     fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>),
-    ) -> Result<Ling3Tick> {
+    ) -> Result<EngineTick> {
         let started = Instant::now();
-        let mut tick = Ling3Tick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
         let mut terminal = BTreeMap::new();
         let decode_ids = self
@@ -302,7 +273,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut Ling3Tick,
+        _tick: &mut EngineTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>),
     ) -> Result<()> {
@@ -337,7 +308,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
     fn prefill(
         &mut self,
         ids: &[Ling3RequestId],
-        tick: &mut Ling3Tick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>),
     ) -> Result<()> {
         let mut budget = self.config.prefill_token_capacity;
@@ -365,8 +336,8 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             )?;
             request.prompt_position = end;
             request.prompt_logits_ready = end == request.prompt.len();
-            tick.prefilled.push(Ling3PrefillProgress {
-                request_id: id,
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(id.get()),
                 prompt_position: end,
             });
         }
@@ -376,7 +347,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
     fn generate_one(
         &mut self,
         id: Ling3RequestId,
-        tick: &mut Ling3Tick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         let mut sequence = self
@@ -407,7 +378,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
-        tick.generated.push(id);
+        tick.generated.push(EngineRequestId::new(id.get()));
         let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
@@ -425,7 +396,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         &mut self,
         id: Ling3RequestId,
         mut reason: ChatFinishReason,
-        tick: &mut Ling3Tick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -451,8 +422,8 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         )?;
         let released = sequence.device_bytes();
         sequence.finish(&self.stream, &mut self.sequence_cache)?;
-        tick.finished.push(Ling3Finished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes: released,
@@ -492,44 +463,7 @@ impl EngineService for Ling3ChatService<'_, '_> {
                     EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
                 ),
             };
-        let tick =
-            Ling3ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: Vec::new(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Ling3ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
 
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
@@ -565,18 +499,21 @@ impl ResponseFilter {
         &mut self,
         request_id: Ling3RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Ling3ChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => output.push(Ling3ChatDelta { request_id, event }),
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Ling3ChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -586,7 +523,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Ling3ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -595,11 +535,11 @@ impl ResponseFilter {
         None
     }
 
-    fn flush(&mut self, request_id: Ling3RequestId, output: &mut Vec<Ling3ChatDelta>) {
+    fn flush(&mut self, request_id: Ling3RequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Ling3ChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

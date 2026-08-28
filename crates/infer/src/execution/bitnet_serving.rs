@@ -52,47 +52,6 @@ struct BitNetAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-/// Prompt progress completed during one tick.
-struct BitNetPrefillProgress {
-    /// Request whose prompt advanced.
-    pub request_id: BitNetRequestId,
-    /// Total prompt position after this tick.
-    pub prompt_position: usize,
-}
-
-/// One structured output delta.
-struct BitNetChatDelta {
-    /// Request owning this delta.
-    pub request_id: BitNetRequestId,
-    /// Reasoning, visible text, or tool-call output.
-    pub event: ChatOutputEvent,
-}
-
-/// Terminal request metadata.
-struct BitNetFinished {
-    /// Finished request.
-    pub request_id: BitNetRequestId,
-    /// API-facing finish reason.
-    pub finish_reason: ChatFinishReason,
-    /// Final token usage.
-    pub usage: ChatUsage,
-    /// Sequence device bytes released at completion.
-    pub released_sequence_device_bytes: usize,
-}
-
-/// Work and output from one service iteration.
-#[derive(Default)]
-struct BitNetTick {
-    /// Prompt progress during this tick.
-    pub prefilled: Vec<BitNetPrefillProgress>,
-    /// Requests producing a token during this tick.
-    pub generated: Vec<BitNetRequestId>,
-    /// Structured streaming deltas.
-    pub output: Vec<BitNetChatDelta>,
-    /// Requests completing during this tick.
-    pub finished: Vec<BitNetFinished>,
-}
-
 /// Outcome of cancelling a queued or active request.
 enum BitNetCancelOutcome {
     /// The request was removed and these device bytes were released.
@@ -276,9 +235,9 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>,
         ),
-    ) -> Result<BitNetTick> {
+    ) -> Result<EngineTick> {
         let started = Instant::now();
-        let mut tick = BitNetTick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
         let mut terminal = BTreeMap::new();
         let decode_ids = self
@@ -340,7 +299,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut BitNetTick,
+        _tick: &mut EngineTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>,
@@ -369,7 +328,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     fn prefill(
         &mut self,
         ids: &[BitNetRequestId],
-        tick: &mut BitNetTick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>,
         ),
@@ -397,8 +356,8 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             )?;
             request.prompt_position = end;
             request.prompt_logits_ready = end == request.prompt.len();
-            tick.prefilled.push(BitNetPrefillProgress {
-                request_id: id,
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(id.get()),
                 prompt_position: end,
             });
         }
@@ -408,7 +367,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     fn generate_one(
         &mut self,
         id: BitNetRequestId,
-        tick: &mut BitNetTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         let mut sequence = self
@@ -445,7 +404,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
-        tick.generated.push(id);
+        tick.generated.push(EngineRequestId::new(id.get()));
         let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
@@ -463,7 +422,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         &mut self,
         id: BitNetRequestId,
         mut reason: ChatFinishReason,
-        tick: &mut BitNetTick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -489,8 +448,8 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         )?;
         let released = sequence.device_bytes();
         sequence.finish(&mut self.sequence_cache)?;
-        tick.finished.push(BitNetFinished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes: released,
@@ -532,44 +491,7 @@ impl EngineService for BitNetChatService<'_, '_> {
                     )));
                 }
             };
-        let tick = BitNetChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: Vec::new(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        BitNetChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
 
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
@@ -605,18 +527,21 @@ impl ResponseFilter {
         &mut self,
         request_id: BitNetRequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<BitNetChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => output.push(BitNetChatDelta { request_id, event }),
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(BitNetChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -626,7 +551,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(BitNetChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -635,11 +563,11 @@ impl ResponseFilter {
         None
     }
 
-    fn flush(&mut self, request_id: BitNetRequestId, output: &mut Vec<BitNetChatDelta>) {
+    fn flush(&mut self, request_id: BitNetRequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(BitNetChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }
