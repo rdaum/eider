@@ -27,6 +27,11 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 micromeasure.workspace = true
 
+[[bin]]
+name = "eider"
+path = "src/bin/eider.rs"
+doc = false
+
 [[bench]]
 name = "qwen36_routed_gate_up"
 harness = false

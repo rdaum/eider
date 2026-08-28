@@ -22,3 +22,8 @@ tracing-subscriber.workspace = true
 hf-hub.workspace = true
 fs2.workspace = true
 futures.workspace = true
+
+[[bin]]
+name = "eider"
+path = "src/bin/eider.rs"
+doc = false
