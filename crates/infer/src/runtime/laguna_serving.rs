@@ -2,7 +2,7 @@
 
 use crate::laguna::{
     HEAD_DIM, KV_HEADS, LAYERS, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace,
-    LagunaPrefillRow,
+    LagunaPrefillRow, LagunaSequenceId, LagunaSequencePool,
 };
 use crate::laguna::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
@@ -127,7 +127,7 @@ struct ActiveRequest<'tokenizer> {
     reasoning_token_budget: Option<usize>,
     last_token: Option<u32>,
     pending_sample: Option<SampledToken>,
-    sequence: Option<Box<LagunaSequence>>,
+    sequence_id: Option<LagunaSequenceId>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -142,7 +142,7 @@ pub struct LagunaChatService<'model, 'template> {
     next_id: u64,
     waiting: VecDeque<LagunaRequestId>,
     requests: BTreeMap<LagunaRequestId, ActiveRequest<'template>>,
-    active_sequences: usize,
+    sequences: LagunaSequencePool,
     sequence_cache: LagunaSequenceCache,
     cache_stream: CudaStream,
     prefill_workspace: LagunaPrefillBatchWorkspace,
@@ -288,7 +288,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
-            active_sequences: 0,
+            sequences: LagunaSequencePool::new(),
             sequence_cache,
             cache_stream: CudaStream::new_blocking()?,
             prefill_workspace,
@@ -367,7 +367,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 reasoning_token_budget,
                 last_token: None,
                 pending_sample: None,
-                sequence: None,
+                sequence_id: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -416,7 +416,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.prompt_position >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -433,7 +433,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -443,14 +443,14 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
-            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.active_sequences;
+        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -459,25 +459,32 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             return LagunaCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
-        let released = request
-            .sequence
-            .as_ref()
-            .map_or(0, |sequence| sequence.device_bytes());
-        if let Some(sequence) = request.sequence
-            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)
-        {
-            warn!(%error, "failed to release cancelled Laguna sequence");
-        }
-        if released != 0 {
-            self.active_sequences -= 1;
-        }
+        let released = if let Some(sequence_id) = request.sequence_id {
+            match self.sequences.release(sequence_id) {
+                Ok(sequence) => {
+                    let bytes = sequence.device_bytes();
+                    if let Err(error) =
+                        sequence.finish(&mut self.sequence_cache, &self.cache_stream)
+                    {
+                        warn!(%error, "failed to release cancelled Laguna sequence");
+                    }
+                    bytes
+                }
+                Err(error) => {
+                    warn!(%error, "missing cancelled Laguna sequence");
+                    0
+                }
+            }
+        } else {
+            0
+        };
         LagunaCancelOutcome::Cancelled {
             released_sequence_device_bytes: released,
         }
     }
 
     pub fn active_sequence_count(&self) -> usize {
-        self.active_sequences
+        self.sequences.len()
     }
 
     fn admit(
@@ -488,7 +495,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.active_sequences < self.config.max_active_sequences {
+        while self.sequences.len() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
@@ -532,8 +539,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence = Some(Box::new(sequence));
-            self.active_sequences += 1;
+            request.sequence_id = Some(self.sequences.insert(sequence)?);
             let progress = LagunaAdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
@@ -586,6 +592,16 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             selected.push((id, chunk));
         }
         if !selected.is_empty() {
+            let sequence_ids = selected
+                .iter()
+                .map(|(id, _)| {
+                    self.requests[id].sequence_id.ok_or_else(|| Error::Format {
+                        label: "Laguna scheduled prefill",
+                        detail: format!("request {} has no admitted sequence", id.get()),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
             let mut requests = selected
                 .iter()
                 .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
@@ -599,15 +615,13 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     .unwrap_or(&mut self.prefill_workspace);
                 let mut rows = requests
                     .iter_mut()
+                    .zip(sequences.sequences_mut())
                     .zip(selected.iter().map(|(_, chunk)| *chunk))
-                    .map(|(request, chunk)| {
+                    .map(|((request, sequence), chunk)| {
                         let start = request.prompt_position;
                         LagunaPrefillRow {
                             token_ids: &request.prompt[start..start + chunk],
-                            sequence: request
-                                .sequence
-                                .as_deref_mut()
-                                .expect("prefill request is admitted"),
+                            sequence,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -618,6 +632,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     .prefill_batch(workspace, &mut rows, &mut self.sequence_cache)
                     .and_then(|()| self.model.synchronize())
             };
+            drop(sequences);
             if let Err(error) = result {
                 for (request, (id, _)) in requests.into_iter().zip(&selected) {
                     self.requests.insert(*id, request);
@@ -634,6 +649,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                     Self::retain_request_checkpoint(
                         &mut self.sequence_cache,
                         &self.cache_stream,
+                        &mut self.sequences,
                         &mut request,
                     );
                 }
@@ -654,28 +670,22 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             let token = request.prompt[request.prompt_position];
             request.prompt_position += 1;
+            let sequence_id = request.sequence_id.expect("prefill request is admitted");
+            let mut sequences = self.sequences.lease_many(&[sequence_id])?;
+            let sequence = sequences.sequence_mut(0);
             let sampled = if request.sampler.config().uses_fast_argmax() {
-                sampled_from_top1(
-                    self.model.decode_one(
-                        request
-                            .sequence
-                            .as_deref_mut()
-                            .expect("prefill request is admitted"),
-                        token,
-                        &mut self.sequence_cache,
-                    )?,
-                )
-            } else {
-                let logits = self.model.logits_one(
-                    request
-                        .sequence
-                        .as_deref_mut()
-                        .expect("prefill request is admitted"),
+                sampled_from_top1(self.model.decode_one(
+                    sequence,
                     token,
                     &mut self.sequence_cache,
-                )?;
+                )?)
+            } else {
+                let logits = self
+                    .model
+                    .logits_one(sequence, token, &mut self.sequence_cache)?;
                 request.sampler.sample(&logits, &request.history)?
             };
+            drop(sequences);
             request.pending_sample = Some(sampled);
             self.model.synchronize()?;
             if checkpoint_ready(
@@ -686,6 +696,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 Self::retain_request_checkpoint(
                     &mut self.sequence_cache,
                     &self.cache_stream,
+                    &mut self.sequences,
                     request,
                 );
             }
@@ -700,6 +711,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
     fn retain_request_checkpoint(
         sequence_cache: &mut LagunaSequenceCache,
         cache_stream: &CudaStream,
+        sequences: &mut LagunaSequencePool,
         request: &mut ActiveRequest<'template>,
     ) {
         if request.prefix_retained || request.prefix_target == 0 {
@@ -709,9 +721,14 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             request.prefix_retained = true;
             return;
         }
-        let Some(sequence) = request.sequence.as_deref_mut() else {
+        let Some(sequence_id) = request.sequence_id else {
             return;
         };
+        let Ok(mut leased) = sequences.lease_many(&[sequence_id]) else {
+            warn!("missing sequence while retaining Laguna prompt prefix");
+            return;
+        };
+        let sequence = leased.sequence_mut(0);
         if sequence.position() != request.prefix_target {
             return;
         }
@@ -739,6 +756,9 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         tick: &mut LagunaTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
+        let sequence_id = request.sequence_id.expect("decode request is admitted");
+        let mut sequences = self.sequences.lease_many(&[sequence_id])?;
+        let sequence = sequences.sequence_mut(0);
         let reasoning_budget_reached = request.output.is_reasoning()
             && request
                 .reasoning_token_budget
@@ -747,14 +767,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             let token = request
                 .last_token
                 .expect("budgeted Laguna request has generated reasoning");
-            self.model.consume_one(
-                request
-                    .sequence
-                    .as_deref_mut()
-                    .expect("decode request is admitted"),
-                token,
-                &mut self.sequence_cache,
-            )?;
+            self.model
+                .consume_one(sequence, token, &mut self.sequence_cache)?;
             SampledToken {
                 id: self.reasoning_end_token,
                 logit: 0.0,
@@ -767,25 +781,15 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 .last_token
                 .expect("generated Laguna token exists after prompt logits");
             if request.sampler.config().uses_fast_argmax() {
-                sampled_from_top1(
-                    self.model.decode_one(
-                        request
-                            .sequence
-                            .as_deref_mut()
-                            .expect("decode request is admitted"),
-                        token,
-                        &mut self.sequence_cache,
-                    )?,
-                )
-            } else {
-                let logits = self.model.logits_one(
-                    request
-                        .sequence
-                        .as_deref_mut()
-                        .expect("decode request is admitted"),
+                sampled_from_top1(self.model.decode_one(
+                    sequence,
                     token,
                     &mut self.sequence_cache,
-                )?;
+                )?)
+            } else {
+                let logits = self
+                    .model
+                    .logits_one(sequence, token, &mut self.sequence_cache)?;
                 request.sampler.sample(&logits, &request.history)?
             }
         };
@@ -832,13 +836,13 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let sequence = request
-            .sequence
+        let sequence_id = request
+            .sequence_id
             .take()
             .expect("terminal request is admitted");
+        let sequence = self.sequences.release(sequence_id)?;
         let released = sequence.device_bytes();
-        (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)?;
-        self.active_sequences -= 1;
+        sequence.finish(&mut self.sequence_cache, &self.cache_stream)?;
         tick.finished.push(LagunaFinished {
             request_id: id,
             finish_reason: reason,

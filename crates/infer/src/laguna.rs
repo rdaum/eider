@@ -27,8 +27,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::info;
 
 mod batch;
+mod execution;
 mod sequence;
 pub use batch::{LagunaPrefillBatchWorkspace, LagunaPrefillRow};
+pub(crate) use execution::{LagunaSequenceId, LagunaSequencePool};
 pub(crate) use sequence::{LagunaAppend, laguna_cache_error};
 pub use sequence::{LagunaSequence, LagunaSequenceCache, new_laguna_sequence_cache};
 
