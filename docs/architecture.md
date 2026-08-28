@@ -23,6 +23,8 @@ identities in its model module. Its scheduler leases that state only for the
 prefill, decode, and prefix-retention operations that use it.
 Laguna uses the same handle-and-lease ownership boundary for its paged sequence
 state across prefill, decode, prefix retention, cancellation, and completion.
+BitNet retains its sequence state in a model-owned pool and leases it for each
+prefill or decode operation; the service retains only request and output state.
 `eider-format` now owns GGUF indexing, GGML K-quant decoding, the
 sharded safetensors index/cache, the versioned host-only NVFP4 artifact codec,
 and ModelOpt checkpoint records and host layouts. `eider-cuda` owns the

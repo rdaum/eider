@@ -17,7 +17,9 @@ use seqcache::AppendPages;
 use serde_json::Value;
 use std::path::Path;
 
+mod execution;
 mod sequence;
+pub(crate) use execution::{BitNetSequenceId, BitNetSequencePool};
 pub(crate) use sequence::bitnet_cache_error;
 pub use sequence::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
 
