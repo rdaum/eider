@@ -673,7 +673,7 @@ mod tests {
         .unwrap();
         assert!(rendered.starts_with("user:hello|"));
         assert!(rendered.contains(r#""name": "read_file""#));
-        assert!(rendered.ends_with("|true:false:true"));
+        assert!(rendered.ends_with("|True:False:True"));
     }
 
     #[test]
@@ -693,7 +693,7 @@ mod tests {
             "<eos>",
         )
         .unwrap();
-        assert_eq!(rendered, "chat:false");
+        assert_eq!(rendered, "chat:False");
     }
 
     #[test]
