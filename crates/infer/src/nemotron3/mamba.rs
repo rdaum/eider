@@ -1,7 +1,7 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, add_f32_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
     nemotron3_mamba_conv_update_f32_into_on_stream,
@@ -202,8 +202,8 @@ impl Nemotron3MambaLayer {
         &self,
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
-        conv_state_table: &DeviceBuffer<*mut u16>,
-        ssm_state_table: &DeviceBuffer<*mut u16>,
+        conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
@@ -233,8 +233,8 @@ impl Nemotron3MambaLayer {
         &self,
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
-        conv_state_table: &DeviceBuffer<*mut u16>,
-        ssm_state_table: &DeviceBuffer<*mut u16>,
+        conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
@@ -265,8 +265,8 @@ impl Nemotron3MambaLayer {
         &self,
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3MambaRowsWorkspace,
-        conv_state_table: &DeviceBuffer<*mut u16>,
-        ssm_state_table: &DeviceBuffer<*mut u16>,
+        conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
+        ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
         state_table_offset: usize,
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
@@ -473,12 +473,12 @@ impl Nemotron3MambaState {
             .copy_prefix_from_device_on_stream(&checkpoint.ssm, checkpoint.ssm.len(), stream)
     }
 
-    pub(super) fn conv_ptr(&mut self) -> *mut u16 {
-        self.conv.inout().as_mut_ptr().cast()
+    pub(super) fn conv_address(&self) -> DeviceAddress<u16> {
+        self.conv.cuda_address()
     }
 
-    pub(super) fn ssm_ptr(&mut self) -> *mut u16 {
-        self.ssm.inout().as_mut_ptr().cast()
+    pub(super) fn ssm_address(&self) -> DeviceAddress<u16> {
+        self.ssm.cuda_address()
     }
 }
 

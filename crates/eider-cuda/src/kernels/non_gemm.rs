@@ -12633,7 +12633,7 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
     projected: &DeviceBuffer<f32>,
     conv_weight_bf16: &DeviceBuffer<u16>,
     conv_bias_bf16: &DeviceBuffer<u16>,
-    conv_state_table: &DeviceBuffer<*mut u16>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -12723,7 +12723,11 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
                 projected.ptr,
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
-                conv_state_table.ptr.add(state_table_offset),
+                conv_state_table
+                    .as_const_ptr()
+                    .add(state_table_offset)
+                    .cast_mut()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 conv_output.buffer_mut().ptr,
@@ -12745,7 +12749,7 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
     projected: &DeviceBuffer<f32>,
     conv_weight_bf16: &DeviceBuffer<u16>,
     conv_bias_bf16: &DeviceBuffer<u16>,
-    conv_state_table: &DeviceBuffer<*mut u16>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<u16>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -12813,7 +12817,11 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
                 projected.ptr,
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
-                conv_state_table.ptr.add(state_table_offset),
+                conv_state_table
+                    .as_const_ptr()
+                    .add(state_table_offset)
+                    .cast_mut()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 conv_output.buffer_mut().ptr,
@@ -12943,7 +12951,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    ssm_state_table: &DeviceBuffer<*mut u16>,
+    ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -13033,7 +13041,11 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 d_bf16.ptr,
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
-                ssm_state_table.ptr.add(state_table_offset),
+                ssm_state_table
+                    .as_const_ptr()
+                    .add(state_table_offset)
+                    .cast_mut()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
@@ -13062,7 +13074,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
     d_bf16: &DeviceBuffer<u16>,
     dt_bias_bf16: &DeviceBuffer<u16>,
     norm_weight_bf16: &DeviceBuffer<u16>,
-    ssm_state_table: &DeviceBuffer<*mut u16>,
+    ssm_state_table: &DeviceBuffer<DeviceAddress<u16>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -13152,7 +13164,11 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 d_bf16.ptr,
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
-                ssm_state_table.ptr.add(state_table_offset),
+                ssm_state_table
+                    .as_const_ptr()
+                    .add(state_table_offset)
+                    .cast_mut()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
@@ -13176,7 +13192,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
 /// Selects one BF16 transaction snapshot per sequence into persistent BF16
 /// recurrent-state buffers without staging the states through host memory.
 pub fn select_bf16_state_snapshot_into_on_stream(
-    state_table: &DeviceBuffer<*mut u16>,
+    state_table: &DeviceBuffer<DeviceAddress<u16>>,
     state_table_offset: usize,
     snapshots_bf16: &DeviceBuffer<u16>,
     selected_slots: &DeviceBuffer<u32>,
@@ -13216,7 +13232,11 @@ pub fn select_bf16_state_snapshot_into_on_stream(
         check_cuda(
             "infer_select_bf16_state_snapshot_on_stream",
             ffi::infer_select_bf16_state_snapshot_on_stream(
-                state_table.ptr.add(state_table_offset),
+                state_table
+                    .as_const_ptr()
+                    .add(state_table_offset)
+                    .cast_mut()
+                    .cast(),
                 snapshots_bf16.ptr,
                 selected_slots.ptr,
                 sequence_count as u32,
@@ -13704,12 +13724,12 @@ mod tests {
         const SEQUENCES: usize = 3;
         const SLOTS: usize = 4;
         const STATE: usize = 5;
-        let mut states = (0..SEQUENCES)
+        let states = (0..SEQUENCES)
             .map(|_| DeviceBuffer::from_host(&[f32_to_bf16(-1.0); STATE]).expect("state"))
             .collect::<Vec<_>>();
         let pointers = states
-            .iter_mut()
-            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .iter()
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
         let pointers = DeviceBuffer::from_host(&pointers).expect("state pointers");
         let snapshots = (0..SEQUENCES * SLOTS * STATE)
@@ -14004,13 +14024,13 @@ mod tests {
         let projected_device = DeviceBuffer::from_host(&projected).expect("projected");
         let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
         let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
-        let mut actual_conv_states = initial_conv_states
+        let actual_conv_states = initial_conv_states
             .iter()
             .map(|state| DeviceBuffer::from_host(state).expect("actual conv state"))
             .collect::<Vec<_>>();
         let conv_state_ptrs = actual_conv_states
-            .iter_mut()
-            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .iter()
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
         let conv_state_table = DeviceBuffer::from_host(&conv_state_ptrs).expect("conv state table");
         let mut actual_conv =
@@ -14122,13 +14142,13 @@ mod tests {
             }
         }
 
-        let mut actual_ssm_states = initial_ssm_states
+        let actual_ssm_states = initial_ssm_states
             .iter()
             .map(|state| DeviceBuffer::from_host(state).expect("actual SSM state"))
             .collect::<Vec<_>>();
         let ssm_state_ptrs = actual_ssm_states
-            .iter_mut()
-            .map(|state| state.as_mut_ptr().cast::<u16>())
+            .iter()
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
         let ssm_state_table = DeviceBuffer::from_host(&ssm_state_ptrs).expect("SSM state table");
         let mut actual_output =

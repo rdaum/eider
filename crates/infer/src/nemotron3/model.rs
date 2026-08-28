@@ -901,8 +901,8 @@ impl Nemotron3Model {
                                 detail: format!("state variant mismatch at layer {layer}"),
                             });
                         };
-                        conv_ptrs.push(state.conv_ptr());
-                        ssm_ptrs.push(state.ssm_ptr());
+                        conv_ptrs.push(state.conv_address());
+                        ssm_ptrs.push(state.ssm_address());
                     }
                 }
                 Nemotron3Layer::Attention(_) => {}
@@ -2088,8 +2088,8 @@ pub struct Nemotron3BlockWorkspace {
     sequence_offsets: DeviceBuffer<u32>,
     sequence_lengths: DeviceBuffer<u32>,
     start_positions: DeviceBuffer<u32>,
-    conv_state_table: DeviceBuffer<*mut u16>,
-    ssm_state_table: DeviceBuffer<*mut u16>,
+    conv_state_table: DeviceBuffer<DeviceAddress<u16>>,
+    ssm_state_table: DeviceBuffer<DeviceAddress<u16>>,
     page_table_table: DeviceBuffer<DeviceAddress<u32>>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     previous_logits_table: DeviceBuffer<DeviceAddress<f32>>,
