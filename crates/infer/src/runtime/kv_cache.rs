@@ -1,9 +1,10 @@
 //! Device-resident KV cache storage for decode.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, DeviceOutput, Error, Result, append_rows_f32_indexed_into_on_stream,
-    append_rows_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, prefill_gqa_attention_f32_into,
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, Error, Result,
+    append_rows_f32_indexed_into_on_stream, append_rows_f32_into_on_stream,
+    cached_gqa_attention_f32_indexed_into_on_stream, cached_gqa_attention_f32_into_on_stream,
+    prefill_gqa_attention_f32_into,
 };
 
 /// Device-resident K/V cache for one sequence across all transformer layers.
@@ -211,12 +212,12 @@ impl LayerKvCache {
         Ok(())
     }
 
-    pub(crate) fn key_ptr(&mut self) -> *mut f32 {
-        self.key.inout().as_mut_ptr().cast()
+    pub(crate) fn key_address(&self) -> DeviceAddress<f32> {
+        self.key.cuda_address()
     }
 
-    pub(crate) fn value_ptr(&mut self) -> *mut f32 {
-        self.value.inout().as_mut_ptr().cast()
+    pub(crate) fn value_address(&self) -> DeviceAddress<f32> {
+        self.value.cuda_address()
     }
 
     /// Appends one or more contiguous K/V rows and advances the valid length.

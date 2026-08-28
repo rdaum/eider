@@ -6,7 +6,7 @@ use super::{
 };
 use crate::runtime::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, argmax_f32_batch_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, argmax_f32_batch_into_on_stream,
     concat_f32_rows_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     increment_u32_in_place_on_stream, rms_norm_f32_into_on_stream, store_u32_column_into_on_stream,
 };
@@ -295,8 +295,8 @@ impl Nemotron3Mtp {
                 actual: cache.len().to_string(),
             })?);
             tokens.extend_from_slice(chunk);
-            key_ptrs.push(cache.key_ptr());
-            value_ptrs.push(cache.value_ptr());
+            key_ptrs.push(cache.key_address());
+            value_ptrs.push(cache.value_address());
         }
         workspace.tokens.copy_from_host(&tokens)?;
         workspace.sequence_offsets.copy_from_host(&offsets)?;
@@ -512,8 +512,8 @@ pub struct Nemotron3MtpWorkspace {
     sequence_offsets: DeviceBuffer<u32>,
     sequence_lengths: DeviceBuffer<u32>,
     start_positions: DeviceBuffer<u32>,
-    key_cache_table: DeviceBuffer<*mut f32>,
-    value_cache_table: DeviceBuffer<*mut f32>,
+    key_cache_table: DeviceBuffer<DeviceAddress<f32>>,
+    value_cache_table: DeviceBuffer<DeviceAddress<f32>>,
     sequence_count: usize,
     rows: usize,
     hidden_size: usize,

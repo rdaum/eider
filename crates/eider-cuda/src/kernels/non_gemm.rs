@@ -6515,8 +6515,8 @@ pub fn prefill_gqa_attention_f32_into_on_stream(
 pub fn append_ragged_kv_f32_into_on_stream(
     key: &DeviceBuffer<f32>,
     value: &DeviceBuffer<f32>,
-    key_cache_table: &DeviceBuffer<*mut f32>,
-    value_cache_table: &DeviceBuffer<*mut f32>,
+    key_cache_table: &DeviceBuffer<DeviceAddress<f32>>,
+    value_cache_table: &DeviceBuffer<DeviceAddress<f32>>,
     cache_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -6562,8 +6562,16 @@ pub fn append_ragged_kv_f32_into_on_stream(
             ffi::infer_append_ragged_kv_f32_on_stream(
                 key.ptr,
                 value.ptr,
-                key_cache_table.ptr.add(cache_table_offset),
-                value_cache_table.ptr.add(cache_table_offset),
+                key_cache_table
+                    .cuda_address()
+                    .offset(cache_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
+                value_cache_table
+                    .cuda_address()
+                    .offset(cache_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 start_positions.ptr,
@@ -6580,8 +6588,8 @@ pub fn append_ragged_kv_f32_into_on_stream(
 #[allow(clippy::too_many_arguments)]
 pub fn ragged_gqa_attention_f32_into_on_stream(
     query: &DeviceBuffer<f32>,
-    key_cache_table: &DeviceBuffer<*mut f32>,
-    value_cache_table: &DeviceBuffer<*mut f32>,
+    key_cache_table: &DeviceBuffer<DeviceAddress<f32>>,
+    value_cache_table: &DeviceBuffer<DeviceAddress<f32>>,
     cache_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -6637,8 +6645,16 @@ pub fn ragged_gqa_attention_f32_into_on_stream(
             "infer_ragged_gqa_attention_f32_on_stream",
             ffi::infer_ragged_gqa_attention_f32_on_stream(
                 query.ptr,
-                key_cache_table.ptr.add(cache_table_offset),
-                value_cache_table.ptr.add(cache_table_offset),
+                key_cache_table
+                    .cuda_address()
+                    .offset(cache_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
+                value_cache_table
+                    .cuda_address()
+                    .offset(cache_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 start_positions.ptr,
@@ -17923,25 +17939,25 @@ mod tests {
         let offsets_device = DeviceBuffer::from_host(&offsets).expect("offsets");
         let lengths_device = DeviceBuffer::from_host(&lengths).expect("lengths");
         let starts_device = DeviceBuffer::from_host(&starts).expect("starts");
-        let mut key_caches = initial_keys
+        let key_caches = initial_keys
             .iter()
             .map(|cache| DeviceBuffer::from_host(cache).expect("key cache"))
             .collect::<Vec<_>>();
-        let mut value_caches = initial_values
+        let value_caches = initial_values
             .iter()
             .map(|cache| DeviceBuffer::from_host(cache).expect("value cache"))
             .collect::<Vec<_>>();
         let key_table = DeviceBuffer::from_host(
             &key_caches
-                .iter_mut()
-                .map(|cache| cache.as_mut_ptr().cast::<f32>())
+                .iter()
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("key table");
         let value_table = DeviceBuffer::from_host(
             &value_caches
-                .iter_mut()
-                .map(|cache| cache.as_mut_ptr().cast::<f32>())
+                .iter()
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("value table");
