@@ -3,12 +3,11 @@ mod support;
 use eider_cuda::{
     CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceAddress, DeviceBuffer, F32Matrix,
     MoeSiluQuantizeAddressSlotBuffers, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
-    format, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream,
+    format, indexed_gemv_addresses_on_stream, indexed_grouped_gemv_addresses_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slot_addresses_on_stream,
+    moe_silu_quantize_slot_addresses_reference_on_stream,
     moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
-    moe_weighted_accumulate_slot_addresses_f32_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_fixed_scale_vector_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream, quantize_fixed_scale_vector_on_stream,
     upload_grouped_nvfp4,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
@@ -66,12 +65,11 @@ struct Sm12xOp {
     k: usize,
     slots: usize,
     weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    a_tiles: DeviceBuffer<*const u8>,
-    a_scales: DeviceBuffer<*const u32>,
+    a_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    a_scales: DeviceBuffer<DeviceAddress<u32>>,
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
-    c: DeviceBuffer<*const f32>,
-    d: DeviceBuffer<*mut f32>,
+    output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     outputs: Vec<F32Matrix>,
 }
 
@@ -251,14 +249,14 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         }
         self.stream.synchronize().expect("sync SM12x gate/up bench");
         black_box(self.sm12x_gate_up.outputs[0].data_ptr());
-        black_box(self.sm12x_gate_up.weights[0].tiles_ptr());
+        black_box(self.sm12x_gate_up.weights[0].tiles_address());
     }
 
     fn run_sm12x_down_chunk(&mut self, chunk_size: usize) {
         for _ in 0..chunk_size {
-            moe_silu_quantize_slots_on_stream(
+            moe_silu_quantize_slot_addresses_on_stream(
                 &self.indices,
-                &self.sm12x_gate_up.c,
+                &self.sm12x_gate_up.output_addresses,
                 &mut self.sm12x_down.b_tiles,
                 &mut self.sm12x_down.b_scales,
                 &self.input_scale_table,
@@ -274,14 +272,14 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         }
         self.stream.synchronize().expect("sync SM12x down bench");
         black_box(self.sm12x_down.outputs[0].data_ptr());
-        black_box(self.sm12x_down.weights[0].tiles_ptr());
+        black_box(self.sm12x_down.weights[0].tiles_address());
     }
 
     fn run_sm12x_silu_quantize_chunk(&mut self, chunk_size: usize) {
         for _ in 0..chunk_size {
-            moe_silu_quantize_slots_on_stream(
+            moe_silu_quantize_slot_addresses_on_stream(
                 &self.indices,
-                &self.sm12x_gate_up.c,
+                &self.sm12x_gate_up.output_addresses,
                 &mut self.sm12x_down.b_tiles,
                 &mut self.sm12x_down.b_scales,
                 &self.input_scale_table,
@@ -301,9 +299,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
 
     fn run_sm12x_silu_quantize_reference_chunk(&mut self, chunk_size: usize) {
         for _ in 0..chunk_size {
-            moe_silu_quantize_slots_reference_on_stream(
+            moe_silu_quantize_slot_addresses_reference_on_stream(
                 &self.indices,
-                &self.sm12x_gate_up.c,
+                &self.sm12x_gate_up.output_addresses,
                 &mut self.sm12x_reference_tiles,
                 &mut self.sm12x_reference_scales,
                 &self.input_scale_table,
@@ -344,9 +342,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
     }
 
     fn verify_sm12x_silu_quantizers(&mut self) -> Result<()> {
-        moe_silu_quantize_slots_reference_on_stream(
+        moe_silu_quantize_slot_addresses_reference_on_stream(
             &self.indices,
-            &self.sm12x_gate_up.c,
+            &self.sm12x_gate_up.output_addresses,
             &mut self.sm12x_reference_tiles,
             &mut self.sm12x_reference_scales,
             &self.input_scale_table,
@@ -355,9 +353,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.sm12x_down.slots,
             &self.stream,
         )?;
-        moe_silu_quantize_slots_on_stream(
+        moe_silu_quantize_slot_addresses_on_stream(
             &self.indices,
-            &self.sm12x_gate_up.c,
+            &self.sm12x_gate_up.output_addresses,
             &mut self.sm12x_down.b_tiles,
             &mut self.sm12x_down.b_scales,
             &self.input_scale_table,
@@ -422,9 +420,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.sm12x_gate_up
                 .run_shared_input(&self.indices, &self.stream)
                 .expect("SM12x gate/up GEMV");
-            moe_silu_quantize_slots_on_stream(
+            moe_silu_quantize_slot_addresses_on_stream(
                 &self.indices,
-                &self.sm12x_gate_up.c,
+                &self.sm12x_gate_up.output_addresses,
                 &mut self.sm12x_down.b_tiles,
                 &mut self.sm12x_down.b_scales,
                 &self.input_scale_table,
@@ -437,10 +435,10 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.sm12x_down
                 .run_grouped_input(&self.indices, &self.stream)
                 .expect("SM12x down GEMV");
-            moe_weighted_accumulate_slots_f32_on_stream(
+            moe_weighted_accumulate_slot_addresses_f32_on_stream(
                 &self.indices,
                 &self.route_weights,
-                &self.sm12x_down.c,
+                &self.sm12x_down.output_addresses,
                 &self.down_alpha_table,
                 self.reduced.inout(),
                 &self.stream,
@@ -581,25 +579,21 @@ impl Sm12xOp {
         let a_tiles = DeviceBuffer::from_host(
             &weights
                 .iter()
-                .map(|weight| weight.tiles_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let a_scales = DeviceBuffer::from_host(
             &weights
                 .iter()
-                .map(|weight| weight.scales_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
-        let mut outputs = (0..slots)
+        let outputs = (0..slots)
             .map(|_| F32Matrix::zeroed(m, 1))
             .collect::<Result<Vec<_>>>()?;
-        let c_ptrs = outputs
+        let output_addresses = outputs
             .iter()
-            .map(|output| output.data_ptr())
-            .collect::<Vec<_>>();
-        let d_ptrs = outputs
-            .iter_mut()
-            .map(|output| output.data_mut_ptr())
+            .map(F32Matrix::data_address)
             .collect::<Vec<_>>();
         let k_tiles = k / 64;
         let b_groups = if gate_up { 1 } else { slots };
@@ -612,21 +606,20 @@ impl Sm12xOp {
             a_scales,
             b_tiles: DeviceBuffer::zeroed(b_groups * k_tiles * 512)?,
             b_scales: DeviceBuffer::zeroed(b_groups * k_tiles)?,
-            c: DeviceBuffer::from_host(&c_ptrs)?,
-            d: DeviceBuffer::from_host(&d_ptrs)?,
+            output_addresses: DeviceBuffer::from_host(&output_addresses)?,
             outputs,
         })
     }
 
     fn run_shared_input(&self, indices: &DeviceBuffer<u32>, stream: &CudaStream) -> Result<()> {
-        indexed_gemv_on_stream(
+        indexed_gemv_addresses_on_stream(
             indices,
             &self.a_tiles,
             &self.a_scales,
             self.weights.len(),
             &self.b_tiles,
             &self.b_scales,
-            &self.d,
+            &self.output_addresses,
             self.m / 16,
             self.k / 64,
             self.slots,
@@ -635,14 +628,14 @@ impl Sm12xOp {
     }
 
     fn run_grouped_input(&self, indices: &DeviceBuffer<u32>, stream: &CudaStream) -> Result<()> {
-        indexed_grouped_gemv_on_stream(
+        indexed_grouped_gemv_addresses_on_stream(
             indices,
             &self.a_tiles,
             &self.a_scales,
             self.weights.len(),
             &self.b_tiles,
             &self.b_scales,
-            &self.d,
+            &self.output_addresses,
             self.m / 16,
             self.k / 64,
             self.slots,

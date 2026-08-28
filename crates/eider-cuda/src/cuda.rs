@@ -1678,19 +1678,6 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
         self.cuda_address().offset(offset)
     }
 
-    /// Builds a bounds-checked raw-pointer table for a legacy CUDA ABI.
-    ///
-    /// New kernels should accept [`DeviceAddress`] tables directly. This
-    /// adapter exists only while a legacy kernel interface still requires raw
-    /// pointer entries; it never exposes individual raw CUDA pointers.
-    pub fn legacy_const_pointer_table(&self, offsets: &[usize]) -> Result<DeviceBuffer<*const T>> {
-        let pointers = offsets
-            .iter()
-            .map(|&offset| self.address_at(offset).map(DeviceAddress::as_const_ptr))
-            .collect::<Result<Vec<_>>>()?;
-        DeviceBuffer::from_host(&pointers)
-    }
-
     /// Returns true when this allocation contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0

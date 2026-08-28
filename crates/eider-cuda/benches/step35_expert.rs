@@ -1,7 +1,8 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, Result,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, F32Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
+    indexed_grouped_gemv_addresses_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
@@ -29,11 +30,10 @@ struct Step35ExpertBench {
     stop: CudaEvent,
     gate_up: Sm121W4A16GateUp,
     down_weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    down_tiles: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u32>,
+    down_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_outputs: Vec<F32Matrix>,
-    down_input_ptrs: DeviceBuffer<*const f32>,
-    down_output_ptrs: DeviceBuffer<*mut f32>,
+    down_output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     indices: DeviceBuffer<u32>,
     route_weights: DeviceBuffer<f32>,
     input: DeviceBuffer<f32>,
@@ -98,24 +98,23 @@ impl Step35ExpertBench {
         let down_tiles = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::tiles_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_scales = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::scales_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
         let mut down_outputs = Vec::with_capacity(TOP_K);
-        let mut down_input_ptrs_host = Vec::with_capacity(TOP_K);
-        let mut down_output_ptrs_host = Vec::with_capacity(TOP_K);
         for _ in 0..TOP_K {
-            let mut output = F32Matrix::zeroed(HIDDEN, 1)?;
-            down_input_ptrs_host.push(output.data_ptr());
-            down_output_ptrs_host.push(output.data_mut_ptr());
-            down_outputs.push(output);
+            down_outputs.push(F32Matrix::zeroed(HIDDEN, 1)?);
         }
+        let down_output_addresses = down_outputs
+            .iter()
+            .map(F32Matrix::data_address)
+            .collect::<Vec<_>>();
 
         let indices = DeviceBuffer::from_host(&(0..TOP_K as u32).collect::<Vec<_>>())?;
         let route_weights = DeviceBuffer::from_host(&route_weights_host)?;
@@ -143,8 +142,7 @@ impl Step35ExpertBench {
             down_tiles,
             down_scales,
             down_outputs,
-            down_input_ptrs: DeviceBuffer::from_host(&down_input_ptrs_host)?,
-            down_output_ptrs: DeviceBuffer::from_host(&down_output_ptrs_host)?,
+            down_output_addresses: DeviceBuffer::from_host(&down_output_addresses)?,
             indices,
             route_weights,
             input,
@@ -176,23 +174,23 @@ impl Step35ExpertBench {
                 TOP_K,
                 stream,
             )?;
-            indexed_grouped_gemv_on_stream(
+            indexed_grouped_gemv_addresses_on_stream(
                 &self.indices,
                 &self.down_tiles,
                 &self.down_scales,
                 TOP_K,
                 &self.down_input_tiles,
                 &self.down_input_scale_words,
-                &self.down_output_ptrs,
+                &self.down_output_addresses,
                 HIDDEN / 16,
                 INTERMEDIATE / 64,
                 TOP_K,
                 stream,
             )?;
-            moe_weighted_accumulate_slots_f32_on_stream(
+            moe_weighted_accumulate_slot_addresses_f32_on_stream(
                 &self.indices,
                 &self.route_weights,
-                &self.down_input_ptrs,
+                &self.down_output_addresses,
                 &self.down_alphas,
                 self.aggregate.inout(),
                 stream,
@@ -390,7 +388,7 @@ fn expert_chain_sample(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64;
     black_box(context.aggregate.as_const_ptr());
-    black_box(context.down_weights[0].tiles_ptr());
+    black_box(context.down_weights[0].tiles_address());
     black_box(context.down_outputs[0].data_ptr());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(

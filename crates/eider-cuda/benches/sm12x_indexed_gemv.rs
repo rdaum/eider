@@ -1,6 +1,6 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, F32Matrix, Result,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, indexed_gemv_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, F32Matrix, Result,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, indexed_gemv_addresses_on_stream,
     quantize_fixed_scale_vector_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
@@ -24,11 +24,11 @@ struct Sm12xIndexedGemvBench {
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
     weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    a_tiles: DeviceBuffer<*const u8>,
-    a_scales: DeviceBuffer<*const u32>,
+    a_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    a_scales: DeviceBuffer<DeviceAddress<u32>>,
     indices: DeviceBuffer<u32>,
     outputs: Vec<F32Matrix>,
-    d: DeviceBuffer<*mut f32>,
+    output_addresses: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 struct Sm12xQwenSlotGemvBench {
@@ -39,18 +39,18 @@ struct Sm12xQwenSlotGemvBench {
     gate_b_tiles: DeviceBuffer<u8>,
     gate_b_scales: DeviceBuffer<u32>,
     gate_weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    gate_a_tiles: DeviceBuffer<*const u8>,
-    gate_a_scales: DeviceBuffer<*const u32>,
+    gate_a_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    gate_a_scales: DeviceBuffer<DeviceAddress<u32>>,
     gate_outputs: Vec<F32Matrix>,
-    gate_d: DeviceBuffer<*mut f32>,
+    gate_output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     down_input: DeviceBuffer<f32>,
     down_b_tiles: DeviceBuffer<u8>,
     down_b_scales: DeviceBuffer<u32>,
     down_weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    down_a_tiles: DeviceBuffer<*const u8>,
-    down_a_scales: DeviceBuffer<*const u32>,
+    down_a_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    down_a_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_outputs: Vec<F32Matrix>,
-    down_d: DeviceBuffer<*mut f32>,
+    down_output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     indices: DeviceBuffer<u32>,
     gate_graph: Option<CudaGraphExec>,
 }
@@ -78,11 +78,11 @@ impl BenchContext for Sm12xIndexedGemvBench {
         }
         let a_tile_ptrs = weights
             .iter()
-            .map(|weight| weight.tiles_ptr())
+            .map(Sm12xFp4DeviceGemmWeight::tiles_address)
             .collect::<Vec<_>>();
         let a_scale_ptrs = weights
             .iter()
-            .map(|weight| weight.scales_ptr())
+            .map(Sm12xFp4DeviceGemmWeight::scales_address)
             .collect::<Vec<_>>();
         let a_tiles = DeviceBuffer::from_host(&a_tile_ptrs).expect("a tiles");
         let a_scales = DeviceBuffer::from_host(&a_scale_ptrs).expect("a scales");
@@ -90,13 +90,13 @@ impl BenchContext for Sm12xIndexedGemvBench {
             DeviceBuffer::from_host(&(0..GROUPS).map(|idx| idx as u32).collect::<Vec<_>>())
                 .expect("indices");
         let mut outputs = Vec::with_capacity(GROUPS);
-        let mut d_ptrs = Vec::with_capacity(GROUPS);
         for _ in 0..GROUPS {
-            let mut output = F32Matrix::zeroed(M, 1).expect("output");
-            d_ptrs.push(output.data_mut_ptr());
-            outputs.push(output);
+            outputs.push(F32Matrix::zeroed(M, 1).expect("output"));
         }
-        let d = DeviceBuffer::from_host(&d_ptrs).expect("d");
+        let output_addresses = outputs
+            .iter()
+            .map(F32Matrix::data_address)
+            .collect::<Vec<_>>();
         Self {
             stream,
             start,
@@ -109,7 +109,7 @@ impl BenchContext for Sm12xIndexedGemvBench {
             a_scales,
             indices,
             outputs,
-            d,
+            output_addresses: DeviceBuffer::from_host(&output_addresses).expect("outputs"),
         }
     }
 
@@ -157,25 +157,25 @@ impl Sm12xQwenSlotGemvBench {
         let gate_a_tiles = DeviceBuffer::from_host(
             &gate_weights
                 .iter()
-                .map(|weight| weight.tiles_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let gate_a_scales = DeviceBuffer::from_host(
             &gate_weights
                 .iter()
-                .map(|weight| weight.scales_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_a_tiles = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(|weight| weight.tiles_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_a_scales = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(|weight| weight.scales_ptr())
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
         let indices =
@@ -190,8 +190,8 @@ impl Sm12xQwenSlotGemvBench {
                 .map(|idx| (((idx * 11) % 19) as f32 - 9.0) * 0.03125)
                 .collect::<Vec<_>>(),
         )?;
-        let (gate_outputs, gate_d) = output_table(1024, GROUPS)?;
-        let (down_outputs, down_d) = output_table(2048, GROUPS)?;
+        let (gate_outputs, gate_output_addresses) = output_table(1024, GROUPS)?;
+        let (down_outputs, down_output_addresses) = output_table(2048, GROUPS)?;
         let mut bench = Self {
             stream,
             start: CudaEvent::new()?,
@@ -203,7 +203,7 @@ impl Sm12xQwenSlotGemvBench {
             gate_a_tiles,
             gate_a_scales,
             gate_outputs,
-            gate_d,
+            gate_output_addresses,
             down_input,
             down_b_tiles: DeviceBuffer::zeroed(512 / 64 * 512)?,
             down_b_scales: DeviceBuffer::zeroed(512 / 64)?,
@@ -211,7 +211,7 @@ impl Sm12xQwenSlotGemvBench {
             down_a_tiles,
             down_a_scales,
             down_outputs,
-            down_d,
+            down_output_addresses,
             indices,
             gate_graph: None,
         };
@@ -223,14 +223,14 @@ impl Sm12xQwenSlotGemvBench {
                 &mut bench.gate_b_scales,
                 stream,
             )?;
-            indexed_gemv_on_stream(
+            indexed_gemv_addresses_on_stream(
                 &bench.indices,
                 &bench.gate_a_tiles,
                 &bench.gate_a_scales,
                 EXPERTS,
                 &bench.gate_b_tiles,
                 &bench.gate_b_scales,
-                &bench.gate_d,
+                &bench.gate_output_addresses,
                 1024 / 16,
                 2048 / 64,
                 GROUPS,
@@ -241,15 +241,19 @@ impl Sm12xQwenSlotGemvBench {
     }
 }
 
-fn output_table(m: usize, groups: usize) -> Result<(Vec<F32Matrix>, DeviceBuffer<*mut f32>)> {
+fn output_table(
+    m: usize,
+    groups: usize,
+) -> Result<(Vec<F32Matrix>, DeviceBuffer<DeviceAddress<f32>>)> {
     let mut outputs = Vec::with_capacity(groups);
-    let mut ptrs = Vec::with_capacity(groups);
     for _ in 0..groups {
-        let mut output = F32Matrix::zeroed(m, 1)?;
-        ptrs.push(output.data_mut_ptr());
-        outputs.push(output);
+        outputs.push(F32Matrix::zeroed(m, 1)?);
     }
-    Ok((outputs, DeviceBuffer::from_host(&ptrs)?))
+    let addresses = outputs
+        .iter()
+        .map(F32Matrix::data_address)
+        .collect::<Vec<_>>();
+    Ok((outputs, DeviceBuffer::from_host(&addresses)?))
 }
 
 fn sm12x_device_weight(linear: &ModelOptNvfp4Linear) -> Result<Sm12xFp4DeviceGemmWeight> {
@@ -285,14 +289,14 @@ fn sm12x_indexed_gate_up(
             &ctx.stream,
         )
         .expect("quantize");
-        indexed_gemv_on_stream(
+        indexed_gemv_addresses_on_stream(
             &ctx.indices,
             &ctx.a_tiles,
             &ctx.a_scales,
             EXPERTS,
             &ctx.b_tiles,
             &ctx.b_scales,
-            &ctx.d,
+            &ctx.output_addresses,
             M / 16,
             K / 64,
             GROUPS,
@@ -304,7 +308,7 @@ fn sm12x_indexed_gate_up(
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
     black_box(ctx.outputs[0].data_ptr());
-    black_box(ctx.weights[0].tiles_ptr());
+    black_box(ctx.weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -326,14 +330,14 @@ fn sm12x_qwen_gate_up(
             &ctx.stream,
         )
         .expect("quantize");
-        indexed_gemv_on_stream(
+        indexed_gemv_addresses_on_stream(
             &ctx.indices,
             &ctx.gate_a_tiles,
             &ctx.gate_a_scales,
             EXPERTS,
             &ctx.gate_b_tiles,
             &ctx.gate_b_scales,
-            &ctx.gate_d,
+            &ctx.gate_output_addresses,
             1024 / 16,
             2048 / 64,
             GROUPS,
@@ -345,7 +349,7 @@ fn sm12x_qwen_gate_up(
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
     black_box(ctx.gate_outputs[0].data_ptr());
-    black_box(ctx.gate_weights[0].tiles_ptr());
+    black_box(ctx.gate_weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -367,14 +371,14 @@ fn sm12x_qwen_down(
             &ctx.stream,
         )
         .expect("quantize");
-        indexed_gemv_on_stream(
+        indexed_gemv_addresses_on_stream(
             &ctx.indices,
             &ctx.down_a_tiles,
             &ctx.down_a_scales,
             EXPERTS,
             &ctx.down_b_tiles,
             &ctx.down_b_scales,
-            &ctx.down_d,
+            &ctx.down_output_addresses,
             2048 / 16,
             512 / 64,
             GROUPS,
@@ -386,7 +390,7 @@ fn sm12x_qwen_down(
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
     black_box(ctx.down_outputs[0].data_ptr());
-    black_box(ctx.down_weights[0].tiles_ptr());
+    black_box(ctx.down_weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
