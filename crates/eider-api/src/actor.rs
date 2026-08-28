@@ -14,9 +14,7 @@ use eider_inference::execution::deepseek4_serving::{
 use eider_inference::execution::gemma4_serving::{
     Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
 };
-use eider_inference::execution::laguna_serving::{
-    LagunaAdmissionProgress, LagunaCancelOutcome, LagunaChatService, LagunaRequestId,
-};
+use eider_inference::execution::laguna_serving::{LagunaChatService, LagunaEngineService};
 use eider_inference::execution::ling3_serving::{
     Ling3AdmissionProgress, Ling3CancelOutcome, Ling3ChatService, Ling3RequestId,
 };
@@ -695,7 +693,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = LagunaActorService::new(service);
+            let mut service = LagunaEngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Deepseek4 => {
@@ -889,17 +887,6 @@ fn nemotron_admission_progress(progress: Nemotron3AdmissionProgress) -> EngineAd
 }
 
 fn gemma_admission_progress(progress: Gemma4AdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: progress.allocation_duration,
-        checkpoint_copy_duration: progress.checkpoint_copy_duration,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-fn laguna_admission_progress(progress: LagunaAdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
         sequence_device_bytes: progress.sequence_device_bytes,
@@ -1699,115 +1686,6 @@ impl EngineService for MuseGlimmerActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             MuseGlimmerCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
-    }
-}
-
-struct LagunaActorService<'model, 'template> {
-    inner: LagunaChatService<'model, 'template>,
-    ids: BTreeMap<u64, LagunaRequestId>,
-}
-
-impl<'model, 'template> LagunaActorService<'model, 'template> {
-    fn new(inner: LagunaChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for LagunaActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer =
-            |event: RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>| match event {
-                RequestLifecycleEvent::Admitted(progress) => {
-                    on_lifecycle(EngineLifecycleEvent::Admitted(laguna_admission_progress(
-                        progress,
-                    )));
-                }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-                }
-            };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(LagunaRequestId::get)
-                .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            LagunaCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            } => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            },
-            LagunaCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
