@@ -19,10 +19,7 @@ use eider_inference::execution::qwen38_flash_next_serving::{
     Qwen38FlashNextAdmissionProgress, Qwen38FlashNextCancelOutcome, Qwen38FlashNextChatService,
     Qwen38FlashNextRequestId,
 };
-use eider_inference::execution::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen38SpeculativeProgress,
-};
-use eider_inference::execution::serving::Qwen36ChatService;
+use eider_inference::execution::serving::{Qwen36ChatService, Qwen36EngineService};
 use eider_inference::execution::step37_serving::{Step37ChatService, Step37EngineService};
 use eider_inference::gemma4::Gemma4Model;
 use eider_inference::laguna::LagunaModel;
@@ -491,7 +488,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = QwenActorService::new(service);
+            let mut service = Qwen36EngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Qwen38FlashNext => {
@@ -785,25 +782,6 @@ fn bonsai_gguf_path(model_dir: &std::path::Path) -> PathBuf {
     model_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf")
 }
 
-fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: Duration::ZERO,
-        checkpoint_copy_duration: Duration::ZERO,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-fn qwen38_speculative_progress(progress: Qwen38SpeculativeProgress) -> EngineSpeculativeProgress {
-    EngineSpeculativeProgress {
-        request_id: progress.request_id.get(),
-        cycles: progress.cycles,
-        accepted_drafts: progress.accepted_drafts,
-    }
-}
-
 fn qwen38_flash_next_admission_progress(
     progress: Qwen38FlashNextAdmissionProgress,
 ) -> EngineAdmissionProgress {
@@ -814,118 +792,6 @@ fn qwen38_flash_next_admission_progress(
         allocation_duration: progress.allocation_duration,
         checkpoint_copy_duration: Duration::ZERO,
         admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-struct QwenActorService<'model, 'template> {
-    inner: Qwen36ChatService<'model, 'template>,
-    ids: BTreeMap<u64, Qwen36RequestId>,
-}
-
-impl<'model, 'template> QwenActorService<'model, 'template> {
-    fn new(inner: Qwen36ChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for QwenActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer =
-            |event: RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>| match event {
-                RequestLifecycleEvent::Admitted(progress) => {
-                    on_lifecycle(EngineLifecycleEvent::Admitted(qwen_admission_progress(
-                        progress,
-                    )));
-                }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-                }
-            };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(Qwen36RequestId::get)
-                .collect(),
-            speculative: tick
-                .speculative
-                .into_iter()
-                .map(qwen38_speculative_progress)
-                .collect(),
-            dflash: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            Qwen36CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
-            },
-            Qwen36CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
-            Qwen36CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
     }
 }
 
