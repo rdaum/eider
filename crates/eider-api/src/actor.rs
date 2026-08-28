@@ -27,7 +27,7 @@ use eider_inference::execution::ling3_serving::{
 };
 use eider_inference::execution::muse_glimmer_serving::{
     MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
-    MuseGlimmerDFlashProgress, MuseGlimmerDFlashStats, MuseGlimmerRequestId,
+    MuseGlimmerDFlashProgress, MuseGlimmerRequestId,
 };
 use eider_inference::execution::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
@@ -55,9 +55,13 @@ use eider_inference::qwen38_flash_next::Qwen38FlashNextModel;
 use eider_inference::step37::{Step37Bf16StorageConfig, Step37TextModel};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
-use eider_runtime::chat_output::ChatOutputEvent;
+use eider_runtime::engine::{
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta,
+    EngineDraftProgress, EngineDraftStats, EngineFinished, EngineLifecycleEvent,
+    EnginePrefillProgress, EngineSpeculativeProgress, EngineTick,
+};
 use eider_runtime::generation::GenerationConfig;
-use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
+use eider_runtime::request::{ChatFinishReason, ChatRequest};
 use eider_runtime::scheduler::{RequestLifecycleEvent, SchedulerConfig};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -189,14 +193,14 @@ struct SessionMetricsSnapshot {
 }
 
 struct DFlashSessionMetrics {
-    cumulative: MuseGlimmerDFlashStats,
+    cumulative: EngineDraftStats,
     last_report_at: Instant,
-    last_report: MuseGlimmerDFlashStats,
+    last_report: EngineDraftStats,
 }
 
 struct DFlashMetricsSnapshot {
-    interval: MuseGlimmerDFlashStats,
-    cumulative: MuseGlimmerDFlashStats,
+    interval: EngineDraftStats,
+    cumulative: EngineDraftStats,
 }
 
 impl InferenceActor {
@@ -800,21 +804,6 @@ fn bonsai_gguf_path(model_dir: &std::path::Path) -> PathBuf {
     model_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf")
 }
 
-struct EngineAdmission {
-    request_id: u64,
-    prompt_tokens: usize,
-    max_output_tokens: usize,
-}
-
-struct EngineAdmissionProgress {
-    request_id: u64,
-    sequence_device_bytes: usize,
-    cached_prompt_tokens: usize,
-    allocation_duration: Duration,
-    checkpoint_copy_duration: Duration,
-    admitted_after_tick_start: Duration,
-}
-
 fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
@@ -826,10 +815,8 @@ fn qwen_admission_progress(progress: Qwen36AdmissionProgress) -> EngineAdmission
     }
 }
 
-fn qwen38_speculative_progress(
-    progress: Qwen38SpeculativeProgress,
-) -> EngineQwen38SpeculativeProgress {
-    EngineQwen38SpeculativeProgress {
+fn qwen38_speculative_progress(progress: Qwen38SpeculativeProgress) -> EngineSpeculativeProgress {
+    EngineSpeculativeProgress {
         request_id: progress.request_id.get(),
         cycles: progress.cycles,
         accepted_drafts: progress.accepted_drafts,
@@ -838,8 +825,8 @@ fn qwen38_speculative_progress(
 
 fn deepseek4_speculative_progress(
     progress: Deepseek4SpeculativeProgress,
-) -> EngineQwen38SpeculativeProgress {
-    EngineQwen38SpeculativeProgress {
+) -> EngineSpeculativeProgress {
+    EngineSpeculativeProgress {
         request_id: progress.request_id.get(),
         cycles: progress.cycles,
         accepted_drafts: progress.accepted_drafts,
@@ -879,10 +866,18 @@ fn muse_admission_progress(progress: MuseGlimmerAdmissionProgress) -> EngineAdmi
     }
 }
 
-fn muse_dflash_progress(progress: MuseGlimmerDFlashProgress) -> EngineDFlashProgress {
-    EngineDFlashProgress {
+fn muse_dflash_progress(progress: MuseGlimmerDFlashProgress) -> EngineDraftProgress {
+    EngineDraftProgress {
         request_id: progress.request_id.get(),
-        stats: progress.stats,
+        stats: EngineDraftStats {
+            cycles: progress.stats.cycles,
+            drafted_tokens: progress.stats.drafted_tokens,
+            accepted_drafts: progress.stats.accepted_drafts,
+            emitted_tokens: progress.stats.emitted_tokens,
+            cycle_duration: progress.stats.cycle_duration,
+            target_position: progress.stats.target_position,
+            draft_position: progress.stats.dflash_position,
+        },
     }
 }
 
@@ -965,58 +960,6 @@ fn qwen38_flash_next_admission_progress(
     }
 }
 
-enum EngineLifecycleEvent {
-    Admitted(EngineAdmissionProgress),
-    PrefillStarted(u64),
-}
-
-struct EnginePrefillProgress {
-    request_id: u64,
-    prompt_position: usize,
-}
-
-struct EngineDelta {
-    request_id: u64,
-    event: ChatOutputEvent,
-}
-
-struct EngineFinished {
-    request_id: u64,
-    finish_reason: ChatFinishReason,
-    usage: ChatUsage,
-    released_sequence_device_bytes: usize,
-}
-
-struct EngineDFlashProgress {
-    request_id: u64,
-    stats: MuseGlimmerDFlashStats,
-}
-
-struct EngineQwen38SpeculativeProgress {
-    request_id: u64,
-    cycles: usize,
-    accepted_drafts: usize,
-}
-
-#[derive(Default)]
-struct EngineTick {
-    prefilled: Vec<EnginePrefillProgress>,
-    generated: Vec<u64>,
-    qwen38_speculative: Vec<EngineQwen38SpeculativeProgress>,
-    dflash: Vec<EngineDFlashProgress>,
-    output: Vec<EngineDelta>,
-    finished: Vec<EngineFinished>,
-    active_sequences: usize,
-}
-
-enum EngineCancelOutcome {
-    Cancelled {
-        released_sequence_device_bytes: usize,
-    },
-    AlreadyFinished,
-    NotFound,
-}
-
 trait ActorService {
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission>;
     fn tick(
@@ -1091,7 +1034,7 @@ impl ActorService for QwenActorService<'_, '_> {
                 .into_iter()
                 .map(Qwen36RequestId::get)
                 .collect(),
-            qwen38_speculative: tick
+            speculative: tick
                 .speculative
                 .into_iter()
                 .map(qwen38_speculative_progress)
@@ -1202,10 +1145,10 @@ impl ActorService for Qwen38FlashNextActorService<'_> {
                 .into_iter()
                 .map(Qwen38FlashNextRequestId::get)
                 .collect(),
-            qwen38_speculative: tick
+            speculative: tick
                 .speculative
                 .into_iter()
-                .map(|progress| EngineQwen38SpeculativeProgress {
+                .map(|progress| EngineSpeculativeProgress {
                     request_id: progress.request_id.get(),
                     cycles: progress.cycles,
                     accepted_drafts: progress.accepted_drafts,
@@ -1318,7 +1261,7 @@ impl ActorService for StepActorService<'_> {
                 .into_iter()
                 .map(Step37RequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1427,7 +1370,7 @@ impl ActorService for NemotronActorService<'_, '_> {
                 .into_iter()
                 .map(Nemotron3RequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1535,7 +1478,7 @@ impl ActorService for GemmaActorService<'_, '_> {
                 .into_iter()
                 .map(Gemma4RequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1641,7 +1584,7 @@ impl ActorService for BitNetActorService<'_, '_> {
                 .into_iter()
                 .map(BitNetRequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1747,7 +1690,7 @@ impl ActorService for Ling3ActorService<'_, '_> {
                 .into_iter()
                 .map(Ling3RequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -1855,7 +1798,7 @@ impl ActorService for MuseGlimmerActorService<'_, '_> {
                 .into_iter()
                 .map(MuseGlimmerRequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: tick.dflash.into_iter().map(muse_dflash_progress).collect(),
             output: tick
                 .output
@@ -1961,7 +1904,7 @@ impl ActorService for BonsaiActorService<'_, '_> {
                 .into_iter()
                 .map(BonsaiRequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -2069,7 +2012,7 @@ impl ActorService for LagunaActorService<'_, '_> {
                 .into_iter()
                 .map(LagunaRequestId::get)
                 .collect(),
-            qwen38_speculative: Vec::new(),
+            speculative: Vec::new(),
             dflash: Vec::new(),
             output: tick
                 .output
@@ -2179,7 +2122,7 @@ impl ActorService for DeepseekActorService<'_> {
                 .into_iter()
                 .map(Deepseek4RequestId::get)
                 .collect(),
-            qwen38_speculative: tick
+            speculative: tick
                 .speculative
                 .into_iter()
                 .map(deepseek4_speculative_progress)
@@ -2367,7 +2310,7 @@ fn run_actor_loop(
                 }
             }
         }
-        for progress in &tick.qwen38_speculative {
+        for progress in &tick.speculative {
             if let Some(request) = active.get_mut(&progress.request_id) {
                 request.metrics.record_qwen38_speculative(progress);
             }
@@ -2718,7 +2661,7 @@ impl SessionMetrics {
         Some(snapshot)
     }
 
-    fn record_qwen38_speculative(&mut self, progress: &EngineQwen38SpeculativeProgress) {
+    fn record_qwen38_speculative(&mut self, progress: &EngineSpeculativeProgress) {
         self.qwen38_speculative_cycles += progress.cycles;
         self.qwen38_accepted_drafts += progress.accepted_drafts;
     }
@@ -2726,13 +2669,13 @@ impl SessionMetrics {
     fn record_dflash(
         &mut self,
         now: Instant,
-        stats: MuseGlimmerDFlashStats,
+        stats: EngineDraftStats,
     ) -> Option<DFlashMetricsSnapshot> {
         let Some(dflash) = &mut self.dflash else {
             self.dflash = Some(DFlashSessionMetrics {
                 cumulative: stats,
                 last_report_at: now,
-                last_report: MuseGlimmerDFlashStats::default(),
+                last_report: EngineDraftStats::default(),
             });
             return None;
         };
@@ -2910,13 +2853,13 @@ impl DFlashMetricsSnapshot {
             tokens_per_cycle = ratio(self.cumulative.emitted_tokens, self.cumulative.cycles),
             cycle_ms = average_duration_ms(self.cumulative.cycle_duration, self.cumulative.cycles),
             target_position = self.cumulative.target_position,
-            dflash_position = self.cumulative.dflash_position,
+            dflash_position = self.cumulative.draft_position,
             "DFlash progress"
         );
     }
 }
 
-fn log_dflash_summary(id: ActorRequestId, stats: MuseGlimmerDFlashStats) {
+fn log_dflash_summary(id: ActorRequestId, stats: EngineDraftStats) {
     info!(
         session = id.0,
         cycles = stats.cycles,
@@ -2927,16 +2870,13 @@ fn log_dflash_summary(id: ActorRequestId, stats: MuseGlimmerDFlashStats) {
         tokens_per_cycle = ratio(stats.emitted_tokens, stats.cycles),
         cycle_ms = average_duration_ms(stats.cycle_duration, stats.cycles),
         target_position = stats.target_position,
-        dflash_position = stats.dflash_position,
+        dflash_position = stats.draft_position,
         "DFlash session complete"
     );
 }
 
-fn dflash_stats_delta(
-    current: MuseGlimmerDFlashStats,
-    previous: MuseGlimmerDFlashStats,
-) -> MuseGlimmerDFlashStats {
-    MuseGlimmerDFlashStats {
+fn dflash_stats_delta(current: EngineDraftStats, previous: EngineDraftStats) -> EngineDraftStats {
+    EngineDraftStats {
         cycles: current.cycles.saturating_sub(previous.cycles),
         drafted_tokens: current
             .drafted_tokens
@@ -2951,7 +2891,7 @@ fn dflash_stats_delta(
             .cycle_duration
             .saturating_sub(previous.cycle_duration),
         target_position: current.target_position,
-        dflash_position: current.dflash_position,
+        draft_position: current.draft_position,
     }
 }
 
@@ -3022,12 +2962,12 @@ mod tests {
     #[test]
     fn session_metrics_accumulate_qwen38_speculative_acceptance() {
         let mut metrics = SessionMetrics::new(Instant::now(), 8);
-        metrics.record_qwen38_speculative(&EngineQwen38SpeculativeProgress {
+        metrics.record_qwen38_speculative(&EngineSpeculativeProgress {
             request_id: 7,
             cycles: 1,
             accepted_drafts: 2,
         });
-        metrics.record_qwen38_speculative(&EngineQwen38SpeculativeProgress {
+        metrics.record_qwen38_speculative(&EngineSpeculativeProgress {
             request_id: 7,
             cycles: 1,
             accepted_drafts: 1,
@@ -3052,14 +2992,14 @@ mod tests {
             metrics
                 .record_dflash(
                     started,
-                    MuseGlimmerDFlashStats {
+                    EngineDraftStats {
                         cycles: 1,
                         drafted_tokens: 15,
                         accepted_drafts: 3,
                         emitted_tokens: 4,
                         cycle_duration: Duration::from_millis(30),
                         target_position: 1_004,
-                        dflash_position: 1_004,
+                        draft_position: 1_004,
                     },
                 )
                 .is_none()
@@ -3067,14 +3007,14 @@ mod tests {
         let snapshot = metrics
             .record_dflash(
                 started + SESSION_METRICS_INTERVAL,
-                MuseGlimmerDFlashStats {
+                EngineDraftStats {
                     cycles: 4,
                     drafted_tokens: 60,
                     accepted_drafts: 15,
                     emitted_tokens: 19,
                     cycle_duration: Duration::from_millis(120),
                     target_position: 1_019,
-                    dflash_position: 1_019,
+                    draft_position: 1_019,
                 },
             )
             .expect("ten-second DFlash report interval elapsed");
@@ -3085,7 +3025,7 @@ mod tests {
         assert_eq!(snapshot.interval.emitted_tokens, 19);
         assert_eq!(snapshot.interval.cycle_duration, Duration::from_millis(120));
         assert_eq!(snapshot.cumulative.target_position, 1_019);
-        assert_eq!(snapshot.cumulative.dflash_position, 1_019);
+        assert_eq!(snapshot.cumulative.draft_position, 1_019);
         assert_eq!(percentage(15, 60), 25.0);
         assert_eq!(ratio(19, 4), 4.75);
         assert_eq!(average_duration_ms(Duration::from_millis(120), 4), 30.0);

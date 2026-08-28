@@ -377,6 +377,12 @@ The runtime passes a sampling request to inference. Inference returns compact
 sampled tokens. It does not return a vocabulary-sized logits buffer unless a
 diagnostic path explicitly requests one.
 
+`eider_runtime::engine` owns the compact admission, lifecycle, tick,
+completion, cancellation, and draft-progress records exchanged with model
+services. Those records carry request identities, token positions, output
+events, usage, byte accounting, and durations, but never a CUDA allocation,
+stream, logits buffer, or model-specific sequence type.
+
 The API can erase the concrete runtime service behind `dyn ActorService`. This
 call occurs once per actor tick. It is outside the layer and kernel hot paths.
 
