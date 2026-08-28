@@ -129,6 +129,7 @@ pub use kernels::non_gemm::{
     moe_weighted_accumulate_slots_f32_batch_prefix_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream,
     moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,

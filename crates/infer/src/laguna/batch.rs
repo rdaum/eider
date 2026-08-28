@@ -10,7 +10,7 @@ use eider_cuda::{
     fill_f32_prefix_into_on_stream,
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
     moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
-    moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
+    moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_prefix_into_on_stream,
@@ -190,27 +190,23 @@ struct LagunaBatchDownWorkspace {
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
     _outputs: Vec<F32Matrix>,
-    inputs: DeviceBuffer<*const f32>,
-    indexed_outputs: DeviceBuffer<DeviceAddress<f32>>,
+    output_addresses: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 impl LagunaBatchDownWorkspace {
     fn new(routes: usize) -> Result<Self> {
         let mut matrices = Vec::with_capacity(routes);
-        let mut inputs = Vec::with_capacity(routes);
-        let mut indexed_outputs = Vec::with_capacity(routes);
+        let mut output_addresses = Vec::with_capacity(routes);
         for _ in 0..routes {
             let output = F32Matrix::zeroed(HIDDEN, 1)?;
-            inputs.push(output.data_ptr());
-            indexed_outputs.push(output.data_address());
+            output_addresses.push(output.data_address());
             matrices.push(output);
         }
         Ok(Self {
             b_tiles: DeviceBuffer::zeroed(routes * (EXPERT_INTERMEDIATE / 64) * 512)?,
             b_scales: DeviceBuffer::zeroed(routes * (EXPERT_INTERMEDIATE / 64))?,
             _outputs: matrices,
-            inputs: DeviceBuffer::from_host(&inputs)?,
-            indexed_outputs: DeviceBuffer::from_host(&indexed_outputs)?,
+            output_addresses: DeviceBuffer::from_host(&output_addresses)?,
         })
     }
 }
@@ -890,18 +886,18 @@ fn run_moe_prefill(
         EXPERTS,
         &workspace.down.b_tiles,
         &workspace.down.b_scales,
-        &workspace.down.indexed_outputs,
+        &workspace.down.output_addresses,
         HIDDEN / 16,
         EXPERT_INTERMEDIATE / 64,
         capacity * TOP_K,
         stream,
     )?;
     fill_f32_prefix_into_on_stream(workspace.routed.output(), 0.0, capacity * HIDDEN, stream)?;
-    moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+    moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream(
         &workspace.sorted_routes,
         &workspace.route_indices,
         &workspace.route_weights,
-        &workspace.down.inputs,
+        &workspace.down.output_addresses,
         &moe.down_alphas,
         workspace.routed.inout(),
         capacity,

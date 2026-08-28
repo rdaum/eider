@@ -13,7 +13,8 @@ use eider_cuda::{
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     fill_f32_into_on_stream,
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_slot_addresses_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    moe_silu_quantize_slot_addresses_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
     nemotron3_sigmoid_topk_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
@@ -764,9 +765,7 @@ struct LagunaMoeWorkspace {
     down_tiles: DeviceBuffer<u8>,
     down_scales: DeviceBuffer<u32>,
     _down_outputs: Vec<F32Matrix>,
-    down_inputs: DeviceBuffer<*const f32>,
-    down_outputs: DeviceBuffer<*mut f32>,
-    indexed_down_outputs: DeviceBuffer<DeviceAddress<f32>>,
+    down_output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     routed: DeviceBuffer<f32>,
     shared: LagunaMlpWorkspace,
     output: DeviceBuffer<f32>,
@@ -789,9 +788,7 @@ impl LagunaMoeWorkspace {
                 .iter()
                 .map(F32Matrix::device_bytes)
                 .sum::<usize>()
-            + self.down_inputs.device_bytes()
-            + self.down_outputs.device_bytes()
-            + self.indexed_down_outputs.device_bytes()
+            + self.down_output_addresses.device_bytes()
             + self.routed.device_bytes()
             + self.shared.device_bytes()
             + self.output.device_bytes()
@@ -895,14 +892,10 @@ impl LagunaMoe {
                 .collect::<Result<Vec<_>>>()?,
         )?;
         let mut down_outputs = Vec::with_capacity(TOP_K);
-        let mut down_inputs = Vec::with_capacity(TOP_K);
-        let mut down_output_ptrs = Vec::with_capacity(TOP_K);
-        let mut indexed_down_outputs = Vec::with_capacity(TOP_K);
+        let mut down_output_addresses = Vec::with_capacity(TOP_K);
         for _ in 0..TOP_K {
-            let mut output = F32Matrix::zeroed(HIDDEN, 1)?;
-            down_inputs.push(output.data_ptr());
-            down_output_ptrs.push(output.data_mut_ptr());
-            indexed_down_outputs.push(output.data_address());
+            let output = F32Matrix::zeroed(HIDDEN, 1)?;
+            down_output_addresses.push(output.data_address());
             down_outputs.push(output);
         }
         Ok(LagunaMoeWorkspace {
@@ -918,9 +911,7 @@ impl LagunaMoe {
             down_tiles: DeviceBuffer::zeroed(TOP_K * (EXPERT_INTERMEDIATE / 64) * 512)?,
             down_scales: DeviceBuffer::zeroed(TOP_K * (EXPERT_INTERMEDIATE / 64))?,
             _down_outputs: down_outputs,
-            down_inputs: DeviceBuffer::from_host(&down_inputs)?,
-            down_outputs: DeviceBuffer::from_host(&down_output_ptrs)?,
-            indexed_down_outputs: DeviceBuffer::from_host(&indexed_down_outputs)?,
+            down_output_addresses: DeviceBuffer::from_host(&down_output_addresses)?,
             routed: DeviceBuffer::zeroed(HIDDEN)?,
             shared: self.shared.new_workspace()?,
             output: DeviceBuffer::zeroed(HIDDEN)?,
@@ -985,17 +976,17 @@ impl LagunaMoe {
             EXPERTS,
             &workspace.down_tiles,
             &workspace.down_scales,
-            &workspace.indexed_down_outputs,
+            &workspace.down_output_addresses,
             HIDDEN / 16,
             EXPERT_INTERMEDIATE / 64,
             TOP_K,
             stream,
         )?;
         fill_f32_into_on_stream(workspace.routed.output(), 0.0, stream)?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &workspace.route_indices,
             &workspace.route_weights,
-            &workspace.down_inputs,
+            &workspace.down_output_addresses,
             &self.down_alphas,
             workspace.routed.inout(),
             stream,

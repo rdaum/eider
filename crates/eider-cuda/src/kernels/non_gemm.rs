@@ -3094,6 +3094,62 @@ pub fn moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
     route_weights: &DeviceBuffer<f32>,
     sorted_inputs: &DeviceBuffer<*const f32>,
     alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_sorted_slots_f32_batch_impl(
+        routes,
+        indices,
+        route_weights,
+        sorted_inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        features,
+        stream,
+    )
+}
+
+/// Writes weighted row sums from expert-major F32 outputs addressed by a typed
+/// CUDA table.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream(
+    routes: &MoeSortedRoutes,
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    sorted_inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_sorted_slots_f32_batch_impl(
+        routes,
+        indices,
+        route_weights,
+        sorted_inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        features,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_weighted_accumulate_sorted_slots_f32_batch_impl<T: DeviceRepr>(
+    routes: &MoeSortedRoutes,
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    sorted_inputs: &DeviceBuffer<T>,
+    alpha_table: &DeviceBuffer<f32>,
     mut output: DeviceInOut<'_, f32>,
     rows: usize,
     groups: usize,
@@ -3137,7 +3193,7 @@ pub fn moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
                 routes.route_to_sorted.ptr,
                 indices.ptr,
                 route_weights.ptr,
-                sorted_inputs.ptr,
+                sorted_inputs.ptr.cast(),
                 alpha_table.ptr,
                 output.buffer_mut().ptr,
                 rows as u32,
@@ -16807,13 +16863,13 @@ mod tests {
             .sorted_routes()
             .copy_to_host(&stream)
             .expect("sorted routes");
-        let sorted_ptrs = DeviceBuffer::from_host(
+        let sorted_addresses = DeviceBuffer::from_host(
             &sorted_routes
                 .iter()
-                .map(|&route| routed[route as usize].as_const_ptr().cast::<f32>())
+                .map(|&route| routed[route as usize].cuda_address())
                 .collect::<Vec<_>>(),
         )
-        .expect("sorted routed pointers");
+        .expect("sorted routed addresses");
         let unsorted_ptrs = DeviceBuffer::from_host(
             &routed
                 .iter()
@@ -16834,11 +16890,11 @@ mod tests {
         )
         .expect("route-order accumulation");
         let mut actual = DeviceBuffer::zeroed(ROWS * LEN).expect("sorted output");
-        moe_weighted_accumulate_sorted_slots_f32_batch_on_stream(
+        moe_weighted_accumulate_sorted_slot_addresses_f32_batch_on_stream(
             &routes,
             &indices_device,
             &weights_device,
-            &sorted_ptrs,
+            &sorted_addresses,
             &alphas_device,
             actual.inout(),
             ROWS,
