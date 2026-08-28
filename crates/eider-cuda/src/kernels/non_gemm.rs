@@ -11131,8 +11131,6 @@ pub fn ling3_kda_prep_into_on_stream(
     }
 }
 
-/// Applies Qwen3.6 convolution/GDN preparation to a changing sequence batch.
-/// `state_table_offset` selects the first row from a larger state-pointer table.
 /// Applies Ling 3 convolution and Q/K normalization to ragged prompt chunks.
 #[allow(clippy::too_many_arguments)]
 pub fn ling3_kda_prep_chunks_into_on_stream(
@@ -11141,7 +11139,7 @@ pub fn ling3_kda_prep_chunks_into_on_stream(
     mut q: DeviceOutput<'_, f32>,
     mut k: DeviceOutput<'_, f32>,
     mut v: DeviceOutput<'_, f32>,
-    conv_state_table: &DeviceBuffer<*mut f32>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<f32>>,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
     sequence_count: usize,
@@ -11196,7 +11194,7 @@ pub fn ling3_kda_prep_chunks_into_on_stream(
                 q.buffer_mut().ptr,
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
-                conv_state_table.ptr,
+                conv_state_table.ptr.cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 sequence_count as u32,
