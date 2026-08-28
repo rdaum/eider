@@ -89,6 +89,7 @@ DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both
 single-sequence decode and ragged batch execution.
+Its speculative verifier also uses typed previous-logit addresses.
 The persistent CUTLASS grouped-GEMM plan and its Qwen, Gemma, and Laguna
 prefill callers also use opaque address tables for weights, activations,
 outputs, and per-expert scales.

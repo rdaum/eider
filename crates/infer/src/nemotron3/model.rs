@@ -1057,7 +1057,7 @@ impl Nemotron3Model {
         let result = (|| -> Result<Nemotron3SpeculativeResult> {
             let previous_logits = sequences
                 .iter()
-                .map(|sequence| sequence.state.logits.as_const_ptr().cast::<f32>())
+                .map(|sequence| sequence.state.logits.cuda_address())
                 .collect::<Vec<_>>();
             workspace
                 .previous_logits_table
@@ -1138,7 +1138,7 @@ impl Nemotron3Model {
         }
         let previous_logits = sequences
             .iter()
-            .map(|sequence| sequence.state.logits.as_const_ptr().cast::<f32>())
+            .map(|sequence| sequence.state.logits.cuda_address())
             .collect::<Vec<_>>();
         workspace
             .previous_logits_table
@@ -2092,7 +2092,7 @@ pub struct Nemotron3BlockWorkspace {
     ssm_state_table: DeviceBuffer<*mut u16>,
     page_table_table: DeviceBuffer<DeviceAddress<u32>>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
-    previous_logits_table: DeviceBuffer<*const f32>,
+    previous_logits_table: DeviceBuffer<DeviceAddress<f32>>,
     accepted_counts: DeviceBuffer<u32>,
     next_tokens: DeviceBuffer<u32>,
     mamba_snapshots: Option<Vec<Nemotron3MambaSnapshots>>,

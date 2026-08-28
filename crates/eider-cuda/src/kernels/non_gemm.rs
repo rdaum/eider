@@ -7139,7 +7139,7 @@ pub fn mask_logits_f32_batch_in_place_on_stream(
 /// every draft is accepted.
 #[allow(clippy::too_many_arguments)]
 pub fn speculative_accept_argmax_f32_into_on_stream(
-    previous_logits: &DeviceBuffer<*const f32>,
+    previous_logits: &DeviceBuffer<DeviceAddress<f32>>,
     verification_logits: &DeviceBuffer<f32>,
     drafted_tokens: &DeviceBuffer<u32>,
     mut accepted_counts: DeviceOutput<'_, u32>,
@@ -7183,7 +7183,7 @@ pub fn speculative_accept_argmax_f32_into_on_stream(
         check_cuda(
             "infer_speculative_accept_argmax_f32_on_stream",
             ffi::infer_speculative_accept_argmax_f32_on_stream(
-                previous_logits.ptr,
+                previous_logits.as_const_ptr().cast(),
                 verification_logits.ptr,
                 drafted_tokens.ptr,
                 accepted_counts.buffer_mut().ptr,
@@ -13661,8 +13661,8 @@ mod tests {
         let mut previous = Vec::new();
         let mut previous_ptrs = Vec::new();
         for token in [1, 8, 7] {
-            let mut row = DeviceBuffer::from_host(&logits(token)).expect("previous logits");
-            previous_ptrs.push(row.as_mut_ptr().cast::<f32>().cast_const());
+            let row = DeviceBuffer::from_host(&logits(token)).expect("previous logits");
+            previous_ptrs.push(row.cuda_address());
             previous.push(row);
         }
         let mut verification = Vec::new();
