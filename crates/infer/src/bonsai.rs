@@ -15,7 +15,9 @@ use seqcache::AppendPages;
 use std::f32::consts::PI;
 use std::path::Path;
 
+mod execution;
 mod sequence;
+pub(crate) use execution::{BonsaiSequenceId, BonsaiSequencePool};
 pub(crate) use sequence::bonsai_cache_error;
 pub use sequence::{BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cache};
 
