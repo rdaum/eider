@@ -15566,11 +15566,15 @@ mod tests {
         let second = (0..EXPERTS)
             .map(|expert| ((expert * 53 % 127) as f32 - 63.0) * 0.025)
             .collect::<Vec<_>>();
+        let third = (0..EXPERTS)
+            .map(|expert| ((expert * 71 % 113) as f32 - 56.0) * 0.021)
+            .collect::<Vec<_>>();
         let bias = (0..EXPERTS)
             .map(|expert| ((expert * 19 % 47) as f32 - 23.0) * 0.002)
             .collect::<Vec<_>>();
         let mut logits = first.clone();
         logits.extend_from_slice(&second);
+        logits.extend_from_slice(&third);
         let logits = DeviceBuffer::from_host(&logits).expect("logits upload");
         let bias = DeviceBuffer::from_host(&bias).expect("bias upload");
         let mut indices = DeviceBuffer::zeroed(ROWS * 8).expect("indices");
@@ -15587,7 +15591,7 @@ mod tests {
         .expect("batch router");
         let actual_indices = indices.copy_to_host(&stream).expect("indices download");
         let actual_weights = weights.copy_to_host(&stream).expect("weights download");
-        for (row, row_logits) in [first, second].iter().enumerate() {
+        for (row, row_logits) in [first, second, third].iter().enumerate() {
             let row_logits = DeviceBuffer::from_host(row_logits).expect("row logits");
             let mut row_indices = DeviceBuffer::zeroed(8).expect("row indices");
             let mut row_weights = DeviceBuffer::zeroed(8).expect("row weights");
