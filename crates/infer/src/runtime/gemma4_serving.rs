@@ -1,12 +1,7 @@
 //! Multi-session chat serving for Gemma 4.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::gemma4::{
     Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
 };
@@ -15,7 +10,12 @@ use crate::gemma4::{
 };
 use crate::metrics::{duration_us, metrics};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
-use nvfp4::{CudaStream, Error, Result};
+use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -252,7 +252,8 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         })?;
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
-        let prefix_target = retained_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt.token_ids.len(), SM12X_KV_PAGE_TOKENS);
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
         self.requests.insert(
@@ -631,7 +632,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             let (id, logit) = self
                 .model
                 .argmax_with_logit(&sequence.state, &self.stream)?;
-            super::sampling::SampledToken {
+            eider_runtime::sampling::SampledToken {
                 id,
                 logit,
                 adjusted_logit: logit,

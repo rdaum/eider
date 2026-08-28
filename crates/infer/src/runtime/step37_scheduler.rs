@@ -1,7 +1,5 @@
 //! Multi-session scheduling for the paged Step-3.7 runtime.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{
     RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
@@ -10,7 +8,9 @@ use crate::step37::{
     HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
 };
 use crate::step37::{Step37Sequence, Step37SequenceCache, step37_cache_error};
-use nvfp4::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
@@ -373,7 +373,8 @@ impl Step37Scheduler {
         let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
-        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt_tokens.len(), SM12X_KV_PAGE_TOKENS);
         self.requests.insert(
             id,
             Box::new(Step37Request {
@@ -440,7 +441,10 @@ impl Step37Scheduler {
                 .expect("waiting request retained");
             let mut state = self.model.new_sequence_state(request.max_tokens().max(1))?;
             let mut page_table = Sm12xPageTable::new(request.max_tokens().max(1))?;
-            let device_token_counts = if request.config.sampling.supports_gpu_sampling()
+            let device_token_counts = if request
+                .config
+                .sampling
+                .supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K)
                 && request.config.sampling.uses_history_penalties()
             {
                 Some(DeviceBuffer::from_host(
@@ -586,7 +590,11 @@ impl Step37Scheduler {
                     request.id.get()
                 ),
             })?;
-        if request.sampler.config().supports_gpu_sampling() {
+        if request
+            .sampler
+            .config()
+            .supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K)
+        {
             let config = request.sampler.config();
             let draw = if config.temperature == 0.0 || config.top_k == 1 {
                 0.0
@@ -614,7 +622,7 @@ impl Step37Scheduler {
         let logits = self
             .model
             .logits_one(state, token, &mut self.sequence_cache)?;
-        request.sampler.sample(&logits, &request.history)
+        Ok(request.sampler.sample(&logits, &request.history)?)
     }
 
     fn retain_request_checkpoint(&mut self, request: &mut Step37Request) {
@@ -814,7 +822,7 @@ impl Step37Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::sampling::SamplingConfig;
+    use eider_runtime::sampling::SamplingConfig;
     use std::path::PathBuf;
 
     #[test]

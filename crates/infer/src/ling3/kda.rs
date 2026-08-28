@@ -1,6 +1,6 @@
 use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host, load_float_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     ling3_kda_128_f32_chunks_into_on_stream, ling3_kda_128_f32_into_on_stream,
     ling3_kda_gate_f32_batch_into_on_stream, ling3_kda_gate_f32_into_on_stream,
@@ -359,7 +359,7 @@ impl Ling3KdaAttentionWorkspace {
 #[cfg(test)]
 mod tests {
     use super::Ling3KdaAttentionState;
-    use nvfp4::{CudaStream, DeviceBuffer};
+    use eider_cuda::{CudaStream, DeviceBuffer};
 
     #[test]
     fn recurrent_append_rollback_restores_both_state_buffers() {

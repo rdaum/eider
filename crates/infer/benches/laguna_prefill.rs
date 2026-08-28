@@ -1,6 +1,6 @@
+use eider_cuda::CudaStream;
 use infer::laguna::{LagunaModel, LagunaPrefillBatchWorkspace, LagunaPrefillRow};
 use infer::laguna::{LagunaSequence, LagunaSequenceCache, new_laguna_sequence_cache};
-use infer::nvfp4::CudaStream;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

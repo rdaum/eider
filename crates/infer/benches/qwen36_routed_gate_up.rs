@@ -1,4 +1,4 @@
-use infer::nvfp4::{
+use eider_cuda::{
     CudaEvent, CudaStream, DeviceBuffer, GpuCounterCollector, Result,
     round_f32_to_bf16_into_on_stream,
 };

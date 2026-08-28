@@ -1,11 +1,12 @@
 use super::{
-    Deepseek4AttentionKind, Deepseek4CompressionState, Deepseek4ExpertLayer,
+    Deepseek4AttentionKind, Deepseek4CacheContext, Deepseek4CompressionState, Deepseek4ExpertLayer,
     Deepseek4ExpertWorkspace, Deepseek4HotExpertCache, Deepseek4HotsetPlan,
-    Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig,
-    Deepseek4PagedExpertLayer, Deepseek4RoutedExpertLayer, Deepseek4SequenceCheckpoint,
-    Deepseek4SequenceState,
+    Deepseek4LayerSequenceState, Deepseek4Manifest, Deepseek4ModelConfig, Deepseek4MtpSequence,
+    Deepseek4MtpSequenceCache, Deepseek4PageBackend, Deepseek4PagedExpertLayer,
+    Deepseek4RoutedExpertLayer, Deepseek4Sequence, Deepseek4SequenceCache,
+    Deepseek4SequenceCheckpoint, Deepseek4SequenceState, deepseek4_cache_error,
 };
-use crate::nvfp4::{
+use eider_cuda::{
     CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, DeviceRepr, Error, INDEXER_SCORE_SLAB,
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, PinnedHostBuffer, Result,
     add_f32_prefix_into_on_stream, arithmetic_positions_u32_into_on_stream,
@@ -18,10 +19,6 @@ use crate::nvfp4::{
     rms_norm_f32_into_on_stream, rope_interleaved_trailing_f32_indexed_in_place_on_stream,
     router_hash_f32_batch_into_on_stream, router_topk_f32_batch_into_on_stream,
     store_compression_overlap_f32_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
-};
-use crate::runtime::deepseek4_sequence_cache::{
-    Deepseek4CacheContext, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4PageBackend,
-    Deepseek4Sequence, Deepseek4SequenceCache, deepseek4_cache_error,
 };
 use std::path::Path;
 use tracing::info;
@@ -1443,10 +1440,7 @@ impl Deepseek4AttentionWeights {
         workspace: &'a mut Deepseek4AttentionWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         backend: &mut Deepseek4PageBackend,
-        append_pages: seqcache::AppendReservations<
-            '_,
-            crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
-        >,
+        append_pages: seqcache::AppendReservations<'_, super::Deepseek4Page>,
         layer: usize,
         hidden: &DeviceBuffer<f32>,
         rope_inv_freq: &DeviceBuffer<f32>,
@@ -1652,7 +1646,7 @@ impl Deepseek4AttentionWeights {
                 compressed_tables: &workspace.metadata.compressed.tables.device,
                 compressed_lengths: &workspace.metadata.compressed.lengths.device,
                 selected_indices: selected.map(|indices| (indices, config.index_topk)),
-                page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+                page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             },
             &self.sink,
             workspace.attended.output(),
@@ -2553,10 +2547,7 @@ impl Deepseek4ResidentLayer {
         workspace: &mut Deepseek4LayerWorkspace,
         rows: &mut [Deepseek4AttentionRow<'_>],
         backend: &mut Deepseek4PageBackend,
-        append_pages: seqcache::AppendReservations<
-            '_,
-            crate::runtime::deepseek4_sequence_cache::Deepseek4Page,
-        >,
+        append_pages: seqcache::AppendReservations<'_, super::Deepseek4Page>,
         layer: usize,
         streams: &DeviceBuffer<f32>,
         token_ids: &DeviceBuffer<u32>,
@@ -4488,19 +4479,19 @@ mod tests {
         Deepseek4UnweightedRmsNorm, load_bf16,
     };
     use crate::deepseek4::{
+        Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
+        deepseek4_cache_error,
+    };
+    use crate::deepseek4::{
         Deepseek4ExpertLayer, Deepseek4HotExpertCache, Deepseek4Manifest,
         Deepseek4PagedExpertLayer, Deepseek4RoutedExpertLayer, Deepseek4SequenceState,
     };
-    use crate::nvfp4::{
+    use crate::sm12x_cache::Sm12xPageTable;
+    use eider_cuda::{
         CudaStream, DeviceBuffer, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
         copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, format,
         repeat_hyper_streams_f32_into_on_stream,
     };
-    use crate::runtime::deepseek4_sequence_cache::{
-        Deepseek4CacheContext, Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
-        deepseek4_cache_error,
-    };
-    use crate::sm12x_cache::Sm12xPageTable;
     use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend, SequenceCache};
 
     const CONFIG: &str = r#"{
@@ -4546,7 +4537,7 @@ mod tests {
         max_tokens: usize,
         stream: &CudaStream,
     ) -> (Deepseek4SequenceCache, Deepseek4Sequence) {
-        let slots = max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS);
+        let slots = max_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS);
         let backend = Deepseek4PageBackend::new(config.num_hidden_layers, config.head_dim, slots)
             .expect("page backend");
         let state = Deepseek4SequenceState::new(config, max_tokens).expect("sequence state");
@@ -4555,7 +4546,7 @@ mod tests {
             slots * backend.page_bytes() + state.device_bytes() + page_table.managed_bytes();
         let mut cache: Deepseek4SequenceCache = SequenceCache::new(
             CacheConfig {
-                page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+                page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
                 max_managed_bytes: managed,
                 max_snapshot_bytes: 0,
                 max_prefix_entries: Some(0),

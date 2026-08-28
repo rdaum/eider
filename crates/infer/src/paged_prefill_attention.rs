@@ -1,6 +1,6 @@
 //! Shared tensor-core prompt attention over compact paged K/V storage.
 
-use nvfp4::{
+use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, DeviceRepr, GemmShape, Result,
     Sm12xKvPagePool, causal_window_softmax_f32_to_bf16_on_stream,
     pack_token_heads_bf16_at_offset_into_on_stream, unpack_heads_f32_at_offset_into_on_stream,

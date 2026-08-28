@@ -1,17 +1,17 @@
 //! Structured chat serving over the multi-session Step-3.7 scheduler.
 
-use super::cache_config::SequenceCacheConfig;
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::step37_scheduler::{
     Step37AdmissionProgress, Step37CancelOutcome, Step37PrefillProgress, Step37RequestId,
     Step37Scheduler,
 };
-use super::stop::StopBuffer;
 use crate::step37::Step37TextModel;
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::stop::StopBuffer;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,7 +344,7 @@ fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::chat::{ChatFunctionCall, ChatToolCall};
+    use eider_runtime::chat::{ChatFunctionCall, ChatToolCall};
     use serde_json::json;
 
     #[test]

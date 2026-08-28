@@ -11,13 +11,13 @@
 //! speculative verifier would commit. Both regimes are measured from the same
 //! prompt in separate passes.
 
-use infer::nvfp4::{CudaStream, DeviceBuffer, Error, Result};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
+use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use infer::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36PrefillRow, Qwen36TextModel,
 };
 use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
-use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         })?,
         None => args.prompt.clone(),
     };
-    infer::nvfp4::set_cuda_device(0)?;
+    eider_cuda::set_cuda_device(0)?;
     let model = Qwen36TextModel::open_with_storage(
         &args.model_dir,
         Qwen36Bf16StorageConfig::new(Qwen36Bf16Storage::Bf16, Qwen36Bf16Storage::Bf16),

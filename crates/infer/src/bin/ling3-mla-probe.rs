@@ -1,7 +1,8 @@
 //! Compare multi-token Ling 3 Tiny MLA attention with the CPU reference.
 
+use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
+use eider_format::SafeTensorShard;
 use infer::ling3::{Ling3Manifest, Ling3MlaAttention};
-use infer::nvfp4::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, SafeTensorShard};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

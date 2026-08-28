@@ -1,10 +1,10 @@
 use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
-use fs2::FileExt;
-use nvfp4::{
+use eider_cuda::{
     Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result, Sm12xFp4GemmWeight,
     Sm121W4A16HostWeight,
 };
+use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

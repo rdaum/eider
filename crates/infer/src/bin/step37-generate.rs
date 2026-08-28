@@ -1,6 +1,6 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
-use infer::nvfp4::{CudaStream, Error, Result};
+use eider_cuda::{CudaStream, Error, Result};
 use infer::step37::{
     Step37Bf16Storage, Step37Bf16StorageConfig, Step37PagingStats, Step37TextModel,
 };

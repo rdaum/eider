@@ -1,11 +1,9 @@
 //! Inference-facing crate for DGX Spark experiments.
 //!
-//! This crate is intentionally thin while the lower-level NVFP4 storage and
+//! This crate is intentionally thin while the lower-level CUDA storage and
 //! cuBLASLt path are still being validated. It will own model loading, layer
 //! composition, KV-cache policy, and decode/prefill orchestration. Low-level
-//! FP4 tensor storage and matmul execution live in `nvfp4`.
-
-pub use nvfp4;
+//! FP4 tensor storage and matmul execution live in `eider-cuda`.
 
 mod paged_prefill_attention;
 

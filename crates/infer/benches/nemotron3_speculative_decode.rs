@@ -2,9 +2,7 @@ use infer::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3SpeculativeCycleWorkspace, Nemotron3StorageConfig,
 };
-use infer::runtime::nemotron3_sequence_cache::{
-    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
-};
+use infer::nemotron3::{Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

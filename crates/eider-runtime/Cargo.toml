@@ -1,0 +1,16 @@
+[package]
+name = "eider-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+eider-format.workspace = true
+llguidance = "1.8"
+minijinja = { version = "2.21.0", features = ["json"] }
+minijinja-contrib = { version = "2.21.0", features = ["pycompat"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokenizers = "0.22"
+toktrie_hf_tokenizers = "1.8"

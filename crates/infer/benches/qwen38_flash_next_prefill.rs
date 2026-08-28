@@ -1,3 +1,4 @@
+use eider_cuda::CudaEvent;
 use infer::qwen38_flash_next::benchmark::{
     Qwen38HyperPrefillMicrobench, Qwen38QsaPrefillMicrobench,
 };
@@ -5,7 +6,6 @@ use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
 };
-use nvfp4::CudaEvent;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -223,7 +223,7 @@ fn qsa_max_context_tokens() -> usize {
                 .parse()
                 .expect("QWEN38_QSA_BENCH_MAX_CONTEXT is an integer")
         })
-        .unwrap_or(nvfp4::SM12X_KV_PAGE_TOKENS)
+        .unwrap_or(eider_cuda::SM12X_KV_PAGE_TOKENS)
 }
 
 fn qsa_start_position() -> usize {

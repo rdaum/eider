@@ -1,4 +1,4 @@
-use infer::nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 use infer::qwen3::infer::{QwenArchitecture, QwenFfnConfig, QwenLayerKind, QwenModelManifest};
 use std::env;
 use std::path::PathBuf;

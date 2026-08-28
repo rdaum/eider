@@ -1,10 +1,10 @@
 //! Compares Flash Next serial decode with its two-row target verifier.
 
-use infer::nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::qwen38_flash_next::{
     Qwen38FlashNextModel, Qwen38VectorVerifierProbeMode, probe_verification_paths,
 };
-use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use std::env;
 use std::path::PathBuf;
 use std::time::Instant;

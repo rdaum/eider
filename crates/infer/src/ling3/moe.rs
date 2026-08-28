@@ -1,6 +1,6 @@
 use super::Ling3Manifest;
 use super::layer::{Ling3Linear, load_float_as_f32};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, add_f32_into_on_stream,
     moe_weighted_accumulate_slots_f32_batch_prefix_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
@@ -215,7 +215,7 @@ impl Ling3Moe {
         stream: &CudaStream,
     ) -> Result<()> {
         if rows == 0 || rows > workspace.capacity || input.len() < rows * self.hidden {
-            return Err(nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Ling 3 MoE batch",
                 expected: format!("1..={} rows with matching input", workspace.capacity),
                 actual: format!("rows={rows} input={}", input.len()),
@@ -318,7 +318,7 @@ impl Ling3Moe {
             rows,
             stream,
         )?;
-        nvfp4::add_f32_prefix_into_on_stream(
+        eider_cuda::add_f32_prefix_into_on_stream(
             &workspace.routed_output,
             &workspace.shared_output,
             workspace.output.output(),

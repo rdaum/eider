@@ -1,8 +1,8 @@
+use eider_cuda::{Error, Result};
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3StorageConfig,
 };
-use infer::nvfp4::{Error, Result};
-use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::runtime::generation::{GenerationConfig, Nemotron3GenerationSession};
 use std::env;
 use std::io::Write;

@@ -2,7 +2,7 @@
 
 use super::{HEAD_DIM, KV_HEADS, Step37DecodeState, Step37TextModel};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{CudaStream, Error, Result};
+use eider_cuda::{CudaStream, Error, Result};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
@@ -13,7 +13,7 @@ pub type Step37SequenceCache = SequenceCache<Sm12xPageBackend, ()>;
 /// Per-row append capability and stable page table passed into model execution.
 pub(crate) struct Step37Append<'a> {
     pub(crate) reservation: &'a AppendReservation,
-    pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
+    pub(crate) page_table: &'a eider_cuda::DeviceBuffer<u32>,
 }
 
 /// One admitted Step-3.7 sequence and all request-private execution state.
@@ -117,7 +117,7 @@ pub fn new_step37_sequence_cache(
             actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
         });
     }
-    let pages_per_sequence = max_context_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS);
+    let pages_per_sequence = max_context_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS);
     let page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {
@@ -156,7 +156,7 @@ pub fn new_step37_sequence_cache(
         })?;
     Step37SequenceCache::new(
         seqcache::CacheConfig {
-            page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+            page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
             max_prefix_entries: Some(0),

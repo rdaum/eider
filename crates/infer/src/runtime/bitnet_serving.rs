@@ -1,14 +1,14 @@
 //! Multi-session chat serving for BitNet.
 
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::bitnet::{BitNetModel, BitNetPrefillWorkspace};
 use crate::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -442,7 +442,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         }
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(sequence)?;
-            super::sampling::SampledToken {
+            eider_runtime::sampling::SampledToken {
                 id,
                 logit,
                 adjusted_logit: logit,

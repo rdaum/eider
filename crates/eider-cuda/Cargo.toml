@@ -1,0 +1,148 @@
+[package]
+name = "eider-cuda"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = "0.2"
+serde_json.workspace = true
+eider-format.workspace = true
+
+[dev-dependencies]
+micromeasure.workspace = true
+
+[[bench]]
+name = "fp4_cublaslt"
+harness = false
+
+[[bench]]
+name = "fp4_quantization"
+harness = false
+
+[[bench]]
+name = "sm12x_indexed_gemv"
+harness = false
+
+[[bench]]
+name = "fp8_linear"
+harness = false
+
+[[bench]]
+name = "fp8_routed_moe"
+harness = false
+
+[[bench]]
+name = "nvfp4_routed_moe_shape"
+harness = false
+
+[[bench]]
+name = "sm121_w4a16_routed_gate_up"
+harness = false
+
+[[bench]]
+name = "qwen36_routed_moe_decode"
+harness = false
+
+[[bench]]
+name = "laguna_routed_gate_up"
+harness = false
+
+[[bench]]
+name = "step35_expert"
+harness = false
+
+[[bench]]
+name = "step35_resident_linear"
+harness = false
+
+[[bench]]
+name = "lm_head_top1"
+harness = false
+
+[[bench]]
+name = "sm121_w4a16_shared_expert"
+harness = false
+
+[[bench]]
+name = "moe_topk"
+harness = false
+
+[[bench]]
+name = "cuda_graph_launch"
+harness = false
+
+[[bench]]
+name = "gated_delta_net"
+harness = false
+
+[[bench]]
+name = "qwen36_gdn_decode"
+harness = false
+
+[[bench]]
+name = "qwen36_chunked_gdn"
+harness = false
+
+[[bench]]
+name = "qwen36_prefill_attention"
+harness = false
+
+[[bench]]
+name = "qwen36_grouped_moe_prefill"
+harness = false
+
+[[bench]]
+name = "qwen38_grouped_moe_prefill"
+harness = false
+
+[[bench]]
+name = "qwen36_prefill_projections"
+harness = false
+
+[[bench]]
+name = "qwen36_shared_expert_prefill"
+harness = false
+
+[[bench]]
+name = "nvfp4_kv_attention"
+harness = false
+
+[[bench]]
+name = "gemma4_prefill_attention"
+harness = false
+
+[[bench]]
+name = "nemotron3_dense_linear"
+harness = false
+
+[[bench]]
+name = "ngram_embedding"
+harness = false
+
+[[bench]]
+name = "dflash2_selector"
+harness = false
+
+[[bench]]
+name = "deepseek4_indexer"
+harness = false
+
+[[bench]]
+name = "q2_expert_overlay"
+harness = false
+
+[[bench]]
+name = "q2_expert_layer"
+harness = false
+
+[[bench]]
+name = "bitnet_w2a8"
+harness = false
+
+[[bench]]
+name = "ternary_g64_w2a8"
+harness = false
+
+[[bin]]
+name = "nvfp4-smoke"
+path = "src/bin/nvfp4-smoke.rs"

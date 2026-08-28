@@ -5,7 +5,7 @@
 //! during loading. Embeddings and normalization vectors remain BF16.
 
 use crate::sm12x_cache::Sm12xCacheContext;
-use nvfp4::{
+use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, Error, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
     ModelOptCublasLtWeight, ModelOptNvfp4Linear, Nvfp4Matrix, Nvfp4TnInputs, Result,
     Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
@@ -250,7 +250,7 @@ impl MuseGlimmerCheckpoint {
         Ok(shard
             .read_tensor_bytes(tensor)?
             .chunks_exact(2)
-            .map(|bytes| nvfp4::format::bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .map(|bytes| eider_cuda::format::bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
             .collect())
     }
 
@@ -671,8 +671,8 @@ impl MuseAttention {
         &self,
         max_tokens: usize,
     ) -> Result<Sm12xKvAttentionWorkspace> {
-        let attention_capacity =
-            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        let attention_capacity = max_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            * eider_cuda::SM12X_KV_PAGE_TOKENS;
         Sm12xKvAttentionWorkspace::new_gqa(
             attention_capacity,
             self.q_heads,

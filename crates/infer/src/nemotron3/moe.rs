@@ -3,7 +3,7 @@ use super::{
     Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig, Nemotron3Router,
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result,
     add_f32_into_on_stream, moe_weighted_accumulate_slots_f32_batch_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream,

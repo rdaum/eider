@@ -5,7 +5,7 @@
 //! stack on the host.
 
 use crate::sm12x_cache::Sm12xCacheContext;
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptCublasLtWeight,
     ModelOptNvfp4Linear, Result, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
     add_f32_into_on_stream, bf16_linear_argmax_f32_into_on_stream,
@@ -1585,7 +1585,7 @@ impl Gemma4Attention {
         &self,
         rows: usize,
         input: &DeviceBuffer<f32>,
-        output: nvfp4::DeviceOutput<'_, f32>,
+        output: eider_cuda::DeviceOutput<'_, f32>,
         position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1845,9 +1845,9 @@ impl Gemma4Model {
         for layer in 0..config.num_hidden_layers {
             layers.push(Gemma4DecoderLayer::load(&checkpoint, layer)?);
         }
-        let embedding_scalar_value = nvfp4::format::bf16_to_f32(nvfp4::format::f32_to_bf16(
-            (config.hidden_size as f32).sqrt(),
-        ));
+        let embedding_scalar_value = eider_cuda::format::bf16_to_f32(
+            eider_cuda::format::f32_to_bf16((config.hidden_size as f32).sqrt()),
+        );
         Ok(Self {
             embedding,
             embedding_channel_scale: DeviceBuffer::from_host(&vec![1.0; config.hidden_size])?,
@@ -2279,7 +2279,7 @@ impl Gemma4Checkpoint {
         Ok(self
             .read_bf16_tensor(tensor, expected_len)?
             .into_iter()
-            .map(nvfp4::format::bf16_to_f32)
+            .map(eider_cuda::format::bf16_to_f32)
             .collect())
     }
 

@@ -1,23 +1,20 @@
 //! Multi-session chat serving for DeepSeek V4.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::deepseek4_sequence_cache::{
-    Deepseek4CacheContext, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4Sequence,
-    Deepseek4SequenceCache, deepseek4_cache_error, new_deepseek4_mtp_sequence_cache,
-    new_deepseek4_sequence_cache,
-};
-use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::deepseek4::{
-    Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4LayerSequenceState, Deepseek4MtpBatchRow,
-    Deepseek4MtpWorkspace, Deepseek4TextModel,
+    Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4CacheContext, Deepseek4LayerSequenceState,
+    Deepseek4MtpBatchRow, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4MtpWorkspace,
+    Deepseek4Sequence, Deepseek4SequenceCache, Deepseek4TextModel, deepseek4_cache_error,
+    new_deepseek4_mtp_sequence_cache, new_deepseek4_sequence_cache,
 };
 use crate::sm12x_cache::Sm12xPageTable;
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -273,7 +270,8 @@ impl<'template> Deepseek4ChatService<'template> {
             label: "DeepSeek V4 request ID",
             detail: "request ID space exhausted".to_string(),
         })?;
-        let prefix_target = retained_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt.token_ids.len(), SM12X_KV_PAGE_TOKENS);
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
@@ -824,7 +822,9 @@ impl<'template> Deepseek4ChatService<'template> {
         let sampled = requests
             .iter_mut()
             .zip(logits.chunks_exact(vocab))
-            .map(|(request, row_logits)| request.sampler.sample(row_logits, &request.history))
+            .map(|(request, row_logits)| {
+                Ok::<_, Error>(request.sampler.sample(row_logits, &request.history)?)
+            })
             .collect::<Result<Vec<_>>>();
         let sampled = match sampled {
             Ok(sampled) => sampled,
@@ -1212,9 +1212,9 @@ mod tests {
         Deepseek4RequestId, MAX_CONTINUATION_PREFILL_TOKENS, ResponseFilter,
         prefill_chunk_capacity, retained_prefix_ready, retention_bounded_chunk,
     };
-    use crate::runtime::chat::{ChatFunctionCall, ChatToolCall};
-    use crate::runtime::chat_output::ChatOutputEvent;
     use crate::runtime::serving::ChatFinishReason;
+    use eider_runtime::chat::{ChatFunctionCall, ChatToolCall};
+    use eider_runtime::chat_output::ChatOutputEvent;
     use serde_json::json;
     use std::collections::BTreeMap;
 

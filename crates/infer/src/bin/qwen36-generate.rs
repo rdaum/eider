@@ -1,6 +1,6 @@
-use infer::nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::qwen3::qwen36::Qwen36TextModel;
-use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::runtime::generation::{GenerationConfig, Qwen36GenerationSession};
 use std::env;
 use std::io::Write;

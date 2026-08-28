@@ -1,6 +1,6 @@
+use eider_cuda::{Error, Result};
 use infer::bonsai::BonsaiModel;
 use infer::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
-use infer::nvfp4::{Error, Result};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

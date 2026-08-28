@@ -4,11 +4,11 @@ use super::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextPrefillWorkspace,
     Qwen38FlashNextSequenceSnapshot, Qwen38LogitsMode, Qwen38NextToken,
 };
-use crate::nvfp4::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
 use crate::qwen3::infer::QwenLayerKind;
 use crate::sm12x_cache::{
     Sm12xAppendTransaction, Sm12xCacheContext, Sm12xPage, Sm12xPageBackend, Sm12xPageTable,
 };
+use eider_cuda::{CudaStream, Error, Qwen38QsaIndexPool, Result, Sm12xKvPagePool};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, BackendAppendCommit, BackendAppendPage, CacheConfig,
     CacheError, PageAllocation, PageBackend, RetainedSnapshot, RetireError, RetireOutcome,
@@ -82,7 +82,7 @@ impl Qwen38FlashNextSequence {
         let mut page_table = Sm12xPageTable::new(max_tokens)?;
         let logical_capacity = page_table
             .page_capacity()
-            .checked_mul(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+            .checked_mul(eider_cuda::SM12X_KV_PAGE_TOKENS)
             .ok_or_else(|| Error::Shape {
                 label: "Qwen3.8 Flash Next sequence capacity",
                 expected: "page-aligned capacity without overflow".to_string(),
@@ -250,9 +250,9 @@ pub fn new_qwen38_flash_next_sequence_cache_with_config(
             actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
         });
     }
-    let pages_per_sequence = max_context_tokens.div_ceil(crate::nvfp4::SM12X_KV_PAGE_TOKENS);
+    let pages_per_sequence = max_context_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS);
     let max_sequence_tokens = pages_per_sequence
-        .checked_mul(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+        .checked_mul(eider_cuda::SM12X_KV_PAGE_TOKENS)
         .ok_or_else(|| Error::Shape {
             label: "Qwen3.8 Flash Next sequence capacity",
             expected: "page-aligned context without overflow".to_string(),
@@ -357,7 +357,7 @@ pub fn new_qwen38_flash_next_sequence_cache_with_config(
     )?;
     Qwen38FlashNextSequenceCache::new(
         CacheConfig {
-            page_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+            page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: snapshot_capacity,
             max_prefix_entries: (retained_bytes == 0).then_some(0),
@@ -382,7 +382,7 @@ pub(crate) fn new_qwen38_flash_next_mtp_sequence_cache(
             actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
         });
     }
-    let pages_per_sequence = max_context_tokens.div_ceil(crate::nvfp4::SM12X_KV_PAGE_TOKENS);
+    let pages_per_sequence = max_context_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS);
     let page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {
@@ -435,7 +435,7 @@ pub(crate) fn new_qwen38_flash_next_mtp_sequence_cache(
         })?;
     Qwen38FlashNextMtpSequenceCache::new(
         CacheConfig {
-            page_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+            page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
             max_prefix_entries: (retained_bytes == 0).then_some(0),

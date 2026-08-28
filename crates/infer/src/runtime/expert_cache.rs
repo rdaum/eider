@@ -1,6 +1,6 @@
 //! Model-neutral resident-slot policy and CUDA upload ordering for paged experts.
 
-use crate::nvfp4::{
+use eider_cuda::{
     CudaEvent, CudaStream, DeviceBuffer, DeviceOutput, Error, PinnedHostBuffer, Result,
     remap_expert_indices_at_offset_into_on_stream, remap_expert_indices_into_on_stream,
     remap_expert_indices_range_into_on_stream,
@@ -341,7 +341,7 @@ impl ExpertUploadCoordinator {
 #[cfg(test)]
 mod tests {
     use super::{ExpertSlotCache, ExpertUploadCoordinator};
-    use crate::nvfp4::CudaStream;
+    use eider_cuda::CudaStream;
 
     #[test]
     fn lru_plan_protects_current_route() {

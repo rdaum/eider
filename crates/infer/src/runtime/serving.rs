@@ -1,17 +1,17 @@
 //! Structured chat serving over the Qwen3.6 continuous scheduler.
 
-use super::cache_config::SequenceCacheConfig;
-use super::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use super::scheduler::{
     Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36PrefillProgress, Qwen36RequestId,
     Qwen36Scheduler, Qwen38SpeculativeProgress, RequestConfig, RequestFinishReason,
     RequestLifecycleEvent, RequestState, SchedulerConfig,
 };
-use super::stop::StopBuffer;
-use super::tool_grammar::QwenXmlGrammarFactory;
 use crate::qwen3::qwen36::Qwen36TextModel;
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, ChatTool, CheckpointChatTemplate};
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::stop::StopBuffer;
+use eider_runtime::tool_grammar::QwenXmlGrammarFactory;
 use std::collections::BTreeMap;
 
 /// Complete structured input for one chat generation request.
@@ -490,9 +490,9 @@ fn map_scheduler_finish(reason: RequestFinishReason) -> ChatFinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::chat::ChatToolCall;
     use crate::runtime::generation::GenerationConfig;
-    use crate::runtime::sampling::SamplingConfig;
+    use eider_runtime::chat::ChatToolCall;
+    use eider_runtime::sampling::SamplingConfig;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -656,7 +656,7 @@ mod tests {
         let mut output = Vec::new();
         let call = ChatOutputEvent::ToolCall(ChatToolCall {
             id: "call_1".to_string(),
-            function: super::super::chat::ChatFunctionCall {
+            function: eider_runtime::chat::ChatFunctionCall {
                 name: "read".to_string(),
                 arguments: BTreeMap::from([("path".to_string(), json!("README.md"))]),
             },

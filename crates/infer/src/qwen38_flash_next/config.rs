@@ -1,7 +1,7 @@
 use crate::qwen3::infer::{
     QwenArchitecture, QwenFfnConfig, QwenLayerKind, QwenLinearAttentionConfig, QwenModelManifest,
 };
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;

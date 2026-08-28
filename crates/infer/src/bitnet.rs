@@ -2,7 +2,7 @@
 
 use crate::sm12x_cache::Sm12xCacheContext;
 
-use nvfp4::{
+use eider_cuda::{
     BitNetActivationWorkspace, BitNetMatrix, BitNetPackedLinear, CublasLt, CudaStream,
     DeviceBuffer, Error, GemmShape, Int8TnMatmulPlan, ModelOptCheckpoint, Result,
     Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
@@ -678,8 +678,8 @@ impl BitNetDecodeWorkspace {
     fn new(config: BitNetConfig, max_tokens: usize) -> Result<Self> {
         let q_width = config.q_width();
         let kv_width = config.kv_width();
-        let attention_capacity =
-            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        let attention_capacity = max_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            * eider_cuda::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             hidden: DeviceBuffer::zeroed(config.hidden)?,
             normed: DeviceBuffer::zeroed(config.hidden)?,
@@ -905,8 +905,8 @@ impl BitNetPrefillWorkspace {
             GemmShape::new(config.hidden, rows, config.intermediate),
             WORKSPACE_LIMIT,
         )?;
-        let attention_capacity =
-            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        let attention_capacity = max_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            * eider_cuda::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             rows,
             max_tokens,

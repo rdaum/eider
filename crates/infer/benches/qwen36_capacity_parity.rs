@@ -1,4 +1,4 @@
-use infer::nvfp4::CudaStream;
+use eider_cuda::CudaStream;
 use infer::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36TextModel,

@@ -1,19 +1,19 @@
 //! Multi-session chat serving for Muse Glimmer.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::muse_glimmer::{MuseGlimmerDFlashCycle, MuseGlimmerModel};
 use crate::muse_glimmer::{
     MuseGlimmerSequence, MuseGlimmerSequenceCache, muse_glimmer_cache_error,
     new_muse_glimmer_sequence_cache_with_budget,
 };
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -282,7 +282,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         })?;
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
-        let prefix_target = retained_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt.token_ids.len(), SM12X_KV_PAGE_TOKENS);
         let prompt_tokens = prompt.token_ids.len();
         let max_output_tokens = request.generation.max_new_tokens;
         let dflash_enabled = self.model.has_dflash()
@@ -637,7 +638,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         }
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(sequence)?;
-            super::sampling::SampledToken {
+            eider_runtime::sampling::SampledToken {
                 id,
                 logit,
                 adjusted_logit: logit,

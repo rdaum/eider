@@ -2,16 +2,13 @@ use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{
     Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace, Nemotron3AttentionWorkspace,
-    Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer, Nemotron3MambaRowsWorkspace,
-    Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest, Nemotron3MoeLayer,
-    Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
-    Nemotron3StorageConfig,
+    Nemotron3CacheContext, Nemotron3KvCacheStorage, Nemotron3LayerKind, Nemotron3MambaLayer,
+    Nemotron3MambaRowsWorkspace, Nemotron3MambaState, Nemotron3MambaWorkspace, Nemotron3Manifest,
+    Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
+    Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3StorageConfig, nemotron3_cache_error,
 };
 use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
-use crate::runtime::nemotron3_sequence_cache::{
-    Nemotron3CacheContext, Nemotron3Sequence, Nemotron3SequenceCache, nemotron3_cache_error,
-};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
     argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,

@@ -1,5 +1,5 @@
 use super::Qwen38FlashNextConfig;
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceOutput, Error, ModelOptCheckpoint, PagedBf16ReadStats, PagedBf16RowReader,
     PagedBf16RowSource, Result,
 };

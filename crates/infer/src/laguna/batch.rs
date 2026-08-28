@@ -3,7 +3,7 @@ use crate::laguna::{LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_ca
 use crate::metrics::metrics;
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::sm12x_cache::Sm12xCacheContext;
-use nvfp4::{
+use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, GemmShape, MoeSortedNvfp4Rows,
     MoeSortedRoutes, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,

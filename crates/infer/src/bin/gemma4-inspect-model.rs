@@ -1,5 +1,5 @@
+use eider_cuda::{Error, Result};
 use infer::gemma4::Gemma4Checkpoint;
-use infer::nvfp4::{Error, Result};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

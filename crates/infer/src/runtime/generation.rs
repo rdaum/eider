@@ -1,18 +1,16 @@
 //! Reusable request-scoped generation sessions.
 
-use super::cache_config::SequenceCacheConfig;
-use super::chat::{ChatReasoningEffort, ChatTemplateOptions};
-use super::nemotron3_sequence_cache::{
-    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
-};
-use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
 use super::scheduler::{
     Qwen36RequestId, Qwen36Scheduler, RequestConfig, RequestFinishReason, SchedulerConfig,
 };
-use super::stop::StopBuffer;
 use crate::nemotron3::Nemotron3Model;
+use crate::nemotron3::{Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache};
 use crate::qwen3::qwen36::Qwen36TextModel;
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::chat::{ChatReasoningEffort, ChatTemplateOptions};
+use eider_runtime::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -605,14 +603,14 @@ impl<'a> Nemotron3GenerationSession<'a> {
             });
         }
         let logits = self.model.logits_to_host(&self.sequence)?;
-        self.sampler.sample(&logits, &self.history)
+        Ok(self.sampler.sample(&logits, &self.history)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GenerationConfig;
-    use crate::runtime::chat::ChatReasoningEffort;
+    use eider_runtime::chat::ChatReasoningEffort;
     use std::fs;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::{AddedToken, Tokenizer};

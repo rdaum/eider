@@ -3,13 +3,13 @@
 use super::config::Qwen38FlashNextConfig;
 use super::hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 use super::qsa::{Qwen38QsaPrefillWorkspace, Qwen38QsaWeights, Qwen38QsaWorkspace};
-use crate::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, SM12X_KV_PAGE_TOKENS,
-};
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{Qwen36BatchModelView, load_hybrid_full_attention};
 use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
 use crate::sm12x_cache::Sm12xPage;
+use eider_cuda::{
+    CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, SM12X_KV_PAGE_TOKENS,
+};
 use std::path::Path;
 
 /// Numerical comparison between serial and batched QSA layer outputs.
@@ -63,7 +63,7 @@ impl Qwen38HyperPrefillMicrobench {
     /// Loads one attention hyperconnection without loading transformer weights.
     pub fn open(model_dir: impl AsRef<Path>, tokens: usize) -> Result<Self> {
         if tokens == 0 || tokens > SM12X_KV_PAGE_TOKENS {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 hyperconnection prefill microbenchmark tokens",
                 expected: format!("1..={SM12X_KV_PAGE_TOKENS}"),
                 actual: tokens.to_string(),
@@ -198,7 +198,7 @@ impl Qwen38QsaPrefillMicrobench {
             || !start_position.is_multiple_of(SM12X_KV_PAGE_TOKENS)
             || !max_context_tokens.is_multiple_of(SM12X_KV_PAGE_TOKENS)
         {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 QSA prefill microbenchmark tokens",
                 expected: format!(
                     "tokens in 1..={SM12X_KV_PAGE_TOKENS} and page-aligned context >= tokens"
@@ -215,7 +215,7 @@ impl Qwen38QsaPrefillMicrobench {
             .layer_kinds
             .iter()
             .position(|kind| *kind == QwenLayerKind::FullAttention)
-            .ok_or_else(|| crate::nvfp4::Error::Format {
+            .ok_or_else(|| eider_cuda::Error::Format {
                 label: "Qwen3.8 QSA prefill microbenchmark",
                 detail: "model has no QSA layer".to_string(),
             })?;

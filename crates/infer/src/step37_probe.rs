@@ -1,9 +1,10 @@
 //! Focused Step-3.7 text-layer validation against the checkpoint's Python model.
 
-use nvfp4::{
-    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, SafeTensorShard,
-    add_f32_into_on_stream, copy_row_f32_into_on_stream,
+use eider_cuda::{
+    CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
+    copy_row_f32_into_on_stream,
 };
+use eider_format::SafeTensorShard;
 use std::path::Path;
 
 use crate::step37::{

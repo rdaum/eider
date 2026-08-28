@@ -1,5 +1,4 @@
 use super::Qwen38FlashNextConfig;
-use crate::nvfp4::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
 use crate::qwen3::infer::QwenModelManifest;
 use crate::qwen3::qwen36::{
     BatchFullAttentionWorkspace, Bf16Linear, Qwen36BatchModelView, Qwen36FullAttentionWeights,
@@ -7,7 +6,8 @@ use crate::qwen3::qwen36::{
 };
 use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
 use crate::sm12x_cache::Sm12xPage;
-use nvfp4::{
+use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
+use eider_cuda::{
     Qwen38QsaSelectionWorkspace, round_f32_to_bf16_in_place_on_stream,
     round_f32_to_bf16_prefix_in_place_on_stream,
 };

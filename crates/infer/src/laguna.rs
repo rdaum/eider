@@ -5,7 +5,7 @@
 //! and LM-head weights remain BF16.
 
 use crate::sm12x_cache::Sm12xCacheContext;
-use nvfp4::{
+use eider_cuda::{
     CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
     GpuSamplingRow, GpuTokenSampler, ModelOptCheckpoint, ModelOptCublasLtWeight,
     ModelOptNvfp4Linear, Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,

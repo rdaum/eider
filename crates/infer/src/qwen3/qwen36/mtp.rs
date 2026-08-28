@@ -26,12 +26,12 @@ use super::{
     Qwen36FullAttentionWorkspace, Qwen36LmHeadWorkspace, Qwen36TextModel, read_bf16_matrix_host,
     read_bf16_vector_delta_as_f32_device,
 };
-use crate::nvfp4::{
+use crate::qwen3::infer::QwenModelManifest;
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
     concat_f32_rows_into_on_stream, rms_norm_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, silu_mul_halves_f32_into_on_stream,
 };
-use crate::qwen3::infer::QwenModelManifest;
 
 /// Device-ready weights for the Qwen3.8 MTP drafter block.
 pub struct Qwen36MtpWeights {

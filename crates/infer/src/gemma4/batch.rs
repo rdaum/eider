@@ -2,7 +2,7 @@ use super::*;
 use crate::gemma4::{Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error};
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::sm12x_cache::Sm12xCacheContext;
-use nvfp4::{
+use eider_cuda::{
     CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape, MoeSortedNvfp4Rows,
     MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,

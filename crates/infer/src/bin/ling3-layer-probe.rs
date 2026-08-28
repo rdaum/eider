@@ -1,7 +1,8 @@
 //! Compare Ling 3 Tiny mixed FP8/NVFP4 layer zero with the CPU artifact.
 
+use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
+use eider_format::SafeTensorShard;
 use infer::ling3::{Ling3KdaDenseLayer, Ling3Manifest};
-use infer::nvfp4::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, SafeTensorShard};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -119,7 +120,7 @@ fn usage() -> Error {
 }
 
 fn reference_values(reference: &SafeTensorShard, name: &str) -> Result<Vec<f32>> {
-    reference.read_float_tensor_as_f32(name)
+    Ok(reference.read_float_tensor_as_f32(name)?)
 }
 
 fn compare(

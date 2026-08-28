@@ -2,7 +2,7 @@
 
 use crate::qwen3::qwen36::{Qwen36SequenceSnapshot, Qwen36SequenceState, Qwen36TextModel};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheConfig, CacheError, PageBackend,
     SequenceCache, SequenceId,

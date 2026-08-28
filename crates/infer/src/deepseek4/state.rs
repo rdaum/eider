@@ -1,5 +1,5 @@
 use super::{Deepseek4AttentionKind, Deepseek4ModelConfig};
-use crate::nvfp4::{CudaStream, DeviceBuffer, Error, Result};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
 
 /// Persistent projected state for one HCA compressor or CSA compressor/indexer.
 pub struct Deepseek4CompressionState {
@@ -732,7 +732,7 @@ mod tests {
         Deepseek4CompressionState, Deepseek4LayerCompressionState, Deepseek4LayerSequenceState,
         Deepseek4SequenceState,
     };
-    use crate::nvfp4::CudaStream;
+    use eider_cuda::CudaStream;
 
     #[test]
     fn compression_state_sizes_pending_overlap_and_completed_entries() {
@@ -869,7 +869,7 @@ mod tests {
             unreachable!()
         };
         let mutated =
-            crate::nvfp4::DeviceBuffer::from_host(&[9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            eider_cuda::DeviceBuffer::from_host(&[9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
                 .expect("mutated values");
         compressor
             .pending_kv

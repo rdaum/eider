@@ -2,8 +2,9 @@
 members = [
     "crates/eider-api",
     "crates/eider-format",
+    "crates/eider-runtime",
     "crates/infer",
-    "crates/nvfp4",
+    "crates/eider-cuda",
 ]
 resolver = "2"
 
@@ -20,8 +21,9 @@ serde_json = "1"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nvfp4 = { path = "crates/nvfp4" }
+eider-cuda = { path = "crates/eider-cuda" }
 eider-format = { path = "crates/eider-format" }
+eider-runtime = { path = "crates/eider-runtime" }
 
 clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"

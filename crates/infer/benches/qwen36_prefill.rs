@@ -1,4 +1,4 @@
-use infer::nvfp4::{CudaStream, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, SM12X_KV_PAGE_TOKENS};
 use infer::qwen3::qwen36::{
     Qwen36DecodeRow, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow, Qwen36TextModel,
 };

@@ -5,7 +5,7 @@
 This document defines the target structure for Eider. It records a design
 decision and the migration order; it does not claim the refactor is complete.
 
-The first migration slice is complete. `nvfp4` now rejects invalid device
+The first migration slice is complete. `eider-cuda` now rejects invalid device
 representations, returns a loan for device-to-pinned-host readback, retains
 captured-graph resources, and supplies typed device views. The DFlash2
 projection uses those views. Physical SM12x page storage and Qwen sequence
@@ -22,6 +22,23 @@ with their model modules too. Laguna and Step-3.7 now keep their page tables,
 append capabilities, and cache allocation rules with their models.
 Muse Glimmer now keeps its snapshot-aware sequence state and cache allocation
 rules beside its model implementation.
+Ling 3 now keeps its MLA page pools, per-sequence recurrent state, graph
+workspaces, and page-table updates beside its model implementation.
+DeepSeek V4 now keeps compressed-attention page storage, MTP residual state,
+and prefix snapshots beside its model implementation. Nemotron 3 now keeps its
+hybrid attention and Mamba sequence state beside its model implementation.
+The safetensors reader has moved into `eider-format`; the remaining ModelOpt
+records and artifact codecs still need to move there.
+Flash Next now keeps its loaded model, QSA caches, persistent workspaces, and
+GPU sampler in a model-owned execution state; its service retains request
+policy and output state.
+`eider-runtime` now owns request sampling and stop-sequence handling. Sampling
+receives the backend's supported GPU top-k limit as a capability instead of
+importing CUDA state.
+It also owns sequence-cache retention policy; models provide the page geometry
+when that policy selects a reusable prompt prefix.
+Checkpoint chat rendering, structured output decoding, and Qwen XML tool
+grammar now also live in `eider-runtime` with no CUDA dependency.
 
 ## Decision
 

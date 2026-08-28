@@ -1,5 +1,5 @@
 use super::*;
-use nvfp4::{
+use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, GemmShape, append_rows_f32_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, f32_to_bf16_into_on_stream,
     rope_neox_inv_freq_sequence_f32_at_offset_into_on_stream,

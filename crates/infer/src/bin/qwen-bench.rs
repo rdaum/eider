@@ -1,8 +1,8 @@
-use fast_telemetry::{Counter, ExportMetrics, Histogram};
-use infer::nvfp4::{
+use eider_cuda::{
     CudaStream, Error, GpuCounterCollector, GpuCounterMetric, Result, SM12X_KV_PAGE_TOKENS,
     device_memory_info,
 };
+use fast_telemetry::{Counter, ExportMetrics, Histogram};
 use infer::qwen3::infer::{
     Qwen3Model, QwenArchitecture, QwenDecodeProfile, QwenModelManifest, QwenRuntimeCounters,
     runtime_counters,
@@ -315,7 +315,7 @@ impl BenchModel {
                 };
                 Ok(Self::Qwen36(Box::new(model)))
             }
-            QwenArchitecture::Qwen38FlashNext => Err(infer::nvfp4::Error::Format {
+            QwenArchitecture::Qwen38FlashNext => Err(eider_cuda::Error::Format {
                 label: "Qwen benchmark model",
                 detail: "Qwen3.8 Flash Next uses its dedicated runtime".to_string(),
             }),

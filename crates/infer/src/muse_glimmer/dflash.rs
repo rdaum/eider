@@ -1,12 +1,12 @@
 use super::*;
-use eider_format::{
-    Error as FormatError, GgufIndex, GgufValue, dequantize_to_bf16, quantized_byte_len,
-};
-use nvfp4::{
+use eider_cuda::{
     Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_prefix_into_on_stream,
     argmax_f32_batch_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
     rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
     silu_mul_f32_prefix_into_on_stream,
+};
+use eider_format::{
+    Error as FormatError, GgufIndex, GgufValue, dequantize_to_bf16, quantized_byte_len,
 };
 use std::path::Path;
 

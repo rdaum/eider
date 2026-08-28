@@ -1,6 +1,6 @@
 //! Device-side expert usage accounting for optional higher-precision hotsets.
 
-use crate::nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, Result, clear_expert_counts_u64_on_stream,
     record_expert_indices_prefix_u64_on_stream, record_expert_indices_u64_on_stream,
 };

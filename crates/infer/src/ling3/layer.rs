@@ -1,5 +1,5 @@
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptBlockScaledFp8Linear, ModelOptCheckpoint,
     ModelOptNvfp4Linear, Result, add_f32_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
@@ -860,7 +860,7 @@ pub(super) fn load_bf16_as_f32(
     DeviceBuffer::from_host(
         &load_bf16_host(checkpoint, name, expected_shape)?
             .into_iter()
-            .map(nvfp4::format::bf16_to_f32)
+            .map(eider_cuda::format::bf16_to_f32)
             .collect::<Vec<_>>(),
     )
 }

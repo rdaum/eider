@@ -1,8 +1,8 @@
+use super::Nemotron3PageBackend;
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::runtime::kv_cache::LayerKvCache;
-use crate::runtime::nemotron3_sequence_cache::Nemotron3PageBackend;
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, Sm12xKvAttentionWorkspace,
     Sm12xKvCache, add_f32_into_on_stream, append_ragged_kv_f32_into_on_stream,
     append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
@@ -283,7 +283,7 @@ impl Nemotron3AttentionLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3AttentionWorkspace,
         backend: &mut Nemotron3PageBackend,
-        pages: seqcache::AppendPages<'_, crate::runtime::nemotron3_sequence_cache::Nemotron3Page>,
+        pages: seqcache::AppendPages<'_, super::Nemotron3Page>,
         page_table: &DeviceBuffer<u32>,
         position: usize,
         compact_attention: Option<&mut Sm12xKvAttentionWorkspace>,
@@ -330,7 +330,7 @@ impl Nemotron3AttentionLayer {
                     &workspace.start_positions,
                     1,
                     1,
-                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    eider_cuda::SM12X_KV_PAGE_TOKENS,
                     self.manifest.kv_heads * self.manifest.attention_head_dim,
                     stream,
                 )?;
@@ -346,7 +346,7 @@ impl Nemotron3AttentionLayer {
                     workspace.attended.output(),
                     1,
                     1,
-                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    eider_cuda::SM12X_KV_PAGE_TOKENS,
                     self.manifest.attention_heads,
                     self.manifest.kv_heads,
                     self.manifest.attention_head_dim,
@@ -481,10 +481,7 @@ impl Nemotron3AttentionLayer {
         hidden: &DeviceBuffer<f32>,
         workspace: &mut Nemotron3AttentionRowsWorkspace,
         backend: &mut Nemotron3PageBackend,
-        reservations: AppendReservations<
-            '_,
-            crate::runtime::nemotron3_sequence_cache::Nemotron3Page,
-        >,
+        reservations: AppendReservations<'_, super::Nemotron3Page>,
         page_tables: &DeviceBuffer<*const u32>,
         page_table_devices: &[&DeviceBuffer<u32>],
         sequence_offsets: &DeviceBuffer<u32>,
@@ -529,7 +526,7 @@ impl Nemotron3AttentionLayer {
                     start_positions,
                     sequence_count,
                     rows,
-                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    eider_cuda::SM12X_KV_PAGE_TOKENS,
                     self.manifest.kv_heads * self.manifest.attention_head_dim,
                     stream,
                 )?;
@@ -545,7 +542,7 @@ impl Nemotron3AttentionLayer {
                     workspace.attended.output(),
                     sequence_count,
                     rows,
-                    nvfp4::SM12X_KV_PAGE_TOKENS,
+                    eider_cuda::SM12X_KV_PAGE_TOKENS,
                     self.manifest.attention_heads,
                     self.manifest.kv_heads,
                     self.manifest.attention_head_dim,

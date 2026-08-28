@@ -6,7 +6,8 @@
 
 use super::batch::{BatchFp8InputQuantization, BatchFp8LinearPlan, run_fp8_batch};
 use super::{Qwen36LmHead, Qwen36TextModel};
-use crate::nvfp4::{
+use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
+use eider_cuda::{
     Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, GpuTokenSampler,
     GpuTopKCandidate, ModelOptCheckpoint, PinnedHostBuffer, Result, RowMajor,
     add_f32_prefix_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
@@ -16,7 +17,6 @@ use crate::nvfp4::{
     rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
     silu_mul_halves_f32_batch_into_on_stream,
 };
-use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use serde::Deserialize;
 use std::fs;
 use std::mem::size_of;
@@ -1834,7 +1834,7 @@ mod tests {
         DFlash2GreedySelector, expected_tensors, f32_to_bf16, inspect_dflash2_config,
         validate_dflash2_checkpoint, vocabulary_top_k,
     };
-    use crate::nvfp4::GpuTopKCandidate;
+    use eider_cuda::GpuTopKCandidate;
     use serde_json::{Value, json};
     use std::fs::{self, File};
     use std::io::Write;

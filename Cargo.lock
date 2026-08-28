@@ -847,7 +847,9 @@ dependencies = [
  "async-stream",
  "axum",
  "clap",
+ "eider-cuda",
  "eider-format",
+ "eider-runtime",
  "fast-telemetry",
  "fast-telemetry-export",
  "fs2",
@@ -863,8 +865,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "eider-cuda"
+version = "0.1.0"
+dependencies = [
+ "eider-format",
+ "libc",
+ "micromeasure",
+ "serde_json",
+]
+
+[[package]]
 name = "eider-format"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "eider-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eider-format",
+ "llguidance",
+ "minijinja",
+ "minijinja-contrib",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
+ "toktrie_hf_tokenizers",
+]
 
 [[package]]
 name = "either"
@@ -1559,7 +1590,9 @@ name = "infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "eider-cuda",
  "eider-format",
+ "eider-runtime",
  "fast-telemetry",
  "fs2",
  "libc",
@@ -1567,7 +1600,6 @@ dependencies = [
  "micromeasure",
  "minijinja",
  "minijinja-contrib",
- "nvfp4",
  "rand 0.9.5",
  "rayon",
  "seqcache",
@@ -1983,15 +2015,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "nvfp4"
-version = "0.1.0"
-dependencies = [
- "libc",
- "micromeasure",
- "serde_json",
 ]
 
 [[package]]

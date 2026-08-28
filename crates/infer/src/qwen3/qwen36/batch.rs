@@ -11,7 +11,7 @@ use crate::sm12x_cache::Sm12xCacheContext;
 
 use super::{Qwen36Append, Qwen36Sequence, Qwen36SequenceCache, qwen36_cache_error as cache_error};
 
-use crate::nvfp4::{
+use eider_cuda::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
     DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
     GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
@@ -45,14 +45,14 @@ const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
 
 pub(crate) trait Qwen36BatchModel {
-    fn batch_lt(&self) -> &crate::nvfp4::CublasLt;
+    fn batch_lt(&self) -> &eider_cuda::CublasLt;
     fn batch_manifest(&self) -> &super::QwenModelManifest;
     fn batch_layer_count(&self) -> usize;
     fn batch_linear_layers(&self) -> Vec<bool>;
 }
 
 impl Qwen36BatchModel for Qwen36TextModel {
-    fn batch_lt(&self) -> &crate::nvfp4::CublasLt {
+    fn batch_lt(&self) -> &eider_cuda::CublasLt {
         &self.lt
     }
 
@@ -73,14 +73,14 @@ impl Qwen36BatchModel for Qwen36TextModel {
 }
 
 pub(crate) struct Qwen36BatchModelView<'a> {
-    lt: &'a crate::nvfp4::CublasLt,
+    lt: &'a eider_cuda::CublasLt,
     manifest: &'a super::QwenModelManifest,
     linear_layers: &'a [bool],
 }
 
 impl<'a> Qwen36BatchModelView<'a> {
     pub(crate) fn new(
-        lt: &'a crate::nvfp4::CublasLt,
+        lt: &'a eider_cuda::CublasLt,
         manifest: &'a super::QwenModelManifest,
         linear_layers: &'a [bool],
     ) -> Self {
@@ -93,7 +93,7 @@ impl<'a> Qwen36BatchModelView<'a> {
 }
 
 impl Qwen36BatchModel for Qwen36BatchModelView<'_> {
-    fn batch_lt(&self) -> &crate::nvfp4::CublasLt {
+    fn batch_lt(&self) -> &eider_cuda::CublasLt {
         self.lt
     }
 
@@ -220,7 +220,7 @@ impl Qwen36DecodedBatch<'_> {
         let active_logits =
             self.rows
                 .checked_mul(self.vocab)
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.6 active batch logits",
                     expected: "rows * vocabulary without overflow".to_string(),
                     actual: format!("{} * {}", self.rows, self.vocab),
@@ -238,13 +238,13 @@ impl Qwen36DecodedBatch<'_> {
         let active_words =
             self.rows
                 .checked_mul(mask_words)
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen tool grammar masks",
                     expected: "rows * mask words without overflow".to_string(),
                     actual: format!("rows={} words={mask_words}", self.rows),
                 })?;
         if allowed.len() != active_words {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen tool grammar masks",
                 expected: format!("{active_words} words"),
                 actual: format!("{} words", allowed.len()),
@@ -300,7 +300,7 @@ impl Qwen36DecodedBatch<'_> {
         rows: &mut [GpuSamplingRow<'_>],
     ) -> Result<Vec<GpuSampledToken>> {
         if rows.len() != self.rows {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 sampling rows",
                 expected: format!("{} active rows", self.rows),
                 actual: format!("{} rows", rows.len()),
@@ -606,7 +606,7 @@ pub(super) fn run_fp8_batch(
     stream: &CudaStream,
 ) -> Result<()> {
     if matches!(input_quantization, BatchFp8InputQuantization::Unused) {
-        return Err(crate::nvfp4::Error::Format {
+        return Err(eider_cuda::Error::Format {
             label: "Qwen3.6 FP8 batch input",
             detail: "FP8 projection was given no prepared activation".to_string(),
         });
@@ -616,7 +616,7 @@ pub(super) fn run_fp8_batch(
             if linear.channel_weight_scale.is_some()
                 || linear.input_scale.map(f32::to_bits) != Some(input_scale.to_bits())
             {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 static FP8 batch input",
                     detail: "projection does not match the prepared static activation scale"
                         .to_string(),
@@ -846,14 +846,14 @@ fn run_linear_batch(
     match linear {
         Qwen36Linear::Nvfp4(linear) => {
             let Some(plan) = plan.as_mut() else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: "NVFP4 projection has no batch plan".to_string(),
                 });
             };
             let actual = plan.storage_name();
             let BatchLinearPlan::Nvfp4(plan) = plan else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: format!(
                         "NVFP4 projection [{}, {}] has a {actual} plan",
@@ -865,14 +865,14 @@ fn run_linear_batch(
         }
         Qwen36Linear::Fp8(linear) => {
             let Some(plan) = plan.as_mut() else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: "FP8 projection has no batch plan".to_string(),
                 });
             };
             let actual = plan.storage_name();
             let BatchLinearPlan::Fp8(plan) = plan else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: format!(
                         "FP8 projection [{}, {}] has a {actual} plan",
@@ -897,14 +897,14 @@ fn run_linear_batch(
         }
         Qwen36Linear::Bf16(linear) => {
             let Some(plan) = plan.as_mut() else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: "BF16 projection has no batch plan".to_string(),
                 });
             };
             let actual = plan.storage_name();
             let BatchLinearPlan::Bf16(plan) = plan else {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen batch linear plan",
                     detail: format!(
                         "BF16 projection [{}, {}] has a {actual} plan",
@@ -948,7 +948,7 @@ fn run_linear_batch_from_set(
             plans
                 .nvfp4
                 .as_mut()
-                .ok_or_else(|| crate::nvfp4::Error::Format {
+                .ok_or_else(|| eider_cuda::Error::Format {
                     label: "Qwen dense batch plan",
                     detail: "NVFP4 projection has no NVFP4 plan".to_string(),
                 })?,
@@ -963,7 +963,7 @@ fn run_linear_batch_from_set(
             plans
                 .fp8
                 .as_mut()
-                .ok_or_else(|| crate::nvfp4::Error::Format {
+                .ok_or_else(|| eider_cuda::Error::Format {
                     label: "Qwen dense batch plan",
                     detail: "FP8 projection has no FP8 plan".to_string(),
                 })?,
@@ -983,7 +983,7 @@ fn run_linear_batch_from_set(
             plans
                 .bf16
                 .as_mut()
-                .ok_or_else(|| crate::nvfp4::Error::Format {
+                .ok_or_else(|| eider_cuda::Error::Format {
                     label: "Qwen dense batch plan",
                     detail: "BF16 projection has no BF16 plan".to_string(),
                 })?,
@@ -1064,7 +1064,7 @@ impl BatchLinearAttentionStateSnapshots {
         let state_rows =
             linear_layers
                 .checked_mul(slots)
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.8 speculative state snapshots",
                     expected: "linear layers * snapshot slots without overflow".to_string(),
                     actual: format!("linear_layers={linear_layers} slots={slots}"),
@@ -1072,7 +1072,7 @@ impl BatchLinearAttentionStateSnapshots {
         let conv_len =
             state_rows
                 .checked_mul(conv_values)
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.8 speculative conv snapshots",
                     expected: "snapshot rows * conv values without overflow".to_string(),
                     actual: format!("rows={state_rows} values={conv_values}"),
@@ -1080,7 +1080,7 @@ impl BatchLinearAttentionStateSnapshots {
         let recurrent_len =
             state_rows
                 .checked_mul(recurrent_values)
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.8 speculative recurrent snapshots",
                     expected: "snapshot rows * recurrent values without overflow".to_string(),
                     actual: format!("rows={state_rows} values={recurrent_values}"),
@@ -1254,13 +1254,13 @@ impl BatchChunkedGdnWorkspace {
             tokens =
                 tokens
                     .checked_add(length as usize)
-                    .ok_or_else(|| crate::nvfp4::Error::Shape {
+                    .ok_or_else(|| eider_cuda::Error::Shape {
                         label: "Qwen3.6 chunked GDN metadata",
                         expected: "cumulative token count without overflow".to_string(),
                         actual: format!("tokens={tokens} length={length}"),
                     })?;
             self.host_cu_seqlens[sequence + 1] =
-                i32::try_from(tokens).map_err(|_| crate::nvfp4::Error::Shape {
+                i32::try_from(tokens).map_err(|_| eider_cuda::Error::Shape {
                     label: "Qwen3.6 chunked GDN token count",
                     expected: "i32-sized packed token count".to_string(),
                     actual: tokens.to_string(),
@@ -1288,7 +1288,7 @@ impl BatchChunkedGdnWorkspace {
         &mut self,
         state_table: &DeviceBuffer<*mut f32>,
         state_table_offset: usize,
-        output_f32: crate::nvfp4::DeviceOutput<'_, f32>,
+        output_f32: eider_cuda::DeviceOutput<'_, f32>,
         sequence_count: usize,
         total_tokens: usize,
         stream: &CudaStream,
@@ -1543,7 +1543,7 @@ impl BatchLinearAttentionWorkspace {
         state: &mut Qwen36LinearAttentionState,
     ) -> Result<()> {
         if layer_idx >= self.conv_state_ptrs.len() {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen hybrid GDN layer",
                 expected: format!("layer < {}", self.conv_state_ptrs.len()),
                 actual: layer_idx.to_string(),
@@ -1810,7 +1810,7 @@ impl BatchGroupedMoeWorkspace {
 
     fn set_rows(&mut self, rows: usize) -> Result<()> {
         if rows == 0 || rows > self.capacity_rows {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 grouped batch MoE rows",
                 expected: format!("1..={}", self.capacity_rows),
                 actual: rows.to_string(),
@@ -1859,7 +1859,7 @@ impl DFlash2TargetCapture {
             || rows == 0
             || hidden == 0
         {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "DFlash2 target capture",
                 expected: "ordered target layers and positive row/hidden sizes".to_string(),
                 actual: format!("layers={layers:?} rows={rows} hidden={hidden}"),
@@ -1993,13 +1993,13 @@ impl BatchMoeWorkspace {
         capacity: usize,
     ) -> Result<Self> {
         if !matches!(weights.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
-            return Err(crate::nvfp4::Error::Format {
+            return Err(eider_cuda::Error::Format {
                 label: "Qwen3.6 batched routed gate/up",
                 detail: "the current model does not use resident CUTLASS W4A4 experts".to_string(),
             });
         }
         if weights.grouped.is_none() {
-            return Err(crate::nvfp4::Error::Format {
+            return Err(eider_cuda::Error::Format {
                 label: "Qwen3.6 batched routed gate/up",
                 detail: "grouped W4A4 expert weights are unavailable".to_string(),
             });
@@ -2017,7 +2017,7 @@ impl BatchMoeWorkspace {
             ),
             Qwen36SharedExpertStorage::Bf16 { .. } => (None, None),
             Qwen36SharedExpertStorage::Fp8 { .. } => {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 batched shared expert",
                     detail: "FP8 shared experts are not supported by the grouped batch path"
                         .to_string(),
@@ -2224,7 +2224,7 @@ impl Qwen36HybridPrefillWorkspace {
 
     fn require_tokens(&self, tokens: usize) -> Result<()> {
         if tokens == 0 || tokens > self.token_capacity {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen hybrid prefill tokens",
                 expected: format!("1..={} tokens", self.token_capacity),
                 actual: tokens.to_string(),
@@ -2560,7 +2560,7 @@ impl Qwen36TextModel {
         max_context_tokens: usize,
     ) -> Result<Qwen36PrefillBatchWorkspace> {
         if sequence_capacity == 0 || token_capacity == 0 || max_context_tokens == 0 {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 prefill batch workspace",
                 expected: "positive sequence, token, and context capacities".to_string(),
                 actual: format!(
@@ -2783,20 +2783,20 @@ impl Qwen36TextModel {
         appends: &[Qwen36Append<'_>],
     ) -> Result<()> {
         if workspace.model_id != self.model_id {
-            return Err(crate::nvfp4::Error::Format {
+            return Err(eider_cuda::Error::Format {
                 label: "Qwen3.6 prefill batch workspace",
                 detail: "workspace was created by a different model instance".to_string(),
             });
         }
         if rows.is_empty() || rows.len() > workspace.sequence_capacity {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 prefill batch rows",
                 expected: format!("1..={}", workspace.sequence_capacity),
                 actual: rows.len().to_string(),
             });
         }
         if appends.len() != rows.len() {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 prefill append rows",
                 expected: format!("{} append descriptors", rows.len()),
                 actual: appends.len().to_string(),
@@ -2805,14 +2805,14 @@ impl Qwen36TextModel {
         let total_tokens = rows.iter().try_fold(0usize, |total, row| {
             total
                 .checked_add(row.token_ids.len())
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill token count",
                     expected: "total token count without overflow".to_string(),
                     actual: format!("total={total} row={}", row.token_ids.len()),
                 })
         })?;
         if total_tokens == 0 || total_tokens > workspace.token_capacity {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 prefill token count",
                 expected: format!("1..={}", workspace.token_capacity),
                 actual: total_tokens.to_string(),
@@ -2820,14 +2820,14 @@ impl Qwen36TextModel {
         }
         for row in rows.iter() {
             if row.token_ids.is_empty() {
-                return Err(crate::nvfp4::Error::Shape {
+                return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill row",
                     expected: "at least one token".to_string(),
                     actual: "0 tokens".to_string(),
                 });
             }
             if row.state.model_id != self.model_id {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 prefill sequence state",
                     detail: "state was created by a different model instance".to_string(),
                 });
@@ -2837,7 +2837,7 @@ impl Qwen36TextModel {
                 .iter()
                 .find(|&&token| token as usize >= self.manifest.vocab)
             {
-                return Err(crate::nvfp4::Error::Shape {
+                return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill token id",
                     expected: format!("token < {}", self.manifest.vocab),
                     actual: token.to_string(),
@@ -2847,7 +2847,7 @@ impl Qwen36TextModel {
                 .state
                 .position
                 .checked_add(row.token_ids.len())
-                .ok_or_else(|| crate::nvfp4::Error::Shape {
+                .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill sequence capacity",
                     expected: "position + tokens without overflow".to_string(),
                     actual: format!(
@@ -2857,7 +2857,7 @@ impl Qwen36TextModel {
                     ),
                 })?;
             if end > row.state.max_tokens || row.state.max_tokens > workspace.max_context_tokens {
-                return Err(crate::nvfp4::Error::Shape {
+                return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill sequence capacity",
                     expected: format!(
                         "end <= sequence max_tokens <= {}",
@@ -3178,7 +3178,7 @@ impl Qwen36TextModel {
         max_context_tokens: usize,
     ) -> Result<Qwen36DecodeBatchWorkspace> {
         if capacity == 0 || max_context_tokens == 0 {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 decode batch workspace",
                 expected: "capacity > 0 and max_context_tokens > 0".to_string(),
                 actual: format!("capacity={capacity} max_context_tokens={max_context_tokens}"),
@@ -3436,7 +3436,7 @@ impl Qwen36TextModel {
                     .into_vec(),
             ),
             _ => {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen decode trace feed-forward workspace",
                     detail: "weights and workspace variants do not match".to_string(),
                 });
@@ -3657,20 +3657,20 @@ impl Qwen36TextModel {
         mut trace: Option<&mut Vec<Qwen36DecodeLayerTrace>>,
     ) -> Result<()> {
         if workspace.model_id != self.model_id {
-            return Err(crate::nvfp4::Error::Format {
+            return Err(eider_cuda::Error::Format {
                 label: "Qwen3.6 decode batch workspace",
                 detail: "workspace was created by a different model instance".to_string(),
             });
         }
         if rows.is_empty() || rows.len() > workspace.capacity {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 decode batch rows",
                 expected: format!("1..={}", workspace.capacity),
                 actual: rows.len().to_string(),
             });
         }
         if appends.len() != rows.len() {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.6 decode append rows",
                 expected: format!("{} append descriptors", rows.len()),
                 actual: appends.len().to_string(),
@@ -3678,13 +3678,13 @@ impl Qwen36TextModel {
         }
         for row in rows.iter() {
             if row.state.model_id != self.model_id {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 sequence state",
                     detail: "state was created by a different model instance".to_string(),
                 });
             }
             if row.token_id as usize >= self.manifest.vocab {
-                return Err(crate::nvfp4::Error::Shape {
+                return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 batch token id",
                     expected: format!("token < {}", self.manifest.vocab),
                     actual: row.token_id.to_string(),
@@ -3693,7 +3693,7 @@ impl Qwen36TextModel {
             if row.state.position >= row.state.max_tokens
                 || row.state.max_tokens > workspace.max_context_tokens
             {
-                return Err(crate::nvfp4::Error::Shape {
+                return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 batch sequence capacity",
                     expected: format!(
                         "position < sequence max_tokens <= {}",
@@ -3974,7 +3974,7 @@ impl Qwen36TextModel {
         include_mtp: bool,
     ) -> Result<Qwen36SpeculativeCycleWorkspace> {
         if drafts == 0 {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 speculative cycle",
                 expected: "at least one draft per cycle".to_string(),
                 actual: "0 drafts".to_string(),
@@ -4134,7 +4134,7 @@ impl Qwen36TextModel {
         mut selector: Option<&mut Qwen36LogitSelector<'_>>,
     ) -> Result<Qwen36SpeculativeCycleOutcome> {
         if drafted.is_empty() || drafted.len() > workspace.drafts {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 external speculative proposal",
                 expected: format!("1..={} draft tokens", workspace.drafts),
                 actual: format!("{} draft tokens", drafted.len()),
@@ -4360,12 +4360,12 @@ impl Qwen36TextModel {
             catchup_hidden,
             host_verify_tokens,
         } = workspace;
-        let mtp = mtp.as_mut().ok_or_else(|| crate::nvfp4::Error::Format {
+        let mtp = mtp.as_mut().ok_or_else(|| eider_cuda::Error::Format {
             label: "Qwen3.8 MTP speculative workspace",
             detail: "MTP scratch was not allocated for this external-drafter workspace".to_string(),
         })?;
         if active_drafts == 0 || active_drafts > *drafts {
-            return Err(crate::nvfp4::Error::Shape {
+            return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 speculative active drafts",
                 expected: format!("between 1 and {} drafts", *drafts),
                 actual: format!("{active_drafts} drafts"),
@@ -5237,7 +5237,7 @@ impl Qwen36FullAttentionWeights {
             model
                 .batch_manifest()
                 .mrope_sections
-                .ok_or_else(|| crate::nvfp4::Error::Format {
+                .ok_or_else(|| eider_cuda::Error::Format {
                     label: "Qwen3.6 batched IMRoPE",
                     detail: "mrope_sections not set in manifest".to_string(),
                 })?;
@@ -5408,7 +5408,7 @@ impl Qwen36FullAttentionWeights {
                 || append.reservation.rows() != 1
                 || segments.len() != 1
             {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 decode append",
                     detail: "reservation does not cover exactly one decode row".to_string(),
                 });
@@ -5440,7 +5440,7 @@ impl Qwen36FullAttentionWeights {
                             stream,
                         )
                 })
-                .map_err(|error| crate::nvfp4::Error::Format {
+                .map_err(|error| eider_cuda::Error::Format {
                     label: "Qwen3.6 decode cache",
                     detail: error.to_string(),
                 })?;
@@ -5464,7 +5464,7 @@ impl Qwen36FullAttentionWeights {
             if append.reservation.start_position() != row.state.position
                 || append.reservation.rows() != row.token_ids.len()
             {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 prefill append",
                     detail: format!(
                         "reservation at {} for {} rows does not cover position {} and {} rows",
@@ -5517,7 +5517,7 @@ impl Qwen36FullAttentionWeights {
                     }
                     Ok(())
                 })
-                .map_err(|error| crate::nvfp4::Error::Format {
+                .map_err(|error| eider_cuda::Error::Format {
                     label: "Qwen3.6 prefill cache",
                     detail: error.to_string(),
                 })?;
@@ -5654,7 +5654,7 @@ impl Qwen36LayerFfnWeights {
                 )?;
                 round_f32_to_bf16_in_place_on_stream(workspace.output.inout(), stream)
             }
-            _ => Err(crate::nvfp4::Error::Format {
+            _ => Err(eider_cuda::Error::Format {
                 label: "Qwen batched feed-forward workspace",
                 detail: "weights and workspace variants do not match".to_string(),
             }),
@@ -5675,7 +5675,7 @@ impl Qwen36MoeWeights {
         match &self.shared {
             Qwen36SharedExpertStorage::Nvfp4(shared) => {
                 let gate_up_plan = workspace.shared_gate_up_plan.as_mut().ok_or_else(|| {
-                    crate::nvfp4::Error::Format {
+                    eider_cuda::Error::Format {
                         label: "Qwen3.6 batched shared expert",
                         detail: "NVFP4 shared gate/up has no batch plan".to_string(),
                     }
@@ -5697,7 +5697,7 @@ impl Qwen36MoeWeights {
                     stream,
                 )?;
                 let down_plan = workspace.shared_down_plan.as_mut().ok_or_else(|| {
-                    crate::nvfp4::Error::Format {
+                    eider_cuda::Error::Format {
                         label: "Qwen3.6 batched shared expert",
                         detail: "NVFP4 shared down has no batch plan".to_string(),
                     }
@@ -5713,7 +5713,7 @@ impl Qwen36MoeWeights {
                 )?;
             }
             Qwen36SharedExpertStorage::Fp8 { .. } => {
-                return Err(crate::nvfp4::Error::Format {
+                return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 batched shared expert",
                     detail: "the current model does not use NVFP4 shared experts".to_string(),
                 });

@@ -1,4 +1,4 @@
-use infer::nvfp4::{CublasLt, CudaStream, DeviceBuffer, Result};
+use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
 use infer::qwen3::qwen36::{Qwen36ExpertPager, Qwen36LayerBlock, Qwen36Model};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         .nth(2)
         .map(|value| value.parse::<usize>())
         .transpose()
-        .map_err(|error| infer::nvfp4::Error::Format {
+        .map_err(|error| eider_cuda::Error::Format {
             label: "Qwen3.6 paging probe capacity",
             detail: error.to_string(),
         })?
@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         .map(|(left, right)| (left - right).abs())
         .fold(0.0f32, f32::max);
     if resident != paged {
-        return Err(infer::nvfp4::Error::Format {
+        return Err(eider_cuda::Error::Format {
             label: "Qwen3.6 paged expert output",
             detail: format!("resident and paged outputs differ; max_abs={max_abs}"),
         });
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         / resident_ffn.len() as f32)
         .sqrt();
     if resident_ffn != paged_ffn {
-        return Err(infer::nvfp4::Error::Format {
+        return Err(eider_cuda::Error::Format {
             label: "Qwen3.6 paged full FFN output",
             detail: format!(
                 "resident and paged outputs differ; max_abs={ffn_max_abs} rms={ffn_rms}"

@@ -1,19 +1,19 @@
 //! Multi-session chat serving for Laguna-S-2.1.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::chat::{ChatReasoningEffort, CheckpointChatTemplate};
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::laguna::{
     HEAD_DIM, KV_HEADS, LAYERS, LagunaModel, LagunaNextToken, LagunaPrefillBatchWorkspace,
     LagunaPrefillRow,
 };
 use crate::laguna::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::chat::{ChatReasoningEffort, CheckpointChatTemplate};
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -341,7 +341,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
             label: "Laguna request ID",
             detail: "request ID space exhausted".to_string(),
         })?;
-        let prefix_target = retained_prompt_prefix_tokens(prompt.token_ids.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt.token_ids.len(), SM12X_KV_PAGE_TOKENS);
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();

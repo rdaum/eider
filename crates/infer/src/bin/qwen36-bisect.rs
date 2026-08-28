@@ -1,4 +1,4 @@
-use infer::nvfp4::{
+use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     Sm12xKvAttentionWorkspace, Sm12xKvCache, append_rows_f32_into_on_stream,
     cached_gqa_attention_f32_into_on_stream, format, nvfp4_w4a16_matvec_f32_into_on_stream,
@@ -1546,8 +1546,8 @@ struct ConcatNvfp4 {
 }
 
 fn concat_nvfp4(
-    gate: &infer::nvfp4::ModelOptNvfp4Linear,
-    up: &infer::nvfp4::ModelOptNvfp4Linear,
+    gate: &eider_cuda::ModelOptNvfp4Linear,
+    up: &eider_cuda::ModelOptNvfp4Linear,
 ) -> ConcatNvfp4 {
     let mut pw = Vec::with_capacity(gate.packed_weight.len() + up.packed_weight.len());
     pw.extend_from_slice(&gate.packed_weight);
@@ -1672,7 +1672,7 @@ fn load_bf16_matrix(
 fn parse_args() -> Result<(PathBuf, usize)> {
     let mut args = env::args_os();
     let _ = args.next();
-    let path = args.next().ok_or_else(|| infer::nvfp4::Error::Format {
+    let path = args.next().ok_or_else(|| eider_cuda::Error::Format {
         label: "usage",
         detail: "qwen36-bisect <model-dir> [full-attention-layer] [token-id]".to_string(),
     })?;

@@ -1,4 +1,4 @@
-use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
+use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,

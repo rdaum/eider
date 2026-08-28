@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 
 /// One hashed embedding table in a multi-order n-gram bank.
 #[derive(Clone, Debug, Eq, PartialEq)]

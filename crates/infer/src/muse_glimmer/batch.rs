@@ -1,5 +1,5 @@
 use super::*;
-use nvfp4::{
+use eider_cuda::{
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_f32_rows_into_columns_on_stream,
     rope_neox_sequence_f32_into_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
@@ -176,8 +176,8 @@ impl MuseTargetBatchWorkspace {
             .layers
             .iter()
             .find(|layer| layer.attention.window.is_none());
-        let attention_capacity =
-            max_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS) * nvfp4::SM12X_KV_PAGE_TOKENS;
+        let attention_capacity = max_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            * eider_cuda::SM12X_KV_PAGE_TOKENS;
         Ok(Self {
             tokens: DeviceBuffer::zeroed(rows)?,
             linear: MuseBatchLinearWorkspace::new(rows)?,

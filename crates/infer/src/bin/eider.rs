@@ -1,7 +1,7 @@
+use eider_cuda::{CublasLt, run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
 use infer::backend_name;
-use infer::nvfp4::{CublasLt, run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};
 
-fn main() -> infer::nvfp4::Result<()> {
+fn main() -> eider_cuda::Result<()> {
     println!("eider backend: {}", backend_name());
 
     run_e2m1_oracle_check()?;

@@ -27,17 +27,17 @@ pub use sequence::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cach
 pub(crate) use sequence::{Qwen36Append, qwen36_cache_error};
 
 use crate::metrics::ExpertPagingMetricHandle;
-use crate::nvfp4::{
+use eider_cuda::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
     ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear, ModelOptNvfp4Linear,
     MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix, PinnedHostBuffer, Result,
-    SafeTensorInfo, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
-    Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
-    Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
-    bf16_linear_two_rows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace,
+    Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight, add_f32_into_on_stream,
+    argmax_f32_batch_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream, bf16_linear_two_rows_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
@@ -61,6 +61,7 @@ use crate::nvfp4::{
     scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
 };
+use eider_format::SafeTensorInfo;
 
 use super::infer::{
     GroupedGemvWorkspace, MoeExpertPointerTables, MoeGroupedDownWorkspace, MoeRouteWorkspace,
@@ -914,7 +915,7 @@ impl Qwen36FullAttentionWeights {
     ) -> Result<Qwen36FullAttentionStep<'a>> {
         let capacity = page_table
             .len()
-            .checked_mul(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+            .checked_mul(eider_cuda::SM12X_KV_PAGE_TOKENS)
             .ok_or_else(|| Error::Shape {
                 label: "Qwen3.6 paged sparse attention capacity",
                 expected: "page table capacity without overflow".to_string(),
@@ -1857,7 +1858,7 @@ impl Fp8Linear {
             .map(|row| {
                 let max_abs = row
                     .iter()
-                    .map(|&value| crate::nvfp4::format::bf16_to_f32(value).abs())
+                    .map(|&value| eider_cuda::format::bf16_to_f32(value).abs())
                     .filter(|value| value.is_finite())
                     .fold(0.0f32, f32::max);
                 if max_abs == 0.0 { 1.0 } else { max_abs / 448.0 }
@@ -2313,9 +2314,7 @@ pub(crate) fn read_bf16_vector_as_f32_device(
     DeviceBuffer::from_host(
         &bytes
             .chunks_exact(2)
-            .map(|chunk| {
-                crate::nvfp4::format::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]))
-            })
+            .map(|chunk| eider_cuda::format::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
             .collect::<Vec<_>>(),
     )
 }
@@ -2330,7 +2329,7 @@ pub(crate) fn read_bf16_vector_delta_as_f32_device(
         &bytes
             .chunks_exact(2)
             .map(|chunk| {
-                1.0 + crate::nvfp4::format::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]))
+                1.0 + eider_cuda::format::bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]))
             })
             .collect::<Vec<_>>(),
     )
@@ -2606,7 +2605,7 @@ fn read_checked_bf16_bytes(
             format!("dtype=BF16 shape={shape:?}"),
         ));
     }
-    shard.read_tensor_bytes(name)
+    Ok(shard.read_tensor_bytes(name)?)
 }
 
 fn shape_error(label: &'static str, info: &SafeTensorInfo, expected: String) -> Error {
@@ -4183,7 +4182,7 @@ impl Qwen36MoeWeights {
                 stream,
             );
         }
-        crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+        eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
             MoeSiluQuantizeSlotBuffers {
                 indices: &workspace.route.indices,
                 gate_up_table,
@@ -4710,7 +4709,7 @@ impl Qwen36MoeWeights {
                 .grouped_down
                 .as_mut()
                 .expect("resident W4A4 down workspace");
-            crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+            eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
                 MoeSiluQuantizeSlotBuffers {
                     indices: &row_workspace.route.indices,
                     gate_up_table,
@@ -5101,7 +5100,7 @@ impl Qwen36MoeWeights {
                 }
             } else if let Some(profile) = profile.as_deref_mut() {
                 let (_, ms) = timed_cuda(stream, || {
-                    crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+                    eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
                         MoeSiluQuantizeSlotBuffers {
                             indices: &workspace.route.indices,
                             gate_up_table,
@@ -5116,7 +5115,7 @@ impl Qwen36MoeWeights {
                 })?;
                 profile.qwen36_routed_silu_quantize_ms += ms;
             } else {
-                crate::nvfp4::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+                eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
                     MoeSiluQuantizeSlotBuffers {
                         indices: &workspace.route.indices,
                         gate_up_table,
@@ -5280,7 +5279,7 @@ impl Qwen36MoeWeights {
                     )?;
                 } else {
                     let expert = lazy_expert.get_gate_up_w4a16()?;
-                    crate::nvfp4::nvfp4_w4a16_matvec_f32_into_on_stream(
+                    eider_cuda::nvfp4_w4a16_matvec_f32_into_on_stream(
                         ffn_norm,
                         &expert.packed_weight,
                         &expert.weight_scale,
@@ -5307,7 +5306,7 @@ impl Qwen36MoeWeights {
                     )?;
                 } else {
                     let expert = lazy_expert.get_down_w4a16()?;
-                    crate::nvfp4::nvfp4_w4a16_matvec_f32_into_on_stream(
+                    eider_cuda::nvfp4_w4a16_matvec_f32_into_on_stream(
                         down_input,
                         &expert.packed_weight,
                         &expert.weight_scale,
@@ -5453,7 +5452,7 @@ impl LazyQwen36Expert {
                 &up,
             )?;
             *self.gate_up_w4a16.borrow_mut() = Some(Nvfp4DeviceLinear::from_host(&gate_up)?);
-            crate::nvfp4::synchronize_device()?;
+            eider_cuda::synchronize_device()?;
         }
         Ok(std::cell::Ref::map(self.gate_up_w4a16.borrow(), |weight| {
             weight.as_ref().expect("Qwen3.6 gate/up loaded")
@@ -5466,7 +5465,7 @@ impl LazyQwen36Expert {
                 .checkpoint
                 .load_nvfp4_linear(&format!("{}.down_proj", self.prefix))?;
             *self.down_w4a16.borrow_mut() = Some(Nvfp4DeviceLinear::from_host(&down)?);
-            crate::nvfp4::synchronize_device()?;
+            eider_cuda::synchronize_device()?;
         }
         Ok(std::cell::Ref::map(self.down_w4a16.borrow(), |weight| {
             weight.as_ref().expect("Qwen3.6 down loaded")
@@ -5487,7 +5486,7 @@ impl LazyQwen36Expert {
                 &up,
             )?;
             *self.gate_up_sm12x.borrow_mut() = Some(Sm12xDeviceLinear::from_host(&gate_up)?);
-            crate::nvfp4::synchronize_device()?;
+            eider_cuda::synchronize_device()?;
         }
         Ok(std::cell::Ref::map(self.gate_up_sm12x.borrow(), |weight| {
             weight.as_ref().expect("Qwen3.6 SM12x gate/up loaded")
@@ -5500,7 +5499,7 @@ impl LazyQwen36Expert {
                 .checkpoint
                 .load_nvfp4_linear(&format!("{}.down_proj", self.prefix))?;
             *self.down_sm12x.borrow_mut() = Some(Sm12xDeviceLinear::from_host(&down)?);
-            crate::nvfp4::synchronize_device()?;
+            eider_cuda::synchronize_device()?;
         }
         Ok(std::cell::Ref::map(self.down_sm12x.borrow(), |weight| {
             weight.as_ref().expect("Qwen3.6 SM12x down loaded")
@@ -5558,7 +5557,7 @@ impl Nvfp4DeviceLinear {
         rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        crate::nvfp4::nvfp4_w4a16_matvec_f32_batch_into_on_stream(
+        eider_cuda::nvfp4_w4a16_matvec_f32_batch_into_on_stream(
             input,
             &self.packed_weight,
             &self.weight_scale,
@@ -7030,7 +7029,7 @@ impl Qwen36Embedding {
         vocab: usize,
         hidden: usize,
         token_ids: &DeviceBuffer<u32>,
-        output: crate::nvfp4::DeviceOutput<'_, f32>,
+        output: eider_cuda::DeviceOutput<'_, f32>,
         rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -7860,7 +7859,7 @@ impl Qwen36TextModel {
     pub fn gather_embedding(
         &self,
         token_id: &DeviceBuffer<u32>,
-        output: crate::nvfp4::DeviceOutput<'_, f32>,
+        output: eider_cuda::DeviceOutput<'_, f32>,
         stream: &CudaStream,
     ) -> Result<()> {
         self.embedding.gather_prefix(
@@ -8335,7 +8334,7 @@ mod tests {
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
         reorder_fp8_v_cols, reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
-    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear};
+    use eider_cuda::{CudaStream, DeviceBuffer, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
     #[test]
     fn recurrent_append_transaction_restores_and_commits_explicitly() {

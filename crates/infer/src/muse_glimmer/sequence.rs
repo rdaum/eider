@@ -2,7 +2,7 @@
 
 use super::{MuseGlimmerDecodeState, MuseGlimmerModel, MuseGlimmerSequenceSnapshot};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{Error, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, CacheConfig, CacheError, PageBackend, SequenceCache,
     SequenceId,
@@ -12,7 +12,7 @@ pub type MuseGlimmerSequenceCache = SequenceCache<Sm12xPageBackend, MuseGlimmerS
 
 pub(crate) struct MuseGlimmerAppend<'a> {
     pub(crate) reservation: &'a seqcache::AppendReservation,
-    pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
+    pub(crate) page_table: &'a eider_cuda::DeviceBuffer<u32>,
 }
 
 pub struct MuseGlimmerSequence {

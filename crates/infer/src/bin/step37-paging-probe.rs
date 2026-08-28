@@ -1,6 +1,6 @@
 //! Measure direct reads from the Step-3.7 prepared expert cache.
 
-use infer::nvfp4::Result;
+use eider_cuda::Result;
 use infer::runtime::expert_cache::{ExpertSlotCache, read_expert_misses};
 use infer::step37::{
     EXPERTS, FIRST_MOE_LAYER, GATE_UP, HIDDEN, INTERMEDIATE, Step37ExpertRecordSource,
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
         .nth(2)
         .map(|value| value.parse::<usize>())
         .transpose()
-        .map_err(|error| infer::nvfp4::Error::Format {
+        .map_err(|error| eider_cuda::Error::Format {
             label: "Step-3.7 paging probe layer",
             detail: error.to_string(),
         })?

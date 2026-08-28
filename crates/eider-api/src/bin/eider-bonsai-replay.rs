@@ -1,12 +1,12 @@
 //! Deterministically replays one Responses request through Bonsai.
 
 use eider_api::protocol::ResponseRequest;
+use eider_cuda::{Error, Result};
 use eider_format::{GgufIndex, GgufValue};
+use eider_runtime::chat::{ChatMessage, CheckpointChatTemplate};
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use infer::bonsai::{BonsaiModel, BonsaiPrefillMode};
 use infer::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
-use infer::nvfp4::{Error, Result};
-use infer::runtime::chat::{ChatMessage, CheckpointChatTemplate};
-use infer::runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use infer::runtime::generation::GenerationConfig;
 use serde_json::{Value, json};
 use std::env;
@@ -194,12 +194,12 @@ fn bonsai_chat_template(model_dir: &std::path::Path) -> Result<CheckpointChatTem
             detail: format!("{} has no tokenizer.chat_template string", gguf.display()),
         })?
         .to_string();
-    CheckpointChatTemplate::from_source_and_tokenizer_files(
+    Ok(CheckpointChatTemplate::from_source_and_tokenizer_files(
         source,
         gguf,
         model_dir.join("tokenizer.json"),
         model_dir.join("tokenizer_config.json"),
-    )
+    )?)
 }
 
 fn mode_name(mode: BonsaiPrefillMode) -> &'static str {

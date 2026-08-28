@@ -6,6 +6,7 @@
 
 mod config;
 mod model;
+mod sequence;
 mod state;
 pub use config::{Deepseek4AttentionKind, Deepseek4ModelConfig};
 pub use model::{
@@ -19,20 +20,27 @@ pub use model::{
     Deepseek4SharedExpertWeights, Deepseek4SharedExpertWorkspace, Deepseek4SpeculativeCycleResult,
     Deepseek4TextModel, Deepseek4UnweightedRmsNorm,
 };
+pub(crate) use sequence::deepseek4_cache_error;
+pub use sequence::{
+    Deepseek4CacheContext, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4Page,
+    Deepseek4PageBackend, Deepseek4Sequence, Deepseek4SequenceCache,
+    new_deepseek4_mtp_sequence_cache, new_deepseek4_sequence_cache,
+};
 pub use state::Deepseek4SequenceCheckpoint;
 pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek4SequenceState};
 
 use crate::metrics::ExpertPagingMetricHandle;
-use crate::nvfp4::{
+use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
+use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptNvfp4Linear, MoeSortedRoutes,
     Nvfp4LinearSlotMut, Nvfp4LinearSlots, Q3ExpertTable, Q3ExpertTableCacheInfo,
-    Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result, SafeTensorShard,
+    Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay, QuantizedQ3, Result,
     gather_sorted_route_rows_f32_into_on_stream, routed_accumulate_f32_batch_into_on_stream,
     routed_accumulate_sorted_f32_batch_into_on_stream,
     silu_mul_halves_clamped_f32_batch_into_on_stream,
 };
-use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
-use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
+use eider_format::SafeTensorShard;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2732,7 +2740,7 @@ mod tests {
         hot_expert_path, hot_layer_dir, inspect_thin_checkpoint, layer_paths,
         prepare_thin_checkpoint_shard, write_hot_expert, write_nvfp4_expert_layer,
     };
-    use crate::nvfp4::{
+    use eider_cuda::{
         CudaStream, DeviceBuffer, ModelOptNvfp4Linear, Q3ExpertTableCacheWriter, format,
         quantize_q3_row_major,
     };
@@ -3194,7 +3202,7 @@ mod tests {
             info
         );
         let checkpoint =
-            crate::nvfp4::ModelOptCheckpoint::open(&thin_dir).expect("open thin checkpoint");
+            eider_cuda::ModelOptCheckpoint::open(&thin_dir).expect("open thin checkpoint");
         assert!(checkpoint.contains_tensor(retained));
         assert!(checkpoint.contains_tensor(mtp_retained));
         assert!(!checkpoint.contains_tensor(routed));

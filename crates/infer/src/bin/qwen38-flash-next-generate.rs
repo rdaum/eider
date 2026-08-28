@@ -1,7 +1,7 @@
-use infer::nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use infer::qwen38_flash_next::Qwen38FlashNextModel;
 use infer::qwen38_flash_next::{Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache};
-use infer::runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;

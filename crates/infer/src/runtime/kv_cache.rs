@@ -1,6 +1,6 @@
 //! Device-resident KV cache storage for decode.
 
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, DeviceOutput, Error, Result, append_rows_f32_indexed_into_on_stream,
     append_rows_f32_into_on_stream, cached_gqa_attention_f32_indexed_into_on_stream,
     cached_gqa_attention_f32_into_on_stream, prefill_gqa_attention_f32_into,

@@ -1,12 +1,12 @@
+use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
 use infer::nemotron3::{Nemotron3Manifest, Nemotron3MoeLayer};
-use infer::nvfp4::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
 use std::path::PathBuf;
 
-fn main() -> infer::nvfp4::Result<()> {
+fn main() -> eider_cuda::Result<()> {
     let model_dir = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or_else(|| infer::nvfp4::Error::Format {
+        .ok_or_else(|| eider_cuda::Error::Format {
             label: "nemotron3-moe-layer-probe arguments",
             detail: "usage: nemotron3-moe-layer-probe <model-dir> [layer]".to_string(),
         })?;
@@ -14,7 +14,7 @@ fn main() -> infer::nvfp4::Result<()> {
         .nth(2)
         .map(|value| value.parse::<usize>())
         .transpose()
-        .map_err(|error| infer::nvfp4::Error::Format {
+        .map_err(|error| eider_cuda::Error::Format {
             label: "nemotron3-moe-layer-probe layer",
             detail: error.to_string(),
         })?
@@ -31,7 +31,7 @@ fn main() -> infer::nvfp4::Result<()> {
     weights.run_one_token(&hidden, &mut workspace, &stream)?;
     let output = weights.output(&workspace).copy_to_host(&stream)?;
     if output.iter().any(|value| !value.is_finite()) {
-        return Err(infer::nvfp4::Error::Format {
+        return Err(eider_cuda::Error::Format {
             label: "Nemotron 3 MoE layer probe",
             detail: "layer output contains a non-finite value".to_string(),
         });

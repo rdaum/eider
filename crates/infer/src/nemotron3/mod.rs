@@ -1,6 +1,6 @@
 //! NVIDIA Nemotron 3 hybrid-model configuration and checkpoint topology.
 
-use nvfp4::{Error, ModelOptCheckpoint, Result};
+use eider_cuda::{Error, ModelOptCheckpoint, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -12,6 +12,7 @@ mod model;
 mod moe;
 mod mtp;
 mod router;
+mod sequence;
 
 pub use attention::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,
@@ -32,6 +33,11 @@ pub use model::{
 pub use moe::{Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace};
 pub use mtp::Nemotron3MtpWorkspace;
 pub use router::{Nemotron3Router, Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace};
+pub use sequence::{
+    Nemotron3CacheContext, Nemotron3Page, Nemotron3PageBackend, Nemotron3Sequence,
+    Nemotron3SequenceCache, new_nemotron3_sequence_cache,
+};
+pub(crate) use sequence::{nemotron3_cache_error, new_nemotron3_sequence_cache_with_budget};
 
 /// Mixer used by one Nemotron 3 backbone layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

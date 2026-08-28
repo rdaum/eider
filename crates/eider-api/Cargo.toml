@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 infer = { path = "../infer" }
 eider-format.workspace = true
+eider-runtime.workspace = true
+eider-cuda.workspace = true
 
 async-stream.workspace = true
 axum.workspace = true

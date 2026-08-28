@@ -1,12 +1,12 @@
 //! Chat Completions request translation and response construction.
 
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished, OneOrMany};
-use infer::runtime::chat::{
+use eider_runtime::chat::{
     ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatReasoningEffort, ChatRole, ChatTool,
     ChatToolCall,
 };
+use eider_runtime::sampling::SamplingConfig;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::sampling::SamplingConfig;
 use infer::runtime::scheduler::RequestConfig;
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use serde::Deserialize;
@@ -398,7 +398,7 @@ impl ChatCompletionStream {
 
     pub fn push(&mut self, inference: InferenceEvent) -> Vec<Value> {
         match inference {
-            InferenceEvent::Output(infer::runtime::chat_output::ChatOutputEvent::Reasoning(
+            InferenceEvent::Output(eider_runtime::chat_output::ChatOutputEvent::Reasoning(
                 delta,
             )) => {
                 if delta.is_empty() {
@@ -408,7 +408,7 @@ impl ChatCompletionStream {
                     vec![self.chunk(json!({"reasoning_content":delta}), Value::Null, Value::Null)]
                 }
             }
-            InferenceEvent::Output(infer::runtime::chat_output::ChatOutputEvent::Text(delta)) => {
+            InferenceEvent::Output(eider_runtime::chat_output::ChatOutputEvent::Text(delta)) => {
                 if delta.is_empty() {
                     Vec::new()
                 } else {
@@ -416,9 +416,7 @@ impl ChatCompletionStream {
                     vec![self.chunk(json!({"content":delta}), Value::Null, Value::Null)]
                 }
             }
-            InferenceEvent::Output(infer::runtime::chat_output::ChatOutputEvent::ToolCall(
-                call,
-            )) => {
+            InferenceEvent::Output(eider_runtime::chat_output::ChatOutputEvent::ToolCall(call)) => {
                 let index = self.tool_calls.len();
                 let tool_call = chat_tool_call(&call);
                 self.tool_calls.push(call);
@@ -576,7 +574,7 @@ fn chat_usage(usage: &ChatUsage) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infer::runtime::chat_output::ChatOutputEvent;
+    use eider_runtime::chat_output::ChatOutputEvent;
 
     fn defaults() -> GenerationConfig {
         GenerationConfig {

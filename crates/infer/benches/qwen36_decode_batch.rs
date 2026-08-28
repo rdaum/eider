@@ -1,10 +1,10 @@
-use infer::nvfp4::{CudaStream, GpuSamplingRow, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CudaStream, GpuSamplingRow, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use infer::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36PrefillRow, Qwen36TextModel,
 };
 use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
-use infer::runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

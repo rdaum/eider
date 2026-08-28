@@ -2,7 +2,7 @@
 
 use super::{BitNetDecodeState, BitNetModel};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheError, SequenceCache, SequenceId};
 
 pub type BitNetSequenceCache = SequenceCache<Sm12xPageBackend, ()>;
@@ -95,7 +95,7 @@ pub fn new_bitnet_sequence_cache(
         });
     }
     let page_slots = sequence_capacity
-        .checked_mul(max_context_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS))
+        .checked_mul(max_context_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS))
         .ok_or_else(|| Error::Shape {
             label: "BitNet sequence cache pages",
             expected: "page count without overflow".to_string(),
@@ -128,7 +128,7 @@ pub fn new_bitnet_sequence_cache(
         })?;
     BitNetSequenceCache::new(
         seqcache::CacheConfig {
-            page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+            page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
             max_prefix_entries: Some(0),

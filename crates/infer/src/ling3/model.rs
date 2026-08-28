@@ -3,10 +3,8 @@ use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host};
 use super::mla::{Ling3MlaAttention, Ling3MlaWorkspace};
 use super::moe::{Ling3Moe, Ling3MoeWorkspace};
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
-use crate::runtime::ling3_sequence_cache::{
-    Ling3CacheContext, Ling3Sequence, Ling3SequenceCache, ling3_cache_error,
-};
-use nvfp4::{
+use super::{Ling3CacheContext, Ling3Sequence, Ling3SequenceCache, ling3_cache_error};
+use eider_cuda::{
     CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     add_f32_into_on_stream, add_f32_prefix_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
@@ -1138,8 +1136,8 @@ impl Ling3PrefillWorkspace {
 #[cfg(test)]
 mod tests {
     use super::Ling3Model;
-    use crate::runtime::ling3_sequence_cache::{admit_ling3_sequence, new_ling3_sequence_cache};
-    use nvfp4::{CudaStream, Result};
+    use crate::ling3::{admit_ling3_sequence, new_ling3_sequence_cache};
+    use eider_cuda::{CudaStream, Result};
 
     #[test]
     #[ignore = "requires EIDER_LING3_MODEL_DIR with the local Ling 3 Tiny FP8 checkpoint"]

@@ -1,4 +1,4 @@
-use nvfp4::{Error, ModelOptCheckpoint, Result};
+use eider_cuda::{Error, ModelOptCheckpoint, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;

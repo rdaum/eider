@@ -1,8 +1,5 @@
 //! Tokenized Qwen3.6 scheduling over chunked prefill and batched decode.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
-use super::tool_grammar::QwenXmlToolGrammar;
 use crate::metrics::metrics;
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36ExecutionConfig, Qwen36ExecutionState,
@@ -11,7 +8,10 @@ use crate::qwen3::qwen36::{
     Qwen38DFlash2SequenceState,
 };
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
-use nvfp4::{DeviceBuffer, Error, GpuSamplingRow, Result};
+use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use eider_runtime::tool_grammar::QwenXmlToolGrammar;
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheError, CacheStats};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -134,7 +134,7 @@ impl Default for RequestConfig {
 impl RequestConfig {
     /// Validates token-selection parameters.
     pub fn validate(&self) -> Result<()> {
-        self.sampling.validate()
+        Ok(self.sampling.validate()?)
     }
 }
 
@@ -474,7 +474,8 @@ impl<'model> Qwen36Scheduler<'model> {
         let finish_reason = (config.max_new_tokens == 0).then_some(RequestFinishReason::Length);
         let sampler = Sampler::new(config.sampling)?;
         let history = TokenHistory::from_tokens(prompt_tokens.iter().copied());
-        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens.len());
+        let prefix_target =
+            retained_prompt_prefix_tokens(prompt_tokens.len(), SM12X_KV_PAGE_TOKENS);
         self.requests.insert(
             id,
             Box::new(Qwen36Request {
@@ -552,7 +553,10 @@ impl<'model> Qwen36Scheduler<'model> {
                 .expect("waiting request is retained");
             let mut sequence = model.new_sequence_state(request.max_tokens().max(1))?;
             let mut page_table = Sm12xPageTable::new(request.max_tokens().max(1))?;
-            let device_token_counts = if request.config.sampling.supports_gpu_sampling()
+            let device_token_counts = if request
+                .config
+                .sampling
+                .supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K)
                 && request.config.sampling.uses_history_penalties()
             {
                 Some(DeviceBuffer::from_host(
@@ -890,7 +894,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 )?;
                 let requires_constrained_verification = grammar_preview
                     .as_ref()
-                    .map(|grammar| {
+                    .map(|grammar| -> Result<bool> {
                         let mut probe = grammar.deep_clone();
                         if probe.is_active() {
                             return Ok(true);
@@ -1009,9 +1013,12 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 
     fn execute_decode(&mut self, selected: &mut [Box<Qwen36Request>]) -> Result<Vec<SampledToken>> {
-        let needs_host_logits = selected
-            .iter()
-            .any(|request| !request.sampler.config().supports_gpu_sampling());
+        let needs_host_logits = selected.iter().any(|request| {
+            !request
+                .sampler
+                .config()
+                .supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K)
+        });
         let all_fast_argmax = selected
             .iter()
             .all(|request| request.sampler.config().uses_fast_argmax());
@@ -1163,7 +1170,7 @@ impl<'model> Qwen36Scheduler<'model> {
                         if request.sampler.config().uses_fast_argmax() {
                             return argmax_logits(row_logits);
                         }
-                        request.sampler.sample(row_logits, &request.history)
+                        Ok(request.sampler.sample(row_logits, &request.history)?)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for (request, sample) in selected.iter_mut().zip(&samples) {
@@ -1828,10 +1835,10 @@ mod tests {
     use crate::qwen3::qwen36::{
         Qwen36DecodeBatchWorkspace, Qwen36TextModel, decode_capacity_classes,
     };
-    use crate::runtime::cache_config::SequenceCacheConfig;
-    use crate::runtime::chat::{ChatFunctionDefinition, ChatTool};
-    use crate::runtime::sampling::{SampledToken, SamplingConfig};
-    use crate::runtime::tool_grammar::{QwenXmlGrammarFactory, QwenXmlToolGrammar};
+    use eider_runtime::cache::SequenceCacheConfig;
+    use eider_runtime::chat::{ChatFunctionDefinition, ChatTool};
+    use eider_runtime::sampling::{SampledToken, SamplingConfig};
+    use eider_runtime::tool_grammar::{QwenXmlGrammarFactory, QwenXmlToolGrammar};
     use serde_json::json;
     use std::path::PathBuf;
     use tokenizers::Tokenizer;
@@ -1928,7 +1935,7 @@ mod tests {
                     prefill_sequence_capacity: 1,
                     prefill_token_capacity: 16,
                     max_active_sequences: 1,
-                    max_context_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                    max_context_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
                     speculative_drafts,
                 },
                 SequenceCacheConfig {
@@ -1980,15 +1987,15 @@ mod tests {
         model
             .enable_dflash2(dflash2_dir)
             .expect("load Qwen3.8 DFlash2 companion");
-        let cached_prefix_tokens = crate::nvfp4::SM12X_KV_PAGE_TOKENS * 17;
+        let cached_prefix_tokens = eider_cuda::SM12X_KV_PAGE_TOKENS * 17;
         let mut scheduler = Qwen36Scheduler::new_with_cache_config(
             &model,
             SchedulerConfig {
                 decode_capacity: 1,
                 prefill_sequence_capacity: 1,
-                prefill_token_capacity: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                prefill_token_capacity: eider_cuda::SM12X_KV_PAGE_TOKENS,
                 max_active_sequences: 1,
-                max_context_tokens: cached_prefix_tokens + crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                max_context_tokens: cached_prefix_tokens + eider_cuda::SM12X_KV_PAGE_TOKENS,
                 speculative_drafts: 2,
             },
             SequenceCacheConfig {
@@ -2107,7 +2114,7 @@ mod tests {
                 prefill_sequence_capacity: 1,
                 prefill_token_capacity: 16,
                 max_active_sequences: 1,
-                max_context_tokens: crate::nvfp4::SM12X_KV_PAGE_TOKENS,
+                max_context_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
                 speculative_drafts: 2,
             },
             SequenceCacheConfig {

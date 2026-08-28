@@ -1,26 +1,20 @@
 //! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
-use super::cache_config::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::sampling::{SampledToken, Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
-use crate::nvfp4::{DeviceBuffer, Error, GpuSamplingRow, GpuTokenSampler, Result};
-use crate::qwen3::infer::QwenLayerKind;
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextCacheConfig, Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSnapshot,
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
-    new_qwen38_flash_next_mtp_sequence_cache, new_qwen38_flash_next_sequence_cache_with_config,
-    qwen38_flash_next_cache_error,
-};
-use crate::qwen38_flash_next::{
-    Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace,
-    Qwen38FlashNextPrefillWorkspace, Qwen38FlashNextSpeculativeFrontier,
-    Qwen38FlashNextSpeculativeWorkspace, Qwen38LogitsMode, Qwen38NextToken,
+    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionState, Qwen38FlashNextModel,
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot,
+    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSpeculativeFrontier,
+    Qwen38LogitsMode, Qwen38NextToken, qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
+use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
+use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -114,12 +108,7 @@ struct ActiveRequest<'tokenizer> {
 
 /// Decode-first multi-session service for the native QSA runtime.
 pub struct Qwen38FlashNextChatService<'template> {
-    model: Qwen38FlashNextModel,
-    prefill_workspace: Qwen38FlashNextPrefillWorkspace,
-    sequence_cache: Qwen38FlashNextSequenceCache,
-    mtp_sequence_cache: Option<Qwen38FlashNextMtpSequenceCache>,
-    mtp_workspace: Option<Qwen38FlashNextMtpWorkspace>,
-    speculative_workspace: Option<Qwen38FlashNextSpeculativeWorkspace>,
+    execution: Qwen38FlashNextExecutionState,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
     next_id: u64,
@@ -128,7 +117,6 @@ pub struct Qwen38FlashNextChatService<'template> {
     decoding: VecDeque<Qwen38FlashNextRequestId>,
     requests: BTreeMap<Qwen38FlashNextRequestId, ActiveRequest<'template>>,
     active_sequences: usize,
-    gpu_sampler: GpuTokenSampler,
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
@@ -167,48 +155,18 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 detail: "native MTP weights were not enabled while loading the model".to_string(),
             });
         }
-        let prefill_workspace = model.new_prefill_workspace(config.prefill_token_capacity)?;
-        let sequence_cache = new_qwen38_flash_next_sequence_cache_with_config(
-            &model,
-            config.max_active_sequences,
-            config.max_context_tokens,
-            Qwen38FlashNextCacheConfig {
-                max_retained_bytes: cache_config.max_retained_bytes,
+        let execution = Qwen38FlashNextExecutionState::new(
+            model,
+            Qwen38FlashNextExecutionConfig {
+                max_active_sequences: config.max_active_sequences,
+                max_context_tokens: config.max_context_tokens,
+                prefill_token_capacity: config.prefill_token_capacity,
+                speculative_drafts: config.speculative_drafts,
+                retained_prefix_bytes: cache_config.max_retained_bytes,
             },
         )?;
-        let gpu_sampler = GpuTokenSampler::new(1, model.config().vocab)?;
-        let mtp_sequence_cache = (config.speculative_drafts == 1)
-            .then(|| {
-                let target_qsa_layers = model
-                    .manifest()
-                    .layer_kinds
-                    .iter()
-                    .filter(|&&kind| kind == QwenLayerKind::FullAttention)
-                    .count()
-                    .max(1);
-                new_qwen38_flash_next_mtp_sequence_cache(
-                    &model,
-                    config.max_active_sequences,
-                    config.max_context_tokens,
-                    cache_config.max_retained_bytes / target_qsa_layers,
-                )
-            })
-            .transpose()?;
-        let mtp_workspace = (config.speculative_drafts == 1)
-            .then(|| {
-                model.new_mtp_workspace(config.max_context_tokens, config.prefill_token_capacity)
-            })
-            .transpose()?;
-        let speculative_workspace = (config.speculative_drafts == 1)
-            .then(|| model.new_speculative_workspace(1))
-            .transpose()?;
         Ok(Self {
-            model,
-            prefill_workspace,
-            sequence_cache,
-            mtp_sequence_cache,
-            mtp_workspace,
-            speculative_workspace,
+            execution,
             template,
             config,
             next_id: 1,
@@ -217,7 +175,6 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             decoding: VecDeque::new(),
             requests: BTreeMap::new(),
             active_sequences: 0,
-            gpu_sampler,
         })
     }
 
@@ -268,7 +225,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let starts_in_reasoning =
             request.template.add_generation_prompt && request.template.enable_thinking;
         let prompt_tokens = prompt.token_ids.len();
-        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens);
+        let prefix_target = retained_prompt_prefix_tokens(prompt_tokens, SM12X_KV_PAGE_TOKENS);
         let max_output_tokens = request.generation.max_new_tokens;
         let sampler = Sampler::new(request.generation.sampling)?;
         let history = TokenHistory::from_tokens(prompt.token_ids.iter().copied());
@@ -373,12 +330,12 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         self.decoding.retain(|&decoding| decoding != id);
         if let Some(mtp_sequence) = request.mtp_sequence.take()
             && let Some(sequence) = request.sequence.as_deref()
-            && let Some(cache) = self.mtp_sequence_cache.as_mut()
+            && let Some(cache) = self.execution.mtp_sequence_cache.as_mut()
         {
             let _ = mtp_sequence.finish(cache, sequence.state.stream());
         }
         if let Some(sequence) = request.sequence.take() {
-            let _ = sequence.finish(&mut self.sequence_cache);
+            let _ = sequence.finish(&mut self.execution.sequence_cache);
             self.active_sequences -= 1;
         }
         Qwen38FlashNextCancelOutcome::Cancelled {
@@ -405,11 +362,16 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             let allocation_started = Instant::now();
             let request = self.requests.get_mut(&id).expect("waiting request exists");
             let capacity = request.prompt.len() + request.generation.max_new_tokens;
-            let device_token_counts = if request.generation.sampling.supports_gpu_sampling()
+            let device_token_counts = if request
+                .generation
+                .sampling
+                .supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K)
                 && request.generation.sampling.uses_history_penalties()
             {
                 Some(DeviceBuffer::from_host(
-                    &request.history.dense_counts(self.model.config().vocab),
+                    &request
+                        .history
+                        .dense_counts(self.execution.model.config().vocab),
                 )?)
             } else {
                 None
@@ -418,8 +380,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 .as_ref()
                 .map_or(0, DeviceBuffer::device_bytes);
             let sequence = Qwen38FlashNextSequence::admit_with_prefix_and_private_bytes(
-                &self.model,
-                &mut self.sequence_cache,
+                &self.execution.model,
+                &mut self.execution.sequence_cache,
                 capacity.max(1),
                 &request.prompt,
                 sampling_bytes,
@@ -430,10 +392,11 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 && request.generation.max_new_tokens != 0
             {
                 let mtp_cache = self
+                    .execution
                     .mtp_sequence_cache
                     .as_mut()
                     .expect("MTP cache was allocated");
-                let mtp_sequence = self.model.new_mtp_sequence_state(
+                let mtp_sequence = self.execution.model.new_mtp_sequence_state(
                     mtp_cache,
                     capacity.max(1),
                     &request.prompt,
@@ -443,12 +406,13 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                     token: 0,
                     logit: 0.0,
                     previous_streams: DeviceBuffer::zeroed(
-                        self.model.config().hidden * self.model.config().hc_count,
+                        self.execution.model.config().hidden
+                            * self.execution.model.config().hc_count,
                     )?,
                 };
                 if mtp_sequence.position() == cached_prompt_tokens {
                     if cached_prompt_tokens != 0 {
-                        self.model.copy_decode_target_streams(
+                        self.execution.model.copy_decode_target_streams(
                             &sequence.state,
                             &mut frontier.previous_streams,
                         )?;
@@ -547,9 +511,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             Qwen38LogitsMode::Full
         };
         sequence.forward_tokens(
-            &mut self.model,
-            &mut self.prefill_workspace,
-            &mut self.sequence_cache,
+            &mut self.execution.model,
+            &mut self.execution.prefill_workspace,
+            &mut self.execution.sequence_cache,
             &request.prompt[start..end],
             logits,
         )?;
@@ -558,30 +522,32 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             request.speculative_frontier.as_mut(),
         ) {
             let mtp_cache = self
+                .execution
                 .mtp_sequence_cache
                 .as_mut()
                 .expect("MTP cache was allocated");
             let mtp_workspace = self
+                .execution
                 .mtp_workspace
                 .as_mut()
                 .expect("MTP workspace was allocated");
-            self.model.mtp_prefill_tokens(
+            self.execution.model.mtp_prefill_tokens(
                 mtp_sequence,
                 mtp_workspace,
                 mtp_cache,
                 &request.prompt[start..end],
-                &self.prefill_workspace,
+                &self.execution.prefill_workspace,
                 &frontier.previous_streams,
                 sequence.state.stream(),
             )?;
-            self.model.copy_prefill_target_streams(
-                &self.prefill_workspace,
+            self.execution.model.copy_prefill_target_streams(
+                &self.execution.prefill_workspace,
                 end - start - 1,
                 &mut frontier.previous_streams,
                 sequence.state.stream(),
             )?;
             if final_prompt_chunk {
-                let next = self.model.read_top1(&sequence.state)?;
+                let next = self.execution.model.read_top1(&sequence.state)?;
                 frontier.token = next.id;
                 frontier.logit = next.value;
             }
@@ -590,9 +556,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         request.prompt_logits_ready =
             end == request.prompt.len() && request.speculative_frontier.is_none();
         Self::retain_request_checkpoint(
-            &self.model,
-            &mut self.sequence_cache,
-            self.mtp_sequence_cache.as_mut(),
+            &self.execution.model,
+            &mut self.execution.sequence_cache,
+            self.execution.mtp_sequence_cache.as_mut(),
             request,
         );
         tick.prefilled.push(Qwen38FlashNextPrefillProgress {
@@ -690,20 +656,25 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 .sequence
                 .as_deref_mut()
                 .expect("request is admitted")
-                .forward_token(&mut self.model, &mut self.sequence_cache, token, logits)?;
+                .forward_token(
+                    &mut self.execution.model,
+                    &mut self.execution.sequence_cache,
+                    token,
+                    logits,
+                )?;
         }
         let sequence = request
             .sequence
             .as_deref()
             .expect("decode request is admitted");
         let sampled = if sampling.uses_fast_argmax() {
-            let next = self.model.read_top1(&sequence.state)?;
+            let next = self.execution.model.read_top1(&sequence.state)?;
             SampledToken {
                 id: next.id,
                 logit: next.value,
                 adjusted_logit: next.value,
             }
-        } else if sampling.supports_gpu_sampling() {
+        } else if sampling.supports_gpu_sampling(eider_cuda::GPU_SAMPLING_MAX_TOP_K) {
             let draw = if sampling.temperature == 0.0 || sampling.top_k == 1 {
                 0.0
             } else {
@@ -718,16 +689,18 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 draw,
                 token_counts: request.device_token_counts.as_mut(),
             };
-            let sampled =
-                self.model
-                    .sample_logits_gpu(&sequence.state, &mut self.gpu_sampler, &mut row)?;
+            let sampled = self.execution.model.sample_logits_gpu(
+                &sequence.state,
+                &mut self.execution.gpu_sampler,
+                &mut row,
+            )?;
             SampledToken {
                 id: sampled.id,
                 logit: sampled.logit,
                 adjusted_logit: sampled.adjusted_logit,
             }
         } else {
-            let logits = self.model.logits_to_host(&sequence.state)?;
+            let logits = self.execution.model.logits_to_host(&sequence.state)?;
             request.sampler.sample(&logits, &request.history)?
         };
         Self::record_generated(request, id, sampled, tick)
@@ -760,8 +733,9 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 .sequence
                 .as_deref_mut()
                 .expect("request is admitted");
-            let outcome = self.model.speculative_cycle_argmax(
-                self.speculative_workspace
+            let outcome = self.execution.model.speculative_cycle_argmax(
+                self.execution
+                    .speculative_workspace
                     .as_mut()
                     .expect("speculative workspace was allocated"),
                 request
@@ -769,17 +743,19 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                     .as_mut()
                     .expect("speculative request has a frontier"),
                 &mut sequence.state,
-                &mut self.sequence_cache,
+                &mut self.execution.sequence_cache,
                 sequence.cache_id,
                 &mut sequence.page_table,
                 request
                     .mtp_sequence
                     .as_mut()
                     .expect("speculative request has MTP state"),
-                self.mtp_workspace
+                self.execution
+                    .mtp_workspace
                     .as_mut()
                     .expect("MTP workspace was allocated"),
-                self.mtp_sequence_cache
+                self.execution
+                    .mtp_sequence_cache
                     .as_mut()
                     .expect("MTP cache was allocated"),
             )?;
@@ -856,12 +832,12 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         self.decoding.retain(|&decoding| decoding != id);
         if let Some(mtp_sequence) = request.mtp_sequence.take()
             && let Some(sequence) = request.sequence.as_deref()
-            && let Some(cache) = self.mtp_sequence_cache.as_mut()
+            && let Some(cache) = self.execution.mtp_sequence_cache.as_mut()
         {
             mtp_sequence.finish(cache, sequence.state.stream())?;
         }
         if let Some(sequence) = request.sequence.take() {
-            sequence.finish(&mut self.sequence_cache)?;
+            sequence.finish(&mut self.execution.sequence_cache)?;
         }
         self.active_sequences -= 1;
         tick.finished.push(Qwen38FlashNextFinished {

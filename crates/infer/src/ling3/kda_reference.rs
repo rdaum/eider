@@ -3,7 +3,7 @@
 //! State uses `[head, key, value]`. The forget gate is diagonal in the key
 //! dimension, unlike Qwen3.6 Gated DeltaNet's scalar per-head decay.
 
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 
 /// Inputs and mutable state for one recurrent KDA token.
 pub struct Ling3KdaStep<'a> {

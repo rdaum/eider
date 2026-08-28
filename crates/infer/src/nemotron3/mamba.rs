@@ -1,6 +1,6 @@
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, add_f32_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_into_on_stream,
     nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream,
@@ -593,7 +593,7 @@ impl Nemotron3MambaWorkspace {
 #[cfg(test)]
 mod tests {
     use super::Nemotron3MambaState;
-    use nvfp4::{CudaStream, DeviceBuffer};
+    use eider_cuda::{CudaStream, DeviceBuffer};
 
     #[test]
     fn mamba_checkpoint_restores_recurrent_state_after_failure() {

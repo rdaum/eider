@@ -1,4 +1,4 @@
-use infer::nvfp4::{
+use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, format,
     nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
@@ -204,7 +204,7 @@ fn parse_model_dir() -> Result<PathBuf> {
     let _ = args.next();
     match (args.next(), args.next()) {
         (Some(path), None) => Ok(PathBuf::from(path)),
-        _ => Err(infer::nvfp4::Error::Format {
+        _ => Err(eider_cuda::Error::Format {
             label: "usage",
             detail: "qwen36-verify-w4a16 <model-dir>".to_string(),
         }),

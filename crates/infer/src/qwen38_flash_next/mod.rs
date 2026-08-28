@@ -3,6 +3,7 @@
 #[doc(hidden)]
 pub mod benchmark;
 mod config;
+mod execution;
 mod hyperconnection;
 mod model;
 mod ple;
@@ -12,6 +13,7 @@ mod sequence;
 mod transform;
 
 pub use config::Qwen38FlashNextConfig;
+pub(crate) use execution::{Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionState};
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,
@@ -45,7 +47,6 @@ mod tests {
         Qwen38LogitsMode, Qwen38PagedPle, Qwen38PleState, Qwen38PleTokenWindow, Qwen38PleWeights,
         Qwen38PleWorkspace,
     };
-    use crate::nvfp4::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
     use crate::qwen3::qwen36::{
         Qwen36LinearAttentionState, Qwen36LinearAttentionWorkspace, Qwen36MoeWeights,
         load_hybrid_linear_attention,
@@ -55,6 +56,7 @@ mod tests {
         new_qwen38_flash_next_sequence_cache_with_config,
     };
     use crate::sm12x_cache::Sm12xCacheContext;
+    use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
 
     #[test]
     fn released_checkpoint_loads_paging_and_resident_scaffolding() {

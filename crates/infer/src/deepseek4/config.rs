@@ -1,4 +1,4 @@
-use nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;

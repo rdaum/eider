@@ -1,7 +1,7 @@
 use super::layer::{Ling3Linear, load_bf16_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
-use crate::runtime::ling3_sequence_cache::{Ling3MlaPagePool, Ling3Page};
-use nvfp4::{
+use super::{Ling3MlaPagePool, Ling3Page};
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     arithmetic_positions_u32_into_on_stream, ling3_mla_attention_f32_into_on_stream,
     ling3_mla_pack_f32_batch_into_on_stream, ling3_mla_pack_f32_into_on_stream,
@@ -326,7 +326,7 @@ impl Ling3MlaAttention {
         for page in pages.iter() {
             let segment = page.segment();
             let physical_row =
-                page.page().slot() * nvfp4::SM12X_KV_PAGE_TOKENS + segment.page_offset();
+                page.page().slot() * eider_cuda::SM12X_KV_PAGE_TOKENS + segment.page_offset();
             key_pool.copy_range_from_device_on_stream(
                 physical_row * key_width,
                 &workspace.key,
@@ -351,7 +351,7 @@ impl Ling3MlaAttention {
             workspace.attention.output(),
             start_position,
             rows,
-            nvfp4::SM12X_KV_PAGE_TOKENS,
+            eider_cuda::SM12X_KV_PAGE_TOKENS,
             self.heads,
             self.qk_dim,
             self.value_dim,
@@ -628,14 +628,14 @@ impl Ling3MlaAttention {
         let value_width = self.heads * self.value_dim;
         let (key_pool, value_pool) = pool.buffers_mut();
         key_pool.copy_range_from_device_on_stream(
-            (page.slot() * nvfp4::SM12X_KV_PAGE_TOKENS + page_offset) * key_width,
+            (page.slot() * eider_cuda::SM12X_KV_PAGE_TOKENS + page_offset) * key_width,
             &workspace.key,
             0,
             key_width,
             stream,
         )?;
         value_pool.copy_range_from_device_on_stream(
-            (page.slot() * nvfp4::SM12X_KV_PAGE_TOKENS + page_offset) * value_width,
+            (page.slot() * eider_cuda::SM12X_KV_PAGE_TOKENS + page_offset) * value_width,
             &workspace.value,
             0,
             value_width,
@@ -649,7 +649,7 @@ impl Ling3MlaAttention {
             page_table,
             workspace.attention.output(),
             position + 1,
-            nvfp4::SM12X_KV_PAGE_TOKENS,
+            eider_cuda::SM12X_KV_PAGE_TOKENS,
             self.heads,
             self.qk_dim,
             self.value_dim,

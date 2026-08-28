@@ -1,4 +1,4 @@
-use infer::nvfp4::{CublasLt, CudaStream, DeviceBuffer, Result};
+use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
 use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
 use std::env;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ fn parse_model_dir() -> Result<PathBuf> {
         .unwrap_or_else(|| "qwen36-moe-probe".to_string());
     match (args.next(), args.next()) {
         (Some(path), None) => Ok(PathBuf::from(path)),
-        _ => Err(infer::nvfp4::Error::Format {
+        _ => Err(eider_cuda::Error::Format {
             label: "usage",
             detail: format!("{program} <model-dir>"),
         }),

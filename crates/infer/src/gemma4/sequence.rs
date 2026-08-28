@@ -2,7 +2,7 @@
 
 use super::{Gemma4DecodeState, Gemma4Model};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use nvfp4::{CudaStream, Error, Result};
+use eider_cuda::{CudaStream, Error, Result};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
@@ -11,7 +11,7 @@ pub type Gemma4SequenceCache = SequenceCache<Sm12xPageBackend, ()>;
 
 pub(crate) struct Gemma4Append<'a> {
     pub(crate) reservation: &'a AppendReservation,
-    pub(crate) page_table: &'a nvfp4::DeviceBuffer<u32>,
+    pub(crate) page_table: &'a eider_cuda::DeviceBuffer<u32>,
 }
 
 pub struct Gemma4Sequence {
@@ -122,7 +122,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
             actual: format!("sequences={sequence_capacity} context={max_context_tokens}"),
         });
     }
-    let pages_per_sequence = max_context_tokens.div_ceil(nvfp4::SM12X_KV_PAGE_TOKENS);
+    let pages_per_sequence = max_context_tokens.div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS);
     let eager_page_slots = sequence_capacity
         .checked_mul(pages_per_sequence)
         .ok_or_else(|| Error::Shape {
@@ -174,7 +174,7 @@ pub(crate) fn new_gemma4_sequence_cache_with_budget(
         Sm12xPageBackend::new_heterogeneous(model.sequence_layer_geometries(), page_slots)?;
     Gemma4SequenceCache::new(
         seqcache::CacheConfig {
-            page_tokens: nvfp4::SM12X_KV_PAGE_TOKENS,
+            page_tokens: eider_cuda::SM12X_KV_PAGE_TOKENS,
             max_managed_bytes: managed_bytes,
             max_snapshot_bytes: 0,
             max_prefix_entries: retained_budget_bytes.is_none().then_some(0),

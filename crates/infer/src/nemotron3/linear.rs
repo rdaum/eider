@@ -1,4 +1,4 @@
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear,
     Result, bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_batch_into_on_stream,
@@ -376,7 +376,7 @@ impl Nemotron3Fp8Linear {
             .map(|row| {
                 let max_abs = row
                     .iter()
-                    .map(|&value| nvfp4::format::bf16_to_f32(value).abs())
+                    .map(|&value| eider_cuda::format::bf16_to_f32(value).abs())
                     .filter(|value| value.is_finite())
                     .fold(0.0f32, f32::max);
                 if max_abs == 0.0 { 1.0 } else { max_abs / 448.0 }
@@ -459,7 +459,7 @@ pub(super) fn load_bf16_as_f32(
     DeviceBuffer::from_host(
         &values
             .into_iter()
-            .map(nvfp4::format::bf16_to_f32)
+            .map(eider_cuda::format::bf16_to_f32)
             .collect::<Vec<_>>(),
     )
 }

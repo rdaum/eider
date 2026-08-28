@@ -2,6 +2,9 @@
 
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::ChatOutputEvent;
 use infer::bitnet::BitNetModel;
 use infer::bonsai::BonsaiModel;
 use infer::deepseek4::Deepseek4TextModel;
@@ -19,9 +22,6 @@ use infer::runtime::bitnet_serving::{
 use infer::runtime::bonsai_serving::{
     BonsaiAdmissionProgress, BonsaiCancelOutcome, BonsaiChatService, BonsaiRequestId,
 };
-use infer::runtime::cache_config::SequenceCacheConfig;
-use infer::runtime::chat::CheckpointChatTemplate;
-use infer::runtime::chat_output::ChatOutputEvent;
 use infer::runtime::deepseek4_serving::{
     Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
     Deepseek4SpeculativeProgress,
@@ -305,7 +305,7 @@ fn actor_main(
     };
     let template = match architecture {
         CheckpointArchitecture::Bonsai => bonsai_chat_template(&model_dir),
-        _ => CheckpointChatTemplate::from_model_dir(&model_dir),
+        _ => CheckpointChatTemplate::from_model_dir(&model_dir).map_err(Into::into),
     };
     let template = match template {
         Ok(template) => template,
@@ -335,7 +335,7 @@ fn actor_main(
         CheckpointArchitecture::BitNet => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;
-            if let Err(error) = infer::nvfp4::set_cuda_device(0) {
+            if let Err(error) = eider_cuda::set_cuda_device(0) {
                 let _ = ready.send(Err(error.to_string()));
                 return;
             }
@@ -362,7 +362,7 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Ling3 => {
-            if let Err(error) = infer::nvfp4::set_cuda_device(0) {
+            if let Err(error) = eider_cuda::set_cuda_device(0) {
                 let _ = ready.send(Err(error.to_string()));
                 return;
             }
@@ -395,7 +395,7 @@ fn actor_main(
         CheckpointArchitecture::MuseGlimmer => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;
-            if let Err(error) = infer::nvfp4::set_cuda_device(0) {
+            if let Err(error) = eider_cuda::set_cuda_device(0) {
                 let _ = ready.send(Err(error.to_string()));
                 return;
             }
@@ -441,7 +441,7 @@ fn actor_main(
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Bonsai => {
-            if let Err(error) = infer::nvfp4::set_cuda_device(0) {
+            if let Err(error) = eider_cuda::set_cuda_device(0) {
                 let _ = ready.send(Err(error.to_string()));
                 return;
             }
@@ -814,12 +814,10 @@ fn bonsai_gguf_path(model_dir: &std::path::Path) -> PathBuf {
     model_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf")
 }
 
-fn bonsai_chat_template(
-    model_dir: &std::path::Path,
-) -> infer::nvfp4::Result<CheckpointChatTemplate> {
+fn bonsai_chat_template(model_dir: &std::path::Path) -> eider_cuda::Result<CheckpointChatTemplate> {
     let gguf = bonsai_gguf_path(model_dir);
     let index =
-        eider_format::GgufIndex::open(&gguf).map_err(|error| infer::nvfp4::Error::Format {
+        eider_format::GgufIndex::open(&gguf).map_err(|error| eider_cuda::Error::Format {
             label: "Bonsai GGUF import",
             detail: error.to_string(),
         })?;
@@ -827,17 +825,17 @@ fn bonsai_chat_template(
         .metadata()
         .get("tokenizer.chat_template")
         .and_then(eider_format::GgufValue::as_str)
-        .ok_or_else(|| infer::nvfp4::Error::Format {
+        .ok_or_else(|| eider_cuda::Error::Format {
             label: "Bonsai chat template",
             detail: format!("{} has no tokenizer.chat_template string", gguf.display()),
         })?
         .to_string();
-    CheckpointChatTemplate::from_source_and_tokenizer_files(
+    Ok(CheckpointChatTemplate::from_source_and_tokenizer_files(
         source,
         gguf,
         model_dir.join("tokenizer.json"),
         model_dir.join("tokenizer_config.json"),
-    )
+    )?)
 }
 
 struct EngineAdmission {
@@ -1058,14 +1056,14 @@ enum EngineCancelOutcome {
 }
 
 trait ActorService {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission>;
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission>;
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick>;
+    ) -> eider_cuda::Result<EngineTick>;
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
     fn active_sequence_count(&self) -> usize;
-    fn shutdown(&mut self) -> infer::nvfp4::Result<()> {
+    fn shutdown(&mut self) -> eider_cuda::Result<()> {
         Ok(())
     }
 }
@@ -1085,7 +1083,7 @@ impl<'model, 'template> QwenActorService<'model, 'template> {
 }
 
 impl ActorService for QwenActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1099,7 +1097,7 @@ impl ActorService for QwenActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
@@ -1196,7 +1194,7 @@ impl<'template> Qwen38FlashNextActorService<'template> {
 }
 
 impl ActorService for Qwen38FlashNextActorService<'_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1210,7 +1208,7 @@ impl ActorService for Qwen38FlashNextActorService<'_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Qwen38FlashNextRequestId,
             Qwen38FlashNextAdmissionProgress,
@@ -1312,7 +1310,7 @@ impl<'template> StepActorService<'template> {
 }
 
 impl ActorService for StepActorService<'_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1326,7 +1324,7 @@ impl ActorService for StepActorService<'_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
@@ -1419,7 +1417,7 @@ impl<'model, 'template> NemotronActorService<'model, 'template> {
 }
 
 impl ActorService for NemotronActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1433,7 +1431,7 @@ impl ActorService for NemotronActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Nemotron3RequestId,
             Nemotron3AdmissionProgress,
@@ -1529,7 +1527,7 @@ impl<'model, 'template> GemmaActorService<'model, 'template> {
 }
 
 impl ActorService for GemmaActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1543,7 +1541,7 @@ impl ActorService for GemmaActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
@@ -1637,7 +1635,7 @@ impl<'model, 'template> BitNetActorService<'model, 'template> {
 }
 
 impl ActorService for BitNetActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1651,7 +1649,7 @@ impl ActorService for BitNetActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
@@ -1743,7 +1741,7 @@ impl<'model, 'template> Ling3ActorService<'model, 'template> {
 }
 
 impl ActorService for Ling3ActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1757,7 +1755,7 @@ impl ActorService for Ling3ActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
@@ -1849,7 +1847,7 @@ impl<'model, 'template> MuseGlimmerActorService<'model, 'template> {
 }
 
 impl ActorService for MuseGlimmerActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1863,7 +1861,7 @@ impl ActorService for MuseGlimmerActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             MuseGlimmerRequestId,
             MuseGlimmerAdmissionProgress,
@@ -1957,7 +1955,7 @@ impl<'model, 'template> BonsaiActorService<'model, 'template> {
 }
 
 impl ActorService for BonsaiActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -1971,7 +1969,7 @@ impl ActorService for BonsaiActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<BonsaiRequestId, BonsaiAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
@@ -2063,7 +2061,7 @@ impl<'model, 'template> LagunaActorService<'model, 'template> {
 }
 
 impl ActorService for LagunaActorService<'_, '_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -2077,7 +2075,7 @@ impl ActorService for LagunaActorService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
@@ -2171,7 +2169,7 @@ impl<'template> DeepseekActorService<'template> {
 }
 
 impl ActorService for DeepseekActorService<'_> {
-    fn add_request(&mut self, request: ChatRequest) -> infer::nvfp4::Result<EngineAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> eider_cuda::Result<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
         self.ids.insert(id, admission.request_id);
@@ -2185,7 +2183,7 @@ impl ActorService for DeepseekActorService<'_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> infer::nvfp4::Result<EngineTick> {
+    ) -> eider_cuda::Result<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Deepseek4RequestId,
             Deepseek4AdmissionProgress,

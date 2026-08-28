@@ -1,12 +1,12 @@
 //! Responses API request translation and streaming event construction.
 
-use infer::runtime::chat::{
+use eider_runtime::chat::{
     ChatFunctionCall, ChatFunctionDefinition, ChatMessage, ChatReasoningEffort, ChatRole, ChatTool,
     ChatToolCall,
 };
-use infer::runtime::chat_output::ChatOutputEvent;
+use eider_runtime::chat_output::ChatOutputEvent;
+use eider_runtime::sampling::SamplingConfig;
 use infer::runtime::generation::GenerationConfig;
-use infer::runtime::sampling::SamplingConfig;
 use infer::runtime::scheduler::RequestConfig;
 use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use serde::{Deserialize, Serialize};

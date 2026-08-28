@@ -1,10 +1,10 @@
 use super::{Qwen38FlashNextConfig, Qwen38PagedPle};
-use crate::nvfp4::{
+use crate::qwen3::qwen36::{Bf16Linear, read_bf16_flat_host, read_bf16_vector_as_f32_device};
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, PagedBf16ReadStats, Result,
     qwen38_hc_norm_f32_into_on_stream, qwen38_ple_conv_update_f32_into_on_stream,
     qwen38_ple_gate_value_f32_into_on_stream,
 };
-use crate::qwen3::qwen36::{Bf16Linear, read_bf16_flat_host, read_bf16_vector_as_f32_device};
 
 const TEXT_PREFIX: &str = "model.language_model";
 

@@ -1,6 +1,6 @@
 //! Shared SM12x paged sequence storage.
 
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
     Sm12xKvPagePool, Sm12xKvTailSnapshot,
 };
@@ -530,7 +530,7 @@ impl PageBackend for Sm12xPageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nvfp4::Sm12xKvAttentionWorkspace;
+    use eider_cuda::Sm12xKvAttentionWorkspace;
     use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, SequenceCache};
 
     const TEST_KV_HEADS: usize = 1;

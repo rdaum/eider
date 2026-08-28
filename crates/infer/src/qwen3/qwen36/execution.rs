@@ -9,8 +9,8 @@ use super::{
     Qwen36SequenceCache, Qwen36SpeculativeCycleWorkspace, Qwen36TextModel,
     Qwen38DFlash2PrefixCache, Qwen38DFlash2Workspace,
 };
-use crate::nvfp4::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use crate::sm12x_cache::{Sm12xPageBackend, Sm12xPageTable};
+use eider_cuda::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::PageBackend;
 use std::mem::size_of;
 

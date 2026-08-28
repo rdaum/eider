@@ -1,5 +1,5 @@
 use crate::kv_cache::{KvCache, LayerKvCache};
-use nvfp4::{
+use eider_cuda::{
     Bf16Matrix, CublasLt, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, GemmShape, ModelOptCheckpoint,
     ModelOptCublasLtWeight, ModelOptNvfp4Activation, ModelOptNvfp4Linear, Nvfp4TnInputs, Result,
     add_f32_into_on_stream, format, rms_norm_f32_into_on_stream, rope_neox_f32_into_on_stream,
@@ -594,7 +594,7 @@ fn read_bf16_vector(checkpoint: &ModelOptCheckpoint, name: &str) -> Result<Vec<f
     let info = shard.require_tensor(name)?;
     let expected_bytes = info.shape.iter().product::<usize>() * 2;
     if info.dtype != "BF16" || info.byte_len() != expected_bytes as u64 {
-        return Err(nvfp4::Error::Shape {
+        return Err(eider_cuda::Error::Shape {
             label: "BF16 vector",
             expected: format!("dtype=BF16 bytes={expected_bytes}"),
             actual: format!(

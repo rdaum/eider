@@ -1,6 +1,6 @@
 //! Prepare and inspect the Step-3.7 routed-expert cache.
 
-use infer::nvfp4::{Error, Result};
+use eider_cuda::{Error, Result};
 use infer::step37::{FIRST_MOE_LAYER, Step37ResidentExperts, prepare_all, prepare_one};
 use std::path::PathBuf;
 

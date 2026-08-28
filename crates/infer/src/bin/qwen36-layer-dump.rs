@@ -1,4 +1,4 @@
-use infer::nvfp4::{CublasLt, CudaStream, DeviceBuffer, Result};
+use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
 use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model};
 use std::env;
 use std::path::PathBuf;
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
 }
 
 fn load_bf16_row(
-    checkpoint: &infer::nvfp4::ModelOptCheckpoint,
+    checkpoint: &eider_cuda::ModelOptCheckpoint,
     name: &str,
     _rows: usize,
     cols: usize,
@@ -120,7 +120,7 @@ fn load_bf16_row(
     let bytes = shard.read_tensor_byte_range(name, offset, cols * 2)?;
     Ok(bytes
         .chunks_exact(2)
-        .map(|c| infer::nvfp4::format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .map(|c| eider_cuda::format::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect())
 }
 
@@ -133,7 +133,7 @@ fn parse_model_dir() -> Result<PathBuf> {
     let _ = args.next();
     match (args.next(), args.next()) {
         (Some(path), None) => Ok(PathBuf::from(path)),
-        _ => Err(infer::nvfp4::Error::Format {
+        _ => Err(eider_cuda::Error::Format {
             label: "usage",
             detail: "qwen36-layer-dump <model-dir>".to_string(),
         }),

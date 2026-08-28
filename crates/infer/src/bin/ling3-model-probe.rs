@@ -1,8 +1,8 @@
 //! Compare the complete Ling 3 Tiny decoder with an independent CPU artifact.
 
-use infer::ling3::Ling3Model;
-use infer::nvfp4::{CudaStream, Error, Result, SafeTensorShard};
-use infer::runtime::ling3_sequence_cache::{admit_ling3_sequence, new_ling3_sequence_cache};
+use eider_cuda::{CudaStream, Error, Result};
+use eider_format::SafeTensorShard;
+use infer::ling3::{Ling3Model, admit_ling3_sequence, new_ling3_sequence_cache};
 use std::path::PathBuf;
 
 const MIN_NVFP4_COSINE: f64 = 0.94;

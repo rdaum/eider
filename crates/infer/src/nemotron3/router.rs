@@ -1,6 +1,6 @@
 use super::linear::load_bf16_host;
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig};
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,

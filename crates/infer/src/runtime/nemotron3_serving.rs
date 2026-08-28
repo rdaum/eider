@@ -1,22 +1,19 @@
 //! Structured multi-session chat serving for Nemotron 3.
 
-use super::cache_config::SequenceCacheConfig;
-use super::chat::CheckpointChatTemplate;
-use super::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use super::nemotron3_sequence_cache::{
-    Nemotron3CacheContext, Nemotron3Sequence, Nemotron3SequenceCache, nemotron3_cache_error,
-    new_nemotron3_sequence_cache_with_budget,
-};
-use super::sampling::{Sampler, TokenHistory};
 use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
-use super::stop::StopBuffer;
 use crate::nemotron3::{
-    Nemotron3BlockWorkspace, Nemotron3Model, Nemotron3MtpWorkspace,
-    Nemotron3SpeculativeCycleWorkspace,
+    Nemotron3BlockWorkspace, Nemotron3CacheContext, Nemotron3Model, Nemotron3MtpWorkspace,
+    Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3SpeculativeCycleWorkspace,
+    nemotron3_cache_error, new_nemotron3_sequence_cache_with_budget,
 };
 use crate::sm12x_cache::Sm12xPageTable;
-use nvfp4::{DeviceBuffer, Error, Result};
+use eider_cuda::{DeviceBuffer, Error, Result};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::chat::CheckpointChatTemplate;
+use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -659,7 +656,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             .forward_one(sequence, &mut self.sequence_cache, input)?;
         let sampled = if request.sampler.config().uses_fast_argmax() {
             let (id, logit) = self.model.argmax_with_logit(sequence)?;
-            super::sampling::SampledToken {
+            eider_runtime::sampling::SampledToken {
                 id,
                 logit,
                 adjusted_logit: logit,

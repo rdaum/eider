@@ -1,7 +1,8 @@
 //! Compare Ling 3 Tiny layer-1 MoE with the independent CPU artifact.
 
+use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
+use eider_format::SafeTensorShard;
 use infer::ling3::{Ling3Manifest, Ling3Moe};
-use infer::nvfp4::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result, SafeTensorShard};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

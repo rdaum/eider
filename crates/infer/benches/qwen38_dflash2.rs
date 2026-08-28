@@ -1,8 +1,8 @@
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::sampling::SamplingConfig;
 use infer::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel,
 };
-use infer::runtime::cache_config::SequenceCacheConfig;
-use infer::runtime::sampling::SamplingConfig;
 use infer::runtime::scheduler::{Qwen36Scheduler, RequestConfig, RequestState, SchedulerConfig};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,

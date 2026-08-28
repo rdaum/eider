@@ -10,8 +10,9 @@ fast-telemetry.workspace = true
 rand = "0.9"
 rayon = "1"
 serde_json.workspace = true
-nvfp4.workspace = true
+eider-cuda.workspace = true
 eider-format.workspace = true
+eider-runtime.workspace = true
 seqcache.workspace = true
 tokenizers = "0.22"
 minijinja = { version = "2.21.0", features = ["json"] }

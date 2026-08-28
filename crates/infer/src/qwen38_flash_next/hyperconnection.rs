@@ -1,11 +1,11 @@
 use super::Qwen38FlashNextConfig;
-use crate::nvfp4::{
+use crate::qwen3::qwen36::{Bf16Linear, read_bf16_vector_as_f32_device};
+use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, CudaStream, DeviceBuffer, Error, GemmShape, ModelOptCheckpoint,
     Result, f32_to_bf16_prefix_into_on_stream, qwen38_hc_collapse_f32_into_on_stream,
     qwen38_hc_combine_f32_into_on_stream, qwen38_hc_norm_f32_into_on_stream,
     qwen38_hc_silu_scale_f32_in_place_on_stream,
 };
-use crate::qwen3::qwen36::{Bf16Linear, read_bf16_vector_as_f32_device};
 use std::collections::HashMap;
 
 /// BF16 low-rank weights for one Qwen generalized residual block.

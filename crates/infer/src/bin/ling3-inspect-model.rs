@@ -1,5 +1,5 @@
+use eider_cuda::{Error, Result};
 use infer::ling3::{Ling3FfnKind, Ling3Manifest};
-use infer::nvfp4::{Error, Result};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

@@ -5,8 +5,7 @@ use crate::runtime::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
-use fs2::FileExt as Fs2FileExt;
-use nvfp4::{
+use eider_cuda::{
     CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     ModelOptCheckpoint, ModelOptNvfp4Linear, PinnedHostBuffer, Result, Sm12xFp4TileSet,
     Sm12xKvAttentionWorkspace, Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight,
@@ -20,6 +19,7 @@ use nvfp4::{
     sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
     silu_mul_halves_f32_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
 };
+use fs2::FileExt as Fs2FileExt;
 use std::f32::consts::PI;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -992,10 +992,13 @@ impl Step37Attention {
                 actual: format!("{} tokens", workspace.tokens),
             });
         }
-        if cache.page_offset != position % nvfp4::SM12X_KV_PAGE_TOKENS {
+        if cache.page_offset != position % eider_cuda::SM12X_KV_PAGE_TOKENS {
             return Err(Error::Shape {
                 label: "Step-3.7 decode attention position",
-                expected: format!("page offset {}", position % nvfp4::SM12X_KV_PAGE_TOKENS),
+                expected: format!(
+                    "page offset {}",
+                    position % eider_cuda::SM12X_KV_PAGE_TOKENS
+                ),
                 actual: cache.page_offset.to_string(),
             });
         }

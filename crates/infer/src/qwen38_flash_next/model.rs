@@ -4,11 +4,6 @@ use super::{
     Qwen38HyperConnectionWorkspace, Qwen38PagedPle, Qwen38PleState, Qwen38PleTokenWindow,
     Qwen38PleWeights, Qwen38PleWorkspace,
 };
-use crate::nvfp4::{
-    CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    ModelOptCheckpoint, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
-    rms_norm_f32_into_on_stream,
-};
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
     Bf16Linear, Qwen36BatchModelView, Qwen36Embedding, Qwen36ExactMoePairWorkspace,
@@ -22,6 +17,11 @@ use crate::qwen38_flash_next::{
     qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
+use eider_cuda::{
+    CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
+    ModelOptCheckpoint, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
+    rms_norm_f32_into_on_stream,
+};
 use seqcache::{AdmissionOutcome, AdmissionRequest, AppendReservation, SequenceId};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1898,7 +1898,7 @@ impl Qwen38FlashNextModel {
             || source.position == 0
             || !source
                 .position
-                .is_multiple_of(crate::nvfp4::SM12X_KV_PAGE_TOKENS)
+                .is_multiple_of(eider_cuda::SM12X_KV_PAGE_TOKENS)
         {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next sequence snapshot",
@@ -3209,7 +3209,7 @@ mod tests {
                 output.copy_to_host(&stream)?.into_vec()
             }
             Qwen38AttentionWeights::Qsa(weights) => {
-                let capacity = crate::nvfp4::SM12X_KV_PAGE_TOKENS;
+                let capacity = eider_cuda::SM12X_KV_PAGE_TOKENS;
                 let mut workspace =
                     Qwen38QsaWorkspace::new(&config, &manifest, &weights, capacity)?;
                 let mut backend = crate::qwen38_flash_next::Qwen38FlashNextPageBackend::new(

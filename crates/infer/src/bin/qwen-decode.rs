@@ -1,4 +1,4 @@
-use infer::nvfp4::Result;
+use eider_cuda::Result;
 use infer::qwen3::infer::Qwen3Model;
 use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
 use std::env;
@@ -14,7 +14,7 @@ fn main() -> Result<()> {
         .next()
         .map(|value| value.parse::<u32>())
         .transpose()
-        .map_err(|err| infer::nvfp4::Error::Format {
+        .map_err(|err| eider_cuda::Error::Format {
             label: "initial token id",
             detail: err.to_string(),
         })?
@@ -23,7 +23,7 @@ fn main() -> Result<()> {
         .next()
         .map(|value| value.parse::<usize>())
         .transpose()
-        .map_err(|err| infer::nvfp4::Error::Format {
+        .map_err(|err| eider_cuda::Error::Format {
             label: "decode steps",
             detail: err.to_string(),
         })?

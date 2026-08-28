@@ -1,12 +1,12 @@
+use eider_cuda::ModelOptCheckpoint;
 use infer::nemotron3::{Nemotron3LayerKind, Nemotron3Manifest};
-use infer::nvfp4::ModelOptCheckpoint;
 use std::path::PathBuf;
 
-fn main() -> infer::nvfp4::Result<()> {
+fn main() -> eider_cuda::Result<()> {
     let model_dir = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or_else(|| infer::nvfp4::Error::Format {
+        .ok_or_else(|| eider_cuda::Error::Format {
             label: "nemotron3-inspect-model arguments",
             detail: "usage: nemotron3-inspect-model <model-dir>".to_string(),
         })?;
