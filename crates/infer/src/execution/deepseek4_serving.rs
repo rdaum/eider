@@ -8,10 +8,16 @@ use crate::deepseek4::{
     new_deepseek4_mtp_sequence_cache, new_deepseek4_sequence_cache,
 };
 use crate::sm12x_cache::Sm12xPageTable;
+use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::engine::{
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
+    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineSpeculativeProgress,
+    EngineTick,
+};
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
 use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
@@ -1147,6 +1153,131 @@ fn retained_prefix_ready(
     prefix_retained: bool,
 ) -> bool {
     !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
+}
+
+/// Model-specific identity and speculative-progress translation for the shared engine contract.
+pub struct Deepseek4EngineService<'template> {
+    inner: Deepseek4ChatService<'template>,
+    ids: BTreeMap<u64, Deepseek4RequestId>,
+}
+
+impl<'template> Deepseek4EngineService<'template> {
+    /// Wraps a DeepSeek V4 chat service for consumption by an engine actor.
+    pub fn new(inner: Deepseek4ChatService<'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl EngineService for Deepseek4EngineService<'_> {
+    type Error = InferenceError;
+    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> InferenceResult<EngineTick> {
+        let mut observer = |event: RequestLifecycleEvent<
+            Deepseek4RequestId,
+            Deepseek4AdmissionProgress,
+        >| match event {
+            RequestLifecycleEvent::Admitted(progress) => {
+                on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
+                    request_id: progress.request_id.get(),
+                    sequence_device_bytes: progress.sequence_device_bytes,
+                    cached_prompt_tokens: progress.cached_prompt_tokens,
+                    allocation_duration: progress.allocation_duration,
+                    checkpoint_copy_duration: progress.checkpoint_copy_duration,
+                    admitted_after_tick_start: progress.admitted_after_tick_start,
+                }))
+            }
+            RequestLifecycleEvent::PrefillStarted(id) => {
+                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
+            }
+        };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Deepseek4RequestId::get)
+                .collect(),
+            speculative: tick
+                .speculative
+                .into_iter()
+                .map(|progress| EngineSpeculativeProgress {
+                    request_id: progress.request_id.get(),
+                    cycles: progress.cycles,
+                    accepted_drafts: progress.accepted_drafts,
+                })
+                .collect(),
+            dflash: Vec::new(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Deepseek4CancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            Deepseek4CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
 }
 
 struct ResponseFilter {
