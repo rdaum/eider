@@ -3,8 +3,8 @@ use crate::gemma4::{Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_ca
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CublasLt, CutlassFp4GroupedGemmPlan, Fp4TnMatmulPlan, GemmShape, MoeSortedNvfp4Rows,
-    MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
+    CublasLt, CutlassFp4GroupedGemmPlan, DeviceAddress, Fp4TnMatmulPlan, GemmShape,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
     dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
@@ -345,9 +345,9 @@ struct Gemma4BatchMoeWorkspace {
     gate: DeviceBuffer<u16>,
     up: DeviceBuffer<u16>,
     down: DeviceBuffer<u16>,
-    gate_output_table: DeviceBuffer<*mut u16>,
-    up_output_table: DeviceBuffer<*mut u16>,
-    down_output_table: DeviceBuffer<*mut u16>,
+    gate_output_table: DeviceBuffer<DeviceAddress<u16>>,
+    up_output_table: DeviceBuffer<DeviceAddress<u16>>,
+    down_output_table: DeviceBuffer<DeviceAddress<u16>>,
     output: DeviceBuffer<f32>,
 }
 
@@ -1205,12 +1205,12 @@ fn run_moe_prefill(
         stream,
     )?;
     workspace.gate_up_plan.run_on_stream(
-        &moe.gate_packed_table,
-        &moe.gate_tiled_scale_table,
+        &moe.gate_grouped_packed_table,
+        &moe.gate_grouped_tiled_scale_table,
         workspace.gate_up_input.packed_table(),
         workspace.gate_up_input.scale_table(),
         &workspace.gate_output_table,
-        &moe.gate_alpha_table,
+        &moe.gate_grouped_alpha_table,
         workspace.sorted_routes.expert_counts(),
         stream,
     )?;
@@ -1222,12 +1222,12 @@ fn run_moe_prefill(
         stream,
     )?;
     workspace.gate_up_plan.run_on_stream(
-        &moe.up_packed_table,
-        &moe.up_tiled_scale_table,
+        &moe.up_grouped_packed_table,
+        &moe.up_grouped_tiled_scale_table,
         workspace.gate_up_input.packed_table(),
         workspace.gate_up_input.scale_table(),
         &workspace.up_output_table,
-        &moe.up_alpha_table,
+        &moe.up_grouped_alpha_table,
         workspace.sorted_routes.expert_counts(),
         stream,
     )?;
@@ -1247,12 +1247,12 @@ fn run_moe_prefill(
         stream,
     )?;
     workspace.down_plan.run_on_stream(
-        &moe.down_packed_table,
-        &moe.down_tiled_scale_table,
+        &moe.down_grouped_packed_table,
+        &moe.down_grouped_tiled_scale_table,
         workspace.down_input.packed_table(),
         workspace.down_input.scale_table(),
         &workspace.down_output_table,
-        &moe.down_alpha_table,
+        &moe.down_grouped_alpha_table,
         workspace.sorted_routes.expert_counts(),
         stream,
     )?;

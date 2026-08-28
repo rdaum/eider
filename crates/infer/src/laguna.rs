@@ -6,8 +6,8 @@
 
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, Error, F32Matrix, GpuSampledToken,
-    GpuSamplingRow, GpuTokenSampler, ModelOptCublasLtWeight, Nvfp4Matrix, Result,
+    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceAddress, DeviceBuffer, Error, F32Matrix,
+    GpuSampledToken, GpuSamplingRow, GpuTokenSampler, ModelOptCublasLtWeight, Nvfp4Matrix, Result,
     Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
     add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
@@ -739,6 +739,9 @@ struct LagunaMoe {
     gate_up_scales: DeviceBuffer<*const u8>,
     gate_up_alphas: DeviceBuffer<f32>,
     gate_up_alpha_table: DeviceBuffer<*mut f32>,
+    gate_up_grouped_values: DeviceBuffer<DeviceAddress<u8>>,
+    gate_up_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
+    gate_up_grouped_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     _down: Vec<Sm12xFp4DeviceGemmWeight>,
     down_tiles: DeviceBuffer<*const u8>,
     down_scales: DeviceBuffer<*const u32>,
@@ -829,6 +832,14 @@ impl LagunaMoe {
             .iter()
             .map(|weight| weight.matrix().scales_ptr())
             .collect::<Vec<_>>();
+        let gate_up_grouped_values = gate_up
+            .iter()
+            .map(|weight| weight.matrix().values_address())
+            .collect::<Vec<_>>();
+        let gate_up_grouped_scales = gate_up
+            .iter()
+            .map(|weight| weight.matrix().scales_address())
+            .collect::<Vec<_>>();
         let mut gate_up_alphas = DeviceBuffer::from_host(
             &gate_up
                 .iter()
@@ -836,6 +847,7 @@ impl LagunaMoe {
                 .collect::<Vec<_>>(),
         )?;
         let gate_up_alpha_table = scalar_pointer_table(&mut gate_up_alphas)?;
+        let gate_up_grouped_alpha_table = device_address_table(&gate_up_alphas)?;
         let mut down = Vec::with_capacity(EXPERTS);
         let mut down_tiles = Vec::with_capacity(EXPERTS);
         let mut down_scales = Vec::with_capacity(EXPERTS);
@@ -862,6 +874,9 @@ impl LagunaMoe {
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
             gate_up_alphas,
             gate_up_alpha_table,
+            gate_up_grouped_values: DeviceBuffer::from_host(&gate_up_grouped_values)?,
+            gate_up_grouped_scales: DeviceBuffer::from_host(&gate_up_grouped_scales)?,
+            gate_up_grouped_alpha_table,
             _down: down,
             down_tiles: DeviceBuffer::from_host(&down_tiles)?,
             down_scales: DeviceBuffer::from_host(&down_scales)?,
@@ -1010,6 +1025,9 @@ impl LagunaMoe {
             + self.gate_up_scales.device_bytes()
             + self.gate_up_alphas.device_bytes()
             + self.gate_up_alpha_table.device_bytes()
+            + self.gate_up_grouped_values.device_bytes()
+            + self.gate_up_grouped_scales.device_bytes()
+            + self.gate_up_grouped_alpha_table.device_bytes()
             + self
                 ._down
                 .iter()
@@ -1091,6 +1109,14 @@ fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*
             .map(|index| unsafe { base.add(index) })
             .collect::<Vec<_>>(),
     )
+}
+
+fn device_address_table(values: &DeviceBuffer<f32>) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
+    let base = values.cuda_address();
+    let addresses = (0..values.len())
+        .map(|index| base.offset(index))
+        .collect::<Result<Vec<_>>>()?;
+    DeviceBuffer::from_host(&addresses)
 }
 
 fn ensure_down_artifacts(

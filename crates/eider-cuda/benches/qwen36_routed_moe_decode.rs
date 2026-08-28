@@ -1,9 +1,9 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan, DeviceBuffer,
-    F32Matrix, ModelOptCublasLtWeight, MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Result,
-    Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp, indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
+    CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan, DeviceAddress,
+    DeviceBuffer, F32Matrix, ModelOptCublasLtWeight, MoeSortedNvfp4Rows, MoeSortedRoutes,
+    Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
+    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
 };
@@ -38,8 +38,8 @@ struct GroupedW4A4Workspace {
     down_plan: CutlassFp4GroupedGemmPlan,
     gate_up: DeviceBuffer<u16>,
     down: DeviceBuffer<u16>,
-    gate_up_output_table: DeviceBuffer<*mut u16>,
-    down_output_table: DeviceBuffer<*mut u16>,
+    gate_up_output_table: DeviceBuffer<DeviceAddress<u16>>,
+    down_output_table: DeviceBuffer<DeviceAddress<u16>>,
     reduced: DeviceBuffer<f32>,
 }
 
@@ -99,6 +99,8 @@ struct Qwen36RoutedMoeDecodeBench {
     w4a4_gate_up_weights: Vec<ModelOptCublasLtWeight>,
     w4a4_gate_up_values: DeviceBuffer<*const u8>,
     w4a4_gate_up_scales: DeviceBuffer<*const u8>,
+    grouped_gate_up_values: DeviceBuffer<DeviceAddress<u8>>,
+    grouped_gate_up_scales: DeviceBuffer<DeviceAddress<u8>>,
     w4a4_gate_up_alphas: DeviceBuffer<f32>,
     w4a4_gate_up_input: Nvfp4Matrix,
     w4a4_gate_up_plan: CutlassFp4GroupedGemvF32Plan,
@@ -107,12 +109,12 @@ struct Qwen36RoutedMoeDecodeBench {
     w4a4_gate_up_output_mut_table: DeviceBuffer<*mut f32>,
     w4a4_gate_up_output_table: DeviceBuffer<*const f32>,
     grouped_gate_up_alpha_values: DeviceBuffer<f32>,
-    grouped_gate_up_alpha_table: DeviceBuffer<*mut f32>,
+    grouped_gate_up_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_down_weights: Vec<ModelOptCublasLtWeight>,
-    grouped_down_values: DeviceBuffer<*const u8>,
-    grouped_down_scales: DeviceBuffer<*const u8>,
+    grouped_down_values: DeviceBuffer<DeviceAddress<u8>>,
+    grouped_down_scales: DeviceBuffer<DeviceAddress<u8>>,
     grouped_down_alpha_values: DeviceBuffer<f32>,
-    grouped_down_alpha_table: DeviceBuffer<*mut f32>,
+    grouped_down_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_w4a4: GroupedW4A4Workspace,
     down_weights: Vec<Sm12xFp4DeviceGemmWeight>,
     down_tiles: DeviceBuffer<*const u8>,
@@ -157,6 +159,18 @@ impl Qwen36RoutedMoeDecodeBench {
                 .map(|weight| weight.matrix().scales_ptr())
                 .collect::<Vec<_>>(),
         )?;
+        let grouped_gate_up_values = DeviceBuffer::from_host(
+            &w4a4_gate_up_weights
+                .iter()
+                .map(|weight| weight.matrix().values_address())
+                .collect::<Vec<_>>(),
+        )?;
+        let grouped_gate_up_scales = DeviceBuffer::from_host(
+            &w4a4_gate_up_weights
+                .iter()
+                .map(|weight| weight.matrix().scales_address())
+                .collect::<Vec<_>>(),
+        )?;
         let w4a4_gate_up_alphas = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
                 .iter()
@@ -178,13 +192,13 @@ impl Qwen36RoutedMoeDecodeBench {
                 .map(|output| output.data_ptr())
                 .collect::<Vec<_>>(),
         )?;
-        let mut grouped_gate_up_alpha_values = DeviceBuffer::from_host(
+        let grouped_gate_up_alpha_values = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let grouped_gate_up_alpha_table = scalar_pointer_table(&mut grouped_gate_up_alpha_values)?;
+        let grouped_gate_up_alpha_table = device_address_table(&grouped_gate_up_alpha_values)?;
 
         let down_host = synthetic_down_weights();
         let down_weights = down_host
@@ -218,22 +232,22 @@ impl Qwen36RoutedMoeDecodeBench {
         let grouped_down_values = DeviceBuffer::from_host(
             &grouped_down_weights
                 .iter()
-                .map(|weight| weight.matrix().values_ptr())
+                .map(|weight| weight.matrix().values_address())
                 .collect::<Vec<_>>(),
         )?;
         let grouped_down_scales = DeviceBuffer::from_host(
             &grouped_down_weights
                 .iter()
-                .map(|weight| weight.matrix().scales_ptr())
+                .map(|weight| weight.matrix().scales_address())
                 .collect::<Vec<_>>(),
         )?;
-        let mut grouped_down_alpha_values = DeviceBuffer::from_host(
+        let grouped_down_alpha_values = DeviceBuffer::from_host(
             &grouped_down_weights
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let grouped_down_alpha_table = scalar_pointer_table(&mut grouped_down_alpha_values)?;
+        let grouped_down_alpha_table = device_address_table(&grouped_down_alpha_values)?;
         let stream = CudaStream::new_non_blocking()?;
         let mut bench = Self {
             stream,
@@ -250,6 +264,8 @@ impl Qwen36RoutedMoeDecodeBench {
             w4a4_gate_up_weights,
             w4a4_gate_up_values,
             w4a4_gate_up_scales,
+            grouped_gate_up_values,
+            grouped_gate_up_scales,
             w4a4_gate_up_alphas,
             w4a4_gate_up_input: Nvfp4Matrix::zeroed_col_major(HIDDEN, 1)?,
             w4a4_gate_up_plan: CutlassFp4GroupedGemvF32Plan::new(GATE_UP, HIDDEN, TOP_K)?,
@@ -390,8 +406,8 @@ impl Qwen36RoutedMoeDecodeBench {
             &self.stream,
         )?;
         grouped.gate_up_plan.run_on_stream(
-            &self.w4a4_gate_up_values,
-            &self.w4a4_gate_up_scales,
+            &self.grouped_gate_up_values,
+            &self.grouped_gate_up_scales,
             grouped.gate_up_input.packed_table(),
             grouped.gate_up_input.scale_table(),
             &grouped.gate_up_output_table,
@@ -594,13 +610,12 @@ fn nrmse(reference: &[f32], actual: &[f32]) -> f64 {
     (error / norm.max(f64::MIN_POSITIVE)).sqrt()
 }
 
-fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
-    let base = values.as_const_ptr().cast::<f32>().cast_mut();
-    DeviceBuffer::from_host(
-        &(0..values.len())
-            .map(|index| unsafe { base.add(index) })
-            .collect::<Vec<_>>(),
-    )
+fn device_address_table(values: &DeviceBuffer<f32>) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
+    let base = values.cuda_address();
+    let addresses = (0..values.len())
+        .map(|index| base.offset(index))
+        .collect::<Result<Vec<_>>>()?;
+    DeviceBuffer::from_host(&addresses)
 }
 
 fn w4a16_sample(

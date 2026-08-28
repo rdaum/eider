@@ -1,6 +1,7 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, DeviceBuffer, MoeSortedNvfp4Rows,
-    MoeSortedRoutes, Nvfp4Matrix, format, moe_weighted_accumulate_sorted_bf16_batch_on_stream,
+    CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, format,
+    moe_weighted_accumulate_sorted_bf16_batch_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -67,18 +68,18 @@ struct Qwen36GroupedMoePrefillBench {
     down_plan: CutlassFp4GroupedGemmPlan,
     gate_up_weights: Vec<Nvfp4Matrix>,
     down_weights: Vec<Nvfp4Matrix>,
-    gate_up_weight_values: DeviceBuffer<*const u8>,
-    gate_up_weight_scales: DeviceBuffer<*const u8>,
-    down_weight_values: DeviceBuffer<*const u8>,
-    down_weight_scales: DeviceBuffer<*const u8>,
+    gate_up_weight_values: DeviceBuffer<DeviceAddress<u8>>,
+    gate_up_weight_scales: DeviceBuffer<DeviceAddress<u8>>,
+    down_weight_values: DeviceBuffer<DeviceAddress<u8>>,
+    down_weight_scales: DeviceBuffer<DeviceAddress<u8>>,
     gate_up_alpha_storage: Vec<DeviceBuffer<f32>>,
     down_alpha_storage: Vec<DeviceBuffer<f32>>,
-    gate_up_alpha_table: DeviceBuffer<*mut f32>,
-    down_alpha_table: DeviceBuffer<*mut f32>,
+    gate_up_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     gate_up: DeviceBuffer<u16>,
     down: DeviceBuffer<u16>,
-    gate_up_output_table: DeviceBuffer<*mut u16>,
-    down_output_table: DeviceBuffer<*mut u16>,
+    gate_up_output_table: DeviceBuffer<DeviceAddress<u16>>,
+    down_output_table: DeviceBuffer<DeviceAddress<u16>>,
     routed_output: DeviceBuffer<f32>,
 }
 
@@ -99,28 +100,28 @@ impl Qwen36GroupedMoePrefillBench {
         let gate_up_weight_values = DeviceBuffer::from_host(
             &gate_up_weights
                 .iter()
-                .map(Nvfp4Matrix::values_ptr)
+                .map(Nvfp4Matrix::values_address)
                 .collect::<Vec<_>>(),
         )
         .expect("gate/up weight values");
         let gate_up_weight_scales = DeviceBuffer::from_host(
             &gate_up_weights
                 .iter()
-                .map(Nvfp4Matrix::scales_ptr)
+                .map(Nvfp4Matrix::scales_address)
                 .collect::<Vec<_>>(),
         )
         .expect("gate/up weight scales");
         let down_weight_values = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Nvfp4Matrix::values_ptr)
+                .map(Nvfp4Matrix::values_address)
                 .collect::<Vec<_>>(),
         )
         .expect("down weight values");
         let down_weight_scales = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Nvfp4Matrix::scales_ptr)
+                .map(Nvfp4Matrix::scales_address)
                 .collect::<Vec<_>>(),
         )
         .expect("down weight scales");
@@ -133,14 +134,14 @@ impl Qwen36GroupedMoePrefillBench {
         let gate_up_alpha_table = DeviceBuffer::from_host(
             &gate_up_alpha_storage
                 .iter()
-                .map(|alpha| alpha.as_const_ptr().cast::<f32>().cast_mut())
+                .map(|alpha| alpha.cuda_address())
                 .collect::<Vec<_>>(),
         )
         .expect("gate/up alpha table");
         let down_alpha_table = DeviceBuffer::from_host(
             &down_alpha_storage
                 .iter()
-                .map(|alpha| alpha.as_const_ptr().cast::<f32>().cast_mut())
+                .map(|alpha| alpha.cuda_address())
                 .collect::<Vec<_>>(),
         )
         .expect("down alpha table");

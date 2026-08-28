@@ -1,6 +1,6 @@
 use eider_cuda::{
     CublasLt, CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan,
-    DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, GemmShape, ModelOptCublasLtWeight,
+    DeviceAddress, DeviceBuffer, F32Matrix, Fp4TnMatmulPlan, GemmShape, ModelOptCublasLtWeight,
     MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs, Result, Sm121W4A16GateUp,
     Sm121W4A16GateUpBatchWorkspace, format, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_silu_quantize_bf16_sorted_slots_on_stream,
@@ -35,11 +35,13 @@ struct LagunaRoutedGateUpBench {
     grouped_weight_values: DeviceBuffer<*const u8>,
     grouped_weight_scales: DeviceBuffer<*const u8>,
     grouped_alphas: DeviceBuffer<f32>,
-    grouped_alpha_table: DeviceBuffer<*mut f32>,
+    grouped_gemm_weight_values: DeviceBuffer<DeviceAddress<u8>>,
+    grouped_gemm_weight_scales: DeviceBuffer<DeviceAddress<u8>>,
+    grouped_gemm_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_input: MoeSortedNvfp4Rows,
     grouped_plan: CutlassFp4GroupedGemmPlan,
     grouped_output: DeviceBuffer<u16>,
-    grouped_output_table: DeviceBuffer<*mut u16>,
+    grouped_output_table: DeviceBuffer<DeviceAddress<u16>>,
     decode_input: DeviceBuffer<f32>,
     decode_indices: DeviceBuffer<u32>,
     decode_input_nvfp4: Nvfp4Matrix,
@@ -94,13 +96,25 @@ impl LagunaRoutedGateUpBench {
                 .map(|weight| weight.matrix().scales_ptr())
                 .collect::<Vec<_>>(),
         )?;
-        let mut grouped_alphas = DeviceBuffer::from_host(
+        let grouped_alphas = DeviceBuffer::from_host(
             &grouped_weights
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let grouped_alpha_table = scalar_pointer_table(&mut grouped_alphas)?;
+        let grouped_gemm_weight_values = DeviceBuffer::from_host(
+            &grouped_weights
+                .iter()
+                .map(|weight| weight.matrix().values_address())
+                .collect::<Vec<_>>(),
+        )?;
+        let grouped_gemm_weight_scales = DeviceBuffer::from_host(
+            &grouped_weights
+                .iter()
+                .map(|weight| weight.matrix().scales_address())
+                .collect::<Vec<_>>(),
+        )?;
+        let grouped_gemm_alpha_table = device_address_table(&grouped_alphas)?;
         let input = DeviceBuffer::from_host(
             &(0..ROWS * HIDDEN)
                 .map(|index| {
@@ -166,7 +180,9 @@ impl LagunaRoutedGateUpBench {
             grouped_weight_values,
             grouped_weight_scales,
             grouped_alphas,
-            grouped_alpha_table,
+            grouped_gemm_weight_values,
+            grouped_gemm_weight_scales,
+            grouped_gemm_alpha_table,
             grouped_input: MoeSortedNvfp4Rows::new(ROWS, TOP_K, EXPERTS, HIDDEN)?,
             grouped_plan: CutlassFp4GroupedGemmPlan::new(GATE_UP, ROUTES, HIDDEN, EXPERTS)?,
             grouped_output: DeviceBuffer::zeroed(ROUTES * GATE_UP)?,
@@ -227,12 +243,12 @@ impl LagunaRoutedGateUpBench {
 
     fn enqueue_grouped_gemm(&mut self) -> Result<()> {
         self.grouped_plan.run_on_stream(
-            &self.grouped_weight_values,
-            &self.grouped_weight_scales,
+            &self.grouped_gemm_weight_values,
+            &self.grouped_gemm_weight_scales,
             self.grouped_input.packed_table(),
             self.grouped_input.scale_table(),
             &self.grouped_output_table,
-            &self.grouped_alpha_table,
+            &self.grouped_gemm_alpha_table,
             self.sorted_routes.expert_counts(),
             &self.stream,
         )
@@ -666,13 +682,12 @@ fn synthetic_weights() -> Vec<ModelOptNvfp4Linear> {
         .collect()
 }
 
-fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
-    let base = values.as_const_ptr().cast::<f32>().cast_mut();
-    DeviceBuffer::from_host(
-        &(0..values.len())
-            .map(|index| unsafe { base.add(index) })
-            .collect::<Vec<_>>(),
-    )
+fn device_address_table(values: &DeviceBuffer<f32>) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
+    let base = values.cuda_address();
+    let addresses = (0..values.len())
+        .map(|index| base.offset(index))
+        .collect::<Result<Vec<_>>>()?;
+    DeviceBuffer::from_host(&addresses)
 }
 
 fn w4a16_pipeline_sample(

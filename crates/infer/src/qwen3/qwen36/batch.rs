@@ -13,13 +13,13 @@ use super::{Qwen36Append, Qwen36Sequence, Qwen36SequenceCache, qwen36_cache_erro
 
 use eider_cuda::{
     Bf16TnMatmulPlan, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemmPlan,
-    DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken, GpuSamplingRow,
-    GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections, Nvfp4Matrix,
-    Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result, Sm12xKvAttentionWorkspace,
-    Sm12xKvPagePool, add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_two_rows_f32_into_on_stream,
-    bf16_to_f32_prefix_into_on_stream, dflash2_capture_f32_into_on_stream,
-    f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
+    DeviceAddress, DeviceBuffer, Fp4TnMatmulPlan, Fp8TnMatmulPlan, GemmShape, GpuSampledToken,
+    GpuSamplingRow, GpuTokenSampler, MoeSortedNvfp4Rows, MoeSortedRoutes, MropeSections,
+    Nvfp4Matrix, Nvfp4TnInputs, PinnedHostBuffer, Qwen36ChunkedGdn, Result,
+    Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_prefix_into_on_stream,
+    argmax_f32_batch_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_two_rows_f32_into_on_stream, bf16_to_f32_prefix_into_on_stream,
+    dflash2_capture_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
@@ -1762,8 +1762,8 @@ struct BatchGroupedMoeWorkspace {
     down_plan: CutlassFp4GroupedGemmPlan,
     gate_up: DeviceBuffer<u16>,
     down: DeviceBuffer<u16>,
-    gate_up_output_table: DeviceBuffer<*mut u16>,
-    down_output_table: DeviceBuffer<*mut u16>,
+    gate_up_output_table: DeviceBuffer<DeviceAddress<u16>>,
+    down_output_table: DeviceBuffer<DeviceAddress<u16>>,
     routed_output: DeviceBuffer<f32>,
 }
 

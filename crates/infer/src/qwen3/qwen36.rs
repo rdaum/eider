@@ -28,7 +28,7 @@ pub(crate) use sequence::{Qwen36Append, qwen36_cache_error};
 
 use crate::metrics::ExpertPagingMetricHandle;
 use eider_cuda::{
-    CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Error, F32Matrix,
+    CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, F32Matrix,
     Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
     ModelOptCublasLtWeight, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
     PinnedHostBuffer, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
@@ -2912,14 +2912,14 @@ enum Qwen36SharedExpertStorage {
 struct Qwen36GroupedMoeWeights {
     _gate_up: Vec<ModelOptCublasLtWeight>,
     _down: Vec<ModelOptCublasLtWeight>,
-    gate_up_values: DeviceBuffer<*const u8>,
-    gate_up_scales: DeviceBuffer<*const u8>,
+    gate_up_values: DeviceBuffer<DeviceAddress<u8>>,
+    gate_up_scales: DeviceBuffer<DeviceAddress<u8>>,
     _gate_up_alphas: DeviceBuffer<f32>,
-    gate_up_alpha_table: DeviceBuffer<*mut f32>,
-    down_values: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u8>,
+    gate_up_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_values: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u8>>,
     _down_alphas: DeviceBuffer<f32>,
-    down_alpha_table: DeviceBuffer<*mut f32>,
+    down_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 impl Qwen36GroupedMoeWeights {
@@ -2929,34 +2929,34 @@ impl Qwen36GroupedMoeWeights {
     ) -> Result<Self> {
         let gate_up_values = gate_up
             .iter()
-            .map(|weight| weight.matrix().values_ptr())
+            .map(|weight| weight.matrix().values_address())
             .collect::<Vec<_>>();
         let gate_up_scales = gate_up
             .iter()
-            .map(|weight| weight.matrix().scales_ptr())
+            .map(|weight| weight.matrix().scales_address())
             .collect::<Vec<_>>();
         let down_values = down
             .iter()
-            .map(|weight| weight.matrix().values_ptr())
+            .map(|weight| weight.matrix().values_address())
             .collect::<Vec<_>>();
         let down_scales = down
             .iter()
-            .map(|weight| weight.matrix().scales_ptr())
+            .map(|weight| weight.matrix().scales_address())
             .collect::<Vec<_>>();
-        let mut gate_up_alphas = DeviceBuffer::from_host(
+        let gate_up_alphas = DeviceBuffer::from_host(
             &gate_up
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let gate_up_alpha_table = scalar_pointer_table(&mut gate_up_alphas)?;
-        let mut down_alphas = DeviceBuffer::from_host(
+        let gate_up_alpha_table = scalar_pointer_table(&gate_up_alphas)?;
+        let down_alphas = DeviceBuffer::from_host(
             &down
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let down_alpha_table = scalar_pointer_table(&mut down_alphas)?;
+        let down_alpha_table = scalar_pointer_table(&down_alphas)?;
         Ok(Self {
             gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
@@ -2972,11 +2972,11 @@ impl Qwen36GroupedMoeWeights {
     }
 }
 
-fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
-    let base = values.as_const_ptr().cast::<f32>().cast_mut();
+fn scalar_pointer_table(values: &DeviceBuffer<f32>) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
+    let base = values.cuda_address();
     let pointers = (0..values.len())
-        .map(|index| unsafe { base.add(index) })
-        .collect::<Vec<_>>();
+        .map(|index| base.offset(index))
+        .collect::<Result<Vec<_>>>()?;
     DeviceBuffer::from_host(&pointers)
 }
 

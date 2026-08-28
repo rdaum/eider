@@ -3,8 +3,8 @@
 //! CUDA kernels for non-GEMM decode operations.
 
 use crate::cuda::{
-    CudaStream, DeviceBuffer, DeviceInOut, DeviceMatrix, DeviceMatrixMut, DeviceOutput, DeviceRepr,
-    PinnedHostBuffer, RowMajor, check_cuda, max_shared_memory_per_block,
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, DeviceMatrix, DeviceMatrixMut,
+    DeviceOutput, DeviceRepr, PinnedHostBuffer, RowMajor, check_cuda, max_shared_memory_per_block,
 };
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -2087,8 +2087,8 @@ pub struct MoeSortedNvfp4Rows {
     scales: DeviceBuffer<u8>,
     source_packed: DeviceBuffer<u8>,
     source_scales: DeviceBuffer<u8>,
-    packed_table: DeviceBuffer<*const u8>,
-    scale_table: DeviceBuffer<*const u8>,
+    packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    scale_table: DeviceBuffer<DeviceAddress<u8>>,
 }
 
 impl MoeSortedNvfp4Rows {
@@ -2420,7 +2420,7 @@ impl MoeSortedNvfp4Rows {
         &mut self,
         routes: &MoeSortedRoutes,
         output: &mut DeviceBuffer<u16>,
-        output_table: &mut DeviceBuffer<*mut u16>,
+        output_table: &mut DeviceBuffer<DeviceAddress<u16>>,
         out_features: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -2456,9 +2456,9 @@ impl MoeSortedNvfp4Rows {
                     self.packed.ptr,
                     self.scales.ptr,
                     output.ptr,
-                    self.packed_table.ptr,
-                    self.scale_table.ptr,
-                    output_table.ptr,
+                    self.packed_table.ptr.cast(),
+                    self.scale_table.ptr.cast(),
+                    output_table.ptr.cast(),
                     self.experts as u32,
                     self.in_features as u32,
                     out_features as u32,
@@ -2470,12 +2470,12 @@ impl MoeSortedNvfp4Rows {
     }
 
     /// Returns the expert-indexed packed activation pointer table.
-    pub fn packed_table(&self) -> &DeviceBuffer<*const u8> {
+    pub fn packed_table(&self) -> &DeviceBuffer<DeviceAddress<u8>> {
         &self.packed_table
     }
 
     /// Returns the expert-indexed tiled scale pointer table.
-    pub fn scale_table(&self) -> &DeviceBuffer<*const u8> {
+    pub fn scale_table(&self) -> &DeviceBuffer<DeviceAddress<u8>> {
         &self.scale_table
     }
 

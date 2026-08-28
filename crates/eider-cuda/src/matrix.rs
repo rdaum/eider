@@ -1,6 +1,6 @@
 //! Matrix owner types for the current cuBLASLt FP4 path.
 
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, HostRead};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInput, DeviceOutput, HostRead};
 use crate::error::{Error, Result};
 use crate::format;
 
@@ -268,9 +268,25 @@ impl Nvfp4Matrix {
         self.values.as_const_ptr().cast()
     }
 
+    /// Returns the opaque address of the packed E2M1 payload.
+    ///
+    /// This is for CUDA-owned pointer-table plans. It remains valid while this
+    /// matrix is retained and cannot be dereferenced by host code.
+    pub fn values_address(&self) -> DeviceAddress<u8> {
+        self.values.cuda_address()
+    }
+
     /// Returns the UE4M3 scale metadata pointer.
     pub fn scales_ptr(&self) -> *const u8 {
         self.scales.as_const_ptr().cast()
+    }
+
+    /// Returns the opaque address of the tiled UE4M3 scale metadata.
+    ///
+    /// This is for CUDA-owned pointer-table plans. It remains valid while this
+    /// matrix is retained and cannot be dereferenced by host code.
+    pub fn scales_address(&self) -> DeviceAddress<u8> {
+        self.scales.cuda_address()
     }
 
     /// Synchronizes `stream` and copies the packed E2M1 payload to host memory.
@@ -436,6 +452,11 @@ impl Bf16Matrix {
     /// Returns the BF16 data pointer.
     pub fn data_ptr(&self) -> *const u16 {
         self.data.as_const_ptr().cast()
+    }
+
+    /// Returns the opaque address of the BF16 matrix data.
+    pub fn data_address(&self) -> DeviceAddress<u16> {
+        self.data.cuda_address()
     }
 
     /// Returns the BF16 data output pointer.

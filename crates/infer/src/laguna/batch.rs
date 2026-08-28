@@ -4,8 +4,8 @@ use crate::metrics::metrics;
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, GemmShape, MoeSortedNvfp4Rows,
-    MoeSortedRoutes, add_f32_prefix_into_on_stream,
+    Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, DeviceAddress, GemmShape,
+    MoeSortedNvfp4Rows, MoeSortedRoutes, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
     fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
@@ -221,7 +221,7 @@ struct LagunaBatchMoeWorkspace {
     gate_up_input: MoeSortedNvfp4Rows,
     gate_up_plan: CutlassFp4GroupedGemmPlan,
     gate_up_output: DeviceBuffer<u16>,
-    gate_up_output_table: DeviceBuffer<*mut u16>,
+    gate_up_output_table: DeviceBuffer<DeviceAddress<u16>>,
     down: LagunaBatchDownWorkspace,
     routed: DeviceBuffer<f32>,
     shared: LagunaBatchMlpWorkspace,
@@ -861,12 +861,12 @@ fn run_moe_prefill(
         stream,
     )?;
     workspace.gate_up_plan.run_on_stream(
-        &moe.gate_up_values,
-        &moe.gate_up_scales,
+        &moe.gate_up_grouped_values,
+        &moe.gate_up_grouped_scales,
         workspace.gate_up_input.packed_table(),
         workspace.gate_up_input.scale_table(),
         &workspace.gate_up_output_table,
-        &moe.gate_up_alpha_table,
+        &moe.gate_up_grouped_alpha_table,
         workspace.sorted_routes.expert_counts(),
         stream,
     )?;

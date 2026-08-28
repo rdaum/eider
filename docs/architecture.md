@@ -57,6 +57,9 @@ boundaries.
 `eider-cuda` denies unchecked unsafe operations inside unsafe functions.
 CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
 `DeviceAddress` values in their device pointer tables instead of raw pointers.
+The persistent CUTLASS grouped-GEMM plan and its Qwen, Gemma, and Laguna
+prefill callers also use opaque address tables for weights, activations,
+outputs, and per-expert scales.
 Model sources and focused benchmarks import host ModelOpt records directly
 from `eider-format`; `eider-cuda` exports only CUDA preparation and execution
 types.

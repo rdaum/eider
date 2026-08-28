@@ -1,6 +1,6 @@
 use super::descriptors::{MatmulDesc, MatmulPreference, MatrixLayout};
 use super::handle::CublasLt;
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, check_cublas, check_cuda};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, check_cublas, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::matrix::{Bf16Matrix, F32Matrix, Nvfp4Matrix};
@@ -1149,12 +1149,12 @@ impl CutlassFp4GroupedGemmPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn run_on_stream(
         &self,
-        a_values: &DeviceBuffer<*const u8>,
-        a_scales: &DeviceBuffer<*const u8>,
-        b_values: &DeviceBuffer<*const u8>,
-        b_scales: &DeviceBuffer<*const u8>,
-        output: &DeviceBuffer<*mut u16>,
-        alpha: &DeviceBuffer<*mut f32>,
+        a_values: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales: &DeviceBuffer<DeviceAddress<u8>>,
+        b_values: &DeviceBuffer<DeviceAddress<u8>>,
+        b_scales: &DeviceBuffer<DeviceAddress<u8>>,
+        output: &DeviceBuffer<DeviceAddress<u16>>,
+        alpha: &DeviceBuffer<DeviceAddress<f32>>,
         tokens_per_expert: &DeviceBuffer<u32>,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1786,28 +1786,28 @@ mod tests {
         let a_values = DeviceBuffer::from_host(
             &a_matrices
                 .iter()
-                .map(|matrix| matrix.input().values_ptr())
+                .map(Nvfp4Matrix::values_address)
                 .collect::<Vec<_>>(),
         )
         .expect("A values table");
         let a_scales = DeviceBuffer::from_host(
             &a_matrices
                 .iter()
-                .map(|matrix| matrix.input().scales_ptr())
+                .map(Nvfp4Matrix::scales_address)
                 .collect::<Vec<_>>(),
         )
         .expect("A scales table");
         let b_values = DeviceBuffer::from_host(
             &b_matrices
                 .iter()
-                .map(|matrix| matrix.input().values_ptr())
+                .map(Nvfp4Matrix::values_address)
                 .collect::<Vec<_>>(),
         )
         .expect("B values table");
         let b_scales = DeviceBuffer::from_host(
             &b_matrices
                 .iter()
-                .map(|matrix| matrix.input().scales_ptr())
+                .map(Nvfp4Matrix::scales_address)
                 .collect::<Vec<_>>(),
         )
         .expect("B scales table");
@@ -1818,7 +1818,7 @@ mod tests {
             .collect::<Vec<_>>();
         let output_ptrs = outputs
             .iter_mut()
-            .map(|output| output.output().data_mut_ptr())
+            .map(|output| output.data_address())
             .collect::<Vec<_>>();
         let output = DeviceBuffer::from_host(&output_ptrs).expect("D table");
         let mut alpha_storage = (0..groups)
@@ -1827,7 +1827,7 @@ mod tests {
         let alpha = DeviceBuffer::from_host(
             &alpha_storage
                 .iter_mut()
-                .map(|scalar| scalar.as_mut_ptr().cast::<f32>())
+                .map(|scalar| scalar.cuda_address())
                 .collect::<Vec<_>>(),
         )
         .expect("alpha table");
