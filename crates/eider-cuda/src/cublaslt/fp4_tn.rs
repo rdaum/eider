@@ -960,6 +960,60 @@ impl CutlassFp4GroupedGemvF32Plan {
         d: &DeviceBuffer<*mut f32>,
         stream: &CudaStream,
     ) -> Result<()> {
+        self.run_indexed_a_tiled_scales_impl(
+            indices,
+            a_values_table,
+            a_scales_table,
+            alpha_table,
+            b,
+            c,
+            d,
+            stream,
+        )
+    }
+
+    /// Launches hardware block-scaled grouped GEMV with typed device address
+    /// tables for selected expert weights and output rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_indexed_a_tiled_scale_addresses_on_stream(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        a_values_table: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales_table: &DeviceBuffer<DeviceAddress<u8>>,
+        alpha_table: &DeviceBuffer<f32>,
+        b: &Nvfp4Matrix,
+        c: &F32Matrix,
+        d: &DeviceBuffer<DeviceAddress<f32>>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.run_indexed_a_tiled_scales_impl(
+            indices,
+            a_values_table,
+            a_scales_table,
+            alpha_table,
+            b,
+            c,
+            d,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_indexed_a_tiled_scales_impl<
+        T: crate::cuda::DeviceRepr,
+        U: crate::cuda::DeviceRepr,
+        V: crate::cuda::DeviceRepr,
+    >(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        a_values_table: &DeviceBuffer<T>,
+        a_scales_table: &DeviceBuffer<U>,
+        alpha_table: &DeviceBuffer<f32>,
+        b: &Nvfp4Matrix,
+        c: &F32Matrix,
+        d: &DeviceBuffer<V>,
+        stream: &CudaStream,
+    ) -> Result<()> {
         if indices.len() != self.groups || d.len() != self.groups {
             return Err(Error::Shape {
                 label: "CUTLASS indexed block-scaled FP4 GEMV route arrays",

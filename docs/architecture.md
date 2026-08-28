@@ -90,6 +90,8 @@ remains while focused benchmarks migrate.
 Step-3.7 and Laguna SM12x gate/up quantization now also receive typed F32
 activation address tables. `DeviceBuffer::address_at` bounds-checks their
 element offsets while the CUDA boundary preserves the native table ABI.
+Laguna's CUTLASS routed gate/up plan now uses its typed expert weight, scale,
+and output tables directly; the remaining legacy raw-table caller is Qwen3.6.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both

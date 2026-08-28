@@ -738,8 +738,6 @@ struct LagunaMoe {
     router: Bf16Linear,
     correction_bias: DeviceBuffer<f32>,
     _gate_up: Vec<ModelOptCublasLtWeight>,
-    gate_up_values: DeviceBuffer<*const u8>,
-    gate_up_scales: DeviceBuffer<*const u8>,
     gate_up_alphas: DeviceBuffer<f32>,
     gate_up_grouped_values: DeviceBuffer<DeviceAddress<u8>>,
     gate_up_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
@@ -762,7 +760,7 @@ struct LagunaMoeWorkspace {
     gate_up_plan: CutlassFp4GroupedGemvF32Plan,
     gate_up_output: DeviceBuffer<f32>,
     gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
-    gate_up_output_table: DeviceBuffer<*mut f32>,
+    gate_up_output_table: DeviceBuffer<DeviceAddress<f32>>,
     down_tiles: DeviceBuffer<u8>,
     down_scales: DeviceBuffer<u32>,
     _down_outputs: Vec<F32Matrix>,
@@ -828,14 +826,6 @@ impl LagunaMoe {
                 actual: format!("expert {expert}: {}x{}", shape.rows, shape.cols),
             });
         }
-        let gate_up_values = gate_up
-            .iter()
-            .map(|weight| weight.matrix().values_ptr())
-            .collect::<Vec<_>>();
-        let gate_up_scales = gate_up
-            .iter()
-            .map(|weight| weight.matrix().scales_ptr())
-            .collect::<Vec<_>>();
         let gate_up_grouped_values = gate_up
             .iter()
             .map(|weight| weight.matrix().values_address())
@@ -873,8 +863,6 @@ impl LagunaMoe {
             router,
             correction_bias,
             _gate_up: gate_up,
-            gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
-            gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
             gate_up_alphas,
             gate_up_grouped_values: DeviceBuffer::from_host(&gate_up_grouped_values)?,
             gate_up_grouped_scales: DeviceBuffer::from_host(&gate_up_grouped_scales)?,
@@ -896,7 +884,6 @@ impl LagunaMoe {
     fn new_workspace(&self) -> Result<LagunaMoeWorkspace> {
         let gate_up_width = EXPERT_INTERMEDIATE * 2;
         let gate_up_output = DeviceBuffer::zeroed(TOP_K * gate_up_width)?;
-        let gate_up_base = gate_up_output.as_const_ptr().cast::<f32>();
         let gate_up_table = DeviceBuffer::from_host(
             &(0..TOP_K)
                 .map(|slot| gate_up_output.address_at(slot * gate_up_width))
@@ -904,8 +891,8 @@ impl LagunaMoe {
         )?;
         let gate_up_output_table = DeviceBuffer::from_host(
             &(0..TOP_K)
-                .map(|slot| unsafe { gate_up_base.cast_mut().add(slot * gate_up_width) })
-                .collect::<Vec<_>>(),
+                .map(|slot| gate_up_output.address_at(slot * gate_up_width))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let mut down_outputs = Vec::with_capacity(TOP_K);
         let mut down_inputs = Vec::with_capacity(TOP_K);
@@ -970,10 +957,10 @@ impl LagunaMoe {
         )?;
         workspace
             .gate_up_plan
-            .run_indexed_a_tiled_scales_on_stream(
+            .run_indexed_a_tiled_scale_addresses_on_stream(
                 &workspace.route_indices,
-                &self.gate_up_values,
-                &self.gate_up_scales,
+                &self.gate_up_grouped_values,
+                &self.gate_up_grouped_scales,
                 &self.gate_up_alphas,
                 &workspace.gate_up_input,
                 &workspace.gate_up_c,
@@ -1026,8 +1013,6 @@ impl LagunaMoe {
                 .iter()
                 .map(ModelOptCublasLtWeight::device_bytes)
                 .sum::<usize>()
-            + self.gate_up_values.device_bytes()
-            + self.gate_up_scales.device_bytes()
             + self.gate_up_alphas.device_bytes()
             + self.gate_up_grouped_values.device_bytes()
             + self.gate_up_grouped_scales.device_bytes()
