@@ -7,7 +7,7 @@ use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{Qwen36BatchModelView, load_hybrid_full_attention};
 use crate::qwen38_flash_next::Qwen38FlashNextPageBackend;
 use crate::sm12x_cache::Sm12xPage;
-use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result, SM12X_KV_PAGE_TOKENS};
+use eider_cuda::{CublasLt, CudaStream, DeviceAddress, DeviceBuffer, Result, SM12X_KV_PAGE_TOKENS};
 use eider_format::ModelOptCheckpoint;
 use std::path::Path;
 
@@ -156,14 +156,14 @@ impl Qwen38HyperPrefillMicrobench {
         &self.stream
     }
 
-    /// One output pointer for benchmark black-boxing.
-    pub fn serial_output_ptr(&self) -> *const std::ffi::c_void {
-        self.serial_output.as_const_ptr()
+    /// One output address for benchmark black-boxing.
+    pub fn serial_output_address(&self) -> DeviceAddress<f32> {
+        self.serial_output.cuda_address()
     }
 
-    /// One output pointer for benchmark black-boxing.
-    pub fn tensor_output_ptr(&self) -> *const std::ffi::c_void {
-        self.tensor_output.as_const_ptr()
+    /// One output address for benchmark black-boxing.
+    pub fn tensor_output_address(&self) -> DeviceAddress<f32> {
+        self.tensor_output.cuda_address()
     }
 }
 
@@ -396,9 +396,9 @@ impl Qwen38QsaPrefillMicrobench {
         &self.stream
     }
 
-    /// One output pointer for benchmark black-boxing.
-    pub fn serial_output_ptr(&self) -> *const std::ffi::c_void {
-        self.serial_output.as_const_ptr()
+    /// One output address for benchmark black-boxing.
+    pub fn serial_output_address(&self) -> DeviceAddress<f32> {
+        self.serial_output.cuda_address()
     }
 }
 

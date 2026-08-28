@@ -178,8 +178,8 @@ impl Qwen36GdnDecodeBench {
     fn elapsed_sample(&self, chunk_size: usize) -> BenchSampleResult {
         self.stop.synchronize().expect("stop synchronize");
         let total_ms = self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64;
-        black_box(self.states[0].as_const_ptr());
-        black_box(self.normed.as_const_ptr());
+        black_box(self.states[0].cuda_address());
+        black_box(self.normed.cuda_address());
         BenchSampleResult::operations(chunk_size as u64).push_metric(
             MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
                 .with_display_name("CUDA event"),

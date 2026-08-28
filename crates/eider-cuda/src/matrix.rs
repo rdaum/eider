@@ -263,8 +263,7 @@ impl Nvfp4Matrix {
         (self.rows * self.cols).div_ceil(2)
     }
 
-    /// Returns the packed E2M1 payload pointer.
-    pub fn values_ptr(&self) -> *const u8 {
+    pub(crate) fn values_ptr(&self) -> *const u8 {
         self.values.as_const_ptr().cast()
     }
 
@@ -276,8 +275,7 @@ impl Nvfp4Matrix {
         self.values.cuda_address()
     }
 
-    /// Returns the UE4M3 scale metadata pointer.
-    pub fn scales_ptr(&self) -> *const u8 {
+    pub(crate) fn scales_ptr(&self) -> *const u8 {
         self.scales.as_const_ptr().cast()
     }
 
@@ -297,16 +295,6 @@ impl Nvfp4Matrix {
     /// Synchronizes `stream` and copies the UE4M3 scale metadata to host memory.
     pub fn copy_scales_to_host<'a>(&'a self, stream: &CudaStream) -> Result<HostRead<'a, u8>> {
         self.scales.copy_to_host(stream)
-    }
-
-    /// Returns the packed E2M1 payload output pointer.
-    pub fn values_mut_ptr(&mut self) -> *mut u8 {
-        self.values.as_mut_ptr().cast()
-    }
-
-    /// Returns the UE4M3 scale metadata output pointer.
-    pub fn scales_mut_ptr(&mut self) -> *mut u8 {
-        self.scales.as_mut_ptr().cast()
     }
 
     /// Borrows this matrix as a kernel input role.
@@ -449,19 +437,9 @@ impl Bf16Matrix {
         &self.data
     }
 
-    /// Returns the BF16 data pointer.
-    pub fn data_ptr(&self) -> *const u16 {
-        self.data.as_const_ptr().cast()
-    }
-
     /// Returns the opaque address of the BF16 matrix data.
     pub fn data_address(&self) -> DeviceAddress<u16> {
         self.data.cuda_address()
-    }
-
-    /// Returns the BF16 data output pointer.
-    pub fn data_mut_ptr(&mut self) -> *mut u16 {
-        self.data.as_mut_ptr().cast()
     }
 
     /// Borrows this matrix as a kernel input role.
@@ -585,19 +563,13 @@ impl F32Matrix {
         &mut self.data
     }
 
-    /// Returns the F32 data pointer.
-    pub fn data_ptr(&self) -> *const f32 {
+    pub(crate) fn data_ptr(&self) -> *const f32 {
         self.data.as_const_ptr().cast()
     }
 
     /// Returns the opaque address of the F32 matrix data.
     pub fn data_address(&self) -> DeviceAddress<f32> {
         self.data.cuda_address()
-    }
-
-    /// Returns the F32 data output pointer.
-    pub fn data_mut_ptr(&mut self) -> *mut f32 {
-        self.data.as_mut_ptr().cast()
     }
 
     /// Borrows this matrix as a kernel input role.

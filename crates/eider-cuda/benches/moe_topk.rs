@@ -230,7 +230,7 @@ fn topk_sample(ctx: &mut MoeTopkBench, chunk_size: usize, _chunk_num: usize) -> 
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.indices.as_const_ptr());
+    black_box(ctx.indices.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -249,7 +249,7 @@ fn topk_batch_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.indices.as_const_ptr());
+    black_box(ctx.indices.cuda_address());
     BenchSampleResult::operations((chunk_size * PREFILL_ROWS) as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms/chunk")
             .with_display_name("CUDA event"),
@@ -268,7 +268,7 @@ fn qwen38_topk_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.indices.as_const_ptr());
+    black_box(ctx.indices.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

@@ -165,7 +165,7 @@ fn f32_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.f32_output.as_const_ptr());
+    black_box(ctx.f32_output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -197,7 +197,7 @@ fn nvfp4_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.nvfp4_output.as_const_ptr());
+    black_box(ctx.nvfp4_output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -409,7 +409,7 @@ fn compact_attention_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -428,7 +428,7 @@ fn compact_qk_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.workspace.scores().as_const_ptr());
+    black_box(ctx.workspace.scores().cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -447,7 +447,7 @@ fn compact_indexed_attention_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -466,7 +466,7 @@ fn compact_pv_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -485,7 +485,7 @@ fn compact_pv_split_sample<const CACHE_LEN: usize, const PV_SPLITS: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -578,7 +578,7 @@ fn tile_qk_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -735,7 +735,7 @@ fn tile_attention_sample<const CACHE_LEN: usize>(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -874,7 +874,7 @@ fn causal_prefill_serial_sample(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.serial_output.as_const_ptr());
+    black_box(ctx.serial_output.cuda_address());
     BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -893,7 +893,7 @@ fn causal_prefill_batched_sample(
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
-    black_box(ctx.batched_output.as_const_ptr());
+    black_box(ctx.batched_output.cuda_address());
     BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -909,19 +909,19 @@ fn main() {
                 let mut context = CompactKvAttentionBench::<4_096>::new();
                 context.run_attention();
                 context.stream.synchronize().expect("profile synchronize");
-                black_box(context.output.as_const_ptr());
+                black_box(context.output.cuda_address());
             }
             Some("32k") => {
                 let mut context = CompactKvAttentionBench::<32_768>::new();
                 context.run_attention();
                 context.stream.synchronize().expect("profile synchronize");
-                black_box(context.output.as_const_ptr());
+                black_box(context.output.cuda_address());
             }
             Some("128k") => {
                 let mut context = CompactKvAttentionBench::<131_072>::new();
                 context.run_attention();
                 context.stream.synchronize().expect("profile synchronize");
-                black_box(context.output.as_const_ptr());
+                black_box(context.output.cuda_address());
             }
             profile => panic!("unknown compact KV profile {profile:?}"),
         }

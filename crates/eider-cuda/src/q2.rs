@@ -636,12 +636,12 @@ impl Q2Matrix {
     }
 
     /// Device pointer to packed two-bit values.
-    pub fn values_ptr(&self) -> DeviceAddress<u8> {
+    pub fn values_address(&self) -> DeviceAddress<u8> {
         self.packed_values.cuda_address()
     }
 
     /// Device pointer to block scales.
-    pub fn scales_ptr(&self) -> DeviceAddress<u16> {
+    pub fn scales_address(&self) -> DeviceAddress<u16> {
         self.scales.cuda_address()
     }
 }
@@ -1883,8 +1883,8 @@ mod tests {
         let input = DeviceBuffer::from_host(&input).expect("device input");
         let output = DeviceBuffer::zeroed(rows).expect("device output");
         let indices = DeviceBuffer::from_host(&[0u32]).expect("indices");
-        let values = DeviceBuffer::from_host(&[weight.values_ptr()]).expect("values table");
-        let scales = DeviceBuffer::from_host(&[weight.scales_ptr()]).expect("scales table");
+        let values = DeviceBuffer::from_host(&[weight.values_address()]).expect("values table");
+        let scales = DeviceBuffer::from_host(&[weight.scales_address()]).expect("scales table");
         let outputs = DeviceBuffer::from_host(&[output.cuda_address()]).expect("output table");
         q2_w2a16_grouped_matvec_f32_into_on_stream(
             &indices, &input, &values, &scales, &outputs, rows, cols, &stream,

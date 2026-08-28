@@ -389,7 +389,7 @@ fn fused_local_sample(
         .record_on_stream(&context.stream)
         .expect("stop");
     context.stop.synchronize().expect("synchronize");
-    black_box(context.fused_output.as_const_ptr());
+    black_box(context.fused_output.cuda_address());
     BenchSampleResult::operations((chunk * TOKENS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         context
@@ -446,7 +446,7 @@ fn compact_local_sample(
         .record_on_stream(&context.stream)
         .expect("stop");
     context.stop.synchronize().expect("synchronize");
-    black_box(context.fused_output.as_const_ptr());
+    black_box(context.fused_output.cuda_address());
     BenchSampleResult::operations((chunk * TOKENS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         context
@@ -542,7 +542,7 @@ fn sample<const KV_HEADS: usize, const HEAD_DIM: usize, const WINDOW: usize>(
         .record_on_stream(&context.stream)
         .expect("stop");
     context.stop.synchronize().expect("synchronize");
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations((chunk * TOKENS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         context

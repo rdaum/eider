@@ -713,18 +713,18 @@ impl<const TOKENS: usize> Qwen36ProjectionBench<TOKENS> {
         self.stop.synchronize().expect("synchronize");
         let selected_weight_bytes = match path {
             ProjectionPath::Fp8 => {
-                black_box(self.fp8_qkv.output.as_const_ptr());
-                black_box(self.fp8_out.output.as_const_ptr());
+                black_box(self.fp8_qkv.output.cuda_address());
+                black_box(self.fp8_out.output.cuda_address());
                 fp8_weight_bytes
             }
             ProjectionPath::Nvfp4 => {
-                black_box(self.nvfp4_qkv.output.data_ptr());
-                black_box(self.nvfp4_out.output.data_ptr());
+                black_box(self.nvfp4_qkv.output.data_address());
+                black_box(self.nvfp4_out.output.data_address());
                 nvfp4_weight_bytes
             }
             ProjectionPath::CutlassNvfp4 => {
-                black_box(self.nvfp4_qkv.output.data_ptr());
-                black_box(self.nvfp4_out.output.data_ptr());
+                black_box(self.nvfp4_qkv.output.data_address());
+                black_box(self.nvfp4_out.output.data_address());
                 nvfp4_weight_bytes
             }
             ProjectionPath::W4A16 => {
@@ -733,14 +733,14 @@ impl<const TOKENS: usize> Qwen36ProjectionBench<TOKENS> {
                         .as_ref()
                         .expect("decode W4A16 qkv")
                         .output
-                        .as_const_ptr(),
+                        .cuda_address(),
                 );
                 black_box(
                     self.w4a16_out
                         .as_ref()
                         .expect("decode W4A16 out")
                         .output
-                        .as_const_ptr(),
+                        .cuda_address(),
                 );
                 nvfp4_weight_bytes
             }
@@ -927,12 +927,12 @@ fn run_abenchting_profile(profile: &str) {
     context.stream.synchronize().expect("profile synchronize");
     match profile {
         "fp8-linear" | "fp8-full" => {
-            black_box(context.fp8_qkv.output.as_const_ptr());
-            black_box(context.fp8_out.output.as_const_ptr());
+            black_box(context.fp8_qkv.output.cuda_address());
+            black_box(context.fp8_out.output.cuda_address());
         }
         "nvfp4-linear" | "nvfp4-full" => {
-            black_box(context.nvfp4_qkv.output.data_ptr());
-            black_box(context.nvfp4_out.output.data_ptr());
+            black_box(context.nvfp4_qkv.output.data_address());
+            black_box(context.nvfp4_out.output.data_address());
         }
         _ => unreachable!(),
     }

@@ -508,9 +508,9 @@ impl Qwen36RoutedMoeDecodeBench {
             .elapsed_ms_until(&self.stop)
             .expect("elapsed time") as f64
             / chunk_size as f64;
-        black_box(self.w4a16_down.reduced.as_const_ptr());
-        black_box(self.w4a4_down.reduced.as_const_ptr());
-        black_box(self.grouped_w4a4.reduced.as_const_ptr());
+        black_box(self.w4a16_down.reduced.cuda_address());
+        black_box(self.w4a4_down.reduced.cuda_address());
+        black_box(self.grouped_w4a4.reduced.cuda_address());
         black_box(self.w4a4_gate_up_weights.len());
         black_box(self.grouped_gate_up_alpha_values.len());
         black_box(self.grouped_down_weights.len());

@@ -307,7 +307,7 @@ fn sm12x_indexed_gate_up(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.outputs[0].data_ptr());
+    black_box(ctx.outputs[0].data_address());
     black_box(ctx.weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
@@ -348,7 +348,7 @@ fn sm12x_qwen_gate_up(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.gate_outputs[0].data_ptr());
+    black_box(ctx.gate_outputs[0].data_address());
     black_box(ctx.gate_weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
@@ -389,7 +389,7 @@ fn sm12x_qwen_down(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.down_outputs[0].data_ptr());
+    black_box(ctx.down_outputs[0].data_address());
     black_box(ctx.down_weights[0].tiles_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
@@ -413,7 +413,7 @@ fn sm12x_qwen_gate_up_graph(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.gate_outputs[0].data_ptr());
+    black_box(ctx.gate_outputs[0].data_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

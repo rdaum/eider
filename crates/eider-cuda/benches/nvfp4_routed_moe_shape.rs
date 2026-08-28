@@ -133,9 +133,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
                 .expect("gate/up grouped GEMV");
         }
         self.stream.synchronize().expect("sync gate/up bench");
-        black_box(self.gate_up.outputs[0].data_ptr());
-        black_box(self.gate_up.owned_a_values[0].as_const_ptr());
-        black_box(self.gate_up.owned_a_scales[0].as_const_ptr());
+        black_box(self.gate_up.outputs[0].data_address());
+        black_box(self.gate_up.owned_a_values[0].cuda_address());
+        black_box(self.gate_up.owned_a_scales[0].cuda_address());
     }
 
     fn run_down_chunk(&mut self, chunk_size: usize) {
@@ -143,9 +143,9 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.down.run(&self.stream).expect("down grouped GEMV");
         }
         self.stream.synchronize().expect("sync down bench");
-        black_box(self.down.outputs[0].data_ptr());
-        black_box(self.down.owned_b_values[0].as_const_ptr());
-        black_box(self.down.owned_b_scales[0].as_const_ptr());
+        black_box(self.down.outputs[0].data_address());
+        black_box(self.down.owned_b_values[0].cuda_address());
+        black_box(self.down.owned_b_scales[0].cuda_address());
     }
 
     fn run_gate_up_down_chunk(&mut self, chunk_size: usize) {
@@ -156,8 +156,8 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.down.run(&self.stream).expect("down grouped GEMV");
         }
         self.stream.synchronize().expect("sync routed bench");
-        black_box(self.gate_up.outputs[0].data_ptr());
-        black_box(self.down.outputs[0].data_ptr());
+        black_box(self.gate_up.outputs[0].data_address());
+        black_box(self.down.outputs[0].data_address());
     }
 
     fn run_gate_up_contiguous_chunk(&mut self, chunk_size: usize) {
@@ -169,7 +169,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync gate/up contiguous bench");
-        black_box(self.gate_up.contiguous_output.as_const_ptr());
+        black_box(self.gate_up.contiguous_output.cuda_address());
     }
 
     fn run_down_contiguous_chunk(&mut self, chunk_size: usize) {
@@ -181,7 +181,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync down contiguous bench");
-        black_box(self.down.contiguous_output.as_const_ptr());
+        black_box(self.down.contiguous_output.cuda_address());
     }
 
     fn run_gate_up_down_contiguous_chunk(&mut self, chunk_size: usize) {
@@ -196,8 +196,8 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync gate/up down contiguous bench");
-        black_box(self.gate_up.contiguous_output.as_const_ptr());
-        black_box(self.down.contiguous_output.as_const_ptr());
+        black_box(self.gate_up.contiguous_output.cuda_address());
+        black_box(self.down.contiguous_output.cuda_address());
     }
 
     fn run_routed_core_chunk(&mut self, chunk_size: usize) {
@@ -230,7 +230,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             .expect("weighted reduce slots");
         }
         self.stream.synchronize().expect("sync routed core bench");
-        black_box(self.reduced.as_const_ptr());
+        black_box(self.reduced.cuda_address());
     }
 
     fn run_sm12x_gate_up_chunk(&mut self, chunk_size: usize) {
@@ -248,7 +248,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
                 .expect("SM12x gate/up GEMV");
         }
         self.stream.synchronize().expect("sync SM12x gate/up bench");
-        black_box(self.sm12x_gate_up.outputs[0].data_ptr());
+        black_box(self.sm12x_gate_up.outputs[0].data_address());
         black_box(self.sm12x_gate_up.weights[0].tiles_address());
     }
 
@@ -271,7 +271,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
                 .expect("SM12x down GEMV");
         }
         self.stream.synchronize().expect("sync SM12x down bench");
-        black_box(self.sm12x_down.outputs[0].data_ptr());
+        black_box(self.sm12x_down.outputs[0].data_address());
         black_box(self.sm12x_down.weights[0].tiles_address());
     }
 
@@ -293,8 +293,8 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync parallel SM12x SiLU quantize bench");
-        black_box(self.sm12x_down.b_tiles.as_const_ptr());
-        black_box(self.sm12x_down.b_scales.as_const_ptr());
+        black_box(self.sm12x_down.b_tiles.cuda_address());
+        black_box(self.sm12x_down.b_scales.cuda_address());
     }
 
     fn run_sm12x_silu_quantize_reference_chunk(&mut self, chunk_size: usize) {
@@ -315,8 +315,8 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync reference SM12x SiLU quantize bench");
-        black_box(self.sm12x_reference_tiles.as_const_ptr());
-        black_box(self.sm12x_reference_scales.as_const_ptr());
+        black_box(self.sm12x_reference_tiles.cuda_address());
+        black_box(self.sm12x_reference_scales.cuda_address());
     }
 
     fn run_sm12x_silu_quantize_bf16_chunk(&mut self, chunk_size: usize) {
@@ -337,8 +337,8 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync BF16 SM12x SiLU quantize bench");
-        black_box(self.sm12x_reference_tiles.as_const_ptr());
-        black_box(self.sm12x_reference_scales.as_const_ptr());
+        black_box(self.sm12x_reference_tiles.cuda_address());
+        black_box(self.sm12x_reference_scales.cuda_address());
     }
 
     fn verify_sm12x_silu_quantizers(&mut self) -> Result<()> {
@@ -448,7 +448,7 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
         self.stream
             .synchronize()
             .expect("sync SM12x routed core bench");
-        black_box(self.reduced.as_const_ptr());
+        black_box(self.reduced.cuda_address());
     }
 }
 

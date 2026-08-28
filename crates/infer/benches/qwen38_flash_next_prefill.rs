@@ -95,7 +95,7 @@ fn serial_sample(
         .start
         .elapsed_ms_until(&context.stop)
         .expect("serial elapsed") as f64;
-    black_box(context.qsa.serial_output_ptr());
+    black_box(context.qsa.serial_output_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -123,7 +123,7 @@ fn batched_sample(
         .start
         .elapsed_ms_until(&context.stop)
         .expect("batched elapsed") as f64;
-    black_box(context.qsa.serial_output_ptr());
+    black_box(context.qsa.serial_output_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -157,7 +157,7 @@ fn serial_hyper_sample(
         .start
         .elapsed_ms_until(&context.stop)
         .expect("serial hyperconnection elapsed") as f64;
-    black_box(context.hyper.serial_output_ptr());
+    black_box(context.hyper.serial_output_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -191,7 +191,7 @@ fn tensor_hyper_sample(
         .start
         .elapsed_ms_until(&context.stop)
         .expect("tensor hyperconnection elapsed") as f64;
-    black_box(context.hyper.tensor_output_ptr());
+    black_box(context.hyper.tensor_output_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

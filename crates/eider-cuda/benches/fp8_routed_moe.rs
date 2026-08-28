@@ -217,14 +217,14 @@ fn finish(ctx: &mut Fp8RoutedMoeBench, chunk_size: usize) -> BenchSampleResult {
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("synchronize");
     let elapsed = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.output.as_const_ptr());
-    black_box(ctx.down_outputs[0].data_ptr());
-    black_box(ctx.gate_weight.as_const_ptr());
-    black_box(ctx.gate_scale.as_const_ptr());
-    black_box(ctx.up_weight.as_const_ptr());
-    black_box(ctx.up_scale.as_const_ptr());
-    black_box(ctx.down_weight.as_const_ptr());
-    black_box(ctx.down_scale.as_const_ptr());
+    black_box(ctx.output.cuda_address());
+    black_box(ctx.down_outputs[0].data_address());
+    black_box(ctx.gate_weight.cuda_address());
+    black_box(ctx.gate_scale.cuda_address());
+    black_box(ctx.up_weight.cuda_address());
+    black_box(ctx.up_scale.cuda_address());
+    black_box(ctx.down_weight.cuda_address());
+    black_box(ctx.down_scale.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

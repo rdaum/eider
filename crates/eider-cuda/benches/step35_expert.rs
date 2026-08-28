@@ -387,9 +387,9 @@ fn expert_chain_sample(
         .start
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64;
-    black_box(context.aggregate.as_const_ptr());
+    black_box(context.aggregate.cuda_address());
     black_box(context.down_weights[0].tiles_address());
-    black_box(context.down_outputs[0].data_ptr());
+    black_box(context.down_outputs[0].data_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")

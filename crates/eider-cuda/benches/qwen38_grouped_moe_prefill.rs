@@ -308,10 +308,10 @@ impl Qwen38GroupedMoePrefillBench {
         enqueue(self);
         self.stop.record_on_stream(&self.stream).expect("stop");
         self.stop.synchronize().expect("synchronize");
-        black_box(self.routed_output.as_const_ptr());
-        black_box(self.gate_up_weights[0].values_ptr());
-        black_box(self.down_weights[0].values_ptr());
-        black_box(self.alpha.as_const_ptr());
+        black_box(self.routed_output.cuda_address());
+        black_box(self.gate_up_weights[0].values_address());
+        black_box(self.down_weights[0].values_address());
+        black_box(self.alpha.cuda_address());
         BenchSampleResult::operations(self.rows as u64).push_metric(MetricValue::new(
             "cuda_event_ms",
             self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64,

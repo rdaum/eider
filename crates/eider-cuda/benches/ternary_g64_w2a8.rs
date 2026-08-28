@@ -346,7 +346,7 @@ impl<const BATCH: usize, const ROWS: usize, const COLS: usize> LayerProjection
     }
 
     fn retain_output(&self) {
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
     }
 }
 
@@ -370,7 +370,7 @@ impl<const BATCH: usize, const ROWS: usize, const COLS: usize> LayerProjection
     }
 
     fn retain_output(&self) {
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
     }
 }
 
@@ -392,7 +392,7 @@ impl<const ROWS: usize, const COLS: usize> LayerProjection for Nvfp4W4A16Bench<R
     }
 
     fn retain_output(&self) {
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
     }
 }
 
@@ -416,7 +416,7 @@ impl<const BATCH: usize, const ROWS: usize, const COLS: usize> LayerProjection
     }
 
     fn retain_output(&self) {
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
     }
 }
 
@@ -651,7 +651,7 @@ fn sample<const BATCH: usize, const ROWS: usize, const COLS: usize>(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),
@@ -685,7 +685,7 @@ fn sample_bf16<const BATCH: usize, const ROWS: usize, const COLS: usize>(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),
@@ -719,7 +719,7 @@ fn sample_nvfp4_w4a16<const ROWS: usize, const COLS: usize>(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),
@@ -753,7 +753,7 @@ fn sample_nvfp4_w4a4<const BATCH: usize, const ROWS: usize, const COLS: usize>(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),

@@ -135,7 +135,7 @@ fn sample<const ROWS: usize, const COLS: usize>(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),

@@ -284,7 +284,7 @@ impl ChunkedGdnBench {
             .expect("stop event");
         self.stop.synchronize().expect("stage synchronise");
         let elapsed_ms = self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64;
-        black_box(self.workspace.output.as_const_ptr());
+        black_box(self.workspace.output.cuda_address());
         BenchSampleResult::operations(TOKENS as u64).push_metric(MetricValue::new(
             "cuda_event_ms",
             elapsed_ms,

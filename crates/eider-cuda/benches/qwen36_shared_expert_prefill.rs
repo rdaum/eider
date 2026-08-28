@@ -167,7 +167,7 @@ impl Qwen36SharedExpertPrefillBench {
         enqueue(self);
         self.stop.record_on_stream(&self.stream).expect("stop");
         self.stop.synchronize().expect("synchronize");
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
         BenchSampleResult::operations(TOKENS as u64).push_metric(MetricValue::new(
             "cuda_event_ms",
             self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64,

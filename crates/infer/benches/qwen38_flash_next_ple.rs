@@ -56,7 +56,7 @@ impl PleReadCase {
         stream.synchronize().expect("complete PLE gather");
         let elapsed = started.elapsed();
         self.window.commit_append().expect("commit PLE append");
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
         (elapsed, stats)
     }
 }

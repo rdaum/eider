@@ -122,14 +122,14 @@ impl BenchContext for Q2ExpertOverlayBench {
         let q2_values = DeviceBuffer::from_host(
             &q2_weights
                 .iter()
-                .map(Q2Matrix::values_ptr)
+                .map(Q2Matrix::values_address)
                 .collect::<Vec<_>>(),
         )
         .expect("Q2 values table");
         let q2_scales = DeviceBuffer::from_host(
             &q2_weights
                 .iter()
-                .map(Q2Matrix::scales_ptr)
+                .map(Q2Matrix::scales_address)
                 .collect::<Vec<_>>(),
         )
         .expect("Q2 scales table");
@@ -244,7 +244,7 @@ fn q2_sample(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.q2_outputs[0].data_ptr());
+    black_box(context.q2_outputs[0].data_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),
@@ -278,7 +278,7 @@ fn q4_sample(
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64
         / chunk_size as f64;
-    black_box(context.q4_outputs[0].data_ptr());
+    black_box(context.q4_outputs[0].data_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(
             MetricValue::new("cuda_event_ms", elapsed_ms, "ms").with_display_name("CUDA event"),

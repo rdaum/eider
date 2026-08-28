@@ -163,7 +163,7 @@ fn top1_graph_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_index.as_const_ptr());
+    black_box(ctx.out_index.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -192,7 +192,7 @@ fn top1_sample<const WARPS: usize>(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_index.as_const_ptr());
+    black_box(ctx.out_index.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

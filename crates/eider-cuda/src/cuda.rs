@@ -556,8 +556,7 @@ impl<'a, T> DeviceInput<'a, T> {
         self.buffer.len == 0
     }
 
-    /// Returns the raw device pointer as an immutable C pointer.
-    pub fn as_const_ptr(&self) -> *const c_void {
+    pub(crate) fn as_const_ptr(&self) -> *const c_void {
         self.buffer.ptr.cast()
     }
 
@@ -591,8 +590,7 @@ impl<'a, T> DeviceOutput<'a, T> {
         self.buffer.len == 0
     }
 
-    /// Returns the raw device pointer as a mutable C pointer.
-    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
         self.buffer.ptr.cast()
     }
 
@@ -623,13 +621,11 @@ impl<'a, T> DeviceInOut<'a, T> {
         self.buffer.len == 0
     }
 
-    /// Returns the raw device pointer as an immutable C pointer.
-    pub fn as_const_ptr(&self) -> *const c_void {
+    pub(crate) fn as_const_ptr(&self) -> *const c_void {
         self.buffer.ptr.cast()
     }
 
-    /// Returns the raw device pointer as a mutable C pointer.
-    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
         self.buffer.ptr.cast()
     }
 
@@ -1665,8 +1661,8 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
     /// Returns the typed device address at `offset` elements from this buffer's start.
     ///
     /// The offset is bounds-checked against this allocation. Use this to build
-    /// device address tables instead of applying pointer arithmetic to
-    /// [`Self::as_const_ptr`].
+    /// device address tables instead of applying pointer arithmetic to a raw
+    /// CUDA pointer.
     pub fn address_at(&self, offset: usize) -> Result<DeviceAddress<T>> {
         if offset > self.len {
             return Err(Error::Shape {
@@ -1703,11 +1699,7 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
         })
     }
 
-    /// Returns the raw device pointer as an immutable C pointer.
-    ///
-    /// This is an untyped FFI address. Do not use it for pointer arithmetic;
-    /// use [`Self::address_at`] when an element offset is required.
-    pub fn as_const_ptr(&self) -> *const c_void {
+    pub(crate) fn as_const_ptr(&self) -> *const c_void {
         self.ptr.cast()
     }
 

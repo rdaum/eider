@@ -582,14 +582,14 @@ impl LagunaRoutedGateUpBench {
             .record_on_stream(&self.stream)
             .expect("record stop event");
         self.stop.synchronize().expect("synchronize stop event");
-        black_box(self.w4a16_workspace.output_bf16().as_const_ptr());
-        black_box(self.w4a16.output_bf16().as_const_ptr());
-        black_box(self.grouped_output.as_const_ptr());
-        black_box(self.decode_output_table.as_const_ptr());
-        black_box(self.decode_cutlass_outputs[0].data().as_const_ptr());
-        black_box(self.decode_cutlass_output_table.as_const_ptr());
+        black_box(self.w4a16_workspace.output_bf16().cuda_address());
+        black_box(self.w4a16.output_bf16().cuda_address());
+        black_box(self.grouped_output.cuda_address());
+        black_box(self.decode_output_table.cuda_address());
+        black_box(self.decode_cutlass_outputs[0].data().cuda_address());
+        black_box(self.decode_cutlass_output_table.cuda_address());
         black_box(self.grouped_weights.len());
-        black_box(self.grouped_alphas.as_const_ptr());
+        black_box(self.grouped_alphas.cuda_address());
         BenchSampleResult::operations(operations)
             .push_metric(MetricValue::new(
                 "cuda_event_ms",

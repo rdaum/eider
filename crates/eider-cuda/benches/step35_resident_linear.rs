@@ -319,7 +319,7 @@ fn finish_sample(context: &mut Step35ResidentLinearBench, chunk_size: usize) -> 
         .start
         .elapsed_ms_until(&context.stop)
         .expect("elapsed") as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

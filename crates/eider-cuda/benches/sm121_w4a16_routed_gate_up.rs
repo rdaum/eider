@@ -201,7 +201,7 @@ fn sm121_w4a16_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(MetricValue::new(
             "cuda_event_ms",
@@ -227,7 +227,7 @@ fn graph_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.output.as_const_ptr());
+    black_box(ctx.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(MetricValue::new(
             "cuda_event_ms",
@@ -253,7 +253,7 @@ fn sm121_w4a16_bf16_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop event");
     ctx.stop.synchronize().expect("sync stop event");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.plan.output_bf16().as_const_ptr());
+    black_box(ctx.plan.output_bf16().cuda_address());
     BenchSampleResult::operations(chunk_size as u64)
         .push_metric(MetricValue::new(
             "cuda_event_ms",

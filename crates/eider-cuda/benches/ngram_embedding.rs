@@ -82,7 +82,7 @@ impl NgramEmbeddingBench {
     fn elapsed(&self, chunk_size: usize, token_rows: usize) -> BenchSampleResult {
         self.stop.synchronize().expect("stop synchronize");
         let total_ms = self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64;
-        black_box(self.output.as_const_ptr());
+        black_box(self.output.cuda_address());
         BenchSampleResult::operations((chunk_size * token_rows) as u64).push_metric(
             MetricValue::new(
                 "cuda_event_ms",

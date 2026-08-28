@@ -260,7 +260,7 @@ fn finish_sample(context: &mut Nemotron3DenseLinearBench, chunk_size: usize) -> 
         .start
         .elapsed_ms_until(&context.stop)
         .expect("measure CUDA events") as f64;
-    black_box(context.output.as_const_ptr());
+    black_box(context.output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -341,7 +341,7 @@ fn nvfp4_verify_rows_sample(
             .run_nvfp4_verify_rows()
             .expect("four-row NVFP4 projection");
     }
-    black_box(context.verify_output.as_const_ptr());
+    black_box(context.verify_output.cuda_address());
     finish_sample(context, chunk_size)
 }
 

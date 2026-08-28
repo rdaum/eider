@@ -308,7 +308,7 @@ impl Qwen36GroupedMoePrefillBench {
         enqueue(self);
         self.stop.record_on_stream(&self.stream).expect("stop");
         self.stop.synchronize().expect("synchronize");
-        black_box(self.routed_output.as_const_ptr());
+        black_box(self.routed_output.cuda_address());
         black_box(self.gate_up_weights.len());
         black_box(self.down_weights.len());
         black_box(self.gate_up_alpha_storage.len());
@@ -385,7 +385,7 @@ fn main() {
         let mut context = Qwen36GroupedMoePrefillBench::new();
         context.enqueue_pipeline();
         context.stream.synchronize().expect("profile synchronize");
-        black_box(context.routed_output.as_const_ptr());
+        black_box(context.routed_output.cuda_address());
         return;
     }
 

@@ -1228,7 +1228,7 @@ fn qkv_sample(ctx: &mut Fp8LinearBench, chunk_size: usize, _chunk_num: usize) ->
             &ctx.stream,
         )
         .expect("qkv");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1249,7 +1249,7 @@ fn qkv_w8a8_sample(
             &ctx.stream,
         )
         .expect("qkv w8a8");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1270,7 +1270,7 @@ fn qkv_channel_scaled_sample(
             &ctx.stream,
         )
         .expect("channel-scaled qkv");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1290,7 +1290,7 @@ fn qkv_channel_scaled_dynamic_sample(
             &ctx.stream,
         )
         .expect("dynamic channel-scaled qkv");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1311,7 +1311,7 @@ fn qkv_channel_scaled_precomputed_dynamic_sample(
             &ctx.stream,
         )
         .expect("precomputed dynamic channel-scaled qkv");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1333,7 +1333,7 @@ fn qkv_channel_scaled_dynamic_quantized_sample(
             &ctx.stream,
         )
         .expect("quantized dynamic channel-scaled qkv");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1367,7 +1367,7 @@ fn qkv_channel_scaled_dynamic_cublaslt_sample(
             &ctx.stream,
         )
         .expect("scale channel QKV output");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1394,7 +1394,7 @@ fn qkv_cublaslt_sample(
                 &ctx.stream,
             )
             .expect("qkv cuBLASLt");
-        black_box(ctx.qkv_output.as_const_ptr());
+        black_box(ctx.qkv_output.cuda_address());
     })
 }
 
@@ -1410,7 +1410,7 @@ fn z_sample(ctx: &mut Fp8LinearBench, chunk_size: usize, _chunk_num: usize) -> B
             &ctx.stream,
         )
         .expect("z");
-        black_box(ctx.z_output.as_const_ptr());
+        black_box(ctx.z_output.cuda_address());
     })
 }
 
@@ -1437,7 +1437,7 @@ fn z_cublaslt_sample(
                 &ctx.stream,
             )
             .expect("z cuBLASLt");
-        black_box(ctx.z_output.as_const_ptr());
+        black_box(ctx.z_output.cuda_address());
     })
 }
 
@@ -1453,7 +1453,7 @@ fn out_sample(ctx: &mut Fp8LinearBench, chunk_size: usize, _chunk_num: usize) ->
             &ctx.stream,
         )
         .expect("out");
-        black_box(ctx.out_output.as_const_ptr());
+        black_box(ctx.out_output.cuda_address());
     })
 }
 
@@ -1480,7 +1480,7 @@ fn out_cublaslt_sample(
                 &ctx.stream,
             )
             .expect("out cuBLASLt");
-        black_box(ctx.out_output.as_const_ptr());
+        black_box(ctx.out_output.cuda_address());
     })
 }
 
@@ -1534,7 +1534,7 @@ fn streaming_scalar_sample<
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1580,7 +1580,7 @@ fn streaming_packed_qkvz_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1651,7 +1651,7 @@ fn streaming_cublaslt_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1715,7 +1715,7 @@ fn streaming_cublaslt_reuse_hidden_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1774,7 +1774,7 @@ fn streaming_cublaslt_z_only_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1822,9 +1822,9 @@ fn finish_channel_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.qkv_output.as_const_ptr());
-    black_box(ctx.z_output.as_const_ptr());
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.qkv_output.cuda_address());
+    black_box(ctx.z_output.cuda_address());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -1983,7 +1983,7 @@ fn streaming_full_attention_sample<
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -2033,7 +2033,7 @@ fn streaming_full_attention_packed_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_output.as_const_ptr());
+    black_box(ctx.out_output.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -2052,7 +2052,7 @@ fn lm_head_simt_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_index.as_const_ptr());
+    black_box(ctx.out_index.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
@@ -2071,7 +2071,7 @@ fn lm_head_cublaslt_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     let total_ms = ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64;
-    black_box(ctx.out_index.as_const_ptr());
+    black_box(ctx.out_index.cuda_address());
     BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", total_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),

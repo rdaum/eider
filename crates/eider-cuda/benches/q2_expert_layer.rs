@@ -433,7 +433,7 @@ fn measure(
     context: &mut Q2ExpertLayerBench,
     chunk_size: usize,
     enqueue: fn(&mut Q2ExpertLayerBench),
-    output: fn(&Q2ExpertLayerBench) -> *const f32,
+    output: fn(&Q2ExpertLayerBench) -> DeviceAddress<f32>,
     resident_bytes: usize,
 ) -> BenchSampleResult {
     context
@@ -475,7 +475,7 @@ fn q2_sample(
         context,
         chunk_size,
         Q2ExpertLayerBench::enqueue_q2,
-        |context| context.q2_workspace.output.as_const_ptr().cast::<f32>(),
+        |context| context.q2_workspace.output.cuda_address(),
         bytes,
     )
 }
@@ -490,7 +490,7 @@ fn mixed_sample(
         context,
         chunk_size,
         Q2ExpertLayerBench::enqueue_mixed,
-        |context| context.mixed_workspace.output.as_const_ptr().cast::<f32>(),
+        |context| context.mixed_workspace.output.cuda_address(),
         bytes,
     )
 }
@@ -505,7 +505,7 @@ fn q4_sample(
         context,
         chunk_size,
         Q2ExpertLayerBench::enqueue_q4,
-        |context| context.q4_workspace.output.as_const_ptr().cast::<f32>(),
+        |context| context.q4_workspace.output.cuda_address(),
         bytes,
     )
 }
