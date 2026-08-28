@@ -1,6 +1,7 @@
 use eider_cuda::{
     CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, F32Matrix, Q2Matrix, format,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, q2_w2a16_grouped_matvec_f32_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
+    q2_w2a16_grouped_matvec_f32_into_on_stream,
 };
 use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
@@ -29,11 +30,11 @@ struct Q2ExpertOverlayBench {
     q2_output_table: DeviceBuffer<DeviceAddress<f32>>,
     q4_values_storage: Vec<DeviceBuffer<u8>>,
     q4_scales_storage: Vec<DeviceBuffer<u8>>,
-    q4_values: DeviceBuffer<*const u8>,
-    q4_scales: DeviceBuffer<*const u8>,
+    q4_values: DeviceBuffer<DeviceAddress<u8>>,
+    q4_scales: DeviceBuffer<DeviceAddress<u8>>,
     q4_scale_2: DeviceBuffer<f32>,
     q4_outputs: Vec<F32Matrix>,
-    q4_output_table: DeviceBuffer<*mut f32>,
+    q4_output_table: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 impl Q2ExpertOverlayBench {
@@ -52,7 +53,7 @@ impl Q2ExpertOverlayBench {
     }
 
     fn enqueue_q4(&self) {
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &self.indices,
             &self.input,
             &self.q4_values,
@@ -163,14 +164,14 @@ impl BenchContext for Q2ExpertOverlayBench {
         let q4_values = DeviceBuffer::from_host(
             &q4_values_storage
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("Q4 values table");
         let q4_scales = DeviceBuffer::from_host(
             &q4_scales_storage
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("Q4 scales table");
@@ -182,13 +183,16 @@ impl BenchContext for Q2ExpertOverlayBench {
         )
         .expect("Q4 scalar scales");
         let mut q4_outputs = Vec::with_capacity(TOP_K);
-        let mut q4_output_ptrs = Vec::with_capacity(TOP_K);
         for _ in 0..TOP_K {
-            let mut output = F32Matrix::zeroed(GATE_UP, 1).expect("Q4 output");
-            q4_output_ptrs.push(output.data_mut_ptr());
-            q4_outputs.push(output);
+            q4_outputs.push(F32Matrix::zeroed(GATE_UP, 1).expect("Q4 output"));
         }
-        let q4_output_table = DeviceBuffer::from_host(&q4_output_ptrs).expect("Q4 output table");
+        let q4_output_table = DeviceBuffer::from_host(
+            &q4_outputs
+                .iter()
+                .map(F32Matrix::data_address)
+                .collect::<Vec<_>>(),
+        )
+        .expect("Q4 output table");
 
         let bench = Self {
             stream,

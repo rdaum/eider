@@ -10615,36 +10615,6 @@ pub fn nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream(
     }
 }
 
-/// Enqueues device-routed grouped W4A16 NVFP4 matvecs.
-///
-/// Every route selects one raw ModelOpt weight and scale pair. The shared f32
-/// activation remains unquantized, and each selected expert's
-/// `weight_scale_2` is applied exactly once to its f32 output.
-#[allow(clippy::too_many_arguments)]
-pub fn nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    input: &DeviceBuffer<f32>,
-    packed_weight_table: &DeviceBuffer<*const u8>,
-    weight_scale_table: &DeviceBuffer<*const u8>,
-    weight_scale_2_table: &DeviceBuffer<f32>,
-    output_table: &DeviceBuffer<*mut f32>,
-    out_features: usize,
-    in_features: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    nvfp4_w4a16_grouped_matvec_f32_impl(
-        indices,
-        input,
-        packed_weight_table,
-        weight_scale_table,
-        weight_scale_2_table,
-        output_table,
-        out_features,
-        in_features,
-        stream,
-    )
-}
-
 /// Enqueues device-routed W4A16 matvecs with typed expert and output address
 /// tables.
 #[allow(clippy::too_many_arguments)]
@@ -10754,33 +10724,6 @@ fn nvfp4_w4a16_grouped_matvec_f32_impl<
     }
 }
 
-/// Enqueues device-routed grouped W4A16 matvecs with one f32 input per route.
-#[allow(clippy::too_many_arguments)]
-pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    input_table: &DeviceBuffer<*const f32>,
-    packed_weight_table: &DeviceBuffer<*const u8>,
-    weight_scale_table: &DeviceBuffer<*const u8>,
-    weight_scale_2_table: &DeviceBuffer<f32>,
-    output_table: &DeviceBuffer<*mut f32>,
-    out_features: usize,
-    in_features: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
-        indices,
-        input_table,
-        packed_weight_table,
-        weight_scale_table,
-        weight_scale_2_table,
-        output_table,
-        indices.len(),
-        out_features,
-        in_features,
-        stream,
-    )
-}
-
 /// Enqueues device-routed W4A16 matvecs with typed input, expert, and output
 /// address tables.
 #[allow(clippy::too_many_arguments)]
@@ -10803,34 +10746,6 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
         weight_scale_2_table,
         output_table,
         indices.len(),
-        out_features,
-        in_features,
-        stream,
-    )
-}
-
-/// Enqueues an active prefix of device-routed grouped W4A16 matvecs.
-#[allow(clippy::too_many_arguments)]
-pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    input_table: &DeviceBuffer<*const f32>,
-    packed_weight_table: &DeviceBuffer<*const u8>,
-    weight_scale_table: &DeviceBuffer<*const u8>,
-    weight_scale_2_table: &DeviceBuffer<f32>,
-    output_table: &DeviceBuffer<*mut f32>,
-    groups: usize,
-    out_features: usize,
-    in_features: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_impl(
-        indices,
-        input_table,
-        packed_weight_table,
-        weight_scale_table,
-        weight_scale_2_table,
-        output_table,
-        groups,
         out_features,
         in_features,
         stream,
@@ -21216,14 +21131,14 @@ mod tests {
         let packed_table = DeviceBuffer::from_host(
             &packed
                 .iter()
-                .map(|weight| weight.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("packed table");
         let scale_table = DeviceBuffer::from_host(
             &scales
                 .iter()
-                .map(|scale| scale.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("scale table");
@@ -21235,25 +21150,23 @@ mod tests {
             .collect::<Vec<_>>();
         let input_table = DeviceBuffer::from_host(
             &(0..BATCH)
-                .flat_map(|row| {
-                    std::iter::repeat_n(input_rows[row].as_const_ptr().cast::<f32>(), ROUTES)
-                })
+                .flat_map(|row| std::iter::repeat_n(input_rows[row].cuda_address(), ROUTES))
                 .collect::<Vec<_>>(),
         )
         .expect("input table");
-        let mut actual_outputs = (0..BATCH * ROUTES)
+        let actual_outputs = (0..BATCH * ROUTES)
             .map(|_| DeviceBuffer::<f32>::zeroed(OUT).expect("actual output"))
             .collect::<Vec<_>>();
         let actual_table = DeviceBuffer::from_host(
             &actual_outputs
-                .iter_mut()
-                .map(|output| output.as_mut_ptr().cast::<f32>())
+                .iter()
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("actual table");
         let indices_device = DeviceBuffer::from_host(&indices).expect("indices");
         let stream = CudaStream::new_non_blocking().expect("stream");
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             &indices_device,
             &input_table,
             &packed_table,
@@ -21270,17 +21183,17 @@ mod tests {
             let begin = row * ROUTES;
             let row_indices =
                 DeviceBuffer::from_host(&indices[begin..begin + ROUTES]).expect("row indices");
-            let mut expected_outputs = (0..ROUTES)
+            let expected_outputs = (0..ROUTES)
                 .map(|_| DeviceBuffer::<f32>::zeroed(OUT).expect("expected output"))
                 .collect::<Vec<_>>();
             let expected_table = DeviceBuffer::from_host(
                 &expected_outputs
-                    .iter_mut()
-                    .map(|output| output.as_mut_ptr().cast::<f32>())
+                    .iter()
+                    .map(DeviceBuffer::cuda_address)
                     .collect::<Vec<_>>(),
             )
             .expect("expected table");
-            nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+            nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
                 &row_indices,
                 input_row,
                 &packed_table,
@@ -21414,31 +21327,31 @@ mod tests {
             .iter()
             .map(|values| DeviceBuffer::from_host(values).expect("scale upload"))
             .collect::<Vec<_>>();
-        let packed_ptrs = packed_device
+        let packed_addresses = packed_device
             .iter()
-            .map(|values| values.as_const_ptr().cast::<u8>())
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
-        let scale_ptrs = scales_device
+        let scale_addresses = scales_device
             .iter()
-            .map(|values| values.as_const_ptr().cast::<u8>())
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
-        let packed_table = DeviceBuffer::from_host(&packed_ptrs).expect("packed table");
-        let scale_table = DeviceBuffer::from_host(&scale_ptrs).expect("scale table");
+        let packed_table = DeviceBuffer::from_host(&packed_addresses).expect("packed table");
+        let scale_table = DeviceBuffer::from_host(&scale_addresses).expect("scale table");
         let weight_scale_2_table =
             DeviceBuffer::from_host(&weight_scale_2).expect("weight scale 2 table");
         let routes_device = DeviceBuffer::from_host(&routes).expect("routes upload");
         let input_device = DeviceBuffer::from_host(&input).expect("input upload");
-        let mut outputs = (0..groups)
+        let outputs = (0..groups)
             .map(|_| F32Matrix::zeroed(rows, 1).expect("output alloc"))
             .collect::<Vec<_>>();
-        let output_ptrs = outputs
-            .iter_mut()
-            .map(F32Matrix::data_mut_ptr)
+        let output_addresses = outputs
+            .iter()
+            .map(F32Matrix::data_address)
             .collect::<Vec<_>>();
-        let output_table = DeviceBuffer::from_host(&output_ptrs).expect("output table");
+        let output_table = DeviceBuffer::from_host(&output_addresses).expect("output table");
         let stream = CudaStream::new_non_blocking().expect("stream");
 
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &routes_device,
             &input_device,
             &packed_table,
@@ -21480,15 +21393,14 @@ mod tests {
         let indices = DeviceBuffer::from_host(&[0u32]).expect("indices");
         let input = DeviceBuffer::<f32>::zeroed(cols).expect("input");
         let packed_weight_table =
-            DeviceBuffer::from_host(&[std::ptr::null::<u8>()]).expect("weight table");
+            DeviceBuffer::from_host(&[DeviceAddress::null()]).expect("weight table");
         let weight_scale_table =
-            DeviceBuffer::from_host(&[std::ptr::null::<u8>()]).expect("scale table");
+            DeviceBuffer::from_host(&[DeviceAddress::null()]).expect("scale table");
         let weight_scale_2_table = DeviceBuffer::from_host(&[1.0f32]).expect("scale 2 table");
-        let output_table =
-            DeviceBuffer::from_host(&[std::ptr::null_mut::<f32>()]).expect("output table");
+        let output_table = DeviceBuffer::from_host(&[DeviceAddress::null()]).expect("output table");
         let stream = CudaStream::new_non_blocking().expect("stream");
 
-        let error = nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        let error = nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &indices,
             &input,
             &packed_weight_table,
