@@ -4,8 +4,8 @@ use crate::metrics::metrics;
 use crate::qwen3::qwen36::{
     Qwen36DecodeBatchWorkspace, Qwen36DecodeRow, Qwen36ExecutionConfig, Qwen36ExecutionState,
     Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36NextToken, Qwen36PrefillRow,
-    Qwen36Sequence, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier, Qwen36TextModel,
-    Qwen38DFlash2SequenceState,
+    Qwen36Sequence, Qwen36SequenceId, Qwen36SpeculativeCycleWorkspace, Qwen36SpeculativeFrontier,
+    Qwen36TextModel, Qwen38DFlash2SequenceState,
 };
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
@@ -152,8 +152,7 @@ struct Qwen36Request {
     prompt_position: usize,
     prefix_target: usize,
     prefix_retained: bool,
-    sequence: Option<Box<Qwen36Sequence>>,
-    device_token_counts: Option<DeviceBuffer<u32>>,
+    sequence_id: Option<Qwen36SequenceId>,
     sequence_device_bytes: usize,
     sampler: Sampler,
     tool_grammar: Option<QwenXmlToolGrammar>,
@@ -367,8 +366,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 prompt_position: 0,
                 prefix_target,
                 prefix_retained: false,
-                sequence: None,
-                device_token_counts: None,
+                sequence_id: None,
                 sequence_device_bytes: 0,
                 sampler,
                 tool_grammar,
@@ -493,12 +491,12 @@ impl<'model> Qwen36Scheduler<'model> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence_device_bytes = sequence.device_bytes()
-                + device_token_counts
-                    .as_ref()
-                    .map_or(0, DeviceBuffer::device_bytes);
-            request.sequence = Some(Box::new(sequence));
-            request.device_token_counts = device_token_counts;
+            let (sequence_id, sequence_device_bytes) = self
+                .execution
+                .sequences
+                .insert(sequence, device_token_counts)?;
+            request.sequence_device_bytes = sequence_device_bytes;
+            request.sequence_id = Some(sequence_id);
             if (self.execution.model.dflash2_enabled()
                 || self.execution.model.mtp_weights().is_some())
                 && self.config.speculative_drafts > 0
@@ -651,15 +649,15 @@ impl<'model> Qwen36Scheduler<'model> {
                 }
             }
             if request.lifecycle == RequestState::Finished {
-                let sequence = request
-                    .sequence
+                let sequence_id = request
+                    .sequence_id
                     .take()
-                    .expect("finished admitted request has a sequence");
-                (*sequence).finish(
+                    .expect("finished admitted request has a sequence ID");
+                let sequence = self.execution.sequences.release(sequence_id)?;
+                sequence.sequence.finish(
                     &mut self.execution.sequence_cache,
                     &self.execution.cache_stream,
                 )?;
-                request.device_token_counts.take();
                 tick.finished.push(request.id);
             } else {
                 self.decoding.push_back(request.id);
@@ -728,10 +726,11 @@ impl<'model> Qwen36Scheduler<'model> {
             .spec_frontier
             .take()
             .expect("speculative request has a frontier");
-        let sequence = request
-            .sequence
-            .as_deref_mut()
-            .expect("speculative request has a sequence");
+        let sequence_id = request
+            .sequence_id
+            .expect("speculative request has a sequence ID");
+        let mut sequences = self.execution.sequences.lease_many(&[sequence_id])?;
+        let sequence = &mut sequences.entry_mut(0).sequence;
         let mut disable_dflash2 = false;
         let mut grammar_preview = request
             .tool_grammar
@@ -937,10 +936,20 @@ impl<'model> Qwen36Scheduler<'model> {
             .iter_mut()
             .find(|workspace| workspace.capacity() >= selected.len())
             .expect("decode capacity classes cover the configured maximum");
+        let sequence_ids = selected
+            .iter()
+            .map(|request| {
+                request.sequence_id.ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 scheduled decode",
+                    detail: format!("request {} has no admitted sequence", request.id.get()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
         let mut rows = Vec::with_capacity(selected.len());
         let mut input_tokens = Vec::with_capacity(selected.len());
         let mut grammar_masks = Vec::with_capacity(selected.len());
-        for request in selected.iter_mut() {
+        for (request, sequence) in selected.iter_mut().zip(sequences.entries_mut()) {
             let token_id = request.decode_input_token()?;
             input_tokens.push(token_id);
             let mask = if request.spec_ready && request.spec_started {
@@ -967,14 +976,10 @@ impl<'model> Qwen36Scheduler<'model> {
                     .flatten()
             };
             grammar_masks.push(mask);
-            let sequence = request
-                .sequence
-                .as_deref_mut()
-                .ok_or_else(|| Error::Format {
-                    label: "Qwen3.6 scheduled decode",
-                    detail: format!("request {} has no admitted sequence", request.id.get()),
-                })?;
-            rows.push(Qwen36DecodeRow { token_id, sequence });
+            rows.push(Qwen36DecodeRow {
+                token_id,
+                sequence: &mut sequence.sequence,
+            });
         }
         let decoded = self.execution.model.decode_batch(
             workspace,
@@ -1013,7 +1018,8 @@ impl<'model> Qwen36Scheduler<'model> {
             } else if !needs_host_logits {
                 let mut sampling_rows = selected
                     .iter_mut()
-                    .map(|request| {
+                    .zip(sequences.entries_mut())
+                    .map(|(request, sequence)| {
                         let config = request.sampler.config();
                         let draw = if config.temperature == 0.0 || config.top_k == 1 {
                             0.0
@@ -1027,7 +1033,7 @@ impl<'model> Qwen36Scheduler<'model> {
                             presence_penalty: config.presence_penalty,
                             frequency_penalty: config.frequency_penalty,
                             draw,
-                            token_counts: request.device_token_counts.as_mut(),
+                            token_counts: sequence.device_token_counts.as_mut(),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1054,8 +1060,12 @@ impl<'model> Qwen36Scheduler<'model> {
                         Ok(request.sampler.sample(row_logits, &request.history)?)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                for (request, sample) in selected.iter_mut().zip(&samples) {
-                    let Some(counts) = request.device_token_counts.as_mut() else {
+                for ((request, sequence), sample) in selected
+                    .iter_mut()
+                    .zip(sequences.entries_mut())
+                    .zip(&samples)
+                {
+                    let Some(counts) = sequence.device_token_counts.as_mut() else {
                         continue;
                     };
                     let mut dense = request.history.dense_counts(vocab);
@@ -1161,9 +1171,18 @@ impl<'model> Qwen36Scheduler<'model> {
             request.prefix_retained = true;
             return;
         }
-        let Some(sequence) = request.sequence.as_deref_mut() else {
+        let Some(sequence_id) = request.sequence_id else {
             return;
         };
+        let Ok(mut sequences) = self.execution.sequences.lease_many(&[sequence_id]) else {
+            warn!(
+                request = request.id.get(),
+                "missing sequence while retaining prompt prefix"
+            );
+            request.prefix_retained = true;
+            return;
+        };
+        let sequence = &mut sequences.entry_mut(0).sequence;
         if sequence.position() != request.prefix_target {
             return;
         }
@@ -1348,17 +1367,28 @@ impl<'model> Qwen36Scheduler<'model> {
             .iter()
             .map(|request| request.id)
             .collect::<Vec<_>>();
+        let sequence_ids = selected
+            .iter()
+            .map(|request| {
+                request.sequence_id.ok_or_else(|| Error::Format {
+                    label: "Qwen3.6 scheduled prefill",
+                    detail: format!("request {} has no admitted sequence", request.id.get()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
         let prefill_result = {
             let mut rows = Vec::with_capacity(selected.len());
-            for (request, chunk) in selected.iter_mut().zip(chunk_lengths.iter().copied()) {
+            for ((request, sequence), chunk) in selected
+                .iter_mut()
+                .zip(sequences.entries_mut())
+                .zip(chunk_lengths.iter().copied())
+            {
                 let start = request.prompt_position;
                 let end = start + chunk;
-                let (prompt_tokens, sequence) = (&request.prompt_tokens, &mut request.sequence);
                 rows.push(Qwen36PrefillRow {
-                    token_ids: &prompt_tokens[start..end],
-                    sequence: sequence
-                        .as_deref_mut()
-                        .expect("prefilling request has admitted sequence"),
+                    token_ids: &request.prompt_tokens[start..end],
+                    sequence: &mut sequence.sequence,
                 });
             }
             for id in prefill_ids {
@@ -1370,6 +1400,7 @@ impl<'model> Qwen36Scheduler<'model> {
                 &mut self.execution.sequence_cache,
             )
         };
+        drop(sequences);
         if let Err(error) = prefill_result {
             for request in selected.into_iter().rev() {
                 self.prefilling.push_front(request.id);
@@ -1479,8 +1510,9 @@ impl<'model> Qwen36Scheduler<'model> {
             .requests
             .remove(&id)
             .expect("cancellation target remains retained");
-        if let Some(sequence) = request.sequence.take()
-            && let Err(error) = (*sequence).finish(
+        if let Some(sequence_id) = request.sequence_id.take()
+            && let Ok(sequence) = self.execution.sequences.release(sequence_id)
+            && let Err(error) = sequence.sequence.finish(
                 &mut self.execution.sequence_cache,
                 &self.execution.cache_stream,
             )
@@ -1552,7 +1584,7 @@ impl<'model> Qwen36Scheduler<'model> {
 
     /// Returns the number of admitted prefill and decode requests.
     pub fn active_sequence_count(&self) -> usize {
-        self.prefilling.len() + self.decoding.len()
+        self.execution.sequences.len()
     }
 
     /// Returns the number of admitted requests eligible for model work.
@@ -1576,9 +1608,9 @@ impl<'model> Qwen36Scheduler<'model> {
     pub fn request_device_bytes(&self, id: Qwen36RequestId) -> Option<usize> {
         self.requests.get(&id).map(|request| {
             request
-                .sequence
-                .as_ref()
-                .map_or(0, |_| request.sequence_device_bytes)
+                .sequence_id
+                .and_then(|sequence_id| self.execution.sequences.device_bytes(sequence_id))
+                .unwrap_or(0)
         })
     }
 
@@ -2184,20 +2216,20 @@ mod tests {
         assert!(scheduler.request_device_bytes(second).unwrap() > 0);
 
         let second_sequence = scheduler.requests[&second]
-            .sequence
-            .as_deref()
-            .expect("second admitted state") as *const _;
+            .sequence_id
+            .expect("second admitted state");
+        assert!(scheduler.execution.sequences.contains(second_sequence));
         let tick = scheduler.tick().expect("second tick");
         assert_eq!(tick.generated.len(), 2);
         assert_eq!(tick.finished, [first]);
         assert_eq!(scheduler.request_device_bytes(first), Some(0));
         assert_eq!(
             scheduler.requests[&second]
-                .sequence
-                .as_deref()
-                .expect("second retained state") as *const _,
+                .sequence_id
+                .expect("second retained state"),
             second_sequence
         );
+        assert!(scheduler.execution.sequences.contains(second_sequence));
 
         let tick = scheduler.tick().expect("third tick");
         assert!(tick.scheduled.contains(&third));

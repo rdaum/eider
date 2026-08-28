@@ -11,8 +11,11 @@ captured-graph resources, and supplies typed device views. The DFlash2
 projection uses those views. Physical SM12x page storage and Qwen sequence
 state have moved out of `runtime` without a compatibility module. Qwen now
 keeps persistent streams, workspaces, cache state, and retained DFlash state
-in an inference-owned execution object; the scheduler keeps request policy and
-queues. `eider-format` now owns GGUF indexing, GGML K-quant decoding, the
+in an inference-owned execution object. Qwen scheduler requests now retain
+opaque sequence identities, while the execution object owns the live CUDA
+sequences and GPU sampling-count buffers; batch leases restore that state on
+every return path. The scheduler keeps request policy and queues.
+`eider-format` now owns GGUF indexing, GGML K-quant decoding, the
 sharded safetensors index/cache, the versioned host-only NVFP4 artifact codec,
 and ModelOpt checkpoint records and host layouts. `eider-cuda` owns the
 explicit upload and cuBLASLt preparation of those records.

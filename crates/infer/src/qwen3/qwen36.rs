@@ -20,7 +20,7 @@ pub(crate) use dflash2::{
 };
 #[cfg(test)]
 pub(crate) use execution::decode_capacity_classes;
-pub(crate) use execution::{Qwen36ExecutionConfig, Qwen36ExecutionState};
+pub(crate) use execution::{Qwen36ExecutionConfig, Qwen36ExecutionState, Qwen36SequenceId};
 pub use mtp::{Qwen36MtpDraftWorkspace, Qwen36MtpSequenceState, Qwen36MtpWeights};
 pub use sequence::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
 

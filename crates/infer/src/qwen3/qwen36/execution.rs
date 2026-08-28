@@ -6,13 +6,165 @@
 
 use super::{
     Qwen36DecodeBatchWorkspace, Qwen36MtpDraftWorkspace, Qwen36PrefillBatchWorkspace,
-    Qwen36SequenceCache, Qwen36SpeculativeCycleWorkspace, Qwen36TextModel,
+    Qwen36Sequence, Qwen36SequenceCache, Qwen36SpeculativeCycleWorkspace, Qwen36TextModel,
     Qwen38DFlash2PrefixCache, Qwen38DFlash2Workspace,
 };
 use crate::sm12x_cache::{Sm12xPageBackend, Sm12xPageTable};
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::PageBackend;
+use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
+
+/// Opaque identity for CUDA-backed Qwen sequence state.
+///
+/// IDs are never reused by one execution state. A request retaining an ID
+/// after release therefore cannot resolve another sequence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Qwen36SequenceId(u64);
+
+/// CUDA-backed state retained for an admitted Qwen sequence.
+pub(crate) struct Qwen36ExecutionSequence {
+    pub(crate) sequence: Qwen36Sequence,
+    pub(crate) device_token_counts: Option<DeviceBuffer<u32>>,
+    pub(crate) device_bytes: usize,
+}
+
+/// Model-owned storage for all live Qwen sequences.
+pub(crate) struct Qwen36SequencePool {
+    sequences: BTreeMap<Qwen36SequenceId, Qwen36ExecutionSequence>,
+    next_id: u64,
+}
+
+/// Temporary exclusive access to one batch of engine-owned sequences.
+///
+/// Dropping a lease restores every entry, including while unwinding an error.
+pub(crate) struct Qwen36SequenceBatch<'a> {
+    pool: &'a mut Qwen36SequencePool,
+    entries: Vec<(Qwen36SequenceId, Qwen36ExecutionSequence)>,
+}
+
+impl Qwen36SequencePool {
+    fn new() -> Self {
+        Self {
+            sequences: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Inserts newly admitted state and returns its non-reusable identity.
+    pub(crate) fn insert(
+        &mut self,
+        sequence: Qwen36Sequence,
+        device_token_counts: Option<DeviceBuffer<u32>>,
+    ) -> Result<(Qwen36SequenceId, usize)> {
+        let device_bytes = sequence
+            .device_bytes()
+            .checked_add(
+                device_token_counts
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::device_bytes),
+            )
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.6 admitted sequence bytes",
+                expected: "sequence state and sampling bytes without overflow".to_string(),
+                actual: "byte count overflow".to_string(),
+            })?;
+        let id = Qwen36SequenceId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
+            label: "Qwen3.6 sequence ID",
+            detail: "sequence ID space exhausted".to_string(),
+        })?;
+        let previous = self.sequences.insert(
+            id,
+            Qwen36ExecutionSequence {
+                sequence,
+                device_token_counts,
+                device_bytes,
+            },
+        );
+        debug_assert!(previous.is_none());
+        Ok((id, device_bytes))
+    }
+
+    /// Permanently removes one sequence after it has finished or been cancelled.
+    pub(crate) fn release(&mut self, id: Qwen36SequenceId) -> Result<Qwen36ExecutionSequence> {
+        self.sequences.remove(&id).ok_or_else(|| Error::Format {
+            label: "Qwen3.6 execution sequence",
+            detail: format!("unknown or released sequence {}", id.0),
+        })
+    }
+
+    /// Exclusively leases all requested entries for one model submission.
+    pub(crate) fn lease_many(
+        &mut self,
+        ids: &[Qwen36SequenceId],
+    ) -> Result<Qwen36SequenceBatch<'_>> {
+        let unique_ids = ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique_ids.len() != ids.len() {
+            return Err(Error::Format {
+                label: "Qwen3.6 execution sequence lease",
+                detail: "duplicate sequence ID in one batch".to_string(),
+            });
+        }
+        let mut entries = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(entry) = self.sequences.remove(&id) else {
+                for (restored_id, restored) in entries.drain(..) {
+                    let previous = self.sequences.insert(restored_id, restored);
+                    debug_assert!(previous.is_none());
+                }
+                return Err(Error::Format {
+                    label: "Qwen3.6 execution sequence lease",
+                    detail: format!("unknown or released sequence {}", id.0),
+                });
+            };
+            entries.push((id, entry));
+        }
+        Ok(Qwen36SequenceBatch {
+            pool: self,
+            entries,
+        })
+    }
+
+    /// Returns the number of live CUDA-backed sequences.
+    pub(crate) fn len(&self) -> usize {
+        self.sequences.len()
+    }
+
+    /// Returns the device allocation retained for one live sequence.
+    pub(crate) fn device_bytes(&self, id: Qwen36SequenceId) -> Option<usize> {
+        self.sequences.get(&id).map(|entry| entry.device_bytes)
+    }
+
+    /// Reports whether an identity still resolves to live execution state.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, id: Qwen36SequenceId) -> bool {
+        self.sequences.contains_key(&id)
+    }
+}
+
+impl Qwen36SequenceBatch<'_> {
+    /// Returns engine sequence state in the same order as the leased IDs.
+    pub(crate) fn entries_mut(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = &mut Qwen36ExecutionSequence> {
+        self.entries.iter_mut().map(|(_, entry)| entry)
+    }
+
+    /// Returns one engine sequence state by its batch row.
+    pub(crate) fn entry_mut(&mut self, row: usize) -> &mut Qwen36ExecutionSequence {
+        &mut self.entries[row].1
+    }
+}
+
+impl Drop for Qwen36SequenceBatch<'_> {
+    fn drop(&mut self) {
+        for (id, entry) in self.entries.drain(..) {
+            let previous = self.pool.sequences.insert(id, entry);
+            debug_assert!(previous.is_none());
+        }
+    }
+}
 
 /// Capacity and retention limits used to build one Qwen execution state.
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +190,7 @@ pub(crate) struct Qwen36ExecutionState<'model> {
     pub(crate) mtp_hidden_scratch: Option<DeviceBuffer<f32>>,
     pub(crate) dflash2_workspace: Option<Qwen38DFlash2Workspace>,
     pub(crate) dflash2_prefix_cache: Qwen38DFlash2PrefixCache,
+    pub(crate) sequences: Qwen36SequencePool,
 }
 
 impl<'model> Qwen36ExecutionState<'model> {
@@ -197,6 +350,7 @@ impl<'model> Qwen36ExecutionState<'model> {
             mtp_hidden_scratch: None,
             dflash2_workspace: None,
             dflash2_prefix_cache: Qwen38DFlash2PrefixCache::new(dflash2_retained_bytes),
+            sequences: Qwen36SequencePool::new(),
         })
     }
 }
