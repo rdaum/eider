@@ -15,7 +15,30 @@ use std::mem::size_of;
 /// Builds a pointer table in stream order, repeating each input row `repeats` times.
 pub fn repeat_row_pointer_table_f32_into_on_stream(
     input: &DeviceBuffer<f32>,
-    mut table: DeviceOutput<'_, *const f32>,
+    table: DeviceOutput<'_, *const f32>,
+    routes: usize,
+    repeats: usize,
+    row_stride: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    repeat_row_pointer_table_f32_impl(input, table, routes, repeats, row_stride, stream)
+}
+
+/// Builds a repeated input-row table with typed device addresses.
+pub fn repeat_row_address_table_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    table: DeviceOutput<'_, DeviceAddress<f32>>,
+    routes: usize,
+    repeats: usize,
+    row_stride: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    repeat_row_pointer_table_f32_impl(input, table, routes, repeats, row_stride, stream)
+}
+
+fn repeat_row_pointer_table_f32_impl<T: DeviceRepr>(
+    input: &DeviceBuffer<f32>,
+    mut table: DeviceOutput<'_, T>,
     routes: usize,
     repeats: usize,
     row_stride: usize,
@@ -54,7 +77,7 @@ pub fn repeat_row_pointer_table_f32_into_on_stream(
             "infer_repeat_row_pointer_table_f32_on_stream",
             ffi::infer_repeat_row_pointer_table_f32_on_stream(
                 input.ptr,
-                table.buffer_mut().ptr,
+                table.buffer_mut().ptr.cast(),
                 routes as u32,
                 repeats as u32,
                 row_stride as u32,
@@ -2819,6 +2842,43 @@ pub fn moe_weighted_accumulate_slots_f32_on_stream(
     route_weights: &DeviceBuffer<f32>,
     inputs: &DeviceBuffer<*const f32>,
     alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_slots_f32_impl(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        stream,
+    )
+}
+
+/// Writes a weighted routed-expert sum using a typed input-address table.
+pub fn moe_weighted_accumulate_slot_addresses_f32_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_slots_f32_impl(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        stream,
+    )
+}
+
+fn moe_weighted_accumulate_slots_f32_impl<T: DeviceRepr>(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<T>,
+    alpha_table: &DeviceBuffer<f32>,
     mut output: DeviceInOut<'_, f32>,
     stream: &CudaStream,
 ) -> Result<()> {
@@ -2850,7 +2910,7 @@ pub fn moe_weighted_accumulate_slots_f32_on_stream(
             ffi::infer_moe_weighted_accumulate_slots_f32_on_stream(
                 indices.ptr,
                 route_weights.ptr,
-                inputs.ptr,
+                inputs.ptr.cast(),
                 alpha_table.ptr,
                 output.buffer_mut().ptr,
                 output.len() as u32,
@@ -2894,6 +2954,58 @@ pub fn moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
     route_weights: &DeviceBuffer<f32>,
     inputs: &DeviceBuffer<*const f32>,
     alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_slots_f32_batch_prefix_impl(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        len,
+        stream,
+    )
+}
+
+/// Writes weighted routed-expert sums for active rows using typed input
+/// addresses.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    len: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_weighted_accumulate_slots_f32_batch_prefix_impl(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        len,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_weighted_accumulate_slots_f32_batch_prefix_impl<T: DeviceRepr>(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<T>,
+    alpha_table: &DeviceBuffer<f32>,
     mut output: DeviceInOut<'_, f32>,
     rows: usize,
     groups: usize,
@@ -2936,7 +3048,7 @@ pub fn moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
             ffi::infer_moe_weighted_accumulate_slots_f32_batch_on_stream(
                 indices.ptr,
                 route_weights.ptr,
-                inputs.ptr,
+                inputs.ptr.cast(),
                 alpha_table.ptr,
                 output.buffer_mut().ptr,
                 rows as u32,
@@ -10658,6 +10770,62 @@ pub fn nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
     in_features: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    nvfp4_w4a16_grouped_matvec_f32_impl(
+        indices,
+        input,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
+/// Enqueues device-routed W4A16 matvecs with typed expert and output address
+/// tables.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<f32>,
+    packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    nvfp4_w4a16_grouped_matvec_f32_impl(
+        indices,
+        input,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_w4a16_grouped_matvec_f32_impl<
+    Weight: DeviceRepr,
+    Scale: DeviceRepr,
+    Output: DeviceRepr,
+>(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<f32>,
+    packed_weight_table: &DeviceBuffer<Weight>,
+    weight_scale_table: &DeviceBuffer<Scale>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<Output>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let groups = indices.len();
     let table_len = packed_weight_table.len();
     let shared_memory_bytes = in_features
@@ -10710,10 +10878,10 @@ pub fn nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
             ffi::infer_nvfp4_w4a16_grouped_matvec_f32_on_stream(
                 indices.ptr,
                 input.ptr,
-                packed_weight_table.ptr,
-                weight_scale_table.ptr,
+                packed_weight_table.ptr.cast(),
+                weight_scale_table.ptr.cast(),
                 weight_scale_2_table.ptr,
-                output_table.ptr,
+                output_table.ptr.cast(),
                 table_len as u32,
                 groups as u32,
                 out_features as u32,
@@ -10751,6 +10919,34 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
     )
 }
 
+/// Enqueues device-routed W4A16 matvecs with typed input, expert, and output
+/// address tables.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
+    packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
+        indices,
+        input_table,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        indices.len(),
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
 /// Enqueues an active prefix of device-routed grouped W4A16 matvecs.
 #[allow(clippy::too_many_arguments)]
 pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
@@ -10760,6 +10956,67 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
     weight_scale_table: &DeviceBuffer<*const u8>,
     weight_scale_2_table: &DeviceBuffer<f32>,
     output_table: &DeviceBuffer<*mut f32>,
+    groups: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_impl(
+        indices,
+        input_table,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        groups,
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
+/// Enqueues an active prefix of device-routed W4A16 matvecs using typed input,
+/// expert, and output address tables.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
+    packed_weight_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_table: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
+    groups: usize,
+    out_features: usize,
+    in_features: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_impl(
+        indices,
+        input_table,
+        packed_weight_table,
+        weight_scale_table,
+        weight_scale_2_table,
+        output_table,
+        groups,
+        out_features,
+        in_features,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_impl<
+    Input: DeviceRepr,
+    Weight: DeviceRepr,
+    Scale: DeviceRepr,
+    Output: DeviceRepr,
+>(
+    indices: &DeviceBuffer<u32>,
+    input_table: &DeviceBuffer<Input>,
+    packed_weight_table: &DeviceBuffer<Weight>,
+    weight_scale_table: &DeviceBuffer<Scale>,
+    weight_scale_2_table: &DeviceBuffer<f32>,
+    output_table: &DeviceBuffer<Output>,
     groups: usize,
     out_features: usize,
     in_features: usize,
@@ -10815,11 +11072,11 @@ pub fn nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
             "infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream",
             ffi::infer_nvfp4_w4a16_grouped_inputs_matvec_f32_on_stream(
                 indices.ptr,
-                input_table.ptr,
-                packed_weight_table.ptr,
-                weight_scale_table.ptr,
+                input_table.ptr.cast(),
+                packed_weight_table.ptr.cast(),
+                weight_scale_table.ptr.cast(),
                 weight_scale_2_table.ptr,
-                output_table.ptr,
+                output_table.ptr.cast(),
                 table_len as u32,
                 groups as u32,
                 out_features as u32,

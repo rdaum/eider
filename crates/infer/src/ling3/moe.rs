@@ -1,14 +1,15 @@
 use super::Ling3Manifest;
 use super::layer::{Ling3Linear, load_float_as_f32};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Result, add_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_batch_prefix_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_batch_into_on_stream,
-    nemotron3_sigmoid_topk_f32_into_on_stream,
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, repeat_row_pointer_table_f32_into_on_stream,
-    silu_mul_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Result, add_f32_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    nemotron3_sigmoid_topk_f32_batch_into_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
+    repeat_row_address_table_f32_into_on_stream, silu_mul_f32_into_on_stream,
+    silu_mul_f32_prefix_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 
@@ -84,14 +85,14 @@ pub struct Ling3Moe {
 }
 
 struct ExpertTables {
-    gate_packed: DeviceBuffer<*const u8>,
-    gate_scales: DeviceBuffer<*const u8>,
+    gate_packed: DeviceBuffer<DeviceAddress<u8>>,
+    gate_scales: DeviceBuffer<DeviceAddress<u8>>,
     gate_scale_2: DeviceBuffer<f32>,
-    up_packed: DeviceBuffer<*const u8>,
-    up_scales: DeviceBuffer<*const u8>,
+    up_packed: DeviceBuffer<DeviceAddress<u8>>,
+    up_scales: DeviceBuffer<DeviceAddress<u8>>,
     up_scale_2: DeviceBuffer<f32>,
-    down_packed: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u8>,
+    down_packed: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u8>>,
     down_scale_2: DeviceBuffer<f32>,
     expert_alpha: DeviceBuffer<f32>,
 }
@@ -106,12 +107,12 @@ pub struct Ling3MoeWorkspace {
     expert_up: DeviceBuffer<f32>,
     expert_activated: DeviceBuffer<f32>,
     expert_output: DeviceBuffer<f32>,
-    input_table: DeviceBuffer<*const f32>,
-    gate_output_table: DeviceBuffer<*mut f32>,
-    up_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
+    input_table: DeviceBuffer<DeviceAddress<f32>>,
+    gate_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    up_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_input_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_result_table: DeviceBuffer<DeviceAddress<f32>>,
     routed_output: DeviceBuffer<f32>,
     shared_gate: DeviceBuffer<f32>,
     shared_up: DeviceBuffer<f32>,
@@ -179,11 +180,11 @@ impl Ling3Moe {
         let expert_up = DeviceBuffer::zeroed(routes * self.intermediate)?;
         let expert_activated = DeviceBuffer::zeroed(routes * self.intermediate)?;
         let expert_output = DeviceBuffer::zeroed(routes * self.hidden)?;
-        let gate_output_table = mutable_pointer_table(&expert_gate, routes, self.intermediate)?;
-        let up_output_table = mutable_pointer_table(&expert_up, routes, self.intermediate)?;
-        let down_input_table = const_pointer_table(&expert_activated, routes, self.intermediate)?;
-        let down_output_table = mutable_pointer_table(&expert_output, routes, self.hidden)?;
-        let down_result_table = const_pointer_table(&expert_output, routes, self.hidden)?;
+        let gate_output_table = address_table(&expert_gate, routes, self.intermediate)?;
+        let up_output_table = address_table(&expert_up, routes, self.intermediate)?;
+        let down_input_table = address_table(&expert_activated, routes, self.intermediate)?;
+        let down_output_table = address_table(&expert_output, routes, self.hidden)?;
+        let down_result_table = address_table(&expert_output, routes, self.hidden)?;
         Ok(Ling3MoeWorkspace {
             capacity: rows,
             logits: DeviceBuffer::zeroed(rows * self.experts.len())?,
@@ -238,7 +239,7 @@ impl Ling3Moe {
             self.scaling_factor,
             stream,
         )?;
-        repeat_row_pointer_table_f32_into_on_stream(
+        repeat_row_address_table_f32_into_on_stream(
             input,
             workspace.input_table.output(),
             routes,
@@ -246,7 +247,7 @@ impl Ling3Moe {
             self.hidden,
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
             &workspace.indices,
             &workspace.input_table,
             &self.expert_tables.gate_packed,
@@ -258,7 +259,7 @@ impl Ling3Moe {
             self.hidden,
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
             &workspace.indices,
             &workspace.input_table,
             &self.expert_tables.up_packed,
@@ -277,7 +278,7 @@ impl Ling3Moe {
             routes * self.intermediate,
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_prefix_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_prefix_into_on_stream(
             &workspace.indices,
             &workspace.down_input_table,
             &self.expert_tables.down_packed,
@@ -289,7 +290,7 @@ impl Ling3Moe {
             self.intermediate,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
             &workspace.indices,
             &workspace.weights,
             &workspace.down_result_table,
@@ -347,7 +348,7 @@ impl Ling3Moe {
             self.scaling_factor,
             stream,
         )?;
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &workspace.indices,
             input,
             &self.expert_tables.gate_packed,
@@ -358,7 +359,7 @@ impl Ling3Moe {
             self.hidden,
             stream,
         )?;
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &workspace.indices,
             input,
             &self.expert_tables.up_packed,
@@ -375,7 +376,7 @@ impl Ling3Moe {
             workspace.expert_activated.output(),
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             &workspace.indices,
             &workspace.down_input_table,
             &self.expert_tables.down_packed,
@@ -386,7 +387,7 @@ impl Ling3Moe {
             self.intermediate,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &workspace.indices,
             &workspace.weights,
             &workspace.down_result_table,
@@ -444,16 +445,16 @@ impl ExpertTables {
         let mut down_scale_2 = Vec::with_capacity(experts.len());
         for expert in experts {
             let (packed, scales, scale_2) = expert.gate.nvfp4_parts()?;
-            gate_packed.push(packed.as_const_ptr().cast::<u8>());
-            gate_scales.push(scales.as_const_ptr().cast::<u8>());
+            gate_packed.push(packed.address_at(0)?);
+            gate_scales.push(scales.address_at(0)?);
             gate_scale_2.push(scale_2);
             let (packed, scales, scale_2) = expert.up.nvfp4_parts()?;
-            up_packed.push(packed.as_const_ptr().cast::<u8>());
-            up_scales.push(scales.as_const_ptr().cast::<u8>());
+            up_packed.push(packed.address_at(0)?);
+            up_scales.push(scales.address_at(0)?);
             up_scale_2.push(scale_2);
             let (packed, scales, scale_2) = expert.down.nvfp4_parts()?;
-            down_packed.push(packed.as_const_ptr().cast::<u8>());
-            down_scales.push(scales.as_const_ptr().cast::<u8>());
+            down_packed.push(packed.address_at(0)?);
+            down_scales.push(scales.address_at(0)?);
             down_scale_2.push(scale_2);
         }
         Ok(Self {
@@ -484,29 +485,15 @@ impl ExpertTables {
     }
 }
 
-fn const_pointer_table(
+fn address_table(
     buffer: &DeviceBuffer<f32>,
     entries: usize,
     stride: usize,
-) -> Result<DeviceBuffer<*const f32>> {
-    let base = buffer.as_const_ptr().cast::<f32>();
+) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
     DeviceBuffer::from_host(
         &(0..entries)
-            .map(|entry| unsafe { base.add(entry * stride) })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn mutable_pointer_table(
-    buffer: &DeviceBuffer<f32>,
-    entries: usize,
-    stride: usize,
-) -> Result<DeviceBuffer<*mut f32>> {
-    let base = buffer.as_const_ptr().cast::<f32>().cast_mut();
-    DeviceBuffer::from_host(
-        &(0..entries)
-            .map(|entry| unsafe { base.add(entry * stride) })
-            .collect::<Vec<_>>(),
+            .map(|entry| buffer.address_at(entry * stride))
+            .collect::<Result<Vec<_>>>()?,
     )
 }
 

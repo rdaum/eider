@@ -94,6 +94,8 @@ Laguna's CUTLASS routed gate/up plan now uses its typed expert weight, scale,
 and output tables directly; the remaining legacy raw-table caller is Qwen3.6.
 Qwen3.6's FP8 routed-expert path likewise uses typed weight and channel-scale
 address tables through its gate/up and down CUDA launches.
+Ling 3's routed W4A16 workspace uses typed input, expert, output, and
+weighted-accumulation tables for both one-token decode and batched execution.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both
