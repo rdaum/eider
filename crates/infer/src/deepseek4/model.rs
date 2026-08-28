@@ -7,8 +7,8 @@ use super::{
     Deepseek4SequenceCheckpoint, Deepseek4SequenceState, deepseek4_cache_error,
 };
 use eider_cuda::{
-    CudaStream, Deepseek4CausalAttentionBatch, DeviceBuffer, DeviceRepr, Error, INDEXER_SCORE_SLAB,
-    PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
+    CudaStream, Deepseek4CausalAttentionBatch, DeviceAddress, DeviceBuffer, DeviceRepr, Error,
+    INDEXER_SCORE_SLAB, PinnedHostBuffer, Result, add_f32_prefix_into_on_stream,
     arithmetic_positions_u32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     block_fp8_grouped_linear_f32_batch_into_on_stream, block_fp8_linear_f32_batch_into_on_stream,
     causal_attention_f32_batch_into_on_stream, compress_windows_f32_into_on_stream,
@@ -1074,7 +1074,7 @@ impl Deepseek4IndexerWeights {
     pub fn select_rows(
         &self,
         workspace: &mut Deepseek4IndexerWorkspace,
-        compressed_tables: &DeviceBuffer<*const f32>,
+        compressed_tables: &DeviceBuffer<DeviceAddress<f32>>,
         compressed_lengths: &DeviceBuffer<u32>,
         positions: &DeviceBuffer<u32>,
         batch_rows: usize,
@@ -1251,7 +1251,7 @@ enum Deepseek4SingleAttentionCompressionWorkspace {
 }
 
 struct Deepseek4AttentionMetadata {
-    page_tables: StagedMetadata<*const u32>,
+    page_tables: StagedMetadata<DeviceAddress<u32>>,
     current_starts: StagedMetadata<u32>,
     query_offsets: StagedMetadata<u32>,
     positions: StagedMetadata<u32>,
@@ -1259,7 +1259,7 @@ struct Deepseek4AttentionMetadata {
 }
 
 struct Deepseek4CompressedMetadata {
-    tables: StagedMetadata<*const f32>,
+    tables: StagedMetadata<DeviceAddress<f32>>,
     lengths: StagedMetadata<u32>,
 }
 
@@ -1788,7 +1788,7 @@ fn fill_prior_attention_metadata(
 ) -> Result<()> {
     let mut output_row = 0;
     for row in rows {
-        let page_table = row.page_table.as_const_ptr().cast::<u32>();
+        let page_table = row.page_table.cuda_address();
         let current_start = u32_value("current start", output_row)?;
         for offset in 0..row.rows {
             metadata.page_tables.host.as_mut_slice()[output_row + offset] = page_table;
@@ -1810,7 +1810,7 @@ fn fill_empty_compressed_metadata(
     let mut output_row = 0;
     for row in rows {
         for offset in 0..row.rows {
-            metadata.tables.host.as_mut_slice()[output_row + offset] = std::ptr::null();
+            metadata.tables.host.as_mut_slice()[output_row + offset] = DeviceAddress::null();
             metadata.lengths.host.as_mut_slice()[output_row + offset] = 0;
         }
         output_row += row.rows;
@@ -1853,7 +1853,7 @@ fn fill_compressed_metadata(
             },
             actual: "missing".to_string(),
         })?;
-        let pointer = state.compressed().input().as_const_ptr().cast::<f32>();
+        let pointer = state.compressed().cuda_address();
         let len = u32_value("compressed length", state.compressed_len())?;
         for offset in 0..row.rows {
             metadata.tables.host.as_mut_slice()[output_row + offset] = pointer;

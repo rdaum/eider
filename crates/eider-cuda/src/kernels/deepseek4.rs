@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::kernels::non_gemm::MoeSortedRoutes;
@@ -14,13 +14,13 @@ pub const INDEXER_SCORE_SLAB: usize = 4096;
 /// Pointer tables and lengths for one batched DeepSeek attention operation.
 pub struct Deepseek4AttentionBatch<'a> {
     /// Per-sequence pointers to `[sliding_capacity, head_dim]` ring storage.
-    pub sliding_tables: &'a DeviceBuffer<*const f32>,
+    pub sliding_tables: &'a DeviceBuffer<DeviceAddress<f32>>,
     /// Number of valid chronological entries in each sliding ring.
     pub sliding_lengths: &'a DeviceBuffer<u32>,
     /// Oldest valid physical slot in each sliding ring.
     pub sliding_starts: &'a DeviceBuffer<u32>,
     /// Per-sequence pointers to `[compressed_length, head_dim]` storage.
-    pub compressed_tables: &'a DeviceBuffer<*const f32>,
+    pub compressed_tables: &'a DeviceBuffer<DeviceAddress<f32>>,
     /// Number of valid compressed entries for each sequence.
     pub compressed_lengths: &'a DeviceBuffer<u32>,
     /// CSA indices, flattened as `[batch, selected_count]`; absent for HCA.
@@ -32,7 +32,7 @@ pub struct Deepseek4CausalAttentionBatch<'a> {
     /// Physical `[page_slots, page_tokens, head_dim]` latent-cache pool.
     pub sliding_pool: &'a DeviceBuffer<f32>,
     /// Per-query pointers to logical-to-physical page-slot tables.
-    pub page_tables: &'a DeviceBuffer<*const u32>,
+    pub page_tables: &'a DeviceBuffer<DeviceAddress<u32>>,
     /// Current chunks concatenated as `[current_rows, head_dim]`.
     pub current_kv: &'a DeviceBuffer<f32>,
     /// Row at which each query's current sequence chunk begins.
@@ -42,7 +42,7 @@ pub struct Deepseek4CausalAttentionBatch<'a> {
     /// Absolute token position for every query.
     pub positions: &'a DeviceBuffer<u32>,
     /// Per-query pointers to completed compressed entries.
-    pub compressed_tables: &'a DeviceBuffer<*const f32>,
+    pub compressed_tables: &'a DeviceBuffer<DeviceAddress<f32>>,
     /// Number of completed compressed entries for each query.
     pub compressed_lengths: &'a DeviceBuffer<u32>,
     /// CSA selections and their logical per-row width.
@@ -715,7 +715,7 @@ pub fn causal_attention_f32_batch_into_on_stream(
 pub fn indexer_topk_f32_batch_into_on_stream(
     query: &DeviceBuffer<f32>,
     head_weights: &DeviceBuffer<f32>,
-    compressed_tables: &DeviceBuffer<*const f32>,
+    compressed_tables: &DeviceBuffer<DeviceAddress<f32>>,
     compressed_lengths: &DeviceBuffer<u32>,
     positions: &DeviceBuffer<u32>,
     mut score_scratch: DeviceOutput<'_, f32>,
@@ -1844,16 +1844,12 @@ mod tests {
         let sliding_b = DeviceBuffer::from_host(&sliding_b).expect("sliding b");
         let compressed_a = DeviceBuffer::from_host(&compressed_a).expect("compressed a");
         let compressed_b = DeviceBuffer::from_host(&compressed_b).expect("compressed b");
-        let sliding_ptrs = DeviceBuffer::from_host(&[
-            sliding_a.input().as_const_ptr().cast::<f32>(),
-            sliding_b.input().as_const_ptr().cast::<f32>(),
-        ])
-        .expect("sliding pointers");
-        let compressed_ptrs = DeviceBuffer::from_host(&[
-            compressed_a.input().as_const_ptr().cast::<f32>(),
-            compressed_b.input().as_const_ptr().cast::<f32>(),
-        ])
-        .expect("compressed pointers");
+        let sliding_ptrs =
+            DeviceBuffer::from_host(&[sliding_a.cuda_address(), sliding_b.cuda_address()])
+                .expect("sliding pointers");
+        let compressed_ptrs =
+            DeviceBuffer::from_host(&[compressed_a.cuda_address(), compressed_b.cuda_address()])
+                .expect("compressed pointers");
         let lengths = DeviceBuffer::from_host(&lengths).expect("lengths");
         let starts = DeviceBuffer::from_host(&starts).expect("starts");
         let compressed_lengths =
@@ -1949,8 +1945,8 @@ mod tests {
         let current = DeviceBuffer::from_host(&current).expect("current");
         let compressed = DeviceBuffer::from_host(&compressed).expect("compressed");
         let page_table = DeviceBuffer::from_host(&[0u32, 1, 2, 3]).expect("page table");
-        let page_table_pointer = page_table.input().as_const_ptr().cast::<u32>();
-        let compressed_pointer = compressed.input().as_const_ptr().cast::<f32>();
+        let page_table_pointer = page_table.cuda_address();
+        let compressed_pointer = compressed.cuda_address();
         let page_tables =
             DeviceBuffer::from_host(&[page_table_pointer; ROWS]).expect("page-table pointers");
         let compressed_tables =
@@ -2044,11 +2040,9 @@ mod tests {
         let head_weights = DeviceBuffer::from_host(&head_weights).expect("head weights");
         let compressed_a = DeviceBuffer::from_host(&compressed_a).expect("compressed a");
         let compressed_b = DeviceBuffer::from_host(&compressed_b).expect("compressed b");
-        let compressed_tables = DeviceBuffer::from_host(&[
-            compressed_a.input().as_const_ptr().cast::<f32>(),
-            compressed_b.input().as_const_ptr().cast::<f32>(),
-        ])
-        .expect("compressed tables");
+        let compressed_tables =
+            DeviceBuffer::from_host(&[compressed_a.cuda_address(), compressed_b.cuda_address()])
+                .expect("compressed tables");
         let compressed_lengths =
             DeviceBuffer::from_host(&compressed_lengths).expect("compressed lengths");
         let positions = DeviceBuffer::from_host(&positions).expect("positions");
@@ -2106,7 +2100,7 @@ mod tests {
         let tables = DeviceBuffer::from_host(
             &compressed
                 .iter()
-                .map(|values| values.input().as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("tables");
@@ -2144,8 +2138,7 @@ mod tests {
             let weights = DeviceBuffer::from_host(&weights_host[row * HEADS..(row + 1) * HEADS])
                 .expect("row weights");
             let table =
-                DeviceBuffer::from_host(&[compressed[row].input().as_const_ptr().cast::<f32>()])
-                    .expect("row table");
+                DeviceBuffer::from_host(&[compressed[row].cuda_address()]).expect("row table");
             let length = DeviceBuffer::from_host(&lengths[row..=row]).expect("row length");
             let position = DeviceBuffer::from_host(&positions[row..=row]).expect("row position");
             let mut token_scores =

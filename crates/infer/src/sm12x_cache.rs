@@ -1,7 +1,7 @@
 //! Shared SM12x paged sequence storage.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, PinnedHostBuffer, Result, SM12X_KV_PAGE_TOKENS,
     Sm12xKvPagePool, Sm12xKvTailSnapshot,
 };
 use seqcache::{
@@ -63,6 +63,11 @@ impl Sm12xPageTable {
     /// Returns the stable device page-table allocation.
     pub fn device(&self) -> &DeviceBuffer<u32> {
         &self.device
+    }
+
+    /// Returns the stable CUDA address of this page table.
+    pub fn device_address(&self) -> DeviceAddress<u32> {
+        self.device.cuda_address()
     }
 
     /// Returns the maximum number of logical pages addressable by this table.

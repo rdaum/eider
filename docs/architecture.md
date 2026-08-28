@@ -85,6 +85,8 @@ CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
 The live Qwen3.6 and Laguna SM12x indexed-down plans now do the same for
 expert tiles, scales, and route outputs. The legacy raw-table entry point
 remains while focused benchmarks migrate.
+DeepSeek V4 attention metadata now stores typed addresses for page tables and
+compressed-state tables, including explicit null entries for absent history.
 The persistent CUTLASS grouped-GEMM plan and its Qwen, Gemma, and Laguna
 prefill callers also use opaque address tables for weights, activations,
 outputs, and per-expert scales.

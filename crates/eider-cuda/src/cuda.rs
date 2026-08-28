@@ -44,7 +44,8 @@ primitive_device_repr!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, 
 /// This value is suitable for device pointer tables, including GB10 pageable
 /// host memory that CUDA accesses through host page tables. It is not a Rust
 /// reference and cannot be dereferenced on the host. Only CUDA internals can
-/// expose its raw address to a kernel launch.
+/// expose its raw address to a kernel launch. A null address represents an
+/// absent entry only where a kernel API explicitly permits one.
 #[repr(transparent)]
 #[derive(Debug, Eq, PartialEq)]
 pub struct DeviceAddress<T> {
@@ -61,6 +62,14 @@ impl<T> Clone for DeviceAddress<T> {
 }
 
 impl<T> DeviceAddress<T> {
+    /// Returns a null CUDA address for an optional kernel pointer table entry.
+    pub fn null() -> Self {
+        Self {
+            pointer: null_mut(),
+            _values: PhantomData,
+        }
+    }
+
     /// Returns an address advanced by `elements` values.
     pub fn offset(self, elements: usize) -> Result<Self> {
         let byte_offset = elements

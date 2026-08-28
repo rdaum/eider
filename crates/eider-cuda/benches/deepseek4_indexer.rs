@@ -1,5 +1,6 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, INDEXER_SCORE_SLAB, indexer_topk_f32_batch_into_on_stream,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, INDEXER_SCORE_SLAB,
+    indexer_topk_f32_batch_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -22,7 +23,7 @@ struct IndexerBench<const ROWS: usize, const ENTRIES: usize> {
     query: DeviceBuffer<f32>,
     head_weights: DeviceBuffer<f32>,
     _compressed: DeviceBuffer<f32>,
-    compressed_tables: DeviceBuffer<*const f32>,
+    compressed_tables: DeviceBuffer<DeviceAddress<f32>>,
     compressed_lengths: DeviceBuffer<u32>,
     positions: DeviceBuffer<u32>,
     score_scratch: DeviceBuffer<f32>,
@@ -89,7 +90,7 @@ impl<const ROWS: usize, const ENTRIES: usize> BenchContext for IndexerBench<ROWS
             compressed[entry * HEAD_DIM] = (entry + 1) as f32 / ENTRIES as f32;
         }
         let compressed = DeviceBuffer::from_host(&compressed).expect("compressed entries");
-        let compressed_pointer = compressed.input().as_const_ptr().cast::<f32>();
+        let compressed_address = compressed.cuda_address();
         let stream = CudaStream::new_non_blocking().expect("stream");
         let mut context = Self {
             stream,
@@ -98,7 +99,7 @@ impl<const ROWS: usize, const ENTRIES: usize> BenchContext for IndexerBench<ROWS
             query: DeviceBuffer::from_host(&query).expect("query"),
             head_weights: DeviceBuffer::from_host(&head_weights).expect("head weights"),
             _compressed: compressed,
-            compressed_tables: DeviceBuffer::from_host(&[compressed_pointer; ROWS])
+            compressed_tables: DeviceBuffer::from_host(&[compressed_address; ROWS])
                 .expect("compressed tables"),
             compressed_lengths: DeviceBuffer::from_host(&[ENTRIES as u32; ROWS])
                 .expect("compressed lengths"),
