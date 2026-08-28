@@ -11,7 +11,7 @@ The first migration slice is complete. `eider-cuda` now rejects invalid device
 representations, returns a loan for device-to-pinned-host readback, retains
 captured-graph resources, and supplies typed device views. The DFlash2
 projection uses those views. Physical SM12x page storage and Qwen sequence
-state have moved out of `runtime` without a compatibility module. Qwen now
+state have moved out of `execution` without a compatibility module. Qwen now
 keeps persistent streams, workspaces, cache state, and retained DFlash state
 in an inference-owned execution object. Qwen scheduler requests now retain
 opaque sequence identities, while the execution object owns the live CUDA
@@ -129,8 +129,8 @@ The persistent CUTLASS grouped-GEMM plan and its Qwen, Gemma, and Laguna
 prefill callers also use opaque address tables for weights, activations,
 outputs, and per-expert scales.
 Model sources and focused benchmarks import host ModelOpt records directly
-from `eider-format`; `eider-cuda` exports only CUDA preparation and execution
-types.
+from `eider-format`. `eider-cuda` accepts them only at explicit upload and
+preparation entry points; execution APIs expose CUDA types.
 `InferenceError` now preserves format failures separately from CUDA failures
 at the actor-service boundary.
 

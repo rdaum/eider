@@ -20,7 +20,7 @@ mod paged_prefill_attention;
 /// Physical SM12x KV-page storage shared by inference model state.
 pub mod sm12x_cache;
 
-/// Runtime state and device-resident KV cache storage.
+/// Model-owned execution support and device-resident KV cache storage.
 pub mod execution;
 pub use execution::kv_cache;
 
