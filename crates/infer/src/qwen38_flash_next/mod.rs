@@ -13,7 +13,10 @@ mod sequence;
 mod transform;
 
 pub use config::Qwen38FlashNextConfig;
-pub(crate) use execution::{Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionState};
+pub(crate) use execution::{
+    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionSequence,
+    Qwen38FlashNextExecutionState, Qwen38FlashNextSequenceId,
+};
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 pub use model::{
     Qwen38FlashNextDecodeState, Qwen38FlashNextModel, Qwen38FlashNextSequenceSnapshot,

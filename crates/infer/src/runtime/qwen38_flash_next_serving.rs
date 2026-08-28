@@ -1,9 +1,10 @@
 //! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionState, Qwen38FlashNextModel,
-    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot,
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSpeculativeFrontier,
+    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionSequence,
+    Qwen38FlashNextExecutionState, Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceCache,
+    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot, Qwen38FlashNextSequence,
+    Qwen38FlashNextSequenceCache, Qwen38FlashNextSequenceId, Qwen38FlashNextSpeculativeFrontier,
     Qwen38LogitsMode, Qwen38NextToken, qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
@@ -94,13 +95,10 @@ struct ActiveRequest<'tokenizer> {
     generated_tokens: usize,
     last_token: Option<u32>,
     prompt_logits_ready: bool,
-    sequence: Option<Box<Qwen38FlashNextSequence>>,
-    mtp_sequence: Option<Qwen38FlashNextMtpSequenceState>,
-    speculative_frontier: Option<Qwen38FlashNextSpeculativeFrontier>,
+    uses_speculative: bool,
+    sequence_id: Option<Qwen38FlashNextSequenceId>,
     sampler: Sampler,
     history: TokenHistory,
-    device_token_counts: Option<DeviceBuffer<u32>>,
-    sequence_device_bytes: usize,
     output: ChatOutputCodec<'tokenizer>,
     filter: ResponseFilter,
     usage: ChatUsage,
@@ -116,7 +114,6 @@ pub struct Qwen38FlashNextChatService<'template> {
     prefilling: VecDeque<Qwen38FlashNextRequestId>,
     decoding: VecDeque<Qwen38FlashNextRequestId>,
     requests: BTreeMap<Qwen38FlashNextRequestId, ActiveRequest<'template>>,
-    active_sequences: usize,
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
@@ -174,7 +171,6 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             prefilling: VecDeque::new(),
             decoding: VecDeque::new(),
             requests: BTreeMap::new(),
-            active_sequences: 0,
         })
     }
 
@@ -240,13 +236,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 generated_tokens: 0,
                 last_token: None,
                 prompt_logits_ready: false,
-                sequence: None,
-                mtp_sequence: None,
-                speculative_frontier: None,
+                uses_speculative: false,
+                sequence_id: None,
                 sampler,
                 history,
-                device_token_counts: None,
-                sequence_device_bytes: 0,
                 output: ChatOutputCodec::new(
                     self.template.tokenizer(),
                     &request.tools,
@@ -310,41 +303,42 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             }
         }
         for (&id, request) in &self.requests {
-            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.active_sequences;
+        tick.active_sequences = self.execution.sequences.len();
         Ok(tick)
     }
 
     pub fn cancel_request(&mut self, id: Qwen38FlashNextRequestId) -> Qwen38FlashNextCancelOutcome {
-        let Some(mut request) = self.requests.remove(&id) else {
+        let Some(request) = self.requests.remove(&id) else {
             return Qwen38FlashNextCancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
         self.prefilling.retain(|&prefilling| prefilling != id);
         self.decoding.retain(|&decoding| decoding != id);
-        if let Some(mtp_sequence) = request.mtp_sequence.take()
-            && let Some(sequence) = request.sequence.as_deref()
-            && let Some(cache) = self.execution.mtp_sequence_cache.as_mut()
-        {
-            let _ = mtp_sequence.finish(cache, sequence.state.stream());
-        }
-        if let Some(sequence) = request.sequence.take() {
-            let _ = sequence.finish(&mut self.execution.sequence_cache);
-            self.active_sequences -= 1;
-        }
+        let released = request
+            .sequence_id
+            .and_then(|sequence_id| self.execution.sequences.release(sequence_id).ok())
+            .map_or(0, |sequence| {
+                let bytes = sequence.device_bytes();
+                let _ = sequence.finish(
+                    &mut self.execution.sequence_cache,
+                    self.execution.mtp_sequence_cache.as_mut(),
+                );
+                bytes
+            });
         Qwen38FlashNextCancelOutcome::Cancelled {
-            released_sequence_device_bytes: request.sequence_device_bytes,
+            released_sequence_device_bytes: released,
         }
     }
 
     pub fn active_sequence_count(&self) -> usize {
-        self.active_sequences
+        self.execution.sequences.len()
     }
 
     fn admit(
@@ -355,7 +349,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.active_sequences < self.config.max_active_sequences {
+        while self.execution.sequences.len() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
@@ -460,13 +454,17 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence = Some(Box::new(sequence));
-            request.mtp_sequence = mtp_sequence;
-            request.speculative_frontier = speculative_frontier;
-            request.device_token_counts = device_token_counts;
-            request.sequence_device_bytes = sequence_device_bytes;
+            request.uses_speculative = speculative_frontier.is_some();
+            request.sequence_id = Some(self.execution.sequences.insert(
+                Qwen38FlashNextExecutionSequence::new(
+                    sequence,
+                    mtp_sequence,
+                    speculative_frontier,
+                    device_token_counts,
+                    sequence_device_bytes,
+                ),
+            )?);
             request.usage.cached_prompt_tokens = cached_prompt_tokens;
-            self.active_sequences += 1;
             if request.generation.max_new_tokens != 0 {
                 self.prefilling.push_back(id);
             }
@@ -497,10 +495,11 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             return Ok(0);
         }
         on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
-        let sequence = request
-            .sequence
-            .as_deref_mut()
-            .expect("request is admitted");
+        let mut sequence = self
+            .execution
+            .sequences
+            .lease(request.sequence_id.expect("request is admitted"))?;
+        let sequence = sequence.sequence_mut();
         let start = request.prompt_position;
         let final_prompt_chunk = end == request.prompt.len();
         let logits = if !final_prompt_chunk {
@@ -510,7 +509,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         } else {
             Qwen38LogitsMode::Full
         };
-        sequence.forward_tokens(
+        sequence.sequence.forward_tokens(
             &mut self.execution.model,
             &mut self.execution.prefill_workspace,
             &mut self.execution.sequence_cache,
@@ -518,8 +517,8 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             logits,
         )?;
         if let (Some(mtp_sequence), Some(frontier)) = (
-            request.mtp_sequence.as_mut(),
-            request.speculative_frontier.as_mut(),
+            sequence.mtp_sequence.as_mut(),
+            sequence.speculative_frontier.as_mut(),
         ) {
             let mtp_cache = self
                 .execution
@@ -538,28 +537,29 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 &request.prompt[start..end],
                 &self.execution.prefill_workspace,
                 &frontier.previous_streams,
-                sequence.state.stream(),
+                sequence.sequence.state.stream(),
             )?;
             self.execution.model.copy_prefill_target_streams(
                 &self.execution.prefill_workspace,
                 end - start - 1,
                 &mut frontier.previous_streams,
-                sequence.state.stream(),
+                sequence.sequence.state.stream(),
             )?;
             if final_prompt_chunk {
-                let next = self.execution.model.read_top1(&sequence.state)?;
+                let next = self.execution.model.read_top1(&sequence.sequence.state)?;
                 frontier.token = next.id;
                 frontier.logit = next.value;
             }
         }
         request.prompt_position = end;
         request.prompt_logits_ready =
-            end == request.prompt.len() && request.speculative_frontier.is_none();
+            end == request.prompt.len() && sequence.speculative_frontier.is_none();
         Self::retain_request_checkpoint(
             &self.execution.model,
             &mut self.execution.sequence_cache,
             self.execution.mtp_sequence_cache.as_mut(),
             request,
+            sequence,
         );
         tick.prefilled.push(Qwen38FlashNextPrefillProgress {
             request_id: id,
@@ -573,6 +573,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         sequence_cache: &mut Qwen38FlashNextSequenceCache,
         mut mtp_sequence_cache: Option<&mut Qwen38FlashNextMtpSequenceCache>,
         request: &mut ActiveRequest<'template>,
+        execution_sequence: &mut Qwen38FlashNextExecutionSequence,
     ) {
         if request.prefix_retained || request.prefix_target == 0 {
             return;
@@ -581,9 +582,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             request.prefix_retained = true;
             return;
         }
-        let Some(sequence) = request.sequence.as_deref_mut() else {
-            return;
-        };
+        let sequence = &mut execution_sequence.sequence;
         if sequence.position() != request.prefix_target {
             return;
         }
@@ -611,9 +610,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             let error = qwen38_flash_next_cache_error(error);
             warn!(%error, "failed to retain shared Qwen3.8 prompt prefix");
         }
-        if let (Some(cache), Some(mtp_sequence)) =
-            (mtp_sequence_cache.as_mut(), request.mtp_sequence.as_mut())
-            && mtp_sequence.position() == request.prefix_target
+        if let (Some(cache), Some(mtp_sequence)) = (
+            mtp_sequence_cache.as_mut(),
+            execution_sequence.mtp_sequence.as_mut(),
+        ) && mtp_sequence.position() == request.prefix_target
             && !cache.contains_prefix(&request.prompt, request.prefix_target)
             && let Err(error) = cache.retain_prefix(
                 mtp_sequence.cache_id,
@@ -636,10 +636,13 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         id: Qwen38FlashNextRequestId,
         tick: &mut Qwen38FlashNextTick,
     ) -> Result<Option<ChatFinishReason>> {
-        if self.requests[&id].speculative_frontier.is_some() {
+        if self.requests[&id].uses_speculative {
             return self.generate_speculative(id, tick);
         }
         let request = self.requests.get_mut(&id).expect("decode request exists");
+        let sequence_id = request.sequence_id.expect("decode request is admitted");
+        let mut sequence = self.execution.sequences.lease(sequence_id)?;
+        let sequence = sequence.sequence_mut();
         let sampling = request.sampler.config();
         if request.prompt_logits_ready {
             request.prompt_logits_ready = false;
@@ -652,23 +655,15 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             } else {
                 Qwen38LogitsMode::Full
             };
-            request
-                .sequence
-                .as_deref_mut()
-                .expect("request is admitted")
-                .forward_token(
-                    &mut self.execution.model,
-                    &mut self.execution.sequence_cache,
-                    token,
-                    logits,
-                )?;
+            sequence.sequence.forward_token(
+                &mut self.execution.model,
+                &mut self.execution.sequence_cache,
+                token,
+                logits,
+            )?;
         }
-        let sequence = request
-            .sequence
-            .as_deref()
-            .expect("decode request is admitted");
         let sampled = if sampling.uses_fast_argmax() {
-            let next = self.execution.model.read_top1(&sequence.state)?;
+            let next = self.execution.model.read_top1(&sequence.sequence.state)?;
             SampledToken {
                 id: next.id,
                 logit: next.value,
@@ -687,10 +682,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 presence_penalty: sampling.presence_penalty,
                 frequency_penalty: sampling.frequency_penalty,
                 draw,
-                token_counts: request.device_token_counts.as_mut(),
+                token_counts: sequence.device_token_counts.as_mut(),
             };
             let sampled = self.execution.model.sample_logits_gpu(
-                &sequence.state,
+                &sequence.sequence.state,
                 &mut self.execution.gpu_sampler,
                 &mut row,
             )?;
@@ -700,7 +695,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 adjusted_logit: sampled.adjusted_logit,
             }
         } else {
-            let logits = self.execution.model.logits_to_host(&sequence.state)?;
+            let logits = self
+                .execution
+                .model
+                .logits_to_host(&sequence.sequence.state)?;
             request.sampler.sample(&logits, &request.history)?
         };
         Self::record_generated(request, id, sampled, tick)
@@ -712,6 +710,12 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         tick: &mut Qwen38FlashNextTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
+        let mut sequence = self.execution.sequences.lease(
+            request
+                .sequence_id
+                .expect("speculative request is admitted"),
+        )?;
+        let sequence = sequence.sequence_mut();
         let remaining = request
             .generation
             .max_new_tokens
@@ -720,7 +724,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             return Ok(Some(ChatFinishReason::Length));
         }
         let committed = if remaining == 1 {
-            let frontier = request
+            let frontier = sequence
                 .speculative_frontier
                 .as_ref()
                 .expect("speculative request has a frontier");
@@ -729,24 +733,20 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 value: frontier.logit,
             }]
         } else {
-            let sequence = request
-                .sequence
-                .as_deref_mut()
-                .expect("request is admitted");
             let outcome = self.execution.model.speculative_cycle_argmax(
                 self.execution
                     .speculative_workspace
                     .as_mut()
                     .expect("speculative workspace was allocated"),
-                request
+                sequence
                     .speculative_frontier
                     .as_mut()
                     .expect("speculative request has a frontier"),
-                &mut sequence.state,
+                &mut sequence.sequence.state,
                 &mut self.execution.sequence_cache,
-                sequence.cache_id,
-                &mut sequence.page_table,
-                request
+                sequence.sequence.cache_id,
+                &mut sequence.sequence.page_table,
+                sequence
                     .mtp_sequence
                     .as_mut()
                     .expect("speculative request has MTP state"),
@@ -830,21 +830,22 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         let mut request = self.requests.remove(&id).expect("terminal request remains");
         self.prefilling.retain(|&prefilling| prefilling != id);
         self.decoding.retain(|&decoding| decoding != id);
-        if let Some(mtp_sequence) = request.mtp_sequence.take()
-            && let Some(sequence) = request.sequence.as_deref()
-            && let Some(cache) = self.execution.mtp_sequence_cache.as_mut()
-        {
-            mtp_sequence.finish(cache, sequence.state.stream())?;
-        }
-        if let Some(sequence) = request.sequence.take() {
-            sequence.finish(&mut self.execution.sequence_cache)?;
-        }
-        self.active_sequences -= 1;
+        let sequence = self.execution.sequences.release(
+            request
+                .sequence_id
+                .take()
+                .expect("terminal request is admitted"),
+        )?;
+        let released_sequence_device_bytes = sequence.device_bytes();
+        sequence.finish(
+            &mut self.execution.sequence_cache,
+            self.execution.mtp_sequence_cache.as_mut(),
+        )?;
         tick.finished.push(Qwen38FlashNextFinished {
             request_id: id,
             finish_reason: reason,
             usage: request.usage,
-            released_sequence_device_bytes: request.sequence_device_bytes,
+            released_sequence_device_bytes,
         });
         Ok(())
     }
