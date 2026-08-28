@@ -4,10 +4,11 @@ use super::{
     Nemotron3RouterRowsWorkspace, Nemotron3RouterWorkspace, Nemotron3StorageConfig,
 };
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_batch_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, relu_squared_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, add_f32_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_batch_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream, relu_squared_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
@@ -323,13 +324,13 @@ impl Nemotron3MoeLayer {
 struct Nemotron3ExpertSlab {
     up_packed: DeviceBuffer<u8>,
     up_scales: DeviceBuffer<u8>,
-    up_packed_table: DeviceBuffer<*const u8>,
-    up_scale_table: DeviceBuffer<*const u8>,
+    up_packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    up_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     up_scale_2: DeviceBuffer<f32>,
     down_packed: DeviceBuffer<u8>,
     down_scales: DeviceBuffer<u8>,
-    down_packed_table: DeviceBuffer<*const u8>,
-    down_scale_table: DeviceBuffer<*const u8>,
+    down_packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    down_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     down_scale_2: DeviceBuffer<f32>,
     expert_alpha: DeviceBuffer<f32>,
     latent: usize,
@@ -412,7 +413,7 @@ impl Nemotron3ExpertSlab {
 
     fn run(&self, workspace: &mut Nemotron3MoeWorkspace, stream: &CudaStream) -> Result<()> {
         let indices = workspace.router.indices();
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.latent,
             &self.up_packed_table,
@@ -428,7 +429,7 @@ impl Nemotron3ExpertSlab {
             workspace.routed_activated.output(),
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.down_input_table,
             &self.down_packed_table,
@@ -439,7 +440,7 @@ impl Nemotron3ExpertSlab {
             self.intermediate,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             workspace.router.weights(),
             &workspace.down_result_table,
@@ -456,7 +457,7 @@ impl Nemotron3ExpertSlab {
         stream: &CudaStream,
     ) -> Result<()> {
         let indices = workspace.router.indices();
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.up_input_table,
             &self.up_packed_table,
@@ -472,7 +473,7 @@ impl Nemotron3ExpertSlab {
             workspace.routed_activated.output(),
             stream,
         )?;
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.down_input_table,
             &self.down_packed_table,
@@ -483,7 +484,7 @@ impl Nemotron3ExpertSlab {
             self.intermediate,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_batch_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
             indices,
             workspace.router.weights(),
             &workspace.down_result_table,
@@ -561,12 +562,11 @@ fn pointer_table(
     slab: &DeviceBuffer<u8>,
     entries: usize,
     stride: usize,
-) -> Result<DeviceBuffer<*const u8>> {
-    let base = slab.as_const_ptr().cast::<u8>();
+) -> Result<DeviceBuffer<DeviceAddress<u8>>> {
     DeviceBuffer::from_host(
         &(0..entries)
-            .map(|entry| unsafe { base.add(entry * stride) })
-            .collect::<Vec<_>>(),
+            .map(|entry| slab.address_at(entry * stride))
+            .collect::<Result<Vec<_>>>()?,
     )
 }
 
@@ -585,10 +585,10 @@ pub struct Nemotron3MoeWorkspace {
     shared_hidden: DeviceBuffer<f32>,
     combined: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
-    up_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
+    up_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_input_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_result_table: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 /// Reusable scratch and pointer-table storage for flattened MoE rows.
@@ -606,11 +606,11 @@ pub struct Nemotron3MoeRowsWorkspace {
     shared_hidden: DeviceBuffer<f32>,
     combined: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
-    up_input_table: DeviceBuffer<*const f32>,
-    up_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
+    up_input_table: DeviceBuffer<DeviceAddress<f32>>,
+    up_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_input_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_result_table: DeviceBuffer<DeviceAddress<f32>>,
     routes_per_row: usize,
 }
 
@@ -638,12 +638,11 @@ impl Nemotron3MoeRowsWorkspace {
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_down = DeviceBuffer::zeroed(routes * latent)?;
-        let up_input_table =
-            repeated_const_pointer_table(&latent_buffer, rows, routes_per_row, latent)?;
-        let up_output_table = mutable_pointer_table(&routed_up, routes, intermediate)?;
-        let down_input_table = const_pointer_table(&routed_activated, routes, intermediate)?;
-        let down_output_table = mutable_pointer_table(&routed_down, routes, latent)?;
-        let down_result_table = const_pointer_table(&routed_down, routes, latent)?;
+        let up_input_table = repeated_address_table(&latent_buffer, rows, routes_per_row, latent)?;
+        let up_output_table = address_table(&routed_up, routes, intermediate)?;
+        let down_input_table = address_table(&routed_activated, routes, intermediate)?;
+        let down_output_table = address_table(&routed_down, routes, latent)?;
+        let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
             router: Nemotron3RouterRowsWorkspace::new(manifest, moe, rows)?,
             normed: DeviceBuffer::zeroed(rows * manifest.hidden_size)?,
@@ -745,10 +744,10 @@ impl Nemotron3MoeWorkspace {
         let routed_up = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_activated = DeviceBuffer::zeroed(routes * intermediate)?;
         let routed_down = DeviceBuffer::zeroed(routes * latent)?;
-        let up_output_table = mutable_pointer_table(&routed_up, routes, intermediate)?;
-        let down_input_table = const_pointer_table(&routed_activated, routes, intermediate)?;
-        let down_output_table = mutable_pointer_table(&routed_down, routes, latent)?;
-        let down_result_table = const_pointer_table(&routed_down, routes, latent)?;
+        let up_output_table = address_table(&routed_up, routes, intermediate)?;
+        let down_input_table = address_table(&routed_activated, routes, intermediate)?;
+        let down_output_table = address_table(&routed_down, routes, latent)?;
+        let down_result_table = address_table(&routed_down, routes, latent)?;
         Ok(Self {
             router: Nemotron3RouterWorkspace::new(manifest, moe)?,
             normed: DeviceBuffer::zeroed(manifest.hidden_size)?,
@@ -820,45 +819,30 @@ impl Nemotron3MoeWorkspace {
     }
 }
 
-fn const_pointer_table(
+fn address_table(
     buffer: &DeviceBuffer<f32>,
     entries: usize,
     stride: usize,
-) -> Result<DeviceBuffer<*const f32>> {
-    let base = buffer.as_const_ptr().cast::<f32>();
+) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
     DeviceBuffer::from_host(
         &(0..entries)
-            .map(|entry| unsafe { base.add(entry * stride) })
-            .collect::<Vec<_>>(),
+            .map(|entry| buffer.address_at(entry * stride))
+            .collect::<Result<Vec<_>>>()?,
     )
 }
 
-fn mutable_pointer_table(
-    buffer: &DeviceBuffer<f32>,
-    entries: usize,
-    stride: usize,
-) -> Result<DeviceBuffer<*mut f32>> {
-    let base = buffer.as_const_ptr().cast_mut().cast::<f32>();
-    DeviceBuffer::from_host(
-        &(0..entries)
-            .map(|entry| unsafe { base.add(entry * stride) })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn repeated_const_pointer_table(
+fn repeated_address_table(
     buffer: &DeviceBuffer<f32>,
     rows: usize,
     repeats: usize,
     row_stride: usize,
-) -> Result<DeviceBuffer<*const f32>> {
-    let base = buffer.as_const_ptr().cast::<f32>();
-    DeviceBuffer::from_host(
-        &(0..rows)
-            .flat_map(|row| {
-                let row_ptr = unsafe { base.add(row * row_stride) };
-                std::iter::repeat_n(row_ptr, repeats)
-            })
-            .collect::<Vec<_>>(),
-    )
+) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
+    let mut addresses = Vec::with_capacity(rows * repeats);
+    for row in 0..rows {
+        addresses.extend(std::iter::repeat_n(
+            buffer.address_at(row * row_stride)?,
+            repeats,
+        ));
+    }
+    DeviceBuffer::from_host(&addresses)
 }

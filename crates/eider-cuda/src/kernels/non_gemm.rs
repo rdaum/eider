@@ -2947,6 +2947,32 @@ pub fn moe_weighted_accumulate_slots_f32_batch_on_stream(
     )
 }
 
+/// Writes one typed-address weighted routed-expert sum for every dense row.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
+    indices: &DeviceBuffer<u32>,
+    route_weights: &DeviceBuffer<f32>,
+    inputs: &DeviceBuffer<DeviceAddress<f32>>,
+    alpha_table: &DeviceBuffer<f32>,
+    output: DeviceInOut<'_, f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let len = output.len().checked_div(rows).unwrap_or(0);
+    moe_weighted_accumulate_slot_addresses_f32_batch_prefix_on_stream(
+        indices,
+        route_weights,
+        inputs,
+        alpha_table,
+        output,
+        rows,
+        groups,
+        len,
+        stream,
+    )
+}
+
 /// Writes a weighted sum for an active prefix of dense rows.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_weighted_accumulate_slots_f32_batch_prefix_on_stream(
