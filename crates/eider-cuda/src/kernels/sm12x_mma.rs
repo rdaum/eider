@@ -3,8 +3,8 @@
 
 use crate::cuda::check_cuda;
 use crate::{
-    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, MoeSortedRoutes, PinnedHostBuffer,
-    Result,
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, DeviceRepr, MoeSortedRoutes,
+    PinnedHostBuffer, Result,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1087,6 +1087,58 @@ pub fn moe_silu_quantize_slots_on_stream(
     groups: usize,
     stream: &CudaStream,
 ) -> Result<()> {
+    moe_silu_quantize_slots_impl(
+        indices,
+        gate_up_table,
+        b_native_tiles,
+        sfb,
+        input_scale_table,
+        gate_up_alpha_table,
+        rows,
+        groups,
+        stream,
+    )
+}
+
+/// Applies SiLU to routed gate/up slots and quantizes each activation into
+/// native SM12x FP4 tiles, using typed device addresses for the input rows.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_slot_addresses_on_stream(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<DeviceAddress<f32>>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    input_scale_table: &DeviceBuffer<f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_silu_quantize_slots_impl(
+        indices,
+        gate_up_table,
+        b_native_tiles,
+        sfb,
+        input_scale_table,
+        gate_up_alpha_table,
+        rows,
+        groups,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_silu_quantize_slots_impl<T: DeviceRepr>(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<T>,
+    b_native_tiles: &mut DeviceBuffer<u8>,
+    sfb: &mut DeviceBuffer<u32>,
+    input_scale_table: &DeviceBuffer<f32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
     let k_tiles = rows / 64;
     if rows == 0
         || !rows.is_multiple_of(64)
@@ -1140,6 +1192,66 @@ pub fn moe_silu_quantize_slots_on_stream(
 pub fn moe_silu_quantize_slots_residual_on_stream(
     indices: &DeviceBuffer<u32>,
     gate_up_table: &DeviceBuffer<*const f32>,
+    primary_tiles: &mut DeviceBuffer<u8>,
+    primary_scales: &mut DeviceBuffer<u32>,
+    residual_tiles: &mut DeviceBuffer<u8>,
+    residual_scales: &mut DeviceBuffer<u32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    swiglu_limit: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_silu_quantize_slots_residual_impl(
+        indices,
+        gate_up_table,
+        primary_tiles,
+        primary_scales,
+        residual_tiles,
+        residual_scales,
+        gate_up_alpha_table,
+        rows,
+        groups,
+        swiglu_limit,
+        stream,
+    )
+}
+
+/// Applies residual SiLU quantization using typed device addresses for the
+/// input rows.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_quantize_slot_addresses_residual_on_stream(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<DeviceAddress<f32>>,
+    primary_tiles: &mut DeviceBuffer<u8>,
+    primary_scales: &mut DeviceBuffer<u32>,
+    residual_tiles: &mut DeviceBuffer<u8>,
+    residual_scales: &mut DeviceBuffer<u32>,
+    gate_up_alpha_table: &DeviceBuffer<f32>,
+    rows: usize,
+    groups: usize,
+    swiglu_limit: f32,
+    stream: &CudaStream,
+) -> Result<()> {
+    moe_silu_quantize_slots_residual_impl(
+        indices,
+        gate_up_table,
+        primary_tiles,
+        primary_scales,
+        residual_tiles,
+        residual_scales,
+        gate_up_alpha_table,
+        rows,
+        groups,
+        swiglu_limit,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn moe_silu_quantize_slots_residual_impl<T: DeviceRepr>(
+    indices: &DeviceBuffer<u32>,
+    gate_up_table: &DeviceBuffer<T>,
     primary_tiles: &mut DeviceBuffer<u8>,
     primary_scales: &mut DeviceBuffer<u32>,
     residual_tiles: &mut DeviceBuffer<u8>,

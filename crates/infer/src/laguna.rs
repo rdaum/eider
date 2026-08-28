@@ -13,7 +13,7 @@ use eider_cuda::{
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     fill_f32_into_on_stream,
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    moe_silu_quantize_slot_addresses_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
     nemotron3_sigmoid_topk_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
@@ -762,7 +762,7 @@ struct LagunaMoeWorkspace {
     gate_up_c: F32Matrix,
     gate_up_plan: CutlassFp4GroupedGemvF32Plan,
     gate_up_output: DeviceBuffer<f32>,
-    gate_up_table: DeviceBuffer<*const f32>,
+    gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
     gate_up_output_table: DeviceBuffer<*mut f32>,
     down_tiles: DeviceBuffer<u8>,
     down_scales: DeviceBuffer<u32>,
@@ -902,8 +902,8 @@ impl LagunaMoe {
         let gate_up_base = gate_up_output.as_const_ptr().cast::<f32>();
         let gate_up_table = DeviceBuffer::from_host(
             &(0..TOP_K)
-                .map(|slot| unsafe { gate_up_base.add(slot * gate_up_width) })
-                .collect::<Vec<_>>(),
+                .map(|slot| gate_up_output.address_at(slot * gate_up_width))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let gate_up_output_table = DeviceBuffer::from_host(
             &(0..TOP_K)
@@ -983,7 +983,7 @@ impl LagunaMoe {
                 &workspace.gate_up_output_table,
                 stream,
             )?;
-        moe_silu_quantize_slots_on_stream(
+        moe_silu_quantize_slot_addresses_on_stream(
             &workspace.route_indices,
             &workspace.gate_up_table,
             &mut workspace.down_tiles,

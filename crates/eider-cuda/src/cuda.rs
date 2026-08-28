@@ -1652,7 +1652,12 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
     ///
     /// CUDA implementation code uses this for device pointer-table entries so
     /// pointer arithmetic retains the buffer's element type and bounds check.
-    pub(crate) fn address_at(&self, offset: usize) -> Result<DeviceAddress<T>> {
+    /// Returns the typed device address at `offset` elements from this buffer's start.
+    ///
+    /// The offset is bounds-checked against this allocation. Use this to build
+    /// device address tables instead of applying pointer arithmetic to
+    /// [`Self::as_const_ptr`].
+    pub fn address_at(&self, offset: usize) -> Result<DeviceAddress<T>> {
         if offset > self.len {
             return Err(Error::Shape {
                 label: "CUDA buffer address",

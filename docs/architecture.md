@@ -87,6 +87,9 @@ CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
 The live Qwen3.6 and Laguna SM12x indexed-down plans now do the same for
 expert tiles, scales, and route outputs. The legacy raw-table entry point
 remains while focused benchmarks migrate.
+Step-3.7 and Laguna SM12x gate/up quantization now also receive typed F32
+activation address tables. `DeviceBuffer::address_at` bounds-checks their
+element offsets while the CUDA boundary preserves the native table ABI.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both

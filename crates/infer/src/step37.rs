@@ -6,18 +6,18 @@ use crate::runtime::expert_cache::{
 };
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
-    Sm121W4A16GateUp, Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_into_on_stream,
-    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
-    cached_gqa_attention_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, gemv_row_scales_residual2_batch_on_stream,
-    indexed_grouped_gemv_row_scales_residual_on_stream, modelopt_m16_k64_row_scale_words,
-    moe_silu_quantize_slots_residual_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    quantize_dynamic_vectors_residual2_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_inv_freq_sequence_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
-    silu_mul_halves_clamped_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
-    step37_sigmoid_top8_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow,
+    GpuTokenSampler, PinnedHostBuffer, Result, Sm12xFp4TileSet, Sm12xKvAttentionWorkspace,
+    Sm12xKvPagePool, Sm121W4A16GateUp, Sm121W4A16HostWeight, add_f32_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
+    bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    gemv_row_scales_residual2_batch_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
+    modelopt_m16_k64_row_scale_words, moe_silu_quantize_slot_addresses_residual_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
+    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
+    silu_mul_halves_f32_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use fs2::FileExt as Fs2FileExt;
@@ -273,7 +273,7 @@ struct Step37ExpertStaging {
 /// Mutable routed-expert execution workspace for one Step-3.7 token.
 pub struct Step37PagedExpertWorkspace {
     gate_up_output: DeviceBuffer<f32>,
-    gate_up_table: DeviceBuffer<*const f32>,
+    gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
     down_input_tiles: DeviceBuffer<u8>,
     down_input_scales: DeviceBuffer<u32>,
     down_residual_tiles: DeviceBuffer<u8>,
@@ -1530,7 +1530,7 @@ impl Step37PagedExperts {
         let indices = self.slots.slot_indices();
         self.gate_up
             .run_on_stream(indices, input, workspace.gate_up_output.output(), stream)?;
-        moe_silu_quantize_slots_residual_on_stream(
+        moe_silu_quantize_slot_addresses_residual_on_stream(
             indices,
             &workspace.gate_up_table,
             &mut workspace.down_input_tiles,
@@ -1589,11 +1589,10 @@ impl Step37PagedExperts {
 impl Step37PagedExpertWorkspace {
     pub fn new() -> Result<Self> {
         let gate_up_output = DeviceBuffer::zeroed(8 * GATE_UP)?;
-        let gate_up_base = gate_up_output.as_const_ptr().cast::<f32>();
         let gate_up_table = DeviceBuffer::from_host(
             &(0..8)
-                .map(|group| unsafe { gate_up_base.add(group * GATE_UP) })
-                .collect::<Vec<_>>(),
+                .map(|group| gate_up_output.address_at(group * GATE_UP))
+                .collect::<Result<Vec<_>>>()?,
         )?;
         let mut down_outputs = Vec::with_capacity(8);
         let mut down_results = Vec::with_capacity(8);

@@ -219,9 +219,11 @@ pub use kernels::sm12x_mma::{
     indexed_grouped_gemv_row_scales_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
     modelopt_m16_k64_row_scale_words, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_bf16_sorted_slots_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
-    moe_silu_quantize_slots_residual_on_stream, quantize_dynamic_vector_on_stream,
-    quantize_dynamic_vectors_residual2_on_stream, quantize_fixed_scale_vector_on_stream,
+    moe_silu_quantize_slot_addresses_on_stream,
+    moe_silu_quantize_slot_addresses_residual_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_silu_quantize_slots_reference_on_stream, moe_silu_quantize_slots_residual_on_stream,
+    quantize_dynamic_vector_on_stream, quantize_dynamic_vectors_residual2_on_stream,
+    quantize_fixed_scale_vector_on_stream,
 };
 pub use kernels::sm121_w4a16::{
     Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, Sm121W4A16HostWeight, Sm121W4A16Linear,
