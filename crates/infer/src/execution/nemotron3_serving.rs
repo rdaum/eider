@@ -53,35 +53,6 @@ struct Nemotron3AdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-/// Prompt progress completed during a tick.
-struct Nemotron3PrefillProgress {
-    pub request_id: Nemotron3RequestId,
-    pub prompt_position: usize,
-}
-
-/// One structured output delta.
-struct Nemotron3ChatDelta {
-    pub request_id: Nemotron3RequestId,
-    pub event: ChatOutputEvent,
-}
-
-/// Terminal request metadata.
-struct Nemotron3Finished {
-    pub request_id: Nemotron3RequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-/// Observable work and output from one service iteration.
-#[derive(Default)]
-struct Nemotron3Tick {
-    pub prefilled: Vec<Nemotron3PrefillProgress>,
-    pub generated: Vec<Nemotron3RequestId>,
-    pub output: Vec<Nemotron3ChatDelta>,
-    pub finished: Vec<Nemotron3Finished>,
-}
-
 /// Outcome of cancelling a waiting or active request.
 enum Nemotron3CancelOutcome {
     Cancelled {
@@ -275,9 +246,9 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
         ),
-    ) -> Result<Nemotron3Tick> {
+    ) -> Result<EngineTick> {
         let tick_started = Instant::now();
-        let mut tick = Nemotron3Tick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
 
         let mut terminal = BTreeMap::new();
@@ -366,7 +337,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut Nemotron3Tick,
+        _tick: &mut EngineTick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
@@ -440,7 +411,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     fn prefill_blocks(
         &mut self,
         ids: &[Nemotron3RequestId],
-        tick: &mut Nemotron3Tick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
         ),
@@ -588,8 +559,8 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
             return Err(error);
         }
         for (id, request) in requests {
-            tick.prefilled.push(Nemotron3PrefillProgress {
-                request_id: id,
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(id.get()),
                 prompt_position: request.prompt_position,
             });
             self.requests.insert(id, request);
@@ -633,7 +604,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     fn generate_one(
         &mut self,
         id: Nemotron3RequestId,
-        tick: &mut Nemotron3Tick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         let input = request
@@ -667,7 +638,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
-        tick.generated.push(id);
+        tick.generated.push(EngineRequestId::new(id.get()));
         let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
@@ -684,7 +655,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     fn generate_speculative(
         &mut self,
         ids: &[Nemotron3RequestId],
-        tick: &mut Nemotron3Tick,
+        tick: &mut EngineTick,
         terminal: &mut BTreeMap<Nemotron3RequestId, ChatFinishReason>,
     ) -> Result<()> {
         if ids.is_empty() {
@@ -751,7 +722,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 if request.output.is_reasoning() {
                     request.usage.reasoning_tokens += 1;
                 }
-                tick.generated.push(id);
+                tick.generated.push(EngineRequestId::new(id.get()));
                 let events = request.output.push_token(token)?;
                 if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
                     terminal.insert(id, reason);
@@ -775,7 +746,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         &mut self,
         id: Nemotron3RequestId,
         mut reason: ChatFinishReason,
-        tick: &mut Nemotron3Tick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -801,8 +772,8 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         )?;
         let released = sequence.device_bytes();
         sequence.finish(self.model, &mut self.sequence_cache)?;
-        tick.finished.push(Nemotron3Finished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes: released,
@@ -857,44 +828,7 @@ impl EngineService for Nemotron3ChatService<'_, '_> {
                 EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
             ),
         };
-        let tick = Nemotron3ChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: Vec::new(),
-            draft_progress: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        Nemotron3ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
         match Nemotron3ChatService::cancel_request(self, Nemotron3RequestId(id.get())) {
@@ -928,20 +862,21 @@ impl ResponseFilter {
         &mut self,
         request_id: Nemotron3RequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<Nemotron3ChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => {
-                    output.push(Nemotron3ChatDelta { request_id, event })
-                }
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(Nemotron3ChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -951,7 +886,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(Nemotron3ChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -960,11 +898,11 @@ impl ResponseFilter {
         None
     }
 
-    fn flush(&mut self, request_id: Nemotron3RequestId, output: &mut Vec<Nemotron3ChatDelta>) {
+    fn flush(&mut self, request_id: Nemotron3RequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(Nemotron3ChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }

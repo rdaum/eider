@@ -398,8 +398,8 @@ mod tests {
         assert!(filter.saw_tool_calls());
         assert_eq!(
             output,
-            [Step37ChatDelta {
-                request_id,
+            [EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: call,
             }]
         );

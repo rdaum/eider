@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert!(output.iter().all(|delta| {
             matches!(delta.event, ChatOutputEvent::ToolCall(_))
-                && delta.request_id == Deepseek4RequestId(1)
+                && delta.request_id == eider_runtime::engine::EngineRequestId::new(1)
         }));
     }
 }

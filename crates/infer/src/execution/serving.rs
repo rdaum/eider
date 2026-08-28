@@ -560,7 +560,7 @@ mod tests {
         }
         let finished = finished.expect("request finished");
         assert!(saw_prefill);
-        assert_eq!(finished.request_id, id);
+        assert_eq!(finished.request_id, EngineRequestId::new(id.get()));
         assert!(finished.usage.prompt_tokens > 1);
         assert_eq!(finished.usage.completion_tokens, 4);
         assert_eq!(generated_tokens, 4);
@@ -598,8 +598,8 @@ mod tests {
         );
         assert_eq!(
             output,
-            [Qwen36ChatDelta {
-                request_id: id,
+            [EngineDelta {
+                request_id: EngineRequestId::new(id.get()),
                 event: ChatOutputEvent::Text("before ".to_string())
             }]
         );
@@ -642,16 +642,16 @@ mod tests {
         assert_eq!(
             output,
             [
-                Qwen36ChatDelta {
-                    request_id: id,
+                EngineDelta {
+                    request_id: EngineRequestId::new(id.get()),
                     event: ChatOutputEvent::Text("safe ".to_string())
                 },
-                Qwen36ChatDelta {
-                    request_id: id,
+                EngineDelta {
+                    request_id: EngineRequestId::new(id.get()),
                     event: ChatOutputEvent::Text("E".to_string())
                 },
-                Qwen36ChatDelta {
-                    request_id: id,
+                EngineDelta {
+                    request_id: EngineRequestId::new(id.get()),
                     event: call
                 }
             ]

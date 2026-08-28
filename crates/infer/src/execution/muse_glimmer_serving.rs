@@ -63,22 +63,6 @@ struct MuseGlimmerAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-struct MuseGlimmerPrefillProgress {
-    pub request_id: MuseGlimmerRequestId,
-    pub prompt_position: usize,
-}
-
-struct MuseGlimmerChatDelta {
-    pub request_id: MuseGlimmerRequestId,
-    pub event: ChatOutputEvent,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MuseGlimmerDFlashProgress {
-    pub request_id: MuseGlimmerRequestId,
-    pub stats: MuseGlimmerDFlashStats,
-}
-
 /// Cumulative DFlash work retained for one request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MuseGlimmerDFlashStats {
@@ -113,22 +97,6 @@ impl MuseGlimmerDFlashStats {
         self.target_position = cycle.target_position;
         self.dflash_position = cycle.dflash_position;
     }
-}
-
-struct MuseGlimmerFinished {
-    pub request_id: MuseGlimmerRequestId,
-    pub finish_reason: ChatFinishReason,
-    pub usage: ChatUsage,
-    pub released_sequence_device_bytes: usize,
-}
-
-#[derive(Default)]
-struct MuseGlimmerTick {
-    pub prefilled: Vec<MuseGlimmerPrefillProgress>,
-    pub generated: Vec<MuseGlimmerRequestId>,
-    pub dflash: Vec<MuseGlimmerDFlashProgress>,
-    pub output: Vec<MuseGlimmerChatDelta>,
-    pub finished: Vec<MuseGlimmerFinished>,
 }
 
 /// Outcome of cancelling a queued or active request.
@@ -307,9 +275,9 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<MuseGlimmerRequestId, MuseGlimmerAdmissionProgress>,
         ),
-    ) -> Result<MuseGlimmerTick> {
+    ) -> Result<EngineTick> {
         let started = Instant::now();
-        let mut tick = MuseGlimmerTick::default();
+        let mut tick = EngineTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
 
         let mut terminal = BTreeMap::new();
@@ -372,7 +340,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        _tick: &mut MuseGlimmerTick,
+        _tick: &mut EngineTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<MuseGlimmerRequestId, MuseGlimmerAdmissionProgress>,
@@ -454,7 +422,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     fn prefill(
         &mut self,
         ids: &[MuseGlimmerRequestId],
-        tick: &mut MuseGlimmerTick,
+        tick: &mut EngineTick,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<MuseGlimmerRequestId, MuseGlimmerAdmissionProgress>,
         ),
@@ -520,8 +488,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                     request,
                 );
             }
-            tick.prefilled.push(MuseGlimmerPrefillProgress {
-                request_id: id,
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(id.get()),
                 prompt_position: end,
             });
         }
@@ -581,7 +549,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     fn generate_one(
         &mut self,
         id: MuseGlimmerRequestId,
-        tick: &mut MuseGlimmerTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
         let mut leased = self
@@ -628,7 +596,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         if request.output.is_reasoning() {
             request.usage.reasoning_tokens += 1;
         }
-        tick.generated.push(id);
+        tick.generated.push(EngineRequestId::new(id.get()));
         let events = request.output.push_token(sampled.id)?;
         if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
             return Ok(Some(reason));
@@ -648,7 +616,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         sequence: &mut MuseGlimmerSequence,
         id: MuseGlimmerRequestId,
         request: &mut ActiveRequest<'template>,
-        tick: &mut MuseGlimmerTick,
+        tick: &mut EngineTick,
     ) -> Result<Option<ChatFinishReason>> {
         let anchor = if let Some(token) = request.pending_dflash_token.take() {
             token
@@ -677,7 +645,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
             if request.output.is_reasoning() {
                 request.usage.reasoning_tokens += 1;
             }
-            tick.generated.push(id);
+            tick.generated.push(EngineRequestId::new(id.get()));
             let events = request.output.push_token(token)?;
             if let Some(reason) = request.filter.apply(id, events, &mut tick.output) {
                 terminal = Some(reason);
@@ -695,9 +663,18 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         request
             .dflash_stats
             .record_cycle(&cycle, emitted_tokens, cycle_duration);
-        tick.dflash.push(MuseGlimmerDFlashProgress {
-            request_id: id,
-            stats: request.dflash_stats,
+        let stats = request.dflash_stats;
+        tick.draft_progress.push(EngineDraftProgress {
+            request_id: EngineRequestId::new(id.get()),
+            stats: EngineDraftStats {
+                cycles: stats.cycles,
+                drafted_tokens: stats.drafted_tokens,
+                accepted_drafts: stats.accepted_drafts,
+                emitted_tokens: stats.emitted_tokens,
+                cycle_duration: stats.cycle_duration,
+                target_position: stats.target_position,
+                draft_position: stats.dflash_position,
+            },
         });
         Ok(terminal)
     }
@@ -706,7 +683,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         &mut self,
         id: MuseGlimmerRequestId,
         mut reason: ChatFinishReason,
-        tick: &mut MuseGlimmerTick,
+        tick: &mut EngineTick,
     ) -> Result<()> {
         let request = self.requests.get_mut(&id).expect("terminal request exists");
         if matches!(reason, ChatFinishReason::Eos | ChatFinishReason::Length) {
@@ -732,8 +709,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         )?;
         let released = sequence.device_bytes();
         sequence.finish(self.model, &mut self.sequence_cache)?;
-        tick.finished.push(MuseGlimmerFinished {
-            request_id: id,
+        tick.finished.push(EngineFinished {
+            request_id: EngineRequestId::new(id.get()),
             finish_reason: reason,
             usage: request.usage,
             released_sequence_device_bytes: released,
@@ -780,59 +757,7 @@ impl EngineService for MuseGlimmerChatService<'_, '_> {
                 EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
             ),
         };
-        let tick = MuseGlimmerChatService::tick_with_lifecycle(self, &mut observer)
-            .map_err(EngineError::new)?;
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(|id| EngineRequestId::new(id.get()))
-                .collect(),
-            verification: Vec::new(),
-            draft_progress: tick
-                .dflash
-                .into_iter()
-                .map(|progress| EngineDraftProgress {
-                    request_id: EngineRequestId::new(progress.request_id.get()),
-                    stats: EngineDraftStats {
-                        cycles: progress.stats.cycles,
-                        drafted_tokens: progress.stats.drafted_tokens,
-                        accepted_drafts: progress.stats.accepted_drafts,
-                        emitted_tokens: progress.stats.emitted_tokens,
-                        cycle_duration: progress.stats.cycle_duration,
-                        target_position: progress.stats.target_position,
-                        draft_position: progress.stats.dflash_position,
-                    },
-                })
-                .collect(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: EngineRequestId::new(delta.request_id.get()),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: EngineRequestId::new(finished.request_id.get()),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-        };
-        Ok(converted)
+        MuseGlimmerChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)
     }
 
     fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
@@ -868,20 +793,21 @@ impl ResponseFilter {
         &mut self,
         request_id: MuseGlimmerRequestId,
         events: Vec<ChatOutputEvent>,
-        output: &mut Vec<MuseGlimmerChatDelta>,
+        output: &mut Vec<EngineDelta>,
     ) -> Option<ChatFinishReason> {
         for event in events {
             match event {
                 ChatOutputEvent::Reasoning(_) if self.saw_tool_calls => {}
-                ChatOutputEvent::Reasoning(_) => {
-                    output.push(MuseGlimmerChatDelta { request_id, event })
-                }
+                ChatOutputEvent::Reasoning(_) => output.push(EngineDelta {
+                    request_id: EngineRequestId::new(request_id.get()),
+                    event,
+                }),
                 ChatOutputEvent::Text(_) if self.saw_tool_calls => {}
                 ChatOutputEvent::Text(text) => {
                     let stopped = self.stop.push(&text);
                     if !stopped.text.is_empty() {
-                        output.push(MuseGlimmerChatDelta {
-                            request_id,
+                        output.push(EngineDelta {
+                            request_id: EngineRequestId::new(request_id.get()),
                             event: ChatOutputEvent::Text(stopped.text),
                         });
                     }
@@ -891,7 +817,10 @@ impl ResponseFilter {
                 }
                 ChatOutputEvent::ToolCall(_) => {
                     self.flush(request_id, output);
-                    output.push(MuseGlimmerChatDelta { request_id, event });
+                    output.push(EngineDelta {
+                        request_id: EngineRequestId::new(request_id.get()),
+                        event,
+                    });
                     self.saw_tool_calls = true;
                     return Some(ChatFinishReason::ToolCalls);
                 }
@@ -900,11 +829,11 @@ impl ResponseFilter {
         None
     }
 
-    fn flush(&mut self, request_id: MuseGlimmerRequestId, output: &mut Vec<MuseGlimmerChatDelta>) {
+    fn flush(&mut self, request_id: MuseGlimmerRequestId, output: &mut Vec<EngineDelta>) {
         let text = self.stop.finish();
         if !text.is_empty() {
-            output.push(MuseGlimmerChatDelta {
-                request_id,
+            output.push(EngineDelta {
+                request_id: EngineRequestId::new(request_id.get()),
                 event: ChatOutputEvent::Text(text),
             });
         }
