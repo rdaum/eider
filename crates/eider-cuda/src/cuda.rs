@@ -1648,6 +1648,21 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
         }
     }
 
+    /// Returns the CUDA address of the element at `offset`.
+    ///
+    /// CUDA implementation code uses this for device pointer-table entries so
+    /// pointer arithmetic retains the buffer's element type and bounds check.
+    pub(crate) fn address_at(&self, offset: usize) -> Result<DeviceAddress<T>> {
+        if offset > self.len {
+            return Err(Error::Shape {
+                label: "CUDA buffer address",
+                expected: format!("offset at most {}", self.len),
+                actual: offset.to_string(),
+            });
+        }
+        self.cuda_address().offset(offset)
+    }
+
     /// Returns true when this allocation contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -1674,6 +1689,9 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
     }
 
     /// Returns the raw device pointer as an immutable C pointer.
+    ///
+    /// This is an untyped FFI address. Do not use it for pointer arithmetic;
+    /// use [`Self::address_at`] when an element offset is required.
     pub fn as_const_ptr(&self) -> *const c_void {
         self.ptr.cast()
     }

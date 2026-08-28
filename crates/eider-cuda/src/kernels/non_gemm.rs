@@ -6563,13 +6563,11 @@ pub fn append_ragged_kv_f32_into_on_stream(
                 key.ptr,
                 value.ptr,
                 key_cache_table
-                    .cuda_address()
-                    .offset(cache_table_offset)?
+                    .address_at(cache_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 value_cache_table
-                    .cuda_address()
-                    .offset(cache_table_offset)?
+                    .address_at(cache_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 sequence_offsets.ptr,
@@ -6646,13 +6644,11 @@ pub fn ragged_gqa_attention_f32_into_on_stream(
             ffi::infer_ragged_gqa_attention_f32_on_stream(
                 query.ptr,
                 key_cache_table
-                    .cuda_address()
-                    .offset(cache_table_offset)?
+                    .address_at(cache_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 value_cache_table
-                    .cuda_address()
-                    .offset(cache_table_offset)?
+                    .address_at(cache_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 sequence_offsets.ptr,
@@ -8837,8 +8833,7 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
                 gate.ptr,
                 beta.ptr,
                 state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 output.buffer_mut().ptr,
@@ -8934,8 +8929,7 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
                 gate.ptr,
                 beta.ptr,
                 state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 sequence_offsets.ptr,
@@ -9012,11 +9006,7 @@ pub fn gather_f32_pointer_rows_range_into_on_stream(
         check_cuda(
             "infer_gather_f32_pointer_rows_on_stream",
             ffi::infer_gather_f32_pointer_rows_on_stream(
-                input_table
-                    .cuda_address()
-                    .offset(table_offset)?
-                    .as_const_ptr()
-                    .cast(),
+                input_table.address_at(table_offset)?.as_const_ptr().cast(),
                 output.ptr.add(output_offset),
                 rows as u32,
                 row_values as u32,
@@ -9089,11 +9079,7 @@ pub fn scatter_f32_pointer_rows_range_on_stream(
             "infer_scatter_f32_pointer_rows_on_stream",
             ffi::infer_scatter_f32_pointer_rows_on_stream(
                 input.ptr.add(input_offset),
-                output_table
-                    .cuda_address()
-                    .offset(table_offset)?
-                    .as_const_ptr()
-                    .cast(),
+                output_table.address_at(table_offset)?.as_const_ptr().cast(),
                 rows as u32,
                 row_values as u32,
                 stream.as_raw(),
@@ -11222,8 +11208,7 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
                 conv_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 batch_size as u32,
@@ -11336,8 +11321,7 @@ pub fn qwen36_gdn_prep_chunks_into_on_stream(
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
                 conv_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 sequence_offsets.ptr,
@@ -11449,8 +11433,7 @@ pub fn qwen36_gdn_prep_chunks_bf16_into_on_stream(
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
                 conv_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast(),
                 sequence_offsets.ptr,
@@ -12768,8 +12751,7 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
                 conv_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast_mut()
                     .cast(),
@@ -12863,8 +12845,7 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
                 conv_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast_mut()
                     .cast(),
@@ -13088,8 +13069,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
                 ssm_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast_mut()
                     .cast(),
@@ -13212,8 +13192,7 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
                 ssm_state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast_mut()
                     .cast(),
@@ -13281,8 +13260,7 @@ pub fn select_bf16_state_snapshot_into_on_stream(
             "infer_select_bf16_state_snapshot_on_stream",
             ffi::infer_select_bf16_state_snapshot_on_stream(
                 state_table
-                    .cuda_address()
-                    .offset(state_table_offset)?
+                    .address_at(state_table_offset)?
                     .as_const_ptr()
                     .cast_mut()
                     .cast(),
