@@ -24,9 +24,11 @@ use tracing::info;
 
 mod batch;
 mod dflash;
+mod execution;
 mod sequence;
 
 pub use dflash::{DFlashConfig, DFlashModel, MuseGlimmerDFlashCycle};
+pub(crate) use execution::{MuseGlimmerSequenceId, MuseGlimmerSequencePool};
 pub(crate) use sequence::{
     MuseGlimmerAppend, muse_glimmer_cache_error, new_muse_glimmer_sequence_cache_with_budget,
 };
