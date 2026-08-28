@@ -130,6 +130,20 @@ pub struct HostRead<'a, T> {
 /// Dropping a pending copy synchronizes its stream. The process aborts if that
 /// synchronisation fails, because Rust cannot safely release the destination
 /// while CUDA might still write to it.
+///
+/// ```compile_fail
+/// use eider_cuda::{CudaStream, DeviceBuffer, PinnedHostBuffer, Result};
+///
+/// fn main() -> Result<()> {
+///     let stream = CudaStream::new_non_blocking()?;
+///     let device = DeviceBuffer::from_host(&[1u32])?;
+///     let mut host = PinnedHostBuffer::zeroed(1)?;
+///     let pending = device.copy_prefix_to_pinned_on_stream(&mut host, 1, &stream)?;
+///     let _racy_host_read = host.as_slice();
+///     drop(pending);
+///     Ok(())
+/// }
+/// ```
 pub struct PendingHostRead<'a, T> {
     _device: &'a DeviceBuffer<T>,
     output: &'a mut PinnedHostBuffer<T>,

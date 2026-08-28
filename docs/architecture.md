@@ -451,7 +451,7 @@ GPU sampling, prefix caching, MTP, DFlash2, graphs, and multiple streams.
 
 Every migration slice must meet these conditions:
 
-- The crate graph has no upward dependency from inference into runtime.
+- The crate graph has no upward dependency from runtime into inference.
 - API and runtime code contain no unsafe code or CUDA resource imports.
 - Compile-fail tests reject workspace reuse during decoded work.
 - Compile-fail tests reject pinned-buffer access during an asynchronous loan.

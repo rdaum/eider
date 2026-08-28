@@ -7453,6 +7453,26 @@ pub struct GpuTopKCandidate {
 }
 
 /// Projects DFlash2 hidden rows through its row-major BF16 selector matrix.
+///
+/// ```compile_fail
+/// use eider_cuda::{
+///     ColumnMajor, CudaStream, DeviceBuffer, Result, RowMajor,
+///     dflash2_hidden_projection_f32_into_on_stream,
+/// };
+///
+/// fn main() -> Result<()> {
+///     let stream = CudaStream::new_non_blocking()?;
+///     let hidden = DeviceBuffer::zeroed(64)?;
+///     let weight = DeviceBuffer::zeroed(64)?;
+///     let mut projected = DeviceBuffer::zeroed(1)?;
+///     dflash2_hidden_projection_f32_into_on_stream(
+///         hidden.slice(0..64)?.matrix::<ColumnMajor>(1, 64, 64)?,
+///         weight.slice(0..64)?.matrix::<RowMajor>(1, 64, 64)?,
+///         projected.slice_mut(0..1)?.matrix::<RowMajor>(1, 1, 1)?,
+///         &stream,
+///     )
+/// }
+/// ```
 pub fn dflash2_hidden_projection_f32_into_on_stream(
     hidden: DeviceMatrix<'_, f32, RowMajor>,
     weight_bf16: DeviceMatrix<'_, u16, RowMajor>,
