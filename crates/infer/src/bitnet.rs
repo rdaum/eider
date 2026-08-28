@@ -602,23 +602,69 @@ struct BitNetLayerCache<'a> {
     page_table: &'a DeviceBuffer<u32>,
 }
 
+fn load_packed_linear(
+    checkpoint: &ModelOptCheckpoint,
+    prefix: &str,
+    out_features: usize,
+    in_features: usize,
+) -> Result<BitNetPackedLinear> {
+    let weight_name = format!("{prefix}.weight");
+    let scale_name = format!("{prefix}.weight_scale");
+    let weight_shard = checkpoint.open_shard_for_tensor(&weight_name)?;
+    let scale_shard = checkpoint.open_shard_for_tensor(&scale_name)?;
+    let weight_info = weight_shard.require_tensor(&weight_name)?;
+    if weight_info.dtype != "U8" || weight_info.shape != [out_features / 4, in_features] {
+        return Err(Error::Shape {
+            label: "BitNet packed weight",
+            expected: format!(
+                "{weight_name} dtype=U8 shape=[{}, {in_features}]",
+                out_features / 4
+            ),
+            actual: format!("dtype={} shape={:?}", weight_info.dtype, weight_info.shape),
+        });
+    }
+    let scale_info = scale_shard.require_tensor(&scale_name)?;
+    let scales = scale_shard.read_float_tensor_as_f32(&scale_name)?;
+    if scales.len() != 1 {
+        return Err(Error::Shape {
+            label: "BitNet weight scale",
+            expected: format!("{scale_name} with one F32 or BF16 value"),
+            actual: format!("dtype={} shape={:?}", scale_info.dtype, scale_info.shape),
+        });
+    }
+    let scale = scales[0];
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Format {
+            label: "BitNet weight scale",
+            detail: format!("{scale_name} must be positive and finite, got {scale}"),
+        });
+    }
+    BitNetPackedLinear::from_hf_packed(
+        prefix,
+        out_features,
+        in_features,
+        &weight_shard.read_tensor_bytes(&weight_name)?,
+        scale,
+    )
+}
+
 impl BitNetLayer {
     fn load(checkpoint: &ModelOptCheckpoint, config: BitNetConfig, index: usize) -> Result<Self> {
         let prefix = format!("model.layers.{index}");
         let attention = format!("{prefix}.self_attn");
-        let q = BitNetPackedLinear::from_checkpoint(
+        let q = load_packed_linear(
             checkpoint,
             &format!("{attention}.q_proj"),
             config.q_width(),
             config.hidden,
         )?;
-        let k = BitNetPackedLinear::from_checkpoint(
+        let k = load_packed_linear(
             checkpoint,
             &format!("{attention}.k_proj"),
             config.kv_width(),
             config.hidden,
         )?;
-        let v = BitNetPackedLinear::from_checkpoint(
+        let v = load_packed_linear(
             checkpoint,
             &format!("{attention}.v_proj"),
             config.kv_width(),
@@ -626,13 +672,13 @@ impl BitNetLayer {
         )?;
         let qkv = BitNetPackedLinear::concat_rows(format!("{attention}.qkv_proj"), &[q, k, v])?;
         let mlp = format!("{prefix}.mlp");
-        let gate = BitNetPackedLinear::from_checkpoint(
+        let gate = load_packed_linear(
             checkpoint,
             &format!("{mlp}.gate_proj"),
             config.intermediate,
             config.hidden,
         )?;
-        let up = BitNetPackedLinear::from_checkpoint(
+        let up = load_packed_linear(
             checkpoint,
             &format!("{mlp}.up_proj"),
             config.intermediate,
@@ -641,14 +687,14 @@ impl BitNetLayer {
         let gate_up = BitNetPackedLinear::concat_rows(format!("{mlp}.gate_up_proj"), &[gate, up])?;
         Ok(Self {
             qkv: BitNetMatrix::from_packed(&qkv)?,
-            output: BitNetMatrix::from_packed(&BitNetPackedLinear::from_checkpoint(
+            output: BitNetMatrix::from_packed(&load_packed_linear(
                 checkpoint,
                 &format!("{attention}.o_proj"),
                 config.hidden,
                 config.q_width(),
             )?)?,
             gate_up: BitNetMatrix::from_packed(&gate_up)?,
-            down: BitNetMatrix::from_packed(&BitNetPackedLinear::from_checkpoint(
+            down: BitNetMatrix::from_packed(&load_packed_linear(
                 checkpoint,
                 &format!("{mlp}.down_proj"),
                 config.hidden,
@@ -1223,6 +1269,7 @@ fn required_f32(json: &Value, field: &'static str) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1253,5 +1300,76 @@ mod tests {
         assert_eq!(config.head_dim, 128);
         assert_eq!(config.kv_width(), 640);
         fs::remove_dir_all(root).expect("remove temp model dir");
+    }
+
+    #[test]
+    fn loads_packed_linear_from_single_file_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "eider-bitnet-safetensors-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create checkpoint directory");
+        let weights = [
+            -1, 0, 1, -1, // row 0
+            1, 1, 0, 0, // row 1
+            0, -1, 0, 1, // row 2
+            -1, -1, -1, -1, // row 3
+        ];
+        let packed = pack_hf_ternary(&weights, 4, 4);
+        let scale = 0x3f00u16.to_le_bytes();
+        let mut header = serde_json::to_vec(&json!({
+            "linear.weight": {
+                "dtype": "U8",
+                "shape": [1, 4],
+                "data_offsets": [0, 4]
+            },
+            "linear.weight_scale": {
+                "dtype": "BF16",
+                "shape": [1],
+                "data_offsets": [4, 6]
+            }
+        }))
+        .expect("serialize safetensors header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + header.len() + 6);
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&packed);
+        file.extend_from_slice(&scale);
+        fs::write(root.join("model.safetensors"), file).expect("write checkpoint");
+
+        let checkpoint = ModelOptCheckpoint::open(&root).expect("open single-file checkpoint");
+        let linear = load_packed_linear(&checkpoint, "linear", 4, 4).expect("load BitNet linear");
+        for row in 0..4 {
+            for col in 0..4 {
+                assert_eq!(
+                    linear.weight(row, col).expect("weight"),
+                    weights[row * 4 + col] as f32 * 0.5
+                );
+            }
+        }
+        fs::remove_dir_all(root).expect("remove checkpoint directory");
+    }
+
+    fn pack_hf_ternary(weights: &[i8], rows: usize, cols: usize) -> Vec<u8> {
+        let packed_rows = rows / 4;
+        let mut output = vec![0u8; rows * cols / 4];
+        for packed_row in 0..packed_rows {
+            for col in 0..cols {
+                let mut byte = 0u8;
+                for pair in 0..4 {
+                    let row = packed_row + pair * packed_rows;
+                    let code = (weights[row * cols + col] + 1) as u8;
+                    byte |= code << (pair * 2);
+                }
+                output[packed_row * cols + col] = byte;
+            }
+        }
+        output
     }
 }
