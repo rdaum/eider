@@ -1627,17 +1627,6 @@ unsafe extern "C" {
         out_d: *mut *mut f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_moe_silu_quantize_slots_nvfp4_on_stream(
-        indices: *const u32,
-        gate_up_table: *const *const f32,
-        packed_table: *const *mut u8,
-        scales_table: *const *mut u8,
-        input_scale_table: *const f32,
-        gate_up_alpha_table: *const f32,
-        rows: u32,
-        groups: u32,
-        stream: cudaStream_t,
-    ) -> cudaError_t;
     pub(crate) fn infer_moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
         indices: *const u32,
         gate_up_table: *const *const f32,
