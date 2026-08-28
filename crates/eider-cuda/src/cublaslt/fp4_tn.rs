@@ -1219,6 +1219,61 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
+    /// Launches grouped GEMV with typed selected A tables, contiguous per-slot
+    /// B operands, and contiguous F32 output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_contiguous_b_addresses_on_stream(
+        &self,
+        a_values_table: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales_table: &DeviceBuffer<DeviceAddress<u8>>,
+        b_values: &DeviceBuffer<u8>,
+        b_scales: &DeviceBuffer<u8>,
+        d: &mut DeviceBuffer<f32>,
+        alpha: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let expected_b_values = self.groups * self.k / 2;
+        let expected_b_scales = self.groups * (self.k / 16);
+        let expected_d = self.groups * self.m;
+        if a_values_table.len() != self.groups
+            || a_scales_table.len() != self.groups
+            || b_values.len() != expected_b_values
+            || b_scales.len() != expected_b_scales
+            || d.len() != expected_d
+        {
+            return Err(Error::Shape {
+                label: "CUTLASS grouped FP4 contiguous-B GEMV buffers",
+                expected: format!(
+                    "A tables={} B values={} B scales={} D={}",
+                    self.groups, expected_b_values, expected_b_scales, expected_d
+                ),
+                actual: format!(
+                    "A values={} A scales={} B values={} B scales={} D={}",
+                    a_values_table.len(),
+                    a_scales_table.len(),
+                    b_values.len(),
+                    b_scales.len(),
+                    d.len()
+                ),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_cutlass_fp4_grouped_gemv_f32_contiguous_b_on_stream",
+                ffi::infer_cutlass_fp4_grouped_gemv_f32_contiguous_b_on_stream(
+                    self.raw,
+                    a_values_table.as_const_ptr().cast(),
+                    a_scales_table.as_const_ptr().cast(),
+                    b_values.as_const_ptr().cast(),
+                    b_scales.as_const_ptr().cast(),
+                    d.as_const_ptr().cast_mut().cast(),
+                    alpha,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Returns `(m, k, groups)` for this plan.
     pub fn shape(&self) -> (usize, usize, usize) {
         (self.m, self.k, self.groups)

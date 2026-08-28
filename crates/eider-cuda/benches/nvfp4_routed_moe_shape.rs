@@ -1,12 +1,15 @@
 mod support;
 
 use eider_cuda::{
-    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceBuffer, F32Matrix, MoeSiluQuantizeSlotBuffers,
-    Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, format, indexed_gemv_on_stream,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_silu_quantize_slots_nvfp4_simple_scales_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_silu_quantize_slots_reference_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    quantize_fixed_scale_vector_on_stream, upload_grouped_nvfp4,
+    CudaStream, CutlassFp4GroupedGemvF32Plan, DeviceAddress, DeviceBuffer, F32Matrix,
+    MoeSiluQuantizeAddressSlotBuffers, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight,
+    format, indexed_gemv_on_stream, indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_slots_on_stream,
+    moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, quantize_fixed_scale_vector_on_stream,
+    upload_grouped_nvfp4,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use micromeasure::{
@@ -43,14 +46,11 @@ struct Nvfp4RoutedMoeShapeBench<const BATCH: usize> {
 
 struct GroupedOp {
     plan: CutlassFp4GroupedGemvF32Plan,
-    a_values: DeviceBuffer<*const u8>,
-    a_scales: DeviceBuffer<*const u8>,
-    b_values: DeviceBuffer<*const u8>,
-    b_scales: DeviceBuffer<*const u8>,
-    b_values_mut: DeviceBuffer<*mut u8>,
-    b_scales_mut: DeviceBuffer<*mut u8>,
-    c: DeviceBuffer<*const f32>,
-    d: DeviceBuffer<*mut f32>,
+    a_values: DeviceBuffer<DeviceAddress<u8>>,
+    a_scales: DeviceBuffer<DeviceAddress<u8>>,
+    b_values: DeviceBuffer<DeviceAddress<u8>>,
+    b_scales: DeviceBuffer<DeviceAddress<u8>>,
+    output_addresses: DeviceBuffer<DeviceAddress<f32>>,
     owned_a_values: Vec<DeviceBuffer<u8>>,
     owned_a_scales: Vec<DeviceBuffer<u8>>,
     owned_b_values: Vec<DeviceBuffer<u8>>,
@@ -207,12 +207,12 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             self.gate_up
                 .run(&self.stream)
                 .expect("gate/up grouped GEMV");
-            moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-                MoeSiluQuantizeSlotBuffers {
+            moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+                MoeSiluQuantizeAddressSlotBuffers {
                     indices: &self.indices,
-                    gate_up_table: &self.gate_up.c,
-                    packed_table: self.down.b_values_mut.output(),
-                    scales_table: self.down.b_scales_mut.output(),
+                    gate_up_table: &self.gate_up.output_addresses,
+                    packed_table: self.down.b_values.output(),
+                    scales_table: self.down.b_scales.output(),
                     input_scale_table: &self.input_scale_table,
                     gate_up_alpha_table: &self.gate_up_alpha_table,
                 },
@@ -221,10 +221,10 @@ impl<const BATCH: usize> Nvfp4RoutedMoeShapeBench<BATCH> {
             )
             .expect("SiLU quantize slots");
             self.down.run(&self.stream).expect("down grouped GEMV");
-            moe_weighted_accumulate_slots_f32_on_stream(
+            moe_weighted_accumulate_slot_addresses_f32_on_stream(
                 &self.indices,
                 &self.route_weights,
-                &self.down.c,
+                &self.down.output_addresses,
                 &self.down_alpha_table,
                 self.reduced.inout(),
                 &self.stream,
@@ -484,47 +484,27 @@ impl GroupedOp {
         }
 
         let a_value_ptrs = (0..slots)
-            .map(|slot| {
-                owned_a_values[slot % owned_a_values.len()]
-                    .as_const_ptr()
-                    .cast::<u8>()
-            })
+            .map(|slot| owned_a_values[slot % owned_a_values.len()].cuda_address())
             .collect::<Vec<_>>();
         let a_scale_ptrs = (0..slots)
-            .map(|slot| {
-                owned_a_scales[slot % owned_a_scales.len()]
-                    .as_const_ptr()
-                    .cast::<u8>()
-            })
+            .map(|slot| owned_a_scales[slot % owned_a_scales.len()].cuda_address())
             .collect::<Vec<_>>();
         let b_value_ptrs = owned_b_values
             .iter()
-            .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
         let b_scale_ptrs = owned_b_scales
             .iter()
-            .map(|buffer| buffer.as_const_ptr().cast::<u8>())
-            .collect::<Vec<_>>();
-        let b_value_mut_ptrs = owned_b_values
-            .iter()
-            .map(|buffer| buffer.as_const_ptr().cast::<u8>().cast_mut())
-            .collect::<Vec<_>>();
-        let b_scale_mut_ptrs = owned_b_scales
-            .iter()
-            .map(|buffer| buffer.as_const_ptr().cast::<u8>().cast_mut())
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
 
-        let mut outputs = (0..slots)
+        let outputs = (0..slots)
             .map(|_| F32Matrix::zeroed(m, 1))
             .collect::<Result<Vec<_>>>()?;
-        let c_ptrs = outputs
+        let output_addresses = outputs
             .iter()
-            .map(|output| output.data_ptr())
+            .map(F32Matrix::data_address)
             .collect::<Vec<_>>();
-        let mut d_ptrs = Vec::with_capacity(slots);
-        for output in &mut outputs {
-            d_ptrs.push(output.data_mut_ptr().cast());
-        }
 
         Ok(Self {
             plan,
@@ -532,10 +512,7 @@ impl GroupedOp {
             a_scales: DeviceBuffer::from_host(&a_scale_ptrs)?,
             b_values: DeviceBuffer::from_host(&b_value_ptrs)?,
             b_scales: DeviceBuffer::from_host(&b_scale_ptrs)?,
-            b_values_mut: DeviceBuffer::from_host(&b_value_mut_ptrs)?,
-            b_scales_mut: DeviceBuffer::from_host(&b_scale_mut_ptrs)?,
-            c: DeviceBuffer::from_host(&c_ptrs)?,
-            d: DeviceBuffer::from_host(&d_ptrs)?,
+            output_addresses: DeviceBuffer::from_host(&output_addresses)?,
             owned_a_values,
             owned_a_scales,
             owned_b_values,
@@ -548,13 +525,12 @@ impl GroupedOp {
     }
 
     fn run(&self, stream: &CudaStream) -> Result<()> {
-        self.plan.run_on_stream(
+        self.plan.run_output_addresses_on_stream(
             &self.a_values,
             &self.a_scales,
             &self.b_values,
             &self.b_scales,
-            &self.c,
-            &self.d,
+            &self.output_addresses,
             1.0,
             0.0,
             stream,
@@ -562,7 +538,7 @@ impl GroupedOp {
     }
 
     fn run_contiguous(&mut self, stream: &CudaStream) -> Result<()> {
-        self.plan.run_contiguous_b_on_stream(
+        self.plan.run_contiguous_b_addresses_on_stream(
             &self.a_values,
             &self.a_scales,
             &self.contiguous_b_values,

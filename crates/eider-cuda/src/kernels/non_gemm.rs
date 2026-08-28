@@ -14147,13 +14147,13 @@ mod tests {
         let b_scales_table = DeviceBuffer::from_host(&b_scales).expect("B scale table");
         let mut output_table = DeviceBuffer::from_host(&output_addresses).expect("output table");
         let mut out_a_values =
-            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected A values");
+            DeviceBuffer::from_host(&[DeviceAddress::null(); 2]).expect("selected A values");
         let mut out_a_scales =
-            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected A scales");
+            DeviceBuffer::from_host(&[DeviceAddress::null(); 2]).expect("selected A scales");
         let mut out_b_values =
-            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected B values");
+            DeviceBuffer::from_host(&[DeviceAddress::null(); 2]).expect("selected B values");
         let mut out_b_scales =
-            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected B scales");
+            DeviceBuffer::from_host(&[DeviceAddress::null(); 2]).expect("selected B scales");
 
         gather_nvfp4_grouped_gemv_address_tables_on_stream(
             GroupedGemvAddressTableBuffers {
