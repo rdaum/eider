@@ -8,15 +8,14 @@ use crate::qwen38_flash_next::{
     Qwen38LogitsMode, Qwen38NextToken, qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineSpeculativeProgress,
-    EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
@@ -76,13 +75,11 @@ pub struct Qwen38FlashNextFinished {
 
 #[derive(Default)]
 pub struct Qwen38FlashNextTick {
-    pub admitted: Vec<Qwen38FlashNextAdmissionProgress>,
     pub prefilled: Vec<Qwen38FlashNextPrefillProgress>,
     pub generated: Vec<Qwen38FlashNextRequestId>,
     pub speculative: Vec<Qwen38FlashNextSpeculativeProgress>,
     pub output: Vec<Qwen38FlashNextChatDelta>,
     pub finished: Vec<Qwen38FlashNextFinished>,
-    pub active_sequences: usize,
 }
 
 pub enum Qwen38FlashNextCancelOutcome {
@@ -123,14 +120,6 @@ pub struct Qwen38FlashNextChatService<'template> {
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
-    pub fn new(
-        model: Qwen38FlashNextModel,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     pub fn new_with_cache_config(
         model: Qwen38FlashNextModel,
         template: &'template CheckpointChatTemplate,
@@ -316,7 +305,6 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.execution.sequences.len();
         Ok(tick)
     }
 
@@ -349,7 +337,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
 
     fn admit(
         &mut self,
-        tick: &mut Qwen38FlashNextTick,
+        _tick: &mut Qwen38FlashNextTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
@@ -475,7 +463,6 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 self.prefilling.push_back(id);
             }
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -858,12 +845,12 @@ impl<'template> Qwen38FlashNextChatService<'template> {
 }
 
 impl EngineService for Qwen38FlashNextChatService<'_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = Qwen38FlashNextChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission =
+            Qwen38FlashNextChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -871,14 +858,14 @@ impl EngineService for Qwen38FlashNextChatService<'_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Qwen38FlashNextRequestId,
             Qwen38FlashNextAdmissionProgress,
         >| match event {
             RequestLifecycleEvent::Admitted(progress) => {
                 on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
                     allocation_duration: progress.allocation_duration,
@@ -886,40 +873,41 @@ impl EngineService for Qwen38FlashNextChatService<'_> {
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 }))
             }
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-            }
+            RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+            ),
         };
-        let tick = Qwen38FlashNextChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = Qwen38FlashNextChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(Qwen38FlashNextRequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: tick
+            verification: tick
                 .speculative
                 .into_iter()
-                .map(|progress| EngineSpeculativeProgress {
-                    request_id: progress.request_id.get(),
+                .map(|progress| EngineVerificationProgress {
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     cycles: progress.cycles,
                     accepted_drafts: progress.accepted_drafts,
                 })
                 .collect(),
-            dflash: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -927,18 +915,17 @@ impl EngineService for Qwen38FlashNextChatService<'_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match Qwen38FlashNextChatService::cancel_request(self, Qwen38FlashNextRequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match Qwen38FlashNextChatService::cancel_request(self, Qwen38FlashNextRequestId(id.get())) {
             Qwen38FlashNextCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

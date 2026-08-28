@@ -3,10 +3,10 @@
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use eider_inference::metrics::metrics as infer_metrics;
-use eider_inference::{InferenceEngineConfig, InferenceError, with_loaded_engine};
+use eider_inference::{InferenceEngineConfig, with_loaded_engine};
 use eider_runtime::engine::{
-    EngineCancelOutcome, EngineDraftStats, EngineFinished, EngineLifecycleEvent, EngineService,
-    EngineSpeculativeProgress,
+    EngineCancelOutcome, EngineDraftStats, EngineFinished, EngineLifecycleEvent, EngineRequestId,
+    EngineService, EngineVerificationProgress,
 };
 use eider_runtime::generation::GenerationConfig;
 use eider_runtime::request::{ChatFinishReason, ChatRequest};
@@ -20,8 +20,24 @@ use tracing::{error, info, warn};
 
 const SESSION_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Compatibility name for the inference-owned engine configuration.
-pub type InferenceActorConfig = InferenceEngineConfig;
+/// API-actor configuration around one inference engine.
+#[derive(Clone, Debug)]
+pub struct InferenceActorConfig {
+    /// Model loading and execution configuration.
+    pub engine: InferenceEngineConfig,
+    /// Bounded event queue per API request.
+    pub event_capacity: usize,
+}
+
+impl InferenceActorConfig {
+    /// Creates actor and engine configuration with standard defaults.
+    pub fn new(model_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            engine: InferenceEngineConfig::new(model_dir),
+            event_capacity: 256,
+        }
+    }
+}
 
 /// Actor-local request identity used for cancellation from async clients.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -79,9 +95,9 @@ struct SessionMetrics {
     last_report_at: Option<Instant>,
     last_report_tokens: usize,
     generated_tokens: usize,
-    qwen38_speculative_cycles: usize,
-    qwen38_accepted_drafts: usize,
-    dflash: Option<DFlashSessionMetrics>,
+    verification_cycles: usize,
+    accepted_drafts: usize,
+    draft_progress: Option<DraftSessionMetrics>,
 }
 
 struct PrefillMetricsSnapshot {
@@ -97,13 +113,13 @@ struct SessionMetricsSnapshot {
     decode_tokens_per_second: f64,
 }
 
-struct DFlashSessionMetrics {
+struct DraftSessionMetrics {
     cumulative: EngineDraftStats,
     last_report_at: Instant,
     last_report: EngineDraftStats,
 }
 
-struct DFlashMetricsSnapshot {
+struct DraftMetricsSnapshot {
     interval: EngineDraftStats,
     cumulative: EngineDraftStats,
 }
@@ -190,7 +206,7 @@ fn actor_main(
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
 ) {
-    let result = with_loaded_engine(config, |service, defaults| {
+    let result = with_loaded_engine(config.engine, |service, defaults| {
         run_actor_loop(service, &mut commands, &ready, defaults);
     });
     if let Err(error) = result {
@@ -199,7 +215,7 @@ fn actor_main(
 }
 
 fn run_actor_loop(
-    service: &mut dyn EngineService<Error = InferenceError>,
+    service: &mut dyn EngineService,
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
     ready: &std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
     defaults: GenerationConfig,
@@ -217,8 +233,8 @@ fn run_actor_loop(
         return;
     }
 
-    let mut active = BTreeMap::<u64, ActiveRequest>::new();
-    let mut scheduler_by_external = BTreeMap::<ActorRequestId, u64>::new();
+    let mut active = BTreeMap::<EngineRequestId, ActiveRequest>::new();
+    let mut scheduler_by_external = BTreeMap::<ActorRequestId, EngineRequestId>::new();
     loop {
         if active.is_empty() {
             let Some(command) = commands.blocking_recv() else {
@@ -335,9 +351,9 @@ fn run_actor_loop(
                 }
             }
         }
-        for progress in &tick.speculative {
+        for progress in &tick.verification {
             if let Some(request) = active.get_mut(&progress.request_id) {
-                request.metrics.record_qwen38_speculative(progress);
+                request.metrics.record_verification(progress);
             }
         }
         for request_id in &tick.generated {
@@ -381,20 +397,20 @@ fn run_actor_loop(
                         output_tokens = snapshot.output_tokens,
                         interval_tok_s = snapshot.interval_tokens_per_second,
                         decode_tok_s = snapshot.decode_tokens_per_second,
-                        speculative_cycles = request.metrics.qwen38_speculative_cycles,
-                        accepted_drafts = request.metrics.qwen38_accepted_drafts,
+                        verification_cycles = request.metrics.verification_cycles,
+                        accepted_drafts = request.metrics.accepted_drafts,
                         accepted_drafts_per_cycle = ratio(
-                            request.metrics.qwen38_accepted_drafts,
-                            request.metrics.qwen38_speculative_cycles
+                            request.metrics.accepted_drafts,
+                            request.metrics.verification_cycles
                         ),
                         "decode progress"
                     );
                 }
             }
         }
-        for progress in &tick.dflash {
+        for progress in &tick.draft_progress {
             if let Some(request) = active.get_mut(&progress.request_id)
-                && let Some(snapshot) = request.metrics.record_dflash(now, progress.stats)
+                && let Some(snapshot) = request.metrics.record_draft_progress(now, progress.stats)
             {
                 snapshot.log(request.external_id);
             }
@@ -410,6 +426,7 @@ fn run_actor_loop(
                 disconnected.push(delta.request_id);
             }
         }
+        let active_sequences = service.active_sequence_count();
         for finished in tick.finished {
             if let Some(request) = active.remove(&finished.request_id) {
                 scheduler_by_external.remove(&request.external_id);
@@ -428,7 +445,7 @@ fn run_actor_loop(
                     now,
                     &finished,
                     active_requests,
-                    tick.active_sequences,
+                    active_sequences,
                 );
                 let _ = request
                     .events
@@ -449,7 +466,7 @@ fn run_actor_loop(
     shutdown_service(service);
 }
 
-fn shutdown_service(service: &mut dyn EngineService<Error = InferenceError>) {
+fn shutdown_service(service: &mut dyn EngineService) {
     if let Err(error) = service.shutdown() {
         error!(error = %error, "failed to shut down inference service");
     }
@@ -457,9 +474,9 @@ fn shutdown_service(service: &mut dyn EngineService<Error = InferenceError>) {
 
 fn handle_command(
     command: ActorCommand,
-    service: &mut dyn EngineService<Error = InferenceError>,
-    active: &mut BTreeMap<u64, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
+    service: &mut dyn EngineService,
+    active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) -> bool {
     match command {
         ActorCommand::Submit {
@@ -507,10 +524,10 @@ fn handle_command(
 }
 
 fn cancel_scheduler_request(
-    scheduler_id: u64,
-    service: &mut dyn EngineService<Error = InferenceError>,
-    active: &mut BTreeMap<u64, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
+    scheduler_id: EngineRequestId,
+    service: &mut dyn EngineService,
+    active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) {
     let outcome = service.cancel_request(scheduler_id);
     let released_sequence_device_bytes = match outcome {
@@ -538,9 +555,9 @@ fn cancel_scheduler_request(
 }
 
 fn fail_all(
-    service: &mut dyn EngineService<Error = InferenceError>,
-    active: &mut BTreeMap<u64, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
+    service: &mut dyn EngineService,
+    active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
     error: &str,
 ) {
     let ids = active.keys().copied().collect::<Vec<_>>();
@@ -572,9 +589,9 @@ fn fail_all(
 }
 
 fn cancel_all(
-    service: &mut dyn EngineService<Error = InferenceError>,
-    active: &mut BTreeMap<u64, ActiveRequest>,
-    scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
+    service: &mut dyn EngineService,
+    active: &mut BTreeMap<EngineRequestId, ActiveRequest>,
+    scheduler_by_external: &mut BTreeMap<ActorRequestId, EngineRequestId>,
 ) {
     let ids = active.keys().copied().collect::<Vec<_>>();
     for id in ids {
@@ -583,8 +600,8 @@ fn cancel_all(
 }
 
 fn update_current_counts(
-    service: &dyn EngineService<Error = InferenceError>,
-    active: &BTreeMap<u64, ActiveRequest>,
+    service: &dyn EngineService,
+    active: &BTreeMap<EngineRequestId, ActiveRequest>,
 ) {
     server_metrics().active_requests.set(active.len() as i64);
     infer_metrics()
@@ -609,9 +626,9 @@ impl SessionMetrics {
             last_report_at: None,
             last_report_tokens: 0,
             generated_tokens: 0,
-            qwen38_speculative_cycles: 0,
-            qwen38_accepted_drafts: 0,
-            dflash: None,
+            verification_cycles: 0,
+            accepted_drafts: 0,
+            draft_progress: None,
         }
     }
 
@@ -689,34 +706,34 @@ impl SessionMetrics {
         Some(snapshot)
     }
 
-    fn record_qwen38_speculative(&mut self, progress: &EngineSpeculativeProgress) {
-        self.qwen38_speculative_cycles += progress.cycles;
-        self.qwen38_accepted_drafts += progress.accepted_drafts;
+    fn record_verification(&mut self, progress: &EngineVerificationProgress) {
+        self.verification_cycles += progress.cycles;
+        self.accepted_drafts += progress.accepted_drafts;
     }
 
-    fn record_dflash(
+    fn record_draft_progress(
         &mut self,
         now: Instant,
         stats: EngineDraftStats,
-    ) -> Option<DFlashMetricsSnapshot> {
-        let Some(dflash) = &mut self.dflash else {
-            self.dflash = Some(DFlashSessionMetrics {
+    ) -> Option<DraftMetricsSnapshot> {
+        let Some(draft_progress) = &mut self.draft_progress else {
+            self.draft_progress = Some(DraftSessionMetrics {
                 cumulative: stats,
                 last_report_at: now,
                 last_report: EngineDraftStats::default(),
             });
             return None;
         };
-        dflash.cumulative = stats;
-        if now.duration_since(dflash.last_report_at) < SESSION_METRICS_INTERVAL {
+        draft_progress.cumulative = stats;
+        if now.duration_since(draft_progress.last_report_at) < SESSION_METRICS_INTERVAL {
             return None;
         }
-        let snapshot = DFlashMetricsSnapshot {
-            interval: dflash_stats_delta(stats, dflash.last_report),
+        let snapshot = DraftMetricsSnapshot {
+            interval: draft_stats_delta(stats, draft_progress.last_report),
             cumulative: stats,
         };
-        dflash.last_report_at = now;
-        dflash.last_report = stats;
+        draft_progress.last_report_at = now;
+        draft_progress.last_report = stats;
         Some(snapshot)
     }
 
@@ -750,11 +767,11 @@ impl SessionMetrics {
             prefill_compute_tok_s = self.prefill_compute_tokens_per_second(now),
             effective_prefill_tok_s = self.effective_prefill_tokens_per_second(now),
             decode_tok_s = self.decode_tokens_per_second(),
-            speculative_cycles = self.qwen38_speculative_cycles,
-            accepted_drafts = self.qwen38_accepted_drafts,
+            verification_cycles = self.verification_cycles,
+            accepted_drafts = self.accepted_drafts,
             accepted_drafts_per_cycle = ratio(
-                self.qwen38_accepted_drafts,
-                self.qwen38_speculative_cycles
+                self.accepted_drafts,
+                self.verification_cycles
             ),
             total_tok_s = rate(
                 finished.usage.completion_tokens,
@@ -766,8 +783,8 @@ impl SessionMetrics {
             active_sequences,
             "session complete"
         );
-        if let Some(dflash) = &self.dflash {
-            log_dflash_summary(id, dflash.cumulative);
+        if let Some(draft_progress) = &self.draft_progress {
+            log_draft_summary(id, draft_progress.cumulative);
         }
     }
 
@@ -857,7 +874,7 @@ impl SessionMetrics {
     }
 }
 
-impl DFlashMetricsSnapshot {
+impl DraftMetricsSnapshot {
     fn log(&self, id: ActorRequestId) {
         info!(
             session = id.0,
@@ -881,13 +898,13 @@ impl DFlashMetricsSnapshot {
             tokens_per_cycle = ratio(self.cumulative.emitted_tokens, self.cumulative.cycles),
             cycle_ms = average_duration_ms(self.cumulative.cycle_duration, self.cumulative.cycles),
             target_position = self.cumulative.target_position,
-            dflash_position = self.cumulative.draft_position,
-            "DFlash progress"
+            draft_position = self.cumulative.draft_position,
+            "draft-and-verify progress"
         );
     }
 }
 
-fn log_dflash_summary(id: ActorRequestId, stats: EngineDraftStats) {
+fn log_draft_summary(id: ActorRequestId, stats: EngineDraftStats) {
     info!(
         session = id.0,
         cycles = stats.cycles,
@@ -898,12 +915,12 @@ fn log_dflash_summary(id: ActorRequestId, stats: EngineDraftStats) {
         tokens_per_cycle = ratio(stats.emitted_tokens, stats.cycles),
         cycle_ms = average_duration_ms(stats.cycle_duration, stats.cycles),
         target_position = stats.target_position,
-        dflash_position = stats.draft_position,
-        "DFlash session complete"
+        draft_position = stats.draft_position,
+        "draft-and-verify session complete"
     );
 }
 
-fn dflash_stats_delta(current: EngineDraftStats, previous: EngineDraftStats) -> EngineDraftStats {
+fn draft_stats_delta(current: EngineDraftStats, previous: EngineDraftStats) -> EngineDraftStats {
     EngineDraftStats {
         cycles: current.cycles.saturating_sub(previous.cycles),
         drafted_tokens: current
@@ -965,7 +982,120 @@ fn map_finish_reason(reason: &ChatFinishReason) -> FinishReason {
 mod tests {
     use super::*;
     use eider_inference::{CheckpointArchitecture, checkpoint_architecture};
+    use eider_runtime::chat_output::ChatOutputEvent;
+    use eider_runtime::engine::{
+        EngineAdmission, EngineAdmissionProgress, EngineDelta, EnginePrefillProgress, EngineResult,
+        EngineTick,
+    };
+    use eider_runtime::request::ChatUsage;
     use std::fs;
+
+    struct FakeEngine {
+        ticked: bool,
+        cancelled: Vec<EngineRequestId>,
+    }
+
+    impl EngineService for FakeEngine {
+        fn add_request(&mut self, _request: ChatRequest) -> EngineResult<EngineAdmission> {
+            Ok(EngineAdmission {
+                request_id: EngineRequestId::new(1),
+                prompt_tokens: 3,
+                max_output_tokens: 2,
+            })
+        }
+
+        fn tick(
+            &mut self,
+            on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+        ) -> EngineResult<EngineTick> {
+            assert!(!self.ticked, "actor must stop after the terminal tick");
+            self.ticked = true;
+            let request_id = EngineRequestId::new(1);
+            on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
+                request_id,
+                sequence_device_bytes: 64,
+                cached_prompt_tokens: 0,
+                allocation_duration: Duration::ZERO,
+                checkpoint_copy_duration: Duration::ZERO,
+                admitted_after_tick_start: Duration::ZERO,
+            }));
+            on_lifecycle(EngineLifecycleEvent::PrefillStarted(request_id));
+            Ok(EngineTick {
+                prefilled: vec![EnginePrefillProgress {
+                    request_id,
+                    prompt_position: 3,
+                }],
+                generated: vec![request_id],
+                output: vec![EngineDelta {
+                    request_id,
+                    event: ChatOutputEvent::Text("ok".to_string()),
+                }],
+                finished: vec![EngineFinished {
+                    request_id,
+                    finish_reason: ChatFinishReason::Length,
+                    usage: ChatUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 1,
+                        ..ChatUsage::default()
+                    },
+                    released_sequence_device_bytes: 64,
+                }],
+                ..EngineTick::default()
+            })
+        }
+
+        fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+            self.cancelled.push(id);
+            EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes: 0,
+            }
+        }
+
+        fn active_sequence_count(&self) -> usize {
+            usize::from(!self.ticked)
+        }
+    }
+
+    #[test]
+    fn actor_drives_a_model_neutral_engine_contract() {
+        let (commands_tx, mut commands) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (events_tx, mut events) = mpsc::channel(4);
+        commands_tx
+            .send(ActorCommand::Submit {
+                id: ActorRequestId(1),
+                request: ChatRequest::new(Vec::new(), Default::default()),
+                events: events_tx,
+                submitted_at: Instant::now(),
+            })
+            .expect("actor command receiver is live");
+        drop(commands_tx);
+
+        let mut engine = FakeEngine {
+            ticked: false,
+            cancelled: Vec::new(),
+        };
+        run_actor_loop(
+            &mut engine,
+            &mut commands,
+            &ready_tx,
+            GenerationConfig::default(),
+        );
+
+        assert!(ready_rx.recv().expect("actor reports readiness").is_ok());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(InferenceEvent::Output(ChatOutputEvent::Text(text))) if text == "ok"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(InferenceEvent::Finished(InferenceFinished {
+                finish_reason: ChatFinishReason::Length,
+                ..
+            }))
+        ));
+        assert!(engine.cancelled.is_empty());
+    }
 
     #[test]
     fn session_metrics_report_exact_interval_and_decode_rates() {
@@ -989,37 +1119,34 @@ mod tests {
     }
 
     #[test]
-    fn session_metrics_accumulate_qwen38_speculative_acceptance() {
+    fn session_metrics_accumulate_verification_acceptance() {
         let mut metrics = SessionMetrics::new(Instant::now(), 8);
-        metrics.record_qwen38_speculative(&EngineSpeculativeProgress {
-            request_id: 7,
+        metrics.record_verification(&EngineVerificationProgress {
+            request_id: EngineRequestId::new(7),
             cycles: 1,
             accepted_drafts: 2,
         });
-        metrics.record_qwen38_speculative(&EngineSpeculativeProgress {
-            request_id: 7,
+        metrics.record_verification(&EngineVerificationProgress {
+            request_id: EngineRequestId::new(7),
             cycles: 1,
             accepted_drafts: 1,
         });
 
-        assert_eq!(metrics.qwen38_speculative_cycles, 2);
-        assert_eq!(metrics.qwen38_accepted_drafts, 3);
+        assert_eq!(metrics.verification_cycles, 2);
+        assert_eq!(metrics.accepted_drafts, 3);
         assert_eq!(
-            ratio(
-                metrics.qwen38_accepted_drafts,
-                metrics.qwen38_speculative_cycles
-            ),
+            ratio(metrics.accepted_drafts, metrics.verification_cycles),
             1.5
         );
     }
 
     #[test]
-    fn dflash_metrics_report_interval_and_cumulative_acceptance() {
+    fn draft_metrics_report_interval_and_cumulative_acceptance() {
         let started = Instant::now();
         let mut metrics = SessionMetrics::new(started, 1_000);
         assert!(
             metrics
-                .record_dflash(
+                .record_draft_progress(
                     started,
                     EngineDraftStats {
                         cycles: 1,
@@ -1034,7 +1161,7 @@ mod tests {
                 .is_none()
         );
         let snapshot = metrics
-            .record_dflash(
+            .record_draft_progress(
                 started + SESSION_METRICS_INTERVAL,
                 EngineDraftStats {
                     cycles: 4,
@@ -1046,7 +1173,7 @@ mod tests {
                     draft_position: 1_019,
                 },
             )
-            .expect("ten-second DFlash report interval elapsed");
+            .expect("ten-second draft report interval elapsed");
 
         assert_eq!(snapshot.interval.cycles, 4);
         assert_eq!(snapshot.interval.drafted_tokens, 60);

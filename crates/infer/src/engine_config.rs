@@ -38,8 +38,6 @@ pub struct InferenceEngineConfig {
     pub step_bf16_storage: Step37Bf16StorageConfig,
     /// Nemotron storage policy.
     pub nemotron_storage: Nemotron3StorageConfig,
-    /// Bounded API event-channel capacity.
-    pub event_capacity: usize,
 }
 
 impl InferenceEngineConfig {
@@ -61,7 +59,6 @@ impl InferenceEngineConfig {
             deepseek_expert_capacity: 8,
             step_bf16_storage: Step37Bf16StorageConfig::default(),
             nemotron_storage: Nemotron3StorageConfig::default(),
-            event_capacity: 256,
         }
     }
 }

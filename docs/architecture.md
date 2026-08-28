@@ -80,7 +80,7 @@ remains `crates/infer` during the migration.
 the model, selects its CUDA resources, constructs the model service, and lends
 that service to the API actor. The actor has no model import, CUDA resource
 import, checkpoint parser, or model-construction branch; it receives only an
-inference-boundary error and a model-neutral engine service.
+runtime-owned `EngineError` values and a model-neutral engine service.
 The `eider-api` package has no direct CUDA dependency.
 Bonsai GGUF chat-template parsing now also lives in `eider-inference`; the API
 receives the resolved template and has no direct format dependency.
@@ -134,8 +134,9 @@ outputs, and per-expert scales.
 Model sources and focused benchmarks import host ModelOpt records directly
 from `eider-format`. `eider-cuda` accepts them only at explicit upload and
 preparation entry points; execution APIs expose CUDA types.
-`InferenceError` now preserves format failures separately from CUDA failures
-at the actor-service boundary.
+`InferenceError` preserves format failures separately from CUDA failures
+inside inference. `EngineError` preserves that source error at the actor
+boundary without making the API depend on an inference-specific error type.
 
 ## Decision
 
@@ -390,6 +391,9 @@ The inference loader lends the concrete model service to the API as `dyn
 EngineService`. This dispatch occurs once per actor tick. It is outside the
 layer and kernel hot paths; model construction and execution remain statically
 typed inside inference.
+`InferenceEngineConfig` owns checkpoint and execution settings. The API-owned
+actor configuration wraps it with API event-channel capacity; neither setting
+is a compatibility alias for the other.
 
 Do not add a universal backend trait for every tensor or CUDA operation. The
 batch inference engine is the only required polymorphic seam.

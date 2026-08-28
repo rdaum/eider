@@ -8,15 +8,14 @@ use crate::deepseek4::{
     new_deepseek4_mtp_sequence_cache, new_deepseek4_sequence_cache,
 };
 use crate::sm12x_cache::Sm12xPageTable;
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineSpeculativeProgress,
-    EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick, EngineVerificationProgress,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
@@ -24,8 +23,6 @@ use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerCo
 use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
-use std::fs;
-use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -103,13 +100,11 @@ pub struct Deepseek4SpeculativeProgress {
 
 #[derive(Default)]
 pub struct Deepseek4Tick {
-    pub admitted: Vec<Deepseek4AdmissionProgress>,
     pub prefilled: Vec<Deepseek4PrefillProgress>,
     pub generated: Vec<Deepseek4RequestId>,
     pub speculative: Vec<Deepseek4SpeculativeProgress>,
     pub output: Vec<Deepseek4ChatDelta>,
     pub finished: Vec<Deepseek4Finished>,
-    pub active_sequences: usize,
 }
 
 pub enum Deepseek4CancelOutcome {
@@ -152,14 +147,6 @@ pub struct Deepseek4ChatService<'template> {
 }
 
 impl<'template> Deepseek4ChatService<'template> {
-    pub fn new(
-        model: Deepseek4TextModel,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     pub fn new_with_cache_config(
         model: Deepseek4TextModel,
         template: &'template CheckpointChatTemplate,
@@ -317,53 +304,6 @@ impl<'template> Deepseek4ChatService<'template> {
     }
 
     /// Atomically writes cumulative routing observations for hot-cache preparation.
-    pub fn write_hotset_plan(
-        &self,
-        path: impl AsRef<Path>,
-        capacity_per_layer: usize,
-    ) -> Result<usize> {
-        if self.sequences.len() != 0 {
-            return Err(Error::Format {
-                label: "DeepSeek V4 hotset plan",
-                detail: "cannot snapshot routing while sequences are active".to_string(),
-            });
-        }
-        let path = path.as_ref();
-        let plan = self
-            .model
-            .hotset_plan(capacity_per_layer, &self.workspace)?;
-        let bytes = serde_json::to_vec_pretty(&plan).map_err(|error| Error::Format {
-            label: "DeepSeek V4 hotset plan",
-            detail: format!("failed to encode plan: {error}"),
-        })?;
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).map_err(|error| Error::Format {
-                label: "DeepSeek V4 hotset plan",
-                detail: format!("failed to create {}: {error}", parent.display()),
-            })?;
-        }
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, bytes).map_err(|error| Error::Format {
-            label: "DeepSeek V4 hotset plan",
-            detail: format!("failed to write {}: {error}", temporary.display()),
-        })?;
-        fs::rename(&temporary, path).map_err(|error| Error::Format {
-            label: "DeepSeek V4 hotset plan",
-            detail: format!(
-                "failed to publish {} as {}: {error}",
-                temporary.display(),
-                path.display()
-            ),
-        })?;
-        Ok(plan.values().map(Vec::len).sum())
-    }
-
-    pub fn tick(&mut self) -> Result<Deepseek4Tick> {
-        self.tick_with_lifecycle(&mut |_| {})
-    }
-
     pub fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
@@ -373,13 +313,6 @@ impl<'template> Deepseek4ChatService<'template> {
         let tick_started = Instant::now();
         let mut tick = Deepseek4Tick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
-        for admission in &tick.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted DeepSeek V4 request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
-        }
 
         let mut terminal = BTreeMap::new();
         let decode_ids = self
@@ -438,7 +371,6 @@ impl<'template> Deepseek4ChatService<'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -472,7 +404,7 @@ impl<'template> Deepseek4ChatService<'template> {
 
     fn admit(
         &mut self,
-        tick: &mut Deepseek4Tick,
+        _tick: &mut Deepseek4Tick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
@@ -602,8 +534,8 @@ impl<'template> Deepseek4ChatService<'template> {
                 checkpoint_copy_duration,
                 admitted_after_tick_start: tick_started.elapsed(),
             };
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -1156,12 +1088,12 @@ fn retained_prefix_ready(
 }
 
 impl EngineService for Deepseek4ChatService<'_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = Deepseek4ChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission =
+            Deepseek4ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -1170,14 +1102,14 @@ impl EngineService for Deepseek4ChatService<'_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Deepseek4RequestId,
             Deepseek4AdmissionProgress,
         >| match event {
             RequestLifecycleEvent::Admitted(progress) => {
                 on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
                     allocation_duration: progress.allocation_duration,
@@ -1185,40 +1117,41 @@ impl EngineService for Deepseek4ChatService<'_> {
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 }))
             }
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-            }
+            RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+            ),
         };
-        let tick = Deepseek4ChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = Deepseek4ChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(Deepseek4RequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: tick
+            verification: tick
                 .speculative
                 .into_iter()
-                .map(|progress| EngineSpeculativeProgress {
-                    request_id: progress.request_id.get(),
+                .map(|progress| EngineVerificationProgress {
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     cycles: progress.cycles,
                     accepted_drafts: progress.accepted_drafts,
                 })
                 .collect(),
-            dflash: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -1226,19 +1159,18 @@ impl EngineService for Deepseek4ChatService<'_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match Deepseek4ChatService::cancel_request(self, Deepseek4RequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match Deepseek4ChatService::cancel_request(self, Deepseek4RequestId(id.get())) {
             Deepseek4CancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

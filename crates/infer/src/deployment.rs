@@ -97,7 +97,7 @@ pub fn checkpoint_architecture(model_dir: &Path) -> InferenceResult<CheckpointAr
 /// kernel hot paths.
 pub fn with_loaded_engine<R>(
     config: InferenceEngineConfig,
-    run: impl FnOnce(&mut dyn EngineService<Error = InferenceError>, GenerationConfig) -> R,
+    run: impl FnOnce(&mut dyn EngineService, GenerationConfig) -> R,
 ) -> InferenceResult<R> {
     let InferenceEngineConfig {
         model_dir,

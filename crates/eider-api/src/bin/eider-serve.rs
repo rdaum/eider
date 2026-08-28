@@ -327,10 +327,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .speculative_drafts
         .unwrap_or(resolved.default_speculative_drafts);
     let mut actor_config = InferenceActorConfig::new(&resolved.checkpoint_dir);
-    actor_config.artifact_dir = resolved.artifact_dir.clone();
-    actor_config.dflash_gguf = resolved.dflash_gguf.clone();
-    actor_config.dflash2_dir = resolved.dflash2_dir.clone();
-    actor_config.scheduler = SchedulerConfig {
+    actor_config.engine.artifact_dir = resolved.artifact_dir.clone();
+    actor_config.engine.dflash_gguf = resolved.dflash_gguf.clone();
+    actor_config.engine.dflash2_dir = resolved.dflash2_dir.clone();
+    actor_config.engine.scheduler = SchedulerConfig {
         decode_capacity: args.decode_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,
         prefill_token_capacity,
@@ -338,26 +338,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_context_tokens,
         speculative_drafts,
     };
-    actor_config.sequence_cache.max_retained_bytes = args
+    actor_config.engine.sequence_cache.max_retained_bytes = args
         .retained_prefix_gib
         .checked_mul(1024 * 1024 * 1024)
         .ok_or("retained-prefix size exceeds usize")?;
-    actor_config.qwen_bf16_storage = Qwen36Bf16StorageConfig::new(
+    actor_config.engine.qwen_bf16_storage = Qwen36Bf16StorageConfig::new(
         args.qwen_bf16_attention.into(),
         args.qwen_bf16_lm_head.into(),
     );
-    actor_config.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
-    actor_config.qwen_fp8_dense_mlp_storage = args.qwen_fp8_dense_mlp.into();
-    actor_config.qwen_fp8_lm_head_storage = args.qwen_fp8_lm_head.into();
-    actor_config.step_expert_capacity = step_expert_capacity;
-    actor_config.deepseek_expert_capacity = args.deepseek_expert_capacity;
-    actor_config.step_bf16_storage = Step37Bf16StorageConfig {
+    actor_config.engine.qwen_fp8_attention_storage = args.qwen_fp8_attention.into();
+    actor_config.engine.qwen_fp8_dense_mlp_storage = args.qwen_fp8_dense_mlp.into();
+    actor_config.engine.qwen_fp8_lm_head_storage = args.qwen_fp8_lm_head.into();
+    actor_config.engine.step_expert_capacity = step_expert_capacity;
+    actor_config.engine.deepseek_expert_capacity = args.deepseek_expert_capacity;
+    actor_config.engine.step_bf16_storage = Step37Bf16StorageConfig {
         attention: args.step_bf16_attention.into(),
         dense_mlp: args.step_bf16_dense_mlp.into(),
         shared_expert: args.step_bf16_shared_expert.into(),
         lm_head: args.step_bf16_lm_head.into(),
     };
-    actor_config.nemotron_storage = Nemotron3StorageConfig {
+    actor_config.engine.nemotron_storage = Nemotron3StorageConfig {
         bf16: args.nemotron_bf16_storage.into(),
         fp8: args.nemotron_fp8_storage.into(),
         kv_cache: args.nemotron_kv_cache.into(),

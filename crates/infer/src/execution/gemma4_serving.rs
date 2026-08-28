@@ -9,14 +9,14 @@ use crate::gemma4::{
 };
 use crate::metrics::{duration_us, metrics};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -84,12 +84,10 @@ pub struct Gemma4Finished {
 /// Observable work and output from one service iteration.
 #[derive(Default)]
 pub struct Gemma4Tick {
-    pub admitted: Vec<Gemma4AdmissionProgress>,
     pub prefilled: Vec<Gemma4PrefillProgress>,
     pub generated: Vec<Gemma4RequestId>,
     pub output: Vec<Gemma4ChatDelta>,
     pub finished: Vec<Gemma4Finished>,
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a waiting or active request.
@@ -133,15 +131,6 @@ pub struct Gemma4ChatService<'model, 'template> {
 }
 
 impl<'model, 'template> Gemma4ChatService<'model, 'template> {
-    /// Creates a multi-session service with explicit scheduling limits.
-    pub fn new(
-        model: &'model Gemma4Model,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     /// Creates a multi-session service with ART-backed prompt prefixes.
     pub fn new_with_cache_config(
         model: &'model Gemma4Model,
@@ -296,11 +285,6 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         })
     }
 
-    /// Runs one decode-first scheduling iteration across active requests.
-    pub fn tick(&mut self) -> Result<Gemma4Tick> {
-        self.tick_with_lifecycle(&mut |_| {})
-    }
-
     /// Runs one scheduler iteration and reports admission and prefill events
     /// when they occur.
     pub fn tick_with_lifecycle(
@@ -312,13 +296,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         let tick_started = Instant::now();
         let mut tick = Gemma4Tick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
-        for admission in &tick.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted Gemma 4 request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
-        }
+
         let mut terminal = BTreeMap::new();
         let decode_ids = self
             .requests
@@ -358,7 +336,6 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -397,7 +374,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut Gemma4Tick,
+        _tick: &mut Gemma4Tick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
@@ -466,8 +443,8 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 checkpoint_copy_duration,
                 admitted_after_tick_start: tick_started.elapsed(),
             };
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -731,12 +708,11 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
 }
 
 impl EngineService for Gemma4ChatService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = Gemma4ChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission = Gemma4ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -745,12 +721,12 @@ impl EngineService for Gemma4ChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
                     on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                        request_id: progress.request_id.get(),
+                        request_id: EngineRequestId::new(progress.request_id.get()),
                         sequence_device_bytes: progress.sequence_device_bytes,
                         cached_prompt_tokens: progress.cached_prompt_tokens,
                         allocation_duration: progress.allocation_duration,
@@ -758,32 +734,33 @@ impl EngineService for Gemma4ChatService<'_, '_> {
                         admitted_after_tick_start: progress.admitted_after_tick_start,
                     }))
                 }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-                }
+                RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                    EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+                ),
             };
-        let tick = Gemma4ChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = Gemma4ChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(Gemma4RequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -791,19 +768,18 @@ impl EngineService for Gemma4ChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match Gemma4ChatService::cancel_request(self, Gemma4RequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match Gemma4ChatService::cancel_request(self, Gemma4RequestId(id.get())) {
             Gemma4CancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

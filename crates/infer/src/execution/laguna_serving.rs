@@ -6,14 +6,14 @@ use crate::laguna::{
 };
 use crate::laguna::{LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::{ChatReasoningEffort, CheckpointChatTemplate};
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
@@ -107,12 +107,10 @@ pub struct LagunaFinished {
 
 #[derive(Default)]
 pub struct LagunaTick {
-    pub admitted: Vec<LagunaAdmissionProgress>,
     pub prefilled: Vec<LagunaPrefillProgress>,
     pub generated: Vec<LagunaRequestId>,
     pub output: Vec<LagunaChatDelta>,
     pub finished: Vec<LagunaFinished>,
-    pub active_sequences: usize,
 }
 
 pub enum LagunaCancelOutcome {
@@ -156,14 +154,6 @@ pub struct LagunaChatService<'model, 'template> {
 }
 
 impl<'model, 'template> LagunaChatService<'model, 'template> {
-    pub fn new(
-        model: &'model LagunaModel,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     pub fn new_with_cache_config(
         model: &'model LagunaModel,
         template: &'template CheckpointChatTemplate,
@@ -395,10 +385,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         })
     }
 
-    pub fn tick(&mut self) -> Result<LagunaTick> {
-        self.tick_with_lifecycle(&mut |_| {})
-    }
-
     pub fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
@@ -408,13 +394,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         let tick_started = Instant::now();
         let mut tick = LagunaTick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
-        for admission in &tick.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted Laguna request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
-        }
 
         let mut terminal = BTreeMap::new();
         let decode_ids = self
@@ -455,7 +434,6 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -494,7 +472,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut LagunaTick,
+        _tick: &mut LagunaTick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>,
@@ -553,8 +531,8 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
                 checkpoint_copy_duration: Duration::ZERO,
                 admitted_after_tick_start: tick_started.elapsed(),
             };
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -871,13 +849,11 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
 }
 
 impl EngineService for LagunaChatService<'_, '_> {
-    type Error = InferenceError;
-
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = LagunaChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission = LagunaChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -886,12 +862,12 @@ impl EngineService for LagunaChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
                     on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                        request_id: progress.request_id.get(),
+                        request_id: EngineRequestId::new(progress.request_id.get()),
                         sequence_device_bytes: progress.sequence_device_bytes,
                         cached_prompt_tokens: progress.cached_prompt_tokens,
                         allocation_duration: progress.allocation_duration,
@@ -899,32 +875,33 @@ impl EngineService for LagunaChatService<'_, '_> {
                         admitted_after_tick_start: progress.admitted_after_tick_start,
                     }))
                 }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-                }
+                RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                    EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+                ),
             };
-        let tick = LagunaChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = LagunaChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(LagunaRequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -932,19 +909,18 @@ impl EngineService for LagunaChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match LagunaChatService::cancel_request(self, LagunaRequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match LagunaChatService::cancel_request(self, LagunaRequestId(id.get())) {
             LagunaCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

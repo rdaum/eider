@@ -2,13 +2,13 @@
 
 use crate::bonsai::{BonsaiModel, BonsaiPrefillWorkspace, BonsaiSequenceId, BonsaiSequencePool};
 use crate::bonsai::{BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cache};
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -83,8 +83,6 @@ pub struct BonsaiFinished {
 /// Work and output from one service iteration.
 #[derive(Default)]
 pub struct BonsaiTick {
-    /// Requests allocated during this tick.
-    pub admitted: Vec<BonsaiAdmissionProgress>,
     /// Prompt progress during this tick.
     pub prefilled: Vec<BonsaiPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -93,8 +91,6 @@ pub struct BonsaiTick {
     pub output: Vec<BonsaiChatDelta>,
     /// Requests completing during this tick.
     pub finished: Vec<BonsaiFinished>,
-    /// Device-resident sequences remaining after the tick.
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a queued or active request.
@@ -315,7 +311,6 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -338,7 +333,7 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut BonsaiTick,
+        _tick: &mut BonsaiTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BonsaiRequestId, BonsaiAdmissionProgress>,
@@ -360,7 +355,6 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
             };
             request.sequence_id = Some(self.sequences.insert(sequence)?);
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -500,13 +494,11 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
 }
 
 impl EngineService for BonsaiChatService<'_, '_> {
-    type Error = InferenceError;
-
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = BonsaiChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission = BonsaiChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -515,12 +507,12 @@ impl EngineService for BonsaiChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<BonsaiRequestId, BonsaiAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
                     on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                        request_id: progress.request_id.get(),
+                        request_id: EngineRequestId::new(progress.request_id.get()),
                         sequence_device_bytes: progress.sequence_device_bytes,
                         cached_prompt_tokens: progress.cached_prompt_tokens,
                         allocation_duration: Duration::ZERO,
@@ -529,31 +521,34 @@ impl EngineService for BonsaiChatService<'_, '_> {
                     }));
                 }
                 RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(
+                        id.get(),
+                    )));
                 }
             };
-        let tick = BonsaiChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = BonsaiChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(BonsaiRequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -561,19 +556,18 @@ impl EngineService for BonsaiChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match BonsaiChatService::cancel_request(self, BonsaiRequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match BonsaiChatService::cancel_request(self, BonsaiRequestId(id.get())) {
             BonsaiCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

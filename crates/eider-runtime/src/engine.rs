@@ -5,13 +5,61 @@
 
 use crate::chat_output::ChatOutputEvent;
 use crate::request::{ChatFinishReason, ChatRequest, ChatUsage};
+use std::error::Error;
+use std::fmt;
 use std::time::Duration;
+
+/// Opaque request identity assigned by an inference engine.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EngineRequestId(u64);
+
+impl EngineRequestId {
+    /// Creates an engine request identity from a scheduler-local counter.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the scheduler-local counter.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Error reported across the model-neutral engine boundary.
+#[derive(Debug)]
+pub struct EngineError {
+    source: Box<dyn Error + Send + Sync>,
+}
+
+impl EngineError {
+    /// Preserves an inference implementation error at the engine boundary.
+    pub fn new(source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for EngineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Result returned by an engine operation.
+pub type EngineResult<T> = Result<T, EngineError>;
 
 /// Request metadata known once an inference engine accepts a request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineAdmission {
     /// Engine-local request identity used for subsequent lifecycle operations.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Rendered prompt token count.
     pub prompt_tokens: usize,
     /// Requested completion-token limit.
@@ -22,7 +70,7 @@ pub struct EngineAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineAdmissionProgress {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Device bytes retained for this request's sequence state.
     pub sequence_device_bytes: usize,
     /// Prompt tokens restored from a retained prefix.
@@ -41,14 +89,14 @@ pub enum EngineLifecycleEvent {
     /// Persistent sequence state is ready for a request.
     Admitted(EngineAdmissionProgress),
     /// The request's next prompt chunk is about to enter model execution.
-    PrefillStarted(u64),
+    PrefillStarted(EngineRequestId),
 }
 
 /// Prompt work completed during one engine tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EnginePrefillProgress {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Total prompt position after this tick.
     pub prompt_position: usize,
 }
@@ -57,7 +105,7 @@ pub struct EnginePrefillProgress {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineDelta {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Decoded reasoning, text, or tool-call event.
     pub event: ChatOutputEvent,
 }
@@ -66,7 +114,7 @@ pub struct EngineDelta {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineFinished {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Why generation completed.
     pub finish_reason: ChatFinishReason,
     /// Final token accounting.
@@ -98,16 +146,16 @@ pub struct EngineDraftStats {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EngineDraftProgress {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Cumulative telemetry after the latest cycle.
     pub stats: EngineDraftStats,
 }
 
 /// Speculative verification progress from one engine tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EngineSpeculativeProgress {
+pub struct EngineVerificationProgress {
     /// Engine-local request identity.
-    pub request_id: u64,
+    pub request_id: EngineRequestId,
     /// Verification cycles completed in this tick.
     pub cycles: usize,
     /// Draft tokens accepted in this tick.
@@ -120,17 +168,15 @@ pub struct EngineTick {
     /// Prompt positions advanced during this tick.
     pub prefilled: Vec<EnginePrefillProgress>,
     /// Requests that emitted one generated token during this tick.
-    pub generated: Vec<u64>,
+    pub generated: Vec<EngineRequestId>,
     /// Speculative verifier progress.
-    pub speculative: Vec<EngineSpeculativeProgress>,
+    pub verification: Vec<EngineVerificationProgress>,
     /// Draft-and-verify telemetry.
-    pub dflash: Vec<EngineDraftProgress>,
+    pub draft_progress: Vec<EngineDraftProgress>,
     /// Decoded output events.
     pub output: Vec<EngineDelta>,
     /// Completed requests.
     pub finished: Vec<EngineFinished>,
-    /// Number of live model sequences after the tick.
-    pub active_sequences: usize,
 }
 
 /// Result of a cancellation request sent to an inference engine.
@@ -150,29 +196,26 @@ pub enum EngineCancelOutcome {
 /// Model service consumed by a serving actor.
 ///
 /// The actor may use a trait object for this service because calls happen once
-/// per scheduler tick, outside model and kernel hot paths. The associated error
-/// keeps runtime independent of a particular inference implementation.
+/// per scheduler tick, outside model and kernel hot paths. Errors cross this
+/// boundary as runtime-owned [`EngineError`] values.
 pub trait EngineService {
-    /// Error returned by the concrete inference implementation.
-    type Error: std::error::Error;
-
     /// Adds one rendered request to the model-specific scheduler.
-    fn add_request(&mut self, request: ChatRequest) -> Result<EngineAdmission, Self::Error>;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission>;
 
     /// Executes one scheduler tick and emits lifecycle transitions.
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> Result<EngineTick, Self::Error>;
+    ) -> EngineResult<EngineTick>;
 
     /// Cancels one engine-local request identity.
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome;
 
     /// Returns the number of live model sequences.
     fn active_sequence_count(&self) -> usize;
 
     /// Releases model-owned execution resources after the actor stops.
-    fn shutdown(&mut self) -> Result<(), Self::Error> {
+    fn shutdown(&mut self) -> EngineResult<()> {
         Ok(())
     }
 }

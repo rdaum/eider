@@ -4,13 +4,13 @@ use crate::ling3::{
     Ling3Model, Ling3PrefillWorkspace, Ling3SequenceCache, Ling3SequenceId, Ling3SequencePool,
     admit_ling3_sequence, new_ling3_sequence_cache,
 };
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{CudaStream, Error, Result};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -68,12 +68,10 @@ pub struct Ling3Finished {
 /// Work and output from one service iteration.
 #[derive(Default)]
 pub struct Ling3Tick {
-    pub admitted: Vec<Ling3AdmissionProgress>,
     pub prefilled: Vec<Ling3PrefillProgress>,
     pub generated: Vec<Ling3RequestId>,
     pub output: Vec<Ling3ChatDelta>,
     pub finished: Vec<Ling3Finished>,
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a queued or active request.
@@ -275,7 +273,6 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -305,7 +302,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut Ling3Tick,
+        _tick: &mut Ling3Tick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>),
     ) -> Result<()> {
@@ -333,7 +330,6 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
             };
             request.sequence_id = Some(self.sequences.insert(sequence)?);
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -466,13 +462,11 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
 }
 
 impl EngineService for Ling3ChatService<'_, '_> {
-    type Error = InferenceError;
-
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = Ling3ChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission = Ling3ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -481,12 +475,12 @@ impl EngineService for Ling3ChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
                     on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                        request_id: progress.request_id.get(),
+                        request_id: EngineRequestId::new(progress.request_id.get()),
                         sequence_device_bytes: progress.sequence_device_bytes,
                         cached_prompt_tokens: progress.cached_prompt_tokens,
                         allocation_duration: Duration::ZERO,
@@ -494,32 +488,33 @@ impl EngineService for Ling3ChatService<'_, '_> {
                         admitted_after_tick_start: progress.admitted_after_tick_start,
                     }))
                 }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-                }
+                RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                    EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+                ),
             };
-        let tick = Ling3ChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick =
+            Ling3ChatService::tick_with_lifecycle(self, &mut observer).map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(Ling3RequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -527,19 +522,18 @@ impl EngineService for Ling3ChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match Ling3ChatService::cancel_request(self, Ling3RequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match Ling3ChatService::cancel_request(self, Ling3RequestId(id.get())) {
             Ling3CancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

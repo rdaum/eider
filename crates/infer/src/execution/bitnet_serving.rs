@@ -2,13 +2,13 @@
 
 use crate::bitnet::{BitNetModel, BitNetPrefillWorkspace, BitNetSequenceId, BitNetSequencePool};
 use crate::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -83,8 +83,6 @@ pub struct BitNetFinished {
 /// Work and output from one service iteration.
 #[derive(Default)]
 pub struct BitNetTick {
-    /// Requests allocated during this tick.
-    pub admitted: Vec<BitNetAdmissionProgress>,
     /// Prompt progress during this tick.
     pub prefilled: Vec<BitNetPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -93,8 +91,6 @@ pub struct BitNetTick {
     pub output: Vec<BitNetChatDelta>,
     /// Requests completing during this tick.
     pub finished: Vec<BitNetFinished>,
-    /// Device-resident sequences remaining after the tick.
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a queued or active request.
@@ -322,7 +318,6 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -345,7 +340,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut BitNetTick,
+        _tick: &mut BitNetTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>,
@@ -367,7 +362,6 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             };
             request.sequence_id = Some(self.sequences.insert(sequence)?);
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -506,13 +500,11 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
 }
 
 impl EngineService for BitNetChatService<'_, '_> {
-    type Error = InferenceError;
-
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = BitNetChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission = BitNetChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -521,12 +513,12 @@ impl EngineService for BitNetChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer =
             |event: RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>| match event {
                 RequestLifecycleEvent::Admitted(progress) => {
                     on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                        request_id: progress.request_id.get(),
+                        request_id: EngineRequestId::new(progress.request_id.get()),
                         sequence_device_bytes: progress.sequence_device_bytes,
                         cached_prompt_tokens: progress.cached_prompt_tokens,
                         allocation_duration: Duration::ZERO,
@@ -535,31 +527,34 @@ impl EngineService for BitNetChatService<'_, '_> {
                     }));
                 }
                 RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(
+                        id.get(),
+                    )));
                 }
             };
-        let tick = BitNetChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = BitNetChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(BitNetRequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -567,19 +562,18 @@ impl EngineService for BitNetChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match BitNetChatService::cancel_request(self, BitNetRequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match BitNetChatService::cancel_request(self, BitNetRequestId(id.get())) {
             BitNetCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

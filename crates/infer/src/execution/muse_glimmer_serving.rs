@@ -7,15 +7,14 @@ use crate::muse_glimmer::{
 };
 use crate::muse_glimmer::{MuseGlimmerSequenceId, MuseGlimmerSequencePool};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
     EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta,
-    EngineDraftProgress, EngineDraftStats, EngineFinished, EngineLifecycleEvent,
-    EnginePrefillProgress, EngineService, EngineTick,
+    EngineDraftProgress, EngineDraftStats, EngineError, EngineFinished, EngineLifecycleEvent,
+    EnginePrefillProgress, EngineRequestId, EngineResult, EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -140,8 +139,6 @@ pub struct MuseGlimmerFinished {
 /// Work and output from one service iteration.
 #[derive(Default)]
 pub struct MuseGlimmerTick {
-    /// Requests allocated during this tick.
-    pub admitted: Vec<MuseGlimmerAdmissionProgress>,
     /// Prompt progress during this tick.
     pub prefilled: Vec<MuseGlimmerPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -152,8 +149,6 @@ pub struct MuseGlimmerTick {
     pub output: Vec<MuseGlimmerChatDelta>,
     /// Requests completing during this tick.
     pub finished: Vec<MuseGlimmerFinished>,
-    /// Device-resident sequences remaining after the tick.
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a queued or active request.
@@ -200,15 +195,6 @@ pub struct MuseGlimmerChatService<'model, 'template> {
 }
 
 impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
-    /// Creates a service with explicit scheduling limits.
-    pub fn new(
-        model: &'model MuseGlimmerModel,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     /// Creates a service with explicit scheduling and prompt-prefix limits.
     pub fn new_with_cache_config(
         model: &'model MuseGlimmerModel,
@@ -345,13 +331,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         let started = Instant::now();
         let mut tick = MuseGlimmerTick::default();
         self.admit(&mut tick, started, on_lifecycle)?;
-        for admission in &tick.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted Muse Glimmer request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
-        }
+
         let mut terminal = BTreeMap::new();
         let decode_ids = self
             .requests
@@ -390,7 +370,6 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -413,7 +392,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut MuseGlimmerTick,
+        _tick: &mut MuseGlimmerTick,
         started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<MuseGlimmerRequestId, MuseGlimmerAdmissionProgress>,
@@ -486,8 +465,8 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
                 admitted_after_tick_start: started.elapsed(),
             };
             request.sequence_id = Some(self.sequences.insert(sequence)?);
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -788,12 +767,12 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
 }
 
 impl EngineService for MuseGlimmerChatService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = MuseGlimmerChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission =
+            MuseGlimmerChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -802,14 +781,14 @@ impl EngineService for MuseGlimmerChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             MuseGlimmerRequestId,
             MuseGlimmerAdmissionProgress,
         >| match event {
             RequestLifecycleEvent::Admitted(progress) => {
                 on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
                     allocation_duration: progress.allocation_duration,
@@ -817,31 +796,32 @@ impl EngineService for MuseGlimmerChatService<'_, '_> {
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 }))
             }
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-            }
+            RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+            ),
         };
-        let tick = MuseGlimmerChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = MuseGlimmerChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(MuseGlimmerRequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: tick
+            verification: Vec::new(),
+            draft_progress: tick
                 .dflash
                 .into_iter()
                 .map(|progress| EngineDraftProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     stats: EngineDraftStats {
                         cycles: progress.stats.cycles,
                         drafted_tokens: progress.stats.drafted_tokens,
@@ -857,7 +837,7 @@ impl EngineService for MuseGlimmerChatService<'_, '_> {
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -865,19 +845,18 @@ impl EngineService for MuseGlimmerChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
 
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match MuseGlimmerChatService::cancel_request(self, MuseGlimmerRequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match MuseGlimmerChatService::cancel_request(self, MuseGlimmerRequestId(id.get())) {
             MuseGlimmerCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {

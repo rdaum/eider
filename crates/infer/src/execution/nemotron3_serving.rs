@@ -7,14 +7,14 @@ use crate::nemotron3::{
     new_nemotron3_sequence_cache_with_budget,
 };
 use crate::sm12x_cache::Sm12xPageTable;
-use crate::{InferenceError, InferenceResult};
 use eider_cuda::{DeviceBuffer, Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
-    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
+    EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -76,12 +76,10 @@ pub struct Nemotron3Finished {
 /// Observable work and output from one service iteration.
 #[derive(Default)]
 pub struct Nemotron3Tick {
-    pub admitted: Vec<Nemotron3AdmissionProgress>,
     pub prefilled: Vec<Nemotron3PrefillProgress>,
     pub generated: Vec<Nemotron3RequestId>,
     pub output: Vec<Nemotron3ChatDelta>,
     pub finished: Vec<Nemotron3Finished>,
-    pub active_sequences: usize,
 }
 
 /// Outcome of cancelling a waiting or active request.
@@ -155,15 +153,6 @@ pub struct Nemotron3ChatService<'model, 'template> {
 }
 
 impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
-    /// Creates a multi-session service with explicit scheduling limits.
-    pub fn new(
-        model: &'model Nemotron3Model,
-        template: &'template CheckpointChatTemplate,
-        config: SchedulerConfig,
-    ) -> Result<Self> {
-        Self::new_with_cache_config(model, template, config, SequenceCacheConfig::default())
-    }
-
     /// Creates a multi-session service with ART-backed reusable prompt prefixes.
     pub fn new_with_cache_config(
         model: &'model Nemotron3Model,
@@ -279,11 +268,6 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         })
     }
 
-    /// Runs one decode-first round-robin scheduling iteration.
-    pub fn tick(&mut self) -> Result<Nemotron3Tick> {
-        self.tick_with_lifecycle(&mut |_| {})
-    }
-
     /// Runs one scheduler iteration and reports admission and prefill events
     /// when they occur.
     pub fn tick_with_lifecycle(
@@ -295,13 +279,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         let tick_started = Instant::now();
         let mut tick = Nemotron3Tick::default();
         self.admit(&mut tick, tick_started, on_lifecycle)?;
-        for admission in &tick.admitted {
-            self.requests
-                .get_mut(&admission.request_id)
-                .expect("admitted Nemotron request is retained")
-                .usage
-                .cached_prompt_tokens = admission.cached_prompt_tokens;
-        }
+
         let mut terminal = BTreeMap::new();
 
         let decode_ids = self
@@ -357,7 +335,6 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -389,7 +366,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     fn admit(
         &mut self,
-        tick: &mut Nemotron3Tick,
+        _tick: &mut Nemotron3Tick,
         tick_started: Instant,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
@@ -454,8 +431,8 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
                 cached_prompt_tokens,
                 admitted_after_tick_start: tick_started.elapsed(),
             };
+            request.usage.cached_prompt_tokens = cached_prompt_tokens;
             on_lifecycle(RequestLifecycleEvent::Admitted(progress));
-            tick.admitted.push(progress);
         }
         Ok(())
     }
@@ -848,12 +825,12 @@ fn prefill_rows_before_retained_prefix(
 }
 
 impl EngineService for Nemotron3ChatService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = Nemotron3ChatService::add_request(self, request)?;
+    fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
+        let admission =
+            Nemotron3ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
         Ok(EngineAdmission {
-            request_id: id,
+            request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
         })
@@ -861,14 +838,14 @@ impl EngineService for Nemotron3ChatService<'_, '_> {
     fn tick(
         &mut self,
         on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
+    ) -> EngineResult<EngineTick> {
         let mut observer = |event: RequestLifecycleEvent<
             Nemotron3RequestId,
             Nemotron3AdmissionProgress,
         >| match event {
             RequestLifecycleEvent::Admitted(progress) => {
                 on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     sequence_device_bytes: progress.sequence_device_bytes,
                     cached_prompt_tokens: progress.cached_prompt_tokens,
                     allocation_duration: Duration::ZERO,
@@ -876,32 +853,33 @@ impl EngineService for Nemotron3ChatService<'_, '_> {
                     admitted_after_tick_start: progress.admitted_after_tick_start,
                 }))
             }
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
-            }
+            RequestLifecycleEvent::PrefillStarted(id) => on_lifecycle(
+                EngineLifecycleEvent::PrefillStarted(EngineRequestId::new(id.get())),
+            ),
         };
-        let tick = Nemotron3ChatService::tick_with_lifecycle(self, &mut observer)?;
+        let tick = Nemotron3ChatService::tick_with_lifecycle(self, &mut observer)
+            .map_err(EngineError::new)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
                 .into_iter()
                 .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
+                    request_id: EngineRequestId::new(progress.request_id.get()),
                     prompt_position: progress.prompt_position,
                 })
                 .collect(),
             generated: tick
                 .generated
                 .into_iter()
-                .map(Nemotron3RequestId::get)
+                .map(|id| EngineRequestId::new(id.get()))
                 .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
+            verification: Vec::new(),
+            draft_progress: Vec::new(),
             output: tick
                 .output
                 .into_iter()
                 .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
+                    request_id: EngineRequestId::new(delta.request_id.get()),
                     event: delta.event,
                 })
                 .collect(),
@@ -909,18 +887,17 @@ impl EngineService for Nemotron3ChatService<'_, '_> {
                 .finished
                 .into_iter()
                 .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
+                    request_id: EngineRequestId::new(finished.request_id.get()),
                     finish_reason: finished.finish_reason,
                     usage: finished.usage,
                     released_sequence_device_bytes: finished.released_sequence_device_bytes,
                 })
                 .collect(),
-            active_sequences: tick.active_sequences,
         };
         Ok(converted)
     }
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        match Nemotron3ChatService::cancel_request(self, Nemotron3RequestId(id)) {
+    fn cancel_request(&mut self, id: EngineRequestId) -> EngineCancelOutcome {
+        match Nemotron3ChatService::cancel_request(self, Nemotron3RequestId(id.get())) {
             Nemotron3CancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
