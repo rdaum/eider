@@ -1,8 +1,7 @@
 //! Device-side expert usage accounting for optional higher-precision hotsets.
 
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, clear_expert_counts_u64_on_stream,
-    record_expert_indices_prefix_u64_on_stream, record_expert_indices_u64_on_stream,
+    CudaStream, DeviceBuffer, Error, Result, record_expert_indices_prefix_u64_on_stream,
 };
 
 /// Cumulative device-resident routed-expert usage counts.
@@ -29,15 +28,6 @@ impl ExpertUsageTracker {
         })
     }
 
-    /// Enqueues one increment for each routed expert ID.
-    pub fn record(
-        &mut self,
-        expert_indices: &DeviceBuffer<u32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        record_expert_indices_u64_on_stream(expert_indices, self.counts.inout(), stream)
-    }
-
     /// Enqueues one increment for a prefix of a reusable route buffer.
     pub fn record_prefix(
         &mut self,
@@ -51,11 +41,6 @@ impl ExpertUsageTracker {
     /// Copies cumulative counts to the host after prior stream work completes.
     pub fn snapshot(&self, stream: &CudaStream) -> Result<Vec<u64>> {
         Ok(self.counts.copy_to_host(stream)?.into_vec())
-    }
-
-    /// Asynchronously resets every count on `stream`.
-    pub fn clear(&mut self, stream: &CudaStream) -> Result<()> {
-        clear_expert_counts_u64_on_stream(self.counts.output(), stream)
     }
 
     /// Device bytes retained by the counter table.
