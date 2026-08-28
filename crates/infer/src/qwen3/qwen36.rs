@@ -48,13 +48,14 @@ use eider_cuda::{
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
-    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
-    qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_into_on_stream,
-    qwen36_gdn_gate_into_on_stream, qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
+    qwen36_ffn_finalize_routed_addresses_f32_into_on_stream,
+    qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_into_on_stream,
+    qwen36_gdn_prep_into_on_stream, rms_norm_f32_into_on_stream,
     rope_imrope_f32_indexed_into_on_stream, rope_imrope_f32_into_on_stream,
     rope_neox_partial_f32_indexed_into_on_stream, rope_neox_partial_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
@@ -3147,7 +3148,6 @@ struct Sm12xGateUpWorkspace {
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
     _outputs: Vec<F32Matrix>,
-    c: DeviceBuffer<*const f32>,
     d: DeviceBuffer<*mut f32>,
     indexed_d: DeviceBuffer<DeviceAddress<f32>>,
     groups: usize,
@@ -3168,12 +3168,10 @@ impl Sm12xGateUpWorkspace {
             });
         }
         let mut outputs = Vec::with_capacity(groups);
-        let mut c_ptrs = Vec::with_capacity(groups);
         let mut d_ptrs = Vec::with_capacity(groups);
         let mut indexed_d = Vec::with_capacity(groups);
         for _ in 0..groups {
             let mut output = F32Matrix::zeroed(out_features, 1)?;
-            c_ptrs.push(output.data_ptr());
             d_ptrs.push(output.data_mut_ptr());
             indexed_d.push(output.data_address());
             outputs.push(output);
@@ -3182,7 +3180,6 @@ impl Sm12xGateUpWorkspace {
             b_tiles: DeviceBuffer::zeroed(b_groups * (in_features / 64) * 512)?,
             b_scales: DeviceBuffer::zeroed(b_groups * (in_features / 64))?,
             _outputs: outputs,
-            c: DeviceBuffer::from_host(&c_ptrs)?,
             d: DeviceBuffer::from_host(&d_ptrs)?,
             indexed_d: DeviceBuffer::from_host(&indexed_d)?,
             groups,
@@ -3197,7 +3194,6 @@ impl Sm12xGateUpWorkspace {
                 .iter()
                 .map(F32Matrix::device_bytes)
                 .sum::<usize>()
-            + self.c.device_bytes()
             + self.d.device_bytes()
     }
 }
@@ -3499,10 +3495,10 @@ impl Qwen36ExpertPager {
             stream,
         )?;
         fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             slot_indices,
             &workspace.route.weights,
-            &workspace.sm12x_down.c,
+            &workspace.sm12x_down.indexed_d,
             &self.down_alphas,
             workspace.moe_out.inout(),
             stream,
@@ -4234,10 +4230,10 @@ impl Qwen36MoeWeights {
                 workspace.sm12x_down.groups,
                 stream,
             )?;
-            return moe_weighted_accumulate_slots_f32_on_stream(
+            return moe_weighted_accumulate_slot_addresses_f32_on_stream(
                 &workspace.route.indices,
                 &workspace.route.weights,
-                &workspace.sm12x_down.c,
+                &workspace.sm12x_down.indexed_d,
                 &self.expert_ptrs.down_alphas,
                 workspace.moe_out.inout(),
                 stream,
@@ -4436,18 +4432,20 @@ impl Qwen36MoeWeights {
                 detail: "grouped down workspace is unavailable".to_string(),
             })?;
         let enable_sm12x = self.storage_plan.down == Qwen36DownStorage::Sm12x;
-        let inputs = if enable_sm12x
-            && self.sm12x_down_tiles.is_some()
-            && self.sm12x_down_scales.is_some()
-        {
-            &workspace.sm12x_down.c
-        } else {
-            &grouped_down.gemv.c
-        };
+        if enable_sm12x && self.sm12x_down_tiles.is_some() && self.sm12x_down_scales.is_some() {
+            return moe_weighted_accumulate_slot_addresses_f32_on_stream(
+                &workspace.route.indices,
+                &workspace.route.weights,
+                &workspace.sm12x_down.indexed_d,
+                &self.expert_ptrs.down_alphas,
+                workspace.moe_out.inout(),
+                stream,
+            );
+        }
         moe_weighted_accumulate_slots_f32_on_stream(
             &workspace.route.indices,
             &workspace.route.weights,
-            inputs,
+            &grouped_down.gemv.c,
             &self.expert_ptrs.down_alphas,
             workspace.moe_out.inout(),
             stream,
@@ -4592,10 +4590,10 @@ impl Qwen36MoeWeights {
         residual: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<()> {
-        qwen36_ffn_finalize_routed_f32_into_on_stream(
+        qwen36_ffn_finalize_routed_addresses_f32_into_on_stream(
             &workspace.route.indices,
             &workspace.route.weights,
-            &workspace.sm12x_down.c,
+            &workspace.sm12x_down.indexed_d,
             &self.expert_ptrs.down_alphas,
             &workspace.shared_gate_logits,
             &workspace.shared_output,
@@ -4981,10 +4979,10 @@ impl Qwen36MoeWeights {
                 })?;
                 profile.qwen36_routed_down_gemv_ms += gemv_ms;
                 let (_, accum_ms) = timed_cuda(stream, || {
-                    moe_weighted_accumulate_slots_f32_on_stream(
+                    moe_weighted_accumulate_slot_addresses_f32_on_stream(
                         &workspace.route.indices,
                         &workspace.route.weights,
-                        &sm12x_down.c,
+                        &sm12x_down.indexed_d,
                         &self.expert_ptrs.down_alphas,
                         workspace.moe_out.inout(),
                         stream,
@@ -5005,10 +5003,10 @@ impl Qwen36MoeWeights {
                     self.experts_per_token,
                     stream,
                 )?;
-                moe_weighted_accumulate_slots_f32_on_stream(
+                moe_weighted_accumulate_slot_addresses_f32_on_stream(
                     &workspace.route.indices,
                     &workspace.route.weights,
-                    &sm12x_down.c,
+                    &sm12x_down.indexed_d,
                     &self.expert_ptrs.down_alphas,
                     workspace.moe_out.inout(),
                     stream,
@@ -5387,10 +5385,10 @@ impl Qwen36MoeWeights {
         if let Some(profile) = profile.as_deref_mut() {
             let (_, ms) = timed_cuda(stream, || {
                 if use_device_route && use_sm12x_down && !used_pager {
-                    qwen36_ffn_finalize_routed_f32_into_on_stream(
+                    qwen36_ffn_finalize_routed_addresses_f32_into_on_stream(
                         &workspace.route.indices,
                         &workspace.route.weights,
-                        &workspace.sm12x_down.c,
+                        &workspace.sm12x_down.indexed_d,
                         &self.expert_ptrs.down_alphas,
                         &workspace.shared_gate_logits,
                         &workspace.shared_output,
@@ -5411,10 +5409,10 @@ impl Qwen36MoeWeights {
             })?;
             profile.qwen36_ffn_combine_ms += ms;
         } else if use_device_route && use_sm12x_down && !used_pager {
-            qwen36_ffn_finalize_routed_f32_into_on_stream(
+            qwen36_ffn_finalize_routed_addresses_f32_into_on_stream(
                 &workspace.route.indices,
                 &workspace.route.weights,
-                &workspace.sm12x_down.c,
+                &workspace.sm12x_down.indexed_d,
                 &self.expert_ptrs.down_alphas,
                 &workspace.shared_gate_logits,
                 &workspace.shared_output,

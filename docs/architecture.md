@@ -108,8 +108,10 @@ Ling 3's routed W4A16 workspace uses typed input, expert, output, and
 weighted-accumulation tables for both one-token decode and batched execution.
 Nemotron 3 uses the same typed routed W4A16 tables for resident expert slabs,
 one-token decode, and flattened multi-row execution.
-Qwen3.6's remaining legacy raw table is built by a checked CUDA adapter rather
-than by inference-side pointer arithmetic.
+Qwen3.6's SM12x routed-down output table now uses typed addresses for both
+weighted accumulation and fused FFN finalization. Legacy raw tables remain in
+its older cuBLAS/CUTLASS plans; the W4A16 gate/up compatibility table is built
+by a checked CUDA adapter rather than inference-side pointer arithmetic.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both

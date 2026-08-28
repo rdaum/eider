@@ -159,6 +159,7 @@ pub use kernels::non_gemm::{
     quantize_nvfp4_simple_scales_f32_into_on_stream,
     quantize_nvfp4_vector_simple_scales_f32_into_on_stream,
     qwen36_ffn_finalize_batch_f32_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
+    qwen36_ffn_finalize_routed_addresses_f32_into_on_stream,
     qwen36_ffn_finalize_routed_batch_f32_into_on_stream,
     qwen36_ffn_finalize_routed_f32_into_on_stream, qwen36_full_attn_prep_f32_batch_into_on_stream,
     qwen36_full_attn_prep_f32_into_on_stream, qwen36_gdn_gate_batch_bf16_into_on_stream,
