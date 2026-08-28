@@ -2,7 +2,7 @@
 
 //! Iterative Qwen3 decode path over the full NVFP4 checkpoint.
 
-use crate::kv_cache::KvCache;
+use crate::execution::kv_cache::KvCache;
 use eider_cuda::{
     ArgmaxResult, CublasLt, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemvF32Plan,
     DeviceAddress, DeviceBuffer, Error, F32Matrix, Fp4TnMatmulPlan, GemmShape,

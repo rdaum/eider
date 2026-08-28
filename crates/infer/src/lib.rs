@@ -18,11 +18,10 @@ pub use error::{InferenceError, InferenceResult};
 mod paged_prefill_attention;
 
 /// Physical SM12x KV-page storage shared by inference model state.
-pub mod sm12x_cache;
+pub(crate) mod sm12x_cache;
 
 /// Model-owned execution support and device-resident KV cache storage.
 pub mod execution;
-pub use execution::kv_cache;
 
 /// BitNet b1.58 ternary text-model loading and inference.
 pub mod bitnet;
