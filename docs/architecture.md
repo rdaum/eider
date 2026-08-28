@@ -18,6 +18,9 @@ every return path. The scheduler keeps request policy and queues.
 Gemma 4 follows the same ownership rule: its chat service keeps scheduling and
 output state, while the Gemma module retains live CUDA sequences behind opaque
 identities and temporary batch leases.
+Step-3.7 also retains its paged sequence and GPU sampling state behind opaque
+identities in its model module. Its scheduler leases that state only for the
+prefill, decode, and prefix-retention operations that use it.
 `eider-format` now owns GGUF indexing, GGML K-quant decoding, the
 sharded safetensors index/cache, the versioned host-only NVFP4 artifact codec,
 and ModelOpt checkpoint records and host layouts. `eider-cuda` owns the

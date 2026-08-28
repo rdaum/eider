@@ -32,8 +32,10 @@ use std::time::Instant;
 use tracing::info;
 
 mod batch;
+mod execution;
 mod sequence;
 pub use batch::{Step37PrefillBatchWorkspace, Step37PrefillRow};
+pub(crate) use execution::{Step37SequenceId, Step37SequencePool};
 pub(crate) use sequence::{Step37Append, step37_cache_error};
 pub use sequence::{Step37Sequence, Step37SequenceCache, new_step37_sequence_cache};
 

@@ -2,7 +2,8 @@
 
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::step37::{
-    HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
+    HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37SequenceId,
+    Step37SequencePool, Step37TextModel,
 };
 use crate::step37::{Step37Sequence, Step37SequenceCache, step37_cache_error};
 use eider_cuda::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
@@ -106,8 +107,7 @@ struct Step37Request {
     prompt_position: usize,
     prefix_target: usize,
     prefix_retained: bool,
-    sequence: Option<Box<Step37Sequence>>,
-    device_token_counts: Option<DeviceBuffer<u32>>,
+    sequence_id: Option<Step37SequenceId>,
     sequence_device_bytes: usize,
     sampler: Sampler,
     history: TokenHistory,
@@ -182,6 +182,7 @@ pub struct Step37Scheduler {
     next_id: u64,
     sequence_cache: Step37SequenceCache,
     cache_stream: CudaStream,
+    sequences: Step37SequencePool,
 }
 
 impl Step37Scheduler {
@@ -320,6 +321,7 @@ impl Step37Scheduler {
             next_id: 0,
             sequence_cache,
             cache_stream: CudaStream::new_blocking()?,
+            sequences: Step37SequencePool::new(),
         })
     }
 
@@ -385,8 +387,7 @@ impl Step37Scheduler {
                 prompt_position: 0,
                 prefix_target,
                 prefix_retained: false,
-                sequence: None,
-                device_token_counts: None,
+                sequence_id: None,
                 sequence_device_bytes: 0,
                 sampler,
                 history,
@@ -490,12 +491,10 @@ impl Step37Scheduler {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence_device_bytes = sequence.device_bytes()
-                + device_token_counts
-                    .as_ref()
-                    .map_or(0, DeviceBuffer::device_bytes);
-            request.sequence = Some(Box::new(sequence));
-            request.device_token_counts = device_token_counts;
+            let (sequence_id, sequence_device_bytes) =
+                self.sequences.insert(sequence, device_token_counts)?;
+            request.sequence_device_bytes = sequence_device_bytes;
+            request.sequence_id = Some(sequence_id);
             request.lifecycle = RequestState::Prefilling;
             self.prefilling.push_back(id);
             let progress = Step37AdmissionProgress {
@@ -563,12 +562,14 @@ impl Step37Scheduler {
             let token = request.apply_sample(sample);
             tick.generated.push(token);
             if request.lifecycle == RequestState::Finished {
-                let sequence = request
-                    .sequence
+                let sequence_id = request
+                    .sequence_id
                     .take()
-                    .expect("finished admitted request has a sequence");
-                (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)?;
-                request.device_token_counts.take();
+                    .expect("finished admitted request has a sequence ID");
+                let sequence = self.sequences.release(sequence_id)?;
+                sequence
+                    .sequence
+                    .finish(&mut self.sequence_cache, &self.cache_stream)?;
                 tick.finished.push(request.id);
             } else {
                 self.decoding.push_back(request.id);
@@ -580,16 +581,15 @@ impl Step37Scheduler {
 
     fn execute_decode(&mut self, request: &mut Step37Request) -> Result<SampledToken> {
         let token = request.decode_input_token()?;
-        let state = request
-            .sequence
-            .as_deref_mut()
-            .ok_or_else(|| Error::Format {
-                label: "Step-3.7 scheduled decode",
-                detail: format!(
-                    "request {} has no admitted sequence state",
-                    request.id.get()
-                ),
-            })?;
+        let sequence_id = request.sequence_id.ok_or_else(|| Error::Format {
+            label: "Step-3.7 scheduled decode",
+            detail: format!(
+                "request {} has no admitted sequence state",
+                request.id.get()
+            ),
+        })?;
+        let mut sequences = self.sequences.lease_many(&[sequence_id])?;
+        let state = sequences.entry_mut(0);
         if request
             .sampler
             .config()
@@ -608,11 +608,14 @@ impl Step37Scheduler {
                 presence_penalty: config.presence_penalty,
                 frequency_penalty: config.frequency_penalty,
                 draw,
-                token_counts: request.device_token_counts.as_mut(),
+                token_counts: state.device_token_counts.as_mut(),
             };
-            let sampled =
-                self.model
-                    .sample_one(state, token, &mut row, &mut self.sequence_cache)?;
+            let sampled = self.model.sample_one(
+                &mut state.sequence,
+                token,
+                &mut row,
+                &mut self.sequence_cache,
+            )?;
             return Ok(SampledToken {
                 id: sampled.id,
                 logit: sampled.logit,
@@ -621,7 +624,7 @@ impl Step37Scheduler {
         }
         let logits = self
             .model
-            .logits_one(state, token, &mut self.sequence_cache)?;
+            .logits_one(&mut state.sequence, token, &mut self.sequence_cache)?;
         Ok(request.sampler.sample(&logits, &request.history)?)
     }
 
@@ -633,9 +636,17 @@ impl Step37Scheduler {
             request.prefix_retained = true;
             return;
         }
-        let Some(sequence) = request.sequence.as_deref_mut() else {
+        let Some(sequence_id) = request.sequence_id else {
             return;
         };
+        let Ok(mut sequences) = self.sequences.lease_many(&[sequence_id]) else {
+            warn!(
+                request = request.id.get(),
+                "missing sequence while retaining Step prompt prefix"
+            );
+            return;
+        };
+        let sequence = &mut sequences.entry_mut(0).sequence;
         if sequence.position() != request.prefix_target {
             return;
         }
@@ -712,6 +723,16 @@ impl Step37Scheduler {
         if selected.is_empty() {
             return Ok(());
         }
+        let sequence_ids = selected
+            .iter()
+            .map(|(id, _)| {
+                self.requests[id].sequence_id.ok_or_else(|| Error::Format {
+                    label: "Step-3.7 scheduled prefill",
+                    detail: format!("request {} has no admitted sequence", id.get()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut sequences = self.sequences.lease_many(&sequence_ids)?;
         let mut requests = selected
             .iter()
             .map(|(id, _)| {
@@ -724,16 +745,14 @@ impl Step37Scheduler {
         let result = {
             let mut rows = requests
                 .iter_mut()
+                .zip(sequences.entries_mut())
                 .zip(selected.iter().map(|(_, chunk)| *chunk))
-                .map(|(request, chunk)| {
+                .map(|((request, sequence), chunk)| {
                     let start = request.prompt_position;
                     let end = start + chunk;
                     Step37PrefillRow {
                         token_ids: &request.prompt_tokens[start..end],
-                        sequence: request
-                            .sequence
-                            .as_deref_mut()
-                            .expect("prefilling request has admitted sequence"),
+                        sequence: &mut sequence.sequence,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -746,6 +765,7 @@ impl Step37Scheduler {
                 &mut self.sequence_cache,
             )
         };
+        drop(sequences);
         if let Err(error) = result {
             for request in requests.into_iter().rev() {
                 self.prefilling.push_front(request.id);
@@ -781,10 +801,20 @@ impl Step37Scheduler {
             .requests
             .remove(&id)
             .expect("cancellation target retained");
-        if let Some(sequence) = request.sequence.take()
-            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.cache_stream)
-        {
-            warn!(request = id.get(), %error, "failed to release cancelled Step sequence state");
+        if let Some(sequence_id) = request.sequence_id.take() {
+            match self.sequences.release(sequence_id) {
+                Ok(sequence) => {
+                    if let Err(error) = sequence
+                        .sequence
+                        .finish(&mut self.sequence_cache, &self.cache_stream)
+                    {
+                        warn!(request = id.get(), %error, "failed to release cancelled Step sequence state");
+                    }
+                }
+                Err(error) => {
+                    warn!(request = id.get(), %error, "missing cancelled Step sequence state")
+                }
+            }
         }
         Step37CancelOutcome::Cancelled(Step37CancelledRequest {
             id,
@@ -795,7 +825,7 @@ impl Step37Scheduler {
     }
 
     pub fn active_sequence_count(&self) -> usize {
-        self.prefilling.len() + self.decoding.len()
+        self.sequences.len()
     }
 
     pub fn request_state(&self, id: Step37RequestId) -> Option<RequestState> {
