@@ -11,9 +11,7 @@ use eider_inference::execution::deepseek4_serving::{
     Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
     Deepseek4SpeculativeProgress,
 };
-use eider_inference::execution::gemma4_serving::{
-    Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
-};
+use eider_inference::execution::gemma4_serving::{Gemma4ChatService, Gemma4EngineService};
 use eider_inference::execution::laguna_serving::{LagunaChatService, LagunaEngineService};
 use eider_inference::execution::ling3_serving::{Ling3ChatService, Ling3EngineService};
 use eider_inference::execution::muse_glimmer_serving::{
@@ -658,7 +656,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = GemmaActorService::new(service);
+            let mut service = Gemma4EngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Laguna => {
@@ -869,17 +867,6 @@ fn nemotron_admission_progress(progress: Nemotron3AdmissionProgress) -> EngineAd
         cached_prompt_tokens: progress.cached_prompt_tokens,
         allocation_duration: Duration::ZERO,
         checkpoint_copy_duration: Duration::ZERO,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-fn gemma_admission_progress(progress: Gemma4AdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: progress.allocation_duration,
-        checkpoint_copy_duration: progress.checkpoint_copy_duration,
         admitted_after_tick_start: progress.admitted_after_tick_start,
     }
 }
@@ -1348,115 +1335,6 @@ impl EngineService for NemotronActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             Nemotron3CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
-    }
-}
-
-struct GemmaActorService<'model, 'template> {
-    inner: Gemma4ChatService<'model, 'template>,
-    ids: BTreeMap<u64, Gemma4RequestId>,
-}
-
-impl<'model, 'template> GemmaActorService<'model, 'template> {
-    fn new(inner: Gemma4ChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for GemmaActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer =
-            |event: RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>| match event {
-                RequestLifecycleEvent::Admitted(progress) => {
-                    on_lifecycle(EngineLifecycleEvent::Admitted(gemma_admission_progress(
-                        progress,
-                    )));
-                }
-                RequestLifecycleEvent::PrefillStarted(id) => {
-                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-                }
-            };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(Gemma4RequestId::get)
-                .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            Gemma4CancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            } => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            },
-            Gemma4CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 

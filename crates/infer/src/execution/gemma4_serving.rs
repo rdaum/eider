@@ -9,10 +9,15 @@ use crate::gemma4::{
 };
 use crate::metrics::{duration_us, metrics};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
+use crate::{InferenceError, InferenceResult};
 use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::engine::{
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
+    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+};
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
 use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
@@ -723,6 +728,122 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
 fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retained: bool) -> bool {
     !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
+}
+
+/// Model-specific identity translation for the shared engine contract.
+pub struct Gemma4EngineService<'model, 'template> {
+    inner: Gemma4ChatService<'model, 'template>,
+    ids: BTreeMap<u64, Gemma4RequestId>,
+}
+
+impl<'model, 'template> Gemma4EngineService<'model, 'template> {
+    /// Wraps a Gemma 4 chat service for consumption by an engine actor.
+    pub fn new(inner: Gemma4ChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl EngineService for Gemma4EngineService<'_, '_> {
+    type Error = InferenceError;
+    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> InferenceResult<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
+                        request_id: progress.request_id.get(),
+                        sequence_device_bytes: progress.sequence_device_bytes,
+                        cached_prompt_tokens: progress.cached_prompt_tokens,
+                        allocation_duration: progress.allocation_duration,
+                        checkpoint_copy_duration: progress.checkpoint_copy_duration,
+                        admitted_after_tick_start: progress.admitted_after_tick_start,
+                    }))
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(Gemma4RequestId::get)
+                .collect(),
+            speculative: Vec::new(),
+            dflash: Vec::new(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            Gemma4CancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            Gemma4CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
+    }
 }
 
 struct ResponseFilter {
