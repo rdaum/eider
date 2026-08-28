@@ -9,11 +9,12 @@ use super::{
 };
 use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace, argmax_f32_into_on_stream,
-    copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, gather_group_row_f32_into_on_stream,
-    prepend_u32_rows_into_on_stream, rms_norm_f32_into_on_stream,
-    select_bf16_state_snapshot_into_on_stream, speculative_accept_argmax_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace,
+    argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    gather_group_row_f32_into_on_stream, prepend_u32_rows_into_on_stream,
+    rms_norm_f32_into_on_stream, select_bf16_state_snapshot_into_on_stream,
+    speculative_accept_argmax_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use std::path::Path;
@@ -913,7 +914,7 @@ impl Nemotron3Model {
         workspace.page_table_table.copy_from_host(
             &page_tables
                 .iter()
-                .map(|table| table.as_const_ptr().cast::<u32>())
+                .map(|table| table.cuda_address())
                 .collect::<Vec<_>>(),
         )?;
 
@@ -2089,7 +2090,7 @@ pub struct Nemotron3BlockWorkspace {
     start_positions: DeviceBuffer<u32>,
     conv_state_table: DeviceBuffer<*mut u16>,
     ssm_state_table: DeviceBuffer<*mut u16>,
-    page_table_table: DeviceBuffer<*const u32>,
+    page_table_table: DeviceBuffer<DeviceAddress<u32>>,
     compact_attention: Option<Sm12xKvAttentionWorkspace>,
     previous_logits_table: DeviceBuffer<*const f32>,
     accepted_counts: DeviceBuffer<u32>,

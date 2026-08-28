@@ -3,8 +3,8 @@ use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use crate::runtime::kv_cache::LayerKvCache;
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace, Sm12xKvCache,
-    add_f32_into_on_stream, append_ragged_kv_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace,
+    Sm12xKvCache, add_f32_into_on_stream, append_ragged_kv_f32_into_on_stream,
     append_ragged_paged_kv_f32_into_on_stream, ragged_gqa_attention_f32_into_on_stream,
     ragged_paged_gqa_attention_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
@@ -314,7 +314,7 @@ impl Nemotron3AttentionLayer {
             super::Nemotron3KvCacheStorage::F32 => {
                 workspace
                     .page_tables
-                    .copy_from_host(&[page_table.as_const_ptr().cast::<u32>()])?;
+                    .copy_from_host(&[page_table.cuda_address()])?;
                 workspace
                     .start_positions
                     .copy_from_host(&[position as u32])?;
@@ -483,7 +483,7 @@ impl Nemotron3AttentionLayer {
         workspace: &mut Nemotron3AttentionRowsWorkspace,
         backend: &mut Nemotron3PageBackend,
         reservations: AppendReservations<'_, super::Nemotron3Page>,
-        page_tables: &DeviceBuffer<*const u32>,
+        page_tables: &DeviceBuffer<DeviceAddress<u32>>,
         page_table_devices: &[&DeviceBuffer<u32>],
         sequence_offsets: &DeviceBuffer<u32>,
         sequence_lengths: &DeviceBuffer<u32>,
@@ -716,7 +716,7 @@ pub struct Nemotron3AttentionWorkspace {
     attended: DeviceBuffer<f32>,
     projected_output: DeviceBuffer<f32>,
     pub(super) output: DeviceBuffer<f32>,
-    page_tables: DeviceBuffer<*const u32>,
+    page_tables: DeviceBuffer<DeviceAddress<u32>>,
     sequence_offsets: DeviceBuffer<u32>,
     sequence_lengths: DeviceBuffer<u32>,
     start_positions: DeviceBuffer<u32>,

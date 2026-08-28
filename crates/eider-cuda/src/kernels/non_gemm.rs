@@ -6661,7 +6661,7 @@ pub fn append_ragged_paged_kv_f32_into_on_stream(
     value: &DeviceBuffer<f32>,
     key_pool: &mut DeviceBuffer<f32>,
     value_pool: &mut DeviceBuffer<f32>,
-    page_tables: &DeviceBuffer<*const u32>,
+    page_tables: &DeviceBuffer<DeviceAddress<u32>>,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
     start_positions: &DeviceBuffer<u32>,
@@ -6717,7 +6717,7 @@ pub fn append_ragged_paged_kv_f32_into_on_stream(
                 value.ptr,
                 key_pool.ptr,
                 value_pool.ptr,
-                page_tables.ptr,
+                page_tables.as_const_ptr().cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 start_positions.ptr,
@@ -6737,7 +6737,7 @@ pub fn ragged_paged_gqa_attention_f32_into_on_stream(
     query: &DeviceBuffer<f32>,
     key_pool: &DeviceBuffer<f32>,
     value_pool: &DeviceBuffer<f32>,
-    page_tables: &DeviceBuffer<*const u32>,
+    page_tables: &DeviceBuffer<DeviceAddress<u32>>,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
     start_positions: &DeviceBuffer<u32>,
@@ -6802,7 +6802,7 @@ pub fn ragged_paged_gqa_attention_f32_into_on_stream(
                 query.ptr,
                 key_pool.ptr,
                 value_pool.ptr,
-                page_tables.ptr,
+                page_tables.as_const_ptr().cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 start_positions.ptr,
@@ -17968,7 +17968,7 @@ mod tests {
         let page_table_ptrs = DeviceBuffer::from_host(
             &page_tables
                 .iter()
-                .map(|table| table.as_const_ptr().cast::<u32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("page table pointers");
