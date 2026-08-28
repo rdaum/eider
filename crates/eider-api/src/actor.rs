@@ -29,7 +29,9 @@ use eider_inference::nemotron3::Nemotron3Model;
 use eider_inference::qwen3::qwen36::Qwen36TextModel;
 use eider_inference::qwen38_flash_next::Qwen38FlashNextModel;
 use eider_inference::step37::Step37TextModel;
-use eider_inference::{InferenceEngineConfig, InferenceError};
+use eider_inference::{
+    CheckpointArchitecture, InferenceEngineConfig, InferenceError, checkpoint_architecture,
+};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::engine::{
     EngineCancelOutcome, EngineDraftStats, EngineFinished, EngineLifecycleEvent, EngineService,
@@ -38,7 +40,6 @@ use eider_runtime::engine::{
 use eider_runtime::generation::GenerationConfig;
 use eider_runtime::request::{ChatFinishReason, ChatRequest};
 use eider_runtime::scheduler::SchedulerConfig;
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -240,7 +241,7 @@ fn actor_main(
     let architecture = match checkpoint_architecture(&model_dir) {
         Ok(architecture) => architecture,
         Err(error) => {
-            let _ = ready.send(Err(error));
+            let _ = ready.send(Err(error.to_string()));
             return;
         }
     };
@@ -689,52 +690,6 @@ fn actor_main(
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CheckpointArchitecture {
-    BitNet,
-    Ling3,
-    MuseGlimmer,
-    Bonsai,
-    Qwen36,
-    Qwen38FlashNext,
-    Step37,
-    Nemotron3,
-    Gemma4,
-    Laguna,
-    Deepseek4,
-}
-
-#[derive(Deserialize)]
-struct CheckpointConfig {
-    model_type: String,
-}
-
-fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArchitecture, String> {
-    let path = model_dir.join("config.json");
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let config: CheckpointConfig = serde_json::from_str(&contents)
-        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-    match config.model_type.as_str() {
-        "bitnet" => Ok(CheckpointArchitecture::BitNet),
-        "bailing_hybrid" => Ok(CheckpointArchitecture::Ling3),
-        "muse_glimmer" => Ok(CheckpointArchitecture::MuseGlimmer),
-        "bonsai" => Ok(CheckpointArchitecture::Bonsai),
-        "qwen3_5" | "qwen3_5_moe" => Ok(CheckpointArchitecture::Qwen36),
-        "qwen3_8_flash_next" => Ok(CheckpointArchitecture::Qwen38FlashNext),
-        "step3p7" => Ok(CheckpointArchitecture::Step37),
-        "nemotron_h" | "nemotron_h_puzzle" => Ok(CheckpointArchitecture::Nemotron3),
-        "gemma4" => Ok(CheckpointArchitecture::Gemma4),
-        "laguna" => Ok(CheckpointArchitecture::Laguna),
-        "deepseek_v4" => Ok(CheckpointArchitecture::Deepseek4),
-        other => Err(format!(
-            "unsupported model_type {other:?} in {}",
-            path.display()
-        )),
-    }
-}
-
 fn bonsai_gguf_path(model_dir: &std::path::Path) -> PathBuf {
     model_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf")
 }

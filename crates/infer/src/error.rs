@@ -6,6 +6,8 @@ pub type InferenceResult<T> = std::result::Result<T, InferenceError>;
 /// Failure reported by an inference engine to its caller.
 #[derive(Debug)]
 pub enum InferenceError {
+    /// A deployment checkpoint could not be selected or read.
+    Deployment(String),
     /// A CUDA operation or device-side validation failed during inference.
     Cuda(eider_cuda::Error),
     /// A checkpoint or derived host artifact was malformed.
@@ -15,6 +17,7 @@ pub enum InferenceError {
 impl std::fmt::Display for InferenceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Deployment(detail) => formatter.write_str(detail),
             Self::Cuda(error) => error.fmt(formatter),
             Self::Format(error) => error.fmt(formatter),
         }
@@ -24,6 +27,7 @@ impl std::fmt::Display for InferenceError {
 impl std::error::Error for InferenceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Deployment(_) => None,
             Self::Cuda(error) => Some(error),
             Self::Format(error) => Some(error),
         }

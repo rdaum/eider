@@ -18,6 +18,9 @@ pub use error::{InferenceError, InferenceResult};
 mod engine_config;
 pub use engine_config::InferenceEngineConfig;
 
+mod deployment;
+pub use deployment::{CheckpointArchitecture, checkpoint_architecture};
+
 mod paged_prefill_attention;
 
 /// Physical SM12x KV-page storage shared by inference model state.
