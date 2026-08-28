@@ -141,12 +141,14 @@ layer.
 
 ```text
 eider-api
-    |
-eider-runtime
-    |
-eider-inference
-   /              \\
-eider-cuda      eider-format
+├── eider-inference
+│   ├── eider-cuda
+│   │   └── eider-format
+│   ├── eider-format
+│   └── eider-runtime
+│       └── eider-format
+└── eider-runtime
+    └── eider-format
 ```
 
 `seqcache` remains a neutral dependency. It can serve both runtime and
