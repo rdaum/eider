@@ -1,6 +1,6 @@
 # Native CUDA Layer
 
-This directory contains the native implementation behind the `nvfp4` Rust
+This directory contains the native implementation behind the `eider-cuda` Rust
 crate. The Rust API and `ffi.rs` own shape validation, buffer ownership, and
 stream arguments; these files own CUDA kernels and the small `extern "C"`
 entrypoints called by those wrappers.
