@@ -5,10 +5,14 @@
 //! path remains available only for explicit quality experiments.
 
 mod config;
+mod execution;
 mod model;
 mod sequence;
 mod state;
 pub use config::{Deepseek4AttentionKind, Deepseek4ModelConfig};
+pub(crate) use execution::{
+    Deepseek4ExecutionSequence, Deepseek4SequenceId, Deepseek4SequencePool,
+};
 pub use model::{
     Deepseek4AttentionRow, Deepseek4AttentionWeights, Deepseek4AttentionWorkspace,
     Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4Bf16Linear, Deepseek4BlockFp8Linear,

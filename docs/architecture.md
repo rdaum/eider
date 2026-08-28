@@ -33,6 +33,8 @@ Nemotron 3 retains its hybrid attention and Mamba sequence state behind opaque
 identities, with a batch lease for its batched prefill and speculative decode.
 Flash Next retains each base sequence, native MTP state, speculative frontier,
 and GPU sampling buffer as one execution-owned record behind an opaque identity.
+DeepSeek V4 retains each target/MTP pair behind an opaque identity and leases
+the pairs together when it builds ordinary, prefill, or speculative batches.
 Muse Glimmer retains its sequence, including DFlash device state, behind an
 opaque identity and leases it for prefill, prefix retention, and decode.
 `eider-format` now owns GGUF indexing, GGML K-quant decoding, the

@@ -1,9 +1,10 @@
 //! Multi-session chat serving for DeepSeek V4.
 
 use crate::deepseek4::{
-    Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4CacheContext, Deepseek4LayerSequenceState,
-    Deepseek4MtpBatchRow, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4MtpWorkspace,
-    Deepseek4Sequence, Deepseek4SequenceCache, Deepseek4TextModel, deepseek4_cache_error,
+    Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4CacheContext, Deepseek4ExecutionSequence,
+    Deepseek4LayerSequenceState, Deepseek4MtpBatchRow, Deepseek4MtpSequence,
+    Deepseek4MtpSequenceCache, Deepseek4MtpWorkspace, Deepseek4Sequence, Deepseek4SequenceCache,
+    Deepseek4SequenceId, Deepseek4SequencePool, Deepseek4TextModel, deepseek4_cache_error,
     new_deepseek4_mtp_sequence_cache, new_deepseek4_sequence_cache,
 };
 use crate::sm12x_cache::Sm12xPageTable;
@@ -121,8 +122,7 @@ struct ActiveRequest<'tokenizer> {
     generated_tokens: usize,
     last_token: Option<u32>,
     pending_sample: Option<SampledToken>,
-    sequence: Option<Deepseek4Sequence>,
-    mtp_sequence: Option<Deepseek4MtpSequence>,
+    sequence_id: Option<Deepseek4SequenceId>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -137,7 +137,7 @@ pub struct Deepseek4ChatService<'template> {
     next_id: u64,
     waiting: VecDeque<Deepseek4RequestId>,
     requests: BTreeMap<Deepseek4RequestId, ActiveRequest<'template>>,
-    active_sequences: usize,
+    sequences: Deepseek4SequencePool,
     sequence_cache: Deepseek4SequenceCache,
     mtp_sequence_cache: Option<Deepseek4MtpSequenceCache>,
     retain_prefixes: bool,
@@ -217,7 +217,7 @@ impl<'template> Deepseek4ChatService<'template> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
-            active_sequences: 0,
+            sequences: Deepseek4SequencePool::new(),
             sequence_cache,
             mtp_sequence_cache,
             retain_prefixes: retained_bytes.is_some(),
@@ -287,8 +287,7 @@ impl<'template> Deepseek4ChatService<'template> {
                 generated_tokens: 0,
                 last_token: None,
                 pending_sample: None,
-                sequence: None,
-                mtp_sequence: None,
+                sequence_id: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -317,7 +316,7 @@ impl<'template> Deepseek4ChatService<'template> {
         path: impl AsRef<Path>,
         capacity_per_layer: usize,
     ) -> Result<usize> {
-        if self.active_sequences != 0 {
+        if self.sequences.len() != 0 {
             return Err(Error::Format {
                 label: "DeepSeek V4 hotset plan",
                 detail: "cannot snapshot routing while sequences are active".to_string(),
@@ -381,7 +380,7 @@ impl<'template> Deepseek4ChatService<'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.prompt_position >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -416,7 +415,7 @@ impl<'template> Deepseek4ChatService<'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -426,14 +425,14 @@ impl<'template> Deepseek4ChatService<'template> {
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
-            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.active_sequences;
+        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -443,34 +442,26 @@ impl<'template> Deepseek4ChatService<'template> {
         };
         self.waiting.retain(|&waiting| waiting != id);
         let released = request
-            .sequence
-            .as_ref()
-            .map_or(0, Deepseek4Sequence::device_bytes)
-            .saturating_add(
-                request
-                    .mtp_sequence
-                    .as_ref()
-                    .map_or(0, Deepseek4MtpSequence::device_bytes),
-            );
-        if let Some(sequence) = request.sequence {
-            if let Err(error) = sequence.finish(self.workspace.stream(), &mut self.sequence_cache) {
-                warn!(%error, request_id = id.get(), "failed to release cancelled DeepSeek V4 sequence");
-            }
-            self.active_sequences -= 1;
-        }
-        if let Some(sequence) = request.mtp_sequence
-            && let Some(cache) = self.mtp_sequence_cache.as_mut()
-            && let Err(error) = sequence.finish(self.workspace.stream(), cache)
-        {
-            warn!(%error, request_id = id.get(), "failed to release cancelled DeepSeek V4 MTP sequence");
-        }
+            .sequence_id
+            .and_then(|sequence_id| self.sequences.release(sequence_id).ok())
+            .map_or(0, |sequence| {
+                let bytes = sequence.device_bytes();
+                if let Err(error) = sequence.finish(
+                    self.workspace.stream(),
+                    &mut self.sequence_cache,
+                    self.mtp_sequence_cache.as_mut(),
+                ) {
+                    warn!(%error, request_id = id.get(), "failed to release cancelled DeepSeek V4 sequence");
+                }
+                bytes
+            });
         Deepseek4CancelOutcome::Cancelled {
             released_sequence_device_bytes: released,
         }
     }
 
     pub fn active_sequence_count(&self) -> usize {
-        self.active_sequences
+        self.sequences.len()
     }
 
     fn admit(
@@ -481,7 +472,7 @@ impl<'template> Deepseek4ChatService<'template> {
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.active_sequences < self.config.max_active_sequences {
+        while self.sequences.len() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
@@ -591,9 +582,10 @@ impl<'template> Deepseek4ChatService<'template> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence = Some(sequence);
-            request.mtp_sequence = mtp_sequence;
-            self.active_sequences += 1;
+            request.sequence_id = Some(
+                self.sequences
+                    .insert(Deepseek4ExecutionSequence::new(sequence, mtp_sequence))?,
+            );
             let progress = Deepseek4AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
@@ -652,35 +644,36 @@ impl<'template> Deepseek4ChatService<'template> {
                 .iter()
                 .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
                 .collect::<Vec<_>>();
-            let result = {
+            let sequence_ids = requests
+                .iter()
+                .map(|request| request.sequence_id.expect("prefill request is admitted"))
+                .collect::<Vec<_>>();
+            let result = (|| -> Result<()> {
                 for &(id, _) in &selected {
                     on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
                 }
+                let mut sequences = self.sequences.lease_many(&sequence_ids)?;
                 if let (Some(mtp_workspace), Some(mtp_cache)) = (
                     self.mtp_workspace.as_mut(),
                     self.mtp_sequence_cache.as_mut(),
                 ) {
                     let mut rows = Vec::with_capacity(requests.len());
                     let mut mtp_rows = Vec::with_capacity(requests.len());
-                    for (request, chunk) in requests
+                    for ((request, sequence), chunk) in requests
                         .iter_mut()
+                        .zip(sequences.sequences_mut())
                         .zip(selected.iter().map(|(_, chunk)| *chunk))
                     {
-                        let ActiveRequest {
-                            prompt,
-                            prompt_position,
-                            sequence,
-                            mtp_sequence,
-                            ..
-                        } = request;
-                        let tokens = &prompt[*prompt_position..*prompt_position + chunk];
+                        let tokens = &request.prompt
+                            [request.prompt_position..request.prompt_position + chunk];
                         rows.push(Deepseek4BatchRow {
                             token_ids: tokens,
-                            sequence: sequence.as_mut().expect("prefill request is admitted"),
+                            sequence: &mut sequence.sequence,
                         });
                         mtp_rows.push(Deepseek4MtpBatchRow {
                             token_ids: tokens,
-                            sequence: mtp_sequence
+                            sequence: sequence
+                                .mtp_sequence
                                 .as_mut()
                                 .expect("speculative request has an MTP sequence"),
                         });
@@ -692,19 +685,17 @@ impl<'template> Deepseek4ChatService<'template> {
                         &mut mtp_rows,
                         &mut self.sequence_cache,
                         mtp_cache,
-                    )
+                    )?;
                 } else {
                     let mut rows = requests
                         .iter_mut()
+                        .zip(sequences.sequences_mut())
                         .zip(selected.iter().map(|(_, chunk)| *chunk))
-                        .map(|(request, chunk)| {
+                        .map(|((request, sequence), chunk)| {
                             let start = request.prompt_position;
                             Deepseek4BatchRow {
                                 token_ids: &request.prompt[start..start + chunk],
-                                sequence: request
-                                    .sequence
-                                    .as_mut()
-                                    .expect("prefill request is admitted"),
+                                sequence: &mut sequence.sequence,
                             }
                         })
                         .collect::<Vec<_>>();
@@ -712,24 +703,35 @@ impl<'template> Deepseek4ChatService<'template> {
                         &mut self.workspace,
                         &mut rows,
                         &mut self.sequence_cache,
-                    )
+                    )?;
                 }
-            };
+                for (index, (request, (_, chunk))) in requests.iter_mut().zip(&selected).enumerate()
+                {
+                    request.prompt_position += chunk;
+                    if retained_prefix_ready(
+                        request.prompt_position,
+                        request.prefix_target,
+                        request.prefix_retained,
+                    ) {
+                        Self::retain_request_prefix(
+                            &self.model,
+                            &self.workspace,
+                            &mut self.sequence_cache,
+                            self.retain_prefixes,
+                            request,
+                            &mut sequences.sequence_mut(index).sequence,
+                        );
+                    }
+                }
+                Ok(())
+            })();
             if let Err(error) = result {
                 for (request, (id, _)) in requests.into_iter().zip(&selected) {
                     self.requests.insert(*id, request);
                 }
                 return Err(error);
             }
-            for (mut request, (id, chunk)) in requests.into_iter().zip(selected) {
-                request.prompt_position += chunk;
-                if retained_prefix_ready(
-                    request.prompt_position,
-                    request.prefix_target,
-                    request.prefix_retained,
-                ) {
-                    self.retain_request_prefix(&mut request);
-                }
+            for (request, (id, _)) in requests.into_iter().zip(selected) {
                 tick.prefilled.push(Deepseek4PrefillProgress {
                     request_id: id,
                     prompt_position: request.prompt_position,
@@ -755,32 +757,31 @@ impl<'template> Deepseek4ChatService<'template> {
             .iter()
             .map(|id| self.requests.remove(id).expect("prefill request exists"))
             .collect::<Vec<_>>();
-        let result = {
+        let sequence_ids = requests
+            .iter()
+            .map(|request| request.sequence_id.expect("prefill request is admitted"))
+            .collect::<Vec<_>>();
+        let result = (|| -> Result<_> {
             for &id in &tail_ids {
                 on_lifecycle(RequestLifecycleEvent::PrefillStarted(id));
             }
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
             if let (Some(mtp_workspace), Some(mtp_cache)) = (
                 self.mtp_workspace.as_mut(),
                 self.mtp_sequence_cache.as_mut(),
             ) {
                 let mut rows = Vec::with_capacity(requests.len());
                 let mut mtp_rows = Vec::with_capacity(requests.len());
-                for request in &mut requests {
-                    let ActiveRequest {
-                        prompt,
-                        prompt_position,
-                        sequence,
-                        mtp_sequence,
-                        ..
-                    } = request;
-                    let tokens = &prompt[*prompt_position..];
+                for (request, sequence) in requests.iter_mut().zip(sequences.sequences_mut()) {
+                    let tokens = &request.prompt[request.prompt_position..];
                     rows.push(Deepseek4BatchRow {
                         token_ids: tokens,
-                        sequence: sequence.as_mut().expect("prefill request is admitted"),
+                        sequence: &mut sequence.sequence,
                     });
                     mtp_rows.push(Deepseek4MtpBatchRow {
                         token_ids: tokens,
-                        sequence: mtp_sequence
+                        sequence: sequence
+                            .mtp_sequence
                             .as_mut()
                             .expect("speculative request has an MTP sequence"),
                     });
@@ -796,19 +797,17 @@ impl<'template> Deepseek4ChatService<'template> {
             } else {
                 let mut rows = requests
                     .iter_mut()
-                    .map(|request| Deepseek4BatchRow {
+                    .zip(sequences.sequences_mut())
+                    .map(|(request, sequence)| Deepseek4BatchRow {
                         token_ids: &request.prompt[request.prompt_position..],
-                        sequence: request
-                            .sequence
-                            .as_mut()
-                            .expect("prefill request is admitted"),
+                        sequence: &mut sequence.sequence,
                     })
                     .collect::<Vec<_>>();
                 self.model
                     .forward_batch(&mut self.workspace, &mut rows, &mut self.sequence_cache)
                     .and_then(|logits| logits.copy_to_host())
             }
-        };
+        })();
         let logits = match result {
             Ok(logits) => logits,
             Err(error) => {
@@ -843,7 +842,17 @@ impl<'template> Deepseek4ChatService<'template> {
                 request.prefix_target,
                 request.prefix_retained,
             ) {
-                self.retain_request_prefix(&mut request);
+                let mut sequence = self
+                    .sequences
+                    .lease(request.sequence_id.expect("prefill request is admitted"))?;
+                Self::retain_request_prefix(
+                    &self.model,
+                    &self.workspace,
+                    &mut self.sequence_cache,
+                    self.retain_prefixes,
+                    &mut request,
+                    &mut sequence.sequence_mut().sequence,
+                );
             }
             tick.prefilled.push(Deepseek4PrefillProgress {
                 request_id: id,
@@ -854,31 +863,29 @@ impl<'template> Deepseek4ChatService<'template> {
         Ok(())
     }
 
-    fn retain_request_prefix(&mut self, request: &mut ActiveRequest<'template>) {
-        if request.prefix_retained || request.prefix_target == 0 || !self.retain_prefixes {
+    fn retain_request_prefix(
+        model: &Deepseek4TextModel,
+        workspace: &Deepseek4BatchWorkspace,
+        sequence_cache: &mut Deepseek4SequenceCache,
+        retain_prefixes: bool,
+        request: &mut ActiveRequest<'template>,
+        sequence: &mut Deepseek4Sequence,
+    ) {
+        if request.prefix_retained || request.prefix_target == 0 || !retain_prefixes {
             return;
         }
-        let Some(sequence) = request.sequence.as_mut() else {
-            return;
-        };
         if sequence.position() != request.prefix_target {
             return;
         }
-        if !self
-            .sequence_cache
-            .contains_prefix(&request.prompt, request.prefix_target)
-        {
-            match self
-                .model
-                .checkpoint_sequence(&sequence.state, &self.workspace)
-            {
+        if !sequence_cache.contains_prefix(&request.prompt, request.prefix_target) {
+            match model.checkpoint_sequence(&sequence.state, workspace) {
                 Ok(snapshot) => {
-                    if let Err(error) = self.sequence_cache.retain_prefix(
+                    if let Err(error) = sequence_cache.retain_prefix(
                         sequence.cache_id,
                         &request.prompt,
                         snapshot,
                         &mut Deepseek4CacheContext {
-                            stream: self.workspace.stream(),
+                            stream: workspace.stream(),
                             page_table: &mut sequence.page_table,
                         },
                     ) {
@@ -907,13 +914,20 @@ impl<'template> Deepseek4ChatService<'template> {
             .iter()
             .filter(|request| request.pending_sample.is_none())
             .count();
+        let sequence_ids = requests
+            .iter()
+            .map(|request| request.sequence_id.expect("decode request is admitted"))
+            .collect::<Vec<_>>();
         let logits = if model_count == 0 {
             Vec::new()
         } else {
-            let result = {
+            let result = (|| -> Result<_> {
+                let mut sequences = self.sequences.lease_many(&sequence_ids)?;
                 let mut rows = requests
                     .iter_mut()
+                    .zip(sequences.sequences_mut())
                     .filter_map(|request| {
+                        let (request, sequence) = request;
                         if request.pending_sample.is_some() {
                             return None;
                         }
@@ -923,17 +937,14 @@ impl<'template> Deepseek4ChatService<'template> {
                             .expect("generated token exists after prompt logits");
                         Some(Deepseek4BatchRow {
                             token_ids: std::slice::from_ref(token),
-                            sequence: request
-                                .sequence
-                                .as_mut()
-                                .expect("decode request is admitted"),
+                            sequence: &mut sequence.sequence,
                         })
                     })
                     .collect::<Vec<_>>();
                 self.model
                     .forward_batch(&mut self.workspace, &mut rows, &mut self.sequence_cache)
                     .and_then(|logits| logits.copy_to_host())
-            };
+            })();
             match result {
                 Ok(logits) => logits,
                 Err(error) => {
@@ -982,7 +993,7 @@ impl<'template> Deepseek4ChatService<'template> {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut requests = ids
+        let requests = ids
             .iter()
             .map(|id| self.requests.remove(id).expect("decode request exists"))
             .collect::<Vec<_>>();
@@ -990,22 +1001,23 @@ impl<'template> Deepseek4ChatService<'template> {
             .iter()
             .map(|request| request.last_token.expect("speculative input exists"))
             .collect::<Vec<_>>();
-        let result = {
+        let sequence_ids = requests
+            .iter()
+            .map(|request| {
+                request
+                    .sequence_id
+                    .expect("speculative request is admitted")
+            })
+            .collect::<Vec<_>>();
+        let result = (|| -> Result<_> {
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
             let mut target_sequences = Vec::with_capacity(requests.len());
             let mut mtp_sequences = Vec::with_capacity(requests.len());
-            for request in &mut requests {
-                let ActiveRequest {
-                    sequence,
-                    mtp_sequence,
-                    ..
-                } = request;
-                target_sequences.push(
-                    sequence
-                        .as_mut()
-                        .expect("speculative target sequence exists"),
-                );
+            for sequence in sequences.sequences_mut() {
+                target_sequences.push(&mut sequence.sequence);
                 mtp_sequences.push(
-                    mtp_sequence
+                    sequence
+                        .mtp_sequence
                         .as_mut()
                         .expect("speculative MTP sequence exists"),
                 );
@@ -1023,7 +1035,7 @@ impl<'template> Deepseek4ChatService<'template> {
                     .as_mut()
                     .expect("speculative cache exists"),
             )
-        };
+        })();
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -1080,26 +1092,18 @@ impl<'template> Deepseek4ChatService<'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let sequence = request
-            .sequence
-            .take()
-            .expect("terminal request is admitted");
-        let mtp_sequence = request.mtp_sequence.take();
-        let released = sequence.device_bytes().saturating_add(
-            mtp_sequence
-                .as_ref()
-                .map_or(0, Deepseek4MtpSequence::device_bytes),
-        );
-        sequence.finish(self.workspace.stream(), &mut self.sequence_cache)?;
-        if let Some(sequence) = mtp_sequence {
-            sequence.finish(
-                self.workspace.stream(),
-                self.mtp_sequence_cache
-                    .as_mut()
-                    .expect("MTP sequence has an MTP cache"),
-            )?;
-        }
-        self.active_sequences -= 1;
+        let sequence = self.sequences.release(
+            request
+                .sequence_id
+                .take()
+                .expect("terminal request is admitted"),
+        )?;
+        let released = sequence.device_bytes();
+        sequence.finish(
+            self.workspace.stream(),
+            &mut self.sequence_cache,
+            self.mtp_sequence_cache.as_mut(),
+        )?;
         tick.finished.push(Deepseek4Finished {
             request_id: id,
             finish_reason: reason,
