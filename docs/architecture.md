@@ -81,6 +81,9 @@ Bonsai GGUF chat-template parsing now also lives in `eider-inference`; the API
 receives the resolved template and has no direct format dependency.
 Both `eider-api` and `eider-runtime` forbid unsafe code at their crate
 boundaries.
+`eider-inference` denies unsafe code as well. Its one explicit exception is a
+reviewed POSIX vectored-read adapter for DeepSeek expert records; model loading
+and execution code cannot introduce unsafe blocks.
 `eider-cuda` denies unchecked unsafe operations inside unsafe functions.
 CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
 `DeviceAddress` values in their device pointer tables instead of raw pointers.
@@ -98,6 +101,8 @@ Ling 3's routed W4A16 workspace uses typed input, expert, output, and
 weighted-accumulation tables for both one-token decode and batched execution.
 Nemotron 3 uses the same typed routed W4A16 tables for resident expert slabs,
 one-token decode, and flattened multi-row execution.
+Qwen3.6's remaining legacy raw table is built by a checked CUDA adapter rather
+than by inference-side pointer arithmetic.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both

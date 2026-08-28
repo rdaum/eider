@@ -5800,10 +5800,11 @@ impl Qwen36MoeWorkspace {
             None
         };
         let w4a16_gate_up_output = DeviceBuffer::zeroed(experts_per_token * gate_up_out_features)?;
-        let w4a16_base = w4a16_gate_up_output.as_const_ptr().cast::<f32>();
-        let w4a16_gate_up_ptrs = (0..experts_per_token)
-            .map(|slot| unsafe { w4a16_base.add(slot * gate_up_out_features) })
+        let w4a16_gate_up_offsets = (0..experts_per_token)
+            .map(|slot| slot * gate_up_out_features)
             .collect::<Vec<_>>();
+        let w4a16_gate_up_table =
+            w4a16_gate_up_output.legacy_const_pointer_table(&w4a16_gate_up_offsets)?;
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(experts)?,
             route: MoeRouteWorkspace::new(experts_per_token)?,
@@ -5811,7 +5812,7 @@ impl Qwen36MoeWorkspace {
             gate_up_input_simple_scales: DeviceBuffer::zeroed(hidden.div_ceil(16))?,
             grouped_gate_up,
             w4a16_gate_up_output,
-            w4a16_gate_up_table: DeviceBuffer::from_host(&w4a16_gate_up_ptrs)?,
+            w4a16_gate_up_table,
             fp8_hidden_input: DeviceBuffer::zeroed(hidden)?,
             fp8_hidden_input_scale: DeviceBuffer::zeroed(1)?,
             fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,
@@ -8341,7 +8342,7 @@ mod tests {
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
         reorder_fp8_v_cols, reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
-    use eider_cuda::{CudaStream, DeviceBuffer};
+    use eider_cuda::{CudaStream, DeviceBuffer, PinnedHostBuffer};
     use eider_format::{ModelOptFp8Linear, ModelOptNvfp4Linear};
 
     #[test]
@@ -8364,13 +8365,16 @@ mod tests {
         };
         state.begin_append(&stream).expect("begin append");
         let active = state.linear_states[0].as_mut().expect("active state");
+        let mutated_conv = PinnedHostBuffer::from_slice(&[9.0, 10.0]).expect("mutated conv");
+        let mutated_recurrent =
+            PinnedHostBuffer::from_slice(&[11.0, 12.0]).expect("mutated recurrent");
         active
             .conv_state
-            .copy_from_host(&[9.0, 10.0])
+            .copy_range_from_pinned_on_stream(0, &mutated_conv, &stream)
             .expect("mutate conv");
         active
             .recurrent_state
-            .copy_from_host(&[11.0, 12.0])
+            .copy_range_from_pinned_on_stream(0, &mutated_recurrent, &stream)
             .expect("mutate recurrent");
         state.abort_append(&stream).expect("abort append");
         let active = state.linear_states[0].as_ref().expect("active state");
@@ -8392,11 +8396,12 @@ mod tests {
         );
 
         state.begin_append(&stream).expect("begin retry");
+        let committed_conv = PinnedHostBuffer::from_slice(&[9.0, 10.0]).expect("committed conv");
         state.linear_states[0]
             .as_mut()
             .expect("active state")
             .conv_state
-            .copy_from_host(&[9.0, 10.0])
+            .copy_range_from_pinned_on_stream(0, &committed_conv, &stream)
             .expect("mutate retry");
         state.commit_append(2);
         assert_eq!(state.position(), 2);

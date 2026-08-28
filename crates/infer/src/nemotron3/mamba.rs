@@ -594,7 +594,7 @@ impl Nemotron3MambaWorkspace {
 #[cfg(test)]
 mod tests {
     use super::Nemotron3MambaState;
-    use eider_cuda::{CudaStream, DeviceBuffer};
+    use eider_cuda::{CudaStream, DeviceBuffer, PinnedHostBuffer};
 
     #[test]
     fn mamba_checkpoint_restores_recurrent_state_after_failure() {
@@ -604,11 +604,16 @@ mod tests {
             ssm: DeviceBuffer::from_host(&[3_u16, 4]).expect("ssm"),
         };
         let checkpoint = state.checkpoint_on_stream(&stream).expect("checkpoint");
+        let mutated_conv = PinnedHostBuffer::from_slice(&[9_u16, 10]).expect("mutated conv");
+        let mutated_ssm = PinnedHostBuffer::from_slice(&[11_u16, 12]).expect("mutated ssm");
         state
             .conv
-            .copy_from_host(&[9_u16, 10])
+            .copy_range_from_pinned_on_stream(0, &mutated_conv, &stream)
             .expect("mutate conv");
-        state.ssm.copy_from_host(&[11_u16, 12]).expect("mutate ssm");
+        state
+            .ssm
+            .copy_range_from_pinned_on_stream(0, &mutated_ssm, &stream)
+            .expect("mutate ssm");
         state
             .restore_checkpoint_on_stream(&checkpoint, &stream)
             .expect("restore");

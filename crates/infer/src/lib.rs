@@ -5,6 +5,13 @@
 //! composition, KV-cache policy, and decode/prefill orchestration. Low-level
 //! FP4 tensor storage and matmul execution live in `eider-cuda`.
 
+#![deny(unsafe_code)]
+
+// POSIX vectored expert-record reads require one reviewed libc call. All model
+// composition and execution code remains under the crate-wide unsafe denial.
+#[allow(unsafe_code)]
+mod system_io;
+
 mod error;
 pub use error::{InferenceError, InferenceResult};
 

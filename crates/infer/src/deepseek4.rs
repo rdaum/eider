@@ -36,6 +36,7 @@ pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek
 use crate::metrics::ExpertPagingMetricHandle;
 use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
 use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
+use crate::system_io::read_exact_vectored_at;
 use eider_cuda::{
     CudaStream, DeviceBuffer, Error, MoeSortedRoutes, Nvfp4LinearSlotMut, Nvfp4LinearSlots,
     Q3ExpertTable, Q3ExpertTableCacheInfo, Q3ExpertTableCacheWriter, Q3Nvfp4ExpertOverlay,
@@ -51,7 +52,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, IoSliceMut, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -419,52 +419,6 @@ struct Deepseek4PagedExpertDestination<'a> {
     w3: Nvfp4LinearSlotMut<'a>,
     w2: Nvfp4LinearSlotMut<'a>,
     layout: Deepseek4Nvfp4RecordLayout,
-}
-
-fn read_exact_vectored_at(
-    file: &File,
-    mut destinations: &mut [IoSliceMut<'_>],
-    mut offset: u64,
-) -> std::io::Result<()> {
-    const MAX_DESTINATIONS: usize = 6;
-    while !destinations.is_empty() {
-        if destinations.len() > MAX_DESTINATIONS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "too many DeepSeek expert record destinations",
-            ));
-        }
-        let mut vectors: [libc::iovec; MAX_DESTINATIONS] = std::array::from_fn(|_| libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        });
-        for (vector, destination) in vectors.iter_mut().zip(destinations.iter_mut()) {
-            vector.iov_base = destination.as_mut_ptr().cast();
-            vector.iov_len = destination.len();
-        }
-        let bytes = unsafe {
-            libc::preadv(
-                file.as_raw_fd(),
-                vectors.as_ptr(),
-                destinations.len() as i32,
-                offset as libc::off_t,
-            )
-        };
-        if bytes == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        if bytes < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let bytes = bytes as usize;
-        offset = offset.saturating_add(bytes as u64);
-        IoSliceMut::advance_slices(&mut destinations, bytes);
-    }
-    Ok(())
 }
 
 /// Mutable output storage for one routed-expert layer.
