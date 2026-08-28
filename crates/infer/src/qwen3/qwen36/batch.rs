@@ -1016,10 +1016,10 @@ struct BatchLinearAttentionWorkspace {
     row_gate: DeviceBuffer<f32>,
     row_beta: DeviceBuffer<f32>,
     row_gdn_output: DeviceBuffer<f32>,
-    conv_state_table: DeviceBuffer<*mut f32>,
-    recurrent_state_table: DeviceBuffer<*mut f32>,
-    conv_state_ptrs: Vec<*mut f32>,
-    recurrent_state_ptrs: Vec<*mut f32>,
+    conv_state_table: DeviceBuffer<DeviceAddress<f32>>,
+    recurrent_state_table: DeviceBuffer<DeviceAddress<f32>>,
+    conv_state_ptrs: Vec<DeviceAddress<f32>>,
+    recurrent_state_ptrs: Vec<DeviceAddress<f32>>,
     padding_states: Vec<Qwen36LinearAttentionState>,
     state_snapshots: Option<BatchLinearAttentionStateSnapshots>,
     gdn_output: DeviceBuffer<f32>,
@@ -1105,7 +1105,7 @@ impl BatchLinearAttentionStateSnapshots {
 
     fn capture_conv(
         &mut self,
-        state_table: &DeviceBuffer<*mut f32>,
+        state_table: &DeviceBuffer<DeviceAddress<f32>>,
         layer_idx: usize,
         sequence: usize,
         slot: usize,
@@ -1127,7 +1127,7 @@ impl BatchLinearAttentionStateSnapshots {
 
     fn capture_recurrent(
         &mut self,
-        state_table: &DeviceBuffer<*mut f32>,
+        state_table: &DeviceBuffer<DeviceAddress<f32>>,
         layer_idx: usize,
         sequence: usize,
         slot: usize,
@@ -1149,8 +1149,8 @@ impl BatchLinearAttentionStateSnapshots {
 
     fn restore(
         &self,
-        conv_state_table: &DeviceBuffer<*mut f32>,
-        recurrent_state_table: &DeviceBuffer<*mut f32>,
+        conv_state_table: &DeviceBuffer<DeviceAddress<f32>>,
+        recurrent_state_table: &DeviceBuffer<DeviceAddress<f32>>,
         slot: usize,
         stream: &CudaStream,
     ) -> Result<()> {
@@ -1286,7 +1286,7 @@ impl BatchChunkedGdnWorkspace {
     #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
-        state_table: &DeviceBuffer<*mut f32>,
+        state_table: &DeviceBuffer<DeviceAddress<f32>>,
         state_table_offset: usize,
         output_f32: eider_cuda::DeviceOutput<'_, f32>,
         sequence_count: usize,
@@ -1371,7 +1371,7 @@ impl BatchLinearAttentionWorkspace {
             .expect("Qwen3.6 linear-attention configuration");
         let value_dim = linear.value_heads * linear.value_head_dim;
         let state_table_len = model.batch_layer_count() * state_capacity;
-        let nulls = vec![std::ptr::null_mut(); state_table_len];
+        let nulls = vec![DeviceAddress::null(); state_table_len];
         let mut padding_states = Vec::with_capacity(state_capacity);
         for _ in 0..state_capacity {
             padding_states.push(Qwen36LinearAttentionState::new(linear, weights)?);
@@ -1429,21 +1429,16 @@ impl BatchLinearAttentionWorkspace {
                 let table_idx = layer_idx * capacity + row_idx;
                 let state = if let Some(row) = rows.get_mut(row_idx) {
                     let Some(state) = row.state.linear_states[layer_idx].as_mut() else {
-                        self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
-                        self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                        self.conv_state_ptrs[table_idx] = DeviceAddress::null();
+                        self.recurrent_state_ptrs[table_idx] = DeviceAddress::null();
                         continue;
                     };
                     state
                 } else {
                     &mut self.padding_states[row_idx]
                 };
-                self.conv_state_ptrs[table_idx] =
-                    state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
-                self.recurrent_state_ptrs[table_idx] = state
-                    .recurrent_state
-                    .as_const_ptr()
-                    .cast_mut()
-                    .cast::<f32>();
+                self.conv_state_ptrs[table_idx] = state.conv_state.cuda_address();
+                self.recurrent_state_ptrs[table_idx] = state.recurrent_state.cuda_address();
             }
         }
         self.conv_state_table
@@ -1505,21 +1500,16 @@ impl BatchLinearAttentionWorkspace {
                 let table_idx = layer_idx * state_capacity + row_idx;
                 let state = if let Some(row) = rows.get_mut(row_idx) {
                     let Some(state) = row.state.linear_states[layer_idx].as_mut() else {
-                        self.conv_state_ptrs[table_idx] = std::ptr::null_mut();
-                        self.recurrent_state_ptrs[table_idx] = std::ptr::null_mut();
+                        self.conv_state_ptrs[table_idx] = DeviceAddress::null();
+                        self.recurrent_state_ptrs[table_idx] = DeviceAddress::null();
                         continue;
                     };
                     state
                 } else {
                     &mut self.padding_states[row_idx]
                 };
-                self.conv_state_ptrs[table_idx] =
-                    state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
-                self.recurrent_state_ptrs[table_idx] = state
-                    .recurrent_state
-                    .as_const_ptr()
-                    .cast_mut()
-                    .cast::<f32>();
+                self.conv_state_ptrs[table_idx] = state.conv_state.cuda_address();
+                self.recurrent_state_ptrs[table_idx] = state.recurrent_state.cuda_address();
             }
         }
         self.conv_state_table
@@ -1529,8 +1519,8 @@ impl BatchLinearAttentionWorkspace {
     }
 
     fn begin_single_prefill(&mut self, tokens: usize) -> Result<()> {
-        self.conv_state_ptrs.fill(std::ptr::null_mut());
-        self.recurrent_state_ptrs.fill(std::ptr::null_mut());
+        self.conv_state_ptrs.fill(DeviceAddress::null());
+        self.recurrent_state_ptrs.fill(DeviceAddress::null());
         if let Some(chunked) = self.chunked_gdn.as_mut() {
             chunked.prepare(&[tokens as u32])?;
         }
@@ -1549,12 +1539,8 @@ impl BatchLinearAttentionWorkspace {
                 actual: layer_idx.to_string(),
             });
         }
-        self.conv_state_ptrs[layer_idx] = state.conv_state.as_const_ptr().cast_mut().cast::<f32>();
-        self.recurrent_state_ptrs[layer_idx] = state
-            .recurrent_state
-            .as_const_ptr()
-            .cast_mut()
-            .cast::<f32>();
+        self.conv_state_ptrs[layer_idx] = state.conv_state.cuda_address();
+        self.recurrent_state_ptrs[layer_idx] = state.recurrent_state.cuda_address();
         Ok(())
     }
 

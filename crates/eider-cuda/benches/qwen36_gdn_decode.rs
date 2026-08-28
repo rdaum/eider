@@ -1,5 +1,5 @@
 use eider_cuda::{
-    CudaEvent, CudaStream, DeviceBuffer, Nvfp4Matrix, format,
+    CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Nvfp4Matrix, format,
     gated_delta_net_128_f32_batch_into_on_stream, gated_rms_norm_f32_into_on_stream,
     gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
@@ -31,7 +31,7 @@ struct Qwen36GdnDecodeBench {
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     states: Vec<DeviceBuffer<f32>>,
-    state_table: DeviceBuffer<*mut f32>,
+    state_table: DeviceBuffer<DeviceAddress<f32>>,
     gdn_output: DeviceBuffer<f32>,
     z: DeviceBuffer<f32>,
     norm_weight: DeviceBuffer<f32>,
@@ -57,7 +57,7 @@ impl Qwen36GdnDecodeBench {
         let dt_bias = (0..HEADS)
             .map(|head| format::f32_to_bf16(-0.5 + head as f32 / 128.0))
             .collect::<Vec<_>>();
-        let mut states = (0..LAYERS)
+        let states = (0..LAYERS)
             .map(|layer| {
                 DeviceBuffer::from_host(
                     &(0..STATE_LEN)
@@ -68,8 +68,8 @@ impl Qwen36GdnDecodeBench {
             })
             .collect::<Vec<_>>();
         let state_ptrs = states
-            .iter_mut()
-            .map(|state| state.inout().as_mut_ptr().cast::<f32>())
+            .iter()
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>();
         Self {
             stream,

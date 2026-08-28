@@ -8754,7 +8754,7 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
     v: &DeviceBuffer<f32>,
     gate: &DeviceBuffer<f32>,
     beta: &DeviceBuffer<f32>,
-    state_table: &DeviceBuffer<*mut f32>,
+    state_table: &DeviceBuffer<DeviceAddress<f32>>,
     mut output: DeviceOutput<'_, f32>,
     state_table_offset: usize,
     batch_size: usize,
@@ -8820,7 +8820,11 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
                 v.ptr,
                 gate.ptr,
                 beta.ptr,
-                state_table.ptr.add(state_table_offset),
+                state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 output.buffer_mut().ptr,
                 batch_size as u32,
                 heads as u32,
@@ -8842,7 +8846,7 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
     v: &DeviceBuffer<f32>,
     gate: &DeviceBuffer<f32>,
     beta: &DeviceBuffer<f32>,
-    state_table: &DeviceBuffer<*mut f32>,
+    state_table: &DeviceBuffer<DeviceAddress<f32>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -8913,7 +8917,11 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
                 v.ptr,
                 gate.ptr,
                 beta.ptr,
-                state_table.ptr.add(state_table_offset),
+                state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 output.buffer_mut().ptr,
@@ -8928,7 +8936,7 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
 
 /// Gathers equally sized f32 rows from a device pointer table.
 pub fn gather_f32_pointer_rows_into_on_stream(
-    input_table: &DeviceBuffer<*mut f32>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
     table_offset: usize,
     mut output: DeviceOutput<'_, f32>,
     rows: usize,
@@ -8949,7 +8957,7 @@ pub fn gather_f32_pointer_rows_into_on_stream(
 /// Gathers equally sized f32 rows into a contiguous output range.
 #[allow(clippy::too_many_arguments)]
 pub fn gather_f32_pointer_rows_range_into_on_stream(
-    input_table: &DeviceBuffer<*mut f32>,
+    input_table: &DeviceBuffer<DeviceAddress<f32>>,
     table_offset: usize,
     output: &mut DeviceBuffer<f32>,
     output_offset: usize,
@@ -8988,7 +8996,11 @@ pub fn gather_f32_pointer_rows_range_into_on_stream(
         check_cuda(
             "infer_gather_f32_pointer_rows_on_stream",
             ffi::infer_gather_f32_pointer_rows_on_stream(
-                input_table.ptr.add(table_offset),
+                input_table
+                    .cuda_address()
+                    .offset(table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 output.ptr.add(output_offset),
                 rows as u32,
                 row_values as u32,
@@ -9001,7 +9013,7 @@ pub fn gather_f32_pointer_rows_range_into_on_stream(
 /// Scatters equally sized f32 rows through a device pointer table.
 pub fn scatter_f32_pointer_rows_on_stream(
     input: &DeviceBuffer<f32>,
-    output_table: &DeviceBuffer<*mut f32>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     table_offset: usize,
     rows: usize,
     row_values: usize,
@@ -9023,7 +9035,7 @@ pub fn scatter_f32_pointer_rows_on_stream(
 pub fn scatter_f32_pointer_rows_range_on_stream(
     input: &DeviceBuffer<f32>,
     input_offset: usize,
-    output_table: &DeviceBuffer<*mut f32>,
+    output_table: &DeviceBuffer<DeviceAddress<f32>>,
     table_offset: usize,
     rows: usize,
     row_values: usize,
@@ -9061,7 +9073,11 @@ pub fn scatter_f32_pointer_rows_range_on_stream(
             "infer_scatter_f32_pointer_rows_on_stream",
             ffi::infer_scatter_f32_pointer_rows_on_stream(
                 input.ptr.add(input_offset),
-                output_table.ptr.add(table_offset),
+                output_table
+                    .cuda_address()
+                    .offset(table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 rows as u32,
                 row_values as u32,
                 stream.as_raw(),
@@ -11103,7 +11119,7 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
     mut q: DeviceOutput<'_, f32>,
     mut k: DeviceOutput<'_, f32>,
     mut v: DeviceOutput<'_, f32>,
-    conv_state_table: &DeviceBuffer<*mut f32>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<f32>>,
     state_table_offset: usize,
     batch_size: usize,
     key_heads: usize,
@@ -11189,7 +11205,11 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
                 q.buffer_mut().ptr,
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
-                conv_state_table.ptr.add(state_table_offset),
+                conv_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 batch_size as u32,
                 key_heads as u32,
                 value_heads as u32,
@@ -11212,7 +11232,7 @@ pub fn qwen36_gdn_prep_chunks_into_on_stream(
     mut q: DeviceOutput<'_, f32>,
     mut k: DeviceOutput<'_, f32>,
     mut v: DeviceOutput<'_, f32>,
-    conv_state_table: &DeviceBuffer<*mut f32>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<f32>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -11299,7 +11319,11 @@ pub fn qwen36_gdn_prep_chunks_into_on_stream(
                 q.buffer_mut().ptr,
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
-                conv_state_table.ptr.add(state_table_offset),
+                conv_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 sequence_count as u32,
@@ -11321,7 +11345,7 @@ pub fn qwen36_gdn_prep_chunks_bf16_into_on_stream(
     mut q: DeviceOutput<'_, u16>,
     mut k: DeviceOutput<'_, u16>,
     mut v: DeviceOutput<'_, u16>,
-    conv_state_table: &DeviceBuffer<*mut f32>,
+    conv_state_table: &DeviceBuffer<DeviceAddress<f32>>,
     state_table_offset: usize,
     sequence_offsets: &DeviceBuffer<u32>,
     sequence_lengths: &DeviceBuffer<u32>,
@@ -11408,7 +11432,11 @@ pub fn qwen36_gdn_prep_chunks_bf16_into_on_stream(
                 q.buffer_mut().ptr,
                 k.buffer_mut().ptr,
                 v.buffer_mut().ptr,
-                conv_state_table.ptr.add(state_table_offset),
+                conv_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
+                    .as_const_ptr()
+                    .cast(),
                 sequence_offsets.ptr,
                 sequence_lengths.ptr,
                 sequence_count as u32,
@@ -12724,8 +12752,9 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_into_on_stream(
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
                 conv_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
                     .as_const_ptr()
-                    .add(state_table_offset)
                     .cast_mut()
                     .cast(),
                 sequence_offsets.ptr,
@@ -12818,8 +12847,9 @@ pub fn nemotron3_mamba_conv_update_f32_chunks_snapshot_into_on_stream(
                 conv_weight_bf16.ptr,
                 conv_bias_bf16.ptr,
                 conv_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
                     .as_const_ptr()
-                    .add(state_table_offset)
                     .cast_mut()
                     .cast(),
                 sequence_offsets.ptr,
@@ -13042,8 +13072,9 @@ pub fn nemotron3_mamba_state_update_f32_chunks_into_on_stream(
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
                 ssm_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
                     .as_const_ptr()
-                    .add(state_table_offset)
                     .cast_mut()
                     .cast(),
                 sequence_offsets.ptr,
@@ -13165,8 +13196,9 @@ pub fn nemotron3_mamba_state_update_f32_chunks_snapshot_into_on_stream(
                 dt_bias_bf16.ptr,
                 norm_weight_bf16.ptr,
                 ssm_state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
                     .as_const_ptr()
-                    .add(state_table_offset)
                     .cast_mut()
                     .cast(),
                 sequence_offsets.ptr,
@@ -13233,8 +13265,9 @@ pub fn select_bf16_state_snapshot_into_on_stream(
             "infer_select_bf16_state_snapshot_on_stream",
             ffi::infer_select_bf16_state_snapshot_on_stream(
                 state_table
+                    .cuda_address()
+                    .offset(state_table_offset)?
                     .as_const_ptr()
-                    .add(state_table_offset)
                     .cast_mut()
                     .cast(),
                 snapshots_bf16.ptr,
@@ -19549,26 +19582,22 @@ mod tests {
         let beta_input_device = DeviceBuffer::from_host(&beta_input).expect("beta input");
         let a_log_device = DeviceBuffer::from_host(&a_log).expect("a log");
         let dt_bias_device = DeviceBuffer::from_host(&dt_bias).expect("dt bias");
-        let mut batch_conv_states = conv_initial
+        let batch_conv_states = conv_initial
             .iter()
             .map(|state| DeviceBuffer::from_host(state).expect("batch conv state"))
             .collect::<Vec<_>>();
-        let mut batch_recurrent_states = recurrent_initial
+        let batch_recurrent_states = recurrent_initial
             .iter()
             .map(|state| DeviceBuffer::from_host(state).expect("batch recurrent state"))
             .collect::<Vec<_>>();
         let state_table_offset = 3;
-        let mut conv_ptrs = vec![std::ptr::null_mut(); state_table_offset];
-        conv_ptrs.extend(
-            batch_conv_states
-                .iter_mut()
-                .map(|state| state.as_mut_ptr().cast::<f32>()),
-        );
-        let mut recurrent_ptrs = vec![std::ptr::null_mut(); state_table_offset];
+        let mut conv_ptrs = vec![DeviceAddress::null(); state_table_offset];
+        conv_ptrs.extend(batch_conv_states.iter().map(DeviceBuffer::cuda_address));
+        let mut recurrent_ptrs = vec![DeviceAddress::null(); state_table_offset];
         recurrent_ptrs.extend(
             batch_recurrent_states
-                .iter_mut()
-                .map(|state| state.as_mut_ptr().cast::<f32>()),
+                .iter()
+                .map(DeviceBuffer::cuda_address),
         );
         let conv_table = DeviceBuffer::from_host(&conv_ptrs).expect("conv table");
         let recurrent_table = DeviceBuffer::from_host(&recurrent_ptrs).expect("recurrent table");
@@ -19780,13 +19809,12 @@ mod tests {
         let gate_device = DeviceBuffer::from_host(&gate).expect("gate");
         let beta_device = DeviceBuffer::from_host(&beta).expect("beta");
 
-        let mut chunk_conv = DeviceBuffer::<f32>::zeroed(conv_dim * 3).expect("chunk conv");
-        let mut chunk_recurrent = DeviceBuffer::<f32>::zeroed(state_len).expect("chunk recurrent");
-        let chunk_conv_table = DeviceBuffer::from_host(&[chunk_conv.as_mut_ptr().cast::<f32>()])
-            .expect("chunk conv table");
-        let chunk_recurrent_table =
-            DeviceBuffer::from_host(&[chunk_recurrent.as_mut_ptr().cast::<f32>()])
-                .expect("chunk recurrent table");
+        let chunk_conv = DeviceBuffer::<f32>::zeroed(conv_dim * 3).expect("chunk conv");
+        let chunk_recurrent = DeviceBuffer::<f32>::zeroed(state_len).expect("chunk recurrent");
+        let chunk_conv_table =
+            DeviceBuffer::from_host(&[chunk_conv.cuda_address()]).expect("chunk conv table");
+        let chunk_recurrent_table = DeviceBuffer::from_host(&[chunk_recurrent.cuda_address()])
+            .expect("chunk recurrent table");
         let offsets = DeviceBuffer::from_host(&[0u32]).expect("offsets");
         let lengths = DeviceBuffer::from_host(&[tokens as u32]).expect("lengths");
         let mut chunk_q = DeviceBuffer::<f32>::zeroed(tokens * value_dim).expect("chunk q");
@@ -19963,9 +19991,9 @@ mod tests {
         let lengths = DeviceBuffer::from_host(&[tokens as u32]).expect("length upload");
         let stream = CudaStream::new_non_blocking().expect("stream");
 
-        let mut chunk_state = DeviceBuffer::from_host(&state_host).expect("chunk state upload");
-        let chunk_table = DeviceBuffer::from_host(&[chunk_state.as_mut_ptr().cast::<f32>()])
-            .expect("chunk table");
+        let chunk_state = DeviceBuffer::from_host(&state_host).expect("chunk state upload");
+        let chunk_table =
+            DeviceBuffer::from_host(&[chunk_state.cuda_address()]).expect("chunk table");
         let mut chunk_output = DeviceBuffer::zeroed(vectors).expect("chunk output");
         gated_delta_net_128_f32_chunks_into_on_stream(
             &q,
@@ -19985,10 +20013,9 @@ mod tests {
         )
         .expect("chunk recurrence");
 
-        let mut repeated_state =
-            DeviceBuffer::from_host(&state_host).expect("repeated state upload");
-        let repeated_table = DeviceBuffer::from_host(&[repeated_state.as_mut_ptr().cast::<f32>()])
-            .expect("repeated table");
+        let repeated_state = DeviceBuffer::from_host(&state_host).expect("repeated state upload");
+        let repeated_table =
+            DeviceBuffer::from_host(&[repeated_state.cuda_address()]).expect("repeated table");
         let mut repeated_output = Vec::with_capacity(vectors);
         for token in 0..tokens {
             let range = token * vector_dim..(token + 1) * vector_dim;

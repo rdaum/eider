@@ -92,6 +92,8 @@ single-sequence decode and ragged batch execution.
 Its speculative verifier also uses typed previous-logit addresses.
 Its Mamba convolution and SSM state tables use typed addresses through normal,
 transactional, and rollback execution.
+Qwen3.6 batch decode and prefill use typed convolution and recurrent-state
+tables through ordinary, chunked, and speculative snapshot paths.
 The persistent CUTLASS grouped-GEMM plan and its Qwen, Gemma, and Laguna
 prefill callers also use opaque address tables for weights, activations,
 outputs, and per-expert scales.
