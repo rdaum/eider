@@ -2544,18 +2544,51 @@ pub struct GroupedGemvPointerTableBuffers<'a> {
 }
 
 /// Typed device-address tables used to gather one grouped GEMV launch.
-#[allow(missing_docs)]
 pub struct GroupedGemvAddressTableBuffers<'a> {
+    /// Selected expert indices, one per grouped slot.
     pub indices: &'a DeviceBuffer<u32>,
+    /// Full expert table of packed A values.
     pub a_values_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    /// Full expert table of packed A scales.
     pub a_scales_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    /// Per-slot packed B values.
     pub b_values_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    /// Per-slot packed B scales.
     pub b_scales_table: &'a DeviceBuffer<DeviceAddress<u8>>,
-    pub c_table: DeviceOutput<'a, DeviceAddress<f32>>,
-    pub d_table: DeviceOutput<'a, DeviceAddress<f32>>,
+    /// Per-slot output addresses, used for both native C and D operands.
+    pub output_table: DeviceOutput<'a, DeviceAddress<f32>>,
+    /// Gathered packed A values for the launch.
     pub out_a_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed A scales for the launch.
     pub out_a_scales: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed B values for the launch.
     pub out_b_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed B scales for the launch.
+    pub out_b_scales: DeviceOutput<'a, DeviceAddress<u8>>,
+}
+
+/// Typed device-address tables used to gather one grouped GEMV launch with a
+/// shared B matrix.
+pub struct GroupedGemvAddressBuffers<'a> {
+    /// Selected expert indices, one per grouped slot.
+    pub indices: &'a DeviceBuffer<u32>,
+    /// Full expert table of packed A values.
+    pub a_values_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    /// Full expert table of packed A scales.
+    pub a_scales_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    /// Packed values of the shared B vector.
+    pub b_values: DeviceAddress<u8>,
+    /// Packed scales of the shared B vector.
+    pub b_scales: DeviceAddress<u8>,
+    /// Per-slot output addresses, used for both native C and D operands.
+    pub output_table: DeviceOutput<'a, DeviceAddress<f32>>,
+    /// Gathered packed A values for the launch.
+    pub out_a_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed A scales for the launch.
+    pub out_a_scales: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed B values for the launch.
+    pub out_b_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Gathered packed B scales for the launch.
     pub out_b_scales: DeviceOutput<'a, DeviceAddress<u8>>,
 }
 
@@ -2708,8 +2741,7 @@ pub fn gather_nvfp4_grouped_gemv_address_tables_on_stream(
         || buffers.a_scales_table.len() != table_len
         || buffers.b_values_table.len() != groups
         || buffers.b_scales_table.len() != groups
-        || buffers.c_table.len() != groups
-        || buffers.d_table.len() != groups
+        || buffers.output_table.len() != groups
         || buffers.out_a_values.len() != groups
         || buffers.out_a_scales.len() != groups
         || buffers.out_b_values.len() != groups
@@ -2722,24 +2754,20 @@ pub fn gather_nvfp4_grouped_gemv_address_tables_on_stream(
             expected: "matching non-empty selected A table, slot B table, and group outputs"
                 .to_string(),
             actual: format!(
-                "groups={groups} table={} b_values={} b_scales={} c={} d={}",
+                "groups={groups} table={} b_values={} b_scales={} outputs={}",
                 table_len,
                 buffers.b_values_table.len(),
                 buffers.b_scales_table.len(),
-                buffers.c_table.len(),
-                buffers.d_table.len()
+                buffers.output_table.len()
             ),
         });
     }
     unsafe {
-        let c_table = buffers.c_table.buffer().ptr.cast::<*const f32>();
-        let d_table = buffers.d_table.buffer().ptr.cast::<*mut f32>();
+        let output_table = buffers.output_table.buffer().ptr;
         let out_a_values = buffers.out_a_values.buffer_mut().ptr;
         let out_a_scales = buffers.out_a_scales.buffer_mut().ptr;
         let out_b_values = buffers.out_b_values.buffer_mut().ptr;
         let out_b_scales = buffers.out_b_scales.buffer_mut().ptr;
-        let out_c = buffers.c_table.buffer_mut().ptr;
-        let out_d = buffers.d_table.buffer_mut().ptr;
         check_cuda(
             "infer_gather_nvfp4_grouped_gemv_ptr_tables_on_stream",
             ffi::infer_gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
@@ -2748,16 +2776,78 @@ pub fn gather_nvfp4_grouped_gemv_address_tables_on_stream(
                 buffers.a_scales_table.ptr.cast(),
                 buffers.b_values_table.ptr.cast(),
                 buffers.b_scales_table.ptr.cast(),
-                c_table,
-                d_table,
+                output_table.cast(),
+                output_table.cast(),
                 groups as u32,
                 table_len as u32,
                 out_a_values.cast(),
                 out_a_scales.cast(),
                 out_b_values.cast(),
                 out_b_scales.cast(),
-                out_c.cast(),
-                out_d.cast(),
+                output_table.cast(),
+                output_table.cast(),
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Gathers selected expert FP4 addresses into grouped GEMV operands with one
+/// shared B matrix.
+pub fn gather_nvfp4_grouped_gemv_addresses_on_stream(
+    mut buffers: GroupedGemvAddressBuffers<'_>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = buffers.indices.len();
+    let table_len = buffers.a_values_table.len();
+    if groups == 0
+        || table_len == 0
+        || buffers.a_scales_table.len() != table_len
+        || buffers.output_table.len() != groups
+        || buffers.out_a_values.len() != groups
+        || buffers.out_a_scales.len() != groups
+        || buffers.out_b_values.len() != groups
+        || buffers.out_b_scales.len() != groups
+        || groups > u32::MAX as usize
+        || table_len > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "grouped GEMV address gather",
+            expected: "matching non-empty selected A table and group outputs".to_string(),
+            actual: format!(
+                "groups={groups} table={} a_scales={} outputs={} out_a={} out_b={}",
+                table_len,
+                buffers.a_scales_table.len(),
+                buffers.output_table.len(),
+                buffers.out_a_values.len(),
+                buffers.out_b_values.len()
+            ),
+        });
+    }
+    unsafe {
+        let output_table = buffers.output_table.buffer().ptr;
+        let out_a_values = buffers.out_a_values.buffer_mut().ptr;
+        let out_a_scales = buffers.out_a_scales.buffer_mut().ptr;
+        let out_b_values = buffers.out_b_values.buffer_mut().ptr;
+        let out_b_scales = buffers.out_b_scales.buffer_mut().ptr;
+        check_cuda(
+            "infer_gather_nvfp4_grouped_gemv_ptrs_on_stream",
+            ffi::infer_gather_nvfp4_grouped_gemv_ptrs_on_stream(
+                buffers.indices.ptr,
+                buffers.a_values_table.ptr.cast(),
+                buffers.a_scales_table.ptr.cast(),
+                buffers.b_values.as_const_ptr(),
+                buffers.b_scales.as_const_ptr(),
+                output_table.cast(),
+                output_table.cast(),
+                groups as u32,
+                table_len as u32,
+                out_a_values.cast(),
+                out_a_scales.cast(),
+                out_b_values.cast(),
+                out_b_scales.cast(),
+                output_table.cast(),
+                output_table.cast(),
                 stream.as_raw(),
             ),
         )
@@ -2771,6 +2861,22 @@ pub struct MoeSiluQuantizeSlotBuffers<'a> {
     pub packed_table: DeviceOutput<'a, *mut u8>,
     pub scales_table: DeviceOutput<'a, *mut u8>,
     pub input_scale_table: &'a DeviceBuffer<f32>,
+    pub gate_up_alpha_table: &'a DeviceBuffer<f32>,
+}
+
+/// Typed device-address tables for per-slot SiLU and NVFP4 quantization.
+pub struct MoeSiluQuantizeAddressSlotBuffers<'a> {
+    /// Selected expert indices, one per routed slot.
+    pub indices: &'a DeviceBuffer<u32>,
+    /// Per-slot gate/up output addresses.
+    pub gate_up_table: &'a DeviceBuffer<DeviceAddress<f32>>,
+    /// Per-slot packed NVFP4 activation addresses.
+    pub packed_table: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Per-slot simple-scale addresses for the packed activations.
+    pub scales_table: DeviceOutput<'a, DeviceAddress<u8>>,
+    /// Per-expert input scales.
+    pub input_scale_table: &'a DeviceBuffer<f32>,
+    /// Per-expert gate/up scales.
     pub gate_up_alpha_table: &'a DeviceBuffer<f32>,
 }
 
@@ -2866,6 +2972,57 @@ pub fn moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
                 buffers.gate_up_table.ptr,
                 packed_table,
                 scales_table,
+                buffers.input_scale_table.ptr,
+                buffers.gate_up_alpha_table.ptr,
+                rows as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues per-slot `silu(gate) * up` plus NVFP4 quantization using typed
+/// device-address tables and selected expert simple scales.
+pub fn moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+    mut buffers: MoeSiluQuantizeAddressSlotBuffers<'_>,
+    rows: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = buffers.indices.len();
+    if rows == 0
+        || groups == 0
+        || buffers.gate_up_table.len() != groups
+        || buffers.packed_table.len() != groups
+        || buffers.scales_table.len() != groups
+        || buffers.input_scale_table.is_empty()
+        || buffers.gate_up_alpha_table.is_empty()
+        || rows > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "MoE slot SiLU simple-scale quantize",
+            expected: "non-empty rows, matching slot tables, and expert scale tables".to_string(),
+            actual: format!(
+                "rows={rows} groups={groups} gate_up={} packed={} scales={} input_scales={} gate_up_alphas={}",
+                buffers.gate_up_table.len(),
+                buffers.packed_table.len(),
+                buffers.scales_table.len(),
+                buffers.input_scale_table.len(),
+                buffers.gate_up_alpha_table.len()
+            ),
+        });
+    }
+    unsafe {
+        let packed_table = buffers.packed_table.buffer_mut().ptr;
+        let scales_table = buffers.scales_table.buffer_mut().ptr;
+        check_cuda(
+            "infer_moe_silu_quantize_slots_nvfp4_simple_scales_on_stream",
+            ffi::infer_moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
+                buffers.indices.ptr,
+                buffers.gate_up_table.ptr.cast(),
+                packed_table.cast(),
+                scales_table.cast(),
                 buffers.input_scale_table.ptr,
                 buffers.gate_up_alpha_table.ptr,
                 rows as u32,
@@ -10346,14 +10503,43 @@ pub fn fp8_moe_grouped_down_addressed_f32_into_on_stream(
     )
 }
 
+/// Enqueues device-routed FP8 down projections with typed expert weights,
+/// channel scales, and output rows.
 #[allow(clippy::too_many_arguments)]
-fn fp8_moe_grouped_down_f32_impl<Weight: DeviceRepr, Scale: DeviceRepr>(
+pub fn fp8_moe_grouped_down_addresses_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    inputs: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    weight_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    fp8_moe_grouped_down_f32_impl(
+        indices,
+        inputs,
+        input_scales,
+        weights,
+        weight_scales,
+        outputs,
+        rows,
+        cols,
+        slots,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_moe_grouped_down_f32_impl<Weight: DeviceRepr, Scale: DeviceRepr, Output: DeviceRepr>(
     indices: &DeviceBuffer<u32>,
     inputs: &DeviceBuffer<u8>,
     input_scales: &DeviceBuffer<f32>,
     weights: &DeviceBuffer<Weight>,
     weight_scales: &DeviceBuffer<Scale>,
-    outputs: &DeviceBuffer<*mut f32>,
+    outputs: &DeviceBuffer<Output>,
     rows: usize,
     cols: usize,
     slots: usize,
@@ -10398,7 +10584,7 @@ fn fp8_moe_grouped_down_f32_impl<Weight: DeviceRepr, Scale: DeviceRepr>(
                 input_scales.ptr,
                 weights.ptr.cast(),
                 weight_scales.ptr.cast(),
-                outputs.ptr,
+                outputs.ptr.cast(),
                 rows as u32,
                 cols as u32,
                 slots as u32,
@@ -13914,6 +14100,109 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+
+    #[test]
+    fn grouped_gemv_address_gather_selects_typed_tables() {
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let a_values_storage = (0..3)
+            .map(|_| DeviceBuffer::<u8>::zeroed(8).expect("A values"))
+            .collect::<Vec<_>>();
+        let a_scales_storage = (0..3)
+            .map(|_| DeviceBuffer::<u8>::zeroed(4).expect("A scales"))
+            .collect::<Vec<_>>();
+        let b_values_storage = (0..2)
+            .map(|_| DeviceBuffer::<u8>::zeroed(8).expect("B values"))
+            .collect::<Vec<_>>();
+        let b_scales_storage = (0..2)
+            .map(|_| DeviceBuffer::<u8>::zeroed(4).expect("B scales"))
+            .collect::<Vec<_>>();
+        let outputs = (0..2)
+            .map(|_| F32Matrix::zeroed(8, 1).expect("output"))
+            .collect::<Vec<_>>();
+
+        let a_values = a_values_storage
+            .iter()
+            .map(DeviceBuffer::cuda_address)
+            .collect::<Vec<_>>();
+        let a_scales = a_scales_storage
+            .iter()
+            .map(DeviceBuffer::cuda_address)
+            .collect::<Vec<_>>();
+        let b_values = b_values_storage
+            .iter()
+            .map(DeviceBuffer::cuda_address)
+            .collect::<Vec<_>>();
+        let b_scales = b_scales_storage
+            .iter()
+            .map(DeviceBuffer::cuda_address)
+            .collect::<Vec<_>>();
+        let output_addresses = outputs
+            .iter()
+            .map(F32Matrix::data_address)
+            .collect::<Vec<_>>();
+        let indices = DeviceBuffer::from_host(&[2u32, 0]).expect("indices");
+        let a_values_table = DeviceBuffer::from_host(&a_values).expect("A value table");
+        let a_scales_table = DeviceBuffer::from_host(&a_scales).expect("A scale table");
+        let b_values_table = DeviceBuffer::from_host(&b_values).expect("B value table");
+        let b_scales_table = DeviceBuffer::from_host(&b_scales).expect("B scale table");
+        let mut output_table = DeviceBuffer::from_host(&output_addresses).expect("output table");
+        let mut out_a_values =
+            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected A values");
+        let mut out_a_scales =
+            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected A scales");
+        let mut out_b_values =
+            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected B values");
+        let mut out_b_scales =
+            DeviceBuffer::from_host(&vec![DeviceAddress::null(); 2]).expect("selected B scales");
+
+        gather_nvfp4_grouped_gemv_address_tables_on_stream(
+            GroupedGemvAddressTableBuffers {
+                indices: &indices,
+                a_values_table: &a_values_table,
+                a_scales_table: &a_scales_table,
+                b_values_table: &b_values_table,
+                b_scales_table: &b_scales_table,
+                output_table: output_table.output(),
+                out_a_values: out_a_values.output(),
+                out_a_scales: out_a_scales.output(),
+                out_b_values: out_b_values.output(),
+                out_b_scales: out_b_scales.output(),
+            },
+            &stream,
+        )
+        .expect("gather");
+
+        assert_eq!(
+            out_a_values
+                .copy_to_host(&stream)
+                .expect("selected A values"),
+            vec![a_values[2], a_values[0]]
+        );
+        assert_eq!(
+            out_a_scales
+                .copy_to_host(&stream)
+                .expect("selected A scales"),
+            vec![a_scales[2], a_scales[0]]
+        );
+        assert_eq!(
+            out_b_values
+                .copy_to_host(&stream)
+                .expect("selected B values"),
+            b_values
+        );
+        assert_eq!(
+            out_b_scales
+                .copy_to_host(&stream)
+                .expect("selected B scales"),
+            b_scales
+        );
+        assert_eq!(
+            output_table
+                .copy_to_host(&stream)
+                .expect("output addresses"),
+            output_addresses
+        );
+    }
 
     #[test]
     fn grammar_mask_applies_independent_rows_and_partial_words() {

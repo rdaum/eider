@@ -29,8 +29,8 @@ pub(crate) use sequence::{Qwen36Append, qwen36_cache_error};
 use crate::metrics::ExpertPagingMetricHandle;
 use eider_cuda::{
     CublasLt, CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, Error, F32Matrix,
-    Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvPointerTableBuffers,
-    ModelOptCublasLtWeight, MoeSiluQuantizeSlotBuffers, MropeSections, Nvfp4Matrix,
+    Fp8TnMatmulPlan, GemmShape, GpuCounterCollector, GroupedGemvAddressTableBuffers,
+    ModelOptCublasLtWeight, MoeSiluQuantizeAddressSlotBuffers, MropeSections, Nvfp4Matrix,
     PinnedHostBuffer, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
     Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
@@ -42,15 +42,16 @@ use eider_cuda::{
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
     fp8_linear_f32_into_on_stream, fp8_linear_pair_configured_f32_into_on_stream,
     fp8_linear_triple_configured_f32_into_on_stream, fp8_linear_w8a8_f32_into_on_stream,
-    fp8_moe_grouped_down_addressed_f32_into_on_stream,
+    fp8_moe_grouped_down_addresses_f32_into_on_stream,
     fp8_moe_grouped_gate_up_addressed_f32_into_on_stream, gated_delta_net_128_f32_into_on_stream,
-    gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
+    gated_rms_norm_f32_into_on_stream, gather_nvfp4_grouped_gemv_address_tables_on_stream,
     indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
-    moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
+    moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slot_addresses_on_stream,
+    moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream,
     moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slot_addresses_f32_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
-    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
+    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_addresses_f32_into_on_stream,
@@ -3012,7 +3013,7 @@ pub struct Qwen36MoeWorkspace {
     pub gate_up_input_simple_scales: DeviceBuffer<u8>,
     pub grouped_gate_up: Option<GroupedGemvWorkspace>,
     w4a16_gate_up_output: DeviceBuffer<f32>,
-    w4a16_gate_up_table: DeviceBuffer<*const f32>,
+    w4a16_gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
     fp8_hidden_input: DeviceBuffer<u8>,
     fp8_hidden_input_scale: DeviceBuffer<f32>,
     fp8_down_input: DeviceBuffer<u8>,
@@ -3148,7 +3149,6 @@ struct Sm12xGateUpWorkspace {
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
     _outputs: Vec<F32Matrix>,
-    d: DeviceBuffer<*mut f32>,
     indexed_d: DeviceBuffer<DeviceAddress<f32>>,
     groups: usize,
 }
@@ -3168,11 +3168,9 @@ impl Sm12xGateUpWorkspace {
             });
         }
         let mut outputs = Vec::with_capacity(groups);
-        let mut d_ptrs = Vec::with_capacity(groups);
         let mut indexed_d = Vec::with_capacity(groups);
         for _ in 0..groups {
-            let mut output = F32Matrix::zeroed(out_features, 1)?;
-            d_ptrs.push(output.data_mut_ptr());
+            let output = F32Matrix::zeroed(out_features, 1)?;
             indexed_d.push(output.data_address());
             outputs.push(output);
         }
@@ -3180,7 +3178,6 @@ impl Sm12xGateUpWorkspace {
             b_tiles: DeviceBuffer::zeroed(b_groups * (in_features / 64) * 512)?,
             b_scales: DeviceBuffer::zeroed(b_groups * (in_features / 64))?,
             _outputs: outputs,
-            d: DeviceBuffer::from_host(&d_ptrs)?,
             indexed_d: DeviceBuffer::from_host(&indexed_d)?,
             groups,
         })
@@ -3194,7 +3191,7 @@ impl Sm12xGateUpWorkspace {
                 .iter()
                 .map(F32Matrix::device_bytes)
                 .sum::<usize>()
-            + self.d.device_bytes()
+            + self.indexed_d.device_bytes()
     }
 }
 
@@ -3470,7 +3467,7 @@ impl Qwen36ExpertPager {
             workspace.w4a16_gate_up_output.output(),
             stream,
         )?;
-        moe_silu_quantize_slots_on_stream(
+        moe_silu_quantize_slot_addresses_on_stream(
             slot_indices,
             &workspace.w4a16_gate_up_table,
             &mut workspace.sm12x_down.b_tiles,
@@ -3631,14 +3628,14 @@ impl Qwen36MoeWeights {
 
         // Pointer table fields which are irrelevant to the selected path remain
         // null. Their allocations are tiny and preserve the shared table ABI.
-        let gate_up_ptrs = vec![std::ptr::null(); experts];
-        let gate_up_scale_ptrs = vec![std::ptr::null(); experts];
-        let mut gate_up_grouped_value_ptrs = vec![std::ptr::null(); experts];
-        let mut gate_up_grouped_scale_ptrs = vec![std::ptr::null(); experts];
-        let down_ptrs = vec![std::ptr::null(); experts];
-        let down_scale_ptrs = vec![std::ptr::null(); experts];
-        let mut down_grouped_value_ptrs = vec![std::ptr::null(); experts];
-        let mut down_grouped_scale_ptrs = vec![std::ptr::null(); experts];
+        let gate_up_ptrs = vec![DeviceAddress::null(); experts];
+        let gate_up_scale_ptrs = vec![DeviceAddress::null(); experts];
+        let mut gate_up_grouped_value_ptrs = vec![DeviceAddress::null(); experts];
+        let mut gate_up_grouped_scale_ptrs = vec![DeviceAddress::null(); experts];
+        let down_ptrs = vec![DeviceAddress::null(); experts];
+        let down_scale_ptrs = vec![DeviceAddress::null(); experts];
+        let mut down_grouped_value_ptrs = vec![DeviceAddress::null(); experts];
+        let mut down_grouped_scale_ptrs = vec![DeviceAddress::null(); experts];
         let mut down_input_scales = Vec::with_capacity(experts);
         let mut down_alphas = Vec::with_capacity(experts);
         let mut gate_up_alphas = Vec::with_capacity(experts);
@@ -3692,12 +3689,12 @@ impl Qwen36MoeWeights {
         }
 
         for (expert_idx, weight) in grouped_gate_up.iter().enumerate() {
-            gate_up_grouped_value_ptrs[expert_idx] = weight.matrix().values_ptr();
-            gate_up_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_ptr();
+            gate_up_grouped_value_ptrs[expert_idx] = weight.matrix().values_address();
+            gate_up_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_address();
         }
         for (expert_idx, weight) in grouped_down.iter().enumerate() {
-            down_grouped_value_ptrs[expert_idx] = weight.matrix().values_ptr();
-            down_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_ptr();
+            down_grouped_value_ptrs[expert_idx] = weight.matrix().values_address();
+            down_grouped_scale_ptrs[expert_idx] = weight.matrix().scales_address();
         }
         let gate_up_storage = Qwen36GateUpStorage::CutlassW4A4;
         let grouped = if grouped_gate_up.len() == experts && grouped_down.len() == experts {
@@ -3822,7 +3819,7 @@ impl Qwen36MoeWeights {
             manifest.hidden,
         )?;
 
-        let null_u8 = vec![std::ptr::null(); experts];
+        let null_u8 = vec![DeviceAddress::null(); experts];
         let expert_ptrs = MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&null_u8)?,
             gate_up_scales: DeviceBuffer::from_host(&null_u8)?,
@@ -3917,7 +3914,7 @@ impl Qwen36MoeWeights {
             1,
             manifest.hidden,
         )?;
-        let null_u8 = vec![std::ptr::null(); experts];
+        let null_u8 = vec![DeviceAddress::null(); experts];
         let expert_ptrs = MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&null_u8)?,
             gate_up_scales: DeviceBuffer::from_host(&null_u8)?,
@@ -4151,7 +4148,7 @@ impl Qwen36MoeWeights {
                         label: "Qwen3.6 grouped down",
                         detail: "grouped gate/up workspace is unavailable".to_string(),
                     })?
-                    .c
+                    .output
             }
             Qwen36GateUpStorage::Fp8 => &workspace.w4a16_gate_up_table,
             Qwen36GateUpStorage::Paged => {
@@ -4171,7 +4168,7 @@ impl Qwen36MoeWeights {
         let enable_sm12x = self.storage_plan.down == Qwen36DownStorage::Sm12x;
         if enable_sm12x && self.sm12x_down_tiles.is_some() && self.sm12x_down_scales.is_some() {
             let gate_up_alpha_table = &self.gate_up_unity_alphas;
-            return moe_silu_quantize_slots_on_stream(
+            return moe_silu_quantize_slot_addresses_on_stream(
                 &workspace.route.indices,
                 gate_up_table,
                 &mut workspace.sm12x_down.b_tiles,
@@ -4183,12 +4180,12 @@ impl Qwen36MoeWeights {
                 stream,
             );
         }
-        eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-            MoeSiluQuantizeSlotBuffers {
+        moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+            MoeSiluQuantizeAddressSlotBuffers {
                 indices: &workspace.route.indices,
                 gate_up_table,
-                packed_table: grouped_down.input_values_mut.output(),
-                scales_table: grouped_down.input_scales_mut.output(),
+                packed_table: grouped_down.input_values.output(),
+                scales_table: grouped_down.input_scales.output(),
                 input_scale_table: &self.expert_ptrs.down_input_scales,
                 gate_up_alpha_table: &self.expert_ptrs.gate_up_alphas,
             },
@@ -4354,15 +4351,14 @@ impl Qwen36MoeWeights {
                 label: "Qwen3.6 grouped down",
                 detail: "grouped down workspace is unavailable".to_string(),
             })?;
-        gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
-            GroupedGemvPointerTableBuffers {
+        gather_nvfp4_grouped_gemv_address_tables_on_stream(
+            GroupedGemvAddressTableBuffers {
                 indices: &workspace.route.indices,
                 a_values_table: &self.expert_ptrs.down_grouped_values,
                 a_scales_table: &self.expert_ptrs.down_grouped_scales,
                 b_values_table: &grouped_down.input_values,
                 b_scales_table: &grouped_down.input_scales,
-                c_table: grouped_down.gemv.c.inout(),
-                d_table: grouped_down.gemv.d.inout(),
+                output_table: grouped_down.gemv.output.output(),
                 out_a_values: grouped_down.gemv.a_values.output(),
                 out_a_scales: grouped_down.gemv.a_scales.output(),
                 out_b_values: grouped_down.gemv.b_values.output(),
@@ -4405,13 +4401,12 @@ impl Qwen36MoeWeights {
                 stream,
             );
         }
-        grouped_down.gemv.plan.run_on_stream(
+        grouped_down.gemv.plan.run_output_addresses_on_stream(
             &grouped_down.gemv.a_values,
             &grouped_down.gemv.a_scales,
             &grouped_down.gemv.b_values,
             &grouped_down.gemv.b_scales,
-            &grouped_down.gemv.c,
-            &grouped_down.gemv.d,
+            &grouped_down.gemv.output,
             1.0,
             0.0,
             stream,
@@ -4442,10 +4437,10 @@ impl Qwen36MoeWeights {
                 stream,
             );
         }
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &workspace.route.indices,
             &workspace.route.weights,
-            &grouped_down.gemv.c,
+            &grouped_down.gemv.output,
             &self.expert_ptrs.down_alphas,
             workspace.moe_out.inout(),
             stream,
@@ -4707,17 +4702,17 @@ impl Qwen36MoeWeights {
                 .grouped_gate_up
                 .as_ref()
                 .expect("resident W4A4 gate/up workspace")
-                .c;
+                .output;
             let grouped_down = row_workspace
                 .grouped_down
                 .as_mut()
                 .expect("resident W4A4 down workspace");
-            eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-                MoeSiluQuantizeSlotBuffers {
+            moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+                MoeSiluQuantizeAddressSlotBuffers {
                     indices: &row_workspace.route.indices,
                     gate_up_table,
-                    packed_table: grouped_down.input_values_mut.output(),
-                    scales_table: grouped_down.input_scales_mut.output(),
+                    packed_table: grouped_down.input_values.output(),
+                    scales_table: grouped_down.input_scales.output(),
                     input_scale_table: &self.expert_ptrs.down_input_scales,
                     gate_up_alpha_table: &self.gate_up_unity_alphas,
                 },
@@ -4964,13 +4959,13 @@ impl Qwen36MoeWeights {
             let sm12x_down = &workspace.sm12x_down;
             if let Some(profile) = profile.as_deref_mut() {
                 let (_, gemv_ms) = timed_cuda(stream, || {
-                    fp8_moe_grouped_down_addressed_f32_into_on_stream(
+                    fp8_moe_grouped_down_addresses_f32_into_on_stream(
                         &workspace.route.indices,
                         &workspace.fp8_down_input,
                         &workspace.fp8_down_input_scales,
                         &fp8.down.weights,
                         &fp8.down.scales,
-                        &sm12x_down.d,
+                        &sm12x_down.indexed_d,
                         manifest.hidden,
                         self.expert_intermediate,
                         self.experts_per_token,
@@ -4991,13 +4986,13 @@ impl Qwen36MoeWeights {
                 profile.qwen36_routed_down_accum_ms += accum_ms;
                 profile.qwen36_routed_down_ms += gemv_ms + accum_ms;
             } else {
-                fp8_moe_grouped_down_addressed_f32_into_on_stream(
+                fp8_moe_grouped_down_addresses_f32_into_on_stream(
                     &workspace.route.indices,
                     &workspace.fp8_down_input,
                     &workspace.fp8_down_input_scales,
                     &fp8.down.weights,
                     &fp8.down.scales,
-                    &sm12x_down.d,
+                    &sm12x_down.indexed_d,
                     manifest.hidden,
                     self.expert_intermediate,
                     self.experts_per_token,
@@ -5078,12 +5073,12 @@ impl Qwen36MoeWeights {
                 .grouped_gate_up
                 .as_ref()
                 .expect("grouped W4A4 workspace")
-                .c;
+                .output;
             let gate_up_alpha_table = &self.gate_up_unity_alphas;
             if use_sm12x_down {
                 let sm12x_down = &mut workspace.sm12x_down;
                 let mut run_silu_quantize = || {
-                    moe_silu_quantize_slots_on_stream(
+                    moe_silu_quantize_slot_addresses_on_stream(
                         &workspace.route.indices,
                         gate_up_table,
                         &mut sm12x_down.b_tiles,
@@ -5103,12 +5098,12 @@ impl Qwen36MoeWeights {
                 }
             } else if let Some(profile) = profile.as_deref_mut() {
                 let (_, ms) = timed_cuda(stream, || {
-                    eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-                        MoeSiluQuantizeSlotBuffers {
+                    moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+                        MoeSiluQuantizeAddressSlotBuffers {
                             indices: &workspace.route.indices,
                             gate_up_table,
-                            packed_table: grouped_down.input_values_mut.output(),
-                            scales_table: grouped_down.input_scales_mut.output(),
+                            packed_table: grouped_down.input_values.output(),
+                            scales_table: grouped_down.input_scales.output(),
                             input_scale_table: &self.expert_ptrs.down_input_scales,
                             gate_up_alpha_table,
                         },
@@ -5118,12 +5113,12 @@ impl Qwen36MoeWeights {
                 })?;
                 profile.qwen36_routed_silu_quantize_ms += ms;
             } else {
-                eider_cuda::moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-                    MoeSiluQuantizeSlotBuffers {
+                moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+                    MoeSiluQuantizeAddressSlotBuffers {
                         indices: &workspace.route.indices,
                         gate_up_table,
-                        packed_table: grouped_down.input_values_mut.output(),
-                        scales_table: grouped_down.input_scales_mut.output(),
+                        packed_table: grouped_down.input_values.output(),
+                        scales_table: grouped_down.input_scales.output(),
                         input_scale_table: &self.expert_ptrs.down_input_scales,
                         gate_up_alpha_table,
                     },
@@ -5179,15 +5174,14 @@ impl Qwen36MoeWeights {
                 }
             } else if let Some(profile) = profile.as_deref_mut() {
                 let (_, gather_ms) = timed_cuda(stream, || {
-                    gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
-                        GroupedGemvPointerTableBuffers {
+                    gather_nvfp4_grouped_gemv_address_tables_on_stream(
+                        GroupedGemvAddressTableBuffers {
                             indices: &workspace.route.indices,
                             a_values_table: &self.expert_ptrs.down_grouped_values,
                             a_scales_table: &self.expert_ptrs.down_grouped_scales,
                             b_values_table: &grouped_down.input_values,
                             b_scales_table: &grouped_down.input_scales,
-                            c_table: grouped_down.gemv.c.inout(),
-                            d_table: grouped_down.gemv.d.inout(),
+                            output_table: grouped_down.gemv.output.output(),
                             out_a_values: grouped_down.gemv.a_values.output(),
                             out_a_scales: grouped_down.gemv.a_scales.output(),
                             out_b_values: grouped_down.gemv.b_values.output(),
@@ -5198,13 +5192,12 @@ impl Qwen36MoeWeights {
                 })?;
                 profile.qwen36_routed_down_gather_ms += gather_ms;
                 let (_, gemv_ms) = timed_cuda(stream, || {
-                    grouped_down.gemv.plan.run_on_stream(
+                    grouped_down.gemv.plan.run_output_addresses_on_stream(
                         &grouped_down.gemv.a_values,
                         &grouped_down.gemv.a_scales,
                         &grouped_down.gemv.b_values,
                         &grouped_down.gemv.b_scales,
-                        &grouped_down.gemv.c,
-                        &grouped_down.gemv.d,
+                        &grouped_down.gemv.output,
                         1.0,
                         0.0,
                         stream,
@@ -5212,10 +5205,10 @@ impl Qwen36MoeWeights {
                 })?;
                 profile.qwen36_routed_down_gemv_ms += gemv_ms;
                 let (_, accum_ms) = timed_cuda(stream, || {
-                    moe_weighted_accumulate_slots_f32_on_stream(
+                    moe_weighted_accumulate_slot_addresses_f32_on_stream(
                         &workspace.route.indices,
                         &workspace.route.weights,
-                        &grouped_down.gemv.c,
+                        &grouped_down.gemv.output,
                         &self.expert_ptrs.down_alphas,
                         workspace.moe_out.inout(),
                         stream,
@@ -5717,8 +5710,6 @@ impl Qwen36MoeWorkspace {
                     .sum::<usize>()
                 + workspace.input_values.device_bytes()
                 + workspace.input_scales.device_bytes()
-                + workspace.input_values_mut.device_bytes()
-                + workspace.input_scales_mut.device_bytes()
         });
         self.router_logits.device_bytes()
             + self.route.indices.device_bytes()
@@ -5801,8 +5792,12 @@ impl Qwen36MoeWorkspace {
         let w4a16_gate_up_offsets = (0..experts_per_token)
             .map(|slot| slot * gate_up_out_features)
             .collect::<Vec<_>>();
-        let w4a16_gate_up_table =
-            w4a16_gate_up_output.legacy_const_pointer_table(&w4a16_gate_up_offsets)?;
+        let w4a16_gate_up_table = DeviceBuffer::from_host(
+            &w4a16_gate_up_offsets
+                .iter()
+                .map(|&offset| w4a16_gate_up_output.address_at(offset))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(experts)?,
             route: MoeRouteWorkspace::new(experts_per_token)?,

@@ -5,15 +5,16 @@
 use crate::kv_cache::KvCache;
 use eider_cuda::{
     ArgmaxResult, CublasLt, CudaEvent, CudaGraphExec, CudaStream, CutlassFp4GroupedGemvF32Plan,
-    DeviceBuffer, Error, F32Matrix, Fp4TnMatmulPlan, GemmShape, GroupedGemvPointerBuffers,
-    GroupedGemvPointerTableBuffers, ModelOptCublasLtWeight, ModelOptNvfp4Activation,
-    MoeSiluQuantizeSlotBuffers, Nvfp4Matrix, Nvfp4TnInputs, Result, add_f32_into_on_stream,
-    append_rows_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_argmax_f32,
-    bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    copy_row_f32_into_on_stream, fill_f32_into_on_stream, format,
-    gather_nvfp4_grouped_gemv_ptr_tables_on_stream, gather_nvfp4_grouped_gemv_ptrs_on_stream,
-    moe_silu_quantize_slots_nvfp4_simple_scales_on_stream, moe_topk_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
+    DeviceAddress, DeviceBuffer, Error, F32Matrix, Fp4TnMatmulPlan, GemmShape,
+    GroupedGemvAddressBuffers, GroupedGemvAddressTableBuffers, ModelOptCublasLtWeight,
+    ModelOptNvfp4Activation, MoeSiluQuantizeAddressSlotBuffers, Nvfp4Matrix, Nvfp4TnInputs, Result,
+    add_f32_into_on_stream, append_rows_f32_into_on_stream, argmax_f32_into_on_stream,
+    bf16_linear_argmax_f32, bf16_linear_logits_f32_into_on_stream,
+    copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
+    fill_f32_into_on_stream, format, gather_nvfp4_grouped_gemv_address_tables_on_stream,
+    gather_nvfp4_grouped_gemv_addresses_on_stream,
+    moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream, moe_topk_f32_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
     rms_norm_rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
     scaled_add_f32_into_on_stream, silu_mul_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
@@ -1260,16 +1261,16 @@ pub struct MoeRouteWorkspace {
 }
 
 pub struct MoeExpertPointerTables {
-    pub gate_up_values: DeviceBuffer<*const u8>,
-    pub gate_up_scales: DeviceBuffer<*const u8>,
-    pub gate_up_grouped_values: DeviceBuffer<*const u8>,
-    pub gate_up_grouped_scales: DeviceBuffer<*const u8>,
+    pub gate_up_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub gate_up_scales: DeviceBuffer<DeviceAddress<u8>>,
+    pub gate_up_grouped_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub gate_up_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
     #[allow(dead_code)]
-    pub down_values: DeviceBuffer<*const u8>,
+    pub down_values: DeviceBuffer<DeviceAddress<u8>>,
     #[allow(dead_code)]
-    pub down_scales: DeviceBuffer<*const u8>,
-    pub down_grouped_values: DeviceBuffer<*const u8>,
-    pub down_grouped_scales: DeviceBuffer<*const u8>,
+    pub down_scales: DeviceBuffer<DeviceAddress<u8>>,
+    pub down_grouped_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub down_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
     pub down_input_scales: DeviceBuffer<f32>,
     pub down_alphas: DeviceBuffer<f32>,
     pub shared_gate_up_input_scale: Option<f32>,
@@ -1280,20 +1281,17 @@ pub struct MoeGroupedDownWorkspace {
     pub gemv: GroupedGemvWorkspace,
     pub inputs: Vec<Nvfp4Matrix>,
     pub input_simple_scales: Vec<DeviceBuffer<u8>>,
-    pub input_values: DeviceBuffer<*const u8>,
-    pub input_scales: DeviceBuffer<*const u8>,
-    pub input_values_mut: DeviceBuffer<*mut u8>,
-    pub input_scales_mut: DeviceBuffer<*mut u8>,
+    pub input_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub input_scales: DeviceBuffer<DeviceAddress<u8>>,
 }
 
 pub struct GroupedGemvWorkspace {
     pub plan: CutlassFp4GroupedGemvF32Plan,
-    pub a_values: DeviceBuffer<*const u8>,
-    pub a_scales: DeviceBuffer<*const u8>,
-    pub b_values: DeviceBuffer<*const u8>,
-    pub b_scales: DeviceBuffer<*const u8>,
-    pub c: DeviceBuffer<*const f32>,
-    pub d: DeviceBuffer<*mut f32>,
+    pub a_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub a_scales: DeviceBuffer<DeviceAddress<u8>>,
+    pub b_values: DeviceBuffer<DeviceAddress<u8>>,
+    pub b_scales: DeviceBuffer<DeviceAddress<u8>>,
+    pub output: DeviceBuffer<DeviceAddress<f32>>,
     pub outputs: Vec<F32Matrix>,
     zero: F32Matrix,
 }
@@ -2758,8 +2756,8 @@ impl MoeExpertPointerTables {
             let expert = expert.get()?;
             let gate_up = &expert.gate_up_proj.device;
             let gate_up_matrix = gate_up.matrix();
-            gate_up_values.push(gate_up_matrix.values_ptr());
-            gate_up_scales.push(gate_up_matrix.scales_ptr());
+            gate_up_values.push(gate_up_matrix.values_address());
+            gate_up_scales.push(gate_up_matrix.scales_address());
             match shared_gate_up_input_scale {
                 None => shared_gate_up_input_scale = Some(gate_up.input_scale()),
                 Some(first) if first == gate_up.input_scale() => {}
@@ -2769,8 +2767,8 @@ impl MoeExpertPointerTables {
 
             let down = &expert.down_proj.device;
             let down_matrix = down.matrix();
-            down_values.push(down_matrix.values_ptr());
-            down_scales.push(down_matrix.scales_ptr());
+            down_values.push(down_matrix.values_address());
+            down_scales.push(down_matrix.scales_address());
             down_input_scales.push(down.input_scale());
             down_alphas.push(down.matmul_alpha());
         }
@@ -2779,21 +2777,21 @@ impl MoeExpertPointerTables {
             gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
             gate_up_grouped_values: DeviceBuffer::from_host(&vec![
-                std::ptr::null();
+                DeviceAddress::null();
                 expert_weights.len()
             ])?,
             gate_up_grouped_scales: DeviceBuffer::from_host(&vec![
-                std::ptr::null();
+                DeviceAddress::null();
                 expert_weights.len()
             ])?,
             down_values: DeviceBuffer::from_host(&down_values)?,
             down_scales: DeviceBuffer::from_host(&down_scales)?,
             down_grouped_values: DeviceBuffer::from_host(&vec![
-                std::ptr::null();
+                DeviceAddress::null();
                 expert_weights.len()
             ])?,
             down_grouped_scales: DeviceBuffer::from_host(&vec![
-                std::ptr::null();
+                DeviceAddress::null();
                 expert_weights.len()
             ])?,
             down_input_scales: DeviceBuffer::from_host(&down_input_scales)?,
@@ -2813,15 +2811,11 @@ impl MoeGroupedDownWorkspace {
         let mut input_simple_scales = Vec::with_capacity(groups);
         let mut input_values = Vec::with_capacity(groups);
         let mut input_scales = Vec::with_capacity(groups);
-        let mut input_values_mut = Vec::with_capacity(groups);
-        let mut input_scales_mut = Vec::with_capacity(groups);
         for _ in 0..groups {
-            let mut input = Nvfp4Matrix::zeroed_col_major(in_features, 1)?;
+            let input = Nvfp4Matrix::zeroed_col_major(in_features, 1)?;
             let simple_scales = DeviceBuffer::zeroed(in_features.div_ceil(16))?;
-            input_values.push(input.values_ptr());
-            input_scales.push(simple_scales.as_const_ptr().cast::<u8>());
-            input_values_mut.push(input.values_mut_ptr().cast());
-            input_scales_mut.push(simple_scales.as_const_ptr().cast_mut().cast::<u8>());
+            input_values.push(input.values_address());
+            input_scales.push(simple_scales.cuda_address());
             inputs.push(input);
             input_simple_scales.push(simple_scales);
         }
@@ -2831,8 +2825,6 @@ impl MoeGroupedDownWorkspace {
             input_simple_scales,
             input_values: DeviceBuffer::from_host(&input_values)?,
             input_scales: DeviceBuffer::from_host(&input_scales)?,
-            input_values_mut: DeviceBuffer::from_host(&input_values_mut)?,
-            input_scales_mut: DeviceBuffer::from_host(&input_scales_mut)?,
         }))
     }
 
@@ -2840,7 +2832,7 @@ impl MoeGroupedDownWorkspace {
         &mut self,
         route: &MoeRouteWorkspace,
         expert_ptrs: &MoeExpertPointerTables,
-        gate_up_outputs: &DeviceBuffer<*const f32>,
+        gate_up_outputs: &DeviceBuffer<DeviceAddress<f32>>,
         ffn_out: &mut DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<bool> {
@@ -2848,27 +2840,26 @@ impl MoeGroupedDownWorkspace {
         if route.indices.len() != groups || self.gemv.outputs.len() != groups {
             return Ok(false);
         }
-        moe_silu_quantize_slots_nvfp4_simple_scales_on_stream(
-            MoeSiluQuantizeSlotBuffers {
+        moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+            MoeSiluQuantizeAddressSlotBuffers {
                 indices: &route.indices,
                 gate_up_table: gate_up_outputs,
-                packed_table: self.input_values_mut.output(),
-                scales_table: self.input_scales_mut.output(),
+                packed_table: self.input_values.output(),
+                scales_table: self.input_scales.output(),
                 input_scale_table: &expert_ptrs.down_input_scales,
                 gate_up_alpha_table: &expert_ptrs.gate_up_alphas,
             },
             self.inputs[0].rows,
             stream,
         )?;
-        gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
-            GroupedGemvPointerTableBuffers {
+        gather_nvfp4_grouped_gemv_address_tables_on_stream(
+            GroupedGemvAddressTableBuffers {
                 indices: &route.indices,
                 a_values_table: &expert_ptrs.down_grouped_values,
                 a_scales_table: &expert_ptrs.down_grouped_scales,
                 b_values_table: &self.input_values,
                 b_scales_table: &self.input_scales,
-                c_table: self.gemv.c.inout(),
-                d_table: self.gemv.d.inout(),
+                output_table: self.gemv.output.output(),
                 out_a_values: self.gemv.a_values.output(),
                 out_a_scales: self.gemv.a_scales.output(),
                 out_b_values: self.gemv.b_values.output(),
@@ -2876,21 +2867,20 @@ impl MoeGroupedDownWorkspace {
             },
             stream,
         )?;
-        self.gemv.plan.run_on_stream(
+        self.gemv.plan.run_output_addresses_on_stream(
             &self.gemv.a_values,
             &self.gemv.a_scales,
             &self.gemv.b_values,
             &self.gemv.b_scales,
-            &self.gemv.c,
-            &self.gemv.d,
+            &self.gemv.output,
             1.0,
             0.0,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &route.indices,
             &route.weights,
-            &self.gemv.c,
+            &self.gemv.output,
             &expert_ptrs.down_alphas,
             ffn_out.inout(),
             stream,
@@ -2909,15 +2899,14 @@ impl MoeGroupedDownWorkspace {
         if route.indices.len() != groups || self.gemv.outputs.len() != groups {
             return Ok(false);
         }
-        gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
-            GroupedGemvPointerTableBuffers {
+        gather_nvfp4_grouped_gemv_address_tables_on_stream(
+            GroupedGemvAddressTableBuffers {
                 indices: &route.indices,
                 a_values_table: &expert_ptrs.down_grouped_values,
                 a_scales_table: &expert_ptrs.down_grouped_scales,
                 b_values_table: &self.input_values,
                 b_scales_table: &self.input_scales,
-                c_table: self.gemv.c.inout(),
-                d_table: self.gemv.d.inout(),
+                output_table: self.gemv.output.output(),
                 out_a_values: self.gemv.a_values.output(),
                 out_a_scales: self.gemv.a_scales.output(),
                 out_b_values: self.gemv.b_values.output(),
@@ -2925,21 +2914,20 @@ impl MoeGroupedDownWorkspace {
             },
             stream,
         )?;
-        self.gemv.plan.run_on_stream(
+        self.gemv.plan.run_output_addresses_on_stream(
             &self.gemv.a_values,
             &self.gemv.a_scales,
             &self.gemv.b_values,
             &self.gemv.b_scales,
-            &self.gemv.c,
-            &self.gemv.d,
+            &self.gemv.output,
             1.0,
             0.0,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &route.indices,
             &route.weights,
-            &self.gemv.c,
+            &self.gemv.output,
             &expert_ptrs.down_alphas,
             ffn_out.inout(),
             stream,
@@ -2955,22 +2943,19 @@ impl GroupedGemvWorkspace {
         }
         let plan = CutlassFp4GroupedGemvF32Plan::new(out_features, in_features, groups)?;
         let mut outputs = Vec::with_capacity(groups);
-        let mut c_ptrs = Vec::with_capacity(groups);
-        let mut d_ptrs = Vec::with_capacity(groups);
+        let mut output_addresses = Vec::with_capacity(groups);
         for _ in 0..groups {
-            let mut output = F32Matrix::zeroed(out_features, 1)?;
-            c_ptrs.push(output.data_ptr());
-            d_ptrs.push(output.data_mut_ptr().cast());
+            let output = F32Matrix::zeroed(out_features, 1)?;
+            output_addresses.push(output.data_address());
             outputs.push(output);
         }
         Ok(Some(Self {
             plan,
-            a_values: DeviceBuffer::from_host(&vec![std::ptr::null(); groups])?,
-            a_scales: DeviceBuffer::from_host(&vec![std::ptr::null(); groups])?,
-            b_values: DeviceBuffer::from_host(&vec![std::ptr::null(); groups])?,
-            b_scales: DeviceBuffer::from_host(&vec![std::ptr::null(); groups])?,
-            c: DeviceBuffer::from_host(&c_ptrs)?,
-            d: DeviceBuffer::from_host(&d_ptrs)?,
+            a_values: DeviceBuffer::from_host(&vec![DeviceAddress::null(); groups])?,
+            a_scales: DeviceBuffer::from_host(&vec![DeviceAddress::null(); groups])?,
+            b_values: DeviceBuffer::from_host(&vec![DeviceAddress::null(); groups])?,
+            b_scales: DeviceBuffer::from_host(&vec![DeviceAddress::null(); groups])?,
+            output: DeviceBuffer::from_host(&output_addresses)?,
             outputs,
             zero: F32Matrix::zeroed(out_features, 1)?,
         }))
@@ -2981,8 +2966,7 @@ impl GroupedGemvWorkspace {
             + self.a_scales.device_bytes()
             + self.b_values.device_bytes()
             + self.b_scales.device_bytes()
-            + self.c.device_bytes()
-            + self.d.device_bytes()
+            + self.output.device_bytes()
             + self
                 .outputs
                 .iter()
@@ -3020,14 +3004,14 @@ impl GroupedGemvWorkspace {
         if indices.len() != groups {
             return Ok(false);
         }
-        self.plan.run_indexed_a_tiled_scales_on_stream(
+        self.plan.run_indexed_a_tiled_scale_addresses_on_stream(
             indices,
             &expert_ptrs.gate_up_grouped_values,
             &expert_ptrs.gate_up_grouped_scales,
             &expert_ptrs.gate_up_alphas,
             gate_up_input,
             &self.zero,
-            &self.d,
+            &self.output,
             stream,
         )?;
         Ok(true)
@@ -3038,22 +3022,21 @@ impl GroupedGemvWorkspace {
         route: &MoeRouteWorkspace,
         expert_ptrs: &MoeExpertPointerTables,
         gate_up_input: &Nvfp4Matrix,
-        gate_up_input_scales: *const u8,
+        gate_up_input_scales: DeviceAddress<u8>,
         stream: &CudaStream,
     ) -> Result<bool> {
         let groups = self.outputs.len();
         if route.indices.len() != groups {
             return Ok(false);
         }
-        gather_nvfp4_grouped_gemv_ptrs_on_stream(
-            GroupedGemvPointerBuffers {
+        gather_nvfp4_grouped_gemv_addresses_on_stream(
+            GroupedGemvAddressBuffers {
                 indices: &route.indices,
                 a_values_table: &expert_ptrs.gate_up_grouped_values,
                 a_scales_table: &expert_ptrs.gate_up_grouped_scales,
-                b_values: gate_up_input.values_ptr(),
+                b_values: gate_up_input.values_address(),
                 b_scales: gate_up_input_scales,
-                c_table: self.c.inout(),
-                d_table: self.d.inout(),
+                output_table: self.output.output(),
                 out_a_values: self.a_values.output(),
                 out_a_scales: self.a_scales.output(),
                 out_b_values: self.b_values.output(),
@@ -3061,13 +3044,12 @@ impl GroupedGemvWorkspace {
             },
             stream,
         )?;
-        self.plan.run_on_stream(
+        self.plan.run_output_addresses_on_stream(
             &self.a_values,
             &self.a_scales,
             &self.b_values,
             &self.b_scales,
-            &self.c,
-            &self.d,
+            &self.output,
             1.0,
             0.0,
             stream,
@@ -3194,7 +3176,7 @@ fn run_moe_decode_ffn(
             route_workspace,
             expert_ptrs,
             gate_up_input,
-            gate_up_input.scales_ptr(),
+            gate_up_input.scales_address(),
             stream,
         )?;
         if count {
@@ -3214,7 +3196,7 @@ fn run_moe_decode_ffn(
         grouped_down.run_device_route(
             route_workspace,
             expert_ptrs,
-            &grouped_gate_up.c,
+            &grouped_gate_up.output,
             ffn_out,
             stream,
         )?;

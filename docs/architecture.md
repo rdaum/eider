@@ -88,8 +88,10 @@ and execution code cannot introduce unsafe blocks.
 CUDA-owned Q2 and Q3 expert tables and NVFP4 paging slots now store opaque
 `DeviceAddress` values in their device pointer tables instead of raw pointers.
 The live Qwen3.6 and Laguna SM12x indexed-down plans now do the same for
-expert tiles, scales, and route outputs. The legacy raw-table entry point
-remains while focused benchmarks migrate.
+expert tiles, scales, and route outputs. Qwen3.6's live CUTLASS grouped-GEMV
+route also uses typed expert, activation, and output tables; one output table
+now supplies both native C and D operands. Legacy raw CUDA entry points remain
+only while focused CUDA benchmarks migrate.
 Step-3.7 and Laguna SM12x gate/up quantization now also receive typed F32
 activation address tables. Step-3.7's paged down-expert tiles, row scales, and
 per-route output tables now use typed addresses through its residual grouped
@@ -102,16 +104,16 @@ also share typed output-address tables with the SM12x and accumulation launches.
 Gemma 4's one-token routed MoE likewise uses typed
 NVFP4 weight, scale, activation, output, and accumulation tables; its batched
 grouped-GEMM path was already typed.
-Qwen3.6's FP8 routed-expert path likewise uses typed weight and channel-scale
-address tables through its gate/up and down CUDA launches.
+Qwen3.6's FP8 routed-expert path likewise uses typed weight, channel-scale,
+and output address tables through its gate/up and down CUDA launches.
 Ling 3's routed W4A16 workspace uses typed input, expert, output, and
 weighted-accumulation tables for both one-token decode and batched execution.
 Nemotron 3 uses the same typed routed W4A16 tables for resident expert slabs,
 one-token decode, and flattened multi-row execution.
 Qwen3.6's SM12x routed-down output table now uses typed addresses for both
-weighted accumulation and fused FFN finalization. Legacy raw tables remain in
-its older cuBLAS/CUTLASS plans; the W4A16 gate/up compatibility table is built
-by a checked CUDA adapter rather than inference-side pointer arithmetic.
+weighted accumulation and fused FFN finalization. Its live inference code no
+longer owns raw CUDA pointer tables; legacy raw CUDA APIs remain below that
+boundary for focused benchmarks and unported callers.
 DeepSeek V4 attention metadata now stores typed addresses for page tables and
 compressed-state tables, including explicit null entries for absent history.
 Nemotron 3's paged F32 attention uses typed page-table addresses for both
