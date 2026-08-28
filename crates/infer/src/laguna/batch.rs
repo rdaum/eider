@@ -7,7 +7,9 @@ use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, CutlassFp4GroupedGemmPlan, DeviceAddress, GemmShape,
     MoeSortedNvfp4Rows, MoeSortedRoutes, add_f32_prefix_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, f32_to_bf16_prefix_into_on_stream,
-    fill_f32_prefix_into_on_stream, moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
+    fill_f32_prefix_into_on_stream,
+    indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_bf16_expert_sorted_slots_on_stream,
     moe_weighted_accumulate_sorted_slots_f32_batch_on_stream,
     nemotron3_sigmoid_topk_f32_batch_into_on_stream,
     rope_neox_inv_freq_scaled_sequence_f32_at_offset_into_on_stream,
@@ -189,18 +191,18 @@ struct LagunaBatchDownWorkspace {
     b_scales: DeviceBuffer<u32>,
     _outputs: Vec<F32Matrix>,
     inputs: DeviceBuffer<*const f32>,
-    outputs: DeviceBuffer<*mut f32>,
+    indexed_outputs: DeviceBuffer<DeviceAddress<f32>>,
 }
 
 impl LagunaBatchDownWorkspace {
     fn new(routes: usize) -> Result<Self> {
         let mut matrices = Vec::with_capacity(routes);
         let mut inputs = Vec::with_capacity(routes);
-        let mut outputs = Vec::with_capacity(routes);
+        let mut indexed_outputs = Vec::with_capacity(routes);
         for _ in 0..routes {
-            let mut output = F32Matrix::zeroed(HIDDEN, 1)?;
+            let output = F32Matrix::zeroed(HIDDEN, 1)?;
             inputs.push(output.data_ptr());
-            outputs.push(output.data_mut_ptr());
+            indexed_outputs.push(output.data_address());
             matrices.push(output);
         }
         Ok(Self {
@@ -208,7 +210,7 @@ impl LagunaBatchDownWorkspace {
             b_scales: DeviceBuffer::zeroed(routes * (EXPERT_INTERMEDIATE / 64))?,
             _outputs: matrices,
             inputs: DeviceBuffer::from_host(&inputs)?,
-            outputs: DeviceBuffer::from_host(&outputs)?,
+            indexed_outputs: DeviceBuffer::from_host(&indexed_outputs)?,
         })
     }
 }
@@ -888,7 +890,7 @@ fn run_moe_prefill(
         EXPERTS,
         &workspace.down.b_tiles,
         &workspace.down.b_scales,
-        &workspace.down.outputs,
+        &workspace.down.indexed_outputs,
         HIDDEN / 16,
         EXPERT_INTERMEDIATE / 64,
         capacity * TOP_K,

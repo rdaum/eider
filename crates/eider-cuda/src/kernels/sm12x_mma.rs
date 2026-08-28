@@ -2,7 +2,10 @@
 #![allow(missing_docs)]
 
 use crate::cuda::check_cuda;
-use crate::{CudaStream, DeviceBuffer, DeviceOutput, MoeSortedRoutes, PinnedHostBuffer, Result};
+use crate::{
+    CudaStream, DeviceAddress, DeviceBuffer, DeviceOutput, MoeSortedRoutes, PinnedHostBuffer,
+    Result,
+};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -757,9 +760,19 @@ impl Sm12xFp4DeviceGemmWeight {
         self.tiles.as_const_ptr().cast()
     }
 
+    /// Returns the opaque address of the native-tile data.
+    pub fn tiles_address(&self) -> DeviceAddress<u8> {
+        self.tiles.cuda_address()
+    }
+
     /// Returns the scale device pointer.
     pub fn scales_ptr(&self) -> *const u32 {
         self.scales.as_const_ptr().cast()
+    }
+
+    /// Returns the opaque address of the scale data.
+    pub fn scales_address(&self) -> DeviceAddress<u32> {
+        self.scales.cuda_address()
     }
 
     /// Returns the output tile count.
@@ -1495,6 +1508,69 @@ pub fn indexed_gemv_on_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn indexed_grouped_gemv_addresses_on_stream(
+    indices: &DeviceBuffer<u32>,
+    a_native_tiles_table: &DeviceBuffer<DeviceAddress<u8>>,
+    a_scales_table: &DeviceBuffer<DeviceAddress<u32>>,
+    table_len: usize,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    d: &DeviceBuffer<DeviceAddress<f32>>,
+    m_tiles: usize,
+    k_tiles: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if indices.len() < groups
+        || d.len() < groups
+        || a_native_tiles_table.len() != table_len
+        || a_scales_table.len() != table_len
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || table_len > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x indexed grouped GEMV buffers",
+            expected: "expert tables, route indices, grouped B vectors, and output pointers"
+                .to_string(),
+            actual: format!(
+                "indices={} D={} A={} SFA={} table_len={table_len} B={} SFB={} m_tiles={m_tiles} k_tiles={k_tiles} groups={groups}",
+                indices.len(),
+                d.len(),
+                a_native_tiles_table.len(),
+                a_scales_table.len(),
+                b_native_tiles.len(),
+                sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_indexed_grouped_gemv_on_stream",
+            crate::ffi::infer_sm12x_indexed_grouped_gemv_on_stream(
+                indices.as_const_ptr().cast(),
+                a_native_tiles_table.as_const_ptr().cast(),
+                a_scales_table.as_const_ptr().cast(),
+                table_len as u32,
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                d.as_const_ptr().cast(),
+                m_tiles as u32,
+                k_tiles as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Enqueues indexed grouped GEMV through legacy raw-pointer tables.
+///
+/// New inference plans must use [`indexed_grouped_gemv_addresses_on_stream`].
 #[allow(clippy::too_many_arguments)]
 pub fn indexed_grouped_gemv_on_stream(
     indices: &DeviceBuffer<u32>,
@@ -2488,21 +2564,22 @@ mod tests {
         }
         let b_tiles = DeviceBuffer::from_host(&b_tile_bytes).expect("b tiles");
         let b_scales = DeviceBuffer::from_host(&b_scale_words).expect("b scales");
-        let mut outputs = (0..groups)
+        let outputs = (0..groups)
             .map(|_| F32Matrix::zeroed(m, 1))
             .collect::<Result<Vec<_>>>()
             .expect("outputs");
         let d = DeviceBuffer::from_host(
             &outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr())
+                .iter()
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )
         .expect("d");
         let indices = DeviceBuffer::from_host(&vec![0u32; groups]).expect("indices");
-        let a_tiles = DeviceBuffer::from_host(&[weight_device.tiles_ptr()]).expect("a tiles");
-        let a_scales = DeviceBuffer::from_host(&[weight_device.scales_ptr()]).expect("a scales");
-        indexed_grouped_gemv_on_stream(
+        let a_tiles = DeviceBuffer::from_host(&[weight_device.tiles_address()]).expect("a tiles");
+        let a_scales =
+            DeviceBuffer::from_host(&[weight_device.scales_address()]).expect("a scales");
+        indexed_grouped_gemv_addresses_on_stream(
             &indices,
             &a_tiles,
             &a_scales,
@@ -3263,8 +3340,8 @@ mod tests {
             Sm12xFp4GemmWeight::quantize_f32_row_major_m16_k16(m, k, &vec![1.0; m * k])
                 .expect("weight");
         let one = one_quantized.weight.to_device().expect("weight device");
-        let a_tiles = DeviceBuffer::from_host(&[one.tiles_ptr()]).expect("tiles");
-        let a_scales = DeviceBuffer::from_host(&[one.scales_ptr()]).expect("scales");
+        let a_tiles = DeviceBuffer::from_host(&[one.tiles_address()]).expect("tiles");
+        let a_scales = DeviceBuffer::from_host(&[one.scales_address()]).expect("scales");
         let vector_one =
             Sm12xFp4GemmVector::quantize_f32_k16(k, &vec![1.0; k]).expect("vector one");
         let expected_one = (0..k)
@@ -3281,10 +3358,10 @@ mod tests {
         let b_tiles = DeviceBuffer::from_host(&b_tiles_host).expect("b tiles");
         let b_scales = DeviceBuffer::from_host(&b_scales_host).expect("b scales");
         let indices = DeviceBuffer::from_host(&[0u32, 0u32]).expect("indices");
-        let mut out0 = F32Matrix::zeroed(m, 1).expect("out0");
-        let mut out1 = F32Matrix::zeroed(m, 1).expect("out1");
-        let d = DeviceBuffer::from_host(&[out0.data_mut_ptr(), out1.data_mut_ptr()]).expect("d");
-        indexed_grouped_gemv_on_stream(
+        let out0 = F32Matrix::zeroed(m, 1).expect("out0");
+        let out1 = F32Matrix::zeroed(m, 1).expect("out1");
+        let d = DeviceBuffer::from_host(&[out0.data_address(), out1.data_address()]).expect("d");
+        indexed_grouped_gemv_addresses_on_stream(
             &indices,
             &a_tiles,
             &a_scales,

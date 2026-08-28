@@ -590,6 +590,11 @@ impl F32Matrix {
         self.data.as_const_ptr().cast()
     }
 
+    /// Returns the opaque address of the F32 matrix data.
+    pub fn data_address(&self) -> DeviceAddress<f32> {
+        self.data.cuda_address()
+    }
+
     /// Returns the F32 data output pointer.
     pub fn data_mut_ptr(&mut self) -> *mut f32 {
         self.data.as_mut_ptr().cast()

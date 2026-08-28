@@ -11,12 +11,13 @@ use eider_cuda::{
     Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm12xKvAttentionWorkspace, Sm12xKvPagePool,
     add_f32_into_on_stream, argmax_f32_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     bf16_linear_pair_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
-    fill_f32_into_on_stream, indexed_grouped_gemv_on_stream, moe_silu_quantize_slots_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, nemotron3_sigmoid_topk_f32_into_on_stream,
-    quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_inv_freq_scaled_sequence_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
-    round_f32_to_bf16_prefix_in_place_on_stream, silu_mul_f32_into_on_stream,
-    softplus_scale_heads_f32_into_on_stream,
+    fill_f32_into_on_stream,
+    indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
+    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    nemotron3_sigmoid_topk_f32_into_on_stream, quantize_nvfp4_col_major_f32_device_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
+    round_f32_to_bf16_in_place_on_stream, round_f32_to_bf16_prefix_in_place_on_stream,
+    silu_mul_f32_into_on_stream, softplus_scale_heads_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use serde::Deserialize;
@@ -745,8 +746,8 @@ struct LagunaMoe {
     gate_up_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
     gate_up_grouped_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     _down: Vec<Sm12xFp4DeviceGemmWeight>,
-    down_tiles: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u32>,
+    down_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_input_scales: DeviceBuffer<f32>,
     down_alphas: DeviceBuffer<f32>,
     gate_up_unity_alphas: DeviceBuffer<f32>,
@@ -768,6 +769,7 @@ struct LagunaMoeWorkspace {
     _down_outputs: Vec<F32Matrix>,
     down_inputs: DeviceBuffer<*const f32>,
     down_outputs: DeviceBuffer<*mut f32>,
+    indexed_down_outputs: DeviceBuffer<DeviceAddress<f32>>,
     routed: DeviceBuffer<f32>,
     shared: LagunaMlpWorkspace,
     output: DeviceBuffer<f32>,
@@ -792,6 +794,7 @@ impl LagunaMoeWorkspace {
                 .sum::<usize>()
             + self.down_inputs.device_bytes()
             + self.down_outputs.device_bytes()
+            + self.indexed_down_outputs.device_bytes()
             + self.routed.device_bytes()
             + self.shared.device_bytes()
             + self.output.device_bytes()
@@ -864,8 +867,8 @@ impl LagunaMoe {
             let down_path = layer_artifacts.join(format!("expert-{expert:03}-down.sm12x"));
             let native = Sm12xFp4GemmWeight::read_cache_file(&down_path)?;
             let device = native.to_device()?;
-            down_tiles.push(device.tiles_ptr());
-            down_scales.push(device.scales_ptr());
+            down_tiles.push(device.tiles_address());
+            down_scales.push(device.scales_address());
             down.push(device);
         }
         Ok(Self {
@@ -910,10 +913,12 @@ impl LagunaMoe {
         let mut down_outputs = Vec::with_capacity(TOP_K);
         let mut down_inputs = Vec::with_capacity(TOP_K);
         let mut down_output_ptrs = Vec::with_capacity(TOP_K);
+        let mut indexed_down_outputs = Vec::with_capacity(TOP_K);
         for _ in 0..TOP_K {
             let mut output = F32Matrix::zeroed(HIDDEN, 1)?;
             down_inputs.push(output.data_ptr());
             down_output_ptrs.push(output.data_mut_ptr());
+            indexed_down_outputs.push(output.data_address());
             down_outputs.push(output);
         }
         Ok(LagunaMoeWorkspace {
@@ -931,6 +936,7 @@ impl LagunaMoe {
             _down_outputs: down_outputs,
             down_inputs: DeviceBuffer::from_host(&down_inputs)?,
             down_outputs: DeviceBuffer::from_host(&down_output_ptrs)?,
+            indexed_down_outputs: DeviceBuffer::from_host(&indexed_down_outputs)?,
             routed: DeviceBuffer::zeroed(HIDDEN)?,
             shared: self.shared.new_workspace()?,
             output: DeviceBuffer::zeroed(HIDDEN)?,
@@ -995,7 +1001,7 @@ impl LagunaMoe {
             EXPERTS,
             &workspace.down_tiles,
             &workspace.down_scales,
-            &workspace.down_outputs,
+            &workspace.indexed_down_outputs,
             HIDDEN / 16,
             EXPERT_INTERMEDIATE / 64,
             TOP_K,

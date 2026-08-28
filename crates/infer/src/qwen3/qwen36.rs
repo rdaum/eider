@@ -44,7 +44,8 @@ use eider_cuda::{
     fp8_linear_triple_configured_f32_into_on_stream, fp8_linear_w8a8_f32_into_on_stream,
     fp8_moe_grouped_down_f32_into_on_stream, fp8_moe_grouped_gate_up_f32_into_on_stream,
     gated_delta_net_128_f32_into_on_stream, gated_rms_norm_f32_into_on_stream,
-    gather_nvfp4_grouped_gemv_ptr_tables_on_stream, indexed_grouped_gemv_on_stream,
+    gather_nvfp4_grouped_gemv_ptr_tables_on_stream,
+    indexed_grouped_gemv_addresses_on_stream as indexed_grouped_gemv_on_stream,
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slots_on_stream,
     moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
@@ -2722,8 +2723,8 @@ pub struct Qwen36MoeWeights {
     shared: Qwen36SharedExpertStorage,
     shared_gate: Bf16Linear,
     _sm12x_down: Vec<Sm12xFp4DeviceGemmWeight>,
-    sm12x_down_tiles: Option<DeviceBuffer<*const u8>>,
-    sm12x_down_scales: Option<DeviceBuffer<*const u32>>,
+    sm12x_down_tiles: Option<DeviceBuffer<DeviceAddress<u8>>>,
+    sm12x_down_scales: Option<DeviceBuffer<DeviceAddress<u32>>>,
     sm12x_down_m_tiles: usize,
     sm12x_down_k_tiles: usize,
     num_experts: usize,
@@ -2762,8 +2763,8 @@ pub struct Qwen36ExpertPager {
     cache_dir: PathBuf,
     gate_up: Sm121W4A16GateUp,
     down: Vec<Sm12xFp4DeviceGemmWeight>,
-    down_tiles: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u32>,
+    down_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_input_scales: DeviceBuffer<f32>,
     down_alphas: DeviceBuffer<f32>,
     gate_up_unity_alphas: DeviceBuffer<f32>,
@@ -3148,6 +3149,7 @@ struct Sm12xGateUpWorkspace {
     _outputs: Vec<F32Matrix>,
     c: DeviceBuffer<*const f32>,
     d: DeviceBuffer<*mut f32>,
+    indexed_d: DeviceBuffer<DeviceAddress<f32>>,
     groups: usize,
 }
 
@@ -3168,10 +3170,12 @@ impl Sm12xGateUpWorkspace {
         let mut outputs = Vec::with_capacity(groups);
         let mut c_ptrs = Vec::with_capacity(groups);
         let mut d_ptrs = Vec::with_capacity(groups);
+        let mut indexed_d = Vec::with_capacity(groups);
         for _ in 0..groups {
             let mut output = F32Matrix::zeroed(out_features, 1)?;
             c_ptrs.push(output.data_ptr());
             d_ptrs.push(output.data_mut_ptr());
+            indexed_d.push(output.data_address());
             outputs.push(output);
         }
         Ok(Self {
@@ -3180,6 +3184,7 @@ impl Sm12xGateUpWorkspace {
             _outputs: outputs,
             c: DeviceBuffer::from_host(&c_ptrs)?,
             d: DeviceBuffer::from_host(&d_ptrs)?,
+            indexed_d: DeviceBuffer::from_host(&indexed_d)?,
             groups,
         })
     }
@@ -3291,13 +3296,13 @@ impl Qwen36ExpertPager {
         let down_tiles = DeviceBuffer::from_host(
             &down
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::tiles_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_scales = DeviceBuffer::from_host(
             &down
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::scales_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_input_scales = DeviceBuffer::zeroed(capacity)?;
@@ -3487,7 +3492,7 @@ impl Qwen36ExpertPager {
             self.slots.capacity(),
             &workspace.sm12x_down.b_tiles,
             &workspace.sm12x_down.b_scales,
-            &workspace.sm12x_down.d,
+            &workspace.sm12x_down.indexed_d,
             self.hidden / 16,
             self.intermediate / 64,
             self.top_k,
@@ -3684,8 +3689,8 @@ impl Qwen36MoeWeights {
                 let weight = Sm12xFp4GemmWeight::read_cache_file(&path)?.to_device()?;
                 sm12x_down_m_tiles = weight.m_tiles();
                 sm12x_down_k_tiles = weight.k_tiles();
-                sm12x_down_tile_ptrs.push(weight.tiles_ptr());
-                sm12x_down_scale_ptrs.push(weight.scales_ptr());
+                sm12x_down_tile_ptrs.push(weight.tiles_address());
+                sm12x_down_scale_ptrs.push(weight.scales_address());
                 sm12x_down.push(weight);
             }
         }
@@ -4223,7 +4228,7 @@ impl Qwen36MoeWeights {
                 self.num_experts,
                 &workspace.sm12x_down.b_tiles,
                 &workspace.sm12x_down.b_scales,
-                &workspace.sm12x_down.d,
+                &workspace.sm12x_down.indexed_d,
                 self.sm12x_down_m_tiles,
                 self.sm12x_down_k_tiles,
                 workspace.sm12x_down.groups,
@@ -4397,7 +4402,7 @@ impl Qwen36MoeWeights {
                 self.num_experts,
                 &workspace.sm12x_down.b_tiles,
                 &workspace.sm12x_down.b_scales,
-                &workspace.sm12x_down.d,
+                &workspace.sm12x_down.indexed_d,
                 self.sm12x_down_m_tiles,
                 self.sm12x_down_k_tiles,
                 workspace.sm12x_down.groups,
@@ -5150,7 +5155,7 @@ impl Qwen36MoeWeights {
                             self.num_experts,
                             &sm12x_down.b_tiles,
                             &sm12x_down.b_scales,
-                            &sm12x_down.d,
+                            &sm12x_down.indexed_d,
                             self.sm12x_down_m_tiles,
                             self.sm12x_down_k_tiles,
                             sm12x_down.groups,
@@ -5167,7 +5172,7 @@ impl Qwen36MoeWeights {
                         self.num_experts,
                         &sm12x_down.b_tiles,
                         &sm12x_down.b_scales,
-                        &sm12x_down.d,
+                        &sm12x_down.indexed_d,
                         self.sm12x_down_m_tiles,
                         self.sm12x_down_k_tiles,
                         sm12x_down.groups,
