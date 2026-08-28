@@ -2543,6 +2543,22 @@ pub struct GroupedGemvPointerTableBuffers<'a> {
     pub out_b_scales: DeviceOutput<'a, *const u8>,
 }
 
+/// Typed device-address tables used to gather one grouped GEMV launch.
+#[allow(missing_docs)]
+pub struct GroupedGemvAddressTableBuffers<'a> {
+    pub indices: &'a DeviceBuffer<u32>,
+    pub a_values_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    pub a_scales_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    pub b_values_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    pub b_scales_table: &'a DeviceBuffer<DeviceAddress<u8>>,
+    pub c_table: DeviceOutput<'a, DeviceAddress<f32>>,
+    pub d_table: DeviceOutput<'a, DeviceAddress<f32>>,
+    pub out_a_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    pub out_a_scales: DeviceOutput<'a, DeviceAddress<u8>>,
+    pub out_b_values: DeviceOutput<'a, DeviceAddress<u8>>,
+    pub out_b_scales: DeviceOutput<'a, DeviceAddress<u8>>,
+}
+
 /// Gathers selected expert FP4 matrix pointers into grouped GEMV operand arrays.
 pub fn gather_nvfp4_grouped_gemv_ptrs_on_stream(
     mut buffers: GroupedGemvPointerBuffers<'_>,
@@ -2673,6 +2689,75 @@ pub fn gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
                 out_b_scales,
                 out_c,
                 out_d,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Gathers selected expert and per-slot FP4 address tables into typed grouped
+/// GEMV operands.
+pub fn gather_nvfp4_grouped_gemv_address_tables_on_stream(
+    mut buffers: GroupedGemvAddressTableBuffers<'_>,
+    stream: &CudaStream,
+) -> Result<()> {
+    let groups = buffers.indices.len();
+    let table_len = buffers.a_values_table.len();
+    if groups == 0
+        || table_len == 0
+        || buffers.a_scales_table.len() != table_len
+        || buffers.b_values_table.len() != groups
+        || buffers.b_scales_table.len() != groups
+        || buffers.c_table.len() != groups
+        || buffers.d_table.len() != groups
+        || buffers.out_a_values.len() != groups
+        || buffers.out_a_scales.len() != groups
+        || buffers.out_b_values.len() != groups
+        || buffers.out_b_scales.len() != groups
+        || groups > u32::MAX as usize
+        || table_len > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "grouped GEMV address table gather",
+            expected: "matching non-empty selected A table, slot B table, and group outputs"
+                .to_string(),
+            actual: format!(
+                "groups={groups} table={} b_values={} b_scales={} c={} d={}",
+                table_len,
+                buffers.b_values_table.len(),
+                buffers.b_scales_table.len(),
+                buffers.c_table.len(),
+                buffers.d_table.len()
+            ),
+        });
+    }
+    unsafe {
+        let c_table = buffers.c_table.buffer().ptr.cast::<*const f32>();
+        let d_table = buffers.d_table.buffer().ptr.cast::<*mut f32>();
+        let out_a_values = buffers.out_a_values.buffer_mut().ptr;
+        let out_a_scales = buffers.out_a_scales.buffer_mut().ptr;
+        let out_b_values = buffers.out_b_values.buffer_mut().ptr;
+        let out_b_scales = buffers.out_b_scales.buffer_mut().ptr;
+        let out_c = buffers.c_table.buffer_mut().ptr;
+        let out_d = buffers.d_table.buffer_mut().ptr;
+        check_cuda(
+            "infer_gather_nvfp4_grouped_gemv_ptr_tables_on_stream",
+            ffi::infer_gather_nvfp4_grouped_gemv_ptr_tables_on_stream(
+                buffers.indices.ptr,
+                buffers.a_values_table.ptr.cast(),
+                buffers.a_scales_table.ptr.cast(),
+                buffers.b_values_table.ptr.cast(),
+                buffers.b_scales_table.ptr.cast(),
+                c_table,
+                d_table,
+                groups as u32,
+                table_len as u32,
+                out_a_values.cast(),
+                out_a_scales.cast(),
+                out_b_values.cast(),
+                out_b_scales.cast(),
+                out_c.cast(),
+                out_d.cast(),
                 stream.as_raw(),
             ),
         )
