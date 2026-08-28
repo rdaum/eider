@@ -880,6 +880,55 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
+    /// Launches the grouped GEMV on `stream` using typed device-address tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_addresses_on_stream(
+        &self,
+        a_values: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales: &DeviceBuffer<DeviceAddress<u8>>,
+        b_values: &DeviceBuffer<DeviceAddress<u8>>,
+        b_scales: &DeviceBuffer<DeviceAddress<u8>>,
+        c: &DeviceBuffer<DeviceAddress<f32>>,
+        d: &DeviceBuffer<DeviceAddress<f32>>,
+        alpha: f32,
+        beta: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        for (label, len) in [
+            ("A values", a_values.len()),
+            ("A scales", a_scales.len()),
+            ("B values", b_values.len()),
+            ("B scales", b_scales.len()),
+            ("C", c.len()),
+            ("D", d.len()),
+        ] {
+            if len != self.groups {
+                return Err(Error::Shape {
+                    label: "CUTLASS grouped FP4 GEMV address table",
+                    expected: format!("{} entries", self.groups),
+                    actual: format!("{label} has {len}"),
+                });
+            }
+        }
+        unsafe {
+            check_cuda(
+                "infer_cutlass_fp4_grouped_gemv_f32_on_stream",
+                ffi::infer_cutlass_fp4_grouped_gemv_f32_on_stream(
+                    self.raw,
+                    a_values.as_const_ptr().cast(),
+                    a_scales.as_const_ptr().cast(),
+                    b_values.as_const_ptr().cast(),
+                    b_scales.as_const_ptr().cast(),
+                    c.as_const_ptr().cast(),
+                    d.as_const_ptr().cast(),
+                    alpha,
+                    beta,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Launches grouped GEMV with A selected by device indices and one shared B vector.
     ///
     /// # Safety
@@ -1734,47 +1783,47 @@ mod tests {
         let a_values_table = DeviceBuffer::from_host(
             &a_value_ptrs
                 .iter()
-                .map(|b| b.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("A values ptr table");
         let a_scales_table = DeviceBuffer::from_host(
             &a_scale_ptrs
                 .iter()
-                .map(|b| b.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("A scales ptr table");
         let mut b_value_ptrs = Vec::with_capacity(groups);
         let mut b_scale_ptrs = Vec::with_capacity(groups);
         for matrix in &b_matrices {
-            let input = matrix.input();
-            b_value_ptrs.push(input.values_ptr());
-            b_scale_ptrs.push(input.scales_ptr());
+            b_value_ptrs.push(matrix.values_address());
+            b_scale_ptrs.push(matrix.scales_address());
         }
         let b_values = DeviceBuffer::from_host(&b_value_ptrs).expect("B values ptrs");
         let b_scales = DeviceBuffer::from_host(&b_scale_ptrs).expect("B scales ptrs");
 
-        let mut outputs = (0..groups)
+        let outputs = (0..groups)
             .map(|_| F32Matrix::zeroed(m, 1).expect("D alloc"))
             .collect::<Vec<_>>();
         let c_ptrs = DeviceBuffer::from_host(
             &outputs
                 .iter()
-                .map(|output| output.input().data_ptr())
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )
         .expect("C ptrs");
-        let mut d_host_ptrs = Vec::with_capacity(groups);
-        for output in &mut outputs {
-            let mut data = output.output();
-            d_host_ptrs.push(data.data_mut_ptr().cast());
-        }
-        let d_ptrs = DeviceBuffer::from_host(&d_host_ptrs).expect("D ptrs");
+        let d_ptrs = DeviceBuffer::from_host(
+            &outputs
+                .iter()
+                .map(F32Matrix::data_address)
+                .collect::<Vec<_>>(),
+        )
+        .expect("D addresses");
 
         let plan = CutlassFp4GroupedGemvF32Plan::new(m, k, groups).expect("grouped plan");
         let stream = crate::CudaStream::new_non_blocking().expect("stream create");
-        plan.run_on_stream(
+        plan.run_addresses_on_stream(
             &a_values_table,
             &a_scales_table,
             &b_values,
