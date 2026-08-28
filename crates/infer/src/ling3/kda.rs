@@ -1,3 +1,5 @@
+//! Ling 3 Kimi Delta Attention weights, state, and execution.
+
 use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host, load_float_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
 use eider_cuda::{

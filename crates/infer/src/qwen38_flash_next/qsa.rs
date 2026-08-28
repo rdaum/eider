@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next sparse-attention weights and selection workspaces.
+
 use super::Qwen38FlashNextConfig;
 use crate::qwen3::infer::QwenModelManifest;
 use crate::qwen3::qwen36::{

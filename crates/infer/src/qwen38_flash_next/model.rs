@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next model loading and batched text-model execution.
+
 use super::qsa::{Qwen38QsaPrefillWorkspace, Qwen38QsaWeights, Qwen38QsaWorkspace};
 use super::{
     Qwen38ExactPleWorkspace, Qwen38FlashNextConfig, Qwen38HyperConnectionWeights,

@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next learned-position embedding transform weights and state.
+
 use super::{Qwen38FlashNextConfig, Qwen38PagedPle};
 use crate::qwen3::qwen36::{Bf16Linear, read_bf16_flat_host, read_bf16_vector_as_f32_device};
 use eider_cuda::{

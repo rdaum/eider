@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next checkpoint configuration parsing and validation.
+
 use crate::qwen3::infer::{
     QwenArchitecture, QwenFfnConfig, QwenLayerKind, QwenLinearAttentionConfig, QwenModelManifest,
 };

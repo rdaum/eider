@@ -1,3 +1,5 @@
+//! NVFP4 transposed-left cuBLASLt matrix-multiplication plans and inputs.
+
 use super::descriptors::{MatmulDesc, MatmulPreference, MatrixLayout};
 use super::handle::CublasLt;
 use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, check_cublas, check_cuda};

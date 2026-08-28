@@ -1,3 +1,5 @@
+//! Nemotron 3 backbone loading and batched text-model execution.
+
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::mtp::{Nemotron3Mtp, Nemotron3MtpState};
 use super::{

@@ -1,3 +1,5 @@
+//! Batched Gemma 4 prefill execution and reusable device workspaces.
+
 use super::*;
 use crate::gemma4::{Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error};
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;

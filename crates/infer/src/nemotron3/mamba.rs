@@ -1,3 +1,5 @@
+//! Nemotron 3 Mamba-2 weights, recurrent state, and execution.
+
 use super::linear::{Nemotron3Linear, load_bf16, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};
 use eider_cuda::{

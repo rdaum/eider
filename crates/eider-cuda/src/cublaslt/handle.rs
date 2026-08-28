@@ -1,3 +1,5 @@
+//! Ownership of cuBLASLt library handles.
+
 use crate::cuda::check_cublas;
 use crate::error::Result;
 use crate::ffi;

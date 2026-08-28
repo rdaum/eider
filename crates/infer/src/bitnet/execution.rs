@@ -1,3 +1,5 @@
+//! Sequence-pool ownership for BitNet serving.
+
 use super::BitNetSequence;
 use eider_cuda::{Error, Result};
 use std::collections::BTreeMap;

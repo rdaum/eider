@@ -1,3 +1,5 @@
+//! SM121 NVFP4 MMA data, weights, and native GEMV launchers.
+
 #![allow(clippy::too_many_arguments)]
 #![allow(missing_docs)]
 

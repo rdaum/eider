@@ -1,3 +1,5 @@
+//! Batched Laguna prefill execution and routed-expert workspaces.
+
 use super::*;
 use crate::laguna::{LagunaAppend, LagunaSequence, LagunaSequenceCache, laguna_cache_error};
 use crate::metrics::metrics;

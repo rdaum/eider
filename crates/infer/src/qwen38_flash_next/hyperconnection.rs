@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next hyperconnection weights and execution workspaces.
+
 use super::Qwen38FlashNextConfig;
 use crate::qwen3::qwen36::{Bf16Linear, read_bf16_vector_as_f32_device};
 use eider_cuda::{

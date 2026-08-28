@@ -1,3 +1,5 @@
+//! Nemotron 3 dense-linear storage choices and device operations.
+
 use eider_cuda::{
     CudaStream, DeviceBuffer, Error, Result, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, fp8_linear_channel_scaled_f32_batch_into_on_stream,

@@ -1,3 +1,5 @@
+//! Batched Muse Glimmer prefill execution and device workspaces.
+
 use super::*;
 use eider_cuda::{
     add_f32_prefix_into_on_stream, argmax_f32_batch_into_on_stream,

@@ -1,3 +1,5 @@
+//! INT8 transposed-left cuBLASLt matrix-multiplication plans.
+
 use super::GemmShape;
 use super::descriptors::{MatmulDesc, MatmulPreference, MatrixLayout};
 use super::handle::CublasLt;

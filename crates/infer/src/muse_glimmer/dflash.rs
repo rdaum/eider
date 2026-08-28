@@ -1,3 +1,5 @@
+//! Muse Glimmer DFlash checkpoint loading, state, and draft execution.
+
 use super::*;
 use eider_cuda::{
     Sm12xKvCache, Sm12xKvTailSnapshot, add_f32_prefix_into_on_stream,

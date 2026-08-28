@@ -1,3 +1,5 @@
+//! RAII wrappers for cuBLASLt matrix-multiplication descriptors.
+
 use crate::cuda::check_cublas;
 use crate::error::Result;
 use crate::ffi;

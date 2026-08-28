@@ -1,3 +1,5 @@
+//! Ling 3 routed-MoE weights and execution workspaces.
+
 use super::Ling3Manifest;
 use super::layer::{Ling3Linear, load_float_as_f32};
 use eider_cuda::{

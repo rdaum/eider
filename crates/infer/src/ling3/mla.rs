@@ -1,3 +1,5 @@
+//! Ling 3 Multi-head Latent Attention weights, cache state, and execution.
+
 use super::layer::{Ling3Linear, load_bf16_as_f32};
 use super::{Ling3AttentionKind, Ling3Manifest};
 use super::{Ling3MlaPagePool, Ling3Page};

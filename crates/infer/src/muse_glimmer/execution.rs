@@ -1,3 +1,5 @@
+//! Muse Glimmer sequence ownership, prefix cache, and execution state.
+
 use super::MuseGlimmerSequence;
 use eider_cuda::{Error, Result};
 use std::collections::BTreeMap;

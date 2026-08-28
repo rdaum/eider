@@ -1,3 +1,5 @@
+//! CUDA launcher for chunked Qwen3.6 Gated DeltaNet execution.
+
 use crate::cuda::{CudaStream, DeviceBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;

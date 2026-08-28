@@ -1,3 +1,5 @@
+//! DeepSeek V4 model loading and batched text-model execution.
+
 use super::{
     Deepseek4AttentionKind, Deepseek4CacheContext, Deepseek4CompressionState, Deepseek4ExpertLayer,
     Deepseek4ExpertWorkspace, Deepseek4HotExpertCache, Deepseek4HotsetPlan,

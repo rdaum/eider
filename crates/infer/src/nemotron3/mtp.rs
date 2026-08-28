@@ -1,3 +1,5 @@
+//! Nemotron 3 multi-token-prediction weights and speculative state.
+
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{
     Nemotron3AttentionCache, Nemotron3AttentionLayer, Nemotron3AttentionRowsWorkspace,

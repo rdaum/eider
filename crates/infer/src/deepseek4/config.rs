@@ -1,3 +1,5 @@
+//! DeepSeek V4 checkpoint configuration parsing and validation.
+
 use eider_cuda::{Error, Result};
 use serde::Deserialize;
 use std::fs;

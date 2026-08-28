@@ -1,3 +1,5 @@
+//! Ling 3 checkpoint configuration parsing and validation.
+
 use eider_cuda::{Error, Result};
 use eider_format::ModelOptCheckpoint;
 use serde::Deserialize;

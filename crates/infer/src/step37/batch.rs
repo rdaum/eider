@@ -1,3 +1,5 @@
+//! Batched Step-3.7 prefill execution and reusable device workspaces.
+
 use super::*;
 use eider_cuda::{
     Bf16TnMatmulPlan, CublasLt, GemmShape, append_rows_f32_into_on_stream,

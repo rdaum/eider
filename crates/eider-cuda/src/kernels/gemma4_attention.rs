@@ -1,3 +1,5 @@
+//! CUDA launcher for Gemma 4 local prefill attention.
+
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;

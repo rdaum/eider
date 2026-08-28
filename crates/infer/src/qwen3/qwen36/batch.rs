@@ -1,3 +1,5 @@
+//! Qwen3.6 batched prefill, decode, and speculative-execution workspaces.
+
 use super::{
     Fp8Linear, Qwen36Attention, Qwen36FullAttentionWeights, Qwen36GateUpStorage, Qwen36LayerBlock,
     Qwen36LayerFfnWeights, Qwen36Linear, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,

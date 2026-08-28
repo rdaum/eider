@@ -1,3 +1,5 @@
+//! Qwen3.8 Flash Next paged learned-position embedding lookup and state.
+
 use super::Qwen38FlashNextConfig;
 use eider_cuda::{
     CudaStream, DeviceOutput, Error, PagedBf16ReadStats, PagedBf16RowReader, PagedBf16RowSource,

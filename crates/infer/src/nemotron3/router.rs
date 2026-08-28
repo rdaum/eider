@@ -1,3 +1,5 @@
+//! Nemotron 3 MoE router weights and top-k routing execution.
+
 use super::linear::load_bf16_host;
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3MoeLayerConfig};
 use eider_cuda::{

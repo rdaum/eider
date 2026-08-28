@@ -1,3 +1,5 @@
+//! Ling 3 decoder-layer weights and shared linear helpers.
+
 use super::{Ling3AttentionKind, Ling3FfnKind, Ling3Manifest};
 use eider_cuda::{
     CudaStream, DeviceBuffer, Error, Result, add_f32_into_on_stream,

@@ -1,3 +1,5 @@
+//! Persistent prepared-weight cache for Qwen3.6 expert storage.
+
 use super::infer::{QwenFfnConfig, QwenModelManifest};
 use crate::metrics::metrics;
 use eider_cuda::{Error, Result, Sm12xFp4GemmWeight, Sm121W4A16HostWeight};

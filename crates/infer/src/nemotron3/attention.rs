@@ -1,3 +1,5 @@
+//! Nemotron 3 attention weights, cache state, and execution workspaces.
+
 use super::Nemotron3PageBackend;
 use super::linear::{Nemotron3Linear, load_bf16_as_f32};
 use super::{Nemotron3LayerKind, Nemotron3Manifest, Nemotron3StorageConfig};

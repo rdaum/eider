@@ -1,3 +1,5 @@
+//! Ling 3 model loading and batched text-model execution.
+
 use super::kda::{Ling3KdaAttention, Ling3KdaAttentionState, Ling3KdaAttentionWorkspace};
 use super::layer::{Ling3Linear, load_bf16_as_f32, load_bf16_host};
 use super::mla::{Ling3MlaAttention, Ling3MlaWorkspace};

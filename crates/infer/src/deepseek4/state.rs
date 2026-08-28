@@ -1,3 +1,5 @@
+//! Per-sequence DeepSeek V4 compression and attention state.
+
 use super::{Deepseek4AttentionKind, Deepseek4ModelConfig};
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
 

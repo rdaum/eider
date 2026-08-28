@@ -1,3 +1,5 @@
+//! CUDA launchers for DeepSeek V4 attention, routing, and expert operations.
+
 #![allow(clippy::too_many_arguments)]
 
 use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};

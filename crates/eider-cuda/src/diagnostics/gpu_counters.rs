@@ -1,3 +1,5 @@
+//! CUPTI and NVPerf GPU-counter collection for diagnostic benchmark passes.
+
 use crate::error::{Error, Result};
 use crate::ffi;
 use std::ffi::{CStr, CString};

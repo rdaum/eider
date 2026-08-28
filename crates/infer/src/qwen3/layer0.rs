@@ -1,3 +1,5 @@
+//! Qwen3 layer-zero loading and smoke-probe execution.
+
 use crate::execution::kv_cache::{KvCache, LayerKvCache};
 use eider_cuda::{
     Bf16Matrix, CublasLt, CudaStream, DeviceBuffer, Fp4TnMatmulPlan, GemmShape,
