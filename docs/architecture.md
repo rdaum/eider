@@ -97,7 +97,9 @@ GEMV and weighted accumulation as well. `DeviceBuffer::address_at`
 bounds-checks their element offsets while the CUDA boundary preserves the
 native table ABI.
 Laguna's CUTLASS routed gate/up plan now uses its typed expert weight, scale,
-and output tables directly; the remaining legacy raw-table caller is Qwen3.6.
+and output tables directly. Gemma 4's one-token routed MoE likewise uses typed
+NVFP4 weight, scale, activation, output, and accumulation tables; its batched
+grouped-GEMM path was already typed.
 Qwen3.6's FP8 routed-expert path likewise uses typed weight and channel-scale
 address tables through its gate/up and down CUDA launches.
 Ling 3's routed W4A16 workspace uses typed input, expert, output, and

@@ -11,9 +11,9 @@ use eider_cuda::{
     bf16_linear_argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,
     gather_indexed_mul_f32_into_on_stream, gelu_tanh_mul_f32_into_on_stream,
     lm_head_top1_f32_into_on_stream, moe_topk_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
     nvfp4_w4a16_matrix_matvec_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
     rope_neox_f32_into_on_stream, rope_neox_proportional_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
@@ -318,23 +318,20 @@ pub struct Gemma4Moe {
     router: Gemma4Router,
     // Owns the allocations referenced by the expert pointer tables below.
     _experts: Vec<Gemma4Expert>,
-    gate_packed_table: DeviceBuffer<*const u8>,
-    gate_scale_table: DeviceBuffer<*const u8>,
-    gate_tiled_scale_table: DeviceBuffer<*const u8>,
+    gate_packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    gate_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     gate_scale_2: DeviceBuffer<f32>,
     gate_grouped_packed_table: DeviceBuffer<DeviceAddress<u8>>,
     gate_grouped_tiled_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     gate_grouped_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
-    up_packed_table: DeviceBuffer<*const u8>,
-    up_scale_table: DeviceBuffer<*const u8>,
-    up_tiled_scale_table: DeviceBuffer<*const u8>,
+    up_packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    up_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     up_scale_2: DeviceBuffer<f32>,
     up_grouped_packed_table: DeviceBuffer<DeviceAddress<u8>>,
     up_grouped_tiled_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     up_grouped_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
-    down_packed_table: DeviceBuffer<*const u8>,
-    down_scale_table: DeviceBuffer<*const u8>,
-    down_tiled_scale_table: DeviceBuffer<*const u8>,
+    down_packed_table: DeviceBuffer<DeviceAddress<u8>>,
+    down_scale_table: DeviceBuffer<DeviceAddress<u8>>,
     down_scale_2: DeviceBuffer<f32>,
     down_grouped_packed_table: DeviceBuffer<DeviceAddress<u8>>,
     down_grouped_tiled_scale_table: DeviceBuffer<DeviceAddress<u8>>,
@@ -351,11 +348,11 @@ pub struct Gemma4MoeWorkspace {
     up: Vec<DeviceBuffer<f32>>,
     activated: Vec<DeviceBuffer<f32>>,
     down: Vec<DeviceBuffer<f32>>,
-    gate_output_table: DeviceBuffer<*mut f32>,
-    up_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
+    gate_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    up_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_input_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_result_table: DeviceBuffer<DeviceAddress<f32>>,
     output: DeviceBuffer<f32>,
 }
 
@@ -610,30 +607,21 @@ impl Gemma4Linear {
         self.run_rows_into(input, output, rows, stream)
     }
 
-    fn nvfp4_parts(&self) -> Result<(*const u8, *const u8, f32)> {
+    fn nvfp4_addresses(&self) -> (DeviceAddress<u8>, DeviceAddress<u8>, f32) {
         let Gemma4LinearStorage::Nvfp4 {
             weight,
             weight_scale,
         } = &self.storage;
-        Ok((
-            weight.matrix().values_ptr(),
-            weight_scale.as_const_ptr().cast::<u8>(),
+        (
+            weight.matrix().values_address(),
+            weight_scale.cuda_address(),
             weight.weight_scale_2(),
-        ))
+        )
     }
 
     fn cublaslt_weight(&self) -> &ModelOptCublasLtWeight {
         let Gemma4LinearStorage::Nvfp4 { weight, .. } = &self.storage;
         weight
-    }
-
-    fn grouped_gemm_parts(&self) -> (*const u8, *const u8, f32) {
-        let weight = self.cublaslt_weight();
-        (
-            weight.matrix().values_ptr(),
-            weight.matrix().scales_ptr(),
-            weight.weight_scale_2(),
-        )
     }
 
     fn grouped_gemm_addresses(&self) -> (DeviceAddress<u8>, DeviceAddress<u8>, f32) {
@@ -963,47 +951,38 @@ impl Gemma4Moe {
         }
         let mut gate_packed = Vec::with_capacity(experts.len());
         let mut gate_scales = Vec::with_capacity(experts.len());
-        let mut gate_tiled_scales = Vec::with_capacity(experts.len());
         let mut gate_scale_2 = Vec::with_capacity(experts.len());
         let mut gate_grouped_packed = Vec::with_capacity(experts.len());
         let mut gate_grouped_tiled_scales = Vec::with_capacity(experts.len());
         let mut up_packed = Vec::with_capacity(experts.len());
         let mut up_scales = Vec::with_capacity(experts.len());
-        let mut up_tiled_scales = Vec::with_capacity(experts.len());
         let mut up_scale_2 = Vec::with_capacity(experts.len());
         let mut up_grouped_packed = Vec::with_capacity(experts.len());
         let mut up_grouped_tiled_scales = Vec::with_capacity(experts.len());
         let mut down_packed = Vec::with_capacity(experts.len());
         let mut down_scales = Vec::with_capacity(experts.len());
-        let mut down_tiled_scales = Vec::with_capacity(experts.len());
         let mut down_scale_2 = Vec::with_capacity(experts.len());
         let mut down_grouped_packed = Vec::with_capacity(experts.len());
         let mut down_grouped_tiled_scales = Vec::with_capacity(experts.len());
         for expert in &experts {
-            let (packed, scales, scale_2) = expert.gate.nvfp4_parts()?;
+            let (packed, scales, scale_2) = expert.gate.nvfp4_addresses();
             gate_packed.push(packed);
             gate_scales.push(scales);
             gate_scale_2.push(scale_2);
-            let (_, scales, _) = expert.gate.grouped_gemm_parts();
-            gate_tiled_scales.push(scales);
             let (packed, scales, _) = expert.gate.grouped_gemm_addresses();
             gate_grouped_packed.push(packed);
             gate_grouped_tiled_scales.push(scales);
-            let (packed, scales, scale_2) = expert.up.nvfp4_parts()?;
+            let (packed, scales, scale_2) = expert.up.nvfp4_addresses();
             up_packed.push(packed);
             up_scales.push(scales);
             up_scale_2.push(scale_2);
-            let (_, scales, _) = expert.up.grouped_gemm_parts();
-            up_tiled_scales.push(scales);
             let (packed, scales, _) = expert.up.grouped_gemm_addresses();
             up_grouped_packed.push(packed);
             up_grouped_tiled_scales.push(scales);
-            let (packed, scales, scale_2) = expert.down.nvfp4_parts()?;
+            let (packed, scales, scale_2) = expert.down.nvfp4_addresses();
             down_packed.push(packed);
             down_scales.push(scales);
             down_scale_2.push(scale_2);
-            let (_, scales, _) = expert.down.grouped_gemm_parts();
-            down_tiled_scales.push(scales);
             let (packed, scales, _) = expert.down.grouped_gemm_addresses();
             down_grouped_packed.push(packed);
             down_grouped_tiled_scales.push(scales);
@@ -1020,21 +999,18 @@ impl Gemma4Moe {
             router,
             gate_packed_table: DeviceBuffer::from_host(&gate_packed)?,
             gate_scale_table: DeviceBuffer::from_host(&gate_scales)?,
-            gate_tiled_scale_table: DeviceBuffer::from_host(&gate_tiled_scales)?,
             gate_scale_2,
             gate_grouped_packed_table: DeviceBuffer::from_host(&gate_grouped_packed)?,
             gate_grouped_tiled_scale_table: DeviceBuffer::from_host(&gate_grouped_tiled_scales)?,
             gate_grouped_alpha_table,
             up_packed_table: DeviceBuffer::from_host(&up_packed)?,
             up_scale_table: DeviceBuffer::from_host(&up_scales)?,
-            up_tiled_scale_table: DeviceBuffer::from_host(&up_tiled_scales)?,
             up_scale_2,
             up_grouped_packed_table: DeviceBuffer::from_host(&up_grouped_packed)?,
             up_grouped_tiled_scale_table: DeviceBuffer::from_host(&up_grouped_tiled_scales)?,
             up_grouped_alpha_table,
             down_packed_table: DeviceBuffer::from_host(&down_packed)?,
             down_scale_table: DeviceBuffer::from_host(&down_scales)?,
-            down_tiled_scale_table: DeviceBuffer::from_host(&down_tiled_scales)?,
             down_scale_2,
             down_grouped_packed_table: DeviceBuffer::from_host(&down_grouped_packed)?,
             down_grouped_tiled_scale_table: DeviceBuffer::from_host(&down_grouped_tiled_scales)?,
@@ -1063,11 +1039,11 @@ impl Gemma4Moe {
             .collect::<Result<Vec<_>>>()?;
         Ok(Gemma4MoeWorkspace {
             router: self.router.new_workspace()?,
-            gate_output_table: mutable_f32_pointer_table(&gate)?,
-            up_output_table: mutable_f32_pointer_table(&up)?,
-            down_input_table: const_f32_pointer_table(&activated)?,
-            down_output_table: mutable_f32_pointer_table(&down)?,
-            down_result_table: const_f32_pointer_table(&down)?,
+            gate_output_table: f32_address_table(&gate)?,
+            up_output_table: f32_address_table(&up)?,
+            down_input_table: f32_address_table(&activated)?,
+            down_output_table: f32_address_table(&down)?,
+            down_result_table: f32_address_table(&down)?,
             gate,
             up,
             activated,
@@ -1109,7 +1085,7 @@ impl Gemma4Moe {
             });
         }
         let indices = self.router.indices(&workspace.router);
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             indices,
             expert_input,
             &self.gate_packed_table,
@@ -1120,7 +1096,7 @@ impl Gemma4Moe {
             self.hidden_size,
             stream,
         )?;
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             indices,
             expert_input,
             &self.up_packed_table,
@@ -1139,7 +1115,7 @@ impl Gemma4Moe {
         {
             gelu_tanh_mul_f32_into_on_stream(gate, up, activated.output(), stream)?;
         }
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             indices,
             &workspace.down_input_table,
             &self.down_packed_table,
@@ -1150,7 +1126,7 @@ impl Gemma4Moe {
             self.intermediate_size,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             self.router.route_weights(&workspace.router),
             &workspace.down_result_table,
@@ -1174,21 +1150,18 @@ impl Gemma4Moe {
                 .sum::<usize>()
             + self.gate_packed_table.device_bytes()
             + self.gate_scale_table.device_bytes()
-            + self.gate_tiled_scale_table.device_bytes()
             + self.gate_scale_2.device_bytes()
             + self.gate_grouped_packed_table.device_bytes()
             + self.gate_grouped_tiled_scale_table.device_bytes()
             + self.gate_grouped_alpha_table.device_bytes()
             + self.up_packed_table.device_bytes()
             + self.up_scale_table.device_bytes()
-            + self.up_tiled_scale_table.device_bytes()
             + self.up_scale_2.device_bytes()
             + self.up_grouped_packed_table.device_bytes()
             + self.up_grouped_tiled_scale_table.device_bytes()
             + self.up_grouped_alpha_table.device_bytes()
             + self.down_packed_table.device_bytes()
             + self.down_scale_table.device_bytes()
-            + self.down_tiled_scale_table.device_bytes()
             + self.down_scale_2.device_bytes()
             + self.down_grouped_packed_table.device_bytes()
             + self.down_grouped_tiled_scale_table.device_bytes()
@@ -1197,20 +1170,11 @@ impl Gemma4Moe {
     }
 }
 
-fn const_f32_pointer_table(buffers: &[DeviceBuffer<f32>]) -> Result<DeviceBuffer<*const f32>> {
+fn f32_address_table(buffers: &[DeviceBuffer<f32>]) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
     DeviceBuffer::from_host(
         &buffers
             .iter()
-            .map(|buffer| buffer.as_const_ptr().cast::<f32>())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn mutable_f32_pointer_table(buffers: &[DeviceBuffer<f32>]) -> Result<DeviceBuffer<*mut f32>> {
-    DeviceBuffer::from_host(
-        &buffers
-            .iter()
-            .map(|buffer| buffer.as_const_ptr().cast_mut().cast::<f32>())
+            .map(DeviceBuffer::cuda_address)
             .collect::<Vec<_>>(),
     )
 }
