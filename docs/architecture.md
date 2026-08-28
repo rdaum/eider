@@ -76,8 +76,11 @@ The model-specific schedulers remain in `eider-inference`; they own their
 model state and invoke the runtime policy types directly.
 The former `infer` package is now named `eider-inference`; its source directory
 remains `crates/infer` during the migration.
-Model loading now selects its CUDA device inside `eider-inference`; the API
-actor has no CUDA resource import and receives inference-boundary errors.
+`eider_inference::with_loaded_engine` now parses the checkpoint family, loads
+the model, selects its CUDA resources, constructs the model service, and lends
+that service to the API actor. The actor has no model import, CUDA resource
+import, checkpoint parser, or model-construction branch; it receives only an
+inference-boundary error and a model-neutral engine service.
 The `eider-api` package has no direct CUDA dependency.
 Bonsai GGUF chat-template parsing now also lives in `eider-inference`; the API
 receives the resolved template and has no direct format dependency.
@@ -383,8 +386,10 @@ services. Those records carry request identities, token positions, output
 events, usage, byte accounting, and durations, but never a CUDA allocation,
 stream, logits buffer, or model-specific sequence type.
 
-The API can erase the concrete runtime service behind `dyn EngineService`. This
-call occurs once per actor tick. It is outside the layer and kernel hot paths.
+The inference loader lends the concrete model service to the API as `dyn
+EngineService`. This dispatch occurs once per actor tick. It is outside the
+layer and kernel hot paths; model construction and execution remain statically
+typed inside inference.
 
 Do not add a universal backend trait for every tensor or CUDA operation. The
 batch inference engine is the only required polymorphic seam.
