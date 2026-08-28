@@ -29,7 +29,7 @@ use std::time::Duration;
 
 /// One request-scoped structured output delta.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Qwen36ChatDelta {
+struct Qwen36ChatDelta {
     /// Scheduler request that owns the output.
     pub request_id: Qwen36RequestId,
     /// Reasoning, visible text, or a completed tool call.
@@ -38,7 +38,7 @@ pub struct Qwen36ChatDelta {
 
 /// Request metadata known after rendering and CPU queueing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen36ChatAdmission {
+struct Qwen36ChatAdmission {
     /// Scheduler identity assigned to the queued request.
     pub request_id: Qwen36RequestId,
     /// Tokens in the rendered prompt.
@@ -49,7 +49,7 @@ pub struct Qwen36ChatAdmission {
 
 /// Terminal request metadata emitted exactly once by the serving bridge.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Qwen36ChatFinished {
+struct Qwen36ChatFinished {
     /// Finished scheduler request.
     pub request_id: Qwen36RequestId,
     /// API-facing reason for stopping generation.
@@ -62,7 +62,7 @@ pub struct Qwen36ChatFinished {
 
 /// Observable work and output from one decode-first scheduler iteration.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Qwen36ChatTick {
+struct Qwen36ChatTick {
     /// Requests receiving persistent device sequence state during the tick.
     /// Requests selected for model work, preserving scheduler order.
     pub scheduled: Vec<Qwen36RequestId>,
@@ -85,7 +85,7 @@ struct ActiveChatRequest<'tokenizer> {
 }
 
 /// Checkpoint prompt rendering, continuous scheduling, and streaming output lifecycle.
-pub struct Qwen36ChatService<'model, 'template> {
+pub(crate) struct Qwen36ChatService<'model, 'template> {
     template: &'template CheckpointChatTemplate,
     scheduler: Qwen36Scheduler<'model>,
     tool_grammar: QwenXmlGrammarFactory,
@@ -94,7 +94,7 @@ pub struct Qwen36ChatService<'model, 'template> {
 
 impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     #[cfg(test)]
-    fn new(
+    pub(crate) fn new(
         model: &'model Qwen36TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
@@ -108,7 +108,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     /// Creates a serving bridge with explicit scheduler and cache limits.
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: &'model Qwen36TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
@@ -125,7 +125,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and admits a structured request to the CPU waiting queue.
-    pub fn add_request(&mut self, mut request: ChatRequest) -> Result<Qwen36ChatAdmission> {
+    fn add_request(&mut self, mut request: ChatRequest) -> Result<Qwen36ChatAdmission> {
         validate_stop_sequences(&request.stop_sequences)?;
         let prompt = self.template.render_and_tokenize(
             &request.messages,
@@ -176,7 +176,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
 
     /// Runs one scheduler iteration and reports admission and prefill events
     /// when they occur.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen36RequestId, Qwen36AdmissionProgress>,
@@ -270,7 +270,7 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 
     /// Cancels a waiting or active request, such as after a client disconnect.
-    pub fn cancel_request(&mut self, id: Qwen36RequestId) -> Qwen36CancelOutcome {
+    fn cancel_request(&mut self, id: Qwen36RequestId) -> Qwen36CancelOutcome {
         let outcome = self.scheduler.cancel_request(id);
         match &outcome {
             Qwen36CancelOutcome::Cancelled(_) => {
@@ -289,18 +289,18 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
 
     /// Returns the number of requests retained by the serving bridge.
     #[cfg(test)]
-    pub fn request_count(&self) -> usize {
+    fn request_count(&self) -> usize {
         self.requests.len()
     }
 
     /// Returns the number of requests currently owning device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.scheduler.active_sequence_count()
     }
 
     /// Returns a request's scheduler lifecycle state.
     #[cfg(test)]
-    pub fn request_state(&self, id: Qwen36RequestId) -> Option<RequestState> {
+    fn request_state(&self, id: Qwen36RequestId) -> Option<RequestState> {
         self.scheduler.request_state(id)
     }
 
@@ -428,7 +428,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

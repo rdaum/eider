@@ -64,22 +64,22 @@ fn reasoning_token_budget(
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct LagunaRequestId(u64);
+struct LagunaRequestId(u64);
 
 impl LagunaRequestId {
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
-pub struct LagunaAdmission {
+struct LagunaAdmission {
     pub request_id: LagunaRequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LagunaAdmissionProgress {
+struct LagunaAdmissionProgress {
     pub request_id: LagunaRequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -88,17 +88,17 @@ pub struct LagunaAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-pub struct LagunaPrefillProgress {
+struct LagunaPrefillProgress {
     pub request_id: LagunaRequestId,
     pub prompt_position: usize,
 }
 
-pub struct LagunaChatDelta {
+struct LagunaChatDelta {
     pub request_id: LagunaRequestId,
     pub event: ChatOutputEvent,
 }
 
-pub struct LagunaFinished {
+struct LagunaFinished {
     pub request_id: LagunaRequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -106,14 +106,14 @@ pub struct LagunaFinished {
 }
 
 #[derive(Default)]
-pub struct LagunaTick {
+struct LagunaTick {
     pub prefilled: Vec<LagunaPrefillProgress>,
     pub generated: Vec<LagunaRequestId>,
     pub output: Vec<LagunaChatDelta>,
     pub finished: Vec<LagunaFinished>,
 }
 
-pub enum LagunaCancelOutcome {
+enum LagunaCancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -138,7 +138,7 @@ struct ActiveRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
-pub struct LagunaChatService<'model, 'template> {
+pub(crate) struct LagunaChatService<'model, 'template> {
     model: &'model LagunaModel,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -154,7 +154,7 @@ pub struct LagunaChatService<'model, 'template> {
 }
 
 impl<'model, 'template> LagunaChatService<'model, 'template> {
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: &'model LagunaModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -292,7 +292,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         })
     }
 
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<LagunaAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<LagunaAdmission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -385,7 +385,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         })
     }
 
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<LagunaRequestId, LagunaAdmissionProgress>,
@@ -437,7 +437,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: LagunaRequestId) -> LagunaCancelOutcome {
+    fn cancel_request(&mut self, id: LagunaRequestId) -> LagunaCancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return LagunaCancelOutcome::NotFound;
         };
@@ -466,7 +466,7 @@ impl<'model, 'template> LagunaChatService<'model, 'template> {
         }
     }
 
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -941,7 +941,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

@@ -20,17 +20,17 @@ use tracing::{info, warn};
 
 /// Stable identity assigned to a BitNet request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct BitNetRequestId(u64);
+struct BitNetRequestId(u64);
 
 impl BitNetRequestId {
     /// Returns the numeric request identity.
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after rendering and tokenization.
-pub struct BitNetAdmission {
+struct BitNetAdmission {
     /// Assigned request identity.
     pub request_id: BitNetRequestId,
     /// Rendered prompt token count.
@@ -41,7 +41,7 @@ pub struct BitNetAdmission {
 
 /// Device allocation completed during a service tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BitNetAdmissionProgress {
+struct BitNetAdmissionProgress {
     /// Admitted request.
     pub request_id: BitNetRequestId,
     /// Sequence-specific device bytes.
@@ -53,7 +53,7 @@ pub struct BitNetAdmissionProgress {
 }
 
 /// Prompt progress completed during one tick.
-pub struct BitNetPrefillProgress {
+struct BitNetPrefillProgress {
     /// Request whose prompt advanced.
     pub request_id: BitNetRequestId,
     /// Total prompt position after this tick.
@@ -61,7 +61,7 @@ pub struct BitNetPrefillProgress {
 }
 
 /// One structured output delta.
-pub struct BitNetChatDelta {
+struct BitNetChatDelta {
     /// Request owning this delta.
     pub request_id: BitNetRequestId,
     /// Reasoning, visible text, or tool-call output.
@@ -69,7 +69,7 @@ pub struct BitNetChatDelta {
 }
 
 /// Terminal request metadata.
-pub struct BitNetFinished {
+struct BitNetFinished {
     /// Finished request.
     pub request_id: BitNetRequestId,
     /// API-facing finish reason.
@@ -82,7 +82,7 @@ pub struct BitNetFinished {
 
 /// Work and output from one service iteration.
 #[derive(Default)]
-pub struct BitNetTick {
+struct BitNetTick {
     /// Prompt progress during this tick.
     pub prefilled: Vec<BitNetPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -94,7 +94,7 @@ pub struct BitNetTick {
 }
 
 /// Outcome of cancelling a queued or active request.
-pub enum BitNetCancelOutcome {
+enum BitNetCancelOutcome {
     /// The request was removed and these device bytes were released.
     Cancelled {
         /// Sequence-specific allocation released, or zero while queued.
@@ -120,7 +120,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Checkpoint rendering and decode-first BitNet execution.
-pub struct BitNetChatService<'model, 'template> {
+pub(crate) struct BitNetChatService<'model, 'template> {
     model: &'model BitNetModel,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -134,7 +134,7 @@ pub struct BitNetChatService<'model, 'template> {
 
 impl<'model, 'template> BitNetChatService<'model, 'template> {
     /// Creates a service with explicit scheduling limits.
-    pub fn new(
+    pub(crate) fn new(
         model: &'model BitNetModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -183,7 +183,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and queues a request without allocating GPU state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<BitNetAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<BitNetAdmission> {
         request.generation.validate()?;
         if !request.tools.is_empty() {
             return Err(Error::Format {
@@ -271,7 +271,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     }
 
     /// Runs one decode-first scheduling iteration.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>,
@@ -322,7 +322,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     }
 
     /// Cancels a queued or active request.
-    pub fn cancel_request(&mut self, id: BitNetRequestId) -> BitNetCancelOutcome {
+    fn cancel_request(&mut self, id: BitNetRequestId) -> BitNetCancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return BitNetCancelOutcome::NotFound;
         };
@@ -334,7 +334,7 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     }
 
     /// Returns the number of requests with device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -594,7 +594,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

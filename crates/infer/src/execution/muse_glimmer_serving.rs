@@ -27,17 +27,17 @@ use tracing::warn;
 
 /// Stable identity assigned to a Muse Glimmer request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct MuseGlimmerRequestId(u64);
+struct MuseGlimmerRequestId(u64);
 
 impl MuseGlimmerRequestId {
     /// Returns the numeric request identity.
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after rendering and tokenization.
-pub struct MuseGlimmerAdmission {
+struct MuseGlimmerAdmission {
     /// Assigned request identity.
     pub request_id: MuseGlimmerRequestId,
     /// Rendered prompt token count.
@@ -48,7 +48,7 @@ pub struct MuseGlimmerAdmission {
 
 /// Device allocation completed during a service tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MuseGlimmerAdmissionProgress {
+struct MuseGlimmerAdmissionProgress {
     /// Admitted request.
     pub request_id: MuseGlimmerRequestId,
     /// Sequence-specific device bytes.
@@ -64,7 +64,7 @@ pub struct MuseGlimmerAdmissionProgress {
 }
 
 /// Prompt progress completed during one tick.
-pub struct MuseGlimmerPrefillProgress {
+struct MuseGlimmerPrefillProgress {
     /// Request whose prompt advanced.
     pub request_id: MuseGlimmerRequestId,
     /// Total prompt position after this tick.
@@ -72,7 +72,7 @@ pub struct MuseGlimmerPrefillProgress {
 }
 
 /// One structured output delta.
-pub struct MuseGlimmerChatDelta {
+struct MuseGlimmerChatDelta {
     /// Request owning this delta.
     pub request_id: MuseGlimmerRequestId,
     /// Reasoning, visible text, or tool-call output.
@@ -81,7 +81,7 @@ pub struct MuseGlimmerChatDelta {
 
 /// Cumulative DFlash work retained for one request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MuseGlimmerDFlashStats {
+struct MuseGlimmerDFlashStats {
     /// Completed draft-and-verify cycles.
     pub cycles: usize,
     /// DFlash predictions proposed across all cycles.
@@ -100,7 +100,7 @@ pub struct MuseGlimmerDFlashStats {
 
 /// Updated cumulative DFlash statistics produced by one service tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MuseGlimmerDFlashProgress {
+struct MuseGlimmerDFlashProgress {
     /// Request owning the speculative state.
     pub request_id: MuseGlimmerRequestId,
     /// Cumulative statistics after the latest cycle.
@@ -125,7 +125,7 @@ impl MuseGlimmerDFlashStats {
 }
 
 /// Terminal request metadata.
-pub struct MuseGlimmerFinished {
+struct MuseGlimmerFinished {
     /// Finished request.
     pub request_id: MuseGlimmerRequestId,
     /// API-facing finish reason.
@@ -138,7 +138,7 @@ pub struct MuseGlimmerFinished {
 
 /// Work and output from one service iteration.
 #[derive(Default)]
-pub struct MuseGlimmerTick {
+struct MuseGlimmerTick {
     /// Prompt progress during this tick.
     pub prefilled: Vec<MuseGlimmerPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -152,7 +152,7 @@ pub struct MuseGlimmerTick {
 }
 
 /// Outcome of cancelling a queued or active request.
-pub enum MuseGlimmerCancelOutcome {
+enum MuseGlimmerCancelOutcome {
     /// The request was removed and these device bytes were released.
     Cancelled {
         /// Sequence-specific allocation released, or zero while queued.
@@ -183,7 +183,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Checkpoint rendering and decode-first Muse Glimmer execution.
-pub struct MuseGlimmerChatService<'model, 'template> {
+pub(crate) struct MuseGlimmerChatService<'model, 'template> {
     model: &'model MuseGlimmerModel,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -196,7 +196,7 @@ pub struct MuseGlimmerChatService<'model, 'template> {
 
 impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     /// Creates a service with explicit scheduling and prompt-prefix limits.
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: &'model MuseGlimmerModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -229,7 +229,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and queues a request without allocating GPU state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<MuseGlimmerAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<MuseGlimmerAdmission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -322,7 +322,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     }
 
     /// Runs one decode-first scheduling iteration.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<MuseGlimmerRequestId, MuseGlimmerAdmissionProgress>,
@@ -374,7 +374,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     }
 
     /// Cancels a queued or active request.
-    pub fn cancel_request(&mut self, id: MuseGlimmerRequestId) -> MuseGlimmerCancelOutcome {
+    fn cancel_request(&mut self, id: MuseGlimmerRequestId) -> MuseGlimmerCancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return MuseGlimmerCancelOutcome::NotFound;
         };
@@ -386,7 +386,7 @@ impl<'model, 'template> MuseGlimmerChatService<'model, 'template> {
     }
 
     /// Returns the number of requests with device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -877,7 +877,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

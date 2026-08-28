@@ -26,22 +26,22 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Qwen38FlashNextRequestId(u64);
+struct Qwen38FlashNextRequestId(u64);
 
 impl Qwen38FlashNextRequestId {
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
-pub struct Qwen38FlashNextAdmission {
+struct Qwen38FlashNextAdmission {
     pub request_id: Qwen38FlashNextRequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Qwen38FlashNextAdmissionProgress {
+struct Qwen38FlashNextAdmissionProgress {
     pub request_id: Qwen38FlashNextRequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -49,24 +49,24 @@ pub struct Qwen38FlashNextAdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-pub struct Qwen38FlashNextPrefillProgress {
+struct Qwen38FlashNextPrefillProgress {
     pub request_id: Qwen38FlashNextRequestId,
     pub prompt_position: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Qwen38FlashNextSpeculativeProgress {
+struct Qwen38FlashNextSpeculativeProgress {
     pub request_id: Qwen38FlashNextRequestId,
     pub cycles: usize,
     pub accepted_drafts: usize,
 }
 
-pub struct Qwen38FlashNextChatDelta {
+struct Qwen38FlashNextChatDelta {
     pub request_id: Qwen38FlashNextRequestId,
     pub event: ChatOutputEvent,
 }
 
-pub struct Qwen38FlashNextFinished {
+struct Qwen38FlashNextFinished {
     pub request_id: Qwen38FlashNextRequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -74,7 +74,7 @@ pub struct Qwen38FlashNextFinished {
 }
 
 #[derive(Default)]
-pub struct Qwen38FlashNextTick {
+struct Qwen38FlashNextTick {
     pub prefilled: Vec<Qwen38FlashNextPrefillProgress>,
     pub generated: Vec<Qwen38FlashNextRequestId>,
     pub speculative: Vec<Qwen38FlashNextSpeculativeProgress>,
@@ -82,7 +82,7 @@ pub struct Qwen38FlashNextTick {
     pub finished: Vec<Qwen38FlashNextFinished>,
 }
 
-pub enum Qwen38FlashNextCancelOutcome {
+enum Qwen38FlashNextCancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -108,7 +108,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Decode-first multi-session service for the native QSA runtime.
-pub struct Qwen38FlashNextChatService<'template> {
+pub(crate) struct Qwen38FlashNextChatService<'template> {
     execution: Qwen38FlashNextExecutionState,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -120,7 +120,7 @@ pub struct Qwen38FlashNextChatService<'template> {
 }
 
 impl<'template> Qwen38FlashNextChatService<'template> {
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: Qwen38FlashNextModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -169,7 +169,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         })
     }
 
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Qwen38FlashNextAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Qwen38FlashNextAdmission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -255,7 +255,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         })
     }
 
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Qwen38FlashNextRequestId, Qwen38FlashNextAdmissionProgress>,
@@ -308,7 +308,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: Qwen38FlashNextRequestId) -> Qwen38FlashNextCancelOutcome {
+    fn cancel_request(&mut self, id: Qwen38FlashNextRequestId) -> Qwen38FlashNextCancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return Qwen38FlashNextCancelOutcome::NotFound;
         };
@@ -331,7 +331,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
         }
     }
 
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.execution.sequences.len()
     }
 
@@ -945,7 +945,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

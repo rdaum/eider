@@ -23,20 +23,20 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Step37ChatDelta {
+struct Step37ChatDelta {
     pub request_id: Step37RequestId,
     pub event: ChatOutputEvent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Step37ChatAdmission {
+struct Step37ChatAdmission {
     pub request_id: Step37RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Step37ChatFinished {
+struct Step37ChatFinished {
     pub request_id: Step37RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -44,7 +44,7 @@ pub struct Step37ChatFinished {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Step37ChatTick {
+struct Step37ChatTick {
     pub scheduled: Vec<Step37RequestId>,
     pub prefilled: Vec<Step37PrefillProgress>,
     pub generated: Vec<Step37RequestId>,
@@ -58,14 +58,14 @@ struct ActiveChatRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
-pub struct Step37ChatService<'template> {
+pub(crate) struct Step37ChatService<'template> {
     template: &'template CheckpointChatTemplate,
     scheduler: Step37Scheduler,
     requests: BTreeMap<Step37RequestId, ActiveChatRequest<'template>>,
 }
 
 impl<'template> Step37ChatService<'template> {
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: Step37TextModel,
         template: &'template CheckpointChatTemplate,
         scheduler: SchedulerConfig,
@@ -78,7 +78,7 @@ impl<'template> Step37ChatService<'template> {
         })
     }
 
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Step37ChatAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Step37ChatAdmission> {
         validate_stop_sequences(&request.stop_sequences)?;
         let prompt = self.template.render_and_tokenize(
             &request.messages,
@@ -119,7 +119,7 @@ impl<'template> Step37ChatService<'template> {
         })
     }
 
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Step37RequestId, Step37AdmissionProgress>,
@@ -207,7 +207,7 @@ impl<'template> Step37ChatService<'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: Step37RequestId) -> Step37CancelOutcome {
+    fn cancel_request(&mut self, id: Step37RequestId) -> Step37CancelOutcome {
         let outcome = self.scheduler.cancel_request(id);
         match &outcome {
             Step37CancelOutcome::Cancelled(_) => {
@@ -224,7 +224,7 @@ impl<'template> Step37ChatService<'template> {
         outcome
     }
 
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.scheduler.active_sequence_count()
     }
 
@@ -342,7 +342,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

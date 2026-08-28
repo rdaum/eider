@@ -27,17 +27,17 @@ use tracing::warn;
 
 /// Stable request identity assigned by a Nemotron 3 chat service.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Nemotron3RequestId(u64);
+struct Nemotron3RequestId(u64);
 
 impl Nemotron3RequestId {
     /// Returns the numeric request identity.
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after prompt rendering and tokenization.
-pub struct Nemotron3Admission {
+struct Nemotron3Admission {
     pub request_id: Nemotron3RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
@@ -45,7 +45,7 @@ pub struct Nemotron3Admission {
 
 /// Device-state allocation completed during a tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Nemotron3AdmissionProgress {
+struct Nemotron3AdmissionProgress {
     pub request_id: Nemotron3RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -54,19 +54,19 @@ pub struct Nemotron3AdmissionProgress {
 }
 
 /// Prompt progress completed during a tick.
-pub struct Nemotron3PrefillProgress {
+struct Nemotron3PrefillProgress {
     pub request_id: Nemotron3RequestId,
     pub prompt_position: usize,
 }
 
 /// One structured output delta.
-pub struct Nemotron3ChatDelta {
+struct Nemotron3ChatDelta {
     pub request_id: Nemotron3RequestId,
     pub event: ChatOutputEvent,
 }
 
 /// Terminal request metadata.
-pub struct Nemotron3Finished {
+struct Nemotron3Finished {
     pub request_id: Nemotron3RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -75,7 +75,7 @@ pub struct Nemotron3Finished {
 
 /// Observable work and output from one service iteration.
 #[derive(Default)]
-pub struct Nemotron3Tick {
+struct Nemotron3Tick {
     pub prefilled: Vec<Nemotron3PrefillProgress>,
     pub generated: Vec<Nemotron3RequestId>,
     pub output: Vec<Nemotron3ChatDelta>,
@@ -83,7 +83,7 @@ pub struct Nemotron3Tick {
 }
 
 /// Outcome of cancelling a waiting or active request.
-pub enum Nemotron3CancelOutcome {
+enum Nemotron3CancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -114,7 +114,7 @@ struct Nemotron3PrefillWorkspace {
 }
 
 impl Nemotron3PrefillWorkspace {
-    fn new(
+    pub(crate) fn new(
         model: &Nemotron3Model,
         sequence_count: usize,
         rows: usize,
@@ -137,7 +137,7 @@ impl Nemotron3PrefillWorkspace {
 }
 
 /// Checkpoint prompt rendering and round-robin multi-session Nemotron execution.
-pub struct Nemotron3ChatService<'model, 'template> {
+pub(crate) struct Nemotron3ChatService<'model, 'template> {
     model: &'model Nemotron3Model,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -154,7 +154,7 @@ pub struct Nemotron3ChatService<'model, 'template> {
 
 impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     /// Creates a multi-session service with ART-backed reusable prompt prefixes.
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: &'model Nemotron3Model,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -188,7 +188,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and queues one request without allocating GPU state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Nemotron3Admission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Nemotron3Admission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -270,7 +270,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
 
     /// Runs one scheduler iteration and reports admission and prefill events
     /// when they occur.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Nemotron3RequestId, Nemotron3AdmissionProgress>,
@@ -339,7 +339,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     }
 
     /// Cancels a waiting or active request.
-    pub fn cancel_request(&mut self, id: Nemotron3RequestId) -> Nemotron3CancelOutcome {
+    fn cancel_request(&mut self, id: Nemotron3RequestId) -> Nemotron3CancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return Nemotron3CancelOutcome::NotFound;
         };
@@ -360,7 +360,7 @@ impl<'model, 'template> Nemotron3ChatService<'model, 'template> {
     }
 
     /// Returns the number of requests currently owning device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -917,7 +917,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

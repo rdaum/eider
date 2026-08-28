@@ -31,17 +31,17 @@ const TAIL_PREFILL_TOKEN_CAPACITY: usize = 512;
 
 /// Stable request identity assigned by a Gemma 4 chat service.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Gemma4RequestId(u64);
+struct Gemma4RequestId(u64);
 
 impl Gemma4RequestId {
     /// Returns the numeric request identity.
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after rendering and tokenization.
-pub struct Gemma4Admission {
+struct Gemma4Admission {
     pub request_id: Gemma4RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
@@ -49,7 +49,7 @@ pub struct Gemma4Admission {
 
 /// Device-state allocation completed during a tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Gemma4AdmissionProgress {
+struct Gemma4AdmissionProgress {
     pub request_id: Gemma4RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -62,19 +62,19 @@ pub struct Gemma4AdmissionProgress {
 }
 
 /// Prompt progress completed during a tick.
-pub struct Gemma4PrefillProgress {
+struct Gemma4PrefillProgress {
     pub request_id: Gemma4RequestId,
     pub prompt_position: usize,
 }
 
 /// One structured output delta.
-pub struct Gemma4ChatDelta {
+struct Gemma4ChatDelta {
     pub request_id: Gemma4RequestId,
     pub event: ChatOutputEvent,
 }
 
 /// Terminal request metadata.
-pub struct Gemma4Finished {
+struct Gemma4Finished {
     pub request_id: Gemma4RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -83,7 +83,7 @@ pub struct Gemma4Finished {
 
 /// Observable work and output from one service iteration.
 #[derive(Default)]
-pub struct Gemma4Tick {
+struct Gemma4Tick {
     pub prefilled: Vec<Gemma4PrefillProgress>,
     pub generated: Vec<Gemma4RequestId>,
     pub output: Vec<Gemma4ChatDelta>,
@@ -91,7 +91,7 @@ pub struct Gemma4Tick {
 }
 
 /// Outcome of cancelling a waiting or active request.
-pub enum Gemma4CancelOutcome {
+enum Gemma4CancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -116,7 +116,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Checkpoint rendering and decode-first, round-robin Gemma 4 execution.
-pub struct Gemma4ChatService<'model, 'template> {
+pub(crate) struct Gemma4ChatService<'model, 'template> {
     model: &'model Gemma4Model,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -132,7 +132,7 @@ pub struct Gemma4ChatService<'model, 'template> {
 
 impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     /// Creates a multi-session service with ART-backed prompt prefixes.
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: &'model Gemma4Model,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -201,7 +201,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and queues a request without allocating GPU state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Gemma4Admission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Gemma4Admission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -287,7 +287,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
     /// Runs one scheduler iteration and reports admission and prefill events
     /// when they occur.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
@@ -340,7 +340,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     }
 
     /// Cancels a waiting or active request.
-    pub fn cancel_request(&mut self, id: Gemma4RequestId) -> Gemma4CancelOutcome {
+    fn cancel_request(&mut self, id: Gemma4RequestId) -> Gemma4CancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return Gemma4CancelOutcome::NotFound;
         };
@@ -368,7 +368,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     }
 
     /// Returns requests currently owning device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -800,7 +800,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

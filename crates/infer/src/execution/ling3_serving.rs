@@ -21,16 +21,16 @@ use std::time::{Duration, Instant};
 
 /// Stable identity assigned to a Ling 3 request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Ling3RequestId(u64);
+struct Ling3RequestId(u64);
 
 impl Ling3RequestId {
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after rendering and tokenisation.
-pub struct Ling3Admission {
+struct Ling3Admission {
     pub request_id: Ling3RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
@@ -38,7 +38,7 @@ pub struct Ling3Admission {
 
 /// Device allocation completed during a service tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Ling3AdmissionProgress {
+struct Ling3AdmissionProgress {
     pub request_id: Ling3RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -46,19 +46,19 @@ pub struct Ling3AdmissionProgress {
 }
 
 /// Prompt progress completed during one tick.
-pub struct Ling3PrefillProgress {
+struct Ling3PrefillProgress {
     pub request_id: Ling3RequestId,
     pub prompt_position: usize,
 }
 
 /// One structured output delta.
-pub struct Ling3ChatDelta {
+struct Ling3ChatDelta {
     pub request_id: Ling3RequestId,
     pub event: ChatOutputEvent,
 }
 
 /// Terminal request metadata.
-pub struct Ling3Finished {
+struct Ling3Finished {
     pub request_id: Ling3RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
@@ -67,7 +67,7 @@ pub struct Ling3Finished {
 
 /// Work and output from one service iteration.
 #[derive(Default)]
-pub struct Ling3Tick {
+struct Ling3Tick {
     pub prefilled: Vec<Ling3PrefillProgress>,
     pub generated: Vec<Ling3RequestId>,
     pub output: Vec<Ling3ChatDelta>,
@@ -75,7 +75,7 @@ pub struct Ling3Tick {
 }
 
 /// Outcome of cancelling a queued or active request.
-pub enum Ling3CancelOutcome {
+enum Ling3CancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -98,7 +98,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Checkpoint rendering and correctness-first Ling 3 execution.
-pub struct Ling3ChatService<'model, 'template> {
+pub(crate) struct Ling3ChatService<'model, 'template> {
     model: &'model Ling3Model,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -112,7 +112,7 @@ pub struct Ling3ChatService<'model, 'template> {
 }
 
 impl<'model, 'template> Ling3ChatService<'model, 'template> {
-    pub fn new(
+    pub(crate) fn new(
         model: &'model Ling3Model,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -147,7 +147,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
     }
 
     /// Renders, tokenises, and queues a request without allocating device state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Ling3Admission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Ling3Admission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -228,7 +228,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
     }
 
     /// Runs one decode-first scheduling iteration.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(RequestLifecycleEvent<Ling3RequestId, Ling3AdmissionProgress>),
     ) -> Result<Ling3Tick> {
@@ -276,7 +276,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: Ling3RequestId) -> Ling3CancelOutcome {
+    fn cancel_request(&mut self, id: Ling3RequestId) -> Ling3CancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return Ling3CancelOutcome::NotFound;
         };
@@ -296,7 +296,7 @@ impl<'model, 'template> Ling3ChatService<'model, 'template> {
         }
     }
 
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -554,7 +554,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

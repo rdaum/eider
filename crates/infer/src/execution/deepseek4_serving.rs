@@ -51,22 +51,22 @@ fn retention_bounded_chunk(
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Deepseek4RequestId(u64);
+struct Deepseek4RequestId(u64);
 
 impl Deepseek4RequestId {
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
-pub struct Deepseek4Admission {
+struct Deepseek4Admission {
     pub request_id: Deepseek4RequestId,
     pub prompt_tokens: usize,
     pub max_output_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Deepseek4AdmissionProgress {
+struct Deepseek4AdmissionProgress {
     pub request_id: Deepseek4RequestId,
     pub sequence_device_bytes: usize,
     pub cached_prompt_tokens: usize,
@@ -75,31 +75,31 @@ pub struct Deepseek4AdmissionProgress {
     pub admitted_after_tick_start: Duration,
 }
 
-pub struct Deepseek4PrefillProgress {
+struct Deepseek4PrefillProgress {
     pub request_id: Deepseek4RequestId,
     pub prompt_position: usize,
 }
 
-pub struct Deepseek4ChatDelta {
+struct Deepseek4ChatDelta {
     pub request_id: Deepseek4RequestId,
     pub event: ChatOutputEvent,
 }
 
-pub struct Deepseek4Finished {
+struct Deepseek4Finished {
     pub request_id: Deepseek4RequestId,
     pub finish_reason: ChatFinishReason,
     pub usage: ChatUsage,
     pub released_sequence_device_bytes: usize,
 }
 
-pub struct Deepseek4SpeculativeProgress {
+struct Deepseek4SpeculativeProgress {
     pub request_id: Deepseek4RequestId,
     pub cycles: usize,
     pub accepted_drafts: usize,
 }
 
 #[derive(Default)]
-pub struct Deepseek4Tick {
+struct Deepseek4Tick {
     pub prefilled: Vec<Deepseek4PrefillProgress>,
     pub generated: Vec<Deepseek4RequestId>,
     pub speculative: Vec<Deepseek4SpeculativeProgress>,
@@ -107,7 +107,7 @@ pub struct Deepseek4Tick {
     pub finished: Vec<Deepseek4Finished>,
 }
 
-pub enum Deepseek4CancelOutcome {
+enum Deepseek4CancelOutcome {
     Cancelled {
         released_sequence_device_bytes: usize,
     },
@@ -131,7 +131,7 @@ struct ActiveRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
-pub struct Deepseek4ChatService<'template> {
+pub(crate) struct Deepseek4ChatService<'template> {
     model: Deepseek4TextModel,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -147,7 +147,7 @@ pub struct Deepseek4ChatService<'template> {
 }
 
 impl<'template> Deepseek4ChatService<'template> {
-    pub fn new_with_cache_config(
+    pub(crate) fn new_with_cache_config(
         model: Deepseek4TextModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -219,7 +219,7 @@ impl<'template> Deepseek4ChatService<'template> {
         })
     }
 
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<Deepseek4Admission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<Deepseek4Admission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -304,7 +304,7 @@ impl<'template> Deepseek4ChatService<'template> {
     }
 
     /// Atomically writes cumulative routing observations for hot-cache preparation.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<Deepseek4RequestId, Deepseek4AdmissionProgress>,
@@ -374,7 +374,7 @@ impl<'template> Deepseek4ChatService<'template> {
         Ok(tick)
     }
 
-    pub fn cancel_request(&mut self, id: Deepseek4RequestId) -> Deepseek4CancelOutcome {
+    fn cancel_request(&mut self, id: Deepseek4RequestId) -> Deepseek4CancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return Deepseek4CancelOutcome::NotFound;
         };
@@ -398,7 +398,7 @@ impl<'template> Deepseek4ChatService<'template> {
         }
     }
 
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -1190,7 +1190,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,

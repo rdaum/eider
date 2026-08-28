@@ -20,17 +20,17 @@ use tracing::{info, warn};
 
 /// Stable identity assigned to a Bonsai request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct BonsaiRequestId(u64);
+struct BonsaiRequestId(u64);
 
 impl BonsaiRequestId {
     /// Returns the numeric request identity.
-    pub fn get(self) -> u64 {
+    fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Request metadata known after rendering and tokenization.
-pub struct BonsaiAdmission {
+struct BonsaiAdmission {
     /// Assigned request identity.
     pub request_id: BonsaiRequestId,
     /// Rendered prompt token count.
@@ -41,7 +41,7 @@ pub struct BonsaiAdmission {
 
 /// Device allocation completed during a service tick.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BonsaiAdmissionProgress {
+struct BonsaiAdmissionProgress {
     /// Admitted request.
     pub request_id: BonsaiRequestId,
     /// Sequence-specific device bytes.
@@ -53,7 +53,7 @@ pub struct BonsaiAdmissionProgress {
 }
 
 /// Prompt progress completed during one tick.
-pub struct BonsaiPrefillProgress {
+struct BonsaiPrefillProgress {
     /// Request whose prompt advanced.
     pub request_id: BonsaiRequestId,
     /// Total prompt position after this tick.
@@ -61,7 +61,7 @@ pub struct BonsaiPrefillProgress {
 }
 
 /// One structured output delta.
-pub struct BonsaiChatDelta {
+struct BonsaiChatDelta {
     /// Request owning this delta.
     pub request_id: BonsaiRequestId,
     /// Reasoning, visible text, or tool-call output.
@@ -69,7 +69,7 @@ pub struct BonsaiChatDelta {
 }
 
 /// Terminal request metadata.
-pub struct BonsaiFinished {
+struct BonsaiFinished {
     /// Finished request.
     pub request_id: BonsaiRequestId,
     /// API-facing finish reason.
@@ -82,7 +82,7 @@ pub struct BonsaiFinished {
 
 /// Work and output from one service iteration.
 #[derive(Default)]
-pub struct BonsaiTick {
+struct BonsaiTick {
     /// Prompt progress during this tick.
     pub prefilled: Vec<BonsaiPrefillProgress>,
     /// Requests producing a token during this tick.
@@ -94,7 +94,7 @@ pub struct BonsaiTick {
 }
 
 /// Outcome of cancelling a queued or active request.
-pub enum BonsaiCancelOutcome {
+enum BonsaiCancelOutcome {
     /// The request was removed and these device bytes were released.
     Cancelled {
         /// Sequence-specific allocation released, or zero while queued.
@@ -120,7 +120,7 @@ struct ActiveRequest<'tokenizer> {
 }
 
 /// Checkpoint rendering and decode-first Bonsai execution.
-pub struct BonsaiChatService<'model, 'template> {
+pub(crate) struct BonsaiChatService<'model, 'template> {
     model: &'model BonsaiModel,
     template: &'template CheckpointChatTemplate,
     config: SchedulerConfig,
@@ -134,7 +134,7 @@ pub struct BonsaiChatService<'model, 'template> {
 
 impl<'model, 'template> BonsaiChatService<'model, 'template> {
     /// Creates a service with explicit scheduling limits.
-    pub fn new(
+    pub(crate) fn new(
         model: &'model BonsaiModel,
         template: &'template CheckpointChatTemplate,
         config: SchedulerConfig,
@@ -183,7 +183,7 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
     }
 
     /// Renders, tokenizes, and queues a request without allocating GPU state.
-    pub fn add_request(&mut self, request: ChatRequest) -> Result<BonsaiAdmission> {
+    fn add_request(&mut self, request: ChatRequest) -> Result<BonsaiAdmission> {
         request.generation.validate()?;
         if request.stop_sequences.iter().any(String::is_empty) {
             return Err(Error::Format {
@@ -264,7 +264,7 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
     }
 
     /// Runs one decode-first scheduling iteration.
-    pub fn tick_with_lifecycle(
+    fn tick_with_lifecycle(
         &mut self,
         on_lifecycle: &mut dyn FnMut(
             RequestLifecycleEvent<BonsaiRequestId, BonsaiAdmissionProgress>,
@@ -315,7 +315,7 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
     }
 
     /// Cancels a queued or active request.
-    pub fn cancel_request(&mut self, id: BonsaiRequestId) -> BonsaiCancelOutcome {
+    fn cancel_request(&mut self, id: BonsaiRequestId) -> BonsaiCancelOutcome {
         let Some(request) = self.requests.remove(&id) else {
             return BonsaiCancelOutcome::NotFound;
         };
@@ -327,7 +327,7 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
     }
 
     /// Returns the number of requests with device sequence state.
-    pub fn active_sequence_count(&self) -> usize {
+    fn active_sequence_count(&self) -> usize {
         self.sequences.len()
     }
 
@@ -588,7 +588,7 @@ struct ResponseFilter {
 }
 
 impl ResponseFilter {
-    fn new(stop_sequences: Vec<String>) -> Self {
+    pub(crate) fn new(stop_sequences: Vec<String>) -> Self {
         Self {
             stop: StopBuffer::new(stop_sequences),
             saw_tool_calls: false,
