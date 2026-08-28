@@ -848,7 +848,6 @@ dependencies = [
  "async-stream",
  "axum",
  "clap",
- "eider-format",
  "eider-inference",
  "eider-runtime",
  "fast-telemetry",
