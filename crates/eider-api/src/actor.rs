@@ -15,8 +15,7 @@ use eider_inference::execution::gemma4_serving::{Gemma4ChatService, Gemma4Engine
 use eider_inference::execution::laguna_serving::{LagunaChatService, LagunaEngineService};
 use eider_inference::execution::ling3_serving::{Ling3ChatService, Ling3EngineService};
 use eider_inference::execution::muse_glimmer_serving::{
-    MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
-    MuseGlimmerDFlashProgress, MuseGlimmerRequestId,
+    MuseGlimmerChatService, MuseGlimmerEngineService,
 };
 use eider_inference::execution::nemotron3_serving::{
     Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
@@ -46,9 +45,9 @@ use eider_inference::{InferenceError, InferenceResult};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta,
-    EngineDraftProgress, EngineDraftStats, EngineFinished, EngineLifecycleEvent,
-    EnginePrefillProgress, EngineService, EngineSpeculativeProgress, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineDraftStats,
+    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineService,
+    EngineSpeculativeProgress, EngineTick,
 };
 use eider_runtime::generation::GenerationConfig;
 use eider_runtime::request::{ChatFinishReason, ChatRequest};
@@ -421,7 +420,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = MuseGlimmerActorService::new(service);
+            let mut service = MuseGlimmerEngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Bonsai => {
@@ -820,32 +819,6 @@ fn deepseek4_speculative_progress(
         request_id: progress.request_id.get(),
         cycles: progress.cycles,
         accepted_drafts: progress.accepted_drafts,
-    }
-}
-
-fn muse_admission_progress(progress: MuseGlimmerAdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: progress.allocation_duration,
-        checkpoint_copy_duration: progress.checkpoint_copy_duration,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-fn muse_dflash_progress(progress: MuseGlimmerDFlashProgress) -> EngineDraftProgress {
-    EngineDraftProgress {
-        request_id: progress.request_id.get(),
-        stats: EngineDraftStats {
-            cycles: progress.stats.cycles,
-            drafted_tokens: progress.stats.drafted_tokens,
-            accepted_drafts: progress.stats.accepted_drafts,
-            emitted_tokens: progress.stats.emitted_tokens,
-            cycle_duration: progress.stats.cycle_duration,
-            target_position: progress.stats.target_position,
-            draft_position: progress.stats.dflash_position,
-        },
     }
 }
 
@@ -1335,115 +1308,6 @@ impl EngineService for NemotronActorService<'_, '_> {
                 released_sequence_device_bytes,
             },
             Nemotron3CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
-    }
-}
-
-struct MuseGlimmerActorService<'model, 'template> {
-    inner: MuseGlimmerChatService<'model, 'template>,
-    ids: BTreeMap<u64, MuseGlimmerRequestId>,
-}
-
-impl<'model, 'template> MuseGlimmerActorService<'model, 'template> {
-    fn new(inner: MuseGlimmerChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for MuseGlimmerActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer = |event: RequestLifecycleEvent<
-            MuseGlimmerRequestId,
-            MuseGlimmerAdmissionProgress,
-        >| match event {
-            RequestLifecycleEvent::Admitted(progress) => on_lifecycle(
-                EngineLifecycleEvent::Admitted(muse_admission_progress(progress)),
-            ),
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-            }
-        };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(MuseGlimmerRequestId::get)
-                .collect(),
-            speculative: Vec::new(),
-            dflash: tick.dflash.into_iter().map(muse_dflash_progress).collect(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            MuseGlimmerCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            } => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            },
-            MuseGlimmerCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
