@@ -741,7 +741,6 @@ struct LagunaMoe {
     gate_up_values: DeviceBuffer<*const u8>,
     gate_up_scales: DeviceBuffer<*const u8>,
     gate_up_alphas: DeviceBuffer<f32>,
-    gate_up_alpha_table: DeviceBuffer<*mut f32>,
     gate_up_grouped_values: DeviceBuffer<DeviceAddress<u8>>,
     gate_up_grouped_scales: DeviceBuffer<DeviceAddress<u8>>,
     gate_up_grouped_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
@@ -845,13 +844,12 @@ impl LagunaMoe {
             .iter()
             .map(|weight| weight.matrix().scales_address())
             .collect::<Vec<_>>();
-        let mut gate_up_alphas = DeviceBuffer::from_host(
+        let gate_up_alphas = DeviceBuffer::from_host(
             &gate_up
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let gate_up_alpha_table = scalar_pointer_table(&mut gate_up_alphas)?;
         let gate_up_grouped_alpha_table = device_address_table(&gate_up_alphas)?;
         let mut down = Vec::with_capacity(EXPERTS);
         let mut down_tiles = Vec::with_capacity(EXPERTS);
@@ -878,7 +876,6 @@ impl LagunaMoe {
             gate_up_values: DeviceBuffer::from_host(&gate_up_values)?,
             gate_up_scales: DeviceBuffer::from_host(&gate_up_scales)?,
             gate_up_alphas,
-            gate_up_alpha_table,
             gate_up_grouped_values: DeviceBuffer::from_host(&gate_up_grouped_values)?,
             gate_up_grouped_scales: DeviceBuffer::from_host(&gate_up_grouped_scales)?,
             gate_up_grouped_alpha_table,
@@ -1032,7 +1029,6 @@ impl LagunaMoe {
             + self.gate_up_values.device_bytes()
             + self.gate_up_scales.device_bytes()
             + self.gate_up_alphas.device_bytes()
-            + self.gate_up_alpha_table.device_bytes()
             + self.gate_up_grouped_values.device_bytes()
             + self.gate_up_grouped_scales.device_bytes()
             + self.gate_up_grouped_alpha_table.device_bytes()
@@ -1110,19 +1106,9 @@ fn load_gate_up(
     })
 }
 
-fn scalar_pointer_table(values: &mut DeviceBuffer<f32>) -> Result<DeviceBuffer<*mut f32>> {
-    let base = values.as_const_ptr().cast::<f32>().cast_mut();
-    DeviceBuffer::from_host(
-        &(0..values.len())
-            .map(|index| unsafe { base.add(index) })
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn device_address_table(values: &DeviceBuffer<f32>) -> Result<DeviceBuffer<DeviceAddress<f32>>> {
-    let base = values.cuda_address();
     let addresses = (0..values.len())
-        .map(|index| base.offset(index))
+        .map(|index| values.address_at(index))
         .collect::<Result<Vec<_>>>()?;
     DeviceBuffer::from_host(&addresses)
 }
