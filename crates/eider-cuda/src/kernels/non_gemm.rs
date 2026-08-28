@@ -2755,70 +2755,6 @@ pub fn moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
     }
 }
 
-/// Enqueues per-slot `silu(gate) * up` into f32 output vectors.
-pub fn moe_silu_slots_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    gate_up_table: &DeviceBuffer<*const f32>,
-    output_table: &DeviceBuffer<*mut f32>,
-    gate_up_alpha_table: &DeviceBuffer<f32>,
-    rows: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    let groups = indices.len();
-    if rows == 0
-        || groups == 0
-        || gate_up_table.len() != groups
-        || output_table.len() != groups
-        || gate_up_alpha_table.is_empty()
-        || rows > u32::MAX as usize
-        || groups > u32::MAX as usize
-    {
-        return Err(Error::Shape {
-            label: "MoE slot f32 SiLU buffers",
-            expected: "non-empty rows, matching slot tables, and expert alpha table".to_string(),
-            actual: format!(
-                "rows={rows} groups={groups} gate_up={} output={} alphas={}",
-                gate_up_table.len(),
-                output_table.len(),
-                gate_up_alpha_table.len()
-            ),
-        });
-    }
-    unsafe {
-        check_cuda(
-            "infer_moe_silu_slots_f32_on_stream",
-            ffi::infer_moe_silu_slots_f32_on_stream(
-                indices.ptr,
-                gate_up_table.ptr,
-                output_table.ptr,
-                gate_up_alpha_table.ptr,
-                rows as u32,
-                groups as u32,
-                stream.as_raw(),
-            ),
-        )
-    }
-}
-
-/// Writes the weighted sum of per-slot f32 expert outputs into `output`.
-pub fn moe_weighted_accumulate_slots_f32_on_stream(
-    indices: &DeviceBuffer<u32>,
-    route_weights: &DeviceBuffer<f32>,
-    inputs: &DeviceBuffer<*const f32>,
-    alpha_table: &DeviceBuffer<f32>,
-    output: DeviceInOut<'_, f32>,
-    stream: &CudaStream,
-) -> Result<()> {
-    moe_weighted_accumulate_slots_f32_impl(
-        indices,
-        route_weights,
-        inputs,
-        alpha_table,
-        output,
-        stream,
-    )
-}
-
 /// Writes a weighted routed-expert sum using a typed input-address table.
 pub fn moe_weighted_accumulate_slot_addresses_f32_on_stream(
     indices: &DeviceBuffer<u32>,
@@ -9983,38 +9919,6 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream
     }
 }
 
-/// Enqueues device-routed channel-scaled FP8 gate and up projections.
-#[allow(clippy::too_many_arguments)]
-pub fn fp8_moe_grouped_gate_up_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    input: &DeviceBuffer<u8>,
-    input_scale: &DeviceBuffer<f32>,
-    gate_weights: &DeviceBuffer<*const u8>,
-    gate_scales: &DeviceBuffer<*const f32>,
-    up_weights: &DeviceBuffer<*const u8>,
-    up_scales: &DeviceBuffer<*const f32>,
-    output: DeviceOutput<'_, f32>,
-    rows: usize,
-    cols: usize,
-    slots: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    fp8_moe_grouped_gate_up_f32_impl(
-        indices,
-        input,
-        input_scale,
-        gate_weights,
-        gate_scales,
-        up_weights,
-        up_scales,
-        output,
-        rows,
-        cols,
-        slots,
-        stream,
-    )
-}
-
 /// Enqueues device-routed FP8 gate and up projections using typed expert
 /// weight and channel-scale address tables.
 #[allow(clippy::too_many_arguments)]
@@ -10166,63 +10070,6 @@ pub fn moe_silu_quantize_fp8_slots_f32_into_on_stream(
             ),
         )
     }
-}
-
-/// Enqueues device-routed channel-scaled FP8 down projections for quantized slots.
-#[allow(clippy::too_many_arguments)]
-pub fn fp8_moe_grouped_down_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    inputs: &DeviceBuffer<u8>,
-    input_scales: &DeviceBuffer<f32>,
-    weights: &DeviceBuffer<*const u8>,
-    weight_scales: &DeviceBuffer<*const f32>,
-    outputs: &DeviceBuffer<*mut f32>,
-    rows: usize,
-    cols: usize,
-    slots: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    fp8_moe_grouped_down_f32_impl(
-        indices,
-        inputs,
-        input_scales,
-        weights,
-        weight_scales,
-        outputs,
-        rows,
-        cols,
-        slots,
-        stream,
-    )
-}
-
-/// Enqueues device-routed FP8 down projections using typed expert weight and
-/// channel-scale address tables.
-#[allow(clippy::too_many_arguments)]
-pub fn fp8_moe_grouped_down_addressed_f32_into_on_stream(
-    indices: &DeviceBuffer<u32>,
-    inputs: &DeviceBuffer<u8>,
-    input_scales: &DeviceBuffer<f32>,
-    weights: &DeviceBuffer<DeviceAddress<u8>>,
-    weight_scales: &DeviceBuffer<DeviceAddress<f32>>,
-    outputs: &DeviceBuffer<*mut f32>,
-    rows: usize,
-    cols: usize,
-    slots: usize,
-    stream: &CudaStream,
-) -> Result<()> {
-    fp8_moe_grouped_down_f32_impl(
-        indices,
-        inputs,
-        input_scales,
-        weights,
-        weight_scales,
-        outputs,
-        rows,
-        cols,
-        slots,
-        stream,
-    )
 }
 
 /// Enqueues device-routed FP8 down projections with typed expert weights,
@@ -16954,10 +16801,10 @@ mod tests {
                 .expect("routed output")
             })
             .collect::<Vec<_>>();
-        let routed_ptrs = DeviceBuffer::from_host(
+        let routed_addresses = DeviceBuffer::from_host(
             &routed
                 .iter()
-                .map(|values| values.as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("routed pointers");
@@ -16966,10 +16813,10 @@ mod tests {
         let alphas_device = DeviceBuffer::from_host(&alphas).expect("alphas");
         let stream = CudaStream::new_non_blocking().expect("stream");
         let mut actual = DeviceBuffer::zeroed(ROWS * LEN).expect("batch output");
-        moe_weighted_accumulate_slots_f32_batch_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_batch_on_stream(
             &indices_device,
             &weights_device,
-            &routed_ptrs,
+            &routed_addresses,
             &alphas_device,
             actual.inout(),
             ROWS,
@@ -16984,18 +16831,18 @@ mod tests {
             let end = begin + GROUPS;
             let row_indices = DeviceBuffer::from_host(&indices[begin..end]).expect("row indices");
             let row_weights = DeviceBuffer::from_host(&weights[begin..end]).expect("row weights");
-            let row_ptrs = DeviceBuffer::from_host(
+            let row_addresses = DeviceBuffer::from_host(
                 &routed[begin..end]
                     .iter()
-                    .map(|values| values.as_const_ptr().cast::<f32>())
+                    .map(DeviceBuffer::cuda_address)
                     .collect::<Vec<_>>(),
             )
             .expect("row pointers");
             let mut expected = DeviceBuffer::zeroed(LEN).expect("row output");
-            moe_weighted_accumulate_slots_f32_on_stream(
+            moe_weighted_accumulate_slot_addresses_f32_on_stream(
                 &row_indices,
                 &row_weights,
-                &row_ptrs,
+                &row_addresses,
                 &alphas_device,
                 expected.inout(),
                 &stream,
@@ -17118,13 +16965,6 @@ mod tests {
                 .expect("routed output upload")
             })
             .collect::<Vec<_>>();
-        let routed_ptrs = DeviceBuffer::from_host(
-            &routed
-                .iter()
-                .map(|values| values.as_const_ptr().cast::<f32>())
-                .collect::<Vec<_>>(),
-        )
-        .expect("routed pointer table upload");
         let routed_addresses = DeviceBuffer::from_host(
             &routed
                 .iter()
@@ -17148,10 +16988,10 @@ mod tests {
         let stream = CudaStream::new_non_blocking().expect("stream");
 
         let mut moe_output = DeviceBuffer::zeroed(len).expect("MoE output alloc");
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &indices,
             &route_weights,
-            &routed_ptrs,
+            &routed_addresses,
             &alpha_table,
             moe_output.inout(),
             &stream,
@@ -21197,41 +21037,41 @@ mod tests {
         let gate_table = DeviceBuffer::from_host(
             &gate
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("gate table upload");
         let up_table = DeviceBuffer::from_host(
             &up.iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("up table upload");
         let down_table = DeviceBuffer::from_host(
             &down
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("down table upload");
         let gate_scale_table = DeviceBuffer::from_host(
             &gate_scales
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("gate scale table upload");
         let up_scale_table = DeviceBuffer::from_host(
             &up_scales
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("up scale table upload");
         let down_scale_table = DeviceBuffer::from_host(
             &down_scales
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<f32>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("down scale table upload");
@@ -21247,13 +21087,13 @@ mod tests {
             DeviceBuffer::<u8>::zeroed(slots * intermediate).expect("down input alloc");
         let mut down_input_scales =
             DeviceBuffer::<f32>::zeroed(slots).expect("down input scales alloc");
-        let mut down_outputs = (0..slots)
+        let down_outputs = (0..slots)
             .map(|_| DeviceBuffer::<f32>::zeroed(hidden).expect("down output alloc"))
             .collect::<Vec<_>>();
         let down_output_table = DeviceBuffer::from_host(
             &down_outputs
-                .iter_mut()
-                .map(|buffer| buffer.as_mut_ptr().cast::<f32>())
+                .iter()
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("down output table upload");
@@ -21265,7 +21105,7 @@ mod tests {
             &stream,
         )
         .expect("input quantization");
-        fp8_moe_grouped_gate_up_f32_into_on_stream(
+        fp8_moe_grouped_gate_up_addressed_f32_into_on_stream(
             &indices_device,
             &input_fp8,
             &input_scale,
@@ -21289,7 +21129,7 @@ mod tests {
             &stream,
         )
         .expect("SiLU quantization");
-        fp8_moe_grouped_down_f32_into_on_stream(
+        fp8_moe_grouped_down_addresses_f32_into_on_stream(
             &indices_device,
             &down_input,
             &down_input_scales,

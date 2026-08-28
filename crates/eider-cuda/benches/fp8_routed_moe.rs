@@ -1,8 +1,10 @@
 use eider_cuda::{
-    CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, DeviceRepr, F32Matrix, Result,
-    fill_f32_into_on_stream, fp8_moe_grouped_down_f32_into_on_stream,
-    fp8_moe_grouped_gate_up_f32_into_on_stream, moe_silu_quantize_fp8_slots_f32_into_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_fp8_e4m3_dynamic_f32_into_on_stream,
+    CudaEvent, CudaGraphExec, CudaStream, DeviceAddress, DeviceBuffer, DeviceRepr, F32Matrix,
+    Result, fill_f32_into_on_stream, fp8_moe_grouped_down_addresses_f32_into_on_stream,
+    fp8_moe_grouped_gate_up_addressed_f32_into_on_stream,
+    moe_silu_quantize_fp8_slots_f32_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    quantize_fp8_e4m3_dynamic_f32_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -26,22 +28,21 @@ struct Fp8RoutedMoeBench {
     hidden_scale: DeviceBuffer<f32>,
     gate_weight: DeviceBuffer<u8>,
     gate_scale: DeviceBuffer<f32>,
-    gate_weights: DeviceBuffer<*const u8>,
-    gate_scales: DeviceBuffer<*const f32>,
+    gate_weights: DeviceBuffer<DeviceAddress<u8>>,
+    gate_scales: DeviceBuffer<DeviceAddress<f32>>,
     up_weight: DeviceBuffer<u8>,
     up_scale: DeviceBuffer<f32>,
-    up_weights: DeviceBuffer<*const u8>,
-    up_scales: DeviceBuffer<*const f32>,
+    up_weights: DeviceBuffer<DeviceAddress<u8>>,
+    up_scales: DeviceBuffer<DeviceAddress<f32>>,
     down_weight: DeviceBuffer<u8>,
     down_scale: DeviceBuffer<f32>,
-    down_weights: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const f32>,
+    down_weights: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<f32>>,
     gate_up: DeviceBuffer<f32>,
     down_input: DeviceBuffer<u8>,
     down_input_scales: DeviceBuffer<f32>,
     down_outputs: Vec<F32Matrix>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_input_table: DeviceBuffer<*const f32>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
     down_alphas: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
     graph: Option<CudaGraphExec>,
@@ -74,19 +75,13 @@ impl Fp8RoutedMoeBench {
         let up_scales = repeated_const_table::<f32>(&up_scale, EXPERTS)?;
         let down_weights = repeated_const_table::<u8>(&down_weight, EXPERTS)?;
         let down_scales = repeated_const_table::<f32>(&down_scale, EXPERTS)?;
-        let mut down_outputs = (0..SLOTS)
+        let down_outputs = (0..SLOTS)
             .map(|_| F32Matrix::zeroed(HIDDEN, 1))
             .collect::<Result<Vec<_>>>()?;
         let down_output_table = DeviceBuffer::from_host(
             &down_outputs
-                .iter_mut()
-                .map(F32Matrix::data_mut_ptr)
-                .collect::<Vec<_>>(),
-        )?;
-        let down_input_table = DeviceBuffer::from_host(
-            &down_outputs
                 .iter()
-                .map(F32Matrix::data_ptr)
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )?;
         let mut bench = Self {
@@ -119,7 +114,6 @@ impl Fp8RoutedMoeBench {
             down_input_scales: DeviceBuffer::zeroed(SLOTS)?,
             down_outputs,
             down_output_table,
-            down_input_table,
             down_alphas: DeviceBuffer::from_host(&vec![1.0; EXPERTS])?,
             output: DeviceBuffer::zeroed(HIDDEN)?,
             graph: None,
@@ -144,7 +138,7 @@ impl Fp8RoutedMoeBench {
             &mut self.hidden_scale,
             stream,
         )?;
-        fp8_moe_grouped_gate_up_f32_into_on_stream(
+        fp8_moe_grouped_gate_up_addressed_f32_into_on_stream(
             &self.indices,
             &self.hidden_fp8,
             &self.hidden_scale,
@@ -166,7 +160,7 @@ impl Fp8RoutedMoeBench {
             SLOTS,
             stream,
         )?;
-        fp8_moe_grouped_down_f32_into_on_stream(
+        fp8_moe_grouped_down_addresses_f32_into_on_stream(
             &self.indices,
             &self.down_input,
             &self.down_input_scales,
@@ -179,10 +173,10 @@ impl Fp8RoutedMoeBench {
             stream,
         )?;
         fill_f32_into_on_stream(self.output.output(), 0.0, stream)?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &self.indices,
             &self.route_weights,
-            &self.down_input_table,
+            &self.down_output_table,
             &self.down_alphas,
             self.output.inout(),
             stream,
@@ -202,8 +196,8 @@ impl Fp8RoutedMoeBench {
 fn repeated_const_table<T: DeviceRepr>(
     buffer: &DeviceBuffer<T>,
     len: usize,
-) -> Result<DeviceBuffer<*const T>> {
-    DeviceBuffer::from_host(&vec![buffer.as_const_ptr().cast::<T>(); len])
+) -> Result<DeviceBuffer<DeviceAddress<T>>> {
+    DeviceBuffer::from_host(&vec![buffer.cuda_address(); len])
 }
 
 fn fp8_values(len: usize, salt: usize) -> Vec<u8> {

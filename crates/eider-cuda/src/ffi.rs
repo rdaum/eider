@@ -1638,15 +1638,6 @@ unsafe extern "C" {
         groups: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-    pub(crate) fn infer_moe_silu_slots_f32_on_stream(
-        indices: *const u32,
-        gate_up_table: *const *const f32,
-        output_table: *const *mut f32,
-        gate_up_alpha_table: *const f32,
-        rows: u32,
-        groups: u32,
-        stream: cudaStream_t,
-    ) -> cudaError_t;
     pub(crate) fn infer_moe_weighted_accumulate_slots_f32_on_stream(
         indices: *const u32,
         route_weights: *const f32,

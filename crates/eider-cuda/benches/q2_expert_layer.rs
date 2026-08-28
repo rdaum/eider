@@ -1,8 +1,9 @@
 use eider_cuda::{
     CudaEvent, CudaStream, DeviceAddress, DeviceBuffer, Q2ExpertTable, Q2Nvfp4ExpertOverlay,
-    QuantizedQ2, format, moe_weighted_accumulate_slots_f32_on_stream,
-    nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream,
-    nvfp4_w4a16_grouped_matvec_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
+    QuantizedQ2, format, moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream,
+    nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream,
+    silu_mul_halves_clamped_f32_into_on_stream,
 };
 use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
@@ -23,8 +24,8 @@ const WEIGHT: f32 = 0.09375;
 struct Nvfp4Table {
     values_storage: Vec<DeviceBuffer<u8>>,
     scales_storage: Vec<DeviceBuffer<u8>>,
-    values: DeviceBuffer<*const u8>,
-    scales: DeviceBuffer<*const u8>,
+    values: DeviceBuffer<DeviceAddress<u8>>,
+    scales: DeviceBuffer<DeviceAddress<u8>>,
     scale_2: DeviceBuffer<f32>,
 }
 
@@ -41,14 +42,14 @@ impl Nvfp4Table {
         let value_table = DeviceBuffer::from_host(
             &values
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("NVFP4 value table");
         let scale_table = DeviceBuffer::from_host(
             &scales
                 .iter()
-                .map(|buffer| buffer.as_const_ptr().cast::<u8>())
+                .map(DeviceBuffer::cuda_address)
                 .collect::<Vec<_>>(),
         )
         .expect("NVFP4 scale table");
@@ -86,15 +87,11 @@ impl Nvfp4Table {
 
 struct LayerWorkspace {
     gate_up: Vec<DeviceBuffer<f32>>,
-    gate_up_table: DeviceBuffer<*mut f32>,
     q2_gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
     activated: Vec<DeviceBuffer<f32>>,
-    activated_table: DeviceBuffer<*const f32>,
     q2_activated_table: DeviceBuffer<DeviceAddress<f32>>,
     _down: Vec<DeviceBuffer<f32>>,
-    down_table: DeviceBuffer<*mut f32>,
     q2_down_table: DeviceBuffer<DeviceAddress<f32>>,
-    down_const_table: DeviceBuffer<*const f32>,
     output: DeviceBuffer<f32>,
 }
 
@@ -103,13 +100,6 @@ impl LayerWorkspace {
         let gate_up = (0..TOP_K)
             .map(|_| DeviceBuffer::<f32>::zeroed(GATE_UP).expect("gate/up output"))
             .collect::<Vec<_>>();
-        let gate_up_table = DeviceBuffer::from_host(
-            &gate_up
-                .iter()
-                .map(|output| output.as_const_ptr().cast::<f32>().cast_mut())
-                .collect::<Vec<_>>(),
-        )
-        .expect("gate/up table");
         let q2_gate_up_table = DeviceBuffer::from_host(
             &gate_up
                 .iter()
@@ -120,13 +110,6 @@ impl LayerWorkspace {
         let activated = (0..TOP_K)
             .map(|_| DeviceBuffer::<f32>::zeroed(INTERMEDIATE).expect("activation"))
             .collect::<Vec<_>>();
-        let activated_table = DeviceBuffer::from_host(
-            &activated
-                .iter()
-                .map(|output| output.as_const_ptr().cast::<f32>())
-                .collect::<Vec<_>>(),
-        )
-        .expect("activation table");
         let q2_activated_table = DeviceBuffer::from_host(
             &activated
                 .iter()
@@ -137,13 +120,6 @@ impl LayerWorkspace {
         let down = (0..TOP_K)
             .map(|_| DeviceBuffer::<f32>::zeroed(HIDDEN).expect("down output"))
             .collect::<Vec<_>>();
-        let down_table = DeviceBuffer::from_host(
-            &down
-                .iter()
-                .map(|output| output.as_const_ptr().cast::<f32>().cast_mut())
-                .collect::<Vec<_>>(),
-        )
-        .expect("down table");
         let q2_down_table = DeviceBuffer::from_host(
             &down
                 .iter()
@@ -151,24 +127,13 @@ impl LayerWorkspace {
                 .collect::<Vec<_>>(),
         )
         .expect("Q2 down table");
-        let down_const_table = DeviceBuffer::from_host(
-            &down
-                .iter()
-                .map(|output| output.as_const_ptr().cast::<f32>())
-                .collect::<Vec<_>>(),
-        )
-        .expect("down const table");
         Self {
             gate_up,
-            gate_up_table,
             q2_gate_up_table,
             activated,
-            activated_table,
             q2_activated_table,
             _down: down,
-            down_table,
             q2_down_table,
-            down_const_table,
             output: DeviceBuffer::zeroed(HIDDEN).expect("layer output"),
         }
     }
@@ -233,10 +198,10 @@ impl Q2ExpertLayerBench {
             stream,
             ..
         } = self;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             route_weights,
-            &q2_workspace.down_const_table,
+            &q2_workspace.q2_down_table,
             unity_alphas,
             q2_workspace.output.inout(),
             stream,
@@ -270,10 +235,10 @@ impl Q2ExpertLayerBench {
             stream,
             ..
         } = self;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             route_weights,
-            &mixed_workspace.down_const_table,
+            &mixed_workspace.q2_down_table,
             unity_alphas,
             mixed_workspace.output.inout(),
             stream,
@@ -282,26 +247,26 @@ impl Q2ExpertLayerBench {
     }
 
     fn enqueue_q4(&mut self) {
-        nvfp4_w4a16_grouped_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_matvec_addressed_f32_into_on_stream(
             &self.indices,
             &self.input,
             &self.q4_gate_up.values,
             &self.q4_gate_up.scales,
             &self.q4_gate_up.scale_2,
-            &self.q4_workspace.gate_up_table,
+            &self.q4_workspace.q2_gate_up_table,
             GATE_UP,
             HIDDEN,
             &self.stream,
         )
         .expect("NVFP4 gate/up");
         self.q4_workspace.activate(&self.stream);
-        nvfp4_w4a16_grouped_inputs_matvec_f32_into_on_stream(
+        nvfp4_w4a16_grouped_inputs_matvec_addressed_f32_into_on_stream(
             &self.indices,
-            &self.q4_workspace.activated_table,
+            &self.q4_workspace.q2_activated_table,
             &self.q4_down.values,
             &self.q4_down.scales,
             &self.q4_down.scale_2,
-            &self.q4_workspace.down_table,
+            &self.q4_workspace.q2_down_table,
             HIDDEN,
             INTERMEDIATE,
             &self.stream,
@@ -315,10 +280,10 @@ impl Q2ExpertLayerBench {
             stream,
             ..
         } = self;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             route_weights,
-            &q4_workspace.down_const_table,
+            &q4_workspace.q2_down_table,
             unity_alphas,
             q4_workspace.output.inout(),
             stream,
