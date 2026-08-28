@@ -75,7 +75,7 @@ use super::qwen36_cache::{
     Qwen36Fp8Nvfp4Cache, down_path, ensure_layer_cache, ensure_model_cache, gate_up_path,
     prepared_layer_dir,
 };
-use crate::runtime::expert_cache::{
+use crate::execution::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertUploadCoordinator, read_expert_misses,
 };
 

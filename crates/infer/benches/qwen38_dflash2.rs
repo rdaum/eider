@@ -1,7 +1,7 @@
+use eider_inference::execution::scheduler::{Qwen36RequestId, Qwen36Scheduler};
 use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel,
 };
-use eider_inference::runtime::scheduler::{Qwen36RequestId, Qwen36Scheduler};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::sampling::SamplingConfig;
 use eider_runtime::scheduler::{RequestConfig, RequestState, SchedulerConfig};

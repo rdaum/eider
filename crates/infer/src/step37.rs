@@ -1,9 +1,9 @@
 //! Step-3.7-Flash text runtime and prepared expert storage.
 
-use crate::metrics::ExpertPagingMetricHandle;
-use crate::runtime::expert_cache::{
+use crate::execution::expert_cache::{
     ExpertRecordSource, ExpertSlotCache, ExpertSlotMiss, ExpertUploadCoordinator,
 };
+use crate::metrics::ExpertPagingMetricHandle;
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
     CudaStream, DeviceAddress, DeviceBuffer, Error, F32Matrix, GpuSampledToken, GpuSamplingRow,

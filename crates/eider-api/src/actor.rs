@@ -6,6 +6,44 @@ use eider_inference::InferenceResult;
 use eider_inference::bitnet::BitNetModel;
 use eider_inference::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use eider_inference::deepseek4::Deepseek4TextModel;
+use eider_inference::execution::bitnet_serving::{
+    BitNetAdmissionProgress, BitNetCancelOutcome, BitNetChatService, BitNetRequestId,
+};
+use eider_inference::execution::bonsai_serving::{
+    BonsaiAdmissionProgress, BonsaiCancelOutcome, BonsaiChatService, BonsaiRequestId,
+};
+use eider_inference::execution::deepseek4_serving::{
+    Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
+    Deepseek4SpeculativeProgress,
+};
+use eider_inference::execution::gemma4_serving::{
+    Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
+};
+use eider_inference::execution::laguna_serving::{
+    LagunaAdmissionProgress, LagunaCancelOutcome, LagunaChatService, LagunaRequestId,
+};
+use eider_inference::execution::ling3_serving::{
+    Ling3AdmissionProgress, Ling3CancelOutcome, Ling3ChatService, Ling3RequestId,
+};
+use eider_inference::execution::muse_glimmer_serving::{
+    MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
+    MuseGlimmerDFlashProgress, MuseGlimmerDFlashStats, MuseGlimmerRequestId,
+};
+use eider_inference::execution::nemotron3_serving::{
+    Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
+};
+use eider_inference::execution::qwen38_flash_next_serving::{
+    Qwen38FlashNextAdmissionProgress, Qwen38FlashNextCancelOutcome, Qwen38FlashNextChatService,
+    Qwen38FlashNextRequestId,
+};
+use eider_inference::execution::scheduler::{
+    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen38SpeculativeProgress,
+};
+use eider_inference::execution::serving::Qwen36ChatService;
+use eider_inference::execution::step37_scheduler::{
+    Step37AdmissionProgress, Step37CancelOutcome, Step37RequestId,
+};
+use eider_inference::execution::step37_serving::Step37ChatService;
 use eider_inference::gemma4::Gemma4Model;
 use eider_inference::laguna::LagunaModel;
 use eider_inference::ling3::Ling3Model;
@@ -14,44 +52,6 @@ use eider_inference::muse_glimmer::MuseGlimmerModel;
 use eider_inference::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use eider_inference::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
 use eider_inference::qwen38_flash_next::Qwen38FlashNextModel;
-use eider_inference::runtime::bitnet_serving::{
-    BitNetAdmissionProgress, BitNetCancelOutcome, BitNetChatService, BitNetRequestId,
-};
-use eider_inference::runtime::bonsai_serving::{
-    BonsaiAdmissionProgress, BonsaiCancelOutcome, BonsaiChatService, BonsaiRequestId,
-};
-use eider_inference::runtime::deepseek4_serving::{
-    Deepseek4AdmissionProgress, Deepseek4CancelOutcome, Deepseek4ChatService, Deepseek4RequestId,
-    Deepseek4SpeculativeProgress,
-};
-use eider_inference::runtime::gemma4_serving::{
-    Gemma4AdmissionProgress, Gemma4CancelOutcome, Gemma4ChatService, Gemma4RequestId,
-};
-use eider_inference::runtime::laguna_serving::{
-    LagunaAdmissionProgress, LagunaCancelOutcome, LagunaChatService, LagunaRequestId,
-};
-use eider_inference::runtime::ling3_serving::{
-    Ling3AdmissionProgress, Ling3CancelOutcome, Ling3ChatService, Ling3RequestId,
-};
-use eider_inference::runtime::muse_glimmer_serving::{
-    MuseGlimmerAdmissionProgress, MuseGlimmerCancelOutcome, MuseGlimmerChatService,
-    MuseGlimmerDFlashProgress, MuseGlimmerDFlashStats, MuseGlimmerRequestId,
-};
-use eider_inference::runtime::nemotron3_serving::{
-    Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
-};
-use eider_inference::runtime::qwen38_flash_next_serving::{
-    Qwen38FlashNextAdmissionProgress, Qwen38FlashNextCancelOutcome, Qwen38FlashNextChatService,
-    Qwen38FlashNextRequestId,
-};
-use eider_inference::runtime::scheduler::{
-    Qwen36AdmissionProgress, Qwen36CancelOutcome, Qwen36RequestId, Qwen38SpeculativeProgress,
-};
-use eider_inference::runtime::serving::Qwen36ChatService;
-use eider_inference::runtime::step37_scheduler::{
-    Step37AdmissionProgress, Step37CancelOutcome, Step37RequestId,
-};
-use eider_inference::runtime::step37_serving::Step37ChatService;
 use eider_inference::step37::{Step37Bf16StorageConfig, Step37TextModel};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;

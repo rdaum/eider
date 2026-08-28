@@ -129,7 +129,7 @@ in view:
 
 - `crates/eider-api/src/` — catalogue deployment, inference actor, HTTP APIs,
   streaming protocol adapters, and server telemetry.
-- `crates/infer/src/runtime/` — shared scheduling, prefix/KV caches, sampling,
+- `crates/infer/src/execution/` — shared scheduling, prefix/KV caches, sampling,
   chat rendering, output parsing, and serving state.
 - `crates/infer/src/{qwen3,step37,laguna,gemma4,muse_glimmer,nemotron3,deepseek4}/` —
   family-specific model loading and execution.

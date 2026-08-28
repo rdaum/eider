@@ -441,7 +441,7 @@ public surface is complete.
 3. Move Qwen masking, sampling, speculative copies, and completion handling
    behind an inference execution guard.
 4. Move model sequence state, KV implementations, expert residency, and page
-   backends out of `runtime`.
+   backends out of `execution`.
 5. Extract pure host checkpoint and artifact code into `eider-format`.
 6. Extract the corrected device and FFI surface into `eider-cuda`.
 7. Extract generic scheduling and serving into `eider-runtime`. Migrate model

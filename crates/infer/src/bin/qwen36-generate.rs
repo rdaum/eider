@@ -1,6 +1,6 @@
 use eider_cuda::{Error, Result};
+use eider_inference::execution::generation::Qwen36GenerationSession;
 use eider_inference::qwen3::qwen36::Qwen36TextModel;
-use eider_inference::runtime::generation::Qwen36GenerationSession;
 use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use eider_runtime::generation::GenerationConfig;
 use std::env;

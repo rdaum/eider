@@ -7,7 +7,7 @@ use super::{
     Nemotron3MoeLayer, Nemotron3MoeRowsWorkspace, Nemotron3MoeWorkspace, Nemotron3MtpWorkspace,
     Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3StorageConfig, nemotron3_cache_error,
 };
-use crate::runtime::kv_cache::LayerKvCacheCheckpoint;
+use crate::execution::kv_cache::LayerKvCacheCheckpoint;
 use eider_cuda::{
     CudaStream, DeviceAddress, DeviceBuffer, Error, Result, Sm12xKvAttentionWorkspace,
     argmax_f32_into_on_stream, copy_bf16_row_to_f32_into_on_stream,

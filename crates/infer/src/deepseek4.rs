@@ -33,9 +33,9 @@ pub use sequence::{
 pub use state::Deepseek4SequenceCheckpoint;
 pub use state::{Deepseek4CompressionState, Deepseek4LayerSequenceState, Deepseek4SequenceState};
 
+use crate::execution::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
+use crate::execution::expert_hotset::{ExpertUsageTracker, select_top_experts};
 use crate::metrics::ExpertPagingMetricHandle;
-use crate::runtime::expert_cache::{ExpertSlotCache, ExpertUploadCoordinator};
-use crate::runtime::expert_hotset::{ExpertUsageTracker, select_top_experts};
 use crate::system_io::read_exact_vectored_at;
 use eider_cuda::{
     CudaStream, DeviceBuffer, Error, MoeSortedRoutes, Nvfp4LinearSlotMut, Nvfp4LinearSlots,

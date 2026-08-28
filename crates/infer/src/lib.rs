@@ -21,8 +21,8 @@ mod paged_prefill_attention;
 pub mod sm12x_cache;
 
 /// Runtime state and device-resident KV cache storage.
-pub mod runtime;
-pub use runtime::kv_cache;
+pub mod execution;
+pub use execution::kv_cache;
 
 /// BitNet b1.58 ternary text-model loading and inference.
 pub mod bitnet;
