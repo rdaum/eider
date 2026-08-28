@@ -2,7 +2,6 @@
 
 use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
-use eider_inference::InferenceResult;
 use eider_inference::bitnet::BitNetModel;
 use eider_inference::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use eider_inference::deepseek4::Deepseek4TextModel;
@@ -53,12 +52,13 @@ use eider_inference::nemotron3::{Nemotron3Model, Nemotron3StorageConfig};
 use eider_inference::qwen3::qwen36::{Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel};
 use eider_inference::qwen38_flash_next::Qwen38FlashNextModel;
 use eider_inference::step37::{Step37Bf16StorageConfig, Step37TextModel};
+use eider_inference::{InferenceError, InferenceResult};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::engine::{
     EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta,
     EngineDraftProgress, EngineDraftStats, EngineFinished, EngineLifecycleEvent,
-    EnginePrefillProgress, EngineSpeculativeProgress, EngineTick,
+    EnginePrefillProgress, EngineService, EngineSpeculativeProgress, EngineTick,
 };
 use eider_runtime::generation::GenerationConfig;
 use eider_runtime::request::{ChatFinishReason, ChatRequest};
@@ -960,19 +960,6 @@ fn qwen38_flash_next_admission_progress(
     }
 }
 
-trait ActorService {
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission>;
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick>;
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
-    fn active_sequence_count(&self) -> usize;
-    fn shutdown(&mut self) -> InferenceResult<()> {
-        Ok(())
-    }
-}
-
 struct QwenActorService<'model, 'template> {
     inner: Qwen36ChatService<'model, 'template>,
     ids: BTreeMap<u64, Qwen36RequestId>,
@@ -987,7 +974,8 @@ impl<'model, 'template> QwenActorService<'model, 'template> {
     }
 }
 
-impl ActorService for QwenActorService<'_, '_> {
+impl EngineService for QwenActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1098,7 +1086,8 @@ impl<'template> Qwen38FlashNextActorService<'template> {
     }
 }
 
-impl ActorService for Qwen38FlashNextActorService<'_> {
+impl EngineService for Qwen38FlashNextActorService<'_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1214,7 +1203,8 @@ impl<'template> StepActorService<'template> {
     }
 }
 
-impl ActorService for StepActorService<'_> {
+impl EngineService for StepActorService<'_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1321,7 +1311,8 @@ impl<'model, 'template> NemotronActorService<'model, 'template> {
     }
 }
 
-impl ActorService for NemotronActorService<'_, '_> {
+impl EngineService for NemotronActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1431,7 +1422,8 @@ impl<'model, 'template> GemmaActorService<'model, 'template> {
     }
 }
 
-impl ActorService for GemmaActorService<'_, '_> {
+impl EngineService for GemmaActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1539,7 +1531,8 @@ impl<'model, 'template> BitNetActorService<'model, 'template> {
     }
 }
 
-impl ActorService for BitNetActorService<'_, '_> {
+impl EngineService for BitNetActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1645,7 +1638,8 @@ impl<'model, 'template> Ling3ActorService<'model, 'template> {
     }
 }
 
-impl ActorService for Ling3ActorService<'_, '_> {
+impl EngineService for Ling3ActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1751,7 +1745,8 @@ impl<'model, 'template> MuseGlimmerActorService<'model, 'template> {
     }
 }
 
-impl ActorService for MuseGlimmerActorService<'_, '_> {
+impl EngineService for MuseGlimmerActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1859,7 +1854,8 @@ impl<'model, 'template> BonsaiActorService<'model, 'template> {
     }
 }
 
-impl ActorService for BonsaiActorService<'_, '_> {
+impl EngineService for BonsaiActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -1965,7 +1961,8 @@ impl<'model, 'template> LagunaActorService<'model, 'template> {
     }
 }
 
-impl ActorService for LagunaActorService<'_, '_> {
+impl EngineService for LagunaActorService<'_, '_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -2073,7 +2070,8 @@ impl<'template> DeepseekActorService<'template> {
     }
 }
 
-impl ActorService for DeepseekActorService<'_> {
+impl EngineService for DeepseekActorService<'_> {
+    type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
         let admission = self.inner.add_request(request)?;
         let id = admission.request_id.get();
@@ -2174,7 +2172,7 @@ impl ActorService for DeepseekActorService<'_> {
 }
 
 fn run_actor_loop(
-    service: &mut dyn ActorService,
+    service: &mut dyn EngineService<Error = InferenceError>,
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
     ready: std::sync::mpsc::SyncSender<Result<GenerationConfig, String>>,
     defaults: GenerationConfig,
@@ -2424,7 +2422,7 @@ fn run_actor_loop(
     shutdown_service(service);
 }
 
-fn shutdown_service(service: &mut dyn ActorService) {
+fn shutdown_service(service: &mut dyn EngineService<Error = InferenceError>) {
     if let Err(error) = service.shutdown() {
         error!(error = %error, "failed to shut down inference service");
     }
@@ -2432,7 +2430,7 @@ fn shutdown_service(service: &mut dyn ActorService) {
 
 fn handle_command(
     command: ActorCommand,
-    service: &mut dyn ActorService,
+    service: &mut dyn EngineService<Error = InferenceError>,
     active: &mut BTreeMap<u64, ActiveRequest>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) -> bool {
@@ -2483,7 +2481,7 @@ fn handle_command(
 
 fn cancel_scheduler_request(
     scheduler_id: u64,
-    service: &mut dyn ActorService,
+    service: &mut dyn EngineService<Error = InferenceError>,
     active: &mut BTreeMap<u64, ActiveRequest>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) {
@@ -2513,7 +2511,7 @@ fn cancel_scheduler_request(
 }
 
 fn fail_all(
-    service: &mut dyn ActorService,
+    service: &mut dyn EngineService<Error = InferenceError>,
     active: &mut BTreeMap<u64, ActiveRequest>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
     error: &str,
@@ -2547,7 +2545,7 @@ fn fail_all(
 }
 
 fn cancel_all(
-    service: &mut dyn ActorService,
+    service: &mut dyn EngineService<Error = InferenceError>,
     active: &mut BTreeMap<u64, ActiveRequest>,
     scheduler_by_external: &mut BTreeMap<ActorRequestId, u64>,
 ) {
@@ -2557,7 +2555,10 @@ fn cancel_all(
     }
 }
 
-fn update_current_counts(service: &dyn ActorService, active: &BTreeMap<u64, ActiveRequest>) {
+fn update_current_counts(
+    service: &dyn EngineService<Error = InferenceError>,
+    active: &BTreeMap<u64, ActiveRequest>,
+) {
     server_metrics().active_requests.set(active.len() as i64);
     infer_metrics()
         .active_sequences

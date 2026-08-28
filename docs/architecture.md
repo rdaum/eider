@@ -383,7 +383,7 @@ services. Those records carry request identities, token positions, output
 events, usage, byte accounting, and durations, but never a CUDA allocation,
 stream, logits buffer, or model-specific sequence type.
 
-The API can erase the concrete runtime service behind `dyn ActorService`. This
+The API can erase the concrete runtime service behind `dyn EngineService`. This
 call occurs once per actor tick. It is outside the layer and kernel hot paths.
 
 Do not add a universal backend trait for every tensor or CUDA operation. The

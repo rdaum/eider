@@ -4,7 +4,7 @@
 //! not expose model buffers, streams, logits, or model-specific sequence IDs.
 
 use crate::chat_output::ChatOutputEvent;
-use crate::request::{ChatFinishReason, ChatUsage};
+use crate::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use std::time::Duration;
 
 /// Request metadata known once an inference engine accepts a request.
@@ -145,4 +145,34 @@ pub enum EngineCancelOutcome {
     AlreadyFinished,
     /// The engine did not retain the request identity.
     NotFound,
+}
+
+/// Model service consumed by a serving actor.
+///
+/// The actor may use a trait object for this service because calls happen once
+/// per scheduler tick, outside model and kernel hot paths. The associated error
+/// keeps runtime independent of a particular inference implementation.
+pub trait EngineService {
+    /// Error returned by the concrete inference implementation.
+    type Error: std::error::Error;
+
+    /// Adds one rendered request to the model-specific scheduler.
+    fn add_request(&mut self, request: ChatRequest) -> Result<EngineAdmission, Self::Error>;
+
+    /// Executes one scheduler tick and emits lifecycle transitions.
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> Result<EngineTick, Self::Error>;
+
+    /// Cancels one engine-local request identity.
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome;
+
+    /// Returns the number of live model sequences.
+    fn active_sequence_count(&self) -> usize;
+
+    /// Releases model-owned execution resources after the actor stops.
+    fn shutdown(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
