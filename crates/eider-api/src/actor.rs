@@ -14,9 +14,7 @@ use eider_inference::execution::ling3_serving::{Ling3ChatService, Ling3EngineSer
 use eider_inference::execution::muse_glimmer_serving::{
     MuseGlimmerChatService, MuseGlimmerEngineService,
 };
-use eider_inference::execution::nemotron3_serving::{
-    Nemotron3AdmissionProgress, Nemotron3CancelOutcome, Nemotron3ChatService, Nemotron3RequestId,
-};
+use eider_inference::execution::nemotron3_serving::{Nemotron3ChatService, Nemotron3EngineService};
 use eider_inference::execution::qwen38_flash_next_serving::{
     Qwen38FlashNextAdmissionProgress, Qwen38FlashNextCancelOutcome, Qwen38FlashNextChatService,
     Qwen38FlashNextRequestId,
@@ -615,7 +613,7 @@ fn actor_main(
                     return;
                 }
             };
-            let mut service = NemotronActorService::new(service);
+            let mut service = Nemotron3EngineService::new(service);
             run_actor_loop(&mut service, &mut commands, ready, defaults);
         }
         CheckpointArchitecture::Gemma4 => {
@@ -810,17 +808,6 @@ fn qwen38_speculative_progress(progress: Qwen38SpeculativeProgress) -> EngineSpe
 }
 
 fn step_admission_progress(progress: Step37AdmissionProgress) -> EngineAdmissionProgress {
-    EngineAdmissionProgress {
-        request_id: progress.request_id.get(),
-        sequence_device_bytes: progress.sequence_device_bytes,
-        cached_prompt_tokens: progress.cached_prompt_tokens,
-        allocation_duration: Duration::ZERO,
-        checkpoint_copy_duration: Duration::ZERO,
-        admitted_after_tick_start: progress.admitted_after_tick_start,
-    }
-}
-
-fn nemotron_admission_progress(progress: Nemotron3AdmissionProgress) -> EngineAdmissionProgress {
     EngineAdmissionProgress {
         request_id: progress.request_id.get(),
         sequence_device_bytes: progress.sequence_device_bytes,
@@ -1173,117 +1160,6 @@ impl EngineService for StepActorService<'_> {
             },
             Step37CancelOutcome::AlreadyFinished => EngineCancelOutcome::AlreadyFinished,
             Step37CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
-        }
-    }
-
-    fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
-    }
-}
-
-struct NemotronActorService<'model, 'template> {
-    inner: Nemotron3ChatService<'model, 'template>,
-    ids: BTreeMap<u64, Nemotron3RequestId>,
-}
-
-impl<'model, 'template> NemotronActorService<'model, 'template> {
-    fn new(inner: Nemotron3ChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for NemotronActorService<'_, '_> {
-    type Error = InferenceError;
-    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
-        let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
-        Ok(EngineAdmission {
-            request_id: id,
-            prompt_tokens: admission.prompt_tokens,
-            max_output_tokens: admission.max_output_tokens,
-        })
-    }
-
-    fn tick(
-        &mut self,
-        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
-    ) -> InferenceResult<EngineTick> {
-        let mut observer = |event: RequestLifecycleEvent<
-            Nemotron3RequestId,
-            Nemotron3AdmissionProgress,
-        >| match event {
-            RequestLifecycleEvent::Admitted(progress) => {
-                on_lifecycle(EngineLifecycleEvent::Admitted(nemotron_admission_progress(
-                    progress,
-                )));
-            }
-            RequestLifecycleEvent::PrefillStarted(id) => {
-                on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
-            }
-        };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
-        let converted = EngineTick {
-            prefilled: tick
-                .prefilled
-                .into_iter()
-                .map(|progress| EnginePrefillProgress {
-                    request_id: progress.request_id.get(),
-                    prompt_position: progress.prompt_position,
-                })
-                .collect(),
-            generated: tick
-                .generated
-                .into_iter()
-                .map(Nemotron3RequestId::get)
-                .collect(),
-            speculative: Vec::new(),
-            dflash: Vec::new(),
-            output: tick
-                .output
-                .into_iter()
-                .map(|delta| EngineDelta {
-                    request_id: delta.request_id.get(),
-                    event: delta.event,
-                })
-                .collect(),
-            finished: tick
-                .finished
-                .into_iter()
-                .map(|finished| EngineFinished {
-                    request_id: finished.request_id.get(),
-                    finish_reason: finished.finish_reason,
-                    usage: finished.usage,
-                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
-                })
-                .collect(),
-            active_sequences: tick.active_sequences,
-        };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
-        Ok(converted)
-    }
-
-    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
-            Nemotron3CancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            } => EngineCancelOutcome::Cancelled {
-                released_sequence_device_bytes,
-            },
-            Nemotron3CancelOutcome::NotFound => EngineCancelOutcome::NotFound,
         }
     }
 
