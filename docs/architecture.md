@@ -459,8 +459,8 @@ public surface is complete.
 6. Extract the corrected device and FFI surface into `eider-cuda`.
 7. Extract generic scheduling and serving into `eider-runtime`. Migrate model
    families one at a time.
-8. Remove old re-exports, old module paths, and duplicate service adapters as
-   each migration slice becomes complete.
+8. Remove old re-exports and old module paths as each migration slice becomes
+   complete. Model services implement the runtime engine contract directly.
 
 Qwen is the reference migration path. It exercises batching, grammar masks,
 GPU sampling, prefix caching, MTP, DFlash2, graphs, and multiple streams.

@@ -3,19 +3,17 @@
 use crate::bitnet::BitNetModel;
 use crate::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use crate::deepseek4::Deepseek4TextModel;
-use crate::execution::bitnet_serving::{BitNetChatService, BitNetEngineService};
-use crate::execution::bonsai_serving::{BonsaiChatService, BonsaiEngineService};
-use crate::execution::deepseek4_serving::{Deepseek4ChatService, Deepseek4EngineService};
-use crate::execution::gemma4_serving::{Gemma4ChatService, Gemma4EngineService};
-use crate::execution::laguna_serving::{LagunaChatService, LagunaEngineService};
-use crate::execution::ling3_serving::{Ling3ChatService, Ling3EngineService};
-use crate::execution::muse_glimmer_serving::{MuseGlimmerChatService, MuseGlimmerEngineService};
-use crate::execution::nemotron3_serving::{Nemotron3ChatService, Nemotron3EngineService};
-use crate::execution::qwen38_flash_next_serving::{
-    Qwen38FlashNextChatService, Qwen38FlashNextEngineService,
-};
-use crate::execution::serving::{Qwen36ChatService, Qwen36EngineService};
-use crate::execution::step37_serving::{Step37ChatService, Step37EngineService};
+use crate::execution::bitnet_serving::BitNetChatService;
+use crate::execution::bonsai_serving::BonsaiChatService;
+use crate::execution::deepseek4_serving::Deepseek4ChatService;
+use crate::execution::gemma4_serving::Gemma4ChatService;
+use crate::execution::laguna_serving::LagunaChatService;
+use crate::execution::ling3_serving::Ling3ChatService;
+use crate::execution::muse_glimmer_serving::MuseGlimmerChatService;
+use crate::execution::nemotron3_serving::Nemotron3ChatService;
+use crate::execution::qwen38_flash_next_serving::Qwen38FlashNextChatService;
+use crate::execution::serving::Qwen36ChatService;
+use crate::execution::step37_serving::Step37ChatService;
 use crate::gemma4::Gemma4Model;
 use crate::laguna::LagunaModel;
 use crate::ling3::Ling3Model;
@@ -146,8 +144,7 @@ pub fn with_loaded_engine<R>(
                 max_context_tokens: scheduler.max_context_tokens.min(model.config().max_context),
                 ..scheduler
             };
-            let service = BitNetChatService::new(&model, &template, scheduler)?;
-            let mut service = BitNetEngineService::new(service);
+            let mut service = BitNetChatService::new(&model, &template, scheduler)?;
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Ling3 => {
@@ -156,8 +153,7 @@ pub fn with_loaded_engine<R>(
                 max_context_tokens: scheduler.max_context_tokens.min(model.max_context_tokens()),
                 ..scheduler
             };
-            let service = Ling3ChatService::new(&model, &template, scheduler)?;
-            let mut service = Ling3EngineService::new(service);
+            let mut service = Ling3ChatService::new(&model, &template, scheduler)?;
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::MuseGlimmer => {
@@ -173,13 +169,12 @@ pub fn with_loaded_engine<R>(
                     .min(model.config().max_position_embeddings),
                 ..scheduler
             };
-            let service = MuseGlimmerChatService::new_with_cache_config(
+            let mut service = MuseGlimmerChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = MuseGlimmerEngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Bonsai => {
@@ -188,8 +183,7 @@ pub fn with_loaded_engine<R>(
                 max_context_tokens: scheduler.max_context_tokens.min(model.config().max_context),
                 ..scheduler
             };
-            let service = BonsaiChatService::new(&model, &template, scheduler)?;
-            let mut service = BonsaiEngineService::new(service);
+            let mut service = BonsaiChatService::new(&model, &template, scheduler)?;
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Qwen36 => {
@@ -212,13 +206,12 @@ pub fn with_loaded_engine<R>(
             {
                 defaults.sampling.temperature = 0.0;
             }
-            let service = Qwen36ChatService::new_with_cache_config(
+            let mut service = Qwen36ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Qwen36EngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Qwen38FlashNext => {
@@ -234,13 +227,12 @@ pub fn with_loaded_engine<R>(
                     .min(model.config().max_position_embeddings),
                 ..scheduler
             };
-            let service = Qwen38FlashNextChatService::new_with_cache_config(
+            let mut service = Qwen38FlashNextChatService::new_with_cache_config(
                 model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Qwen38FlashNextEngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Step37 => {
@@ -250,39 +242,36 @@ pub fn with_loaded_engine<R>(
                 step_expert_capacity,
                 step_bf16_storage,
             )?;
-            let service = Step37ChatService::new_with_cache_config(
+            let mut service = Step37ChatService::new_with_cache_config(
                 model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Step37EngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Nemotron3 => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;
             let model = Nemotron3Model::load_with_storage(&model_dir, nemotron_storage)?;
-            let service = Nemotron3ChatService::new_with_cache_config(
+            let mut service = Nemotron3ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Nemotron3EngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Gemma4 => {
             let mut defaults = defaults;
             defaults.sampling.temperature = 0.0;
             let model = Gemma4Model::load(&model_dir)?;
-            let service = Gemma4ChatService::new_with_cache_config(
+            let mut service = Gemma4ChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Gemma4EngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Laguna => {
@@ -291,13 +280,12 @@ pub fn with_loaded_engine<R>(
             defaults.sampling.top_k = 20;
             defaults.sampling.top_p = 0.95;
             let model = LagunaModel::load_with_artifact_dir(&model_dir, &artifact_dir)?;
-            let service = LagunaChatService::new_with_cache_config(
+            let mut service = LagunaChatService::new_with_cache_config(
                 &model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = LagunaEngineService::new(service);
             Ok(run(&mut service, defaults))
         }
         CheckpointArchitecture::Deepseek4 => {
@@ -318,13 +306,12 @@ pub fn with_loaded_engine<R>(
                     deepseek_expert_capacity,
                 )?
             };
-            let service = Deepseek4ChatService::new_with_cache_config(
+            let mut service = Deepseek4ChatService::new_with_cache_config(
                 model,
                 &template,
                 scheduler,
                 sequence_cache,
             )?;
-            let mut service = Deepseek4EngineService::new(service);
             Ok(run(&mut service, defaults))
         }
     }

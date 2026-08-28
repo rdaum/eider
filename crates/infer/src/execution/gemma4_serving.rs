@@ -730,28 +730,11 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
     !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
 }
 
-/// Model-specific identity translation for the shared engine contract.
-pub struct Gemma4EngineService<'model, 'template> {
-    inner: Gemma4ChatService<'model, 'template>,
-    ids: BTreeMap<u64, Gemma4RequestId>,
-}
-
-impl<'model, 'template> Gemma4EngineService<'model, 'template> {
-    /// Wraps a Gemma 4 chat service for consumption by an engine actor.
-    pub fn new(inner: Gemma4ChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for Gemma4EngineService<'_, '_> {
+impl EngineService for Gemma4ChatService<'_, '_> {
     type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = Gemma4ChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -779,12 +762,7 @@ impl EngineService for Gemma4EngineService<'_, '_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = Gemma4ChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -821,17 +799,11 @@ impl EngineService for Gemma4EngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
 
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match Gemma4ChatService::cancel_request(self, Gemma4RequestId(id)) {
             Gemma4CancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
@@ -842,7 +814,7 @@ impl EngineService for Gemma4EngineService<'_, '_> {
     }
 
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        Gemma4ChatService::active_sequence_count(self)
     }
 }
 

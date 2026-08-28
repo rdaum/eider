@@ -787,28 +787,11 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
     !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
 }
 
-/// Model-specific identity and draft-progress translation for the shared engine contract.
-pub struct MuseGlimmerEngineService<'model, 'template> {
-    inner: MuseGlimmerChatService<'model, 'template>,
-    ids: BTreeMap<u64, MuseGlimmerRequestId>,
-}
-
-impl<'model, 'template> MuseGlimmerEngineService<'model, 'template> {
-    /// Wraps a Muse Glimmer chat service for consumption by an engine actor.
-    pub fn new(inner: MuseGlimmerChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for MuseGlimmerEngineService<'_, '_> {
+impl EngineService for MuseGlimmerChatService<'_, '_> {
     type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = MuseGlimmerChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -838,12 +821,7 @@ impl EngineService for MuseGlimmerEngineService<'_, '_> {
                 on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
             }
         };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = MuseGlimmerChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -895,17 +873,11 @@ impl EngineService for MuseGlimmerEngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
 
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match MuseGlimmerChatService::cancel_request(self, MuseGlimmerRequestId(id)) {
             MuseGlimmerCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
@@ -916,7 +888,7 @@ impl EngineService for MuseGlimmerEngineService<'_, '_> {
     }
 
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        MuseGlimmerChatService::active_sequence_count(self)
     }
 }
 

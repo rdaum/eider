@@ -870,32 +870,12 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
     !prefix_retained && prefix_target != 0 && prompt_position >= prefix_target
 }
 
-/// Model-specific identity translation for the shared engine contract.
-///
-/// The serving actor sees only numeric request identities and runtime-owned
-/// lifecycle records. Laguna sequence identities remain internal to inference.
-pub struct LagunaEngineService<'model, 'template> {
-    inner: LagunaChatService<'model, 'template>,
-    ids: BTreeMap<u64, LagunaRequestId>,
-}
-
-impl<'model, 'template> LagunaEngineService<'model, 'template> {
-    /// Wraps a Laguna chat service for consumption by an engine actor.
-    pub fn new(inner: LagunaChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for LagunaEngineService<'_, '_> {
+impl EngineService for LagunaChatService<'_, '_> {
     type Error = InferenceError;
 
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = LagunaChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -923,12 +903,7 @@ impl EngineService for LagunaEngineService<'_, '_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = LagunaChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -965,17 +940,11 @@ impl EngineService for LagunaEngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
 
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match LagunaChatService::cancel_request(self, LagunaRequestId(id)) {
             LagunaCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
@@ -986,7 +955,7 @@ impl EngineService for LagunaEngineService<'_, '_> {
     }
 
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        LagunaChatService::active_sequence_count(self)
     }
 }
 

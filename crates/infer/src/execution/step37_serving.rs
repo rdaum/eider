@@ -269,28 +269,11 @@ impl<'template> Step37ChatService<'template> {
     }
 }
 
-/// Model-specific identity translation for the shared engine contract.
-pub struct Step37EngineService<'template> {
-    inner: Step37ChatService<'template>,
-    ids: BTreeMap<u64, Step37RequestId>,
-}
-
-impl<'template> Step37EngineService<'template> {
-    /// Wraps a Step-3.7 chat service for consumption by an engine actor.
-    pub fn new(inner: Step37ChatService<'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for Step37EngineService<'_> {
+impl EngineService for Step37ChatService<'_> {
     type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = Step37ChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -317,12 +300,7 @@ impl EngineService for Step37EngineService<'_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = Step37ChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -359,16 +337,10 @@ impl EngineService for Step37EngineService<'_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match Step37ChatService::cancel_request(self, Step37RequestId::from_u64(id)) {
             Step37CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
                 released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
             },
@@ -377,7 +349,7 @@ impl EngineService for Step37EngineService<'_> {
         }
     }
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        Step37ChatService::active_sequence_count(self)
     }
 }
 

@@ -499,32 +499,12 @@ impl<'model, 'template> BonsaiChatService<'model, 'template> {
     }
 }
 
-/// Model-specific identity translation for the shared engine contract.
-///
-/// The serving actor sees only numeric request identities and runtime-owned
-/// lifecycle records. Bonsai sequence identities remain internal to inference.
-pub struct BonsaiEngineService<'model, 'template> {
-    inner: BonsaiChatService<'model, 'template>,
-    ids: BTreeMap<u64, BonsaiRequestId>,
-}
-
-impl<'model, 'template> BonsaiEngineService<'model, 'template> {
-    /// Wraps a Bonsai chat service for consumption by an engine actor.
-    pub fn new(inner: BonsaiChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for BonsaiEngineService<'_, '_> {
+impl EngineService for BonsaiChatService<'_, '_> {
     type Error = InferenceError;
 
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = BonsaiChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -552,12 +532,7 @@ impl EngineService for BonsaiEngineService<'_, '_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = BonsaiChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -594,17 +569,11 @@ impl EngineService for BonsaiEngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
 
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match BonsaiChatService::cancel_request(self, BonsaiRequestId(id)) {
             BonsaiCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
@@ -615,7 +584,7 @@ impl EngineService for BonsaiEngineService<'_, '_> {
     }
 
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        BonsaiChatService::active_sequence_count(self)
     }
 }
 

@@ -23,6 +23,10 @@ use tracing::warn;
 pub struct Step37RequestId(u64);
 
 impl Step37RequestId {
+    pub(crate) const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Returns the numeric request identity.
     pub fn get(self) -> u64 {
         self.0

@@ -505,32 +505,12 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
     }
 }
 
-/// Model-specific identity translation for the shared engine contract.
-///
-/// The serving actor sees only numeric request identities and runtime-owned
-/// lifecycle records. BitNet sequence identities remain internal to inference.
-pub struct BitNetEngineService<'model, 'template> {
-    inner: BitNetChatService<'model, 'template>,
-    ids: BTreeMap<u64, BitNetRequestId>,
-}
-
-impl<'model, 'template> BitNetEngineService<'model, 'template> {
-    /// Wraps a BitNet chat service for consumption by an engine actor.
-    pub fn new(inner: BitNetChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-
-impl EngineService for BitNetEngineService<'_, '_> {
+impl EngineService for BitNetChatService<'_, '_> {
     type Error = InferenceError;
 
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = BitNetChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -558,12 +538,7 @@ impl EngineService for BitNetEngineService<'_, '_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = BitNetChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -600,17 +575,11 @@ impl EngineService for BitNetEngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
 
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match BitNetChatService::cancel_request(self, BitNetRequestId(id)) {
             BitNetCancelOutcome::Cancelled {
                 released_sequence_device_bytes,
             } => EngineCancelOutcome::Cancelled {
@@ -621,7 +590,7 @@ impl EngineService for BitNetEngineService<'_, '_> {
     }
 
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        BitNetChatService::active_sequence_count(self)
     }
 }
 

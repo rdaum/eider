@@ -345,25 +345,11 @@ impl<'model, 'template> Qwen36ChatService<'model, 'template> {
     }
 }
 
-/// Model-specific identity and speculative-progress translation for the engine contract.
-pub struct Qwen36EngineService<'model, 'template> {
-    inner: Qwen36ChatService<'model, 'template>,
-    ids: BTreeMap<u64, Qwen36RequestId>,
-}
-impl<'model, 'template> Qwen36EngineService<'model, 'template> {
-    pub fn new(inner: Qwen36ChatService<'model, 'template>) -> Self {
-        Self {
-            inner,
-            ids: BTreeMap::new(),
-        }
-    }
-}
-impl EngineService for Qwen36EngineService<'_, '_> {
+impl EngineService for Qwen36ChatService<'_, '_> {
     type Error = InferenceError;
     fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
-        let admission = self.inner.add_request(request)?;
+        let admission = Qwen36ChatService::add_request(self, request)?;
         let id = admission.request_id.get();
-        self.ids.insert(id, admission.request_id);
         Ok(EngineAdmission {
             request_id: id,
             prompt_tokens: admission.prompt_tokens,
@@ -390,12 +376,7 @@ impl EngineService for Qwen36EngineService<'_, '_> {
                     on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()))
                 }
             };
-        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
-        let finished_ids = tick
-            .finished
-            .iter()
-            .map(|finished| finished.request_id.get())
-            .collect::<Vec<_>>();
+        let tick = Qwen36ChatService::tick_with_lifecycle(self, &mut observer)?;
         let converted = EngineTick {
             prefilled: tick
                 .prefilled
@@ -440,16 +421,10 @@ impl EngineService for Qwen36EngineService<'_, '_> {
                 .collect(),
             active_sequences: tick.active_sequences,
         };
-        for id in finished_ids {
-            self.ids.remove(&id);
-        }
         Ok(converted)
     }
     fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
-        let Some(inner_id) = self.ids.remove(&id) else {
-            return EngineCancelOutcome::NotFound;
-        };
-        match self.inner.cancel_request(inner_id) {
+        match Qwen36ChatService::cancel_request(self, Qwen36RequestId::from_u64(id)) {
             Qwen36CancelOutcome::Cancelled(cancelled) => EngineCancelOutcome::Cancelled {
                 released_sequence_device_bytes: cancelled.released_sequence_device_bytes,
             },
@@ -458,7 +433,7 @@ impl EngineService for Qwen36EngineService<'_, '_> {
         }
     }
     fn active_sequence_count(&self) -> usize {
-        self.inner.active_sequence_count()
+        Qwen36ChatService::active_sequence_count(self)
     }
 }
 
