@@ -3657,7 +3657,7 @@ impl Qwen36MoeWeights {
                 &up,
             )?;
             gate_up_alphas.push(weight.weight_scale_2);
-            grouped_gate_up.push(weight.as_cublaslt_weight()?);
+            grouped_gate_up.push(ModelOptCublasLtWeight::from_modelopt(&weight)?);
 
             match storage_plan.down {
                 Qwen36DownStorage::Legacy => {
@@ -3665,14 +3665,14 @@ impl Qwen36MoeWeights {
                         checkpoint.load_nvfp4_linear(&format!("{}.down_proj", expert.prefix))?;
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
-                    grouped_down.push(weight.as_cublaslt_weight()?);
+                    grouped_down.push(ModelOptCublasLtWeight::from_modelopt(&weight)?);
                 }
                 Qwen36DownStorage::Sm12x => {
                     let weight =
                         checkpoint.load_nvfp4_linear(&format!("{}.down_proj", expert.prefix))?;
                     down_input_scales.push(weight.input_scale);
                     down_alphas.push(weight.weight_scale_2 * weight.input_scale);
-                    grouped_down.push(weight.as_cublaslt_weight()?);
+                    grouped_down.push(ModelOptCublasLtWeight::from_modelopt(&weight)?);
                 }
                 Qwen36DownStorage::Fp8 => {
                     unreachable!("NVFP4 loader cannot select FP8 down storage")
@@ -5512,7 +5512,7 @@ impl Nvfp4DeviceLinear {
         Ok(Self {
             packed_weight: DeviceBuffer::from_host(&host.packed_weight)?,
             weight_scale: DeviceBuffer::from_host(&host.weight_scale)?,
-            cublaslt_weight: host.as_cublaslt_weight()?,
+            cublaslt_weight: ModelOptCublasLtWeight::from_modelopt(host)?,
             weight_scale_2: host.weight_scale_2,
             input_scale: host.input_scale,
             out_features: host.out_features,
@@ -6036,7 +6036,11 @@ fn load_concat_gate_up(
             actual: format!("gate={} up={}", gate.in_features, up.in_features),
         });
     }
-    ModelOptNvfp4Linear::concat_out_features(format!("{gate_prefix}.gate_up_proj"), &gate, &up)
+    Ok(ModelOptNvfp4Linear::concat_out_features(
+        format!("{gate_prefix}.gate_up_proj"),
+        &gate,
+        &up,
+    )?)
 }
 
 fn load_dense_gate_up(

@@ -142,7 +142,7 @@ impl Qwen36RoutedMoeDecodeBench {
         let w4a16_gate_up = Sm121W4A16GateUp::new_with_top_k(&gate_up_host, TOP_K)?;
         let w4a4_gate_up_weights = gate_up_host
             .iter()
-            .map(ModelOptNvfp4Linear::as_cublaslt_weight)
+            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
             .collect::<Result<Vec<_>>>()?;
         let w4a4_gate_up_values = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
@@ -212,7 +212,7 @@ impl Qwen36RoutedMoeDecodeBench {
         )?;
         let grouped_down_weights = down_host
             .iter()
-            .map(ModelOptNvfp4Linear::as_cublaslt_weight)
+            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
             .collect::<Result<Vec<_>>>()?;
         let grouped_down_values = DeviceBuffer::from_host(
             &grouped_down_weights

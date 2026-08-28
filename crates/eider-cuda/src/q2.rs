@@ -8,7 +8,7 @@ use crate::cuda::{CudaStream, DeviceBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format;
-use crate::modelopt::ModelOptNvfp4Linear;
+use crate::modelopt_device::ModelOptNvfp4Linear;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};

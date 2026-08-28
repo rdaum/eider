@@ -160,9 +160,10 @@ impl<const TOKENS: usize> W4A16Projection<TOKENS> {
 
 impl<const TOKENS: usize> Nvfp4Projection<TOKENS> {
     fn new(lt: &CublasLt, host: &ModelOptFp8Linear, activation: &Nvfp4Matrix) -> Self {
-        let weight = ModelOptNvfp4Linear::quantize_fp8(host)
-            .and_then(|weight| weight.as_cublaslt_weight())
-            .expect("requantize FP8 projection to NVFP4");
+        let host_weight =
+            ModelOptNvfp4Linear::quantize_fp8(host).expect("requantize FP8 projection to NVFP4");
+        let weight = ModelOptCublasLtWeight::from_modelopt(&host_weight)
+            .expect("prepare FP8 projection for cuBLASLt");
         let c = F32Matrix::zeroed(host.out_features, TOKENS).expect("NVFP4 C matrix");
         let plan = Fp4TnMatmulPlan::new_f32_output(
             lt,

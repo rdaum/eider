@@ -10,7 +10,7 @@ use crate::cublaslt::{CublasLt, Int8TnMatmulPlan};
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInput, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::modelopt::ModelOptCheckpoint;
+use crate::modelopt_device::ModelOptCheckpoint;
 
 /// Host-side row-major packed ternary linear.
 #[derive(Clone, Debug)]

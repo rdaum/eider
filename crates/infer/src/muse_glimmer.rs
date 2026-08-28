@@ -319,7 +319,7 @@ impl MuseNvfp4Linear {
         let in_features = weight.in_features;
         Ok(Self {
             name: name.to_string(),
-            weight: weight.as_cublaslt_weight()?,
+            weight: ModelOptCublasLtWeight::from_modelopt(&weight)?,
             out_features,
             in_features,
         })

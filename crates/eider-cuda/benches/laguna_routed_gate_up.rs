@@ -80,7 +80,7 @@ impl LagunaRoutedGateUpBench {
         let w4a16_workspace = w4a16.new_batch_workspace(ROWS)?;
         let grouped_weights = weights
             .iter()
-            .map(ModelOptNvfp4Linear::as_cublaslt_weight)
+            .map(|weight| ModelOptCublasLtWeight::from_modelopt(&weight))
             .collect::<Result<Vec<_>>>()?;
         let grouped_weight_values = DeviceBuffer::from_host(
             &grouped_weights

@@ -1079,7 +1079,7 @@ fn load_gate_up(
         }
         prepared
             .into_iter()
-            .map(|(_, weight)| weight.as_cublaslt_weight())
+            .map(|(_, weight)| ModelOptCublasLtWeight::from_modelopt(&weight))
             .collect()
     })
 }

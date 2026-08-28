@@ -90,7 +90,7 @@ impl Qwen3Layer0Weights {
 impl LayerLinear {
     fn load(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<Self> {
         let host = checkpoint.load_nvfp4_linear(prefix)?;
-        let device = host.as_cublaslt_weight()?;
+        let device = ModelOptCublasLtWeight::from_modelopt(&host)?;
         Ok(Self { host, device })
     }
 }

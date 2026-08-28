@@ -519,10 +519,12 @@ fn load_expert_linear(
     let name = format!("{prefix}.weight");
     let shard = checkpoint.open_shard_for_tensor(&name)?;
     match shard.require_tensor(&name)?.dtype.as_str() {
-        "U8" => checkpoint.load_nvfp4_linear(prefix),
+        "U8" => Ok(checkpoint.load_nvfp4_linear(prefix)?),
         "BF16" => {
             let values = super::linear::load_bf16_host(checkpoint, &name, &[rows, cols])?;
-            ModelOptNvfp4Linear::quantize_bf16(prefix, rows, cols, &values)
+            Ok(ModelOptNvfp4Linear::quantize_bf16(
+                prefix, rows, cols, &values,
+            )?)
         }
         dtype => Err(Error::Format {
             label: "Nemotron 3 routed expert",

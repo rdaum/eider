@@ -10,6 +10,7 @@
 //! BF16. Prefer [`Fp4TnMatmul`] when the operation can own its matrices.
 
 #![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod format;
 
@@ -22,7 +23,7 @@ mod expert_slots;
 mod ffi;
 mod kernels;
 mod matrix;
-mod modelopt;
+mod modelopt_device;
 mod ngram;
 mod paged_rows;
 mod q2;
@@ -226,9 +227,10 @@ pub use kernels::sm121_w4a16::{
     Sm121W4A16LinearBatchWorkspace,
 };
 pub use matrix::{Bf16Matrix, F32Matrix, MatrixShape, Nvfp4Matrix};
-pub use modelopt::{
+pub use modelopt_device::{
     ModelOptBlockScaledFp8Linear, ModelOptCheckpoint, ModelOptCublasLtWeight, ModelOptFp8Linear,
     ModelOptNvfp4Activation, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt,
+    upload_grouped_nvfp4,
 };
 pub use ngram::{
     NgramEmbeddingBank, NgramEmbeddingFormat, NgramFp8Rows, NgramNvfp4Rows,

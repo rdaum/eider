@@ -1748,7 +1748,7 @@ impl LayerLinear {
 
     fn from_host(host: &ModelOptNvfp4Linear) -> Result<Self> {
         Ok(Self {
-            device: host.as_cublaslt_weight()?,
+            device: ModelOptCublasLtWeight::from_modelopt(host)?,
         })
     }
 }

@@ -76,6 +76,10 @@ impl Step35ExpertBench {
                     &weights.gate,
                     &weights.up,
                 )
+                .map_err(|error| eider_cuda::Error::Format {
+                    label: "Step-3.5 ModelOpt gate/up record",
+                    detail: error.to_string(),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let gate_up = Sm121W4A16GateUp::new(&gate_up_weights)?;

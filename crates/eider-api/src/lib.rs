@@ -1,5 +1,7 @@
 //! OpenAI-compatible Responses and Chat Completions serving for Eider.
 
+#![forbid(unsafe_code)]
+
 pub mod actor;
 pub mod chat_completions;
 pub mod deployment;

@@ -4,6 +4,7 @@ use eider_cuda::{
     Error, ModelOptCheckpoint, ModelOptNvfp4Linear, Result, Sm12xFp4GemmWeight,
     Sm121W4A16HostWeight,
 };
+use eider_format::Nvfp4Artifact;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -44,16 +45,18 @@ impl Qwen36Fp8Nvfp4Cache {
         let path = self
             .root
             .join(format!("{:016x}.nvfp4", stable_hash(prefix.as_bytes())));
-        if let Ok(weight) = ModelOptNvfp4Linear::read_cache_file(&path)
-            && weight.prefix == prefix
+        if let Ok(artifact) = Nvfp4Artifact::read_from(&path)
+            && artifact.prefix == prefix
         {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(weight);
+            return Ok(modelopt_from_artifact(artifact));
         }
 
         let source = checkpoint.load_fp8_linear(prefix)?;
         let weight = ModelOptNvfp4Linear::quantize_fp8(&source)?;
-        weight.write_cache_file(&path)?;
+        artifact_from_modelopt(&weight)
+            .write_to(&path)
+            .map_err(format_artifact_error)?;
         self.prepared.fetch_add(1, Ordering::Relaxed);
         Ok(weight)
     }
@@ -63,6 +66,37 @@ impl Qwen36Fp8Nvfp4Cache {
             self.hits.load(Ordering::Relaxed),
             self.prepared.load(Ordering::Relaxed),
         )
+    }
+}
+
+fn modelopt_from_artifact(artifact: Nvfp4Artifact) -> ModelOptNvfp4Linear {
+    ModelOptNvfp4Linear {
+        prefix: artifact.prefix,
+        out_features: artifact.out_features,
+        in_features: artifact.in_features,
+        packed_weight: artifact.packed_weight,
+        weight_scale: artifact.weight_scale,
+        weight_scale_2: artifact.weight_scale_2,
+        input_scale: artifact.input_scale,
+    }
+}
+
+fn artifact_from_modelopt(weight: &ModelOptNvfp4Linear) -> Nvfp4Artifact {
+    Nvfp4Artifact {
+        prefix: weight.prefix.clone(),
+        out_features: weight.out_features,
+        in_features: weight.in_features,
+        packed_weight: weight.packed_weight.clone(),
+        weight_scale: weight.weight_scale.clone(),
+        weight_scale_2: weight.weight_scale_2,
+        input_scale: weight.input_scale,
+    }
+}
+
+fn format_artifact_error(error: eider_format::Error) -> Error {
+    Error::Format {
+        label: "Qwen3.6 NVFP4 artifact",
+        detail: error.to_string(),
     }
 }
 
@@ -422,5 +456,32 @@ fn cache_fs_error(action: &'static str, path: &Path, error: std::io::Error) -> E
     Error::Format {
         label: "Qwen3.6 SM12x cache",
         detail: format!("failed to {action} {}: {error}", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{artifact_from_modelopt, modelopt_from_artifact};
+    use eider_cuda::ModelOptNvfp4Linear;
+
+    #[test]
+    fn modelopt_artifact_conversion_preserves_host_representation() {
+        let source = ModelOptNvfp4Linear {
+            prefix: "model.layers.7.mlp.down_proj".to_string(),
+            out_features: 2,
+            in_features: 16,
+            packed_weight: (0..16).collect(),
+            weight_scale: vec![11, 22],
+            weight_scale_2: 0.75,
+            input_scale: 1.25,
+        };
+        let restored = modelopt_from_artifact(artifact_from_modelopt(&source));
+        assert_eq!(restored.prefix, source.prefix);
+        assert_eq!(restored.out_features, source.out_features);
+        assert_eq!(restored.in_features, source.in_features);
+        assert_eq!(restored.packed_weight, source.packed_weight);
+        assert_eq!(restored.weight_scale, source.weight_scale);
+        assert_eq!(restored.weight_scale_2, source.weight_scale_2);
+        assert_eq!(restored.input_scale, source.input_scale);
     }
 }

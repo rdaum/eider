@@ -7,6 +7,7 @@ use eider_cuda::{
     moe_silu_quantize_bf16_slots_on_stream, moe_silu_quantize_slots_nvfp4_simple_scales_on_stream,
     moe_silu_quantize_slots_on_stream, moe_silu_quantize_slots_reference_on_stream,
     moe_weighted_accumulate_slots_f32_on_stream, quantize_fixed_scale_vector_on_stream,
+    upload_grouped_nvfp4,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -713,12 +714,9 @@ impl QwenLayerWeights {
                 &gate,
                 &up,
             )?;
-            gate_up.push(gate_up_host.to_grouped_device()?);
-            down.push(
-                checkpoint
-                    .load_nvfp4_linear(&format!("{expert_prefix}.down_proj"))?
-                    .to_grouped_device()?,
-            );
+            gate_up.push(upload_grouped_nvfp4(&gate_up_host)?);
+            let down_host = checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.down_proj"))?;
+            down.push(upload_grouped_nvfp4(&down_host)?);
         }
         Ok(Self { gate_up, down })
     }

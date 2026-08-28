@@ -535,7 +535,7 @@ impl Gemma4Linear {
         let weight_scale = DeviceBuffer::from_host(&weight.weight_scale)?;
         let out_features = weight.out_features;
         let in_features = weight.in_features;
-        let weight = weight.as_cublaslt_weight()?;
+        let weight = ModelOptCublasLtWeight::from_modelopt(&weight)?;
         Ok(Self {
             storage: Gemma4LinearStorage::Nvfp4 {
                 weight,
@@ -2215,16 +2215,16 @@ impl Gemma4Checkpoint {
             if info.dtype == "BF16" {
                 let [out_features, in_features] = matrix_shape(&info.shape, tensor)?;
                 let values = self.read_bf16_tensor(tensor, out_features * in_features)?;
-                return ModelOptNvfp4Linear::quantize_bf16(
+                return Ok(ModelOptNvfp4Linear::quantize_bf16(
                     tensor,
                     out_features,
                     in_features,
                     &values,
-                );
+                )?);
             }
         }
         let prefix = self.native_prefix(tensor)?;
-        self.checkpoint.load_nvfp4_linear(&prefix)
+        Ok(self.checkpoint.load_nvfp4_linear(&prefix)?)
     }
 
     /// Loads one expert projection from a stacked Gemma MoE tensor as NVFP4.
@@ -2254,16 +2254,16 @@ impl Gemma4Checkpoint {
                     expert * values_per_expert,
                     values_per_expert,
                 )?;
-                return ModelOptNvfp4Linear::quantize_bf16(
+                return Ok(ModelOptNvfp4Linear::quantize_bf16(
                     format!("{tensor}[{expert}]"),
                     out_features,
                     in_features,
                     &values,
-                );
+                )?);
             }
         }
         let prefix = self.native_prefix(tensor)?;
-        self.checkpoint.load_nvfp4_expert_linear(&prefix, expert)
+        Ok(self.checkpoint.load_nvfp4_expert_linear(&prefix, expert)?)
     }
 
     /// Loads a BF16 vector as host F32 values, for normalization and routing.

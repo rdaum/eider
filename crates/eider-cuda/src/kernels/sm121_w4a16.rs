@@ -3,7 +3,7 @@
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::modelopt::ModelOptNvfp4Linear;
+use crate::modelopt_device::ModelOptNvfp4Linear;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;

@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::ffi;
 use crate::kernels::non_gemm::f32_to_bf16_into_on_stream;
 use crate::matrix::Nvfp4Matrix;
-use crate::modelopt::{ModelOptCublasLtWeight, ModelOptNvfp4Linear};
+use crate::modelopt_device::{ModelOptCublasLtWeight, ModelOptNvfp4Linear};
 
 /// Number of input values represented by one GGUF scale block.
 pub const TERNARY_G64_GROUP_SIZE: usize = 64;
@@ -177,6 +177,10 @@ impl TernaryG64PackedLinear {
                 self.weight_unchecked(row, col)
             },
         )
+        .map_err(|error| Error::Format {
+            label: "ternary NVFP4 preparation",
+            detail: error.to_string(),
+        })
     }
 
     /// Computes the same per-group W2A8 operation as the CUDA path.
@@ -317,7 +321,8 @@ impl TernaryG64Matrix {
             matrix.bf16_prefill_weight = Some(weight);
         }
         if nvfp4_prefill {
-            matrix.nvfp4_prefill_weight = Some(linear.quantize_nvfp4()?.as_cublaslt_weight()?);
+            let host = linear.quantize_nvfp4()?;
+            matrix.nvfp4_prefill_weight = Some(ModelOptCublasLtWeight::from_modelopt(&host)?);
         }
         Ok(matrix)
     }

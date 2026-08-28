@@ -12,9 +12,11 @@ projection uses those views. Physical SM12x page storage and Qwen sequence
 state have moved out of `runtime` without a compatibility module. Qwen now
 keeps persistent streams, workspaces, cache state, and retained DFlash state
 in an inference-owned execution object; the scheduler keeps request policy and
-queues. `eider-format` now owns GGUF indexing and GGML K-quant decoding. The
-remaining safetensors, ModelOpt, and artifact representations still need to
-move there. Flash Next now owns its QSA page backend, sequence state, and
+queues. `eider-format` now owns GGUF indexing, GGML K-quant decoding, the
+sharded safetensors index/cache, the versioned host-only NVFP4 artifact codec,
+and ModelOpt checkpoint records and host layouts. `eider-cuda` owns the
+explicit upload and cuBLASLt preparation of those records.
+Flash Next now owns its QSA page backend, sequence state, and
 retained-prefix cache configuration beside the model rather than under
 `runtime`. Gemma 4 now owns its dense-model sequence state and physical page
 table for the same reason. BitNet and Bonsai now keep their sequence state
@@ -27,8 +29,8 @@ workspaces, and page-table updates beside its model implementation.
 DeepSeek V4 now keeps compressed-attention page storage, MTP residual state,
 and prefix snapshots beside its model implementation. Nemotron 3 now keeps its
 hybrid attention and Mamba sequence state beside its model implementation.
-The safetensors reader has moved into `eider-format`; the remaining ModelOpt
-records and artifact codecs still need to move there.
+The safetensors reader/index, NVFP4 artifact codec, and ModelOpt records have
+moved into `eider-format`.
 Flash Next now keeps its loaded model, QSA caches, persistent workspaces, and
 GPU sampler in a model-owned execution state; its service retains request
 policy and output state.
@@ -50,6 +52,9 @@ remains `crates/infer` during the migration.
 Model loading now selects its CUDA device inside `eider-inference`; the API
 actor has no CUDA resource import and receives inference-boundary errors.
 The `eider-api` package has no direct CUDA dependency.
+Both `eider-api` and `eider-runtime` forbid unsafe code at their crate
+boundaries.
+`eider-cuda` denies unchecked unsafe operations inside unsafe functions.
 
 ## Decision
 
