@@ -2,8 +2,9 @@ use eider_cuda::{
     CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, CutlassFp4GroupedGemvF32Plan, DeviceAddress,
     DeviceBuffer, F32Matrix, ModelOptCublasLtWeight, MoeSortedNvfp4Rows, MoeSortedRoutes,
     Nvfp4Matrix, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmWeight, Sm121W4A16GateUp,
-    indexed_grouped_gemv_on_stream, moe_silu_quantize_bf16_slots_on_stream,
-    moe_silu_quantize_slots_on_stream, moe_weighted_accumulate_slots_f32_on_stream,
+    indexed_grouped_gemv_addresses_on_stream, moe_silu_quantize_bf16_slots_on_stream,
+    moe_silu_quantize_slot_addresses_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
     moe_weighted_accumulate_sorted_bf16_batch_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream,
 };
@@ -25,8 +26,7 @@ struct DownWorkspace {
     b_tiles: DeviceBuffer<u8>,
     b_scales: DeviceBuffer<u32>,
     outputs: Vec<F32Matrix>,
-    output_mut_table: DeviceBuffer<*mut f32>,
-    output_table: DeviceBuffer<*const f32>,
+    output_table: DeviceBuffer<DeviceAddress<f32>>,
     reduced: DeviceBuffer<f32>,
 }
 
@@ -62,26 +62,19 @@ impl GroupedW4A4Workspace {
 
 impl DownWorkspace {
     fn new() -> Result<Self> {
-        let mut outputs = (0..TOP_K)
+        let outputs = (0..TOP_K)
             .map(|_| F32Matrix::zeroed(HIDDEN, 1))
             .collect::<Result<Vec<_>>>()?;
-        let output_mut_table = DeviceBuffer::from_host(
-            &outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr())
-                .collect::<Vec<_>>(),
-        )?;
         let output_table = DeviceBuffer::from_host(
             &outputs
                 .iter()
-                .map(|output| output.data_ptr())
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )?;
         Ok(Self {
             b_tiles: DeviceBuffer::zeroed(TOP_K * (INTERMEDIATE / 64) * 512)?,
             b_scales: DeviceBuffer::zeroed(TOP_K * (INTERMEDIATE / 64))?,
             outputs,
-            output_mut_table,
             output_table,
             reduced: DeviceBuffer::zeroed(HIDDEN)?,
         })
@@ -97,17 +90,14 @@ struct Qwen36RoutedMoeDecodeBench {
     input: DeviceBuffer<f32>,
     w4a16_gate_up: Sm121W4A16GateUp,
     w4a4_gate_up_weights: Vec<ModelOptCublasLtWeight>,
-    w4a4_gate_up_values: DeviceBuffer<*const u8>,
-    w4a4_gate_up_scales: DeviceBuffer<*const u8>,
-    grouped_gate_up_values: DeviceBuffer<DeviceAddress<u8>>,
-    grouped_gate_up_scales: DeviceBuffer<DeviceAddress<u8>>,
+    w4a4_gate_up_values: DeviceBuffer<DeviceAddress<u8>>,
+    w4a4_gate_up_scales: DeviceBuffer<DeviceAddress<u8>>,
     w4a4_gate_up_alphas: DeviceBuffer<f32>,
     w4a4_gate_up_input: Nvfp4Matrix,
     w4a4_gate_up_plan: CutlassFp4GroupedGemvF32Plan,
     w4a4_gate_up_zero: F32Matrix,
     w4a4_gate_up_outputs: Vec<F32Matrix>,
-    w4a4_gate_up_output_mut_table: DeviceBuffer<*mut f32>,
-    w4a4_gate_up_output_table: DeviceBuffer<*const f32>,
+    w4a4_gate_up_output_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_gate_up_alpha_values: DeviceBuffer<f32>,
     grouped_gate_up_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_down_weights: Vec<ModelOptCublasLtWeight>,
@@ -117,8 +107,8 @@ struct Qwen36RoutedMoeDecodeBench {
     grouped_down_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_w4a4: GroupedW4A4Workspace,
     down_weights: Vec<Sm12xFp4DeviceGemmWeight>,
-    down_tiles: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u32>,
+    down_tiles: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_input_scales: DeviceBuffer<f32>,
     down_alphas: DeviceBuffer<f32>,
     unity_gate_up_alphas: DeviceBuffer<f32>,
@@ -150,22 +140,10 @@ impl Qwen36RoutedMoeDecodeBench {
         let w4a4_gate_up_values = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
                 .iter()
-                .map(|weight| weight.matrix().values_ptr())
-                .collect::<Vec<_>>(),
-        )?;
-        let w4a4_gate_up_scales = DeviceBuffer::from_host(
-            &w4a4_gate_up_weights
-                .iter()
-                .map(|weight| weight.matrix().scales_ptr())
-                .collect::<Vec<_>>(),
-        )?;
-        let grouped_gate_up_values = DeviceBuffer::from_host(
-            &w4a4_gate_up_weights
-                .iter()
                 .map(|weight| weight.matrix().values_address())
                 .collect::<Vec<_>>(),
         )?;
-        let grouped_gate_up_scales = DeviceBuffer::from_host(
+        let w4a4_gate_up_scales = DeviceBuffer::from_host(
             &w4a4_gate_up_weights
                 .iter()
                 .map(|weight| weight.matrix().scales_address())
@@ -177,19 +155,13 @@ impl Qwen36RoutedMoeDecodeBench {
                 .map(ModelOptCublasLtWeight::weight_scale_2)
                 .collect::<Vec<_>>(),
         )?;
-        let mut w4a4_gate_up_outputs = (0..TOP_K)
+        let w4a4_gate_up_outputs = (0..TOP_K)
             .map(|_| F32Matrix::zeroed(GATE_UP, 1))
             .collect::<Result<Vec<_>>>()?;
-        let w4a4_gate_up_output_mut_table = DeviceBuffer::from_host(
-            &w4a4_gate_up_outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr())
-                .collect::<Vec<_>>(),
-        )?;
         let w4a4_gate_up_output_table = DeviceBuffer::from_host(
             &w4a4_gate_up_outputs
                 .iter()
-                .map(|output| output.data_ptr())
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )?;
         let grouped_gate_up_alpha_values = DeviceBuffer::from_host(
@@ -216,13 +188,13 @@ impl Qwen36RoutedMoeDecodeBench {
         let down_tiles = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::tiles_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::tiles_address)
                 .collect::<Vec<_>>(),
         )?;
         let down_scales = DeviceBuffer::from_host(
             &down_weights
                 .iter()
-                .map(Sm12xFp4DeviceGemmWeight::scales_ptr)
+                .map(Sm12xFp4DeviceGemmWeight::scales_address)
                 .collect::<Vec<_>>(),
         )?;
         let grouped_down_weights = down_host
@@ -264,14 +236,11 @@ impl Qwen36RoutedMoeDecodeBench {
             w4a4_gate_up_weights,
             w4a4_gate_up_values,
             w4a4_gate_up_scales,
-            grouped_gate_up_values,
-            grouped_gate_up_scales,
             w4a4_gate_up_alphas,
             w4a4_gate_up_input: Nvfp4Matrix::zeroed_col_major(HIDDEN, 1)?,
             w4a4_gate_up_plan: CutlassFp4GroupedGemvF32Plan::new(GATE_UP, HIDDEN, TOP_K)?,
             w4a4_gate_up_zero: F32Matrix::zeroed(GATE_UP, 1)?,
             w4a4_gate_up_outputs,
-            w4a4_gate_up_output_mut_table,
             w4a4_gate_up_output_table,
             grouped_gate_up_alpha_values,
             grouped_gate_up_alpha_table,
@@ -311,20 +280,20 @@ impl Qwen36RoutedMoeDecodeBench {
             TOP_K,
             &self.stream,
         )?;
-        indexed_grouped_gemv_on_stream(
+        indexed_grouped_gemv_addresses_on_stream(
             &self.indices,
             &self.down_tiles,
             &self.down_scales,
             EXPERTS,
             &self.w4a16_down.b_tiles,
             &self.w4a16_down.b_scales,
-            &self.w4a16_down.output_mut_table,
+            &self.w4a16_down.output_table,
             HIDDEN / 16,
             INTERMEDIATE / 64,
             TOP_K,
             &self.stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &self.indices,
             &self.route_weights,
             &self.w4a16_down.output_table,
@@ -344,17 +313,17 @@ impl Qwen36RoutedMoeDecodeBench {
             &self.stream,
         )?;
         self.w4a4_gate_up_plan
-            .run_indexed_a_tiled_scales_on_stream(
+            .run_indexed_a_tiled_scale_addresses_on_stream(
                 &self.indices,
                 &self.w4a4_gate_up_values,
                 &self.w4a4_gate_up_scales,
                 &self.w4a4_gate_up_alphas,
                 &self.w4a4_gate_up_input,
                 &self.w4a4_gate_up_zero,
-                &self.w4a4_gate_up_output_mut_table,
+                &self.w4a4_gate_up_output_table,
                 &self.stream,
             )?;
-        moe_silu_quantize_slots_on_stream(
+        moe_silu_quantize_slot_addresses_on_stream(
             &self.indices,
             &self.w4a4_gate_up_output_table,
             &mut self.w4a4_down.b_tiles,
@@ -365,20 +334,20 @@ impl Qwen36RoutedMoeDecodeBench {
             TOP_K,
             &self.stream,
         )?;
-        indexed_grouped_gemv_on_stream(
+        indexed_grouped_gemv_addresses_on_stream(
             &self.indices,
             &self.down_tiles,
             &self.down_scales,
             EXPERTS,
             &self.w4a4_down.b_tiles,
             &self.w4a4_down.b_scales,
-            &self.w4a4_down.output_mut_table,
+            &self.w4a4_down.output_table,
             HIDDEN / 16,
             INTERMEDIATE / 64,
             TOP_K,
             &self.stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             &self.indices,
             &self.route_weights,
             &self.w4a4_down.output_table,
@@ -406,8 +375,8 @@ impl Qwen36RoutedMoeDecodeBench {
             &self.stream,
         )?;
         grouped.gate_up_plan.run_on_stream(
-            &self.grouped_gate_up_values,
-            &self.grouped_gate_up_scales,
+            &self.w4a4_gate_up_values,
+            &self.w4a4_gate_up_scales,
             grouped.gate_up_input.packed_table(),
             grouped.gate_up_input.scale_table(),
             &grouped.gate_up_output_table,

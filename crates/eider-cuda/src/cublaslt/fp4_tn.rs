@@ -831,55 +831,6 @@ impl CutlassFp4GroupedGemvF32Plan {
         Ok(Self { raw, m, k, groups })
     }
 
-    /// Launches the grouped GEMV on `stream` using device-resident pointer arrays.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_on_stream(
-        &self,
-        a_values: &DeviceBuffer<*const u8>,
-        a_scales: &DeviceBuffer<*const u8>,
-        b_values: &DeviceBuffer<*const u8>,
-        b_scales: &DeviceBuffer<*const u8>,
-        c: &DeviceBuffer<*const f32>,
-        d: &DeviceBuffer<*mut f32>,
-        alpha: f32,
-        beta: f32,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        for (label, len) in [
-            ("A values", a_values.len()),
-            ("A scales", a_scales.len()),
-            ("B values", b_values.len()),
-            ("B scales", b_scales.len()),
-            ("C", c.len()),
-            ("D", d.len()),
-        ] {
-            if len != self.groups {
-                return Err(Error::Shape {
-                    label: "CUTLASS grouped FP4 GEMV pointer array",
-                    expected: format!("{} entries", self.groups),
-                    actual: format!("{label} has {len}"),
-                });
-            }
-        }
-        unsafe {
-            check_cuda(
-                "infer_cutlass_fp4_grouped_gemv_f32_on_stream",
-                ffi::infer_cutlass_fp4_grouped_gemv_f32_on_stream(
-                    self.raw,
-                    a_values.as_const_ptr().cast(),
-                    a_scales.as_const_ptr().cast(),
-                    b_values.as_const_ptr().cast(),
-                    b_scales.as_const_ptr().cast(),
-                    c.as_const_ptr().cast(),
-                    d.as_const_ptr().cast(),
-                    alpha,
-                    beta,
-                    stream.as_raw(),
-                ),
-            )
-        }
-    }
-
     /// Launches the grouped GEMV on `stream` using typed device-address tables.
     #[allow(clippy::too_many_arguments)]
     pub fn run_addresses_on_stream(
@@ -977,70 +928,6 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
-    /// Launches grouped GEMV with A selected by device indices and one shared B vector.
-    ///
-    /// # Safety
-    ///
-    /// `b_values` and `b_scales` must point to valid device allocations with
-    /// the layout and sizes required by this plan for the duration of the
-    /// enqueued work.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn run_indexed_a_on_stream(
-        &self,
-        indices: &DeviceBuffer<u32>,
-        a_values_table: &DeviceBuffer<*const u8>,
-        a_scales_table: &DeviceBuffer<*const u8>,
-        table_len: usize,
-        b_values: *const u8,
-        b_scales: *const u8,
-        d: &DeviceBuffer<*mut f32>,
-        alpha: f32,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        if indices.len() != self.groups || d.len() != self.groups {
-            return Err(Error::Shape {
-                label: "CUTLASS grouped FP4 GEMV indexed arrays",
-                expected: format!("{} entries", self.groups),
-                actual: format!("indices={} D={}", indices.len(), d.len()),
-            });
-        }
-        if a_values_table.len() != table_len || a_scales_table.len() != table_len {
-            return Err(Error::Shape {
-                label: "CUTLASS grouped FP4 GEMV expert table",
-                expected: format!("{table_len} entries"),
-                actual: format!(
-                    "A values={} A scales={}",
-                    a_values_table.len(),
-                    a_scales_table.len()
-                ),
-            });
-        }
-        if table_len > u32::MAX as usize {
-            return Err(Error::Shape {
-                label: "CUTLASS grouped FP4 GEMV expert table",
-                expected: "table_len <= u32::MAX".to_string(),
-                actual: table_len.to_string(),
-            });
-        }
-        unsafe {
-            check_cuda(
-                "infer_cutlass_fp4_grouped_gemv_f32_indexed_a_on_stream",
-                ffi::infer_cutlass_fp4_grouped_gemv_f32_indexed_a_on_stream(
-                    self.raw,
-                    indices.as_const_ptr().cast(),
-                    a_values_table.as_const_ptr().cast(),
-                    a_scales_table.as_const_ptr().cast(),
-                    table_len as u32,
-                    b_values,
-                    b_scales,
-                    d.as_const_ptr().cast(),
-                    alpha,
-                    stream.as_raw(),
-                ),
-            )
-        }
-    }
-
     /// Launches grouped GEMV with typed selected A, shared B, and output
     /// address tables.
     #[allow(clippy::too_many_arguments)]
@@ -1100,34 +987,6 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
-    /// Launches hardware block-scaled grouped GEMV with A selected by device indices.
-    ///
-    /// The shared B vector and expert scale matrices use the tiled
-    /// cuBLASLt/CUTLASS layout rather than the compact grouped-SIMT layout.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_indexed_a_tiled_scales_on_stream(
-        &self,
-        indices: &DeviceBuffer<u32>,
-        a_values_table: &DeviceBuffer<*const u8>,
-        a_scales_table: &DeviceBuffer<*const u8>,
-        alpha_table: &DeviceBuffer<f32>,
-        b: &Nvfp4Matrix,
-        c: &F32Matrix,
-        d: &DeviceBuffer<*mut f32>,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        self.run_indexed_a_tiled_scales_impl(
-            indices,
-            a_values_table,
-            a_scales_table,
-            alpha_table,
-            b,
-            c,
-            d,
-            stream,
-        )
-    }
-
     /// Launches hardware block-scaled grouped GEMV with typed device address
     /// tables for selected expert weights and output rows.
     #[allow(clippy::too_many_arguments)]
@@ -1155,19 +1014,15 @@ impl CutlassFp4GroupedGemvF32Plan {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_indexed_a_tiled_scales_impl<
-        T: crate::cuda::DeviceRepr,
-        U: crate::cuda::DeviceRepr,
-        V: crate::cuda::DeviceRepr,
-    >(
+    fn run_indexed_a_tiled_scales_impl(
         &self,
         indices: &DeviceBuffer<u32>,
-        a_values_table: &DeviceBuffer<T>,
-        a_scales_table: &DeviceBuffer<U>,
+        a_values_table: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales_table: &DeviceBuffer<DeviceAddress<u8>>,
         alpha_table: &DeviceBuffer<f32>,
         b: &Nvfp4Matrix,
         c: &F32Matrix,
-        d: &DeviceBuffer<V>,
+        d: &DeviceBuffer<DeviceAddress<f32>>,
         stream: &CudaStream,
     ) -> Result<()> {
         if indices.len() != self.groups || d.len() != self.groups {
@@ -1218,60 +1073,6 @@ impl CutlassFp4GroupedGemvF32Plan {
                     b.scales_ptr(),
                     c.data_ptr(),
                     d.as_const_ptr().cast(),
-                    stream.as_raw(),
-                ),
-            )
-        }
-    }
-
-    /// Launches grouped GEMV with contiguous per-slot B operands and contiguous F32 output.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_contiguous_b_on_stream(
-        &self,
-        a_values_table: &DeviceBuffer<*const u8>,
-        a_scales_table: &DeviceBuffer<*const u8>,
-        b_values: &DeviceBuffer<u8>,
-        b_scales: &DeviceBuffer<u8>,
-        d: &mut DeviceBuffer<f32>,
-        alpha: f32,
-        stream: &CudaStream,
-    ) -> Result<()> {
-        let expected_b_values = self.groups * self.k / 2;
-        let expected_b_scales = self.groups * (self.k / 16);
-        let expected_d = self.groups * self.m;
-        if a_values_table.len() != self.groups
-            || a_scales_table.len() != self.groups
-            || b_values.len() != expected_b_values
-            || b_scales.len() != expected_b_scales
-            || d.len() != expected_d
-        {
-            return Err(Error::Shape {
-                label: "CUTLASS grouped FP4 contiguous-B GEMV buffers",
-                expected: format!(
-                    "A tables={} B values={} B scales={} D={}",
-                    self.groups, expected_b_values, expected_b_scales, expected_d
-                ),
-                actual: format!(
-                    "A values={} A scales={} B values={} B scales={} D={}",
-                    a_values_table.len(),
-                    a_scales_table.len(),
-                    b_values.len(),
-                    b_scales.len(),
-                    d.len()
-                ),
-            });
-        }
-        unsafe {
-            check_cuda(
-                "infer_cutlass_fp4_grouped_gemv_f32_contiguous_b_on_stream",
-                ffi::infer_cutlass_fp4_grouped_gemv_f32_contiguous_b_on_stream(
-                    self.raw,
-                    a_values_table.as_const_ptr().cast(),
-                    a_scales_table.as_const_ptr().cast(),
-                    b_values.as_const_ptr().cast(),
-                    b_scales.as_const_ptr().cast(),
-                    d.as_const_ptr().cast_mut().cast(),
-                    alpha,
                     stream.as_raw(),
                 ),
             )
@@ -2174,40 +1975,33 @@ mod tests {
             b_quantized.push(bq);
         }
         for group in 0..groups {
-            a_value_ptrs.push(owned_a_values[group].as_const_ptr().cast::<u8>());
-            a_scale_ptrs.push(owned_a_scales[group].as_const_ptr().cast::<u8>());
-            b_value_ptrs_host.push(owned_b_values[group].as_const_ptr().cast::<u8>());
-            b_scale_ptrs_host.push(owned_b_scales[group].as_const_ptr().cast::<u8>());
+            a_value_ptrs.push(owned_a_values[group].cuda_address());
+            a_scale_ptrs.push(owned_a_scales[group].cuda_address());
+            b_value_ptrs_host.push(owned_b_values[group].cuda_address());
+            b_scale_ptrs_host.push(owned_b_scales[group].cuda_address());
         }
         let a_values_table = DeviceBuffer::from_host(&a_value_ptrs).expect("A values ptrs");
         let a_scales_table = DeviceBuffer::from_host(&a_scale_ptrs).expect("A scales ptrs");
         let b_values = DeviceBuffer::from_host(&b_value_ptrs_host).expect("B values ptrs");
         let b_scales = DeviceBuffer::from_host(&b_scale_ptrs_host).expect("B scales ptrs");
-        let mut outputs = (0..groups)
+        let outputs = (0..groups)
             .map(|_| F32Matrix::zeroed(m, 1).expect("D alloc"))
             .collect::<Vec<_>>();
-        let c_ptrs = DeviceBuffer::from_host(
+        let output_addresses = DeviceBuffer::from_host(
             &outputs
                 .iter()
-                .map(|output| output.input().data_ptr())
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )
-        .expect("C ptrs");
-        let mut d_host_ptrs = Vec::with_capacity(groups);
-        for output in &mut outputs {
-            let mut data = output.output();
-            d_host_ptrs.push(data.data_mut_ptr().cast());
-        }
-        let d_ptrs = DeviceBuffer::from_host(&d_host_ptrs).expect("D ptrs");
+        .expect("output addresses");
         let plan = CutlassFp4GroupedGemvF32Plan::new(m, k, groups).expect("grouped plan");
         let stream = crate::CudaStream::new_non_blocking().expect("stream");
-        plan.run_on_stream(
+        plan.run_output_addresses_on_stream(
             &a_values_table,
             &a_scales_table,
             &b_values,
             &b_scales,
-            &c_ptrs,
-            &d_ptrs,
+            &output_addresses,
             1.0,
             0.0,
             &stream,
