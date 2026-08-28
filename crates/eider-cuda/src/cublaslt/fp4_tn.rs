@@ -1041,6 +1041,65 @@ impl CutlassFp4GroupedGemvF32Plan {
         }
     }
 
+    /// Launches grouped GEMV with typed selected A, shared B, and output
+    /// address tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_indexed_a_addresses_on_stream(
+        &self,
+        indices: &DeviceBuffer<u32>,
+        a_values_table: &DeviceBuffer<DeviceAddress<u8>>,
+        a_scales_table: &DeviceBuffer<DeviceAddress<u8>>,
+        table_len: usize,
+        b_values: DeviceAddress<u8>,
+        b_scales: DeviceAddress<u8>,
+        outputs: &DeviceBuffer<DeviceAddress<f32>>,
+        alpha: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if indices.len() != self.groups || outputs.len() != self.groups {
+            return Err(Error::Shape {
+                label: "CUTLASS grouped FP4 GEMV indexed arrays",
+                expected: format!("{} entries", self.groups),
+                actual: format!("indices={} outputs={}", indices.len(), outputs.len()),
+            });
+        }
+        if a_values_table.len() != table_len || a_scales_table.len() != table_len {
+            return Err(Error::Shape {
+                label: "CUTLASS grouped FP4 GEMV expert table",
+                expected: format!("{table_len} entries"),
+                actual: format!(
+                    "A values={} A scales={}",
+                    a_values_table.len(),
+                    a_scales_table.len()
+                ),
+            });
+        }
+        if table_len > u32::MAX as usize {
+            return Err(Error::Shape {
+                label: "CUTLASS grouped FP4 GEMV expert table",
+                expected: "table_len <= u32::MAX".to_string(),
+                actual: table_len.to_string(),
+            });
+        }
+        unsafe {
+            check_cuda(
+                "infer_cutlass_fp4_grouped_gemv_f32_indexed_a_on_stream",
+                ffi::infer_cutlass_fp4_grouped_gemv_f32_indexed_a_on_stream(
+                    self.raw,
+                    indices.as_const_ptr().cast(),
+                    a_values_table.as_const_ptr().cast(),
+                    a_scales_table.as_const_ptr().cast(),
+                    table_len as u32,
+                    b_values.as_const_ptr(),
+                    b_scales.as_const_ptr(),
+                    outputs.as_const_ptr().cast(),
+                    alpha,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
     /// Launches hardware block-scaled grouped GEMV with A selected by device indices.
     ///
     /// The shared B vector and expert scale matrices use the tiled

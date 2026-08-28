@@ -32,11 +32,9 @@ struct LagunaRoutedGateUpBench {
     w4a16: Sm121W4A16GateUp,
     w4a16_workspace: Sm121W4A16GateUpBatchWorkspace,
     grouped_weights: Vec<ModelOptCublasLtWeight>,
-    grouped_weight_values: DeviceBuffer<*const u8>,
-    grouped_weight_scales: DeviceBuffer<*const u8>,
+    grouped_weight_values: DeviceBuffer<DeviceAddress<u8>>,
+    grouped_weight_scales: DeviceBuffer<DeviceAddress<u8>>,
     grouped_alphas: DeviceBuffer<f32>,
-    grouped_gemm_weight_values: DeviceBuffer<DeviceAddress<u8>>,
-    grouped_gemm_weight_scales: DeviceBuffer<DeviceAddress<u8>>,
     grouped_gemm_alpha_table: DeviceBuffer<DeviceAddress<f32>>,
     grouped_input: MoeSortedNvfp4Rows,
     grouped_plan: CutlassFp4GroupedGemmPlan,
@@ -48,11 +46,11 @@ struct LagunaRoutedGateUpBench {
     decode_input_scales: DeviceBuffer<u8>,
     decode_plan: CutlassFp4GroupedGemvF32Plan,
     decode_outputs: Vec<F32Matrix>,
-    decode_output_table: DeviceBuffer<*mut f32>,
+    decode_output_table: DeviceBuffer<DeviceAddress<f32>>,
     decode_cutlass_plan: Fp4TnMatmulPlan,
     decode_cutlass_c: F32Matrix,
     decode_cutlass_outputs: Vec<F32Matrix>,
-    decode_cutlass_output_table: DeviceBuffer<*mut f32>,
+    decode_cutlass_output_table: DeviceBuffer<DeviceAddress<f32>>,
     validation_nrmse: f64,
     validation_max_abs_error: f32,
     decode_validation_nrmse: f64,
@@ -87,31 +85,19 @@ impl LagunaRoutedGateUpBench {
         let grouped_weight_values = DeviceBuffer::from_host(
             &grouped_weights
                 .iter()
-                .map(|weight| weight.matrix().values_ptr())
+                .map(|weight| weight.matrix().values_address())
                 .collect::<Vec<_>>(),
         )?;
         let grouped_weight_scales = DeviceBuffer::from_host(
             &grouped_weights
                 .iter()
-                .map(|weight| weight.matrix().scales_ptr())
+                .map(|weight| weight.matrix().scales_address())
                 .collect::<Vec<_>>(),
         )?;
         let grouped_alphas = DeviceBuffer::from_host(
             &grouped_weights
                 .iter()
                 .map(ModelOptCublasLtWeight::weight_scale_2)
-                .collect::<Vec<_>>(),
-        )?;
-        let grouped_gemm_weight_values = DeviceBuffer::from_host(
-            &grouped_weights
-                .iter()
-                .map(|weight| weight.matrix().values_address())
-                .collect::<Vec<_>>(),
-        )?;
-        let grouped_gemm_weight_scales = DeviceBuffer::from_host(
-            &grouped_weights
-                .iter()
-                .map(|weight| weight.matrix().scales_address())
                 .collect::<Vec<_>>(),
         )?;
         let grouped_gemm_alpha_table = device_address_table(&grouped_alphas)?;
@@ -139,23 +125,23 @@ impl LagunaRoutedGateUpBench {
         let decode_indices =
             DeviceBuffer::from_host(&(0..TOP_K).map(|route| route as u32).collect::<Vec<_>>())?;
         let decode_input_nvfp4 = Nvfp4Matrix::zeroed_col_major(HIDDEN, 1)?;
-        let mut decode_outputs = (0..TOP_K)
+        let decode_outputs = (0..TOP_K)
             .map(|_| F32Matrix::zeroed(GATE_UP, 1))
             .collect::<Result<Vec<_>>>()?;
         let decode_output_table = DeviceBuffer::from_host(
             &decode_outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr().cast())
+                .iter()
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )?;
         let decode_cutlass_c = F32Matrix::zeroed(GATE_UP, 1)?;
-        let mut decode_cutlass_outputs = (0..TOP_K)
+        let decode_cutlass_outputs = (0..TOP_K)
             .map(|_| F32Matrix::zeroed(GATE_UP, 1))
             .collect::<Result<Vec<_>>>()?;
         let decode_cutlass_output_table = DeviceBuffer::from_host(
             &decode_cutlass_outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr().cast())
+                .iter()
+                .map(F32Matrix::data_address)
                 .collect::<Vec<_>>(),
         )?;
         let lt = CublasLt::new()?;
@@ -180,8 +166,6 @@ impl LagunaRoutedGateUpBench {
             grouped_weight_values,
             grouped_weight_scales,
             grouped_alphas,
-            grouped_gemm_weight_values,
-            grouped_gemm_weight_scales,
             grouped_gemm_alpha_table,
             grouped_input: MoeSortedNvfp4Rows::new(ROWS, TOP_K, EXPERTS, HIDDEN)?,
             grouped_plan: CutlassFp4GroupedGemmPlan::new(GATE_UP, ROUTES, HIDDEN, EXPERTS)?,
@@ -243,8 +227,8 @@ impl LagunaRoutedGateUpBench {
 
     fn enqueue_grouped_gemm(&mut self) -> Result<()> {
         self.grouped_plan.run_on_stream(
-            &self.grouped_gemm_weight_values,
-            &self.grouped_gemm_weight_scales,
+            &self.grouped_weight_values,
+            &self.grouped_weight_scales,
             self.grouped_input.packed_table(),
             self.grouped_input.scale_table(),
             &self.grouped_output_table,
@@ -282,19 +266,17 @@ impl LagunaRoutedGateUpBench {
     }
 
     fn enqueue_grouped_decode_gemv(&mut self) -> Result<()> {
-        unsafe {
-            self.decode_plan.run_indexed_a_on_stream(
-                &self.decode_indices,
-                &self.grouped_weight_values,
-                &self.grouped_weight_scales,
-                EXPERTS,
-                self.decode_input_nvfp4.values_ptr(),
-                self.decode_input_scales.as_const_ptr().cast(),
-                &self.decode_output_table,
-                1.0 / HIDDEN as f32,
-                &self.stream,
-            )
-        }
+        self.decode_plan.run_indexed_a_addresses_on_stream(
+            &self.decode_indices,
+            &self.grouped_weight_values,
+            &self.grouped_weight_scales,
+            EXPERTS,
+            self.decode_input_nvfp4.values_address(),
+            self.decode_input_scales.cuda_address(),
+            &self.decode_output_table,
+            1.0 / HIDDEN as f32,
+            &self.stream,
+        )
     }
 
     fn enqueue_cutlass_decode(&mut self) -> Result<()> {
@@ -334,16 +316,17 @@ impl LagunaRoutedGateUpBench {
     }
 
     fn enqueue_indexed_cutlass_decode_gemv(&mut self) -> Result<()> {
-        self.decode_plan.run_indexed_a_tiled_scales_on_stream(
-            &self.decode_indices,
-            &self.grouped_weight_values,
-            &self.grouped_weight_scales,
-            &self.grouped_alphas,
-            &self.decode_input_nvfp4,
-            &self.decode_cutlass_c,
-            &self.decode_cutlass_output_table,
-            &self.stream,
-        )
+        self.decode_plan
+            .run_indexed_a_tiled_scale_addresses_on_stream(
+                &self.decode_indices,
+                &self.grouped_weight_values,
+                &self.grouped_weight_scales,
+                &self.grouped_alphas,
+                &self.decode_input_nvfp4,
+                &self.decode_cutlass_c,
+                &self.decode_cutlass_output_table,
+                &self.stream,
+            )
     }
 
     fn validate(&mut self) -> Result<()> {
