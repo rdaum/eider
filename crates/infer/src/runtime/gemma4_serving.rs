@@ -2,6 +2,7 @@
 
 use crate::gemma4::{
     Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
+    Gemma4SequenceId, Gemma4SequencePool,
 };
 use crate::gemma4::{
     Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
@@ -103,7 +104,7 @@ struct ActiveRequest<'tokenizer> {
     generated_tokens: usize,
     last_token: Option<u32>,
     prompt_logits_ready: bool,
-    sequence: Option<Box<Gemma4Sequence>>,
+    sequence_id: Option<Gemma4SequenceId>,
     sampler: Sampler,
     history: TokenHistory,
     output: ChatOutputCodec<'tokenizer>,
@@ -122,7 +123,7 @@ pub struct Gemma4ChatService<'model, 'template> {
     next_id: u64,
     waiting: VecDeque<Gemma4RequestId>,
     requests: BTreeMap<Gemma4RequestId, ActiveRequest<'template>>,
-    active_sequences: usize,
+    sequences: Gemma4SequencePool,
     sequence_cache: Gemma4SequenceCache,
 }
 
@@ -200,7 +201,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
-            active_sequences: 0,
+            sequences: Gemma4SequencePool::new(),
             sequence_cache,
         })
     }
@@ -267,7 +268,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 generated_tokens: 0,
                 last_token: None,
                 prompt_logits_ready: false,
-                sequence: None,
+                sequence_id: None,
                 sampler: Sampler::new(request.generation.sampling)?,
                 history: TokenHistory::from_tokens(prompt.token_ids.iter().copied()),
                 output: ChatOutputCodec::new(
@@ -318,7 +319,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.prompt_position >= request.prompt.len()
                     && request.generated_tokens < request.generation.max_new_tokens
             })
@@ -335,7 +336,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             .requests
             .iter()
             .filter(|(_, request)| {
-                request.sequence.is_some()
+                request.sequence_id.is_some()
                     && request.generation.max_new_tokens != 0
                     && request.prompt_position < request.prompt.len()
             })
@@ -345,14 +346,14 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         self.prefill(&prefill_ids, &mut tick, on_lifecycle)?;
 
         for (&id, request) in &self.requests {
-            if request.sequence.is_some() && request.generation.max_new_tokens == 0 {
+            if request.sequence_id.is_some() && request.generation.max_new_tokens == 0 {
                 terminal.entry(id).or_insert(ChatFinishReason::Length);
             }
         }
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
-        tick.active_sequences = self.active_sequences;
+        tick.active_sequences = self.sequences.len();
         Ok(tick)
     }
 
@@ -362,18 +363,23 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             return Gemma4CancelOutcome::NotFound;
         };
         self.waiting.retain(|&waiting| waiting != id);
-        let released = request
-            .sequence
-            .as_ref()
-            .map_or(0, |sequence| sequence.device_bytes());
-        if let Some(sequence) = request.sequence
-            && let Err(error) = (*sequence).finish(&mut self.sequence_cache, &self.stream)
-        {
-            warn!(%error, "failed to release cancelled Gemma 4 sequence");
-        }
-        if released != 0 {
-            self.active_sequences -= 1;
-        }
+        let released = if let Some(sequence_id) = request.sequence_id {
+            match self.sequences.release(sequence_id) {
+                Ok(sequence) => {
+                    let bytes = sequence.device_bytes();
+                    if let Err(error) = sequence.finish(&mut self.sequence_cache, &self.stream) {
+                        warn!(%error, "failed to release cancelled Gemma 4 sequence");
+                    }
+                    bytes
+                }
+                Err(error) => {
+                    warn!(%error, "missing cancelled Gemma 4 sequence");
+                    0
+                }
+            }
+        } else {
+            0
+        };
         Gemma4CancelOutcome::Cancelled {
             released_sequence_device_bytes: released,
         }
@@ -381,7 +387,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
 
     /// Returns requests currently owning device sequence state.
     pub fn active_sequence_count(&self) -> usize {
-        self.active_sequences
+        self.sequences.len()
     }
 
     fn admit(
@@ -392,7 +398,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
         ),
     ) -> Result<()> {
-        while self.active_sequences < self.config.max_active_sequences {
+        while self.sequences.len() < self.config.max_active_sequences {
             let Some(id) = self.waiting.pop_front() else {
                 break;
             };
@@ -446,8 +452,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             request.prompt_position = cached_prompt_tokens;
             request.prefix_retained =
                 cached_prompt_tokens == request.prefix_target && cached_prompt_tokens != 0;
-            request.sequence = Some(Box::new(sequence));
-            self.active_sequences += 1;
+            request.sequence_id = Some(self.sequences.insert(sequence)?);
             let progress = Gemma4AdmissionProgress {
                 request_id: id,
                 sequence_device_bytes: bytes,
@@ -495,6 +500,16 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         if selected.is_empty() {
             return Ok(());
         }
+        let sequence_ids = selected
+            .iter()
+            .map(|(id, _)| {
+                self.requests[id].sequence_id.ok_or_else(|| Error::Format {
+                    label: "Gemma 4 scheduled prefill",
+                    detail: format!("request {} has no admitted sequence", id.get()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut sequences = self.sequences.lease_many(&sequence_ids)?;
         let mut requests = selected
             .iter()
             .map(|(id, _)| self.requests.remove(id).expect("prefill request exists"))
@@ -508,16 +523,14 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 .unwrap_or(&mut self.prefill_workspace);
             let mut rows = requests
                 .iter_mut()
+                .zip(sequences.sequences_mut())
                 .zip(selected.iter().map(|(_, chunk)| *chunk))
-                .map(|(request, chunk)| {
+                .map(|((request, sequence), chunk)| {
                     let start = request.prompt_position;
                     let end = start + chunk;
                     Gemma4PrefillRow {
                         token_ids: &request.prompt[start..end],
-                        sequence: request
-                            .sequence
-                            .as_deref_mut()
-                            .expect("prefill request is admitted"),
+                        sequence,
                         output: if end != request.prompt.len() {
                             Gemma4PrefillOutput::None
                         } else if request.sampler.config().uses_fast_argmax() {
@@ -535,6 +548,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 .prefill_batch(workspace, &mut rows, &self.stream, &mut self.sequence_cache)
                 .and_then(|()| self.stream.synchronize())
         };
+        drop(sequences);
         if let Err(error) = result {
             for (request, (id, _)) in requests.into_iter().zip(&selected) {
                 self.requests.insert(*id, request);
@@ -552,6 +566,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
                 Self::retain_request_checkpoint(
                     &mut self.sequence_cache,
                     &self.stream,
+                    &mut self.sequences,
                     &mut request,
                 );
             }
@@ -567,6 +582,7 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
     fn retain_request_checkpoint(
         sequence_cache: &mut Gemma4SequenceCache,
         stream: &CudaStream,
+        sequences: &mut Gemma4SequencePool,
         request: &mut ActiveRequest<'template>,
     ) {
         if request.prefix_retained || request.prefix_target == 0 {
@@ -576,9 +592,14 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             request.prefix_retained = true;
             return;
         }
-        let Some(sequence) = request.sequence.as_deref_mut() else {
+        let Some(sequence_id) = request.sequence_id else {
             return;
         };
+        let Ok(mut leased) = sequences.lease_many(&[sequence_id]) else {
+            warn!("missing sequence while retaining Gemma 4 prompt prefix");
+            return;
+        };
+        let sequence = leased.sequence_mut(0);
         if sequence.position() != request.prefix_target {
             return;
         }
@@ -606,10 +627,9 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         tick: &mut Gemma4Tick,
     ) -> Result<Option<ChatFinishReason>> {
         let request = self.requests.get_mut(&id).expect("decode request exists");
-        let sequence = request
-            .sequence
-            .as_deref_mut()
-            .expect("decode request is admitted");
+        let sequence_id = request.sequence_id.expect("decode request is admitted");
+        let mut sequences = self.sequences.lease_many(&[sequence_id])?;
+        let sequence = sequences.sequence_mut(0);
         if request.prompt_logits_ready {
             request.prompt_logits_ready = false;
         } else {
@@ -684,13 +704,13 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             }
         }
         let mut request = self.requests.remove(&id).expect("terminal request remains");
-        let sequence = request
-            .sequence
+        let sequence_id = request
+            .sequence_id
             .take()
             .expect("terminal request is admitted");
+        let sequence = self.sequences.release(sequence_id)?;
         let released = sequence.device_bytes();
-        (*sequence).finish(&mut self.sequence_cache, &self.stream)?;
-        self.active_sequences -= 1;
+        sequence.finish(&mut self.sequence_cache, &self.stream)?;
         tick.finished.push(Gemma4Finished {
             request_id: id,
             finish_reason: reason,

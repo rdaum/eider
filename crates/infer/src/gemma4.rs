@@ -24,8 +24,10 @@ use std::fs;
 use std::path::Path;
 
 mod batch;
+mod execution;
 mod sequence;
 pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow};
+pub(crate) use execution::{Gemma4SequenceId, Gemma4SequencePool};
 pub(crate) use sequence::{
     Gemma4Append, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
 };

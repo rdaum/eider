@@ -15,6 +15,9 @@ in an inference-owned execution object. Qwen scheduler requests now retain
 opaque sequence identities, while the execution object owns the live CUDA
 sequences and GPU sampling-count buffers; batch leases restore that state on
 every return path. The scheduler keeps request policy and queues.
+Gemma 4 follows the same ownership rule: its chat service keeps scheduling and
+output state, while the Gemma module retains live CUDA sequences behind opaque
+identities and temporary batch leases.
 `eider-format` now owns GGUF indexing, GGML K-quant decoding, the
 sharded safetensors index/cache, the versioned host-only NVFP4 artifact codec,
 and ModelOpt checkpoint records and host layouts. `eider-cuda` owns the
