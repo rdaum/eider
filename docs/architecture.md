@@ -91,8 +91,11 @@ The live Qwen3.6 and Laguna SM12x indexed-down plans now do the same for
 expert tiles, scales, and route outputs. The legacy raw-table entry point
 remains while focused benchmarks migrate.
 Step-3.7 and Laguna SM12x gate/up quantization now also receive typed F32
-activation address tables. `DeviceBuffer::address_at` bounds-checks their
-element offsets while the CUDA boundary preserves the native table ABI.
+activation address tables. Step-3.7's paged down-expert tiles, row scales, and
+per-route output tables now use typed addresses through its residual grouped
+GEMV and weighted accumulation as well. `DeviceBuffer::address_at`
+bounds-checks their element offsets while the CUDA boundary preserves the
+native table ABI.
 Laguna's CUTLASS routed gate/up plan now uses its typed expert weight, scale,
 and output tables directly; the remaining legacy raw-table caller is Qwen3.6.
 Qwen3.6's FP8 routed-expert path likewise uses typed weight and channel-scale

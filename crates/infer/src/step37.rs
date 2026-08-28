@@ -12,12 +12,14 @@ use eider_cuda::{
     argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_logits_f32_into_on_stream, cached_gqa_attention_f32_into_on_stream,
     copy_bf16_row_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
-    gemv_row_scales_residual2_batch_on_stream, indexed_grouped_gemv_row_scales_residual_on_stream,
-    modelopt_m16_k64_row_scale_words, moe_silu_quantize_slot_addresses_residual_on_stream,
-    moe_weighted_accumulate_slots_f32_on_stream, quantize_dynamic_vectors_residual2_on_stream,
-    rms_norm_f32_into_on_stream, rope_neox_inv_freq_sequence_f32_into_on_stream,
-    sigmoid_scale_heads_f32_into_on_stream, silu_mul_halves_clamped_f32_into_on_stream,
-    silu_mul_halves_f32_into_on_stream, step37_sigmoid_top8_f32_into_on_stream,
+    gemv_row_scales_residual2_batch_on_stream,
+    indexed_grouped_gemv_row_scales_residual_addresses_on_stream, modelopt_m16_k64_row_scale_words,
+    moe_silu_quantize_slot_addresses_residual_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream,
+    quantize_dynamic_vectors_residual2_on_stream, rms_norm_f32_into_on_stream,
+    rope_neox_inv_freq_sequence_f32_into_on_stream, sigmoid_scale_heads_f32_into_on_stream,
+    silu_mul_halves_clamped_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
+    step37_sigmoid_top8_f32_into_on_stream,
 };
 use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
 use fs2::FileExt as Fs2FileExt;
@@ -246,8 +248,8 @@ pub struct Step37PagedExperts {
     source: Step37ExpertRecordSource,
     gate_up: Sm121W4A16GateUp,
     down: Vec<Step37DownSlot>,
-    down_values: DeviceBuffer<*const u8>,
-    down_scales: DeviceBuffer<*const u32>,
+    down_values: DeviceBuffer<DeviceAddress<u8>>,
+    down_scales: DeviceBuffer<DeviceAddress<u32>>,
     down_weight_scale_2: DeviceBuffer<f32>,
     gate_up_unity_alphas: DeviceBuffer<f32>,
     slots: ExpertSlotCache,
@@ -279,8 +281,8 @@ pub struct Step37PagedExpertWorkspace {
     down_residual_tiles: DeviceBuffer<u8>,
     down_residual_scales: DeviceBuffer<u32>,
     _down_outputs: Vec<F32Matrix>,
-    down_output_table: DeviceBuffer<*mut f32>,
-    down_result_table: DeviceBuffer<*const f32>,
+    down_output_table: DeviceBuffer<DeviceAddress<f32>>,
+    down_result_table: DeviceBuffer<DeviceAddress<f32>>,
     aggregate: DeviceBuffer<f32>,
 }
 
@@ -1322,13 +1324,13 @@ impl Step37PagedExperts {
         let down_values = DeviceBuffer::from_host(
             &down
                 .iter()
-                .map(|slot| slot.tiles.as_const_ptr().cast())
+                .map(|slot| slot.tiles.cuda_address())
                 .collect::<Vec<_>>(),
         )?;
         let down_scales = DeviceBuffer::from_host(
             &down
                 .iter()
-                .map(|slot| slot.row_scales.as_const_ptr().cast())
+                .map(|slot| slot.row_scales.cuda_address())
                 .collect::<Vec<_>>(),
         )?;
         let down_weight_scale_2 = DeviceBuffer::zeroed(capacity)?;
@@ -1543,7 +1545,7 @@ impl Step37PagedExperts {
             self.swiglu_limit.unwrap_or(0.0),
             stream,
         )?;
-        indexed_grouped_gemv_row_scales_residual_on_stream(
+        indexed_grouped_gemv_row_scales_residual_addresses_on_stream(
             indices,
             &self.down_values,
             &self.down_scales,
@@ -1558,7 +1560,7 @@ impl Step37PagedExperts {
             8,
             stream,
         )?;
-        moe_weighted_accumulate_slots_f32_on_stream(
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
             indices,
             route_weights,
             &workspace.down_result_table,
@@ -1596,11 +1598,12 @@ impl Step37PagedExpertWorkspace {
         )?;
         let mut down_outputs = Vec::with_capacity(8);
         let mut down_results = Vec::with_capacity(8);
-        let mut down_output_ptrs = Vec::with_capacity(8);
+        let mut down_output_addresses = Vec::with_capacity(8);
         for _ in 0..8 {
-            let mut down = F32Matrix::zeroed(HIDDEN, 1)?;
-            down_results.push(down.data_ptr());
-            down_output_ptrs.push(down.data_mut_ptr());
+            let down = F32Matrix::zeroed(HIDDEN, 1)?;
+            let address = down.data_address();
+            down_results.push(address);
+            down_output_addresses.push(address);
             down_outputs.push(down);
         }
         Ok(Self {
@@ -1611,7 +1614,7 @@ impl Step37PagedExpertWorkspace {
             down_residual_tiles: DeviceBuffer::zeroed(8 * (INTERMEDIATE / 64) * 512)?,
             down_residual_scales: DeviceBuffer::zeroed(8 * (INTERMEDIATE / 64))?,
             _down_outputs: down_outputs,
-            down_output_table: DeviceBuffer::from_host(&down_output_ptrs)?,
+            down_output_table: DeviceBuffer::from_host(&down_output_addresses)?,
             down_result_table: DeviceBuffer::from_host(&down_results)?,
             aggregate: DeviceBuffer::zeroed(HIDDEN)?,
         })

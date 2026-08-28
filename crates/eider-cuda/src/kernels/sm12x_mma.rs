@@ -1879,6 +1879,79 @@ pub fn indexed_grouped_gemv_row_scales_residual_on_stream(
     }
 }
 
+/// Runs grouped row-scaled GEMV for the sum of primary and residual FP4 inputs
+/// through typed CUDA address tables.
+///
+/// This is the typed counterpart of
+/// [`indexed_grouped_gemv_row_scales_residual_on_stream`]. New inference plans
+/// must use it instead of constructing raw device-pointer tables.
+#[allow(clippy::too_many_arguments)]
+pub fn indexed_grouped_gemv_row_scales_residual_addresses_on_stream(
+    indices: &DeviceBuffer<u32>,
+    a_native_tiles_table: &DeviceBuffer<DeviceAddress<u8>>,
+    a_row_scales_table: &DeviceBuffer<DeviceAddress<u32>>,
+    table_len: usize,
+    b_native_tiles: &DeviceBuffer<u8>,
+    sfb: &DeviceBuffer<u32>,
+    residual_native_tiles: &DeviceBuffer<u8>,
+    residual_sfb: &DeviceBuffer<u32>,
+    d: &DeviceBuffer<DeviceAddress<f32>>,
+    m_tiles: usize,
+    k_tiles: usize,
+    groups: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if indices.len() != groups
+        || d.len() != groups
+        || a_native_tiles_table.len() != table_len
+        || a_row_scales_table.len() != table_len
+        || b_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || sfb.len() < groups * k_tiles
+        || residual_native_tiles.len() < groups * k_tiles * TILE_BYTES
+        || residual_sfb.len() < groups * k_tiles
+        || table_len > u32::MAX as usize
+        || m_tiles > u32::MAX as usize
+        || k_tiles > u32::MAX as usize
+        || groups > u32::MAX as usize
+    {
+        return Err(crate::Error::Shape {
+            label: "SM12x indexed grouped row-scaled residual GEMV buffers",
+            expected: "expert tables, two grouped B vectors, and output addresses".to_string(),
+            actual: format!(
+                "indices={} D={} A={} SFA={} table_len={table_len} B={}/{} residual={}/{} m_tiles={m_tiles} k_tiles={k_tiles} groups={groups}",
+                indices.len(),
+                d.len(),
+                a_native_tiles_table.len(),
+                a_row_scales_table.len(),
+                b_native_tiles.len(),
+                sfb.len(),
+                residual_native_tiles.len(),
+                residual_sfb.len()
+            ),
+        });
+    }
+    unsafe {
+        check_cuda(
+            "infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream",
+            crate::ffi::infer_sm12x_indexed_grouped_gemv_row_scales_residual_on_stream(
+                indices.as_const_ptr().cast(),
+                a_native_tiles_table.as_const_ptr().cast(),
+                a_row_scales_table.as_const_ptr().cast(),
+                table_len as u32,
+                b_native_tiles.as_const_ptr().cast(),
+                sfb.as_const_ptr().cast(),
+                residual_native_tiles.as_const_ptr().cast(),
+                residual_sfb.as_const_ptr().cast(),
+                d.as_const_ptr().cast(),
+                m_tiles as u32,
+                k_tiles as u32,
+                groups as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Runs a row-scaled SM12x GEMV over primary plus residual FP4 rows.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_row_scales_residual2_batch_on_stream(
@@ -3117,21 +3190,27 @@ mod tests {
             )
             .expect("grouped gemv");
         }
-        let mut fused_outputs = (0..groups)
+        let fused_outputs = (0..groups)
             .map(|_| F32Matrix::zeroed(m, 1))
             .collect::<Result<Vec<_>>>()
             .expect("fused outputs");
         let fused_output_table = DeviceBuffer::from_host(
             &fused_outputs
-                .iter_mut()
-                .map(|output| output.data_mut_ptr())
+                .iter()
+                .map(|output| output.data_address())
                 .collect::<Vec<_>>(),
         )
         .expect("fused output table");
-        indexed_grouped_gemv_row_scales_residual_on_stream(
+        let addressed_weight_table =
+            DeviceBuffer::from_host(&vec![weight_tiles.cuda_address(); groups])
+                .expect("addressed weight table");
+        let addressed_scale_table =
+            DeviceBuffer::from_host(&vec![row_scales.cuda_address(); groups])
+                .expect("addressed scale table");
+        indexed_grouped_gemv_row_scales_residual_addresses_on_stream(
             &indices,
-            &weight_table,
-            &scale_table,
+            &addressed_weight_table,
+            &addressed_scale_table,
             groups,
             &primary_tiles,
             &primary_scales,
