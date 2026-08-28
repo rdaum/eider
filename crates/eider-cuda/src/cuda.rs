@@ -1140,6 +1140,14 @@ impl Drop for CudaEvent {
 ///
 /// let _ = DeviceBuffer::<NonZeroU32>::zeroed(1);
 /// ```
+///
+/// ```compile_fail
+/// use eider_cuda::DeviceBuffer;
+///
+/// let buffer = DeviceBuffer::<u32>::zeroed(1)?;
+/// let _raw_cuda_pointer = buffer.as_const_ptr();
+/// # Ok::<(), eider_cuda::Error>(())
+/// ```
 pub struct DeviceBuffer<T> {
     pub(crate) ptr: *mut T,
     len: usize,
