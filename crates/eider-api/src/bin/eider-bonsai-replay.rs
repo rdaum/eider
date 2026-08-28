@@ -2,10 +2,9 @@
 
 use anyhow::{Result, anyhow};
 use eider_api::protocol::ResponseRequest;
-use eider_format::{GgufIndex, GgufValue};
-use eider_inference::bonsai::{BonsaiModel, BonsaiPrefillMode};
+use eider_inference::bonsai::{BonsaiModel, BonsaiPrefillMode, load_chat_template};
 use eider_inference::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
-use eider_runtime::chat::{ChatMessage, CheckpointChatTemplate};
+use eider_runtime::chat::ChatMessage;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
 use eider_runtime::generation::GenerationConfig;
 use serde_json::{Value, json};
@@ -78,7 +77,8 @@ fn main() -> Result<()> {
         chat.messages.push(ChatMessage::assistant(assistant));
         chat.messages.push(ChatMessage::user(user));
     }
-    let template = bonsai_chat_template(&model_dir)?;
+    let template =
+        load_chat_template(&model_dir).map_err(|error| failure("Bonsai chat template", error))?;
     let prompt = template.render_and_tokenize(&chat.messages, &chat.tools, chat.template)?;
     let starts_in_reasoning = chat.template.add_generation_prompt && chat.template.enable_thinking;
 
@@ -173,28 +173,6 @@ fn parse_mode(value: &str) -> Option<BonsaiPrefillMode> {
         "nvfp4" => Some(BonsaiPrefillMode::Nvfp4),
         _ => None,
     }
-}
-
-fn bonsai_chat_template(model_dir: &std::path::Path) -> Result<CheckpointChatTemplate> {
-    let gguf = model_dir.join(GGUF_NAME);
-    let index = GgufIndex::open(&gguf).map_err(|error| failure("Bonsai GGUF import", error))?;
-    let source = index
-        .metadata()
-        .get("tokenizer.chat_template")
-        .and_then(GgufValue::as_str)
-        .ok_or_else(|| {
-            failure(
-                "Bonsai chat template",
-                format!("{} has no tokenizer.chat_template string", gguf.display()),
-            )
-        })?
-        .to_string();
-    Ok(CheckpointChatTemplate::from_source_and_tokenizer_files(
-        source,
-        gguf,
-        model_dir.join("tokenizer.json"),
-        model_dir.join("tokenizer_config.json"),
-    )?)
 }
 
 fn mode_name(mode: BonsaiPrefillMode) -> &'static str {

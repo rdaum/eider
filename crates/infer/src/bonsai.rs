@@ -11,6 +11,7 @@ use eider_cuda::{
     set_cuda_device, silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
 };
 use eider_format::{Error as FormatError, GgufIndex, GgufValue};
+use eider_runtime::chat::CheckpointChatTemplate;
 use seqcache::AppendPages;
 use std::f32::consts::PI;
 use std::path::Path;
@@ -24,6 +25,30 @@ pub use sequence::{BonsaiSequence, BonsaiSequenceCache, new_bonsai_sequence_cach
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_Q2_0_G64: u32 = 42;
 const Q2_0_G64_BYTES_PER_GROUP: usize = 18;
+
+const GGUF_FILE_NAME: &str = "Ternary-Bonsai-8B-Q2_0_g64.gguf";
+
+/// Loads the Bonsai chat template embedded in the model's GGUF checkpoint.
+///
+/// This keeps checkpoint parsing with the model implementation while the API
+/// layer receives only the rendered-template configuration.
+pub fn load_chat_template(model_dir: &Path) -> std::result::Result<CheckpointChatTemplate, String> {
+    let gguf = model_dir.join(GGUF_FILE_NAME);
+    let index = GgufIndex::open(&gguf).map_err(|error| format!("Bonsai GGUF import: {error}"))?;
+    let source = index
+        .metadata()
+        .get("tokenizer.chat_template")
+        .and_then(GgufValue::as_str)
+        .ok_or_else(|| format!("{} has no tokenizer.chat_template string", gguf.display()))?
+        .to_string();
+    CheckpointChatTemplate::from_source_and_tokenizer_files(
+        source,
+        gguf,
+        model_dir.join("tokenizer.json"),
+        model_dir.join("tokenizer_config.json"),
+    )
+    .map_err(|error| error.to_string())
+}
 
 /// Validated Ternary Bonsai checkpoint configuration.
 #[derive(Clone, Copy, Debug, PartialEq)]

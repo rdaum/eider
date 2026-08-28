@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 anyhow = "1"
 eider-inference = { path = "../infer" }
-eider-format.workspace = true
 eider-runtime.workspace = true
 
 async-stream.workspace = true

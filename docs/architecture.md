@@ -77,6 +77,8 @@ remains `crates/infer` during the migration.
 Model loading now selects its CUDA device inside `eider-inference`; the API
 actor has no CUDA resource import and receives inference-boundary errors.
 The `eider-api` package has no direct CUDA dependency.
+Bonsai GGUF chat-template parsing now also lives in `eider-inference`; the API
+receives the resolved template and has no direct format dependency.
 Both `eider-api` and `eider-runtime` forbid unsafe code at their crate
 boundaries.
 `eider-cuda` denies unchecked unsafe operations inside unsafe functions.

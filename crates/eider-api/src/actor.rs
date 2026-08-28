@@ -4,7 +4,7 @@ use crate::metrics::{FinishReason, ServerEndpoint, metrics as server_metrics};
 use crate::protocol::{ApiError, InferenceEvent, InferenceFinished};
 use eider_inference::InferenceResult;
 use eider_inference::bitnet::BitNetModel;
-use eider_inference::bonsai::BonsaiModel;
+use eider_inference::bonsai::{BonsaiModel, load_chat_template as bonsai_chat_template};
 use eider_inference::deepseek4::Deepseek4TextModel;
 use eider_inference::gemma4::Gemma4Model;
 use eider_inference::laguna::LagunaModel;
@@ -798,27 +798,6 @@ fn checkpoint_architecture(model_dir: &std::path::Path) -> Result<CheckpointArch
 
 fn bonsai_gguf_path(model_dir: &std::path::Path) -> PathBuf {
     model_dir.join("Ternary-Bonsai-8B-Q2_0_g64.gguf")
-}
-
-fn bonsai_chat_template(
-    model_dir: &std::path::Path,
-) -> std::result::Result<CheckpointChatTemplate, String> {
-    let gguf = bonsai_gguf_path(model_dir);
-    let index = eider_format::GgufIndex::open(&gguf)
-        .map_err(|error| format!("Bonsai GGUF import: {error}"))?;
-    let source = index
-        .metadata()
-        .get("tokenizer.chat_template")
-        .and_then(eider_format::GgufValue::as_str)
-        .ok_or_else(|| format!("{} has no tokenizer.chat_template string", gguf.display()))?
-        .to_string();
-    CheckpointChatTemplate::from_source_and_tokenizer_files(
-        source,
-        gguf,
-        model_dir.join("tokenizer.json"),
-        model_dir.join("tokenizer_config.json"),
-    )
-    .map_err(|error| error.to_string())
 }
 
 struct EngineAdmission {
