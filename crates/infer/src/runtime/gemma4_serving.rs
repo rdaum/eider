@@ -1,7 +1,5 @@
 //! Multi-session chat serving for Gemma 4.
 
-use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use crate::gemma4::{
     Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
 };
@@ -14,7 +12,9 @@ use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

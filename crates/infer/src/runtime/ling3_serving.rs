@@ -1,7 +1,5 @@
 //! Decode-first multi-session chat serving for Ling 3.
 
-use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use crate::ling3::{
     Ling3Model, Ling3PrefillWorkspace, Ling3Sequence, Ling3SequenceCache, admit_ling3_sequence,
     new_ling3_sequence_cache,
@@ -9,7 +7,9 @@ use crate::ling3::{
 use eider_cuda::{CudaStream, Error, Result};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};

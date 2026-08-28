@@ -1,5 +1,5 @@
 use eider_cuda::{Error, Result};
-use infer::gemma4::Gemma4Checkpoint;
+use eider_inference::gemma4::Gemma4Checkpoint;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

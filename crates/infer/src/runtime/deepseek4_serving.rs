@@ -1,7 +1,5 @@
 //! Multi-session chat serving for DeepSeek V4.
 
-use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use crate::deepseek4::{
     Deepseek4BatchRow, Deepseek4BatchWorkspace, Deepseek4CacheContext, Deepseek4LayerSequenceState,
     Deepseek4MtpBatchRow, Deepseek4MtpSequence, Deepseek4MtpSequenceCache, Deepseek4MtpWorkspace,
@@ -13,7 +11,9 @@ use eider_cuda::{Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};
@@ -1212,9 +1212,9 @@ mod tests {
         Deepseek4RequestId, MAX_CONTINUATION_PREFILL_TOKENS, ResponseFilter,
         prefill_chunk_capacity, retained_prefix_ready, retention_bounded_chunk,
     };
-    use crate::runtime::serving::ChatFinishReason;
     use eider_runtime::chat::{ChatFunctionCall, ChatToolCall};
     use eider_runtime::chat_output::ChatOutputEvent;
+    use eider_runtime::request::ChatFinishReason;
     use serde_json::json;
     use std::collections::BTreeMap;
 

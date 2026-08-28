@@ -1,13 +1,13 @@
 //! Deterministically replays one Responses request through Bonsai.
 
+use anyhow::{Result, anyhow};
 use eider_api::protocol::ResponseRequest;
-use eider_cuda::{Error, Result};
 use eider_format::{GgufIndex, GgufValue};
+use eider_inference::bonsai::{BonsaiModel, BonsaiPrefillMode};
+use eider_inference::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
 use eider_runtime::chat::{ChatMessage, CheckpointChatTemplate};
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
-use infer::bonsai::{BonsaiModel, BonsaiPrefillMode};
-use infer::bonsai::{BonsaiSequence, new_bonsai_sequence_cache};
-use infer::runtime::generation::GenerationConfig;
+use eider_runtime::generation::GenerationConfig;
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
@@ -43,10 +43,7 @@ fn main() -> Result<()> {
         .and_then(|value| value.into_string().ok())
         .map(|value| value.parse::<usize>())
         .transpose()
-        .map_err(|error| Error::Format {
-            label: "max-new-tokens",
-            detail: error.to_string(),
-        })?
+        .map_err(|error| failure("max-new-tokens", error))?
         .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
     let continuation_assistant = args
         .next()
@@ -61,22 +58,22 @@ fn main() -> Result<()> {
         return Err(usage(&program));
     }
 
-    let request = fs::read_to_string(&request_path).map_err(|error| Error::Format {
-        label: "Responses replay request",
-        detail: format!("{}: {error}", request_path.display()),
+    let request = fs::read_to_string(&request_path).map_err(|error| {
+        failure(
+            "Responses replay request",
+            format!("{}: {error}", request_path.display()),
+        )
     })?;
-    let request: ResponseRequest =
-        serde_json::from_str(&request).map_err(|error| Error::Format {
-            label: "Responses replay request",
-            detail: format!("{}: {error}", request_path.display()),
-        })?;
+    let request: ResponseRequest = serde_json::from_str(&request).map_err(|error| {
+        failure(
+            "Responses replay request",
+            format!("{}: {error}", request_path.display()),
+        )
+    })?;
     let defaults = GenerationConfig::from_model_dir(&model_dir)?;
     let mut chat = request
         .into_chat_request(&defaults)
-        .map_err(|error| Error::Format {
-            label: "Responses replay request",
-            detail: error.message,
-        })?;
+        .map_err(|error| failure("Responses replay request", error.message))?;
     if let (Some(assistant), Some(user)) = (continuation_assistant, continuation_user) {
         chat.messages.push(ChatMessage::assistant(assistant));
         chat.messages.push(ChatMessage::user(user));
@@ -139,10 +136,7 @@ fn main() -> Result<()> {
     let raw_text = template
         .tokenizer()
         .decode(&token_ids, false)
-        .map_err(|error| Error::Format {
-            label: "Responses replay output",
-            detail: error.to_string(),
-        })?;
+        .map_err(|error| failure("Responses replay output", error))?;
     sequence.finish(&mut cache)?;
     let report = serde_json::to_string_pretty(&json!({
         "prefill_mode": mode_name(mode),
@@ -161,9 +155,11 @@ fn main() -> Result<()> {
     }))
     .expect("replay report serializes");
     if let Some(output_path) = output_path {
-        fs::write(&output_path, report).map_err(|error| Error::Format {
-            label: "Responses replay output",
-            detail: format!("{}: {error}", output_path.display()),
+        fs::write(&output_path, report).map_err(|error| {
+            failure(
+                "Responses replay output",
+                format!("{}: {error}", output_path.display()),
+            )
         })?;
     } else {
         println!("{report}");
@@ -181,17 +177,16 @@ fn parse_mode(value: &str) -> Option<BonsaiPrefillMode> {
 
 fn bonsai_chat_template(model_dir: &std::path::Path) -> Result<CheckpointChatTemplate> {
     let gguf = model_dir.join(GGUF_NAME);
-    let index = GgufIndex::open(&gguf).map_err(|error| Error::Format {
-        label: "Bonsai GGUF import",
-        detail: error.to_string(),
-    })?;
+    let index = GgufIndex::open(&gguf).map_err(|error| failure("Bonsai GGUF import", error))?;
     let source = index
         .metadata()
         .get("tokenizer.chat_template")
         .and_then(GgufValue::as_str)
-        .ok_or_else(|| Error::Format {
-            label: "Bonsai chat template",
-            detail: format!("{} has no tokenizer.chat_template string", gguf.display()),
+        .ok_or_else(|| {
+            failure(
+                "Bonsai chat template",
+                format!("{} has no tokenizer.chat_template string", gguf.display()),
+            )
         })?
         .to_string();
     Ok(CheckpointChatTemplate::from_source_and_tokenizer_files(
@@ -222,14 +217,18 @@ fn top_logits(logits: &[f32], limit: usize) -> Vec<(u32, f32)> {
     values
 }
 
-fn usage(program: &str) -> Error {
-    Error::Format {
-        label: "usage",
-        detail: format!(
+fn usage(program: &str) -> anyhow::Error {
+    failure(
+        "usage",
+        format!(
             "{program} <model-dir> <responses-request.json> <bf16|nvfp4> [output.json] \
              [max-new-tokens] [assistant-continuation user-continuation]"
         ),
-    }
+    )
+}
+
+fn failure(label: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("{label}: {detail}")
 }
 
 fn event_json(event: ChatOutputEvent) -> Value {

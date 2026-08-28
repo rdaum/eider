@@ -1,8 +1,10 @@
 use eider_cuda::{CudaStream, SM12X_KV_PAGE_TOKENS};
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36DecodeRow, Qwen36PrefillBatchWorkspace, Qwen36PrefillRow, Qwen36TextModel,
 };
-use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

@@ -1,5 +1,5 @@
-use infer::bitnet::{BitNetModel, BitNetPrefillWorkspace};
-use infer::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
+use eider_inference::bitnet::{BitNetModel, BitNetPrefillWorkspace};
+use eider_inference::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

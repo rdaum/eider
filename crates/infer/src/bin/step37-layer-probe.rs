@@ -1,7 +1,7 @@
 //! Compare representative Step-3.7 layers with the Python reference.
 
 use eider_cuda::Result;
-use infer::step37_probe::validate_reference_layers;
+use eider_inference::step37_probe::validate_reference_layers;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

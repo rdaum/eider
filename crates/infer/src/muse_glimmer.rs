@@ -11,7 +11,7 @@ use eider_cuda::{
     Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_into_on_stream, argmax_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_f32_rows_into_columns_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream,
+    rope_neox_f32_into_on_stream, round_f32_to_bf16_in_place_on_stream, set_cuda_device,
     sigmoid_mul_f32_into_on_stream, silu_mul_f32_into_on_stream,
 };
 use seqcache::RetainedSnapshot;
@@ -1092,6 +1092,7 @@ pub struct MuseGlimmerNextToken {
 impl MuseGlimmerModel {
     /// Loads the checkpoint's complete text backbone into resident storage.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        set_cuda_device(0)?;
         let checkpoint = MuseGlimmerCheckpoint::open(model_dir)?;
         let config = checkpoint.config.clone();
         let lt = CublasLt::new()?;

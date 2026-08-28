@@ -1,7 +1,7 @@
 //! Prepare and inspect DeepSeek V4 routed-expert and thin-checkpoint artifacts.
 
 use eider_cuda::{Error, Result};
-use infer::deepseek4::{
+use eider_inference::deepseek4::{
     finalise_thin_checkpoint, inspect_expert_artifacts, inspect_hot_expert_cache,
     inspect_nvfp4_expert_layer, inspect_nvfp4_expert_store, inspect_nvfp4_mtp_layer,
     inspect_thin_checkpoint, inspect_thin_checkpoint_shard, preflight_expert_artifacts,

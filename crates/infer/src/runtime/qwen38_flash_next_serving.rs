@@ -1,7 +1,5 @@
 //! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
-use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use crate::qwen38_flash_next::{
     Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionState, Qwen38FlashNextModel,
     Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot,
@@ -13,7 +11,9 @@ use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKE
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};

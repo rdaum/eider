@@ -1,9 +1,11 @@
 use eider_cuda::CudaStream;
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36Bf16StorageConfig, Qwen36DecodeBatchTrace, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36TextModel,
 };
-use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

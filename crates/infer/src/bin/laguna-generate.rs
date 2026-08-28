@@ -1,8 +1,8 @@
 //! Minimal Laguna load and greedy-decode probe.
 
 use eider_cuda::{CudaStream, Error, Result};
-use infer::laguna::LagunaModel;
-use infer::laguna::{LagunaSequence, new_laguna_sequence_cache};
+use eider_inference::laguna::LagunaModel;
+use eider_inference::laguna::{LagunaSequence, new_laguna_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;

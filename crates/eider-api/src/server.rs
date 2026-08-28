@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use infer::metrics::metrics as infer_metrics;
+use eider_inference::metrics::metrics as infer_metrics;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::future::Future;

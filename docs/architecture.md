@@ -39,6 +39,17 @@ It also owns sequence-cache retention policy; models provide the page geometry
 when that policy selects a reusable prompt prefix.
 Checkpoint chat rendering, structured output decoding, and Qwen XML tool
 grammar now also live in `eider-runtime` with no CUDA dependency.
+Generic scheduler limits, request generation policy, lifecycle events, and
+API-facing chat request and usage records now also live in `eider-runtime`.
+Checkpoint-derived generation defaults, including tokenizer EOS resolution and
+chat-template defaults, now live there as well.
+The model-specific schedulers remain in `eider-inference`; they own their
+model state and invoke the runtime policy types directly.
+The former `infer` package is now named `eider-inference`; its source directory
+remains `crates/infer` during the migration.
+Model loading now selects its CUDA device inside `eider-inference`; the API
+actor has no CUDA resource import and receives inference-boundary errors.
+The `eider-api` package has no direct CUDA dependency.
 
 ## Decision
 

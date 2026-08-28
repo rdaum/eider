@@ -1,7 +1,5 @@
 //! Structured chat serving over the multi-session Step-3.7 scheduler.
 
-use super::scheduler::{RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use super::step37_scheduler::{
     Step37AdmissionProgress, Step37CancelOutcome, Step37PrefillProgress, Step37RequestId,
     Step37Scheduler,
@@ -11,6 +9,10 @@ use eider_cuda::{Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
+use eider_runtime::scheduler::{
+    RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
+};
 use eider_runtime::stop::StopBuffer;
 use std::collections::BTreeMap;
 

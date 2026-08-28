@@ -1,9 +1,12 @@
-//! Inference-facing crate for DGX Spark experiments.
+//! Model loading and inference execution for DGX Spark.
 //!
 //! This crate is intentionally thin while the lower-level CUDA storage and
 //! cuBLASLt path are still being validated. It will own model loading, layer
 //! composition, KV-cache policy, and decode/prefill orchestration. Low-level
 //! FP4 tensor storage and matmul execution live in `eider-cuda`.
+
+mod error;
+pub use error::{InferenceError, InferenceResult};
 
 mod paged_prefill_attention;
 

@@ -1,6 +1,6 @@
 use eider_cuda::CudaStream;
-use infer::step37::{Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel};
-use infer::step37::{Step37Sequence, Step37SequenceCache, new_step37_sequence_cache};
+use eider_inference::step37::{Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel};
+use eider_inference::step37::{Step37Sequence, Step37SequenceCache, new_step37_sequence_cache};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, Throughput, black_box, run_benchmark_main,

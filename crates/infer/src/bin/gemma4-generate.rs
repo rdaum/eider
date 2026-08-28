@@ -1,6 +1,6 @@
 use eider_cuda::{CudaStream, Error, Result};
-use infer::gemma4::Gemma4Model;
-use infer::gemma4::{Gemma4Sequence, new_gemma4_sequence_cache};
+use eider_inference::gemma4::Gemma4Model;
+use eider_inference::gemma4::{Gemma4Sequence, new_gemma4_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

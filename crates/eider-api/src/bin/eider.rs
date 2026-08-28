@@ -72,7 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 eider_api::metrics::metrics().model_preparations.inc();
-                infer::step37::prepare_all_at(&resolved.checkpoint_dir, &resolved.artifact_dir)?;
+                eider_inference::step37::prepare_all_at(
+                    &resolved.checkpoint_dir,
+                    &resolved.artifact_dir,
+                )?;
             }
             info!(
                 identity = %resolved.identity,

@@ -8,8 +8,8 @@ use eider_cuda::{
     CudaGraphExec, CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result,
     add_f32_into_on_stream, add_f32_prefix_into_on_stream, bf16_linear_logits_f32_into_on_stream,
     copy_bf16_row_to_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
-    copy_row_f32_into_on_stream, rms_norm_f32_into_on_stream, silu_mul_f32_into_on_stream,
-    silu_mul_f32_prefix_into_on_stream,
+    copy_row_f32_into_on_stream, rms_norm_f32_into_on_stream, set_cuda_device,
+    silu_mul_f32_into_on_stream, silu_mul_f32_prefix_into_on_stream,
 };
 use std::path::Path;
 
@@ -403,6 +403,7 @@ pub struct Ling3PrefillWorkspace {
 
 impl Ling3Model {
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        set_cuda_device(0)?;
         let manifest = Ling3Manifest::load(&model_dir)?;
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let embedding = DeviceBuffer::from_host(&load_bf16_host(

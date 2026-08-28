@@ -1,5 +1,7 @@
 use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint, PagedBf16ReadStats};
-use infer::qwen38_flash_next::{Qwen38FlashNextConfig, Qwen38PagedPle, Qwen38PleTokenWindow};
+use eider_inference::qwen38_flash_next::{
+    Qwen38FlashNextConfig, Qwen38PagedPle, Qwen38PleTokenWindow,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,

@@ -1,5 +1,5 @@
 use eider_cuda::{Error, Result};
-use infer::ling3::{Ling3FfnKind, Ling3Manifest};
+use eider_inference::ling3::{Ling3FfnKind, Ling3Manifest};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

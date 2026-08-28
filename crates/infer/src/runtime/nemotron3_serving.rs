@@ -1,7 +1,5 @@
 //! Structured multi-session chat serving for Nemotron 3.
 
-use super::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
-use super::serving::{ChatFinishReason, ChatRequest, ChatUsage};
 use crate::nemotron3::{
     Nemotron3BlockWorkspace, Nemotron3CacheContext, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3Sequence, Nemotron3SequenceCache, Nemotron3SpeculativeCycleWorkspace,
@@ -12,7 +10,9 @@ use eider_cuda::{DeviceBuffer, Error, Result};
 use eider_runtime::cache::SequenceCacheConfig;
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
+use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
 use eider_runtime::stop::StopBuffer;
 use seqcache::{AdmissionOutcome, AdmissionRequest};
 use std::collections::{BTreeMap, VecDeque};

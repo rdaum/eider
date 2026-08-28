@@ -1,5 +1,7 @@
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result, synchronize_device};
-use infer::qwen3::qwen36::{Qwen36FullAttentionState, Qwen36LinearAttentionState, Qwen36Model};
+use eider_inference::qwen3::qwen36::{
+    Qwen36FullAttentionState, Qwen36LinearAttentionState, Qwen36Model,
+};
 use std::env;
 use std::path::PathBuf;
 

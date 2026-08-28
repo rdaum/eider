@@ -5,10 +5,10 @@ use eider_runtime::chat::{
     ChatToolCall,
 };
 use eider_runtime::chat_output::ChatOutputEvent;
+use eider_runtime::generation::GenerationConfig;
+use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::SamplingConfig;
-use infer::runtime::generation::GenerationConfig;
-use infer::runtime::scheduler::RequestConfig;
-use infer::runtime::serving::{ChatFinishReason, ChatRequest, ChatUsage};
+use eider_runtime::scheduler::RequestConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;

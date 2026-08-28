@@ -1,8 +1,8 @@
-use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
-use infer::muse_glimmer::{
+use eider_inference::muse_glimmer::{
     MuseGlimmerModel, MuseGlimmerSequence, MuseGlimmerSequenceCache,
     new_muse_glimmer_sequence_cache,
 };
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, Throughput, black_box, run_benchmark_main,

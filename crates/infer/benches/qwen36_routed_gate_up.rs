@@ -2,7 +2,7 @@ use eider_cuda::{
     CudaEvent, CudaStream, DeviceBuffer, GpuCounterCollector, Result,
     round_f32_to_bf16_into_on_stream,
 };
-use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36LayerBlockWorkspace, Qwen36Model};
+use eider_inference::qwen3::qwen36::{Qwen36LayerBlock, Qwen36LayerBlockWorkspace, Qwen36Model};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, DiagnosticError, DiagnosticResult, MeasurementBackend, MeasurementDomain,

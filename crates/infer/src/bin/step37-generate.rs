@@ -1,10 +1,10 @@
 //! Decode throughput probe for Step-3.7-Flash.
 
 use eider_cuda::{CudaStream, Error, Result};
-use infer::step37::{
+use eider_inference::step37::{
     Step37Bf16Storage, Step37Bf16StorageConfig, Step37PagingStats, Step37TextModel,
 };
-use infer::step37::{Step37Sequence, new_step37_sequence_cache};
+use eider_inference::step37::{Step37Sequence, new_step37_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 

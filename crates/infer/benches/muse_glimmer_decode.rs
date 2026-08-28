@@ -1,4 +1,4 @@
-use infer::muse_glimmer::{
+use eider_inference::muse_glimmer::{
     MuseGlimmerModel, MuseGlimmerSequence, MuseGlimmerSequenceCache,
     new_muse_glimmer_sequence_cache,
 };

@@ -8,7 +8,7 @@ use eider_cuda::{
     TernaryG64ActivationWorkspace, TernaryG64Matrix, TernaryG64PackedLinear,
     add_f32_into_on_stream, argmax_f32_into_on_stream, copy_row_f32_into_on_stream,
     rms_norm_f32_into_on_stream, rope_neox_inv_freq_scaled_sequence_f32_into_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
+    set_cuda_device, silu_mul_halves_f32_batch_into_on_stream, split_qkv_f32_batch_into_on_stream,
 };
 use eider_format::{Error as FormatError, GgufIndex, GgufValue};
 use seqcache::AppendPages;
@@ -266,6 +266,7 @@ impl BonsaiModel {
         gguf_path: &Path,
         prefill_mode: BonsaiPrefillMode,
     ) -> Result<Self> {
+        set_cuda_device(0)?;
         let index = GgufIndex::open(gguf_path).map_err(format_error)?;
         let config = BonsaiConfig::from_index(&index)?;
         let embeddings = load_q2_matrix(&index, "token_embd.weight", config.vocab, config.hidden)?;

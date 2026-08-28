@@ -1,8 +1,8 @@
 //! Minimal Muse Glimmer load and greedy-decode probe.
 
 use eider_cuda::{Error, Result};
-use infer::muse_glimmer::MuseGlimmerModel;
-use infer::muse_glimmer::{MuseGlimmerSequence, new_muse_glimmer_sequence_cache};
+use eider_inference::muse_glimmer::MuseGlimmerModel;
+use eider_inference::muse_glimmer::{MuseGlimmerSequence, new_muse_glimmer_sequence_cache};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokenizers::Tokenizer;

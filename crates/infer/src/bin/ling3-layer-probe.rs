@@ -2,7 +2,7 @@
 
 use eider_cuda::{CudaStream, DeviceBuffer, Error, ModelOptCheckpoint, Result};
 use eider_format::SafeTensorShard;
-use infer::ling3::{Ling3KdaDenseLayer, Ling3Manifest};
+use eider_inference::ling3::{Ling3KdaDenseLayer, Ling3Manifest};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

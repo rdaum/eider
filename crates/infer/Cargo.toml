@@ -1,5 +1,5 @@
 [package]
-name = "infer"
+name = "eider-inference"
 version.workspace = true
 edition.workspace = true
 

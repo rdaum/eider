@@ -1,6 +1,6 @@
 use eider_cuda::{CudaStream, Error, Result};
-use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
-use infer::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
+use eider_inference::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 
@@ -40,8 +40,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn ffn_label(ffn: infer::qwen3::infer::QwenFfnConfig) -> String {
-    use infer::qwen3::infer::QwenFfnConfig;
+fn ffn_label(ffn: eider_inference::qwen3::infer::QwenFfnConfig) -> String {
+    use eider_inference::qwen3::infer::QwenFfnConfig;
     match ffn {
         QwenFfnConfig::Dense => "dense".to_string(),
         QwenFfnConfig::Moe {

@@ -1,9 +1,11 @@
 use eider_cuda::{Error, Result};
-use infer::nemotron3::{
+use eider_inference::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3StorageConfig,
 };
-use infer::nemotron3::{Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache};
+use eider_inference::nemotron3::{
+    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
+};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

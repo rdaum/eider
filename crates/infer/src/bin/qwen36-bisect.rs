@@ -4,7 +4,7 @@ use eider_cuda::{
     cached_gqa_attention_f32_into_on_stream, format, nvfp4_w4a16_matvec_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36Attention, Qwen36AttentionWorkspace, Qwen36LayerBlock, Qwen36Model,
 };
 use std::env;
@@ -567,7 +567,8 @@ fn main() -> Result<()> {
     let (gpu_q_proj, gpu_q_rope, gpu_attn, gpu_gated, gpu_out) = match &block3.attention {
         Qwen36Attention::FullAttention(weights) => {
             let mut workspace = model.full_attention_workspace(weights, 8)?;
-            let mut state = infer::qwen3::qwen36::Qwen36FullAttentionState::new(&manifest, 8)?;
+            let mut state =
+                eider_inference::qwen3::qwen36::Qwen36FullAttentionState::new(&manifest, 8)?;
             let step = weights.run_one_token(
                 &mut workspace,
                 &mut state,
@@ -681,7 +682,7 @@ fn main() -> Result<()> {
 
 fn seq_full_attn_bisect(
     model: &Qwen36Model,
-    manifest: &infer::qwen3::infer::QwenModelManifest,
+    manifest: &eider_inference::qwen3::infer::QwenModelManifest,
     checkpoint: &ModelOptCheckpoint,
     target_layer: usize,
 ) -> Result<()> {
@@ -786,8 +787,12 @@ fn seq_full_attn_bisect(
                 weights.prepare_qkv_one_token(
                     ws,
                     match &states[target_layer].attention {
-                        infer::qwen3::qwen36::Qwen36AttentionState::FullAttention(state) => state,
-                        infer::qwen3::qwen36::Qwen36AttentionState::LinearAttention(_) => {
+                        eider_inference::qwen3::qwen36::Qwen36AttentionState::FullAttention(
+                            state,
+                        ) => state,
+                        eider_inference::qwen3::qwen36::Qwen36AttentionState::LinearAttention(
+                            _,
+                        ) => {
                             unreachable!("target layer should be full attention")
                         }
                     },

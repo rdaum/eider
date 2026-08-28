@@ -1,5 +1,5 @@
 use eider_cuda::CudaEvent;
-use infer::qwen38_flash_next::benchmark::{
+use eider_inference::qwen38_flash_next::benchmark::{
     Qwen38HyperPrefillMicrobench, Qwen38QsaPrefillMicrobench,
 };
 use micromeasure::{

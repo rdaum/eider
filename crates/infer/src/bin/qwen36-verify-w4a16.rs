@@ -2,8 +2,10 @@ use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, ModelOptCheckpoint, Result, format,
     nvfp4_w4a16_matvec_f32_into_on_stream, rms_norm_f32_into_on_stream,
 };
-use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
-use infer::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{
+    Qwen36DecodeRow, Qwen36LayerBlock, Qwen36Model, Qwen36TextModel,
+};
+use eider_inference::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 

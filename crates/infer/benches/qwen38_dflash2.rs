@@ -1,9 +1,10 @@
-use eider_runtime::cache::SequenceCacheConfig;
-use eider_runtime::sampling::SamplingConfig;
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage, Qwen36TextModel,
 };
-use infer::runtime::scheduler::{Qwen36Scheduler, RequestConfig, RequestState, SchedulerConfig};
+use eider_inference::runtime::scheduler::{Qwen36RequestId, Qwen36Scheduler};
+use eider_runtime::cache::SequenceCacheConfig;
+use eider_runtime::sampling::SamplingConfig;
+use eider_runtime::scheduler::{RequestConfig, RequestState, SchedulerConfig};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -21,7 +22,7 @@ const SEED_TOKEN: u32 = 9_707;
 
 struct DFlash2Case {
     scheduler: Qwen36Scheduler<'static>,
-    request: infer::runtime::scheduler::Qwen36RequestId,
+    request: Qwen36RequestId,
     emitted_tokens: usize,
     accepted_drafts: usize,
 }

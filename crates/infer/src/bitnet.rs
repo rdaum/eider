@@ -9,7 +9,7 @@ use eider_cuda::{
     bf16_linear_logits_f32_into_on_stream, copy_bf16_row_to_f32_indexed_into_on_stream,
     copy_bf16_rows_to_f32_indexed_into_on_stream, copy_row_f32_into_on_stream,
     relu_squared_mul_halves_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    rope_neox_f32_indexed_into_on_stream, rope_neox_sequence_f32_into_on_stream, set_cuda_device,
     split_qkv_f32_batch_into_on_stream, split_qkv_f32_into_on_stream,
 };
 use seqcache::AppendPages;
@@ -234,6 +234,7 @@ pub struct BitNetPrefillWorkspace {
 impl BitNetModel {
     /// Loads the official offline-packed BitNet checkpoint into GPU memory.
     pub fn load(model_dir: &Path) -> Result<Self> {
+        set_cuda_device(0)?;
         let config = BitNetConfig::load(model_dir)?;
         let checkpoint = ModelOptCheckpoint::open(model_dir)?;
         let embeddings = read_bf16_matrix(

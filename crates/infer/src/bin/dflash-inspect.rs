@@ -1,7 +1,7 @@
 //! Inspect an official DFlash GGUF without loading tensor payloads.
 
 use eider_cuda::{Error, Result};
-use infer::muse_glimmer::DFlashConfig;
+use eider_inference::muse_glimmer::DFlashConfig;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

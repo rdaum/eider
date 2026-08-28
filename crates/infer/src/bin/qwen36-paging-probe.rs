@@ -1,5 +1,5 @@
 use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
-use infer::qwen3::qwen36::{Qwen36ExpertPager, Qwen36LayerBlock, Qwen36Model};
+use eider_inference::qwen3::qwen36::{Qwen36ExpertPager, Qwen36LayerBlock, Qwen36Model};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

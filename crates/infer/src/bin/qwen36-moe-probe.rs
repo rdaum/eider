@@ -1,5 +1,5 @@
 use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
-use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
+use eider_inference::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model, Qwen36TextModel};
 use std::env;
 use std::path::PathBuf;
 

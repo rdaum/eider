@@ -1,5 +1,5 @@
 use eider_cuda::{CudaStream, DeviceBuffer, ModelOptCheckpoint};
-use infer::nemotron3::{Nemotron3Manifest, Nemotron3MoeLayer};
+use eider_inference::nemotron3::{Nemotron3Manifest, Nemotron3MoeLayer};
 use std::path::PathBuf;
 
 fn main() -> eider_cuda::Result<()> {

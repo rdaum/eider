@@ -1,6 +1,6 @@
 use eider_cuda::{CudaStream, Error, Result};
-use infer::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
-use infer::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{Qwen36DecodeRow, Qwen36TextModel};
+use eider_inference::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::PathBuf;
 

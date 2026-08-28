@@ -2,17 +2,17 @@ use eider_cuda::{
     CudaStream, Error, GpuCounterCollector, GpuCounterMetric, Result, SM12X_KV_PAGE_TOKENS,
     device_memory_info,
 };
-use fast_telemetry::{Counter, ExportMetrics, Histogram};
-use infer::qwen3::infer::{
+use eider_inference::qwen3::infer::{
     Qwen3Model, QwenArchitecture, QwenDecodeProfile, QwenModelManifest, QwenRuntimeCounters,
     runtime_counters,
 };
-use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::layer0::DEFAULT_MODEL_DIR;
+use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8Storage,
     Qwen36GpuCounterProbe, Qwen36GpuCounterStage, Qwen36Model, Qwen36PrefillRow, Qwen36TextModel,
 };
-use infer::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use fast_telemetry::{Counter, ExportMetrics, Histogram};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -329,7 +329,7 @@ impl BenchModel {
         }
     }
 
-    fn expert_paging_stats(&self) -> Option<infer::qwen3::qwen36::Qwen36PagingStats> {
+    fn expert_paging_stats(&self) -> Option<eider_inference::qwen3::qwen36::Qwen36PagingStats> {
         match self {
             Self::Qwen3(_) => None,
             Self::Qwen36(model) => model.expert_paging_stats(),
@@ -957,8 +957,8 @@ fn tokens_per_second(tokens: usize, ms: f64) -> f64 {
 
 fn print_paging_delta(
     label: &str,
-    before: Option<infer::qwen3::qwen36::Qwen36PagingStats>,
-    after: Option<infer::qwen3::qwen36::Qwen36PagingStats>,
+    before: Option<eider_inference::qwen3::qwen36::Qwen36PagingStats>,
+    after: Option<eider_inference::qwen3::qwen36::Qwen36PagingStats>,
 ) {
     let (Some(before), Some(after)) = (before, after) else {
         return;

@@ -1,5 +1,5 @@
 use eider_cuda::{CublasLt, CudaStream, DeviceBuffer, Result};
-use infer::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model};
+use eider_inference::qwen3::qwen36::{Qwen36LayerBlock, Qwen36Model};
 use std::env;
 use std::path::PathBuf;
 
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             .layer_kinds
             .get(layer)
             .copied()
-            .unwrap_or(infer::qwen3::infer::QwenLayerKind::LinearAttention);
+            .unwrap_or(eider_inference::qwen3::infer::QwenLayerKind::LinearAttention);
         if layer == 0 {
             let attn_resid = ws.attn_residual.copy_to_host(&stream)?;
             let hidden_h = current.copy_to_host(&stream)?;
@@ -65,8 +65,9 @@ fn main() -> Result<()> {
                 attn_out[0],
                 attn_out.iter().fold(0.0f32, |m, x| m.max(x.abs()))
             );
-            if let infer::qwen3::qwen36::Qwen36AttentionWorkspace::LinearAttention(la_ws) =
-                &ws.attention
+            if let eider_inference::qwen3::qwen36::Qwen36AttentionWorkspace::LinearAttention(
+                la_ws,
+            ) = &ws.attention
             {
                 let gdn = la_ws.gdn_output.copy_to_host(&stream)?;
                 let normed = la_ws.normed.copy_to_host(&stream)?;

@@ -1,6 +1,6 @@
 use eider_cuda::{Error, Result};
-use infer::bitnet::BitNetModel;
-use infer::bitnet::{BitNetSequence, new_bitnet_sequence_cache};
+use eider_inference::bitnet::BitNetModel;
+use eider_inference::bitnet::{BitNetSequence, new_bitnet_sequence_cache};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

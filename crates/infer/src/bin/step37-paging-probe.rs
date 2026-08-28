@@ -1,8 +1,8 @@
 //! Measure direct reads from the Step-3.7 prepared expert cache.
 
 use eider_cuda::Result;
-use infer::runtime::expert_cache::{ExpertSlotCache, read_expert_misses};
-use infer::step37::{
+use eider_inference::runtime::expert_cache::{ExpertSlotCache, read_expert_misses};
+use eider_inference::step37::{
     EXPERTS, FIRST_MOE_LAYER, GATE_UP, HIDDEN, INTERMEDIATE, Step37ExpertRecordSource,
 };
 use std::path::PathBuf;

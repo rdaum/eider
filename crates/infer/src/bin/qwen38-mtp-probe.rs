@@ -12,12 +12,14 @@
 //! prompt in separate passes.
 
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
-use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeBatchWorkspace, Qwen36DecodeRow,
     Qwen36Fp8Storage, Qwen36PrefillRow, Qwen36TextModel,
 };
-use infer::qwen3::qwen36::{Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{
+    Qwen36Sequence, Qwen36SequenceCache, new_qwen36_sequence_cache,
+};
+use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
 use std::env;
 use std::path::{Path, PathBuf};
 

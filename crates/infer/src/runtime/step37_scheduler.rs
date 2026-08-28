@@ -1,8 +1,5 @@
 //! Multi-session scheduling for the paged Step-3.7 runtime.
 
-use super::scheduler::{
-    RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
-};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
 use crate::step37::{
     HEAD_DIM, KV_HEADS, Step37PrefillBatchWorkspace, Step37PrefillRow, Step37TextModel,
@@ -11,6 +8,9 @@ use crate::step37::{Step37Sequence, Step37SequenceCache, step37_cache_error};
 use eider_cuda::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::scheduler::{
+    RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
+};
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheConfig, PageBackend};
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;

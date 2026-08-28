@@ -9,11 +9,11 @@
 //! first divergence, if any.
 
 use eider_cuda::{CudaStream, DeviceBuffer, Error, Result};
-use infer::qwen3::qwen36::{
+use eider_inference::qwen3::qwen36::{
     Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36DecodeRow, Qwen36Fp8Storage,
     Qwen36PrefillRow, Qwen36SpeculativeFrontier, Qwen36TextModel,
 };
-use infer::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
+use eider_inference::qwen3::qwen36::{Qwen36Sequence, new_qwen36_sequence_cache};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

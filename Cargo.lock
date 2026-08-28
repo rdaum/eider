@@ -844,18 +844,18 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "eider-api"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "clap",
- "eider-cuda",
  "eider-format",
+ "eider-inference",
  "eider-runtime",
  "fast-telemetry",
  "fast-telemetry-export",
  "fs2",
  "futures",
  "hf-hub",
- "infer",
  "serde",
  "serde_json",
  "tokio",
@@ -879,6 +879,32 @@ name = "eider-format"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "eider-inference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eider-cuda",
+ "eider-format",
+ "eider-runtime",
+ "fast-telemetry",
+ "fs2",
+ "libc",
+ "llguidance",
+ "micromeasure",
+ "minijinja",
+ "minijinja-contrib",
+ "rand 0.9.5",
+ "rayon",
+ "seqcache",
+ "serde",
+ "serde_json",
+ "tokenizers 0.22.2",
+ "toktrie_hf_tokenizers",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1583,32 +1609,6 @@ dependencies = [
  "unicode-width",
  "unit-prefix",
  "web-time",
-]
-
-[[package]]
-name = "infer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eider-cuda",
- "eider-format",
- "eider-runtime",
- "fast-telemetry",
- "fs2",
- "libc",
- "llguidance",
- "micromeasure",
- "minijinja",
- "minijinja-contrib",
- "rand 0.9.5",
- "rayon",
- "seqcache",
- "serde",
- "serde_json",
- "tokenizers 0.22.2",
- "toktrie_hf_tokenizers",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

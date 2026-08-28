@@ -1,8 +1,10 @@
-use infer::nemotron3::{
+use eider_inference::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3Model, Nemotron3MtpWorkspace,
     Nemotron3SpeculativeCycleWorkspace, Nemotron3StorageConfig,
 };
-use infer::nemotron3::{Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache};
+use eider_inference::nemotron3::{
+    Nemotron3Sequence, Nemotron3SequenceCache, new_nemotron3_sequence_cache,
+};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -30,10 +32,10 @@ struct SpeculativeCase {
     mode: Mode,
     target_sequence: Nemotron3Sequence,
     target_cache: Nemotron3SequenceCache,
-    target_workspace: infer::nemotron3::Nemotron3BlockWorkspace,
+    target_workspace: eider_inference::nemotron3::Nemotron3BlockWorkspace,
     mtp_sequence: Nemotron3Sequence,
     _mtp_cache: Nemotron3SequenceCache,
-    mtp_target_workspace: infer::nemotron3::Nemotron3BlockWorkspace,
+    mtp_target_workspace: eider_inference::nemotron3::Nemotron3BlockWorkspace,
     mtp_workspace: Nemotron3MtpWorkspace,
     cycle_workspace: Option<Nemotron3SpeculativeCycleWorkspace>,
     cycle_input: u32,

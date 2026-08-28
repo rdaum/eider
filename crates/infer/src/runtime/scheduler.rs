@@ -10,10 +10,13 @@ use crate::qwen3::qwen36::{
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
 use eider_cuda::{DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
-use eider_runtime::sampling::{SampledToken, Sampler, SamplingConfig, TokenHistory};
+use eider_runtime::sampling::{SampledToken, Sampler, TokenHistory};
+use eider_runtime::scheduler::{
+    RequestConfig, RequestFinishReason, RequestLifecycleEvent, RequestState, SchedulerConfig,
+};
 use eider_runtime::tool_grammar::QwenXmlToolGrammar;
 use seqcache::{AdmissionOutcome, AdmissionRequest, CacheError, CacheStats};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -33,120 +36,6 @@ impl Qwen36RequestId {
     pub(crate) fn for_test(value: u64) -> Self {
         Self(value)
     }
-}
-
-/// Request lifecycle visible to a serving frontend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestState {
-    /// Accepted on the CPU but not yet allocated persistent GPU state.
-    Waiting,
-    /// Consuming all but the final prompt token into persistent model state.
-    Prefilling,
-    /// Producing completion tokens.
-    Decoding,
-    /// Reached EOS or the requested completion length.
-    Finished,
-}
-
-/// Execution and admission limits for one scheduler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SchedulerConfig {
-    /// Maximum independent rows in one latency-sensitive decode batch.
-    pub decode_capacity: usize,
-    /// Maximum independent prompt chunks in one prefill batch.
-    pub prefill_sequence_capacity: usize,
-    /// Maximum total prompt tokens consumed by one prefill batch.
-    pub prefill_token_capacity: usize,
-    /// Maximum requests with allocated persistent GPU state.
-    pub max_active_sequences: usize,
-    /// Maximum prompt plus completion tokens for any request.
-    pub max_context_tokens: usize,
-    /// Draft tokens verified per speculative cycle; zero disables speculation.
-    pub speculative_drafts: usize,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            decode_capacity: 8,
-            prefill_sequence_capacity: 8,
-            prefill_token_capacity: 2_048,
-            max_active_sequences: 8,
-            max_context_tokens: 32_768,
-            speculative_drafts: 0,
-        }
-    }
-}
-
-impl SchedulerConfig {
-    pub(crate) fn validate(self) -> Result<()> {
-        if self.decode_capacity == 0
-            || self.prefill_sequence_capacity == 0
-            || self.prefill_token_capacity == 0
-            || self.max_active_sequences == 0
-            || self.max_context_tokens == 0
-        {
-            return Err(Error::Shape {
-                label: "scheduler configuration",
-                expected: "all capacities greater than zero".to_string(),
-                actual: format!(
-                    "decode={} prefill_sequences={} prefill_tokens={} active={} context={}",
-                    self.decode_capacity,
-                    self.prefill_sequence_capacity,
-                    self.prefill_token_capacity,
-                    self.max_active_sequences,
-                    self.max_context_tokens
-                ),
-            });
-        }
-        if self.speculative_drafts > MAX_SPECULATIVE_DRAFTS {
-            return Err(Error::Shape {
-                label: "scheduler speculative drafts",
-                expected: format!("at most {MAX_SPECULATIVE_DRAFTS} drafts"),
-                actual: format!("{} drafts", self.speculative_drafts),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Token-level generation policy for a scheduled request.
-#[derive(Clone, Debug)]
-pub struct RequestConfig {
-    /// Token selection policy.
-    pub sampling: SamplingConfig,
-    /// Maximum number of completion tokens.
-    pub max_new_tokens: usize,
-    /// Model token IDs that terminate generation.
-    pub eos_token_ids: BTreeSet<u32>,
-}
-
-impl Default for RequestConfig {
-    fn default() -> Self {
-        Self {
-            sampling: SamplingConfig::default(),
-            max_new_tokens: 64,
-            eos_token_ids: BTreeSet::new(),
-        }
-    }
-}
-
-impl RequestConfig {
-    /// Validates token-selection parameters.
-    pub fn validate(&self) -> Result<()> {
-        Ok(self.sampling.validate()?)
-    }
-}
-
-/// Why a tokenized scheduled request completed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestFinishReason {
-    /// The model selected a configured EOS token.
-    Eos,
-    /// The request reached its completion-token limit.
-    Length,
-    /// A request-scoped tool grammar completed a function call.
-    ToolCalls,
 }
 
 /// One completion token produced by a scheduler tick.
@@ -184,15 +73,6 @@ pub struct Qwen36AdmissionProgress {
     pub cached_prompt_tokens: usize,
     /// Elapsed scheduler-tick time when admission completed.
     pub admitted_after_tick_start: Duration,
-}
-
-/// A lifecycle event emitted at the point where scheduler work begins.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestLifecycleEvent<RequestId, AdmissionProgress> {
-    /// Device-resident sequence state is ready for the request.
-    Admitted(AdmissionProgress),
-    /// The request's next prompt chunk is about to enter the model.
-    PrefillStarted(RequestId),
 }
 
 /// Observable result of one scheduler tick.
@@ -391,6 +271,7 @@ impl<'model> Qwen36Scheduler<'model> {
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
+        validate_speculative_drafts(config)?;
         let execution = Qwen36ExecutionState::new(
             model,
             Qwen36ExecutionConfig {
@@ -1719,6 +1600,17 @@ impl<'model> Qwen36Scheduler<'model> {
     }
 }
 
+fn validate_speculative_drafts(config: SchedulerConfig) -> Result<()> {
+    if config.speculative_drafts > MAX_SPECULATIVE_DRAFTS {
+        return Err(Error::Shape {
+            label: "scheduler speculative drafts",
+            expected: format!("at most {MAX_SPECULATIVE_DRAFTS} drafts"),
+            actual: format!("{} drafts", config.speculative_drafts),
+        });
+    }
+    Ok(())
+}
+
 fn speculative_draft_count(
     configured: usize,
     max_new_tokens: usize,
@@ -1831,6 +1723,7 @@ mod tests {
         MAX_SPECULATIVE_DRAFTS, Qwen36CancelOutcome, Qwen36Scheduler, RequestConfig,
         RequestFinishReason, RequestState, SchedulerConfig, argmax_logits, argmax_logits_allowed,
         ordinary_decode_emission, prefill_chunk_tokens, speculative_draft_count,
+        validate_speculative_drafts,
     };
     use crate::qwen3::qwen36::{
         Qwen36DecodeBatchWorkspace, Qwen36TextModel, decode_capacity_classes,
@@ -1912,7 +1805,7 @@ mod tests {
             speculative_drafts: MAX_SPECULATIVE_DRAFTS + 1,
             ..SchedulerConfig::default()
         };
-        assert!(config.validate().is_err());
+        assert!(validate_speculative_drafts(config).is_err());
     }
 
     #[test]

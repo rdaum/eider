@@ -1,7 +1,7 @@
 use eider_cuda::{Error, Result};
+use eider_inference::qwen3::infer::Qwen3Model;
+use eider_inference::qwen3::layer0::DEFAULT_MODEL_DIR;
 use eider_runtime::sampling::{Sampler, SamplingConfig, TokenHistory};
-use infer::qwen3::infer::Qwen3Model;
-use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::env;

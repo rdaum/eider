@@ -1,6 +1,6 @@
 use eider_cuda::Result;
-use infer::qwen3::infer::Qwen3Model;
-use infer::qwen3::layer0::DEFAULT_MODEL_DIR;
+use eider_inference::qwen3::infer::Qwen3Model;
+use eider_inference::qwen3::layer0::DEFAULT_MODEL_DIR;
 use std::env;
 use std::path::PathBuf;
 

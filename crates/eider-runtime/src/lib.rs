@@ -9,6 +9,9 @@
 pub mod cache;
 pub mod chat;
 pub mod chat_output;
+pub mod generation;
+pub mod request;
 pub mod sampling;
+pub mod scheduler;
 pub mod stop;
 pub mod tool_grammar;

@@ -2,14 +2,16 @@ use clap::{Parser, ValueEnum};
 use eider_api::deployment::{ArtifactKind, resolve_catalogue_model, resolve_local_model};
 use eider_api::metrics::{TokenRateSampler, metrics as server_metrics};
 use eider_api::{ApiConfig, InferenceActor, InferenceActorConfig, serve_with_shutdown};
-use fast_telemetry_export::dogstatsd::DogStatsDConfig;
-use infer::metrics::metrics as infer_metrics;
-use infer::nemotron3::{
+use eider_inference::metrics::metrics as infer_metrics;
+use eider_inference::nemotron3::{
     Nemotron3Bf16Storage, Nemotron3Fp8Storage, Nemotron3KvCacheStorage, Nemotron3StorageConfig,
 };
-use infer::qwen3::qwen36::{Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage};
-use infer::runtime::scheduler::SchedulerConfig;
-use infer::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
+use eider_inference::qwen3::qwen36::{
+    Qwen36Bf16Storage, Qwen36Bf16StorageConfig, Qwen36Fp8Storage,
+};
+use eider_inference::step37::{Step37Bf16Storage, Step37Bf16StorageConfig};
+use eider_runtime::scheduler::SchedulerConfig;
+use fast_telemetry_export::dogstatsd::DogStatsDConfig;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -306,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if resolved.preparation == ArtifactKind::Step37Experts {
         server_metrics().model_preparations.inc();
         info!(artifact_dir = %resolved.artifact_dir.display(), "preparing Step-3.7 expert artifacts");
-        infer::step37::prepare_all_at(&resolved.checkpoint_dir, &resolved.artifact_dir)?;
+        eider_inference::step37::prepare_all_at(&resolved.checkpoint_dir, &resolved.artifact_dir)?;
     }
     let defaults = resolved.defaults;
     let served_model_name = args
@@ -456,7 +458,7 @@ fn start_dogstatsd_export(endpoint: String, interval_secs: u64) -> CancellationT
     let mut token_rate_sampler = new_token_rate_sampler();
     tokio::spawn(async move {
         let mut server_state = eider_api::metrics::ServerMetricsDogStatsDState::new();
-        let mut infer_state = infer::metrics::InferMetricsDogStatsDState::new();
+        let mut infer_state = eider_inference::metrics::InferMetricsDogStatsDState::new();
         fast_telemetry_export::dogstatsd::run(config, cancel_clone, move |output| {
             sample_token_rates(&mut token_rate_sampler);
             server_metrics().export_dogstatsd_delta(output, &[], &mut server_state);
