@@ -2,9 +2,14 @@
 
 use crate::bitnet::{BitNetModel, BitNetPrefillWorkspace, BitNetSequenceId, BitNetSequencePool};
 use crate::bitnet::{BitNetSequence, BitNetSequenceCache, new_bitnet_sequence_cache};
+use crate::{InferenceError, InferenceResult};
 use eider_cuda::{Error, Result};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::engine::{
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineFinished,
+    EngineLifecycleEvent, EnginePrefillProgress, EngineService, EngineTick,
+};
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
 use eider_runtime::scheduler::{RequestConfig, RequestLifecycleEvent, SchedulerConfig};
@@ -497,6 +502,126 @@ impl<'model, 'template> BitNetChatService<'model, 'template> {
             released_sequence_device_bytes: released,
         });
         Ok(())
+    }
+}
+
+/// Model-specific identity translation for the shared engine contract.
+///
+/// The serving actor sees only numeric request identities and runtime-owned
+/// lifecycle records. BitNet sequence identities remain internal to inference.
+pub struct BitNetEngineService<'model, 'template> {
+    inner: BitNetChatService<'model, 'template>,
+    ids: BTreeMap<u64, BitNetRequestId>,
+}
+
+impl<'model, 'template> BitNetEngineService<'model, 'template> {
+    /// Wraps a BitNet chat service for consumption by an engine actor.
+    pub fn new(inner: BitNetChatService<'model, 'template>) -> Self {
+        Self {
+            inner,
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl EngineService for BitNetEngineService<'_, '_> {
+    type Error = InferenceError;
+
+    fn add_request(&mut self, request: ChatRequest) -> InferenceResult<EngineAdmission> {
+        let admission = self.inner.add_request(request)?;
+        let id = admission.request_id.get();
+        self.ids.insert(id, admission.request_id);
+        Ok(EngineAdmission {
+            request_id: id,
+            prompt_tokens: admission.prompt_tokens,
+            max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        on_lifecycle: &mut dyn FnMut(EngineLifecycleEvent),
+    ) -> InferenceResult<EngineTick> {
+        let mut observer =
+            |event: RequestLifecycleEvent<BitNetRequestId, BitNetAdmissionProgress>| match event {
+                RequestLifecycleEvent::Admitted(progress) => {
+                    on_lifecycle(EngineLifecycleEvent::Admitted(EngineAdmissionProgress {
+                        request_id: progress.request_id.get(),
+                        sequence_device_bytes: progress.sequence_device_bytes,
+                        cached_prompt_tokens: progress.cached_prompt_tokens,
+                        allocation_duration: Duration::ZERO,
+                        checkpoint_copy_duration: Duration::ZERO,
+                        admitted_after_tick_start: progress.admitted_after_tick_start,
+                    }));
+                }
+                RequestLifecycleEvent::PrefillStarted(id) => {
+                    on_lifecycle(EngineLifecycleEvent::PrefillStarted(id.get()));
+                }
+            };
+        let tick = self.inner.tick_with_lifecycle(&mut observer)?;
+        let finished_ids = tick
+            .finished
+            .iter()
+            .map(|finished| finished.request_id.get())
+            .collect::<Vec<_>>();
+        let converted = EngineTick {
+            prefilled: tick
+                .prefilled
+                .into_iter()
+                .map(|progress| EnginePrefillProgress {
+                    request_id: progress.request_id.get(),
+                    prompt_position: progress.prompt_position,
+                })
+                .collect(),
+            generated: tick
+                .generated
+                .into_iter()
+                .map(BitNetRequestId::get)
+                .collect(),
+            speculative: Vec::new(),
+            dflash: Vec::new(),
+            output: tick
+                .output
+                .into_iter()
+                .map(|delta| EngineDelta {
+                    request_id: delta.request_id.get(),
+                    event: delta.event,
+                })
+                .collect(),
+            finished: tick
+                .finished
+                .into_iter()
+                .map(|finished| EngineFinished {
+                    request_id: finished.request_id.get(),
+                    finish_reason: finished.finish_reason,
+                    usage: finished.usage,
+                    released_sequence_device_bytes: finished.released_sequence_device_bytes,
+                })
+                .collect(),
+            active_sequences: tick.active_sequences,
+        };
+        for id in finished_ids {
+            self.ids.remove(&id);
+        }
+        Ok(converted)
+    }
+
+    fn cancel_request(&mut self, id: u64) -> EngineCancelOutcome {
+        let Some(inner_id) = self.ids.remove(&id) else {
+            return EngineCancelOutcome::NotFound;
+        };
+        match self.inner.cancel_request(inner_id) {
+            BitNetCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            } => EngineCancelOutcome::Cancelled {
+                released_sequence_device_bytes,
+            },
+            BitNetCancelOutcome::NotFound => EngineCancelOutcome::NotFound,
+        }
+    }
+
+    fn active_sequence_count(&self) -> usize {
+        self.inner.active_sequence_count()
     }
 }
 
