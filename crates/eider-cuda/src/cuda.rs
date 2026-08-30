@@ -1,10 +1,10 @@
 //! CUDA runtime helpers and device-buffer ownership.
 
+use crate::deferred::{CompletionStatus, CudaBackend, InFlight, Recording};
 use crate::error::{Error, Result};
 use crate::ffi;
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 use std::mem::size_of;
 use std::ops::{Deref, Range};
 use std::ptr::null_mut;
@@ -125,13 +125,18 @@ pub struct HostRead<'a, T> {
     _device: PhantomData<&'a DeviceBuffer<T>>,
 }
 
+struct PendingHostReadResources<'a, T> {
+    _device: &'a DeviceBuffer<T>,
+    output: &'a mut PinnedHostBuffer<T>,
+}
+
 /// An asynchronous device-to-host copy into pinned memory.
 ///
-/// This value retains the source allocation and the mutable pinned destination
-/// until the copy completes. Call [`Self::wait`] before reading the destination.
-/// Dropping a pending copy synchronizes its stream. The process aborts if that
-/// synchronisation fails, because Rust cannot safely release the destination
-/// while CUDA might still write to it.
+/// This value retains the source allocation and mutable pinned destination
+/// until CUDA completes. Polling does not release either loan. [`Self::wait`]
+/// returns the reusable destination. Dropping an unfinished copy waits first.
+/// The process aborts if completion cannot be established because releasing
+/// the destination could race a CUDA write.
 ///
 /// ```compile_fail
 /// use eider_cuda::{CudaStream, DeviceBuffer, PinnedHostBuffer, Result};
@@ -147,32 +152,30 @@ pub struct HostRead<'a, T> {
 /// }
 /// ```
 pub struct PendingHostRead<'a, T> {
-    _device: &'a DeviceBuffer<T>,
-    output: &'a mut PinnedHostBuffer<T>,
-    stream: &'a CudaStream,
+    submission: Option<InFlight<CudaBackend<'a>, PendingHostReadResources<'a, T>>>,
 }
 
 impl<'a, T> PendingHostRead<'a, T> {
-    /// Waits for the copy and returns the reusable pinned destination.
-    pub fn wait(self) -> Result<&'a mut PinnedHostBuffer<T>> {
-        self.stream.synchronize()?;
-        let pending = ManuallyDrop::new(self);
-        // SAFETY: the stream completed successfully, so CUDA no longer uses
-        // the destination. ManuallyDrop suppresses PendingHostRead::drop while
-        // the mutable loan moves out of the completed transfer.
-        Ok(unsafe {
-            std::ptr::read(&(*(&pending as *const ManuallyDrop<Self> as *const Self)).output)
-        })
+    /// Polls the copy without releasing its resource loans.
+    pub fn poll(&mut self) -> Result<CompletionStatus> {
+        self.submission
+            .as_mut()
+            .expect("pending host read owns its submission")
+            .poll()
     }
-}
 
-impl<T> Drop for PendingHostRead<'_, T> {
-    fn drop(&mut self) {
-        if self.stream.synchronize().is_err() {
-            // Releasing `output` after an unknown CUDA completion state would
-            // permit a host and device data race through a safe API.
-            std::process::abort();
-        }
+    /// Waits for the copy and returns the reusable pinned destination.
+    pub fn wait(mut self) -> Result<&'a mut PinnedHostBuffer<T>> {
+        let mut submission = self
+            .submission
+            .take()
+            .expect("pending host read owns its submission");
+        submission.wait()?;
+        let resources = submission
+            .try_reclaim()
+            .ok()
+            .expect("wait observed host read completion");
+        Ok(resources.output)
     }
 }
 
@@ -893,6 +896,16 @@ impl CudaStream {
         }
     }
 
+    /// Reports whether all currently visible work on this stream completed.
+    pub fn query(&self) -> Result<bool> {
+        let status = unsafe { ffi::cudaStreamQuery(self.stream) };
+        match status {
+            ffi::CUDA_SUCCESS => Ok(true),
+            ffi::CUDA_ERROR_NOT_READY => Ok(false),
+            status => Err(Error::Cuda("cudaStreamQuery", status)),
+        }
+    }
+
     /// Makes this stream wait until `event` has completed.
     pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
         unsafe {
@@ -1286,22 +1299,29 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
                 actual: format!("{len} values"),
             });
         }
-        unsafe {
+        let resources = PendingHostReadResources {
+            _device: self,
+            output,
+        };
+        let mut recording = Recording::new(
+            CudaBackend::new(stream),
+            resources,
+            "device-to-pinned-host copy",
+        )?;
+        recording.record(|pass, resources| unsafe {
             check_cuda(
                 "cudaMemcpyAsync(D2H pinned prefix)",
                 ffi::cudaMemcpyAsync(
-                    output.ptr.cast(),
-                    self.ptr.cast(),
+                    resources.output.ptr.cast(),
+                    resources._device.ptr.cast(),
                     len * size_of::<T>(),
                     ffi::CUDA_MEMCPY_DEVICE_TO_HOST,
-                    stream.as_raw(),
+                    pass.stream().as_raw(),
                 ),
-            )?;
-        }
+            )
+        })?;
         Ok(PendingHostRead {
-            _device: self,
-            output,
-            stream,
+            submission: Some(recording.submit()),
         })
     }
 
@@ -1806,6 +1826,11 @@ mod tests {
         let host = device
             .copy_prefix_to_pinned_on_stream(&mut host, 2, &stream)
             .expect("pinned prefix copy");
+        let mut host = host;
+        assert!(matches!(
+            host.poll().expect("poll pinned prefix copy"),
+            crate::CompletionStatus::Pending | crate::CompletionStatus::Complete
+        ));
         let host = host.wait().expect("pinned prefix copy completion");
 
         assert_eq!(&host.as_slice()[..2], [1, 2]);

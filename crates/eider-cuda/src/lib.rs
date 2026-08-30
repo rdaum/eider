@@ -17,6 +17,7 @@ pub mod format;
 mod bitnet;
 mod cublaslt;
 mod cuda;
+mod deferred;
 mod diagnostics;
 mod error;
 mod expert_slots;
@@ -46,6 +47,11 @@ pub use cuda::{
     DeviceSlice, DeviceSliceMut, HostRead, ModelOptNvfp4, PageableHostBuffer, PagedKv,
     PendingHostRead, PinnedHostBuffer, RowMajor, Sm12xMma, device_memory_info, set_cuda_device,
     synchronize_device,
+};
+pub use deferred::{
+    BoundedExecutionSlots, CompletionStatus, CudaBackend, CudaFence, CudaPass, DeferredBackend,
+    DiscardedRecording, ExecutionSlotStatus, InFlight, InlineBackend, Recording, SlotSubmitError,
+    SubmissionGroupPolicy, SubmissionGrouping,
 };
 pub use diagnostics::gpu_counters::{GpuCounterCollector, GpuCounterMetric};
 pub use diagnostics::smoke::{run_e2m1_oracle_check, run_fp4_ones_smoke, run_fp32_smoke};

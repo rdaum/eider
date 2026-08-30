@@ -21,6 +21,7 @@ pub(crate) type cudaMemcpyKind = i32;
 #[allow(non_camel_case_types)]
 pub(crate) type cudaStreamCaptureMode = i32;
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
+pub(crate) const CUDA_ERROR_NOT_READY: cudaError_t = 600;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: cudaMemcpyKind = 2;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: cudaMemcpyKind = 3;
@@ -3673,6 +3674,7 @@ unsafe extern "C" {
         start: cudaEvent_t,
         end: cudaEvent_t,
     ) -> cudaError_t;
+    pub(crate) fn cudaStreamQuery(stream: cudaStream_t) -> cudaError_t;
 
     pub(crate) fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> cublasStatus_t;
     pub(crate) fn cublasLtDestroy(handle: cublasLtHandle_t) -> cublasStatus_t;

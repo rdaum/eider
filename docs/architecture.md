@@ -8,8 +8,10 @@ boundary described here are implemented. Future model and kernel work must
 preserve them.
 
 The first migration slice is complete. `eider-cuda` now rejects invalid device
-representations, returns a loan for device-to-pinned-host readback, retains
-captured-graph resources, and supplies typed device views. The DFlash2
+representations, returns a deferred owner for device-to-pinned-host readback,
+retains captured-graph resources, and supplies typed device views. The
+deferred backend framework moves command resources through recording,
+in-flight, completion, and reclamation states. The DFlash2
 projection uses those views. Physical SM12x page storage and Qwen sequence
 state have moved out of `execution` without a compatibility module. Qwen now
 keeps persistent streams, workspaces, cache state, and retained DFlash state
@@ -268,13 +270,15 @@ already need this data. The views add no allocation or device work.
 
 ### Streams and asynchronous work
 
-All enqueues use an exclusive `CudaPass` or `&mut CudaStream`. An immutable
-stream reference is only for observation after completion.
+`Recording<CudaBackend, R>` lends an exclusive `CudaPass` together with its
+resources. Submission moves those resources into `InFlight`, which releases
+them only after `poll` or `wait` observes completion. Failed and discarded
+CUDA recordings also retain their resources because CUDA launches are eager.
+`BoundedExecutionSlots` applies the same lifecycle to reusable workspaces.
 
-An execution guard owns a pass and retains all mutable resource loans. The
-guard releases them only after an explicit completion operation. A failed
-operation must also complete or safely cancel outstanding work before it
-releases the resources.
+Existing kernel entry points can still take `&CudaStream` while they migrate
+to `CudaPass`. New deferred operation groups take `CudaPass`; do not add a
+second operation API for the same path.
 
 Pinned host transfers return a pending loan. The loan prevents host access to
 the pinned buffer until `wait` completes. This rule applies to both host-to-
