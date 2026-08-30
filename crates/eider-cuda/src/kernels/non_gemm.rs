@@ -7520,16 +7520,11 @@ impl GpuTokenSampler {
         Ok(results)
     }
 
-    /// Returns the highest-logit candidates for each active row.
-    ///
-    /// Candidates are row-major and sorted by descending logit, with the
-    /// lower token ID first when logits are equal. `output` is reused.
-    pub fn top_k_candidates_into(
+    fn enqueue_top_k(
         &mut self,
         logits: &DeviceBuffer<f32>,
         rows: usize,
         top_k: usize,
-        output: &mut Vec<GpuTopKCandidate>,
         stream: &CudaStream,
     ) -> Result<()> {
         if rows == 0
@@ -7576,6 +7571,22 @@ impl GpuTokenSampler {
                 ),
             )?;
         }
+        Ok(())
+    }
+
+    /// Returns the highest-logit candidates for each active row.
+    ///
+    /// Candidates are row-major and sorted by descending logit, with the
+    /// lower token ID first when logits are equal. `output` is reused.
+    pub fn top_k_candidates_into(
+        &mut self,
+        logits: &DeviceBuffer<f32>,
+        rows: usize,
+        top_k: usize,
+        output: &mut Vec<GpuTopKCandidate>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.enqueue_top_k(logits, rows, top_k, stream)?;
         let active_keys = rows * GPU_SAMPLING_MAX_TOP_K;
         let top_keys = self.top_keys.copy_prefix_to_pinned_on_stream(
             &mut self.host_top_keys,
@@ -7608,6 +7619,202 @@ impl GpuTokenSampler {
             }
         }
         Ok(())
+    }
+}
+
+/// Resident BF16 weights for coherent DFlash2 proposal selection.
+///
+/// The plan consumes hidden rows and unary logits already produced by the
+/// target and leaves `[anchor, proposals..]` in device memory for target
+/// verification. Vocabulary reduction, hidden projection, and transition
+/// scoring remain ordered on the caller's CUDA stream.
+pub struct DFlash2SelectorPlan {
+    vocab: usize,
+    hidden: usize,
+    rank: usize,
+    top_k: usize,
+    hidden_projection: DeviceBuffer<u16>,
+    predecessor_codebook: DeviceBuffer<u16>,
+    successor_codebook: DeviceBuffer<u16>,
+}
+
+/// Reusable device storage for [`DFlash2SelectorPlan`].
+pub struct DFlash2SelectorWorkspace {
+    capacity: usize,
+    projected: DeviceBuffer<f32>,
+    sampler: GpuTokenSampler,
+    tokens: DeviceBuffer<u32>,
+}
+
+impl DFlash2SelectorPlan {
+    /// Uploads and validates the three official DFlash2 selector tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        vocab: usize,
+        hidden: usize,
+        rank: usize,
+        top_k: usize,
+        hidden_projection: &[u16],
+        predecessor_codebook: &[u16],
+        successor_codebook: &[u16],
+    ) -> Result<Self> {
+        let projection_len = rank.checked_mul(hidden);
+        let codebook_len = vocab.checked_mul(rank);
+        if vocab == 0
+            || hidden == 0
+            || rank == 0
+            || rank > 256
+            || top_k == 0
+            || top_k > GPU_SAMPLING_MAX_TOP_K
+            || projection_len != Some(hidden_projection.len())
+            || codebook_len != Some(predecessor_codebook.len())
+            || codebook_len != Some(successor_codebook.len())
+            || [vocab, hidden, rank, top_k]
+                .into_iter()
+                .any(|value| value > u32::MAX as usize)
+        {
+            return Err(Error::Shape {
+                label: "DFlash2 selector plan",
+                expected: format!(
+                    "vocab>0 hidden>0 rank=1..=256 top_k=1..={GPU_SAMPLING_MAX_TOP_K} projection={rank}x{hidden} codebooks={vocab}x{rank}"
+                ),
+                actual: format!(
+                    "vocab={vocab} hidden={hidden} rank={rank} top_k={top_k} weights={}/{}/{}",
+                    hidden_projection.len(),
+                    predecessor_codebook.len(),
+                    successor_codebook.len()
+                ),
+            });
+        }
+        Ok(Self {
+            vocab,
+            hidden,
+            rank,
+            top_k,
+            hidden_projection: DeviceBuffer::from_host(hidden_projection)?,
+            predecessor_codebook: DeviceBuffer::from_host(predecessor_codebook)?,
+            successor_codebook: DeviceBuffer::from_host(successor_codebook)?,
+        })
+    }
+
+    /// Allocates reusable selector storage for at most `capacity` draft rows.
+    pub fn new_workspace(&self, capacity: usize) -> Result<DFlash2SelectorWorkspace> {
+        if capacity == 0 {
+            return Err(Error::Shape {
+                label: "DFlash2 selector workspace",
+                expected: "positive draft capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
+        let token_capacity = capacity.checked_add(1).ok_or_else(|| Error::Shape {
+            label: "DFlash2 selector workspace",
+            expected: "draft capacity plus anchor without overflow".to_string(),
+            actual: capacity.to_string(),
+        })?;
+        Ok(DFlash2SelectorWorkspace {
+            capacity,
+            projected: DeviceBuffer::zeroed(capacity.checked_mul(self.rank).ok_or_else(|| {
+                Error::Shape {
+                    label: "DFlash2 selector workspace",
+                    expected: "projected size without overflow".to_string(),
+                    actual: format!("capacity={capacity} rank={}", self.rank),
+                }
+            })?)?,
+            sampler: GpuTokenSampler::new(capacity, self.vocab)?,
+            tokens: DeviceBuffer::zeroed(token_capacity)?,
+        })
+    }
+
+    /// Enqueues coherent path selection and returns `[anchor, proposals..]`.
+    pub fn select<'workspace>(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        logits: &DeviceBuffer<f32>,
+        anchor_token: u32,
+        drafts: usize,
+        workspace: &'workspace mut DFlash2SelectorWorkspace,
+        stream: &CudaStream,
+    ) -> Result<&'workspace DeviceBuffer<u32>> {
+        if drafts == 0
+            || drafts > workspace.capacity
+            || anchor_token as usize >= self.vocab
+            || hidden.len() != workspace.capacity.saturating_mul(self.hidden)
+            || logits.len() != workspace.capacity.saturating_mul(self.vocab)
+            || drafts > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "DFlash2 selector inputs",
+                expected: format!(
+                    "drafts=1..={} anchor<{} hidden={} logits={}",
+                    workspace.capacity,
+                    self.vocab,
+                    workspace.capacity.saturating_mul(self.hidden),
+                    workspace.capacity.saturating_mul(self.vocab)
+                ),
+                actual: format!(
+                    "drafts={drafts} anchor={anchor_token} hidden={} logits={}",
+                    hidden.len(),
+                    logits.len()
+                ),
+            });
+        }
+        dflash2_hidden_projection_f32_into_on_stream(
+            hidden.slice(0..drafts * self.hidden)?.matrix::<RowMajor>(
+                drafts,
+                self.hidden,
+                self.hidden,
+            )?,
+            self.hidden_projection
+                .slice(0..self.rank * self.hidden)?
+                .matrix::<RowMajor>(self.rank, self.hidden, self.hidden)?,
+            workspace
+                .projected
+                .slice_mut(0..drafts * self.rank)?
+                .matrix::<RowMajor>(drafts, self.rank, self.rank)?,
+            stream,
+        )?;
+        workspace
+            .sampler
+            .enqueue_top_k(logits, drafts, self.top_k, stream)?;
+        unsafe {
+            check_cuda(
+                "infer_dflash2_select_path_f32_on_stream",
+                ffi::infer_dflash2_select_path_f32_on_stream(
+                    workspace.projected.as_const_ptr().cast(),
+                    workspace.sampler.top_keys.as_const_ptr().cast(),
+                    self.predecessor_codebook.as_const_ptr().cast(),
+                    self.successor_codebook.as_const_ptr().cast(),
+                    workspace.tokens.as_mut_ptr().cast(),
+                    anchor_token,
+                    drafts as u32,
+                    self.vocab as u32,
+                    self.rank as u32,
+                    self.top_k as u32,
+                    GPU_SAMPLING_MAX_TOP_K as u32,
+                    stream.as_raw(),
+                ),
+            )?;
+        }
+        Ok(&workspace.tokens)
+    }
+
+    /// Returns exact bytes owned by resident selector weights.
+    pub fn device_bytes(&self) -> usize {
+        self.hidden_projection.device_bytes()
+            + self.predecessor_codebook.device_bytes()
+            + self.successor_codebook.device_bytes()
+    }
+}
+
+impl DFlash2SelectorWorkspace {
+    /// Returns exact bytes owned by reusable selector storage.
+    pub fn device_bytes(&self) -> usize {
+        self.projected.device_bytes() + self.sampler.device_bytes() + self.tokens.device_bytes()
+    }
+
+    /// Returns the verification-token buffer for dependency wiring and capture.
+    pub const fn verification_tokens(&self) -> &DeviceBuffer<u32> {
+        &self.tokens
     }
 }
 
@@ -14912,6 +15119,47 @@ mod tests {
             1.0e-5,
             "DFlash2 hidden projection",
         );
+    }
+
+    #[test]
+    fn dflash2_device_selector_follows_the_selected_predecessor() {
+        let bf16 = |values: &[f32]| values.iter().copied().map(f32_to_bf16).collect::<Vec<_>>();
+        let rank = 256;
+        let mut projection = vec![0.0; rank * rank];
+        for component in 0..rank {
+            projection[component * rank + component] = 1.0;
+        }
+        let plan = DFlash2SelectorPlan::new(
+            4,
+            rank,
+            rank,
+            2,
+            &bf16(&projection),
+            &bf16(
+                &[2.0, -2.0, -3.0, 0.0]
+                    .into_iter()
+                    .flat_map(|value| std::iter::repeat_n(value, rank))
+                    .collect::<Vec<_>>(),
+            ),
+            &bf16(
+                &[0.0, -1.0, 1.0, 0.0]
+                    .into_iter()
+                    .flat_map(|value| std::iter::repeat_n(value, rank))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .expect("selector plan");
+        let hidden = DeviceBuffer::from_host(&vec![1.0f32; 2 * rank]).expect("hidden");
+        let logits = DeviceBuffer::from_host(&[0.0f32, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, -1.0])
+            .expect("logits");
+        let mut workspace = plan.new_workspace(2).expect("selector workspace");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let tokens = plan
+            .select(&hidden, &logits, 0, 2, &mut workspace, &stream)
+            .expect("device selector")
+            .copy_prefix_to_host(3, &stream)
+            .expect("selector readback");
+        assert_eq!(&*tokens, [0, 2, 1]);
     }
 
     #[test]

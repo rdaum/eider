@@ -7267,6 +7267,142 @@ __device__ __forceinline__ float infer_sampling_key_value(std::uint64_t key) {
     return __uint_as_float(bits);
 }
 
+__device__ __forceinline__ std::int32_t infer_total_order_key(float value) {
+    std::int32_t bits = __float_as_int(value);
+    bits ^= (bits >> 31) & INT32_MAX;
+    return bits;
+}
+
+// DFlash2 path selection is sequential across draft rows because the selected
+// token becomes the next row's predecessor. Vocabulary top-k and the hidden
+// projection remain parallel kernels. This compact continuation consumes both
+// device results directly and never materializes selector state on the host.
+__global__ void infer_dflash2_select_path_f32_kernel(
+    const float* projected,
+    const std::uint64_t* top_keys,
+    const std::uint16_t* predecessor_codebook_bf16,
+    const std::uint16_t* successor_codebook_bf16,
+    std::uint32_t* output_tokens,
+    std::uint32_t anchor_token,
+    std::uint32_t drafts,
+    std::uint32_t rank,
+    std::uint32_t top_k,
+    std::uint32_t key_stride) {
+    constexpr std::uint32_t kMaxRank = 256;
+    constexpr std::uint32_t kMaxTopK = 32;
+    __shared__ float terms[kMaxTopK * kMaxRank];
+    __shared__ float candidate_scores[kMaxTopK];
+    __shared__ std::uint32_t candidate_tokens[kMaxTopK];
+    __shared__ std::uint32_t predecessor;
+    if (threadIdx.x == 0) {
+        predecessor = anchor_token;
+        output_tokens[0] = anchor_token;
+    }
+    __syncthreads();
+
+    const std::uint32_t lanes_per_candidate = blockDim.x / top_k;
+    const std::uint32_t candidate_slot = threadIdx.x / lanes_per_candidate;
+    const std::uint32_t candidate_lane = threadIdx.x % lanes_per_candidate;
+    for (std::uint32_t step = 0; step < drafts; ++step) {
+        const float* hidden = projected + static_cast<std::size_t>(step) * rank;
+        const std::uint16_t* predecessor_code =
+            predecessor_codebook_bf16 + static_cast<std::size_t>(predecessor) * rank;
+        const std::uint64_t* candidates =
+            top_keys + static_cast<std::size_t>(step) * key_stride;
+
+        if (candidate_slot < top_k) {
+            const std::uint64_t candidate_key = candidates[candidate_slot];
+            if (candidate_key != 0) {
+                const std::uint32_t candidate = infer_sampling_key_id(candidate_key);
+                const std::uint16_t* successor_code =
+                    successor_codebook_bf16 + static_cast<std::size_t>(candidate) * rank;
+                for (std::uint32_t component = candidate_lane; component < rank;
+                     component += lanes_per_candidate) {
+                    const float predecessor_value = __bfloat162float(
+                        *reinterpret_cast<const __nv_bfloat16*>(predecessor_code + component));
+                    const float successor_value = __bfloat162float(
+                        *reinterpret_cast<const __nv_bfloat16*>(successor_code + component));
+                    const float left = __fmul_rn(predecessor_value, hidden[component]);
+                    terms[candidate_slot * kMaxRank + component] =
+                        __fmul_rn(left, successor_value);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x < top_k) {
+            const std::uint64_t candidate_key = candidates[threadIdx.x];
+            if (candidate_key != 0) {
+                float transition = 0.0f;
+                for (std::uint32_t component = 0; component < rank; ++component) {
+                    transition = __fadd_rn(
+                        transition, terms[threadIdx.x * kMaxRank + component]);
+                }
+                candidate_scores[threadIdx.x] = __fadd_rn(
+                    infer_sampling_key_value(candidate_key), transition);
+                candidate_tokens[threadIdx.x] = infer_sampling_key_id(candidate_key);
+            } else {
+                candidate_scores[threadIdx.x] = -INFINITY;
+                candidate_tokens[threadIdx.x] = 0;
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            bool found = false;
+            std::uint32_t best_token = 0;
+            float best_score = -INFINITY;
+            std::int32_t best_key = infer_total_order_key(best_score);
+            for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+                if (candidates[slot] == 0) continue;
+                const float score = candidate_scores[slot];
+                const std::uint32_t candidate = candidate_tokens[slot];
+                const std::int32_t score_key = infer_total_order_key(score);
+                if (!found || score_key > best_key ||
+                    (__float_as_uint(score) == __float_as_uint(best_score) &&
+                     candidate < best_token)) {
+                    found = true;
+                    best_token = candidate;
+                    best_score = score;
+                    best_key = score_key;
+                }
+            }
+            // The hierarchical top-k emits zero only for absent finite logits.
+            // Token zero is a safe in-vocabulary sentinel if a corrupt row has
+            // no candidates; ordinary target verification will reject it.
+            output_tokens[step + 1] = found ? best_token : 0U;
+            predecessor = output_tokens[step + 1];
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" cudaError_t infer_dflash2_select_path_f32_on_stream(
+    const float* projected,
+    const std::uint64_t* top_keys,
+    const std::uint16_t* predecessor_codebook_bf16,
+    const std::uint16_t* successor_codebook_bf16,
+    std::uint32_t* output_tokens,
+    std::uint32_t anchor_token,
+    std::uint32_t drafts,
+    std::uint32_t vocab,
+    std::uint32_t rank,
+    std::uint32_t top_k,
+    std::uint32_t key_stride,
+    cudaStream_t stream) {
+    if (projected == nullptr || top_keys == nullptr ||
+        predecessor_codebook_bf16 == nullptr || successor_codebook_bf16 == nullptr ||
+        output_tokens == nullptr || drafts == 0 || vocab == 0 || rank == 0 || rank > 256 ||
+        top_k == 0 || top_k > key_stride || anchor_token >= vocab) {
+        return cudaErrorInvalidValue;
+    }
+    infer_dflash2_select_path_f32_kernel<<<1, 256, 0, stream>>>(
+        projected, top_keys, predecessor_codebook_bf16,
+        successor_codebook_bf16, output_tokens, anchor_token, drafts, rank,
+        top_k, key_stride);
+    return cudaGetLastError();
+}
+
 using InferSamplingBlockSort = cub::BlockRadixSort<
     std::uint64_t,
     kInferSamplingThreads,

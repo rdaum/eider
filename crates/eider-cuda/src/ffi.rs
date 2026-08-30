@@ -2407,6 +2407,20 @@ unsafe extern "C" {
         rank: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn infer_dflash2_select_path_f32_on_stream(
+        projected: *const f32,
+        top_keys: *const u64,
+        predecessor_codebook_bf16: *const u16,
+        successor_codebook_bf16: *const u16,
+        output_tokens: *mut u32,
+        anchor_token: u32,
+        drafts: u32,
+        vocab: u32,
+        rank: u32,
+        top_k: u32,
+        key_stride: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub(crate) fn infer_sample_topk_topp_f32_batch_on_stream(
         logits: *const f32,
         params: *const c_void,

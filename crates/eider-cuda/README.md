@@ -13,6 +13,7 @@ The crate provides:
 - ModelOpt-to-device preparation boundaries
 - cuBLASLt plans for BF16, FP8, INT8, and NVFP4 matrix products
 - native SM121 W4A16 and non-GEMM kernels
+- device-resident DFlash2 projection, top-k, and coherent path selection
 - diagnostic smoke checks and GPU counter collection.
 
 The crate does not select a model family, schedule requests, or parse an HTTP
@@ -54,6 +55,7 @@ Run a focused benchmark for each shape-specific kernel change. Benchmarks use
 
 ```sh
 cargo bench -p eider-cuda --bench sm121_w4a16_routed_gate_up
+cargo bench -p eider-cuda --bench dflash2_selector
 ```
 
 CAUTION: GB10 device allocations use the same 128 GB unified memory as the

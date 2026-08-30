@@ -11,8 +11,9 @@ The first migration slice is complete. `eider-cuda` now rejects invalid device
 representations, returns a deferred owner for device-to-pinned-host readback,
 retains captured-graph resources, and supplies typed device views. The
 deferred backend framework moves command resources through recording,
-in-flight, completion, and reclamation states. The DFlash2
-projection uses those views. Physical SM12x page storage and Qwen sequence
+in-flight, completion, and reclamation states. DFlash2 keeps its projection,
+top-k reduction, transition scoring, and proposal IDs on the device through
+target verification. Physical SM12x page storage and Qwen sequence
 state have moved out of `execution` without a compatibility module. Qwen now
 keeps persistent streams, workspaces, cache state, and retained DFlash state
 in an inference-owned execution object. Qwen scheduler requests now retain

@@ -769,13 +769,20 @@ impl<'model> Qwen36Scheduler<'model> {
                 .as_mut()
                 .expect("DFlash2 workspace was allocated");
             (|| {
-                let proposals = self.execution.model.dflash2_propose(
+                let verification_tokens = self.execution.model.dflash2_propose(
                     dflash2_state,
                     frontier.token,
                     drafts,
                     dflash2_workspace,
                     workspace.stream(),
                 )?;
+                let host_proposals = grammar_preview
+                    .as_ref()
+                    .map(|_| {
+                        verification_tokens.copy_prefix_to_host(drafts + 1, workspace.stream())
+                    })
+                    .transpose()?
+                    .map(|host| host[1..].to_vec());
                 let requires_constrained_verification = grammar_preview
                     .as_ref()
                     .map(|grammar| -> Result<bool> {
@@ -783,7 +790,10 @@ impl<'model> Qwen36Scheduler<'model> {
                         if probe.is_active() {
                             return Ok(true);
                         }
-                        for &proposal in &proposals {
+                        for &proposal in host_proposals
+                            .as_deref()
+                            .expect("grammar proposals were materialized")
+                        {
                             probe.commit(proposal)?;
                             if probe.is_active() {
                                 return Ok(true);
@@ -815,20 +825,25 @@ impl<'model> Qwen36Scheduler<'model> {
                         .model
                         .verify_external_speculative_constrained(
                             workspace,
-                            &proposals,
+                            host_proposals
+                                .as_deref()
+                                .expect("constrained proposals were materialized"),
                             &mut frontier,
                             sequence,
                             &mut self.execution.sequence_cache,
                             &mut selector,
                         )?
                 } else {
-                    self.execution.model.verify_external_speculative_argmax(
-                        workspace,
-                        &proposals,
-                        &mut frontier,
-                        sequence,
-                        &mut self.execution.sequence_cache,
-                    )?
+                    self.execution
+                        .model
+                        .verify_external_speculative_device_argmax(
+                            workspace,
+                            verification_tokens,
+                            drafts,
+                            &mut frontier,
+                            sequence,
+                            &mut self.execution.sequence_cache,
+                        )?
                 };
                 if let Err(error) = self.execution.model.dflash2_append_speculative(
                     dflash2_state,

@@ -120,8 +120,38 @@ pub struct Qwen36PrefillRow<'tokens, 'sequence> {
     pub sequence: &'sequence mut Qwen36Sequence,
 }
 
+enum Qwen36PrefillTokens<'a> {
+    Host(&'a [u32]),
+    // Device tokens must come from a model-owned selector that only emits
+    // vocabulary IDs. General callers use the checked host representation.
+    Device {
+        buffer: &'a DeviceBuffer<u32>,
+        len: usize,
+    },
+}
+
+impl Qwen36PrefillTokens<'_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Host(tokens) => tokens.len(),
+            Self::Device { len, .. } => *len,
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    const fn host(&self) -> Option<&[u32]> {
+        match self {
+            Self::Host(tokens) => Some(tokens),
+            Self::Device { .. } => None,
+        }
+    }
+}
+
 struct Qwen36PrefillStateRow<'tokens, 'state> {
-    token_ids: &'tokens [u32],
+    tokens: Qwen36PrefillTokens<'tokens>,
     state: &'state mut Qwen36SequenceState,
 }
 
@@ -2440,6 +2470,23 @@ pub struct Qwen36SpeculativeCycleWorkspace {
     host_verify_tokens: Vec<u32>,
 }
 
+enum Qwen36ExternalDrafts<'a> {
+    Host(&'a [u32]),
+    Device {
+        verification_tokens: &'a DeviceBuffer<u32>,
+        draft_count: usize,
+    },
+}
+
+impl Qwen36ExternalDrafts<'_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Host(tokens) => tokens.len(),
+            Self::Device { draft_count, .. } => *draft_count,
+        }
+    }
+}
+
 fn align_speculative_committed_logits(
     frontier_logit: f32,
     next_logits: &[f32],
@@ -2689,7 +2736,7 @@ impl Qwen36TextModel {
             for (row, reservation) in rows.iter_mut().zip(&reservations) {
                 let sequence = &mut *row.sequence;
                 state_rows.push(Qwen36PrefillStateRow {
-                    token_ids: row.token_ids,
+                    tokens: Qwen36PrefillTokens::Host(row.token_ids),
                     state: &mut sequence.state,
                 });
                 appends.push(Qwen36Append {
@@ -2792,11 +2839,11 @@ impl Qwen36TextModel {
         }
         let total_tokens = rows.iter().try_fold(0usize, |total, row| {
             total
-                .checked_add(row.token_ids.len())
+                .checked_add(row.tokens.len())
                 .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill token count",
                     expected: "total token count without overflow".to_string(),
-                    actual: format!("total={total} row={}", row.token_ids.len()),
+                    actual: format!("total={total} row={}", row.tokens.len()),
                 })
         })?;
         if total_tokens == 0 || total_tokens > workspace.token_capacity {
@@ -2807,7 +2854,7 @@ impl Qwen36TextModel {
             });
         }
         for row in rows.iter() {
-            if row.token_ids.is_empty() {
+            if row.tokens.is_empty() {
                 return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill row",
                     expected: "at least one token".to_string(),
@@ -2820,11 +2867,11 @@ impl Qwen36TextModel {
                     detail: "state was created by a different model instance".to_string(),
                 });
             }
-            if let Some(token) = row
-                .token_ids
-                .iter()
-                .find(|&&token| token as usize >= self.manifest.vocab)
-            {
+            if let Some(token) = row.tokens.host().and_then(|tokens| {
+                tokens
+                    .iter()
+                    .find(|&&token| token as usize >= self.manifest.vocab)
+            }) {
                 return Err(eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill token id",
                     expected: format!("token < {}", self.manifest.vocab),
@@ -2834,14 +2881,14 @@ impl Qwen36TextModel {
             let end = row
                 .state
                 .position
-                .checked_add(row.token_ids.len())
+                .checked_add(row.tokens.len())
                 .ok_or_else(|| eider_cuda::Error::Shape {
                     label: "Qwen3.6 prefill sequence capacity",
                     expected: "position + tokens without overflow".to_string(),
                     actual: format!(
                         "position={} tokens={}",
                         row.state.position,
-                        row.token_ids.len()
+                        row.tokens.len()
                     ),
                 })?;
             if end > row.state.max_tokens || row.state.max_tokens > workspace.max_context_tokens {
@@ -2863,17 +2910,34 @@ impl Qwen36TextModel {
         let mut offset = 0usize;
         for (sequence, row) in rows.iter().enumerate() {
             workspace.host_sequence_offsets[sequence] = offset as u32;
-            workspace.host_sequence_lengths[sequence] = row.token_ids.len() as u32;
-            for (token_offset, &token) in row.token_ids.iter().enumerate() {
-                workspace.host_token_ids[offset + token_offset] = token;
+            let tokens = row.tokens.len();
+            workspace.host_sequence_lengths[sequence] = tokens as u32;
+            if let Some(host_tokens) = row.tokens.host() {
+                workspace.host_token_ids[offset..offset + tokens].copy_from_slice(host_tokens);
+            }
+            for token_offset in 0..tokens {
                 workspace.host_positions[offset + token_offset] =
                     (row.state.position + token_offset) as u32;
             }
-            offset += row.token_ids.len();
+            offset += tokens;
         }
-        workspace
-            .token_ids
-            .copy_prefix_from_host(&workspace.host_token_ids[..total_tokens])?;
+        if rows
+            .iter()
+            .any(|row| matches!(row.tokens, Qwen36PrefillTokens::Host(_)))
+        {
+            workspace
+                .token_ids
+                .copy_prefix_from_host(&workspace.host_token_ids[..total_tokens])?;
+        }
+        let stream = &workspace.stream;
+        let token_ids = &mut workspace.token_ids;
+        let mut offset = 0usize;
+        for row in rows.iter() {
+            if let Qwen36PrefillTokens::Device { buffer, len } = &row.tokens {
+                token_ids.copy_range_from_device_on_stream(offset, buffer, 0, *len, stream)?;
+            }
+            offset += row.tokens.len();
+        }
         workspace
             .positions
             .copy_prefix_from_host(&workspace.host_positions[..total_tokens])?;
@@ -4080,17 +4144,28 @@ impl Qwen36TextModel {
         )
     }
 
-    /// Verifies a proposal supplied by an external drafter and commits its
-    /// accepted prefix. The target remains the sole source of committed tokens.
-    pub(crate) fn verify_external_speculative_argmax(
+    /// Verifies device-resident external drafts without a pre-verification
+    /// token readback.
+    pub(crate) fn verify_external_speculative_device_argmax(
         &self,
         workspace: &mut Qwen36SpeculativeCycleWorkspace,
-        drafted: &[u32],
+        verification_tokens: &DeviceBuffer<u32>,
+        draft_count: usize,
         frontier: &mut Qwen36SpeculativeFrontier,
         sequence: &mut Qwen36Sequence,
         cache: &mut Qwen36SequenceCache,
     ) -> Result<Qwen36SpeculativeCycleOutcome> {
-        self.verify_external_speculative(workspace, drafted, frontier, sequence, cache, None)
+        self.verify_external_speculative(
+            workspace,
+            Qwen36ExternalDrafts::Device {
+                verification_tokens,
+                draft_count,
+            },
+            frontier,
+            sequence,
+            cache,
+            None,
+        )
     }
 
     pub(crate) fn verify_external_speculative_constrained(
@@ -4104,7 +4179,7 @@ impl Qwen36TextModel {
     ) -> Result<Qwen36SpeculativeCycleOutcome> {
         self.verify_external_speculative(
             workspace,
-            drafted,
+            Qwen36ExternalDrafts::Host(drafted),
             frontier,
             sequence,
             cache,
@@ -4115,26 +4190,29 @@ impl Qwen36TextModel {
     fn verify_external_speculative(
         &self,
         workspace: &mut Qwen36SpeculativeCycleWorkspace,
-        drafted: &[u32],
+        drafted: Qwen36ExternalDrafts<'_>,
         frontier: &mut Qwen36SpeculativeFrontier,
         sequence: &mut Qwen36Sequence,
         cache: &mut Qwen36SequenceCache,
         mut selector: Option<&mut Qwen36LogitSelector<'_>>,
     ) -> Result<Qwen36SpeculativeCycleOutcome> {
-        if drafted.is_empty() || drafted.len() > workspace.drafts {
+        let draft_count = drafted.len();
+        if draft_count == 0 || draft_count > workspace.drafts {
             return Err(eider_cuda::Error::Shape {
                 label: "Qwen3.8 external speculative proposal",
                 expected: format!("1..={} draft tokens", workspace.drafts),
-                actual: format!("{} draft tokens", drafted.len()),
+                actual: format!("{draft_count} draft tokens"),
             });
         }
-        let rows = drafted.len() + 1;
+        let rows = draft_count + 1;
         let row_capacity = workspace.drafts + 1;
         let hidden = self.manifest.hidden;
-        let verify = &mut workspace.verify;
         workspace.host_verify_tokens.clear();
-        workspace.host_verify_tokens.push(frontier.token);
-        workspace.host_verify_tokens.extend_from_slice(drafted);
+        if let Qwen36ExternalDrafts::Host(tokens) = &drafted {
+            workspace.host_verify_tokens.push(frontier.token);
+            workspace.host_verify_tokens.extend_from_slice(tokens);
+        }
+        let verify = &mut workspace.verify;
 
         let reservation = cache
             .reserve_append(
@@ -4157,8 +4235,20 @@ impl Qwen36TextModel {
             return Err(error);
         }
         let forward = {
+            let tokens = match &drafted {
+                Qwen36ExternalDrafts::Host(_) => {
+                    Qwen36PrefillTokens::Host(&workspace.host_verify_tokens)
+                }
+                Qwen36ExternalDrafts::Device {
+                    verification_tokens,
+                    ..
+                } => Qwen36PrefillTokens::Device {
+                    buffer: verification_tokens,
+                    len: rows,
+                },
+            };
             let mut state_rows = [Qwen36PrefillStateRow {
-                token_ids: &workspace.host_verify_tokens,
+                tokens,
                 state: &mut sequence.state,
             }];
             let appends = [Qwen36Append {
@@ -4230,10 +4320,19 @@ impl Qwen36TextModel {
                         .into_vec(),
                 )
             };
+            if let Qwen36ExternalDrafts::Device {
+                verification_tokens,
+                ..
+            } = &drafted
+            {
+                let host = verification_tokens.copy_prefix_to_host(rows, verify.stream())?;
+                workspace.host_verify_tokens.extend_from_slice(&host);
+            }
+            let drafted_tokens = &workspace.host_verify_tokens[1..];
             let mut accepted = 0;
-            while accepted < drafted.len()
+            while accepted < drafted_tokens.len()
                 && accepted < argmax.len()
-                && drafted[accepted] == argmax[accepted]
+                && drafted_tokens[accepted] == argmax[accepted]
             {
                 accepted += 1;
             }
@@ -4263,7 +4362,7 @@ impl Qwen36TextModel {
             }
         };
         let committed_rows = verification.accepted + 1;
-        if verification.accepted < drafted.len()
+        if verification.accepted < draft_count
             && let Err(error) = verify
                 .linear
                 .restore_state_snapshot(verification.accepted, verify.stream())
@@ -4409,7 +4508,7 @@ impl Qwen36TextModel {
 
             let forward = {
                 let mut state_rows = [Qwen36PrefillStateRow {
-                    token_ids: host_verify_tokens,
+                    tokens: Qwen36PrefillTokens::Host(host_verify_tokens),
                     state: &mut sequence.state,
                 }];
                 let appends = [Qwen36Append {
@@ -5450,7 +5549,7 @@ impl Qwen36FullAttentionWeights {
     ) -> Result<()> {
         for (sequence, (row, append)) in rows.iter_mut().zip(appends).enumerate() {
             if append.reservation.start_position() != row.state.position
-                || append.reservation.rows() != row.token_ids.len()
+                || append.reservation.rows() != row.tokens.len()
             {
                 return Err(eider_cuda::Error::Format {
                     label: "Qwen3.6 prefill append",
@@ -5459,7 +5558,7 @@ impl Qwen36FullAttentionWeights {
                         append.reservation.start_position(),
                         append.reservation.rows(),
                         row.state.position,
-                        row.token_ids.len()
+                        row.tokens.len()
                     ),
                 });
             }

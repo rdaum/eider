@@ -1,6 +1,7 @@
 use eider_cuda::{
-    CudaStream, DeviceBuffer, GpuTokenSampler, GpuTopKCandidate, PinnedHostBuffer, Result,
-    RowMajor, dflash2_hidden_projection_f32_into_on_stream,
+    CudaStream, DFlash2SelectorPlan, DFlash2SelectorWorkspace, DeviceBuffer, GpuTokenSampler,
+    GpuTopKCandidate, PinnedHostBuffer, Result, RowMajor,
+    dflash2_hidden_projection_f32_into_on_stream,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -13,6 +14,7 @@ const VOCAB: usize = 248_320;
 const TOP_K: usize = 16;
 const HIDDEN: usize = 5_120;
 const RANK: usize = 256;
+const ANCHOR: u32 = 17;
 
 struct SelectorBench {
     stream: CudaStream,
@@ -28,6 +30,11 @@ struct SelectorBench {
     device_projection: DeviceBuffer<u16>,
     device_projected: DeviceBuffer<f32>,
     host_projected: PinnedHostBuffer<f32>,
+    predecessor_codebook: Vec<u16>,
+    successor_codebook: Vec<u16>,
+    selector: DFlash2SelectorPlan,
+    selector_workspace: DFlash2SelectorWorkspace,
+    host_drafts: Vec<u32>,
 }
 
 impl BenchContext for SelectorBench {
@@ -77,6 +84,37 @@ impl SelectorBench {
             &stream,
         )?;
         validate_projection(projected.wait()?.as_slice(), &cpu_projected);
+        let predecessor_codebook = vec![f32_to_bf16(0.0); VOCAB * RANK];
+        let successor_codebook = vec![f32_to_bf16(0.0); VOCAB * RANK];
+        let selector = DFlash2SelectorPlan::new(
+            VOCAB,
+            HIDDEN,
+            RANK,
+            TOP_K,
+            &host_projection,
+            &predecessor_codebook,
+            &successor_codebook,
+        )?;
+        let mut selector_workspace = selector.new_workspace(ROWS)?;
+        let expected_drafts = select_path(
+            ANCHOR,
+            &cpu_projected,
+            &cpu_candidates,
+            &predecessor_codebook,
+            &successor_codebook,
+        );
+        let actual_drafts = selector
+            .select(
+                &device_hidden,
+                &device_logits,
+                ANCHOR,
+                ROWS,
+                &mut selector_workspace,
+                &stream,
+            )?
+            .copy_prefix_to_host(ROWS + 1, &stream)?;
+        assert_eq!(actual_drafts[0], ANCHOR);
+        assert_eq!(&actual_drafts[1..], expected_drafts);
         Ok(Self {
             stream,
             host_logits,
@@ -91,6 +129,11 @@ impl SelectorBench {
             device_projection,
             device_projected,
             host_projected,
+            predecessor_codebook,
+            successor_codebook,
+            selector,
+            selector_workspace,
+            host_drafts: Vec::with_capacity(ROWS),
         })
     }
 }
@@ -183,6 +226,44 @@ fn cpu_top_k_rows(logits: &[f32], output: &mut Vec<GpuTopKCandidate>) {
             }
         }
     }
+}
+
+fn select_path(
+    anchor: u32,
+    projected: &[f32],
+    candidates: &[GpuTopKCandidate],
+    predecessor_codebook: &[u16],
+    successor_codebook: &[u16],
+) -> Vec<u32> {
+    let mut output = Vec::with_capacity(ROWS);
+    let mut predecessor = anchor as usize;
+    for step in 0..ROWS {
+        let predecessor_code = &predecessor_codebook[predecessor * RANK..(predecessor + 1) * RANK];
+        let hidden = &projected[step * RANK..(step + 1) * RANK];
+        let mut best = None;
+        for &GpuTopKCandidate { id, logit } in &candidates[step * TOP_K..(step + 1) * TOP_K] {
+            let successor = &successor_codebook[id as usize * RANK..(id as usize + 1) * RANK];
+            let transition = predecessor_code
+                .iter()
+                .zip(hidden)
+                .zip(successor)
+                .map(|((&predecessor, &hidden), &successor)| {
+                    bf16_to_f32(predecessor) * hidden * bf16_to_f32(successor)
+                })
+                .sum::<f32>();
+            let score = logit + transition;
+            if best.is_none_or(|(best_id, best_score): (u32, f32)| {
+                score.total_cmp(&best_score).is_gt()
+                    || (score.to_bits() == best_score.to_bits() && id < best_id)
+            }) {
+                best = Some((id, score));
+            }
+        }
+        let selected = best.expect("non-empty selector top-k").0;
+        output.push(selected);
+        predecessor = selected as usize;
+    }
+    output
 }
 
 fn cpu_sample(
@@ -292,6 +373,96 @@ fn gpu_projection_sample(
     ))
 }
 
+fn host_assisted_path_sample(
+    context: &mut SelectorBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    let started = Instant::now();
+    for _ in 0..chunk_size {
+        dflash2_hidden_projection_f32_into_on_stream(
+            context
+                .device_hidden
+                .slice(0..ROWS * HIDDEN)
+                .expect("hidden matrix")
+                .matrix::<RowMajor>(ROWS, HIDDEN, HIDDEN)
+                .expect("hidden matrix"),
+            context
+                .device_projection
+                .slice(0..RANK * HIDDEN)
+                .expect("weight matrix")
+                .matrix::<RowMajor>(RANK, HIDDEN, HIDDEN)
+                .expect("weight matrix"),
+            context
+                .device_projected
+                .slice_mut(0..ROWS * RANK)
+                .expect("output matrix")
+                .matrix::<RowMajor>(ROWS, RANK, RANK)
+                .expect("output matrix"),
+            &context.stream,
+        )
+        .expect("device DFlash2 projection");
+        let projected = context
+            .device_projected
+            .copy_prefix_to_pinned_on_stream(
+                &mut context.host_projected,
+                ROWS * RANK,
+                &context.stream,
+            )
+            .expect("copy DFlash2 projection");
+        context
+            .sampler
+            .top_k_candidates_into(
+                &context.device_logits,
+                ROWS,
+                TOP_K,
+                &mut context.candidates,
+                &context.stream,
+            )
+            .expect("device DFlash2 top-k");
+        let projected = projected.wait().expect("DFlash2 projection");
+        context.host_drafts = select_path(
+            ANCHOR,
+            projected.as_slice(),
+            &context.candidates,
+            &context.predecessor_codebook,
+            &context.successor_codebook,
+        );
+        black_box(&context.host_drafts);
+    }
+    BenchSampleResult::operations(chunk_size as u64).push_metric(MetricValue::duration_ms(
+        "selector_ms",
+        started.elapsed().div_f64(chunk_size as f64),
+    ))
+}
+
+fn resident_path_sample(
+    context: &mut SelectorBench,
+    chunk_size: usize,
+    _chunk_num: usize,
+) -> BenchSampleResult {
+    let started = Instant::now();
+    for _ in 0..chunk_size {
+        let tokens = context
+            .selector
+            .select(
+                &context.device_hidden,
+                &context.device_logits,
+                ANCHOR,
+                ROWS,
+                &mut context.selector_workspace,
+                &context.stream,
+            )
+            .expect("resident DFlash2 selector");
+        black_box(tokens);
+    }
+    context.stream.synchronize().expect("resident selector");
+    BenchSampleResult::operations(chunk_size as u64).push_metric(MetricValue::duration_ms(
+        "selector_ms",
+        started.elapsed().div_f64(chunk_size as f64),
+    ))
+}
+
 fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("dflash2-selector".to_string()),
@@ -324,6 +495,14 @@ fn main() {
             group
                 .measurement_domain(MeasurementDomain::Gpu)
                 .bench_sample("rows_2_hidden_5120_rank_256", gpu_projection_sample);
+        });
+        runner.group::<SelectorBench>("DFlash2 host-assisted path", |group| {
+            group.bench_sample("rows_2_official_shape", host_assisted_path_sample);
+        });
+        runner.group::<SelectorBench>("DFlash2 resident path", |group| {
+            group
+                .measurement_domain(MeasurementDomain::Gpu)
+                .bench_sample("rows_2_official_shape", resident_path_sample);
         });
     });
 }

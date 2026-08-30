@@ -8,19 +8,22 @@ use super::batch::{BatchFp8InputQuantization, BatchFp8LinearPlan, run_fp8_batch}
 use super::{Qwen36LmHead, Qwen36TextModel};
 use crate::qwen3::infer::{QwenFfnConfig, QwenModelManifest};
 use eider_cuda::{
-    Bf16TnMatmulPlan, CudaStream, DeviceBuffer, Error, GemmShape, GpuTokenSampler,
-    GpuTopKCandidate, PinnedHostBuffer, Result, RowMajor, add_f32_prefix_into_on_stream,
+    Bf16TnMatmulPlan, CudaStream, DFlash2SelectorPlan, DFlash2SelectorWorkspace, DeviceBuffer,
+    Error, GemmShape, Result, add_f32_prefix_into_on_stream,
     bf16_linear_logits_f32_batch_into_on_stream, dflash2_grouped_conv_f32_into_on_stream,
-    dflash2_hidden_projection_f32_into_on_stream, dflash2_noncausal_attention_f32_into_on_stream,
-    f32_to_bf16_prefix_into_on_stream, fill_f32_prefix_into_on_stream,
-    quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream, rms_norm_f32_into_on_stream,
-    rope_neox_sequence_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    dflash2_noncausal_attention_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream,
+    fill_f32_prefix_into_on_stream, quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream,
+    rms_norm_f32_into_on_stream, rope_neox_sequence_f32_into_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
 use serde::Deserialize;
 use std::fs;
 use std::mem::size_of;
 use std::path::Path;
+
+#[cfg(test)]
+use eider_cuda::GpuTopKCandidate;
 
 const DFLASH2_ARCHITECTURE: &str = "DFlash2DraftModel";
 const DFLASH2_CONTEXT_ROWS: usize = 128;
@@ -172,6 +175,7 @@ impl DFlash2Config {
     }
 }
 
+#[cfg(test)]
 struct DFlash2GreedySelector {
     vocab: usize,
     rank: usize,
@@ -180,25 +184,8 @@ struct DFlash2GreedySelector {
     successor_codebook: Vec<u16>,
 }
 
+#[cfg(test)]
 impl DFlash2GreedySelector {
-    fn load(checkpoint: &ModelOptCheckpoint, config: &DFlash2Config) -> Result<Self> {
-        Ok(Self {
-            vocab: config.vocab,
-            rank: config.selector_rank,
-            top_k: config.selector_top_k,
-            predecessor_codebook: read_bf16_host(
-                checkpoint,
-                "candidate_selector.predecessor_codebook",
-                &[config.vocab, config.selector_rank],
-            )?,
-            successor_codebook: read_bf16_host(
-                checkpoint,
-                "candidate_selector.successor_codebook",
-                &[config.vocab, config.selector_rank],
-            )?,
-        })
-    }
-
     /// Selects one coherent greedy path through row-major draft outputs.
     fn select(
         &self,
@@ -443,8 +430,7 @@ pub(crate) struct Qwen38DFlash2 {
     hidden_norm: DeviceBuffer<f32>,
     layers: Vec<DFlash2Layer>,
     norm: DeviceBuffer<f32>,
-    selector_projection: DeviceBuffer<u16>,
-    selector: DFlash2GreedySelector,
+    selector: DFlash2SelectorPlan,
 }
 
 pub(crate) struct DFlash2LayerState {
@@ -507,11 +493,7 @@ pub(crate) struct Qwen38DFlash2Workspace {
     lm_head_quantized: DeviceBuffer<u8>,
     lm_head_scale: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
-    selector_projected: DeviceBuffer<f32>,
-    host_projected: PinnedHostBuffer<f32>,
-    selector_sampler: GpuTokenSampler,
-    selector_candidates: Vec<GpuTopKCandidate>,
-    drafts: Vec<u32>,
+    selector: DFlash2SelectorWorkspace,
 }
 
 const DFLASH2_BLOCK_ROWS: usize = 8;
@@ -637,19 +619,36 @@ impl Qwen38DFlash2 {
             );
         }
         let norm = load_bf16_f32(&checkpoint, "norm.weight", &[config.hidden])?;
-        let selector_projection = DeviceBuffer::from_host(&read_bf16_host(
+        let selector_projection = read_bf16_host(
             &checkpoint,
             "candidate_selector.hidden_projection.weight",
             &[config.selector_rank, config.hidden],
-        )?)?;
-        let selector = DFlash2GreedySelector::load(&checkpoint, &config)?;
+        )?;
+        let predecessor_codebook = read_bf16_host(
+            &checkpoint,
+            "candidate_selector.predecessor_codebook",
+            &[config.vocab, config.selector_rank],
+        )?;
+        let successor_codebook = read_bf16_host(
+            &checkpoint,
+            "candidate_selector.successor_codebook",
+            &[config.vocab, config.selector_rank],
+        )?;
+        let selector = DFlash2SelectorPlan::new(
+            config.vocab,
+            config.hidden,
+            config.selector_rank,
+            config.selector_top_k,
+            &selector_projection,
+            &predecessor_codebook,
+            &successor_codebook,
+        )?;
         Ok(Self {
             config,
             fc,
             hidden_norm,
             layers,
             norm,
-            selector_projection,
             selector,
         })
     }
@@ -815,11 +814,7 @@ impl Qwen38DFlash2 {
             lm_head_quantized: DeviceBuffer::zeroed(draft_tokens * hidden)?,
             lm_head_scale: DeviceBuffer::zeroed(draft_tokens)?,
             logits: DeviceBuffer::zeroed(draft_tokens * self.config.vocab)?,
-            selector_projected: DeviceBuffer::zeroed(draft_tokens * self.config.selector_rank)?,
-            host_projected: PinnedHostBuffer::zeroed(draft_tokens * self.config.selector_rank)?,
-            selector_sampler: GpuTokenSampler::new(draft_tokens, self.config.vocab)?,
-            selector_candidates: Vec::with_capacity(draft_tokens * self.config.selector_top_k),
-            drafts: Vec::with_capacity(self.config.draft_tokens()),
+            selector: self.selector.new_workspace(draft_tokens)?,
         })
     }
 
@@ -960,7 +955,7 @@ impl Qwen38DFlash2 {
         draft_tokens: usize,
         workspace: &'workspace mut Qwen38DFlash2Workspace,
         stream: &CudaStream,
-    ) -> Result<&'workspace [u32]> {
+    ) -> Result<&'workspace DeviceBuffer<u32>> {
         if anchor_token as usize >= self.config.vocab
             || draft_tokens == 0
             || draft_tokens > self.config.draft_tokens()
@@ -1249,47 +1244,14 @@ impl Qwen38DFlash2 {
                 )?;
             }
         }
-        let projected_values = drafts * self.config.selector_rank;
-        dflash2_hidden_projection_f32_into_on_stream(
-            workspace
-                .sample_hidden
-                .slice(0..drafts * self.config.hidden)?
-                .matrix::<RowMajor>(drafts, self.config.hidden, self.config.hidden)?,
-            self.selector_projection
-                .slice(0..self.config.selector_rank * self.config.hidden)?
-                .matrix::<RowMajor>(
-                    self.config.selector_rank,
-                    self.config.hidden,
-                    self.config.hidden,
-                )?,
-            workspace
-                .selector_projected
-                .slice_mut(0..projected_values)?
-                .matrix::<RowMajor>(drafts, self.config.selector_rank, self.config.selector_rank)?,
-            stream,
-        )?;
-        let projected = workspace
-            .selector_projected
-            .copy_prefix_to_pinned_on_stream(
-                &mut workspace.host_projected,
-                projected_values,
-                stream,
-            )?;
-        workspace.selector_sampler.top_k_candidates_into(
-            &workspace.logits,
-            drafts,
-            self.config.selector_top_k,
-            &mut workspace.selector_candidates,
-            stream,
-        )?;
-        let projected = projected.wait()?;
         self.selector.select(
+            &workspace.sample_hidden,
+            &workspace.logits,
             anchor_token,
-            &projected.as_slice()[..projected_values],
-            &workspace.selector_candidates,
-            &mut workspace.drafts,
-        )?;
-        Ok(&workspace.drafts)
+            drafts,
+            &mut workspace.selector,
+            stream,
+        )
     }
 }
 
@@ -1577,19 +1539,18 @@ impl Qwen36TextModel {
             )
     }
 
-    pub(crate) fn dflash2_propose(
+    pub(crate) fn dflash2_propose<'workspace>(
         &self,
         state: &Qwen38DFlash2SequenceState,
         anchor_token: u32,
         draft_tokens: usize,
-        workspace: &mut Qwen38DFlash2Workspace,
+        workspace: &'workspace mut Qwen38DFlash2Workspace,
         stream: &CudaStream,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<&'workspace DeviceBuffer<u32>> {
         self.dflash2
             .as_ref()
             .expect("validated DFlash2 companion")
             .propose(self, state, anchor_token, draft_tokens, workspace, stream)
-            .map(<[u32]>::to_vec)
     }
 }
 
