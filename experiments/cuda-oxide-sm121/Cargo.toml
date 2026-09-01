@@ -1,0 +1,14 @@
+[package]
+name = "cuda-oxide-sm121"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep cuda-oxide's pinned nightly and build graph out of Eider's stable
+# workspace.
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }

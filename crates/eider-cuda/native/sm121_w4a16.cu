@@ -9,7 +9,6 @@ constexpr std::uint32_t kTileM = 16;
 constexpr std::uint32_t kTileK = 16;
 constexpr std::uint32_t kPackedTileBytes = kTileM * kTileK / 2;
 constexpr std::uint32_t kScaleTileBytes = kTileM;
-constexpr std::uint32_t kMaxWarpsPerBlock = 16;
 
 __device__ __forceinline__ std::uint32_t pack_bf16_pair(float low, float high) {
     return static_cast<std::uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(low)))
@@ -72,8 +71,8 @@ __device__ __forceinline__ void mma_m16n8k16(
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template <bool WriteF32>
-__global__ void routed_w4a16_kernel(
+template <bool WriteF32, std::uint32_t WarpsPerBlock>
+__global__ __launch_bounds__(WarpsPerBlock * 32) void routed_w4a16_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* __restrict__ input,
     const std::uint8_t* __restrict__ tiled_weight,
@@ -87,11 +86,10 @@ __global__ void routed_w4a16_kernel(
     std::uint32_t in_features) {
     const std::uint32_t lane = threadIdx.x & 31u;
     const std::uint32_t warp = threadIdx.x >> 5u;
-    const std::uint32_t warps_per_block = blockDim.x >> 5u;
     const std::uint32_t route = blockIdx.y;
     const std::uint32_t out_tile = blockIdx.x;
     const std::uint32_t routes = batch_size * top_k;
-    if (warp >= warps_per_block || route >= routes || out_tile * kTileM >= out_features) {
+    if (route >= routes || out_tile * kTileM >= out_features) {
         return;
     }
 
@@ -117,7 +115,7 @@ __global__ void routed_w4a16_kernel(
     float d2 = 0.0f;
     float d3 = 0.0f;
 
-    for (std::uint32_t k_tile = warp; k_tile < k_tiles; k_tile += warps_per_block) {
+    for (std::uint32_t k_tile = warp; k_tile < k_tiles; k_tile += WarpsPerBlock) {
         const std::size_t tile =
             static_cast<std::size_t>(out_tile) * k_tiles + k_tile;
         const std::uint8_t* tile_weight =
@@ -155,7 +153,7 @@ __global__ void routed_w4a16_kernel(
         mma_m16n8k16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
     }
 
-    __shared__ float partial[kMaxWarpsPerBlock][kTileM];
+    __shared__ float partial[WarpsPerBlock][kTileM];
     if ((lane & 3u) == 0) {
         partial[warp][row0] = d0;
         partial[warp][row1] = d2;
@@ -164,7 +162,7 @@ __global__ void routed_w4a16_kernel(
     if (threadIdx.x < kTileM) {
         float value = 0.0f;
         #pragma unroll
-        for (std::uint32_t partial_index = 0; partial_index < warps_per_block;
+        for (std::uint32_t partial_index = 0; partial_index < WarpsPerBlock;
              ++partial_index) {
             value += partial[partial_index][threadIdx.x];
         }
@@ -198,9 +196,36 @@ cudaError_t launch_routed(
         return cudaErrorInvalidValue;
     }
     const dim3 grid(out_features / kTileM, batch_size * top_k);
-    const std::uint32_t warps_per_block = batch_size == 1 ? 16 : 8;
-    if (output_f32 == nullptr) {
-        routed_w4a16_kernel<false><<<grid, warps_per_block * 32, 0, stream>>>(
+    if (batch_size == 1) {
+        if (output_f32 == nullptr) {
+            routed_w4a16_kernel<false, 16><<<grid, 16 * 32, 0, stream>>>(
+                indices,
+                input,
+                tiled_weight,
+                tiled_scales,
+                global_scales,
+                reinterpret_cast<__nv_bfloat16*>(output_bf16),
+                nullptr,
+                batch_size,
+                top_k,
+                out_features,
+                in_features);
+        } else {
+            routed_w4a16_kernel<true, 16><<<grid, 16 * 32, 0, stream>>>(
+                indices,
+                input,
+                tiled_weight,
+                tiled_scales,
+                global_scales,
+                reinterpret_cast<__nv_bfloat16*>(output_bf16),
+                output_f32,
+                batch_size,
+                top_k,
+                out_features,
+                in_features);
+        }
+    } else if (output_f32 == nullptr) {
+        routed_w4a16_kernel<false, 8><<<grid, 8 * 32, 0, stream>>>(
             indices,
             input,
             tiled_weight,
@@ -213,7 +238,7 @@ cudaError_t launch_routed(
             out_features,
             in_features);
     } else {
-        routed_w4a16_kernel<true><<<grid, warps_per_block * 32, 0, stream>>>(
+        routed_w4a16_kernel<true, 8><<<grid, 8 * 32, 0, stream>>>(
             indices,
             input,
             tiled_weight,
