@@ -71,7 +71,7 @@ __device__ __forceinline__ void mma_m16n8k16(
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-template <bool WriteF32, std::uint32_t WarpsPerBlock>
+template <bool WriteF32, std::uint32_t WarpsPerBlock, std::uint32_t FixedTopK>
 __global__ __launch_bounds__(WarpsPerBlock * 32) void routed_w4a16_kernel(
     const std::uint32_t* __restrict__ indices,
     const float* __restrict__ input,
@@ -88,13 +88,13 @@ __global__ __launch_bounds__(WarpsPerBlock * 32) void routed_w4a16_kernel(
     const std::uint32_t warp = threadIdx.x >> 5u;
     const std::uint32_t route = blockIdx.y;
     const std::uint32_t out_tile = blockIdx.x;
-    const std::uint32_t routes = batch_size * top_k;
+    const std::uint32_t routes = FixedTopK == 0 ? batch_size * top_k : FixedTopK;
     if (route >= routes || out_tile * kTileM >= out_features) {
         return;
     }
 
     const std::uint32_t expert = indices[route];
-    const std::uint32_t input_row = route / top_k;
+    const std::uint32_t input_row = FixedTopK == 0 ? route / top_k : 0;
     const std::uint32_t k_tiles = in_features / kTileK;
     const std::size_t expert_weight_stride =
         static_cast<std::size_t>(out_features) * in_features / 2;
@@ -135,8 +135,8 @@ __global__ __launch_bounds__(WarpsPerBlock * 32) void routed_w4a16_kernel(
         const std::uint8_t* weight_row0 = tile_weight + row0 * (kTileK / 2);
         const std::uint8_t* weight_row1 = tile_weight + row1 * (kTileK / 2);
         const std::uint32_t a0 = dequant_pair(weight_row0[pair0 / 2], scale0);
-        const std::uint32_t a1 = dequant_pair(weight_row0[pair1 / 2], scale0);
-        const std::uint32_t a2 = dequant_pair(weight_row1[pair0 / 2], scale1);
+        const std::uint32_t a1 = dequant_pair(weight_row1[pair0 / 2], scale1);
+        const std::uint32_t a2 = dequant_pair(weight_row0[pair1 / 2], scale0);
         const std::uint32_t a3 = dequant_pair(weight_row1[pair1 / 2], scale1);
 
         std::uint32_t b0 = 0;
@@ -176,6 +176,80 @@ __global__ __launch_bounds__(WarpsPerBlock * 32) void routed_w4a16_kernel(
     }
 }
 
+template <bool WriteF32, std::uint32_t WarpsPerBlock, std::uint32_t FixedTopK>
+void launch_shape(
+    dim3 grid,
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint8_t* tiled_weight,
+    const std::uint8_t* tiled_scales,
+    const float* global_scales,
+    std::uint16_t* output_bf16,
+    float* output_f32,
+    std::uint32_t batch_size,
+    std::uint32_t top_k,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    routed_w4a16_kernel<WriteF32, WarpsPerBlock, FixedTopK>
+        <<<grid, WarpsPerBlock * 32, 0, stream>>>(
+            indices,
+            input,
+            tiled_weight,
+            tiled_scales,
+            global_scales,
+            reinterpret_cast<__nv_bfloat16*>(output_bf16),
+            output_f32,
+            batch_size,
+            top_k,
+            out_features,
+            in_features);
+}
+
+template <bool WriteF32>
+void launch_routed_shape(
+    dim3 grid,
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint8_t* tiled_weight,
+    const std::uint8_t* tiled_scales,
+    const float* global_scales,
+    std::uint16_t* output_bf16,
+    float* output_f32,
+    std::uint32_t batch_size,
+    std::uint32_t top_k,
+    std::uint32_t out_features,
+    std::uint32_t in_features,
+    cudaStream_t stream) {
+    if (batch_size != 1) {
+        launch_shape<WriteF32, 8, 0>(
+            grid, indices, input, tiled_weight, tiled_scales, global_scales,
+            output_bf16, output_f32, batch_size, top_k, out_features,
+            in_features, stream);
+        return;
+    }
+    switch (top_k) {
+        case 8:
+            launch_shape<WriteF32, 16, 8>(
+                grid, indices, input, tiled_weight, tiled_scales, global_scales,
+                output_bf16, output_f32, batch_size, top_k, out_features,
+                in_features, stream);
+            break;
+        case 10:
+            launch_shape<WriteF32, 16, 10>(
+                grid, indices, input, tiled_weight, tiled_scales, global_scales,
+                output_bf16, output_f32, batch_size, top_k, out_features,
+                in_features, stream);
+            break;
+        default:
+            launch_shape<WriteF32, 16, 0>(
+                grid, indices, input, tiled_weight, tiled_scales, global_scales,
+                output_bf16, output_f32, batch_size, top_k, out_features,
+                in_features, stream);
+            break;
+    }
+}
+
 cudaError_t launch_routed(
     const std::uint32_t* indices,
     const float* input,
@@ -196,60 +270,16 @@ cudaError_t launch_routed(
         return cudaErrorInvalidValue;
     }
     const dim3 grid(out_features / kTileM, batch_size * top_k);
-    if (batch_size == 1) {
-        if (output_f32 == nullptr) {
-            routed_w4a16_kernel<false, 16><<<grid, 16 * 32, 0, stream>>>(
-                indices,
-                input,
-                tiled_weight,
-                tiled_scales,
-                global_scales,
-                reinterpret_cast<__nv_bfloat16*>(output_bf16),
-                nullptr,
-                batch_size,
-                top_k,
-                out_features,
-                in_features);
-        } else {
-            routed_w4a16_kernel<true, 16><<<grid, 16 * 32, 0, stream>>>(
-                indices,
-                input,
-                tiled_weight,
-                tiled_scales,
-                global_scales,
-                reinterpret_cast<__nv_bfloat16*>(output_bf16),
-                output_f32,
-                batch_size,
-                top_k,
-                out_features,
-                in_features);
-        }
-    } else if (output_f32 == nullptr) {
-        routed_w4a16_kernel<false, 8><<<grid, 8 * 32, 0, stream>>>(
-            indices,
-            input,
-            tiled_weight,
-            tiled_scales,
-            global_scales,
-            reinterpret_cast<__nv_bfloat16*>(output_bf16),
-            nullptr,
-            batch_size,
-            top_k,
-            out_features,
-            in_features);
+    if (output_f32 == nullptr) {
+        launch_routed_shape<false>(
+            grid, indices, input, tiled_weight, tiled_scales, global_scales,
+            output_bf16, nullptr, batch_size, top_k, out_features, in_features,
+            stream);
     } else {
-        routed_w4a16_kernel<true, 8><<<grid, 8 * 32, 0, stream>>>(
-            indices,
-            input,
-            tiled_weight,
-            tiled_scales,
-            global_scales,
-            reinterpret_cast<__nv_bfloat16*>(output_bf16),
-            output_f32,
-            batch_size,
-            top_k,
-            out_features,
-            in_features);
+        launch_routed_shape<true>(
+            grid, indices, input, tiled_weight, tiled_scales, global_scales,
+            output_bf16, output_f32, batch_size, top_k, out_features,
+            in_features, stream);
     }
     return cudaGetLastError();
 }

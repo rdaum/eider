@@ -157,30 +157,37 @@ It expands each weight tile to BF16 registers during the matvec.
 The correctness case covers the tiled scale layout, the global scale, and BF16 output rounding.
 A two-row case also covers the eight-warp batch kernel.
 
-The first comparison measures the production routed kernel before and after warp-count specialization.
-The values are means from five runs.
+The self-contained routed benchmark later found an error in the BF16 MMA A fragment.
+The kernel supplied its second and third fragment registers in the wrong order.
+Uniform synthetic weights concealed this error.
 
-| Production W4A16 kernel | Runtime warp count | Specialized warp count |
+The benchmark now uses varied E2M1 values and UE4M3 scales.
+It compares direct F32, BF16, and graph outputs with the row-major W4A16 reference.
+The benchmark covers top-1, top-8, and top-10 without a model checkpoint.
+
+After the correction, fixed top-k kernels removed the single-row route division.
+
+| Routed W4A16 gate/up `[1024, 2048]` | Generic top-k | Fixed top-k |
 |---|---:|---:|
-| Gate+up `[34816, 5120]` | about 475 us | about 458 us |
-| Down `[5120, 17408]` | about 284 us | about 270 us |
+| Top-8 | about 39 us | about 37 us |
+| Top-10 | about 48 us | about 46 us |
 
-The specialization improves these synthetic cases by approximately 4 to 5 percent.
-It removes runtime checks from the shared-memory reduction.
+The fixed top-k kernels improve these cases by approximately 5 percent.
+The top-1 specialization had no measurable effect, so the dense path remains generic.
 
-The second comparison removes the routed-batch bookkeeping from both kernels.
+The compiler comparison removes the routed-batch bookkeeping from both kernels.
 Both dense kernels use a fixed 16-warp launch and perform the same stores.
 
 | Dense W4A16 control | cuda-oxide | NVCC |
 |---|---:|---:|
-| Gate+up `[34816, 5120]` | about 467 us | about 452 us |
-| Down `[5120, 17408]` | about 265 us | about 258 us |
+| Gate+up `[34816, 5120]` | about 480 us | about 480 us |
+| Down `[5120, 17408]` | about 264 us | about 264 us |
 | Registers per thread | 40 | 40 |
 | Shared memory | 2 KiB | 2 KiB |
 | Local and stack memory | 0 bytes | 0 bytes |
 
 Both compilers produce spill-free kernels with the same resource use.
-The specialized NVCC control is approximately 3 percent faster.
+The corrected W4A16 comparison shows no measurable compiler advantage.
 
 ## Conclusion
 
@@ -193,8 +200,8 @@ The cuda-oxide schedule helps the long-K shape and has neutral performance on ga
 The W4A16 port also handles shared memory, warp shuffles, BF16 conversion, and BF16 MMA.
 Its resource use matches NVCC, but its schedule does not improve performance.
 
-The experiment found a production improvement: specialize the eight-warp and 16-warp kernels at compile time.
-This change does not require a new backend.
+The routed benchmark found a production improvement in the fixed top-k kernels.
+This improvement does not require a new backend.
 
 cuda-oxide still requires a pinned nightly Rust toolchain.
 The current result does not justify an Eider runtime switch.

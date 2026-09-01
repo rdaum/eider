@@ -455,8 +455,8 @@ mod kernels {
             let (a0, a1, a2, a3) = unsafe {
                 (
                     dequant_bf16_pair(*tiled_weight.get_unchecked(weight_row0 + pair0 / 2), scale0),
-                    dequant_bf16_pair(*tiled_weight.get_unchecked(weight_row0 + pair1 / 2), scale0),
                     dequant_bf16_pair(*tiled_weight.get_unchecked(weight_row1 + pair0 / 2), scale1),
+                    dequant_bf16_pair(*tiled_weight.get_unchecked(weight_row0 + pair1 / 2), scale0),
                     dequant_bf16_pair(*tiled_weight.get_unchecked(weight_row1 + pair1 / 2), scale1),
                 )
             };

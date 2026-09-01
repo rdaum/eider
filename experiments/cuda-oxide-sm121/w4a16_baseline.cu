@@ -102,8 +102,8 @@ __global__ __launch_bounds__(512) void fixed_dense_w4a16_kernel(
         const std::uint8_t* weight_row0 = tile_weight + row0 * (kBenchTileK / 2);
         const std::uint8_t* weight_row1 = tile_weight + row1 * (kBenchTileK / 2);
         const std::uint32_t a0 = dequant_pair(weight_row0[pair0 / 2], scale0);
-        const std::uint32_t a1 = dequant_pair(weight_row0[pair1 / 2], scale0);
-        const std::uint32_t a2 = dequant_pair(weight_row1[pair0 / 2], scale1);
+        const std::uint32_t a1 = dequant_pair(weight_row1[pair0 / 2], scale1);
+        const std::uint32_t a2 = dequant_pair(weight_row0[pair1 / 2], scale0);
         const std::uint32_t a3 = dequant_pair(weight_row1[pair1 / 2], scale1);
 
         std::uint32_t b0 = 0;

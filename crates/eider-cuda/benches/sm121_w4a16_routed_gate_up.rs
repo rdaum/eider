@@ -2,53 +2,53 @@ use eider_cuda::{
     CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, Result, Sm121W4A16GateUp,
     nvfp4_w4a16_matvec_f32_into_on_stream,
 };
-use eider_format::{ModelOptCheckpoint, ModelOptNvfp4Linear};
+use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MetricValue, black_box, run_benchmark_main,
 };
-use std::path::PathBuf;
 use std::time::Duration;
 
 const HIDDEN: usize = 2048;
 const GATE_UP: usize = 1024;
-const TOP_K: usize = 8;
-const EXPERTS: usize = 8;
-const ROUTES: [u32; TOP_K] = [7, 2, 7, 0, 5, 1, 6, 3];
+const EXPERTS: usize = 10;
+const ROUTES: [u32; EXPERTS] = [7, 2, 7, 0, 5, 1, 6, 3, 9, 4];
 
-struct Sm121W4A16RoutedGateUpBench {
+struct Sm121W4A16RoutedGateUpBench<const TOP_K: usize> {
     stream: CudaStream,
     start: CudaEvent,
     stop: CudaEvent,
     plan: Sm121W4A16GateUp,
     weights: Vec<ModelOptNvfp4Linear>,
+    routes: Vec<u32>,
     indices: DeviceBuffer<u32>,
     input: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
     graph: CudaGraphExec,
 }
 
-impl BenchContext for Sm121W4A16RoutedGateUpBench {
+impl<const TOP_K: usize> BenchContext for Sm121W4A16RoutedGateUpBench<TOP_K> {
     fn prepare(_num_chunks: usize) -> Self {
         Self::new().expect("prepare SM121 W4A16 routed gate/up benchmark")
     }
 
     fn chunk_size() -> Option<usize> {
-        Some(20)
+        Some(2_000)
     }
 }
 
-impl Sm121W4A16RoutedGateUpBench {
+impl<const TOP_K: usize> Sm121W4A16RoutedGateUpBench<TOP_K> {
     fn new() -> Result<Self> {
-        let weights = load_weights()?;
-        let plan = Sm121W4A16GateUp::new(&weights)?;
+        let weights = synthetic_weights();
+        let plan = Sm121W4A16GateUp::new_with_top_k(&weights, TOP_K)?;
         let stream = CudaStream::new_blocking()?;
         let input = DeviceBuffer::from_host(
             &(0..HIDDEN)
                 .map(|idx| (((idx * 7) % 17) as f32 - 8.0) * 0.03125)
                 .collect::<Vec<_>>(),
         )?;
-        let indices = DeviceBuffer::from_host(&ROUTES)?;
+        let routes = ROUTES[..TOP_K].to_vec();
+        let indices = DeviceBuffer::from_host(&routes)?;
         let mut output = DeviceBuffer::zeroed(TOP_K * GATE_UP)?;
         let graph = stream
             .capture(|stream| plan.run_on_stream(&indices, &input, output.output(), stream))?;
@@ -58,6 +58,7 @@ impl Sm121W4A16RoutedGateUpBench {
             stop: CudaEvent::new()?,
             plan,
             weights,
+            routes,
             indices,
             input,
             output,
@@ -112,7 +113,7 @@ impl Sm121W4A16RoutedGateUpBench {
         let mut reference = DeviceBuffer::zeroed(GATE_UP)?;
         let mut worst = (0.0f32, 0.0f32, 0.0f32, 0usize, 0usize);
         let mut expected_outputs = Vec::with_capacity(TOP_K);
-        for (slot, &expert) in ROUTES.iter().enumerate() {
+        for (slot, &expert) in self.routes.iter().enumerate() {
             let weight = &self.weights[expert as usize];
             let packed_weight = DeviceBuffer::from_host(&weight.packed_weight)?;
             let weight_scale = DeviceBuffer::from_host(&weight.weight_scale)?;
@@ -147,12 +148,12 @@ impl Sm121W4A16RoutedGateUpBench {
                         .abs()
                         .total_cmp(&(right[worst.4] - worst.1).abs())
                 })
-                .map(|(slot, values)| (slot, ROUTES[slot], values[worst.4]));
+                .map(|(slot, values)| (slot, self.routes[slot], values[worst.4]));
             return Err(eider_cuda::Error::Format {
                 label: "SM121 W4A16 routed gate/up versus W4A16",
                 detail: format!(
                     "slot={} expert={} row={} actual={} expected={} error={} allowed={allowed} nearest={nearest:?}",
-                    worst.3, ROUTES[worst.3], worst.4, worst.1, worst.2, worst.0
+                    worst.3, self.routes[worst.3], worst.4, worst.1, worst.2, worst.0
                 ),
             });
         }
@@ -160,33 +161,33 @@ impl Sm121W4A16RoutedGateUpBench {
     }
 }
 
-fn load_weights() -> Result<Vec<ModelOptNvfp4Linear>> {
-    let checkpoint = ModelOptCheckpoint::open(model_dir())?;
-    let prefix = "model.language_model.layers.0.mlp";
-    let mut weights = Vec::with_capacity(EXPERTS);
-    for expert in 0..EXPERTS {
-        let expert_prefix = format!("{prefix}.experts.{expert}");
-        let gate = checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.gate_proj"))?;
-        let up = checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.up_proj"))?;
-        weights.push(ModelOptNvfp4Linear::concat_out_features(
-            format!("{expert_prefix}.gate_up_proj"),
-            &gate,
-            &up,
-        )?);
-    }
-    Ok(weights)
-}
-
-fn model_dir() -> PathBuf {
-    std::env::var_os("QWEN36_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/qwen3.6-35b-a3-nvfp4")
+fn synthetic_weights() -> Vec<ModelOptNvfp4Linear> {
+    (0..EXPERTS)
+        .map(|expert| {
+            let mut packed_weight = vec![0u8; GATE_UP * HIDDEN / 2];
+            for (index, packed) in packed_weight.iter_mut().enumerate() {
+                let code = 1 + ((index + expert * 3) % 7) as u8;
+                *packed = code | (code << 4);
+            }
+            let mut weight_scale = vec![0u8; GATE_UP * HIDDEN / 16];
+            for (index, scale) in weight_scale.iter_mut().enumerate() {
+                *scale = 0x30 + (((index + expert) % 3) as u8 * 8);
+            }
+            ModelOptNvfp4Linear {
+                prefix: format!("synthetic.experts.{expert}.gate_up_proj"),
+                out_features: GATE_UP,
+                in_features: HIDDEN,
+                packed_weight,
+                weight_scale,
+                weight_scale_2: (expert + 1) as f32 * 0.125,
+                input_scale: 1.0,
+            }
         })
+        .collect()
 }
 
-fn sm121_w4a16_sample(
-    ctx: &mut Sm121W4A16RoutedGateUpBench,
+fn sm121_w4a16_sample<const TOP_K: usize>(
+    ctx: &mut Sm121W4A16RoutedGateUpBench<TOP_K>,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -211,8 +212,8 @@ fn sm121_w4a16_sample(
         .push_metric(MetricValue::integer("slots", TOP_K as i64, "slots"))
 }
 
-fn graph_sample(
-    ctx: &mut Sm121W4A16RoutedGateUpBench,
+fn graph_sample<const TOP_K: usize>(
+    ctx: &mut Sm121W4A16RoutedGateUpBench<TOP_K>,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -237,8 +238,8 @@ fn graph_sample(
         .push_metric(MetricValue::integer("slots", TOP_K as i64, "slots"))
 }
 
-fn sm121_w4a16_bf16_sample(
-    ctx: &mut Sm121W4A16RoutedGateUpBench,
+fn sm121_w4a16_bf16_sample<const TOP_K: usize>(
+    ctx: &mut Sm121W4A16RoutedGateUpBench<TOP_K>,
     chunk_size: usize,
     _chunk_num: usize,
 ) -> BenchSampleResult {
@@ -277,13 +278,25 @@ fn main() {
         ..BenchmarkMainOptions::default()
     };
     run_benchmark_main(options, |runner| {
-        runner.group::<Sm121W4A16RoutedGateUpBench>("NVFP4 SM121 W4A16 routed gate/up", |group| {
-            group.bench_sample("qwen36_layer0_top8_m1024_k2048", sm121_w4a16_sample);
-            group.bench_sample(
-                "qwen36_layer0_top8_m1024_k2048_bf16_output",
-                sm121_w4a16_bf16_sample,
-            );
-            group.bench_sample("qwen36_layer0_top8_m1024_k2048_graph", graph_sample);
+        runner.group::<Sm121W4A16RoutedGateUpBench<1>>("NVFP4 SM121 W4A16 dense", |group| {
+            group.bench_sample("synthetic_top1_m1024_k2048", sm121_w4a16_sample::<1>);
         });
+        runner.group::<Sm121W4A16RoutedGateUpBench<8>>(
+            "NVFP4 SM121 W4A16 routed gate/up top-8",
+            |group| {
+                group.bench_sample("synthetic_top8_m1024_k2048", sm121_w4a16_sample::<8>);
+                group.bench_sample(
+                    "synthetic_top8_m1024_k2048_bf16_output",
+                    sm121_w4a16_bf16_sample::<8>,
+                );
+                group.bench_sample("synthetic_top8_m1024_k2048_graph", graph_sample::<8>);
+            },
+        );
+        runner.group::<Sm121W4A16RoutedGateUpBench<10>>(
+            "NVFP4 SM121 W4A16 routed gate/up top-10",
+            |group| {
+                group.bench_sample("synthetic_top10_m1024_k2048", sm121_w4a16_sample::<10>);
+            },
+        );
     });
 }
