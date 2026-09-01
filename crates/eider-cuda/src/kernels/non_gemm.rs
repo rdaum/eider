@@ -3867,6 +3867,26 @@ pub fn rope_imrope_f32_into_on_stream(
         });
     }
     sections.validate(rotary_dim)?;
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_imrope(
+            input.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            [
+                sections.v0 as u32,
+                sections.v1 as u32,
+                sections.v2 as u32,
+                sections.v3 as u32,
+            ],
+            positions,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_imrope_f32_on_stream",
@@ -3921,6 +3941,27 @@ pub fn rope_imrope_f32_indexed_into_on_stream(
         });
     }
     sections.validate(rotary_dim)?;
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_imrope_indexed(
+            input.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            [
+                sections.v0 as u32,
+                sections.v1 as u32,
+                sections.v2 as u32,
+                sections.v3 as u32,
+            ],
+            positions.ptr,
+            positions.len() as u32,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_imrope_f32_indexed_on_stream",
@@ -3989,6 +4030,27 @@ pub fn rope_imrope_text_batch_f32_into_on_stream(
         });
     }
     sections.validate(rotary_dim)?;
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_imrope_text_batch(
+            input.ptr,
+            output.buffer_mut().ptr,
+            positions.ptr,
+            rows as u32,
+            heads_per_row as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            [
+                sections.v0 as u32,
+                sections.v1 as u32,
+                sections.v2 as u32,
+                sections.v3 as u32,
+            ],
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_imrope_text_batch_f32_on_stream",
@@ -11829,6 +11891,24 @@ pub fn nvfp4_w4a16_top1_configured_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        w4a16_matvec_oxide::launch_top1(
+            input.ptr,
+            packed_weight.ptr,
+            weight_scale.ptr,
+            scratch_value.ptr,
+            scratch_index.ptr,
+            out_index.ptr,
+            out_value.ptr,
+            out_features as u32,
+            in_features as u32,
+            weight_scale_2,
+            warps_per_block as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_nvfp4_w4a16_top1_f32_on_stream",
@@ -17476,6 +17556,60 @@ mod tests {
             &expected,
             2.0e-6,
             "text IMRoPE equals standard partial RoPE",
+        );
+    }
+
+    #[test]
+    fn rope_imrope_text_batch_matches_per_row_partial_rope() {
+        let batch_size = 3usize;
+        let heads = 4usize;
+        let head_dim = 256usize;
+        let rotary_dim = 64usize;
+        let sections = MropeSections {
+            v0: 11,
+            v1: 11,
+            v2: 10,
+            v3: 0,
+        };
+        let positions = [3u32, 19, 47];
+        let theta = 10_000_000.0f32;
+        let row_width = heads * head_dim;
+        let input = (0..batch_size * row_width)
+            .map(|idx| ((idx * 17 % 113) as f32 - 56.0) * 0.007_812_5)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(row_width)
+            .zip(positions)
+            .flat_map(|(row, position)| {
+                cpu_rope_neox_partial(heads, head_dim, rotary_dim, row, position as usize, theta)
+            })
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("batched IMRoPE input upload");
+        let positions_device =
+            DeviceBuffer::from_host(&positions).expect("batched IMRoPE positions upload");
+        let mut output_device =
+            DeviceBuffer::<f32>::zeroed(input.len()).expect("batched IMRoPE alloc");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        rope_imrope_text_batch_f32_into_on_stream(
+            batch_size,
+            heads,
+            head_dim,
+            rotary_dim,
+            sections,
+            &positions_device,
+            &input_device,
+            output_device.output(),
+            theta,
+            &stream,
+        )
+        .expect("batched IMRoPE enqueue");
+        assert_close(
+            &output_device
+                .copy_to_host(&stream)
+                .expect("batched IMRoPE download"),
+            &expected,
+            2.0e-6,
+            "batched text IMRoPE",
         );
     }
 

@@ -237,26 +237,28 @@ fn main() {
         );
     }
 
-    let mut qwen38_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
-    qwen38_nvcc.args([
-        "-std=c++17",
-        "-O3",
-        "--use_fast_math",
-        "-arch=sm_121",
-        "-I",
-        &cuda_include,
-        "-c",
-        "native/qwen38.cu",
-        "-o",
-        &qwen38_object,
-    ]);
-    let qwen38_status = qwen38_nvcc
-        .status()
-        .expect("failed to run nvcc for Qwen3.8 kernels");
-    assert!(
-        qwen38_status.success(),
-        "nvcc failed to build Qwen3.8 kernels"
-    );
+    if !cuda_oxide {
+        let mut qwen38_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+        qwen38_nvcc.args([
+            "-std=c++17",
+            "-O3",
+            "--use_fast_math",
+            "-arch=sm_121",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/qwen38.cu",
+            "-o",
+            &qwen38_object,
+        ]);
+        let qwen38_status = qwen38_nvcc
+            .status()
+            .expect("failed to run nvcc for Qwen3.8 kernels");
+        assert!(
+            qwen38_status.success(),
+            "nvcc failed to build Qwen3.8 kernels"
+        );
+    }
 
     let mut gemma4_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
     gemma4_nvcc.args([
@@ -510,7 +512,6 @@ fn main() {
         ternary_g64_object.as_str(),
         deepseek4_object.as_str(),
         ngram_object.as_str(),
-        qwen38_object.as_str(),
         gemma4_attention_object.as_str(),
         sm12x_mma_object.as_str(),
         cutlass_gemv_object.as_str(),
@@ -518,6 +519,7 @@ fn main() {
     ];
     if !cuda_oxide {
         archive_objects.push(qwen36_gdn_object.as_str());
+        archive_objects.push(qwen38_object.as_str());
         archive_objects.push(sm121_w4a16_object.as_str());
     }
     if std::path::Path::new(&archive).exists() {

@@ -60,6 +60,9 @@ struct Functions {
     rope_partial: Kernel,
     rope_partial_indexed: Kernel,
     rope_partial_sequence: Kernel,
+    rope_imrope: Kernel,
+    rope_imrope_indexed: Kernel,
+    rope_imrope_text_batch: Kernel,
     quantize_fp8_dynamic: Kernel,
     scale_channel_scalar: Kernel,
     scale_channel_row_scalar: Kernel,
@@ -124,6 +127,9 @@ impl Functions {
             rope_partial: Kernel::load(c"rope_neox_partial_f32")?,
             rope_partial_indexed: Kernel::load(c"rope_neox_partial_indexed_f32")?,
             rope_partial_sequence: Kernel::load(c"rope_neox_partial_sequence_f32")?,
+            rope_imrope: Kernel::load(c"rope_imrope_f32")?,
+            rope_imrope_indexed: Kernel::load(c"rope_imrope_indexed_f32")?,
+            rope_imrope_text_batch: Kernel::load(c"rope_imrope_text_batch_f32")?,
             quantize_fp8_dynamic: Kernel::load(c"quantize_fp8_e4m3_dynamic_f32")?,
             scale_channel_scalar: Kernel::load(c"scale_channel_f32_device_scalar")?,
             scale_channel_row_scalar: Kernel::load(c"scale_channel_f32_device_row_scalar")?,
@@ -2172,6 +2178,158 @@ pub(crate) unsafe fn rope_partial_sequence(
     ];
     unsafe {
         functions()?.rope_partial_sequence.launch(
+            LaunchConfig::new(grid(len), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches interleaved MRoPE at host-supplied positions.
+///
+/// # Safety
+///
+/// The buffers must satisfy `rows * head_dim` and remain valid until `stream`
+/// completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rope_imrope(
+    input: *const f32,
+    output: *mut f32,
+    rows: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    sections: [u32; 4],
+    positions: [u32; 4],
+    theta: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut head_dim_arg = head_dim;
+    let mut rotary_dim_arg = rotary_dim;
+    let mut sections_arg = sections;
+    let mut positions_arg = positions;
+    let mut theta_arg = theta;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut head_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[0] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[1] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[2] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[3] as *mut u32).cast::<c_void>(),
+        (&mut positions_arg[0] as *mut u32).cast::<c_void>(),
+        (&mut positions_arg[1] as *mut u32).cast::<c_void>(),
+        (&mut positions_arg[2] as *mut u32).cast::<c_void>(),
+        (&mut positions_arg[3] as *mut u32).cast::<c_void>(),
+        (&mut theta_arg as *mut f32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.rope_imrope.launch(
+            LaunchConfig::new(grid(rows * head_dim), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches interleaved MRoPE at device-supplied positions.
+///
+/// # Safety
+///
+/// The buffers and position vector must remain valid until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rope_imrope_indexed(
+    input: *const f32,
+    output: *mut f32,
+    rows: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    sections: [u32; 4],
+    positions: *const u32,
+    position_count: u32,
+    theta: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut head_dim_arg = head_dim;
+    let mut rotary_dim_arg = rotary_dim;
+    let mut sections_arg = sections;
+    let mut positions_arg = positions;
+    let mut position_count_arg = position_count;
+    let mut theta_arg = theta;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut head_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[0] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[1] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[2] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[3] as *mut u32).cast::<c_void>(),
+        (&mut positions_arg as *mut *const u32).cast::<c_void>(),
+        (&mut position_count_arg as *mut u32).cast::<c_void>(),
+        (&mut theta_arg as *mut f32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.rope_imrope_indexed.launch(
+            LaunchConfig::new(grid(rows * head_dim), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches text interleaved MRoPE for a batch of head rows.
+///
+/// # Safety
+///
+/// The buffers and positions must remain valid until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn rope_imrope_text_batch(
+    input: *const f32,
+    output: *mut f32,
+    positions: *const u32,
+    batch_size: u32,
+    heads_per_row: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    sections: [u32; 4],
+    theta: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut output_arg = output;
+    let mut positions_arg = positions;
+    let mut batch_size_arg = batch_size;
+    let mut heads_per_row_arg = heads_per_row;
+    let mut head_dim_arg = head_dim;
+    let mut rotary_dim_arg = rotary_dim;
+    let mut sections_arg = sections;
+    let mut theta_arg = theta;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut positions_arg as *mut *const u32).cast::<c_void>(),
+        (&mut batch_size_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_per_row_arg as *mut u32).cast::<c_void>(),
+        (&mut head_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[0] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[1] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[2] as *mut u32).cast::<c_void>(),
+        (&mut sections_arg[3] as *mut u32).cast::<c_void>(),
+        (&mut theta_arg as *mut f32).cast::<c_void>(),
+    ];
+    let len = batch_size * heads_per_row * head_dim;
+    unsafe {
+        functions()?.rope_imrope_text_batch.launch(
             LaunchConfig::new(grid(len), block(), 0),
             stream,
             &mut parameters,

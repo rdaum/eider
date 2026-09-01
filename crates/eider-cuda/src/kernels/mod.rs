@@ -11,6 +11,8 @@ pub(crate) mod qwen36_gdn_oxide;
 #[cfg(test)]
 mod qwen36_gdn_reference;
 pub(crate) mod qwen38;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) mod qwen38_oxide;
 pub(crate) mod sm121_w4a16;
 #[cfg(feature = "cuda-oxide")]
 pub(crate) mod sm121_w4a16_oxide;

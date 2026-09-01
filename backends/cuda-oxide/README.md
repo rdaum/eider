@@ -16,14 +16,22 @@ DFlash2 speculation. It includes these Eider kernel groups:
 - dense SM121 W4A16
 - compact FP4 KV cache and attention
 - dense Qwen attention and recurrent or chunked GDN operations
+- interleaved MRoPE for dense Qwen decode and prefill
+- fused NVFP4 LM-head top-1 selection
 - FP8 and NVFP4 activation preparation
 - token sampling and DFlash2 path selection
 - DFlash2 convolution, attention, projection, and state capture.
 
-CUDA, cuBLASLt, and CUTLASS remain external production dependencies. They
-provide device management and matrix plans outside the custom-kernel backend.
-NVCC still compiles other model families. The build does not use silent kernel
-fallbacks for the operations in the list.
+The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
+It still uses the CUDA driver, CUDA runtime, and cuBLASLt.
+
+The server build can include NVCC and CUTLASS kernels for other model paths.
+The operations in the list do not use silent native-kernel fallbacks.
+
+`scripts/run-eider-qwen38.sh` defaults to the dense `qwen3.8-27b` catalogue
+entry. The separate `qwen3.8-flash-next` runtime has cuda-oxide
+hyperconnection, PLE, and QSA primitives. Its complete execution path has not
+yet been audited.
 
 ## Requirements
 
@@ -54,7 +62,7 @@ scripts/run-eider-qwen38.sh --cuda-oxide --offline
 You can also enable the Eider feature directly:
 
 ```sh
-CARGO_OXIDE=.deps/cuda-oxide/bin/cargo-oxide \
+CARGO_OXIDE="$PWD/.deps/cuda-oxide/bin/cargo-oxide" \
   cargo build --release -p eider-api --features cuda-oxide
 ```
 

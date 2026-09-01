@@ -1876,6 +1876,7 @@ unsafe extern "C" {
         k_eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_imrope_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1893,6 +1894,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_imrope_f32_indexed_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1908,6 +1910,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_imrope_text_batch_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -3208,6 +3211,7 @@ unsafe extern "C" {
         output_offset: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_nvfp4_w4a16_top1_f32_on_stream(
         input: *const f32,
         packed_weight: *const u8,
@@ -3509,6 +3513,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_hc_norm_f32_on_stream(
         input: *const f32,
         delta_weight: *const f32,
@@ -3519,12 +3524,14 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_hc_silu_scale_f32_on_stream(
         values: *mut f32,
         count: usize,
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_hc_collapse_f32_on_stream(
         normed: *const f32,
         gate_logits: *const f32,
@@ -3534,6 +3541,7 @@ unsafe extern "C" {
         hc_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_hc_combine_f32_on_stream(
         residual: *const f32,
         block_output: *const f32,
@@ -3544,6 +3552,7 @@ unsafe extern "C" {
         hc_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_repeat_streams_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -3552,6 +3561,7 @@ unsafe extern "C" {
         hc_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_ple_gate_value_f32_on_stream(
         key: *const f32,
         query: *const f32,
@@ -3562,6 +3572,7 @@ unsafe extern "C" {
         hc_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_ple_conv_update_f32_on_stream(
         normalized: *const f32,
         gated: *const f32,
@@ -3574,6 +3585,7 @@ unsafe extern "C" {
         dilation: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_qsa_prepare_and_select_on_stream(
         projection: *const f32,
         q_norm: *const f32,
@@ -3599,6 +3611,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_qsa_append_key_on_stream(
         projection: *const f32,
         key_pool_bf16: *mut u16,

@@ -66,6 +66,8 @@ if [[ "$cuda_oxide" == true ]]; then
     printf 'cargo-oxide is not executable: %s\n' "$CARGO_OXIDE" >&2
     exit 1
   fi
+  cargo_oxide_path="$(command -v "$CARGO_OXIDE")"
+  export CARGO_OXIDE="$(realpath "$cargo_oxide_path")"
 fi
 
 cargo_args=(

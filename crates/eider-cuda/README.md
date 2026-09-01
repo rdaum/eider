@@ -62,13 +62,16 @@ The default build compiles Eider kernels with NVCC. The optional `cuda-oxide`
 feature selects cuda-oxide kernels at compile time.
 
 The cuda-oxide path contains the Qwen3.8 27B target-prefill, target-decode, and
-DFlash2 kernels. This path includes W4A16, compact FP4 KV, chunked and
-recurrent GDN, attention, sampling, and DFlash2 operations. Both builds use the
-same safe Rust API and device layouts.
+DFlash2 kernels. It includes W4A16, compact FP4 KV, GDN, IMRoPE, sampling,
+fused LM-head top-1, and DFlash2 operations. Both builds use the same safe Rust
+API and device layouts.
 
-The feature does not replace CUDA, cuBLASLt, or CUTLASS. These libraries
-provide device management and matrix plans outside the custom-kernel backend.
-NVCC still compiles kernels for other model families.
+The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
+It still uses the CUDA driver, CUDA runtime, and cuBLASLt. The server build can
+include NVCC and CUTLASS kernels for other model paths.
+
+The separate Qwen3.8 Flash Next runtime has cuda-oxide hyperconnection, PLE,
+and QSA primitives. Its complete execution path has not yet been audited.
 
 The `eider-api/cuda-oxide` feature enables this backend in a production server
 build.

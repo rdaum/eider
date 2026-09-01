@@ -5,6 +5,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
 use cuda_device::{
     DynamicSharedArray, SharedArray, convert, cuda_module, kernel, launch_bounds, launch_contract,
 };
@@ -760,6 +761,145 @@ mod kernels {
             * weight_scale_2;
         if warp::lane_id() == 0 {
             unsafe { output.add(row).write(value) };
+        }
+    }
+
+    /// Computes block-local top-1 candidates for a row-major W4A16 matvec.
+    #[kernel]
+    #[launch_bounds(1024)]
+    pub unsafe fn nvfp4_w4a16_top1_pass1_f32(
+        input: *const f32,
+        packed_weight: *const u8,
+        weight_scale: *const u8,
+        scratch_value: *mut f32,
+        scratch_index: *mut u32,
+        out_features: u32,
+        in_features: u32,
+        weight_scale_2: f32,
+    ) {
+        let input_shared = DynamicSharedArray::<f32>::get();
+        let thread_index = thread::threadIdx_x() as usize;
+        let threads = thread::blockDim_x() as usize;
+        let in_features = in_features as usize;
+        let mut col = thread_index;
+        while col < in_features {
+            unsafe { input_shared.add(col).write(*input.add(col)) };
+            col += threads;
+        }
+        let warps_per_block = threads / LANES;
+        let warp_values = unsafe { input_shared.add(in_features) };
+        let warp_indices = unsafe { warp_values.add(warps_per_block).cast::<u32>() };
+        thread::sync_threads();
+
+        let warp_index = thread_index / LANES;
+        let lane = warp::lane_id() as usize;
+        let row = thread::blockIdx_x() as usize * warps_per_block + warp_index;
+        let mut value = f32::NEG_INFINITY;
+        let mut index = 0;
+        if row < out_features as usize {
+            let packed_row = unsafe { packed_weight.add(row * (in_features / 2)) };
+            let row_scale = unsafe { weight_scale.add(row * (in_features / TILE_K)) };
+            value = unsafe {
+                nvfp4_row_dot_warp(packed_row, row_scale, input_shared, in_features)
+            } * weight_scale_2;
+            index = row as u32;
+        }
+        if lane == 0 {
+            unsafe {
+                warp_values.add(warp_index).write(value);
+                warp_indices.add(warp_index).write(index);
+            }
+        }
+        thread::sync_threads();
+
+        let mut stride = warps_per_block / 2;
+        while stride != 0 {
+            if thread_index < stride {
+                let other_value = unsafe { *warp_values.add(thread_index + stride) };
+                let other_index = unsafe { *warp_indices.add(thread_index + stride) };
+                let current_value = unsafe { *warp_values.add(thread_index) };
+                let current_index = unsafe { *warp_indices.add(thread_index) };
+                if other_value > current_value
+                    || (other_value == current_value && other_index < current_index)
+                {
+                    unsafe {
+                        warp_values.add(thread_index).write(other_value);
+                        warp_indices.add(thread_index).write(other_index);
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if thread_index == 0 {
+            unsafe {
+                scratch_value
+                    .add(thread::blockIdx_x() as usize)
+                    .write(*warp_values);
+                scratch_index
+                    .add(thread::blockIdx_x() as usize)
+                    .write(*warp_indices);
+            }
+        }
+    }
+
+    /// Reduces W4A16 block candidates to one top-1 result.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (128, 1, 1))]
+    pub unsafe fn nvfp4_w4a16_top1_final_f32(
+        scratch_value: *const f32,
+        scratch_index: *const u32,
+        out_index: *mut u32,
+        out_value: *mut f32,
+        len: u32,
+    ) {
+        static mut MAX_VALUES: SharedArray<f32, 128> = SharedArray::UNINIT;
+        static mut MAX_INDICES: SharedArray<u32, 128> = SharedArray::UNINIT;
+        let max_values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut MAX_VALUES) };
+        let max_indices = unsafe { SharedArray::as_raw_mut_ptr(&raw mut MAX_INDICES) };
+        let lane = thread::threadIdx_x();
+        let mut best_value = f32::NEG_INFINITY;
+        let mut best_index = 0;
+        let mut candidate = lane;
+        while candidate < len {
+            let value = unsafe { *scratch_value.add(candidate as usize) };
+            let index = unsafe { *scratch_index.add(candidate as usize) };
+            if value > best_value || (value == best_value && index < best_index) {
+                best_value = value;
+                best_index = index;
+            }
+            candidate += thread::blockDim_x();
+        }
+        unsafe {
+            max_values.add(lane as usize).write(best_value);
+            max_indices.add(lane as usize).write(best_index);
+        }
+        thread::sync_threads();
+        let mut stride = thread::blockDim_x() / 2;
+        while stride != 0 {
+            if lane < stride {
+                let other_value = unsafe { *max_values.add((lane + stride) as usize) };
+                let other_index = unsafe { *max_indices.add((lane + stride) as usize) };
+                let current_value = unsafe { *max_values.add(lane as usize) };
+                let current_index = unsafe { *max_indices.add(lane as usize) };
+                if other_value > current_value
+                    || (other_value == current_value && other_index < current_index)
+                {
+                    unsafe {
+                        max_values.add(lane as usize).write(other_value);
+                        max_indices.add(lane as usize).write(other_index);
+                    }
+                }
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe {
+                out_index.write(*max_indices);
+                out_value.write(*max_values);
+            }
         }
     }
 
@@ -4584,6 +4724,217 @@ mod kernels {
         }
     }
 
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn rope_imrope<const MODE: u32>(
+        input: *const f32,
+        output: *mut f32,
+        positions: *const u32,
+        position_count: u32,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        v0: u32,
+        v1: u32,
+        v2: u32,
+        v3: u32,
+        pos_t: u32,
+        pos_h: u32,
+        pos_w: u32,
+        pos_extra: u32,
+        theta: f32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let len = rows * heads * head_dim;
+        if index >= len {
+            return;
+        }
+        let dim = index % head_dim;
+        if dim >= rotary_dim {
+            unsafe { output.add(index as usize).write(*input.add(index as usize)) };
+            return;
+        }
+        let half = rotary_dim / 2;
+        if dim >= half {
+            return;
+        }
+
+        let batch = index / (heads * head_dim);
+        let (position_t, position_h, position_w, position_extra) = if MODE == 0 {
+            (pos_t, pos_h, pos_w, pos_extra)
+        } else if MODE == 1 {
+            let position_t = unsafe { *positions };
+            if position_count == 1 {
+                (position_t, position_t, position_t, 0)
+            } else {
+                (
+                    position_t,
+                    unsafe { *positions.add(1) },
+                    unsafe { *positions.add(2) },
+                    unsafe { *positions.add(3) },
+                )
+            }
+        } else {
+            let position = unsafe { *positions.add(batch as usize) };
+            (position, position, position, 0)
+        };
+        let section_dims = v0 + v1 + v2 + v3;
+        let sector = dim % section_dims;
+        let position = if sector % 3 == 1 && sector < 3 * v1 {
+            position_h
+        } else if sector % 3 == 2 && sector < 3 * v2 {
+            position_w
+        } else if sector % 3 == 0 && sector < 3 * v0 {
+            position_t
+        } else {
+            position_extra
+        };
+        let exponent = -2.0 * dim as f32 / rotary_dim as f32;
+        let angle = position as f32 * theta.powf(exponent);
+        let sine = cuda_device::float::sin_approx_f32(angle);
+        let cosine = cuda_device::float::cos_approx_f32(angle);
+        let row_start = (index / head_dim) * head_dim;
+        let first = unsafe { *input.add((row_start + dim) as usize) };
+        let second = unsafe { *input.add((row_start + dim + half) as usize) };
+        unsafe {
+            output
+                .add((row_start + dim) as usize)
+                .write(first * cosine - second * sine);
+            output
+                .add((row_start + dim + half) as usize)
+                .write(first * sine + second * cosine);
+        }
+    }
+
+    /// Applies interleaved MRoPE at host-supplied positions.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_imrope_f32(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        v0: u32,
+        v1: u32,
+        v2: u32,
+        v3: u32,
+        pos_t: u32,
+        pos_h: u32,
+        pos_w: u32,
+        pos_extra: u32,
+        theta: f32,
+    ) {
+        unsafe {
+            rope_imrope::<0>(
+                input,
+                output,
+                core::ptr::null(),
+                0,
+                rows,
+                1,
+                head_dim,
+                rotary_dim,
+                v0,
+                v1,
+                v2,
+                v3,
+                pos_t,
+                pos_h,
+                pos_w,
+                pos_extra,
+                theta,
+            )
+        }
+    }
+
+    /// Applies interleaved MRoPE at device-supplied positions.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_imrope_indexed_f32(
+        input: *const f32,
+        output: *mut f32,
+        rows: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        v0: u32,
+        v1: u32,
+        v2: u32,
+        v3: u32,
+        positions: *const u32,
+        position_count: u32,
+        theta: f32,
+    ) {
+        unsafe {
+            rope_imrope::<1>(
+                input,
+                output,
+                positions,
+                position_count,
+                rows,
+                1,
+                head_dim,
+                rotary_dim,
+                v0,
+                v1,
+                v2,
+                v3,
+                0,
+                0,
+                0,
+                0,
+                theta,
+            )
+        }
+    }
+
+    /// Applies text interleaved MRoPE to a batch of head rows.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_imrope_text_batch_f32(
+        input: *const f32,
+        output: *mut f32,
+        positions: *const u32,
+        batch_size: u32,
+        heads_per_row: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        v0: u32,
+        v1: u32,
+        v2: u32,
+        v3: u32,
+        theta: f32,
+    ) {
+        unsafe {
+            rope_imrope::<2>(
+                input,
+                output,
+                positions,
+                batch_size,
+                batch_size,
+                heads_per_row,
+                head_dim,
+                rotary_dim,
+                v0,
+                v1,
+                v2,
+                v3,
+                0,
+                0,
+                0,
+                0,
+                theta,
+            )
+        }
+    }
+
     /// Dynamically quantizes independent f32 rows to E4M3.
     #[kernel]
     #[launch_bounds(256)]
@@ -6215,5 +6566,656 @@ mod kernels {
                 thread::blockIdx_y(),
             )
         }
+    }
+
+    #[inline(always)]
+    unsafe fn qwen38_rope_value(
+        values: *const f32,
+        dim: u32,
+        rotary_dim: u32,
+        position: u32,
+        theta: f32,
+    ) -> f32 {
+        if dim >= rotary_dim {
+            return unsafe { *values.add(dim as usize) };
+        }
+        let half = rotary_dim / 2;
+        let pair = dim % half;
+        let exponent = -2.0 * pair as f32 / rotary_dim as f32;
+        let angle = position as f32 * theta.powf(exponent);
+        let first = unsafe { *values.add(pair as usize) };
+        let second = unsafe { *values.add((pair + half) as usize) };
+        if dim < half {
+            first * angle.cos() - second * angle.sin()
+        } else {
+            second * angle.cos() + first * angle.sin()
+        }
+    }
+
+    /// Applies per-stream RMS normalization for Qwen3.8 Flash Next hyperconnections.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_hc_norm_f32(
+        input: *const f32,
+        delta_weight: *const f32,
+        output: *mut f32,
+        hidden: u32,
+        hc_count: u32,
+        eps: f32,
+    ) {
+        static mut REDUCTION: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
+        let group = thread::blockIdx_x();
+        let branch = group % hc_count;
+        let lane = thread::threadIdx_x();
+        let offset = group as usize * hidden as usize;
+        let mut square_sum = 0.0f32;
+        let mut col = lane;
+        while col < hidden {
+            let value = unsafe { *input.add(offset + col as usize) };
+            square_sum = value.mul_add(value, square_sum);
+            col += thread::blockDim_x();
+        }
+        unsafe { reduction.add(lane as usize).write(square_sum) };
+        thread::sync_threads();
+        let mut stride = thread::blockDim_x() / 2;
+        while stride != 0 {
+            if lane < stride {
+                unsafe {
+                    *reduction.add(lane as usize) += *reduction.add((lane + stride) as usize)
+                };
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        let inverse_rms = 1.0 / (unsafe { *reduction } / hidden as f32 + eps).sqrt();
+        let weight_offset = branch as usize * hidden as usize;
+        col = lane;
+        while col < hidden {
+            let index = offset + col as usize;
+            unsafe {
+                output.add(index).write(
+                    *input.add(index)
+                        * inverse_rms
+                        * (1.0 + *delta_weight.add(weight_offset + col as usize)),
+                )
+            };
+            col += thread::blockDim_x();
+        }
+    }
+
+    /// Applies scaled SiLU for a Qwen3.8 Flash Next hyperconnection.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn qwen38_hc_silu_scale_f32(values: *mut f32, count: u64, scale: f32) {
+        let index = thread::blockIdx_x() as u64 * thread::blockDim_x() as u64
+            + thread::threadIdx_x() as u64;
+        if index < count {
+            let value = unsafe { *values.add(index as usize) } * scale;
+            unsafe { values.add(index as usize).write(value * sigmoid(value)) };
+        }
+    }
+
+    /// Collapses Qwen3.8 Flash Next streams with learned sigmoid gates.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_hc_collapse_f32(
+        normed: *const f32,
+        gate_logits: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let count = tokens * hidden;
+        if index >= count {
+            return;
+        }
+        let token = index / hidden;
+        let col = index - token * hidden;
+        let token_offset = token as usize * hc_count as usize * hidden as usize;
+        let mut sum = 0.0f32;
+        let mut branch = 0;
+        while branch < hc_count {
+            let offset = token_offset + branch as usize * hidden as usize + col as usize;
+            sum += sigmoid(unsafe { *gate_logits.add(offset) }) * unsafe { *normed.add(offset) };
+            branch += 1;
+        }
+        unsafe { output.add(index as usize).write(sum / hc_count as f32) };
+    }
+
+    /// Injects one Qwen3.8 Flash Next block output into all streams.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_hc_combine_f32(
+        residual: *const f32,
+        block_output: *const f32,
+        inject_logits: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let stream_width = hc_count * hidden;
+        let count = tokens * stream_width;
+        if index >= count {
+            return;
+        }
+        let token = index / stream_width;
+        let within_token = index - token * stream_width;
+        let branch = within_token / hidden;
+        let col = within_token - branch * hidden;
+        let logit =
+            unsafe { *inject_logits.add((token * hc_count + branch) as usize) } / hc_count as f32;
+        let injection = 2.0 * sigmoid(logit);
+        unsafe {
+            output.add(index as usize).write(
+                *residual.add(index as usize)
+                    + injection * *block_output.add((token * hidden + col) as usize),
+            )
+        };
+    }
+
+    /// Repeats each Qwen3.8 Flash Next hidden row across its streams.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_repeat_streams_f32(
+        input: *const f32,
+        output: *mut f32,
+        tokens: u32,
+        hidden: u32,
+        hc_count: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let stream_width = hc_count * hidden;
+        let count = tokens * stream_width;
+        if index < count {
+            let token = index / stream_width;
+            let col = index % hidden;
+            unsafe {
+                output
+                    .add(index as usize)
+                    .write(*input.add((token * hidden + col) as usize))
+            };
+        }
+    }
+
+    /// Computes the signed-square-root gate for Qwen3.8 Flash Next PLE values.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_ple_gate_value_f32(
+        key: *const f32,
+        query: *const f32,
+        value: *const f32,
+        gated: *mut f32,
+        hidden: u32,
+        hc_count: u32,
+    ) {
+        static mut REDUCTION: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
+        let group = thread::blockIdx_x();
+        let token = group / hc_count;
+        let lane = thread::threadIdx_x();
+        let stream_offset = group as usize * hidden as usize;
+        let mut dot = 0.0f32;
+        let mut col = lane;
+        while col < hidden {
+            let index = stream_offset + col as usize;
+            dot = unsafe { (*key.add(index)).mul_add(*query.add(index), dot) };
+            col += thread::blockDim_x();
+        }
+        unsafe { reduction.add(lane as usize).write(dot) };
+        thread::sync_threads();
+        let mut stride = thread::blockDim_x() / 2;
+        while stride != 0 {
+            if lane < stride {
+                unsafe {
+                    *reduction.add(lane as usize) += *reduction.add((lane + stride) as usize)
+                };
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        let scaled = unsafe { *reduction } / (hidden as f32).sqrt();
+        let signed_root = if scaled > 0.0 {
+            scaled.max(1.0e-6).sqrt()
+        } else if scaled < 0.0 {
+            -(-scaled).max(1.0e-6).sqrt()
+        } else {
+            0.0
+        };
+        let gate = sigmoid(signed_root);
+        let value_offset = token as usize * hidden as usize;
+        col = lane;
+        while col < hidden {
+            unsafe {
+                gated
+                    .add(stream_offset + col as usize)
+                    .write(gate * *value.add(value_offset + col as usize))
+            };
+            col += thread::blockDim_x();
+        }
+    }
+
+    /// Applies the Qwen3.8 Flash Next PLE convolution and updates its state.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_ple_conv_update_f32(
+        normalized: *const f32,
+        gated: *const f32,
+        weight_bf16: *const u16,
+        state: *mut f32,
+        output: *mut f32,
+        tokens: u32,
+        channels: u32,
+        kernel: u32,
+        dilation: u32,
+        history: u32,
+    ) {
+        let channel = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if channel >= channels {
+            return;
+        }
+        let state_offset = channel as usize * history as usize;
+        let weight_offset = channel as usize * kernel as usize;
+        let mut token = 0;
+        while token < tokens {
+            let mut conv = 0.0f32;
+            let mut tap = 0;
+            while tap < kernel {
+                let lag = (kernel - 1 - tap) * dilation;
+                let centre = history + token;
+                let source = centre - lag;
+                let x = if source < history {
+                    unsafe { *state.add(state_offset + source as usize) }
+                } else {
+                    unsafe { *normalized.add(((source - history) * channels + channel) as usize) }
+                };
+                conv = x.mul_add(
+                    bf16_to_f32(unsafe { *weight_bf16.add(weight_offset + tap as usize) }),
+                    conv,
+                );
+                tap += 1;
+            }
+            let index = (token * channels + channel) as usize;
+            unsafe {
+                output
+                    .add(index)
+                    .write(*gated.add(index) + conv * sigmoid(conv))
+            };
+            token += 1;
+        }
+        let mut position = 0;
+        while position < history {
+            let source = tokens + position;
+            let next = if source < history {
+                unsafe { *state.add(state_offset + source as usize) }
+            } else {
+                unsafe { *normalized.add(((source - history) * channels + channel) as usize) }
+            };
+            unsafe { state.add(state_offset + position as usize).write(next) };
+            position += 1;
+        }
+    }
+
+    /// Clears Qwen3.8 Flash Next QSA micro-block and tile masks.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_qsa_clear_masks(
+        selected_blocks: *mut u8,
+        selected_tiles: *mut u8,
+        max_blocks: u32,
+        max_tiles: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if index < max_blocks {
+            unsafe { selected_blocks.add(index as usize).write(0) };
+        }
+        if index < max_tiles {
+            unsafe { selected_tiles.add(index as usize).write(0) };
+        }
+    }
+
+    /// Prepares normalized, rotary Qwen3.8 Flash Next QSA queries.
+    #[kernel]
+    #[launch_bounds(1024)]
+    pub unsafe fn qwen38_qsa_prepare_query_f32(
+        projection: *const f32,
+        q_norm: *const f32,
+        query: *mut f32,
+        head_dim: u32,
+        rotary_dim: u32,
+        position: u32,
+        eps: f32,
+        theta: f32,
+    ) {
+        static mut VALUES: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VALUES) };
+        let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
+        let head = thread::blockIdx_x();
+        let dim = thread::threadIdx_x();
+        let index = (head * head_dim + dim) as usize;
+        let value = unsafe { *projection.add(index) };
+        unsafe {
+            values.add(dim as usize).write(value);
+            reduction.add(dim as usize).write(value * value);
+        }
+        thread::sync_threads();
+        let mut stride = head_dim / 2;
+        while stride != 0 {
+            if dim < stride {
+                unsafe { *reduction.add(dim as usize) += *reduction.add((dim + stride) as usize) };
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        let inverse_rms = 1.0 / (unsafe { *reduction } / head_dim as f32 + eps).sqrt();
+        unsafe { *values.add(dim as usize) = value * inverse_rms * *q_norm.add(dim as usize) };
+        thread::sync_threads();
+        unsafe {
+            query
+                .add(index)
+                .write(qwen38_rope_value(values, dim, rotary_dim, position, theta))
+        };
+    }
+
+    /// Appends the raw BF16 QSA index key for one Qwen3.8 Flash Next token.
+    #[kernel]
+    #[launch_bounds(128)]
+    pub unsafe fn qwen38_qsa_append_key_f32(
+        projection: *const f32,
+        key_pool_bf16: *mut u16,
+        slot: u32,
+        page_offset: u32,
+        page_tokens: u32,
+        heads: u32,
+        head_dim: u32,
+    ) {
+        let dim = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if dim < head_dim {
+            let source = (heads * head_dim + dim) as usize;
+            let destination = ((slot * page_tokens + page_offset) * head_dim + dim) as usize;
+            let encoded = convert::cvt_bf16x2_f32(unsafe { *projection.add(source) }, 0.0) as u16;
+            unsafe { key_pool_bf16.add(destination).write(encoded) };
+        }
+    }
+
+    /// Scores complete four-token QSA micro-blocks.
+    #[kernel]
+    #[launch_bounds(1024)]
+    pub unsafe fn qwen38_qsa_score_blocks_f32(
+        query: *const f32,
+        key_pool_bf16: *const u16,
+        page_table: *const u32,
+        k_norm: *const f32,
+        scores: *mut f32,
+        page_tokens: u32,
+        heads: u32,
+        head_dim: u32,
+        rotary_dim: u32,
+        eps: f32,
+        theta: f32,
+    ) {
+        static mut VALUES: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VALUES) };
+        let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
+        let block = thread::blockIdx_x();
+        let dim = thread::threadIdx_x();
+        let token = block * 4;
+        let page_slot = unsafe { *page_table.add((token / page_tokens) as usize) };
+        let page_offset = token % page_tokens;
+        let page_base = page_slot as usize * page_tokens as usize * head_dim as usize;
+        let mut pooled = 0.0f32;
+        let mut row = 0;
+        while row < 4 {
+            pooled += bf16_to_f32(unsafe {
+                *key_pool_bf16.add(
+                    page_base + (page_offset + row) as usize * head_dim as usize + dim as usize,
+                )
+            });
+            row += 1;
+        }
+        pooled = round_to_bf16(pooled * 0.25);
+        unsafe {
+            values.add(dim as usize).write(pooled);
+            reduction.add(dim as usize).write(pooled * pooled);
+        }
+        thread::sync_threads();
+        let mut stride = head_dim / 2;
+        while stride != 0 {
+            if dim < stride {
+                unsafe { *reduction.add(dim as usize) += *reduction.add((dim + stride) as usize) };
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        let inverse_rms = 1.0 / (unsafe { *reduction } / head_dim as f32 + eps).sqrt();
+        unsafe { *values.add(dim as usize) = pooled * inverse_rms * *k_norm.add(dim as usize) };
+        thread::sync_threads();
+        let key = unsafe { qwen38_rope_value(values, dim, rotary_dim, token, theta) };
+        let mut score = 0.0f32;
+        let mut head = 0;
+        while head < heads {
+            let dot = unsafe { *query.add((head * head_dim + dim) as usize) } * key;
+            unsafe { reduction.add(dim as usize).write(dot) };
+            thread::sync_threads();
+            stride = head_dim / 2;
+            while stride != 0 {
+                if dim < stride {
+                    unsafe {
+                        *reduction.add(dim as usize) += *reduction.add((dim + stride) as usize)
+                    };
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            if dim == 0 {
+                score += unsafe { *reduction }.max(0.0);
+            }
+            thread::sync_threads();
+            head += 1;
+        }
+        if dim == 0 {
+            unsafe {
+                scores
+                    .add(block as usize)
+                    .write(score / (head_dim as f32).sqrt())
+            };
+        }
+    }
+
+    /// Selects the highest-scoring QSA micro-blocks with stable index ties.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_qsa_select_blocks_f32(
+        scores: *const f32,
+        selected_blocks: *mut u8,
+        complete_blocks: u32,
+        selected_complete_blocks: u32,
+        tail_tokens: u32,
+    ) {
+        static mut HISTOGRAM: SharedArray<u32, 256> = SharedArray::UNINIT;
+        static mut REDUCTION: SharedArray<u32, 256> = SharedArray::UNINIT;
+        static mut PREFIX: SharedArray<u32, 1> = SharedArray::UNINIT;
+        static mut RANK: SharedArray<u32, 1> = SharedArray::UNINIT;
+        static mut COUNT: SharedArray<u32, 1> = SharedArray::UNINIT;
+        static mut TIE_CUTOFF: SharedArray<u32, 1> = SharedArray::UNINIT;
+        let histogram = unsafe { SharedArray::as_raw_mut_ptr(&raw mut HISTOGRAM) };
+        let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
+        let prefix = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PREFIX) };
+        let rank = unsafe { SharedArray::as_raw_mut_ptr(&raw mut RANK) };
+        let count = unsafe { SharedArray::as_raw_mut_ptr(&raw mut COUNT) };
+        let tie_cutoff = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TIE_CUTOFF) };
+        let lane = thread::threadIdx_x();
+        if complete_blocks <= selected_complete_blocks {
+            let mut block = lane;
+            while block < complete_blocks {
+                unsafe { selected_blocks.add(block as usize).write(1) };
+                block += thread::blockDim_x();
+            }
+            if tail_tokens != 0 && lane == 0 {
+                unsafe { selected_blocks.add(complete_blocks as usize).write(1) };
+            }
+            return;
+        }
+        if lane == 0 {
+            unsafe {
+                prefix.write(0);
+                rank.write(selected_complete_blocks);
+            }
+        }
+        thread::sync_threads();
+        let mut shift = 24u32;
+        loop {
+            unsafe { histogram.add(lane as usize).write(0) };
+            thread::sync_threads();
+            let higher_mask = if shift == 24 {
+                0
+            } else {
+                !((1u32 << (shift + 8)) - 1)
+            };
+            let current_prefix = unsafe { *prefix };
+            let mut block = lane;
+            while block < complete_blocks {
+                let score = unsafe { *scores.add(block as usize) };
+                let bits = if score.is_finite() {
+                    score.max(0.0)
+                } else {
+                    0.0
+                }
+                .to_bits();
+                if bits & higher_mask == current_prefix {
+                    let bucket = ((bits >> shift) & 0xff) as usize;
+                    unsafe {
+                        BlockAtomicU32::from_ptr(histogram.add(bucket))
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+                block += thread::blockDim_x();
+            }
+            thread::sync_threads();
+            if lane == 0 {
+                let mut higher = 0u32;
+                let mut byte = 255u32;
+                loop {
+                    let next = higher + unsafe { *histogram.add(byte as usize) };
+                    if unsafe { *rank } <= next {
+                        unsafe {
+                            *prefix |= byte << shift;
+                            *rank -= higher;
+                        }
+                        break;
+                    }
+                    higher = next;
+                    if byte == 0 {
+                        break;
+                    }
+                    byte -= 1;
+                }
+            }
+            thread::sync_threads();
+            if shift == 0 {
+                break;
+            }
+            shift -= 8;
+        }
+        let selected_bits = unsafe { *prefix };
+        let mut local_greater = 0u32;
+        let mut block = lane;
+        while block < complete_blocks {
+            let score = unsafe { *scores.add(block as usize) };
+            let bits = if score.is_finite() {
+                score.max(0.0)
+            } else {
+                0.0
+            }
+            .to_bits();
+            local_greater += u32::from(bits > selected_bits);
+            block += thread::blockDim_x();
+        }
+        unsafe { reduction.add(lane as usize).write(local_greater) };
+        thread::sync_threads();
+        let mut stride = thread::blockDim_x() / 2;
+        while stride != 0 {
+            if lane < stride {
+                unsafe {
+                    *reduction.add(lane as usize) += *reduction.add((lane + stride) as usize)
+                };
+            }
+            thread::sync_threads();
+            stride /= 2;
+        }
+        if lane == 0 {
+            unsafe { count.write(selected_complete_blocks - *reduction) };
+            let mut seen = 0u32;
+            let mut candidate = 0u32;
+            while candidate < complete_blocks {
+                let score = unsafe { *scores.add(candidate as usize) };
+                let bits = if score.is_finite() {
+                    score.max(0.0)
+                } else {
+                    0.0
+                }
+                .to_bits();
+                if bits == selected_bits {
+                    seen += 1;
+                    if seen == unsafe { *count } {
+                        unsafe { tie_cutoff.write(candidate) };
+                        break;
+                    }
+                }
+                candidate += 1;
+            }
+        }
+        thread::sync_threads();
+        block = lane;
+        while block < complete_blocks {
+            let score = unsafe { *scores.add(block as usize) };
+            let bits = if score.is_finite() {
+                score.max(0.0)
+            } else {
+                0.0
+            }
+            .to_bits();
+            let selected =
+                bits > selected_bits || (bits == selected_bits && block <= unsafe { *tie_cutoff });
+            unsafe {
+                selected_blocks
+                    .add(block as usize)
+                    .write(u8::from(selected))
+            };
+            block += thread::blockDim_x();
+        }
+        if tail_tokens != 0 && lane == 0 {
+            unsafe { selected_blocks.add(complete_blocks as usize).write(1) };
+        }
+    }
+
+    /// Builds the selected compact-attention tile mask from QSA micro-blocks.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_qsa_build_tile_mask(
+        selected_blocks: *const u8,
+        selected_tiles: *mut u8,
+        visible_blocks: u32,
+    ) {
+        let tile = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let block_start = tile * 16;
+        if block_start >= visible_blocks {
+            return;
+        }
+        let block_end = (block_start + 16).min(visible_blocks);
+        let mut selected = false;
+        let mut block = block_start;
+        while block < block_end {
+            selected |= unsafe { *selected_blocks.add(block as usize) } != 0;
+            block += 1;
+        }
+        unsafe { selected_tiles.add(tile as usize).write(u8::from(selected)) };
     }
 }

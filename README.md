@@ -405,17 +405,21 @@ The default build compiles Eider kernels with NVCC. The optional `cuda-oxide`
 feature selects the cuda-oxide implementation at compile time.
 
 The cuda-oxide path supports Qwen3.8 27B target prefill and decode with DFlash2
-speculation. It includes dense W4A16, compact FP4 KV, chunked and recurrent
-GDN, attention, sampling, and DFlash2 kernels. The build uses the same safe
-Rust host API and device layouts.
+speculation. It includes dense W4A16, compact FP4 KV, GDN, IMRoPE, sampling,
+fused LM-head top-1, and DFlash2 kernels. Both builds use the same safe Rust
+host API and device layouts.
 
-The server still links CUDA, cuBLASLt, and CUTLASS. These libraries provide
-device management and the matrix plans that are outside the custom-kernel
-backend. NVCC still compiles kernels for other model families.
+The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
+It still uses the CUDA driver, CUDA runtime, and cuBLASLt. The server build can
+include NVCC and CUTLASS kernels for other model paths.
+
+The launcher defaults to the dense `qwen3.8-27b` catalogue entry. The separate
+`qwen3.8-flash-next` runtime also has cuda-oxide hyperconnection, PLE, and QSA
+primitives, but its complete execution path has not yet been audited.
 
 ```sh
 scripts/setup-cuda-oxide.sh
-CARGO_OXIDE=.deps/cuda-oxide/bin/cargo-oxide \
+CARGO_OXIDE="$PWD/.deps/cuda-oxide/bin/cargo-oxide" \
   cargo build --release -p eider-api --features cuda-oxide
 scripts/run-eider-qwen38.sh --cuda-oxide --offline
 ```

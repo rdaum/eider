@@ -4,6 +4,8 @@ use crate::SM12X_KV_PAGE_TOKENS;
 use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::qwen38_oxide;
 use std::mem::size_of;
 
 /// Stable-slot BF16 storage for the raw QSA index key emitted for each token.
@@ -140,6 +142,20 @@ impl Qwen38QsaIndexPool {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen38_oxide::qsa_append_key(
+                projection.ptr,
+                self.values.ptr,
+                slot as u32,
+                page_offset as u32,
+                SM12X_KV_PAGE_TOKENS as u32,
+                heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen38_qsa_append_key_on_stream",
@@ -254,6 +270,34 @@ impl Qwen38QsaSelectionWorkspace {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen38_oxide::qsa_prepare_and_select(
+                projection.ptr,
+                q_norm.ptr,
+                k_norm.ptr,
+                pool.values.ptr,
+                page_table.as_const_ptr().cast(),
+                self.query.ptr,
+                self.scores.ptr,
+                self.selected_blocks.ptr,
+                self.selected_tiles.ptr,
+                slot as u32,
+                page_offset as u32,
+                cache_len as u32,
+                self.max_tokens as u32,
+                SM12X_KV_PAGE_TOKENS as u32,
+                self.heads as u32,
+                self.head_dim as u32,
+                rotary_dim as u32,
+                self.compress_ratio as u32,
+                self.budget as u32,
+                eps,
+                theta,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen38_qsa_prepare_and_select_on_stream",
@@ -347,6 +391,20 @@ pub fn qwen38_hc_norm_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::hc_norm(
+            input.ptr,
+            delta_weight.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            hidden as u32,
+            hc_count as u32,
+            eps,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_hc_norm_f32_on_stream",
@@ -378,6 +436,16 @@ pub fn qwen38_hc_silu_scale_f32_in_place_on_stream(
             actual: format!("count={count} buffer={} hc_count={hc_count}", values.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::hc_silu_scale(
+            values.as_mut_ptr().cast(),
+            count,
+            1.0 / hc_count as f32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_hc_silu_scale_f32_on_stream",
@@ -425,6 +493,19 @@ pub fn qwen38_hc_collapse_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::hc_collapse(
+            normed.ptr,
+            gate_logits.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            hidden as u32,
+            hc_count as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_hc_collapse_f32_on_stream",
@@ -481,6 +562,20 @@ pub fn qwen38_hc_combine_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::hc_combine(
+            residual.ptr,
+            block_output.ptr,
+            inject_logits.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            hidden as u32,
+            hc_count as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_hc_combine_f32_on_stream",
@@ -517,6 +612,18 @@ pub fn qwen38_repeat_streams_f32_into_on_stream(
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::repeat_streams(
+            input.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            hidden as u32,
+            hc_count as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_repeat_streams_f32_on_stream",
@@ -569,6 +676,20 @@ pub fn qwen38_ple_gate_value_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::ple_gate_value(
+            key_normed.ptr,
+            query_normed.ptr,
+            value.ptr,
+            gated.buffer_mut().ptr,
+            tokens as u32,
+            hidden as u32,
+            hc_count as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_ple_gate_value_f32_on_stream",
@@ -640,6 +761,22 @@ pub fn qwen38_ple_conv_update_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::ple_conv_update(
+            normalized.ptr,
+            gated.ptr,
+            weight_bf16.ptr,
+            state.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            channels as u32,
+            kernel as u32,
+            dilation as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen38_ple_conv_update_f32_on_stream",
