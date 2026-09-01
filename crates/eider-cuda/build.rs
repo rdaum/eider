@@ -556,7 +556,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../backends/cuda-oxide/Cargo.toml");
     println!("cargo:rerun-if-changed=../../backends/cuda-oxide/Cargo.lock");
     println!("cargo:rerun-if-changed=../../backends/cuda-oxide/rust-toolchain.toml");
-    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/src");
     println!("cargo:rerun-if-changed=native/cutlass_gemv.cu");
     println!("cargo:rerun-if-changed=native/cutlass_gemv_stub.cpp");
     println!("cargo:rerun-if-changed=native/cutlass_grouped_gemm.cu");
