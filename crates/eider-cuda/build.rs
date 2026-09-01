@@ -5,7 +5,7 @@ fn main() {
     let workspace_root = manifest_dir
         .parent()
         .and_then(|path| path.parent())
-        .expect("nvfp4 is under crates/");
+        .expect("eider-cuda is under crates/");
     let default_deps_dir = workspace_root.join(".deps");
     let default_cutlass_dir = default_deps_dir.join("cutlass");
     let default_cutlass_build_dir = default_deps_dir.join("cutlass-build-sm121");
@@ -63,6 +63,7 @@ fn main() {
         );
     }
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+    let cuda_oxide = std::env::var_os("CARGO_FEATURE_CUDA_OXIDE").is_some();
     let oracle_object = format!("{out_dir}/fp4_oracle.o");
     let gpu_counters_object = format!("{out_dir}/gpu_counters.o");
     let non_gemm_object = format!("{out_dir}/non_gemm.o");
@@ -213,26 +214,28 @@ fn main() {
         "nvcc failed to build n-gram embedding kernels"
     );
 
-    let mut qwen36_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
-    qwen36_nvcc.args([
-        "-std=c++17",
-        "-O3",
-        "--use_fast_math",
-        "-arch=sm_121",
-        "-I",
-        &cuda_include,
-        "-c",
-        "native/qwen36_gdn.cu",
-        "-o",
-        &qwen36_gdn_object,
-    ]);
-    let qwen36_status = qwen36_nvcc
-        .status()
-        .expect("failed to run nvcc for Qwen3.6 GDN kernels");
-    assert!(
-        qwen36_status.success(),
-        "nvcc failed to build Qwen3.6 GDN kernels"
-    );
+    if !cuda_oxide {
+        let mut qwen36_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+        qwen36_nvcc.args([
+            "-std=c++17",
+            "-O3",
+            "--use_fast_math",
+            "-arch=sm_121",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/qwen36_gdn.cu",
+            "-o",
+            &qwen36_gdn_object,
+        ]);
+        let qwen36_status = qwen36_nvcc
+            .status()
+            .expect("failed to run nvcc for Qwen3.6 GDN kernels");
+        assert!(
+            qwen36_status.success(),
+            "nvcc failed to build Qwen3.6 GDN kernels"
+        );
+    }
 
     let mut qwen38_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
     qwen38_nvcc.args([
@@ -299,26 +302,75 @@ fn main() {
         "nvcc failed to build SM12x MMA kernels"
     );
 
-    let mut sm121_w4a16_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
-    sm121_w4a16_nvcc.args([
-        "-std=c++17",
-        "-O3",
-        "--use_fast_math",
-        "--generate-code=arch=compute_121a,code=sm_121a",
-        "-I",
-        &cuda_include,
-        "-c",
-        "native/sm121_w4a16.cu",
-        "-o",
-        &sm121_w4a16_object,
-    ]);
-    let sm121_w4a16_status = sm121_w4a16_nvcc
-        .status()
-        .expect("failed to run nvcc for SM121 W4A16 kernels");
-    assert!(
-        sm121_w4a16_status.success(),
-        "nvcc failed to build SM121 W4A16 kernels"
-    );
+    let cuda_oxide_target = PathBuf::from(&out_dir).join("cuda-oxide-target");
+    let cuda_oxide_artifacts = PathBuf::from(&out_dir).join("cuda-oxide-artifacts");
+    if cuda_oxide {
+        let cargo_oxide = std::env::var_os("CARGO_OXIDE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cargo-oxide"));
+        let backend_dir = workspace_root.join("backends/cuda-oxide");
+        let oxide_status = std::process::Command::new(&cargo_oxide)
+            .current_dir(&backend_dir)
+            .env("RUSTUP_TOOLCHAIN", "nightly-2026-08-28")
+            .env_remove("RUSTC")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RUSTDOC")
+            .env("CUDA_OXIDE_PTX_DIR", &cuda_oxide_artifacts)
+            .args([
+                "oxide",
+                "build",
+                "--arch",
+                "sm_121a",
+                "--",
+                "--release",
+                "--target-dir",
+            ])
+            .arg(&cuda_oxide_target)
+            .status()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to run {} for the cuda-oxide backend: {error}. Run scripts/setup-cuda-oxide.sh or set CARGO_OXIDE to an executable path",
+                    cargo_oxide.display()
+                )
+            });
+        assert!(oxide_status.success(), "cuda-oxide backend build failed");
+
+        let oxide_ptx = cuda_oxide_artifacts.join("eider_cuda_oxide.ptx");
+        let oxide_cubin = PathBuf::from(&out_dir).join("eider_cuda_oxide.cubin");
+        let ptxas_status = std::process::Command::new(format!("{cuda_root}/bin/ptxas"))
+            .args(["-O3", "--gpu-name", "sm_121a"])
+            .arg(&oxide_ptx)
+            .arg("--output-file")
+            .arg(&oxide_cubin)
+            .status()
+            .expect("failed to run ptxas for the cuda-oxide backend");
+        assert!(
+            ptxas_status.success(),
+            "ptxas failed to build the cuda-oxide backend"
+        );
+    } else {
+        let mut sm121_w4a16_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
+        sm121_w4a16_nvcc.args([
+            "-std=c++17",
+            "-O3",
+            "--use_fast_math",
+            "--generate-code=arch=compute_121a,code=sm_121a",
+            "-I",
+            &cuda_include,
+            "-c",
+            "native/sm121_w4a16.cu",
+            "-o",
+            &sm121_w4a16_object,
+        ]);
+        let sm121_w4a16_status = sm121_w4a16_nvcc
+            .status()
+            .expect("failed to run nvcc for SM121 W4A16 kernels");
+        assert!(
+            sm121_w4a16_status.success(),
+            "nvcc failed to build SM121 W4A16 kernels"
+        );
+    }
 
     if cutlass_available {
         let mut cutlass_nvcc = std::process::Command::new(format!("{cuda_root}/bin/nvcc"));
@@ -450,25 +502,30 @@ fn main() {
         );
     }
 
+    let mut archive_objects = vec![
+        oracle_object.as_str(),
+        gpu_counters_object.as_str(),
+        non_gemm_object.as_str(),
+        bitnet_object.as_str(),
+        ternary_g64_object.as_str(),
+        deepseek4_object.as_str(),
+        ngram_object.as_str(),
+        qwen38_object.as_str(),
+        gemma4_attention_object.as_str(),
+        sm12x_mma_object.as_str(),
+        cutlass_gemv_object.as_str(),
+        cutlass_grouped_gemm_object.as_str(),
+    ];
+    if !cuda_oxide {
+        archive_objects.push(qwen36_gdn_object.as_str());
+        archive_objects.push(sm121_w4a16_object.as_str());
+    }
+    if std::path::Path::new(&archive).exists() {
+        std::fs::remove_file(&archive).expect("failed to replace fp4 oracle archive");
+    }
     let archive_status = std::process::Command::new("ar")
-        .args([
-            "crs",
-            &archive,
-            &oracle_object,
-            &gpu_counters_object,
-            &non_gemm_object,
-            &bitnet_object,
-            &ternary_g64_object,
-            &deepseek4_object,
-            &ngram_object,
-            &qwen36_gdn_object,
-            &qwen38_object,
-            &gemma4_attention_object,
-            &sm12x_mma_object,
-            &sm121_w4a16_object,
-            &cutlass_gemv_object,
-            &cutlass_grouped_gemm_object,
-        ])
+        .args(["crs", &archive])
+        .args(archive_objects)
         .status()
         .expect("failed to run ar for fp4 oracle");
     assert!(archive_status.success(), "ar failed to archive fp4 oracle");
@@ -494,6 +551,10 @@ fn main() {
     println!("cargo:rerun-if-changed=native/gemma4_attention.cu");
     println!("cargo:rerun-if-changed=native/sm12x_mma.cu");
     println!("cargo:rerun-if-changed=native/sm121_w4a16.cu");
+    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/Cargo.toml");
+    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/Cargo.lock");
+    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/rust-toolchain.toml");
+    println!("cargo:rerun-if-changed=../../backends/cuda-oxide/src/lib.rs");
     println!("cargo:rerun-if-changed=native/cutlass_gemv.cu");
     println!("cargo:rerun-if-changed=native/cutlass_gemv_stub.cpp");
     println!("cargo:rerun-if-changed=native/cutlass_grouped_gemm.cu");
@@ -506,4 +567,5 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUILD_DIR");
     println!("cargo:rerun-if-env-changed=EIDER_AUTO_SETUP_CUTLASS");
     println!("cargo:rerun-if-env-changed=EIDER_REQUIRE_CUTLASS");
+    println!("cargo:rerun-if-env-changed=CARGO_OXIDE");
 }

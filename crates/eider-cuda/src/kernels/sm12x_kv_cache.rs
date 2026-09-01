@@ -470,6 +470,25 @@ impl Sm12xKvCache {
             });
         }
 
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                self.key_values_mut_ptr(),
+                self.key_scales_mut_ptr(),
+                self.value_values_mut_ptr(),
+                self.value_scales_mut_ptr(),
+                self.key_tail_mut_ptr(),
+                self.value_tail_mut_ptr(),
+                position as u32,
+                self.max_tokens as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_on_stream",
@@ -529,6 +548,25 @@ impl Sm12xKvCache {
                 actual: format!("{} rows", position + 1),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append(
+                key.as_const_ptr().cast::<f32>().add(key_offset),
+                value.as_const_ptr().cast::<f32>().add(value_offset),
+                self.key_values_mut_ptr(),
+                self.key_scales_mut_ptr(),
+                self.value_values_mut_ptr(),
+                self.value_scales_mut_ptr(),
+                self.key_tail_mut_ptr(),
+                self.value_tail_mut_ptr(),
+                position as u32,
+                self.max_tokens as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_on_stream",
@@ -600,6 +638,30 @@ impl Sm12xKvCache {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append_rows(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                self.key_values_mut_ptr(),
+                self.key_scales_mut_ptr(),
+                self.value_values_mut_ptr(),
+                self.value_scales_mut_ptr(),
+                self.key_tail_mut_ptr(),
+                self.value_tail_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                input_row_offset as u32,
+                self.len as u32,
+                rows as u32,
+                self.max_tokens as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_rows_on_stream",
@@ -681,6 +743,30 @@ impl Sm12xKvCache {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append_rows(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                self.key_values_mut_ptr(),
+                self.key_scales_mut_ptr(),
+                self.value_values_mut_ptr(),
+                self.value_scales_mut_ptr(),
+                self.key_tail_mut_ptr(),
+                self.value_tail_mut_ptr(),
+                key_output.as_mut_ptr().cast(),
+                value_output.as_mut_ptr().cast(),
+                rows as u32,
+                input_row_offset as u32,
+                0,
+                rows as u32,
+                self.max_tokens as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_rows_on_stream",
@@ -779,6 +865,25 @@ impl Sm12xKvCache {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append_indexed(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                self.key_values_mut_ptr(),
+                self.key_scales_mut_ptr(),
+                self.value_values_mut_ptr(),
+                self.value_scales_mut_ptr(),
+                self.key_tail_mut_ptr(),
+                self.value_tail_mut_ptr(),
+                position.as_const_ptr().cast(),
+                self.max_tokens as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_indexed_on_stream",
@@ -1210,6 +1315,25 @@ impl Sm12xKvPagePool {
         let key_tail_offset = self.layout.key_tail;
         let value_tail_offset = self.layout.value_tail;
         let page_base = self.component_mut_ptr(slot, 0);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append(
+                key.as_const_ptr().cast::<f32>().add(key_offset),
+                value.as_const_ptr().cast::<f32>().add(value_offset),
+                page_base.add(key_values_offset),
+                page_base.add(key_scales_offset),
+                page_base.add(value_values_offset),
+                page_base.add(value_scales_offset),
+                page_base.add(key_tail_offset).cast(),
+                page_base.add(value_tail_offset).cast(),
+                position as u32,
+                SM12X_KV_PAGE_TOKENS as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_on_stream",
@@ -1274,6 +1398,30 @@ impl Sm12xKvPagePool {
         let key_tail_offset = self.layout.key_tail;
         let value_tail_offset = self.layout.value_tail;
         let page_base = self.component_mut_ptr(slot, 0);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append_rows(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                page_base.add(key_values_offset),
+                page_base.add(key_scales_offset),
+                page_base.add(value_values_offset),
+                page_base.add(value_scales_offset),
+                page_base.add(key_tail_offset).cast(),
+                page_base.add(value_tail_offset).cast(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                input_row_offset as u32,
+                start_position as u32,
+                rows as u32,
+                SM12X_KV_PAGE_TOKENS as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_cache_append_rows_on_stream",
@@ -1555,6 +1703,46 @@ impl Sm12xKvAttentionWorkspace {
         }
 
         let pv_splits = pv_split_count(cache.len);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                cache.key_values_ptr(),
+                cache.key_scales_ptr(),
+                cache.key_tail_ptr(),
+                cache.value_values_ptr(),
+                cache.value_scales_ptr(),
+                cache.value_tail_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                cache.len as u32,
+                std::ptr::null(),
+                cache.max_tokens as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                pv_splits as u32,
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_on_stream",
@@ -1627,6 +1815,46 @@ impl Sm12xKvAttentionWorkspace {
         }
 
         let pv_splits = pv_split_count(cache.len - window_start);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                cache.key_values_ptr(),
+                cache.key_scales_ptr(),
+                cache.key_tail_ptr(),
+                cache.value_values_ptr(),
+                cache.value_scales_ptr(),
+                cache.value_tail_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                cache.len as u32,
+                std::ptr::null(),
+                cache.max_tokens as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                pv_splits as u32,
+                window_start as u32,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_window_on_stream",
@@ -1741,6 +1969,37 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::append_causal_attention_rows(
+                query.as_const_ptr().cast(),
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                cache.key_values_mut_ptr(),
+                cache.key_scales_mut_ptr(),
+                cache.value_values_mut_ptr(),
+                cache.value_scales_mut_ptr(),
+                cache.key_tail_mut_ptr(),
+                cache.value_tail_mut_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                input_row_offset as u32,
+                cache.len as u32,
+                rows as u32,
+                cache.max_tokens as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                window_tokens.unwrap_or(0) as u32,
+                self.causal_row_capacity as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_append_causal_attention_rows_on_stream",
@@ -1869,6 +2128,46 @@ impl Sm12xKvAttentionWorkspace {
         let key_tail = layout.key_tail;
         let value_tail = layout.value_tail;
         let page_stride = layout.total_bytes;
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                pool.component_ptr(key_values),
+                pool.component_ptr(key_scales),
+                pool.component_ptr(key_tail).cast(),
+                pool.component_ptr(value_values),
+                pool.component_ptr(value_scales),
+                pool.component_ptr(value_tail).cast(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                0,
+                std::ptr::null(),
+                logical_capacity as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                1,
+                0,
+                page_table.as_const_ptr().cast(),
+                SM12X_KV_PAGE_TOKENS as u32,
+                page_stride as u32,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                input_row_offset as u32,
+                rows as u32,
+                start_position as u32,
+                window_tokens.unwrap_or(0) as u32,
+                input_row_offset as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_paged_causal_attention_rows_on_stream",
@@ -1956,6 +2255,46 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                cache.key_values_ptr(),
+                cache.key_scales_ptr(),
+                cache.key_tail_ptr(),
+                cache.value_values_ptr(),
+                cache.value_scales_ptr(),
+                cache.value_tail_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                cache.len as u32,
+                std::ptr::null(),
+                cache.max_tokens as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                1,
+                window_start as u32,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                input_row_offset as u32,
+                rows as u32,
+                u32::MAX,
+                0,
+                output_row_offset as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_rows_window_on_stream",
@@ -2035,6 +2374,46 @@ impl Sm12xKvAttentionWorkspace {
             });
         }
         let pv_splits = pv_split_count(cache.len);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast::<f32>().add(query_offset),
+                cache.key_values_ptr(),
+                cache.key_scales_ptr(),
+                cache.key_tail_ptr(),
+                cache.value_values_ptr(),
+                cache.value_scales_ptr(),
+                cache.value_tail_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast::<f32>().add(output_offset),
+                cache.len as u32,
+                std::ptr::null(),
+                cache.max_tokens as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                pv_splits as u32,
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_on_stream",
@@ -2163,6 +2542,46 @@ impl Sm12xKvAttentionWorkspace {
         }
         let layout = &pool.layout;
         let pv_splits = pv_split_count(cache_len);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast::<f32>().add(query_offset),
+                pool.component_ptr(layout.key_values),
+                pool.component_ptr(layout.key_scales),
+                pool.component_ptr(layout.key_tail).cast(),
+                pool.component_ptr(layout.value_values),
+                pool.component_ptr(layout.value_scales),
+                pool.component_ptr(layout.value_tail).cast(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast::<f32>().add(output_offset),
+                cache_len as u32,
+                std::ptr::null(),
+                logical_capacity as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                pv_splits as u32,
+                0,
+                page_table.as_const_ptr().cast(),
+                SM12X_KV_PAGE_TOKENS as u32,
+                layout.total_bytes as u32,
+                selected_blocks.as_const_ptr().cast(),
+                selected_tiles.as_const_ptr().cast(),
+                selected_tokens as u32,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_paged_sparse_attention_on_stream",
@@ -2260,6 +2679,46 @@ impl Sm12xKvAttentionWorkspace {
         }
         let layout = &pool.layout;
         let pv_splits = pv_split_count(cache_len);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast::<f32>().add(query_offset),
+                pool.component_ptr(layout.key_values),
+                pool.component_ptr(layout.key_scales),
+                pool.component_ptr(layout.key_tail).cast(),
+                pool.component_ptr(layout.value_values),
+                pool.component_ptr(layout.value_scales),
+                pool.component_ptr(layout.value_tail).cast(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast::<f32>().add(output_offset),
+                cache_len as u32,
+                std::ptr::null(),
+                logical_capacity as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                pv_splits as u32,
+                window_start as u32,
+                page_table.as_const_ptr().cast(),
+                SM12X_KV_PAGE_TOKENS as u32,
+                layout.total_bytes as u32,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_paged_attention_on_stream",
@@ -2332,6 +2791,46 @@ impl Sm12xKvAttentionWorkspace {
                 ),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                cache.key_values_ptr(),
+                cache.key_scales_ptr(),
+                cache.key_tail_ptr(),
+                cache.value_values_ptr(),
+                cache.value_scales_ptr(),
+                cache.value_tail_ptr(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                0,
+                cache_len.as_const_ptr().cast(),
+                cache.max_tokens as u32,
+                self.kv_heads as u32 * MMA_N as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                PV_SPLIT_CAPACITY as u32,
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                1,
+                u32::MAX,
+                0,
+                0,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm12x_kv_attention_indexed_on_stream",
@@ -3730,6 +4229,76 @@ mod tests {
             max_abs <= 0.25,
             "compact FP4 attention error too large: max_abs={max_abs}"
         );
+    }
+
+    #[test]
+    fn indexed_compact_append_and_attention_match_host_positions() {
+        const MAX_TOKENS: usize = 64;
+        const TOKENS: usize = 17;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = KV_HEADS * MMA_N;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let query_width = Q_HEADS * HEAD_DIM;
+        let key_host = (0..TOKENS * kv_width)
+            .map(|index| ((index * 31 % 251) as f32 - 125.0) / 512.0)
+            .collect::<Vec<_>>();
+        let value_host = (0..TOKENS * kv_width)
+            .map(|index| ((index * 47 % 257) as f32 - 128.0) / 384.0)
+            .collect::<Vec<_>>();
+        let query_host = (0..query_width)
+            .map(|index| ((index * 19 % 239) as f32 - 119.0) / 448.0)
+            .collect::<Vec<_>>();
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut host_cache = Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("host cache");
+        let mut indexed_cache =
+            Sm12xKvCache::new(MAX_TOKENS, KV_HEADS, HEAD_DIM).expect("indexed cache");
+        for token in 0..TOKENS {
+            let key = DeviceBuffer::from_host(&key_host[token * kv_width..(token + 1) * kv_width])
+                .expect("key row");
+            let value =
+                DeviceBuffer::from_host(&value_host[token * kv_width..(token + 1) * kv_width])
+                    .expect("value row");
+            host_cache
+                .append_at_on_stream(&key, &value, token, &stream)
+                .expect("host-position append");
+            let position = DeviceBuffer::from_host(&[token as u32]).expect("position");
+            indexed_cache
+                .append_indexed_on_stream(&key, &value, &position, &stream)
+                .expect("indexed append");
+        }
+
+        let query = DeviceBuffer::from_host(&query_host).expect("query");
+        let cache_len = DeviceBuffer::from_host(&[TOKENS as u32]).expect("cache length");
+        let mut expected = DeviceBuffer::zeroed(query_width).expect("expected");
+        let mut actual = DeviceBuffer::zeroed(query_width).expect("actual");
+        let mut host_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("host workspace");
+        let mut indexed_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(MAX_TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("indexed workspace");
+        host_workspace
+            .attention_into_on_stream(&host_cache, &query, expected.output(), &stream)
+            .expect("host-position attention");
+        indexed_workspace
+            .attention_indexed_into_on_stream(
+                &indexed_cache,
+                &query,
+                &cache_len,
+                actual.output(),
+                &stream,
+            )
+            .expect("indexed attention");
+
+        let expected = expected.copy_to_host(&stream).expect("expected copy");
+        let actual = actual.copy_to_host(&stream).expect("actual copy");
+        let max_abs = expected
+            .iter()
+            .zip(actual.iter())
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1.0e-6, "indexed attention max_abs={max_abs}");
     }
 
     #[test]

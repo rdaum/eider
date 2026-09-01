@@ -1,8 +1,13 @@
 //! CUDA launcher for chunked Qwen3.6 Gated DeltaNet execution.
 
-use crate::cuda::{CudaStream, DeviceBuffer, check_cuda};
+#[cfg(not(feature = "cuda-oxide"))]
+use crate::cuda::check_cuda;
+use crate::cuda::{CudaStream, DeviceBuffer};
 use crate::error::{Error, Result};
+#[cfg(not(feature = "cuda-oxide"))]
 use crate::ffi;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::qwen36_gdn_oxide;
 
 const HEADS: usize = 32;
 const HEAD_DIM: usize = 128;
@@ -137,6 +142,19 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::cumsum(
+                gate.as_const_ptr().cast(),
+                gate_cumsum.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_indices.as_const_ptr().cast(),
+                total_tokens as u32,
+                chunk_count as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_cumsum_on_stream",
@@ -167,6 +185,21 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::kkt(
+                key.as_const_ptr().cast(),
+                beta.as_const_ptr().cast(),
+                gate_cumsum.as_const_ptr().cast(),
+                a.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_indices.as_const_ptr().cast(),
+                total_tokens as u32,
+                chunk_count as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_kkt_on_stream",
@@ -197,6 +230,19 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::solve(
+                a.as_mut_ptr().cast(),
+                a_inverse.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_indices.as_const_ptr().cast(),
+                total_tokens as u32,
+                chunk_count as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_solve_on_stream",
@@ -229,6 +275,23 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::wu(
+                key.as_const_ptr().cast(),
+                value.as_const_ptr().cast(),
+                a_inverse.as_const_ptr().cast(),
+                gate_cumsum.as_const_ptr().cast(),
+                w.as_mut_ptr().cast(),
+                u.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_indices.as_const_ptr().cast(),
+                total_tokens as u32,
+                chunk_count as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_wu_on_stream",
@@ -266,6 +329,24 @@ impl Qwen36ChunkedGdn {
         total_tokens: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::h(
+                key.as_const_ptr().cast(),
+                u.as_const_ptr().cast(),
+                w.as_const_ptr().cast(),
+                value_new.as_mut_ptr().cast(),
+                gate_cumsum.as_const_ptr().cast(),
+                h.as_mut_ptr().cast(),
+                state.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_offsets.as_const_ptr().cast(),
+                sequence_count as u32,
+                total_tokens as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_h_on_stream",
@@ -303,6 +384,24 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen36_gdn_oxide::output(
+                query.as_const_ptr().cast(),
+                key.as_const_ptr().cast(),
+                value_new.as_const_ptr().cast(),
+                h.as_const_ptr().cast(),
+                gate_cumsum.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                cu_seqlens.as_const_ptr().cast(),
+                chunk_indices.as_const_ptr().cast(),
+                total_tokens as u32,
+                chunk_count as u32,
+                (HEAD_DIM as f32).sqrt().recip(),
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_qwen36_gdn_chunk_output_on_stream",

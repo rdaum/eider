@@ -381,12 +381,14 @@ the runtime useful as a place to study modern inference systems.
 
 ## Development
 
-The workspace has three main crates:
+The workspace has five main crates:
 
-- `nvfp4` contains CUDA kernels, cuBLASLt plans, device storage, checkpoint
-  formats, and GPU benchmarks.
-- `infer` contains model execution, sampling, scheduling, sequence caches, and
-  model benchmarks.
+- `eider-format` contains checkpoint types and format parsers.
+- `eider-cuda` contains CUDA kernels, cuBLASLt plans, device storage, and GPU
+  benchmarks.
+- `eider-runtime` contains backend-neutral execution traits and state types.
+- `eider-inference` contains model execution, sampling, scheduling, sequence
+  caches, and model benchmarks.
 - `eider-api` contains catalogue deployment, the inference actor, HTTP APIs,
   streaming, and telemetry.
 
@@ -398,6 +400,28 @@ cargo build --release -p eider-api --bin eider-serve
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The default build compiles Eider kernels with NVCC. The optional `cuda-oxide`
+feature selects the cuda-oxide implementation at compile time.
+
+The cuda-oxide path supports Qwen3.8 27B target prefill and decode with DFlash2
+speculation. It includes dense W4A16, compact FP4 KV, chunked and recurrent
+GDN, attention, sampling, and DFlash2 kernels. The build uses the same safe
+Rust host API and device layouts.
+
+The server still links CUDA, cuBLASLt, and CUTLASS. These libraries provide
+device management and the matrix plans that are outside the custom-kernel
+backend. NVCC still compiles kernels for other model families.
+
+```sh
+scripts/setup-cuda-oxide.sh
+CARGO_OXIDE=.deps/cuda-oxide/bin/cargo-oxide \
+  cargo build --release -p eider-api --features cuda-oxide
+scripts/run-eider-qwen38.sh --cuda-oxide --offline
+```
+
+The cuda-oxide build keeps nightly Rust outside the stable workspace. Read the
+[cuda-oxide backend guide](backends/cuda-oxide/README.md) before you enable it.
 
 Configure the repository-local CUTLASS tree for SM121:
 
@@ -412,11 +436,11 @@ Focused benchmarks use
 correctness gate before it records timing data.
 
 ```sh
-cargo bench -p nvfp4 --bench qwen36_routed_moe_decode
-cargo bench -p nvfp4 --bench qwen38_grouped_moe_prefill
-cargo bench -p infer --bench qwen36_prefill
-cargo bench -p infer --bench step37_prefill
-cargo bench -p infer --bench laguna_prefill
+cargo bench -p eider-cuda --bench qwen36_routed_moe_decode
+cargo bench -p eider-cuda --bench qwen38_grouped_moe_prefill
+cargo bench -p eider-inference --bench qwen36_prefill
+cargo bench -p eider-inference --bench step37_prefill
+cargo bench -p eider-inference --bench laguna_prefill
 ```
 
 A kernel result is not sufficient evidence for a server improvement. Measure

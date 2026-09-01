@@ -1,0 +1,12 @@
+[package]
+name = "eider-cuda-oxide"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide", rev = "97f8b2b7882f0c15ad9ce9b53abed5553920caa8" }

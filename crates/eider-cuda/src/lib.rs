@@ -17,6 +17,8 @@ pub mod format;
 mod bitnet;
 mod cublaslt;
 mod cuda;
+#[cfg(feature = "cuda-oxide")]
+mod cuda_oxide;
 mod deferred;
 mod diagnostics;
 mod error;

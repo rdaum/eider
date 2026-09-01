@@ -20,6 +20,18 @@ pub(crate) type cudaGraphExec_t = *mut c_void;
 pub(crate) type cudaMemcpyKind = i32;
 #[allow(non_camel_case_types)]
 pub(crate) type cudaStreamCaptureMode = i32;
+#[allow(non_camel_case_types)]
+#[cfg(feature = "cuda-oxide")]
+pub(crate) type CUmodule = *mut c_void;
+#[allow(non_camel_case_types)]
+#[cfg(feature = "cuda-oxide")]
+pub(crate) type CUfunction = *mut c_void;
+#[allow(non_camel_case_types)]
+#[cfg(feature = "cuda-oxide")]
+pub(crate) type CUcontext = *mut c_void;
+#[allow(non_camel_case_types)]
+#[cfg(feature = "cuda-oxide")]
+pub(crate) type CUresult = i32;
 pub(crate) const CUDA_SUCCESS: cudaError_t = 0;
 pub(crate) const CUDA_ERROR_NOT_READY: cudaError_t = 600;
 pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: cudaMemcpyKind = 1;
@@ -30,6 +42,14 @@ pub(crate) const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 pub(crate) const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 pub(crate) const CUDA_STREAM_CAPTURE_MODE_RELAXED: cudaStreamCaptureMode = 2;
 pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 8;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) const CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) const CUDA_DEV_ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
+#[cfg(feature = "cuda-oxide")]
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 pub(crate) const CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS: i32 = 88;
 pub(crate) const CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES: i32 = 100;
 #[allow(non_camel_case_types)]
@@ -93,6 +113,34 @@ pub(crate) struct cublasLtMatmulHeuristicResult_t {
 }
 
 unsafe extern "C" {
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuCtxGetCurrent(context: *mut CUcontext) -> CUresult;
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuCtxSetCurrent(context: CUcontext) -> CUresult;
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuFuncSetAttribute(function: CUfunction, attribute: i32, value: i32) -> CUresult;
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult;
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuModuleGetFunction(
+        function: *mut CUfunction,
+        module: CUmodule,
+        name: *const c_char,
+    ) -> CUresult;
+    #[cfg(feature = "cuda-oxide")]
+    pub(crate) fn cuLaunchKernel(
+        function: CUfunction,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_memory_bytes: u32,
+        stream: cudaStream_t,
+        kernel_parameters: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> CUresult;
     pub(crate) fn infer_bitnet_quantize_i8_f32_on_stream(
         input: *const f32,
         output: *mut i8,
@@ -648,6 +696,7 @@ unsafe extern "C" {
         input_multiplier: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_cache_append_on_stream(
         key: *const f32,
         value: *const f32,
@@ -663,6 +712,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_cache_append_rows_on_stream(
         key: *const f32,
         value: *const f32,
@@ -683,6 +733,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_cache_append_indexed_on_stream(
         key: *const f32,
         value: *const f32,
@@ -746,6 +797,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_attention_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -769,6 +821,7 @@ unsafe extern "C" {
         pv_splits: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_paged_attention_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -796,6 +849,7 @@ unsafe extern "C" {
         pv_splits: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_paged_sparse_attention_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -840,6 +894,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_attention_window_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -864,6 +919,7 @@ unsafe extern "C" {
         pv_splits: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_append_causal_attention_rows_on_stream(
         query: *const f32,
         key: *const f32,
@@ -891,6 +947,7 @@ unsafe extern "C" {
         workspace_rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_paged_causal_attention_rows_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -919,6 +976,7 @@ unsafe extern "C" {
         workspace_rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_attention_rows_window_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -945,6 +1003,7 @@ unsafe extern "C" {
         workspace_rows: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm12x_kv_attention_indexed_on_stream(
         query: *const f32,
         key_values: *const u8,
@@ -1156,6 +1215,7 @@ unsafe extern "C" {
         alpha: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rms_norm_f32_on_stream(
         input: *const f32,
         weight: *const f32,
@@ -1268,6 +1328,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_silu_mul_halves_f32_on_stream(
         gate_up: *const f32,
         output: *mut f32,
@@ -1281,6 +1342,7 @@ unsafe extern "C" {
         limit: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_silu_mul_halves_f32_batch_on_stream(
         gate_up: *const f32,
         output: *mut f32,
@@ -1296,12 +1358,14 @@ unsafe extern "C" {
         limit: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_fill_f32_on_stream(
         output: *mut f32,
         value: f32,
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_scaled_add_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1316,6 +1380,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sigmoid_mul_f32_on_stream(
         gate: *const f32,
         input: *const f32,
@@ -1346,6 +1411,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_full_attn_prep_f32_on_stream(
         q_full: *const f32,
         k_raw: *const f32,
@@ -1360,6 +1426,7 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_full_attn_prep_f32_batch_on_stream(
         q_full: *const f32,
         k_raw: *const f32,
@@ -1746,6 +1813,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_neox_partial_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1756,6 +1824,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_neox_partial_f32_indexed_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1854,6 +1923,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_neox_sequence_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1864,6 +1934,7 @@ unsafe extern "C" {
         theta: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_rope_neox_partial_sequence_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -1888,6 +1959,7 @@ unsafe extern "C" {
         attention_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_add_f32_on_stream(
         left: *const f32,
         right: *const f32,
@@ -1895,6 +1967,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_concat_f32_rows_on_stream(
         left: *const f32,
         right: *const f32,
@@ -1985,6 +2058,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_copy_bf16_rows_to_f32_indexed_on_stream(
         input: *const u16,
         rows: *const u32,
@@ -1993,6 +2067,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_copy_fp8_rows_to_f32_indexed_on_stream(
         input: *const u8,
         row_scales: *const f32,
@@ -2088,6 +2163,7 @@ unsafe extern "C" {
         cols: u32,
         input_scale: f32,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_quantize_nvfp4_col_major_f32_on_stream(
         input: *const f32,
         packed: *mut u8,
@@ -2222,6 +2298,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_dflash2_capture_f32_on_stream(
         input: *const f32,
         output: *mut f32,
@@ -2231,6 +2308,7 @@ unsafe extern "C" {
         tap: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_dflash2_grouped_conv_f32_on_stream(
         input: *const f32,
         coefficients: *const f32,
@@ -2244,6 +2322,7 @@ unsafe extern "C" {
         side: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_dflash2_noncausal_attention_f32_on_stream(
         query: *const f32,
         context_key: *const f32,
@@ -2364,6 +2443,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_argmax_f32_on_stream(
         values: *const f32,
         out_index: *mut u32,
@@ -2371,6 +2451,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_argmax_f32_batch_on_stream(
         values: *const f32,
         out_index: *mut u32,
@@ -2379,6 +2460,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_mask_logits_f32_batch_on_stream(
         logits: *mut f32,
         allowed: *const u32,
@@ -2398,6 +2480,7 @@ unsafe extern "C" {
         vocab_size: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_dflash2_hidden_projection_f32_on_stream(
         hidden: *const f32,
         weight_bf16: *const u16,
@@ -2407,6 +2490,7 @@ unsafe extern "C" {
         rank: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_dflash2_select_path_f32_on_stream(
         projected: *const f32,
         top_keys: *const u64,
@@ -2421,6 +2505,7 @@ unsafe extern "C" {
         key_stride: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sample_topk_topp_f32_batch_on_stream(
         logits: *const f32,
         params: *const c_void,
@@ -2440,6 +2525,7 @@ unsafe extern "C" {
         rows: u32,
         cols: u32,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_bf16_linear_logits_f32_on_stream(
         input: *const f32,
         weight: *const u16,
@@ -2448,6 +2534,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_bf16_linear_logits_f32_batch_on_stream(
         input: *const f32,
         weight: *const u16,
@@ -2457,6 +2544,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_bf16_linear_two_rows_f32_on_stream(
         input: *const f32,
         weight: *const u16,
@@ -2465,6 +2553,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_bf16_linear_pair_logits_f32_on_stream(
         input: *const f32,
         first_weight: *const u16,
@@ -2501,12 +2590,14 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_bf16_to_f32_on_stream(
         input: *const u16,
         output: *mut f32,
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_f32_to_bf16_on_stream(
         input: *const f32,
         output: *mut u16,
@@ -2582,17 +2673,20 @@ unsafe extern "C" {
         input_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_round_f32_to_bf16_in_place_on_stream(
         values: *mut f32,
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_round_f32_to_bf16_on_stream(
         input: *const f32,
         output: *mut f32,
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gated_delta_net_128_f32_on_stream(
         q: *const f32,
         k: *const f32,
@@ -2604,6 +2698,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gated_delta_net_128_f32_batch_on_stream(
         q: *const f32,
         k: *const f32,
@@ -2616,6 +2711,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gated_delta_net_128_f32_chunks_on_stream(
         q: *const f32,
         k: *const f32,
@@ -2631,6 +2727,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_cumsum_on_stream(
         gate: *const u16,
         gate_cumsum: *mut f32,
@@ -2640,6 +2737,7 @@ unsafe extern "C" {
         chunk_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_kkt_on_stream(
         key: *const u16,
         beta: *const u16,
@@ -2651,6 +2749,7 @@ unsafe extern "C" {
         chunk_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_solve_on_stream(
         a: *mut f32,
         a_inverse: *mut u16,
@@ -2660,6 +2759,7 @@ unsafe extern "C" {
         chunk_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_wu_on_stream(
         key: *const u16,
         value: *const u16,
@@ -2673,6 +2773,7 @@ unsafe extern "C" {
         chunk_count: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_h_on_stream(
         key: *const u16,
         u: *const u16,
@@ -2687,6 +2788,7 @@ unsafe extern "C" {
         total_tokens: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_chunk_output_on_stream(
         query: *const u16,
         key: *const u16,
@@ -2701,6 +2803,7 @@ unsafe extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gather_f32_pointer_rows_on_stream(
         input_table: *const *mut f32,
         output: *mut f32,
@@ -2708,6 +2811,7 @@ unsafe extern "C" {
         row_values: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_scatter_f32_pointer_rows_on_stream(
         input: *const f32,
         output_table: *const *mut f32,
@@ -2768,6 +2872,7 @@ unsafe extern "C" {
         threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_fp8_linear_channel_scaled_f32_configured_on_stream(
         input: *const f32,
         weight: *const u8,
@@ -2808,6 +2913,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream(
         input: *const f32,
         quantized_input: *mut u8,
@@ -2854,6 +2960,7 @@ unsafe extern "C" {
         slots: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_quantize_fp8_e4m3_dynamic_f32_on_stream(
         input: *const f32,
         quantized_input: *mut u8,
@@ -2861,6 +2968,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_quantize_fp8_e4m3_dynamic_f32_batch_on_stream(
         input: *const f32,
         quantized_input: *mut u8,
@@ -2877,6 +2985,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_scale_channel_f32_device_scalar_on_stream(
         values: *mut f32,
         channel_scale: *const f32,
@@ -2884,6 +2993,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_scale_channel_f32_device_row_scalar_on_stream(
         values: *mut f32,
         channel_scale: *const f32,
@@ -2902,7 +3012,9 @@ unsafe extern "C" {
         input_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm121_w4a16_supported() -> i32;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_sm121_w4a16_gate_up_on_stream(
         indices: *const u32,
         input: *const f32,
@@ -2934,6 +3046,7 @@ unsafe extern "C" {
         weight_scale_2: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_nvfp4_w4a16_matvec_f32_warp_rows_on_stream(
         input: *const f32,
         packed_weight: *const u8,
@@ -2945,6 +3058,7 @@ unsafe extern "C" {
         warps_per_block: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream(
         input: *const f32,
         packed_weight: *const u8,
@@ -3109,6 +3223,7 @@ unsafe extern "C" {
         warps_per_block: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_prep_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
@@ -3289,6 +3404,7 @@ unsafe extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_prep_batch_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
@@ -3302,6 +3418,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_prep_chunks_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
@@ -3318,6 +3435,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_prep_chunks_bf16_on_stream(
         qkv: *const f32,
         conv_weight_bf16: *const u16,
@@ -3334,6 +3452,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_gate_on_stream(
         alpha: *const f32,
         beta_input: *const f32,
@@ -3344,6 +3463,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_gate_batch_on_stream(
         alpha: *const f32,
         beta_input: *const f32,
@@ -3355,6 +3475,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_gate_batch_bf16_on_stream(
         alpha: *const f32,
         beta_input: *const f32,
@@ -3366,6 +3487,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_gate_paired_batch_on_stream(
         alpha_beta: *const f32,
         a_log_bf16: *const u16,
@@ -3376,6 +3498,7 @@ unsafe extern "C" {
         heads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_gdn_gate_paired_batch_bf16_on_stream(
         alpha_beta: *const f32,
         a_log_bf16: *const u16,
@@ -3487,6 +3610,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gated_rms_norm_f32_on_stream(
         input: *const f32,
         gate: *const f32,
@@ -3497,6 +3621,7 @@ unsafe extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream(
         input: *const f32,
         gate: *const f32,

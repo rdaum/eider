@@ -3,6 +3,10 @@ name = "eider-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+cuda-oxide = ["eider-inference/cuda-oxide"]
+
 [dependencies]
 anyhow = "1"
 eider-inference = { path = "../infer" }

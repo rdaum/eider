@@ -1,7 +1,7 @@
 # eider-cuda
 
-`eider-cuda` owns CUDA resources, GPU storage, cuBLASLt plans, and native
-SM121 kernels for Eider. It targets the GB10 GPU in NVIDIA DGX Spark systems.
+`eider-cuda` owns CUDA resources, GPU storage, cuBLASLt plans, and SM121 kernels
+for Eider. It targets the GB10 GPU in NVIDIA DGX Spark systems.
 
 ## Responsibilities
 
@@ -12,7 +12,7 @@ The crate provides:
   state transitions
 - ModelOpt-to-device preparation boundaries
 - cuBLASLt plans for BF16, FP8, INT8, and NVFP4 matrix products
-- native SM121 W4A16 and non-GEMM kernels
+- SM121 W4A16 and non-GEMM kernels
 - device-resident DFlash2 projection, top-k, and coherent path selection
 - diagnostic smoke checks and GPU counter collection.
 
@@ -57,6 +57,29 @@ Run a focused benchmark for each shape-specific kernel change. Benchmarks use
 cargo bench -p eider-cuda --bench sm121_w4a16_routed_gate_up
 cargo bench -p eider-cuda --bench dflash2_selector
 ```
+
+The default build compiles Eider kernels with NVCC. The optional `cuda-oxide`
+feature selects cuda-oxide kernels at compile time.
+
+The cuda-oxide path contains the Qwen3.8 27B target-prefill, target-decode, and
+DFlash2 kernels. This path includes W4A16, compact FP4 KV, chunked and
+recurrent GDN, attention, sampling, and DFlash2 operations. Both builds use the
+same safe Rust API and device layouts.
+
+The feature does not replace CUDA, cuBLASLt, or CUTLASS. These libraries
+provide device management and matrix plans outside the custom-kernel backend.
+NVCC still compiles kernels for other model families.
+
+The `eider-api/cuda-oxide` feature enables this backend in a production server
+build.
+
+```sh
+scripts/setup-cuda-oxide.sh
+scripts/run-eider-qwen38.sh --cuda-oxide --offline
+```
+
+See [`../../backends/cuda-oxide/README.md`](../../backends/cuda-oxide/README.md)
+for the cuda-oxide requirements and build commands.
 
 CAUTION: GB10 device allocations use the same 128 GB unified memory as the
 host. Do not start another full model while a server is active.

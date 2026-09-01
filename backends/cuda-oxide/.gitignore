@@ -1,0 +1,6 @@
+/target/
+/.oxide-artifacts/
+/*.cubin
+/*.ll
+/*.opt.ll
+/*.ptx

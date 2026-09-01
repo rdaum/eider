@@ -1,8 +1,13 @@
 //! Eider-owned SM121 W4A16 tensor-core operations.
 
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer, check_cuda};
+#[cfg(not(feature = "cuda-oxide"))]
+use crate::cuda::check_cuda;
+use crate::cuda::{CudaStream, DeviceBuffer, DeviceOutput, PinnedHostBuffer};
 use crate::error::{Error, Result};
+#[cfg(not(feature = "cuda-oxide"))]
 use crate::ffi;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::sm121_w4a16_oxide;
 use eider_format::ModelOptNvfp4Linear;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -583,6 +588,24 @@ impl Sm121W4A16GateUp {
     ) -> Result<()> {
         let output_f32 =
             output_f32.map_or(std::ptr::null_mut(), |mut output| output.buffer_mut().ptr);
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            sm121_w4a16_oxide::launch(
+                indices.ptr,
+                input.ptr,
+                self.tiled_weight.ptr,
+                self.weight_scale.ptr,
+                self.global_scale.ptr,
+                output_bf16.ptr,
+                output_f32,
+                batch_size as u32,
+                self.top_k as u32,
+                self.gate_up as u32,
+                self.hidden as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sm121_w4a16_gate_up_on_stream",
@@ -797,12 +820,18 @@ fn validate_buffers(
 }
 
 fn ensure_device_support() -> Result<()> {
-    if unsafe { ffi::infer_sm121_w4a16_supported() } == 0 {
+    #[cfg(feature = "cuda-oxide")]
+    return sm121_w4a16_oxide::ensure_supported();
+    #[cfg(not(feature = "cuda-oxide"))]
+    let supported = unsafe { ffi::infer_sm121_w4a16_supported() } != 0;
+    #[cfg(not(feature = "cuda-oxide"))]
+    if !supported {
         return Err(Error::Format {
             label: "SM121 W4A16 device support",
             detail: "requires an sm_121 device".to_string(),
         });
     }
+    #[cfg(not(feature = "cuda-oxide"))]
     Ok(())
 }
 

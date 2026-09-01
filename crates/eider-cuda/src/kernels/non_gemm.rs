@@ -9,6 +9,10 @@ use crate::cuda::{
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::format;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::core_oxide;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::w4a16_matvec_oxide;
 use crate::matrix::{Bf16Matrix, Nvfp4Matrix};
 use std::mem::size_of;
 
@@ -101,6 +105,32 @@ pub fn rms_norm_f32_into_on_stream(
         });
     }
 
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rms_norm(
+            input.ptr,
+            weight.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            eps,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        return core_oxide::copy_fp8_rows_to_f32_indexed(
+            input.ptr,
+            row_scales.ptr,
+            rows.ptr,
+            output.buffer_mut().ptr,
+            row_count as u32,
+            cols as u32,
+            stream.as_raw(),
+        );
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rms_norm_f32_on_stream",
@@ -705,6 +735,16 @@ pub fn silu_mul_halves_f32_into_on_stream(
         });
     }
 
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::silu_mul_halves(
+            gate_up.ptr,
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_silu_mul_halves_f32_on_stream",
@@ -783,6 +823,17 @@ pub fn silu_mul_halves_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::silu_mul_halves_batch(
+            gate_up.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_silu_mul_halves_f32_batch_on_stream",
@@ -873,6 +924,11 @@ pub fn fill_f32_prefix_into_on_stream(
             actual: format!("output={} active={len} value={value}", output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::fill(output.buffer_mut().ptr, value, len as u32, stream.as_raw())
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_fill_f32_on_stream",
@@ -908,6 +964,17 @@ pub fn scaled_add_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::scaled_add(
+            input.ptr,
+            output.buffer_mut().ptr,
+            scale,
+            input.len() as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_scaled_add_f32_on_stream",
@@ -994,6 +1061,17 @@ pub fn sigmoid_mul_f32_prefix_into_on_stream(
             actual: format!("len={len}"),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::sigmoid_mul(
+            gate.ptr,
+            input.ptr,
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_sigmoid_mul_f32_on_stream",
@@ -1245,6 +1323,25 @@ pub fn qwen36_full_attn_prep_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_full_attn_prep(
+            q_full.ptr,
+            k_raw.ptr,
+            q_norm.ptr,
+            k_norm.ptr,
+            q.buffer_mut().ptr,
+            gate.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            1,
+            q_heads as u32,
+            kv_heads as u32,
+            head_dim as u32,
+            eps,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_full_attn_prep_f32_on_stream",
@@ -1321,6 +1418,25 @@ pub fn qwen36_full_attn_prep_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_full_attn_prep(
+            q_full.ptr,
+            k_raw.ptr,
+            q_norm.ptr,
+            k_norm.ptr,
+            q.buffer_mut().ptr,
+            gate.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            rows as u32,
+            q_heads as u32,
+            kv_heads as u32,
+            head_dim as u32,
+            eps,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_full_attn_prep_f32_batch_on_stream",
@@ -3377,6 +3493,20 @@ pub fn rope_neox_partial_f32_into_on_stream(
             actual: format!("rotary_dim={rotary_dim} head_dim={head_dim}"),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_partial(
+            input.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            position as u32,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_neox_partial_f32_on_stream",
@@ -3422,6 +3552,20 @@ pub fn rope_neox_partial_f32_indexed_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_partial_indexed(
+            input.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            position.ptr,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_neox_partial_f32_indexed_on_stream",
@@ -3998,6 +4142,21 @@ pub fn rope_neox_sequence_f32_into_on_stream(
         });
     }
 
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_partial_sequence(
+            input.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            heads as u32,
+            head_dim as u32,
+            head_dim as u32,
+            start_position as u32,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_neox_sequence_f32_on_stream",
@@ -4062,6 +4221,21 @@ pub fn rope_neox_partial_sequence_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::rope_partial_sequence(
+            input.ptr,
+            output.buffer_mut().ptr,
+            tokens as u32,
+            heads as u32,
+            head_dim as u32,
+            rotary_dim as u32,
+            start_position as u32,
+            theta,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_rope_neox_partial_sequence_f32_on_stream",
@@ -4277,6 +4451,17 @@ pub fn add_f32_prefix_into_on_stream(
         });
     }
 
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::add(
+            left.ptr,
+            right.ptr,
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_add_f32_on_stream",
@@ -4356,6 +4541,18 @@ pub fn concat_f32_rows_into_on_stream(
         });
     }
 
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::concat_f32_rows(
+            left.ptr,
+            right.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_concat_f32_rows_on_stream",
@@ -4945,6 +5142,18 @@ pub fn copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::copy_bf16_rows_to_f32_indexed(
+            input.ptr,
+            rows.ptr,
+            output.buffer_mut().ptr,
+            row_count as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_copy_bf16_rows_to_f32_indexed_on_stream",
@@ -5006,6 +5215,19 @@ pub fn copy_fp8_rows_to_f32_indexed_prefix_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::copy_fp8_rows_to_f32_indexed(
+            input.ptr,
+            row_scales.ptr,
+            rows.ptr,
+            output.buffer_mut().ptr,
+            row_count as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_copy_fp8_rows_to_f32_indexed_on_stream",
@@ -5153,6 +5375,19 @@ pub fn quantize_nvfp4_col_major_f32_device_into_on_stream(
     let mut output = output.output();
     let values = output.values_mut_ptr().cast();
     let scales = output.scales_mut_ptr().cast();
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::quantize_nvfp4_col_major(
+            input.ptr,
+            values,
+            scales,
+            rows as u32,
+            cols as u32,
+            input_scale,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_quantize_nvfp4_col_major_f32_on_stream",
@@ -6035,6 +6270,19 @@ pub fn dflash2_capture_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::dflash2_capture(
+            input.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            hidden as u32,
+            taps as u32,
+            tap as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_dflash2_capture_f32_on_stream",
@@ -6117,6 +6365,23 @@ pub fn dflash2_grouped_conv_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::dflash2_grouped_conv(
+            input.ptr,
+            coefficients.ptr,
+            base.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            hidden as u32,
+            groups as u32,
+            taps as u32,
+            block_size as u32,
+            side as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_dflash2_grouped_conv_f32_on_stream",
@@ -6212,6 +6477,26 @@ pub fn dflash2_noncausal_attention_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::dflash2_noncausal_attention(
+            query.ptr,
+            context_key.ptr,
+            context_value.ptr,
+            block_key.ptr,
+            block_value.ptr,
+            output.buffer_mut().ptr,
+            context_end as u32,
+            context_len as u32,
+            rows as u32,
+            q_heads as u32,
+            kv_heads as u32,
+            head_dim as u32,
+            window as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_dflash2_noncausal_attention_f32_on_stream",
@@ -7027,6 +7312,18 @@ pub fn argmax_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::argmax(
+            values.ptr,
+            out_index.buffer_mut().ptr,
+            out_value.buffer_mut().ptr,
+            1,
+            values.len() as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_argmax_f32_on_stream",
@@ -7070,6 +7367,18 @@ pub fn argmax_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::argmax(
+            values.ptr,
+            out_index.buffer_mut().ptr,
+            out_value.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_argmax_f32_batch_on_stream",
@@ -7118,6 +7427,18 @@ pub fn mask_logits_f32_batch_in_place_on_stream(
             actual: format!("logits={} mask={}", logits.len(), allowed.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::mask_logits_batch(
+            logits.buffer_mut().ptr,
+            allowed.ptr,
+            rows as u32,
+            cols as u32,
+            mask_words as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_mask_logits_f32_batch_on_stream",
@@ -7308,6 +7629,19 @@ pub fn dflash2_hidden_projection_f32_into_on_stream(
     let hidden = hidden.values();
     let weight_bf16 = weight_bf16.values();
     let mut projected = projected.values_mut();
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::dflash2_hidden_projection(
+            hidden.as_const_ptr().cast(),
+            weight_bf16.as_const_ptr().cast(),
+            projected.as_mut_ptr().cast(),
+            rows as u32,
+            hidden_size as u32,
+            rank as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_dflash2_hidden_projection_f32_on_stream",
@@ -7482,6 +7816,21 @@ impl GpuTokenSampler {
             };
         }
         self.params.copy_from_host(&self.host_params)?;
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            core_oxide::sampling_sample(
+                logits.ptr,
+                self.params.ptr.cast(),
+                self.stage_one_keys.ptr,
+                self.stage_two_keys.ptr,
+                self.top_keys.ptr,
+                self.results.ptr.cast(),
+                rows.len() as u32,
+                vocab as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_sample_topk_topp_f32_batch_on_stream",
@@ -7545,31 +7894,46 @@ impl GpuTokenSampler {
                 actual: format!("rows={rows} top_k={top_k} logits={}", logits.len()),
             });
         }
-        self.host_params.fill(DeviceSamplingParams {
-            temperature: 1.0,
-            top_p: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            draw: 0.0,
-            top_k: top_k as u32,
-            token_counts: 0,
-        });
-        self.params.copy_from_host(&self.host_params)?;
+        #[cfg(feature = "cuda-oxide")]
         unsafe {
-            check_cuda(
-                "infer_sample_topk_topp_f32_batch_on_stream",
-                ffi::infer_sample_topk_topp_f32_batch_on_stream(
-                    logits.ptr,
-                    self.params.ptr.cast(),
-                    self.stage_one_keys.ptr,
-                    self.stage_two_keys.ptr,
-                    self.top_keys.ptr,
-                    self.results.ptr.cast(),
-                    rows as u32,
-                    self.vocab as u32,
-                    stream.as_raw(),
-                ),
+            core_oxide::sampling_topk(
+                logits.ptr,
+                self.stage_one_keys.ptr,
+                self.stage_two_keys.ptr,
+                self.top_keys.ptr,
+                rows as u32,
+                self.vocab as u32,
+                stream.as_raw(),
             )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        {
+            self.host_params.fill(DeviceSamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                draw: 0.0,
+                top_k: top_k as u32,
+                token_counts: 0,
+            });
+            self.params.copy_from_host(&self.host_params)?;
+            unsafe {
+                check_cuda(
+                    "infer_sample_topk_topp_f32_batch_on_stream",
+                    ffi::infer_sample_topk_topp_f32_batch_on_stream(
+                        logits.ptr,
+                        self.params.ptr.cast(),
+                        self.stage_one_keys.ptr,
+                        self.stage_two_keys.ptr,
+                        self.top_keys.ptr,
+                        self.results.ptr.cast(),
+                        rows as u32,
+                        self.vocab as u32,
+                        stream.as_raw(),
+                    ),
+                )?;
+            }
         }
         Ok(())
     }
@@ -7776,6 +8140,23 @@ impl DFlash2SelectorPlan {
         workspace
             .sampler
             .enqueue_top_k(logits, drafts, self.top_k, stream)?;
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            core_oxide::dflash2_select_path(
+                workspace.projected.as_const_ptr().cast(),
+                workspace.sampler.top_keys.as_const_ptr().cast(),
+                self.predecessor_codebook.as_const_ptr().cast(),
+                self.successor_codebook.as_const_ptr().cast(),
+                workspace.tokens.as_mut_ptr().cast(),
+                anchor_token,
+                drafts as u32,
+                self.rank as u32,
+                self.top_k as u32,
+                GPU_SAMPLING_MAX_TOP_K as u32,
+                stream.as_raw(),
+            )?;
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_dflash2_select_path_f32_on_stream",
@@ -8065,6 +8446,19 @@ pub fn bf16_linear_logits_f32_into_on_stream(
             actual: format!("{} values", logits.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_linear_logits_batch(
+            input.ptr,
+            weight.ptr,
+            logits.buffer_mut().ptr,
+            1,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_linear_logits_f32_on_stream",
@@ -8126,6 +8520,19 @@ pub fn bf16_linear_logits_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_linear_logits_batch(
+            input.ptr,
+            weight.ptr,
+            logits.buffer_mut().ptr,
+            batch_size as u32,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_linear_logits_f32_batch_on_stream",
@@ -8188,6 +8595,19 @@ pub fn bf16_linear_two_rows_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_linear_logits_batch(
+            input.ptr,
+            weight.ptr,
+            logits.buffer_mut().ptr,
+            2,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_linear_two_rows_f32_on_stream",
@@ -8241,6 +8661,28 @@ pub fn bf16_linear_pair_logits_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_linear_logits_batch(
+            input.ptr,
+            first_weight.ptr,
+            first_logits.buffer_mut().ptr,
+            1,
+            first_rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )?;
+        core_oxide::bf16_linear_logits_batch(
+            input.ptr,
+            second_weight.ptr,
+            second_logits.buffer_mut().ptr,
+            1,
+            second_rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_linear_pair_logits_f32_on_stream",
@@ -8351,6 +8793,16 @@ pub fn bf16_matrix_to_f32_into_on_stream(
     }
 
     let matrix = matrix.input();
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_to_f32(
+            matrix.data_ptr(),
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_to_f32_on_stream",
@@ -8378,6 +8830,16 @@ pub fn bf16_to_f32_prefix_into_on_stream(
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::bf16_to_f32(
+            input.ptr,
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_bf16_to_f32_on_stream",
@@ -8407,6 +8869,16 @@ pub fn f32_to_bf16_into_on_stream(
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::f32_to_bf16(
+            input.ptr,
+            output.buffer_mut().ptr,
+            input.len() as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_f32_to_bf16_on_stream",
@@ -8434,6 +8906,16 @@ pub fn f32_to_bf16_prefix_into_on_stream(
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::f32_to_bf16(
+            input.ptr,
+            output.buffer_mut().ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_f32_to_bf16_on_stream",
@@ -8857,6 +9339,12 @@ pub fn round_f32_to_bf16_prefix_in_place_on_stream(
             actual: format!("{} values with {count} active", values.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        let pointer = values.buffer_mut().ptr;
+        core_oxide::round_to_bf16(pointer, pointer, count as u32, stream.as_raw())
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_round_f32_to_bf16_in_place_on_stream",
@@ -8882,6 +9370,16 @@ pub fn round_f32_to_bf16_into_on_stream(
             actual: format!("input={} output={}", input.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::round_to_bf16(
+            input.ptr,
+            output.buffer_mut().ptr,
+            input.len() as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_round_f32_to_bf16_on_stream",
@@ -8953,6 +9451,21 @@ pub fn gated_delta_net_128_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gated_delta_net_128(
+            q.ptr,
+            k.ptr,
+            v.ptr,
+            gate.ptr,
+            beta.ptr,
+            state.buffer_mut().ptr,
+            output.buffer_mut().ptr,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gated_delta_net_128_f32_on_stream",
@@ -9041,6 +9554,25 @@ pub fn gated_delta_net_128_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gated_delta_net_128_batch(
+            q.ptr,
+            k.ptr,
+            v.ptr,
+            gate.ptr,
+            beta.ptr,
+            state_table
+                .address_at(state_table_offset)?
+                .as_const_ptr()
+                .cast(),
+            output.buffer_mut().ptr,
+            batch_size as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gated_delta_net_128_f32_batch_on_stream",
@@ -9137,6 +9669,28 @@ pub fn gated_delta_net_128_f32_chunks_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gated_delta_net_128_chunks(
+            q.ptr,
+            k.ptr,
+            v.ptr,
+            gate.ptr,
+            beta.ptr,
+            state_table
+                .address_at(state_table_offset)?
+                .as_const_ptr()
+                .cast(),
+            sequence_offsets.ptr,
+            sequence_lengths.ptr,
+            output.buffer_mut().ptr,
+            sequence_count as u32,
+            total_tokens as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gated_delta_net_128_f32_chunks_on_stream",
@@ -9220,6 +9774,17 @@ pub fn gather_f32_pointer_rows_range_into_on_stream(
             actual: format!("table={} output={}", input_table.len(), output.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gather_f32_pointer_rows(
+            input_table.address_at(table_offset)?.as_const_ptr().cast(),
+            output.ptr.add(output_offset),
+            rows as u32,
+            row_values as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gather_f32_pointer_rows_on_stream",
@@ -9292,6 +9857,17 @@ pub fn scatter_f32_pointer_rows_range_on_stream(
             actual: format!("input={} table={}", input.len(), output_table.len()),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::scatter_f32_pointer_rows(
+            input.ptr.add(input_offset),
+            output_table.address_at(table_offset)?.as_const_ptr().cast(),
+            rows as u32,
+            row_values as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_scatter_f32_pointer_rows_on_stream",
@@ -9673,6 +10249,20 @@ pub fn fp8_linear_channel_scaled_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::fp8_linear_channel_scaled(
+            input.ptr,
+            weight.ptr,
+            channel_weight_scale.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            threads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_fp8_linear_channel_scaled_f32_configured_on_stream",
@@ -9939,6 +10529,29 @@ pub fn fp8_linear_channel_scaled_dynamic_quantized_f32_configured_into_on_stream
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::quantize_fp8_dynamic(
+            input.ptr,
+            quantized_input.ptr,
+            input_scale.ptr,
+            1,
+            cols as u32,
+            stream.as_raw(),
+        )?;
+        core_oxide::fp8_linear_quantized_channel_scaled(
+            quantized_input.ptr,
+            weight.ptr,
+            channel_weight_scale.ptr,
+            input_scale.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            threads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_fp8_linear_channel_scaled_dynamic_quantized_f32_configured_on_stream",
@@ -10231,6 +10844,18 @@ pub fn quantize_fp8_e4m3_dynamic_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::quantize_fp8_dynamic(
+            input.ptr,
+            quantized_input.ptr,
+            input_scale.ptr,
+            1,
+            input.len() as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_quantize_fp8_e4m3_dynamic_f32_on_stream",
@@ -10278,6 +10903,18 @@ pub fn quantize_fp8_e4m3_dynamic_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::quantize_fp8_dynamic(
+            input.ptr,
+            quantized_input.ptr,
+            input_scale.ptr,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_quantize_fp8_e4m3_dynamic_f32_batch_on_stream",
@@ -10317,6 +10954,17 @@ pub fn scale_channel_f32_device_scalar_in_place_on_stream(
         });
     }
     let len = values.len();
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::scale_channel_scalar(
+            values.buffer_mut().ptr,
+            channel_scale.ptr,
+            scalar.ptr,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_scale_channel_f32_device_scalar_on_stream",
@@ -10364,6 +11012,18 @@ pub fn scale_channel_f32_device_row_scalar_in_place_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::scale_channel_row_scalar(
+            values.buffer_mut().ptr,
+            channel_scale.ptr,
+            row_scale.ptr,
+            rows as u32,
+            channels as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_scale_channel_f32_device_row_scalar_on_stream",
@@ -10692,6 +11352,22 @@ pub fn nvfp4_w4a16_matvec_f32_batch_into_on_stream(
             detail: format!("expected finite scale, got {weight_scale_2}"),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        w4a16_matvec_oxide::launch_batch(
+            input.ptr,
+            packed_weight.ptr,
+            weight_scale.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            out_features as u32,
+            in_features as u32,
+            weight_scale_2,
+            8,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_nvfp4_w4a16_matvec_f32_warp_rows_batch_on_stream",
@@ -10781,6 +11457,21 @@ pub fn nvfp4_w4a16_matvec_warp_rows_f32_into_on_stream(
         in_features,
         weight_scale_2,
     )?;
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        w4a16_matvec_oxide::launch(
+            input.ptr,
+            packed_weight.ptr,
+            weight_scale.ptr,
+            output.buffer_mut().ptr,
+            out_features as u32,
+            in_features as u32,
+            weight_scale_2,
+            warps_per_block as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_nvfp4_w4a16_matvec_f32_warp_rows_on_stream",
@@ -11230,6 +11921,22 @@ pub fn qwen36_gdn_prep_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_prep(
+            qkv.ptr,
+            conv_weight_bf16.ptr,
+            q.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            v.buffer_mut().ptr,
+            conv_state.buffer_mut().ptr,
+            key_heads as u32,
+            value_heads as u32,
+            head_dim as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_prep_on_stream",
@@ -11539,6 +12246,26 @@ pub fn qwen36_gdn_prep_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_prep_batch(
+            qkv.ptr,
+            conv_weight_bf16.ptr,
+            q.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            v.buffer_mut().ptr,
+            conv_state_table
+                .address_at(state_table_offset)?
+                .as_const_ptr()
+                .cast(),
+            batch_size as u32,
+            key_heads as u32,
+            value_heads as u32,
+            head_dim as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_prep_batch_on_stream",
@@ -11652,6 +12379,29 @@ pub fn qwen36_gdn_prep_chunks_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_prep_chunks(
+            qkv.ptr,
+            conv_weight_bf16.ptr,
+            q.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            v.buffer_mut().ptr,
+            conv_state_table
+                .address_at(state_table_offset)?
+                .as_const_ptr()
+                .cast(),
+            sequence_offsets.ptr,
+            sequence_lengths.ptr,
+            sequence_count as u32,
+            total_tokens as u32,
+            key_heads as u32,
+            value_heads as u32,
+            head_dim as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_prep_chunks_on_stream",
@@ -11764,6 +12514,29 @@ pub fn qwen36_gdn_prep_chunks_bf16_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_prep_chunks_bf16(
+            qkv.ptr,
+            conv_weight_bf16.ptr,
+            q.buffer_mut().ptr,
+            k.buffer_mut().ptr,
+            v.buffer_mut().ptr,
+            conv_state_table
+                .address_at(state_table_offset)?
+                .as_const_ptr()
+                .cast(),
+            sequence_offsets.ptr,
+            sequence_lengths.ptr,
+            sequence_count as u32,
+            total_tokens as u32,
+            key_heads as u32,
+            value_heads as u32,
+            head_dim as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_prep_chunks_bf16_on_stream",
@@ -11824,6 +12597,20 @@ pub fn qwen36_gdn_gate_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_gate(
+            alpha.ptr,
+            beta_input.ptr,
+            a_log_bf16.ptr,
+            dt_bias_bf16.ptr,
+            gate.buffer_mut().ptr,
+            beta.buffer_mut().ptr,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_gate_on_stream",
@@ -12588,6 +13375,21 @@ pub fn qwen36_gdn_gate_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_gate_batch(
+            alpha.ptr,
+            beta_input.ptr,
+            a_log_bf16.ptr,
+            dt_bias_bf16.ptr,
+            gate.buffer_mut().ptr,
+            beta.buffer_mut().ptr,
+            batch_size as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_gate_batch_on_stream",
@@ -12649,6 +13451,21 @@ pub fn qwen36_gdn_gate_batch_bf16_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_gate_batch_bf16(
+            alpha.ptr,
+            beta_input.ptr,
+            a_log_bf16.ptr,
+            dt_bias_bf16.ptr,
+            gate.buffer_mut().ptr,
+            beta.buffer_mut().ptr,
+            batch_size as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_gate_batch_bf16_on_stream",
@@ -12713,6 +13530,20 @@ pub fn qwen36_gdn_gate_paired_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_gate_paired_batch(
+            alpha_beta.ptr,
+            a_log_bf16.ptr,
+            dt_bias_bf16.ptr,
+            gate.buffer_mut().ptr,
+            beta.buffer_mut().ptr,
+            batch_size as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_gate_paired_batch_on_stream",
@@ -12775,6 +13606,20 @@ pub fn qwen36_gdn_gate_paired_batch_bf16_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen_gdn_gate_paired_batch_bf16(
+            alpha_beta.ptr,
+            a_log_bf16.ptr,
+            dt_bias_bf16.ptr,
+            gate.buffer_mut().ptr,
+            beta.buffer_mut().ptr,
+            batch_size as u32,
+            heads as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_gdn_gate_paired_batch_bf16_on_stream",
@@ -12829,6 +13674,20 @@ pub fn gated_rms_norm_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gated_rms_norm(
+            input.ptr,
+            gate.ptr,
+            weight.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            eps,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gated_rms_norm_f32_on_stream",
@@ -12901,6 +13760,22 @@ pub fn gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
         });
     }
     let mut output = output.output();
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::gated_rms_norm_quantize_nvfp4(
+            input.ptr,
+            gate.ptr,
+            weight.ptr,
+            output.values_mut_ptr().cast(),
+            output.scales_mut_ptr().cast(),
+            rows as u32,
+            heads as u32,
+            eps,
+            input_scale,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_gated_rms_norm_quantize_nvfp4_col_major_f32_on_stream",
@@ -17299,6 +18174,44 @@ mod tests {
     }
 
     #[test]
+    fn copy_bf16_rows_to_f32_indexed_matches_cpu_reference() {
+        let vocab_rows = 4;
+        let cols = 5;
+        let values = (0..vocab_rows * cols)
+            .map(|index| format::f32_to_bf16(index as f32 * 0.25 - 2.0))
+            .collect::<Vec<_>>();
+        let indices = vec![3u32, 1, 2];
+        let input = DeviceBuffer::from_host(&values).expect("BF16 embedding upload");
+        let indices_device = DeviceBuffer::from_host(&indices).expect("row index upload");
+        let mut output = DeviceBuffer::zeroed(indices.len() * cols).expect("BF16 row output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        copy_bf16_rows_to_f32_indexed_prefix_into_on_stream(
+            vocab_rows,
+            cols,
+            &input,
+            &indices_device,
+            output.output(),
+            indices.len(),
+            &stream,
+        )
+        .expect("BF16 embedding gather");
+
+        let expected = indices
+            .iter()
+            .flat_map(|&row| {
+                values[row as usize * cols..(row as usize + 1) * cols]
+                    .iter()
+                    .map(|&value| format::bf16_to_f32(value))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output.copy_to_host(&stream).expect("BF16 row download"),
+            expected
+        );
+    }
+
+    #[test]
     fn copy_fp8_rows_to_f32_indexed_applies_selected_row_scales() {
         let rows = 3;
         let cols = 4;
@@ -20548,6 +21461,80 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_long_chunk_recurrence_matches_cpu_reference() {
+        let tokens = 1024usize;
+        let heads = 1usize;
+        let vector_dim = heads * 128;
+        let vectors = tokens * vector_dim;
+        let q = (0..vectors)
+            .map(|index| ((index * 17 % 97) as f32 - 48.0) * 0.002)
+            .collect::<Vec<_>>();
+        let k = (0..vectors)
+            .map(|index| ((index * 29 % 101) as f32 - 50.0) * 0.002)
+            .collect::<Vec<_>>();
+        let v = (0..vectors)
+            .map(|index| ((index * 43 % 103) as f32 - 51.0) * 0.001)
+            .collect::<Vec<_>>();
+        let gate = (0..tokens).map(|_| -0.015f32).collect::<Vec<_>>();
+        let beta = (0..tokens).map(|_| 0.125f32).collect::<Vec<_>>();
+        let mut expected_state = vec![0.0f32; heads * 128 * 128];
+        let mut expected_output = Vec::with_capacity(vectors);
+        for token in 0..tokens {
+            let vector = token * vector_dim..(token + 1) * vector_dim;
+            expected_output.extend(cpu_gated_delta_net_128(
+                &q[vector.clone()],
+                &k[vector.clone()],
+                &v[vector],
+                &gate[token..token + 1],
+                &beta[token..token + 1],
+                &mut expected_state,
+                heads,
+            ));
+        }
+
+        let q = DeviceBuffer::from_host(&q).expect("q upload");
+        let k = DeviceBuffer::from_host(&k).expect("k upload");
+        let v = DeviceBuffer::from_host(&v).expect("v upload");
+        let gate = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let beta = DeviceBuffer::from_host(&beta).expect("beta upload");
+        let state = DeviceBuffer::<f32>::zeroed(expected_state.len()).expect("state");
+        let state_table = DeviceBuffer::from_host(&[state.cuda_address()]).expect("state table");
+        let offsets = DeviceBuffer::from_host(&[0u32]).expect("offsets");
+        let lengths = DeviceBuffer::from_host(&[tokens as u32]).expect("lengths");
+        let mut output = DeviceBuffer::<f32>::zeroed(vectors).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        gated_delta_net_128_f32_chunks_into_on_stream(
+            &q,
+            &k,
+            &v,
+            &gate,
+            &beta,
+            &state_table,
+            0,
+            &offsets,
+            &lengths,
+            output.output(),
+            1,
+            tokens,
+            heads,
+            &stream,
+        )
+        .expect("long chunk recurrence");
+        assert_close(
+            &output.copy_to_host(&stream).expect("output download"),
+            &expected_output,
+            3.0e-5,
+            "long chunk output",
+        );
+        assert_close(
+            &state.copy_to_host(&stream).expect("state download"),
+            &expected_state,
+            3.0e-5,
+            "long chunk state",
+        );
+    }
+
+    #[test]
     fn channel_scaled_bf16_to_fp8_quantization_uses_row_scales() {
         let rows = 2usize;
         let cols = 4usize;
@@ -21870,6 +22857,81 @@ mod tests {
             &expected,
             2.0e-6,
             "gated rms",
+        );
+    }
+
+    #[test]
+    fn gated_rms_norm_nvfp4_quantization_matches_staged_path() {
+        let rows = 2usize;
+        let heads = 3usize;
+        let head_dim = 128usize;
+        let cols = heads * head_dim;
+        let eps = 1.0e-6;
+        let input_scale = 0.375;
+        let input = (0..rows * cols)
+            .map(|idx| ((idx * 17 % 101) as f32 - 50.0) * 0.015625)
+            .collect::<Vec<_>>();
+        let gate = (0..rows * cols)
+            .map(|idx| ((idx * 19 % 97) as f32 - 48.0) * 0.0234375)
+            .collect::<Vec<_>>();
+        let weight = (0..head_dim)
+            .map(|idx| 0.75 + (idx % 13) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let gate = DeviceBuffer::from_host(&gate).expect("gate upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let mut normalized = DeviceBuffer::zeroed(rows * cols).expect("normalized allocation");
+        let mut expected = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("expected matrix");
+        let mut actual = Nvfp4Matrix::zeroed_col_major(cols, rows).expect("actual matrix");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+
+        gated_rms_norm_f32_into_on_stream(
+            &input,
+            &gate,
+            &weight,
+            normalized.output(),
+            rows * heads,
+            head_dim,
+            eps,
+            &stream,
+        )
+        .expect("staged gated RMSNorm");
+        quantize_nvfp4_col_major_f32_device_into_on_stream(
+            cols,
+            rows,
+            &normalized,
+            &mut expected,
+            input_scale,
+            &stream,
+        )
+        .expect("staged quantization");
+        gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream(
+            rows,
+            heads,
+            head_dim,
+            &input,
+            &gate,
+            &weight,
+            &mut actual,
+            eps,
+            input_scale,
+            &stream,
+        )
+        .expect("fused quantization");
+
+        assert_eq!(
+            actual.values.copy_to_host(&stream).expect("actual values"),
+            expected
+                .values
+                .copy_to_host(&stream)
+                .expect("expected values")
+        );
+        assert_eq!(
+            actual.scales.copy_to_host(&stream).expect("actual scales"),
+            expected
+                .scales
+                .copy_to_host(&stream)
+                .expect("expected scales")
         );
     }
 

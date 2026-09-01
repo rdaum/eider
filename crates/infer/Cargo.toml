@@ -3,6 +3,10 @@ name = "eider-inference"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+cuda-oxide = ["eider-cuda/cuda-oxide"]
+
 [dependencies]
 fs2.workspace = true
 anyhow = "1"

@@ -3,6 +3,10 @@ name = "eider-cuda"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+cuda-oxide = []
+
 [dependencies]
 libc = "0.2"
 serde_json.workspace = true
