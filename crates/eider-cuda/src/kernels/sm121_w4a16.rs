@@ -7,6 +7,8 @@ use crate::error::{Error, Result};
 #[cfg(not(feature = "cuda-oxide"))]
 use crate::ffi;
 #[cfg(feature = "cuda-oxide")]
+use crate::kernels::sm121_w4a4_oxide;
+#[cfg(feature = "cuda-oxide")]
 use crate::kernels::sm121_w4a16_oxide;
 use eider_format::ModelOptNvfp4Linear;
 use std::fs::File;
@@ -51,6 +53,20 @@ pub struct Sm121W4A16GateUp {
 pub struct Sm121W4A16GateUpBatchWorkspace {
     capacity: usize,
     output_bf16: DeviceBuffer<u16>,
+}
+
+/// Reusable grouped W4A4 storage for an Oxide routed batch.
+#[cfg(feature = "cuda-oxide")]
+pub struct Sm121W4A4GroupedWorkspace {
+    capacity_rows: usize,
+    top_k: usize,
+    sorted_routes: DeviceBuffer<u32>,
+    group_experts: DeviceBuffer<u32>,
+    group_starts: DeviceBuffer<u32>,
+    group_lengths: DeviceBuffer<u32>,
+    group_count: DeviceBuffer<u32>,
+    input_tiles: DeviceBuffer<u8>,
+    input_scales: DeviceBuffer<u32>,
 }
 
 /// Persistent SM121 W4A16 plan for one dense projection.
@@ -435,6 +451,57 @@ impl Sm121W4A16GateUp {
         })
     }
 
+    /// Allocates reusable grouped W4A4 storage for `capacity` input rows.
+    #[cfg(feature = "cuda-oxide")]
+    pub fn new_w4a4_grouped_workspace(&self, capacity: usize) -> Result<Sm121W4A4GroupedWorkspace> {
+        sm121_w4a4_oxide::ensure_supported()?;
+        if capacity == 0 || self.experts > 1024 || !self.hidden.is_multiple_of(64) {
+            return Err(Error::Shape {
+                label: "SM121 grouped W4A4 workspace",
+                expected: "positive capacity, at most 1024 experts, and K divisible by 64"
+                    .to_string(),
+                actual: format!(
+                    "capacity={capacity} experts={} in_features={}",
+                    self.experts, self.hidden
+                ),
+            });
+        }
+        let routes = capacity
+            .checked_mul(self.top_k)
+            .ok_or_else(|| Error::Shape {
+                label: "SM121 grouped W4A4 workspace",
+                expected: "capacity * top-k without overflow".to_string(),
+                actual: format!("capacity={capacity} top_k={}", self.top_k),
+            })?;
+        let input_tiles = routes
+            .checked_mul(self.hidden / 64)
+            .and_then(|value| value.checked_mul(512))
+            .ok_or_else(|| Error::Shape {
+                label: "SM121 grouped W4A4 input tiles",
+                expected: "workspace size without overflow".to_string(),
+                actual: format!("routes={routes} in_features={}", self.hidden),
+            })?;
+        let input_scales = routes
+            .checked_mul(self.hidden / 64)
+            .and_then(|value| value.checked_mul(16))
+            .ok_or_else(|| Error::Shape {
+                label: "SM121 grouped W4A4 input scales",
+                expected: "workspace size without overflow".to_string(),
+                actual: format!("routes={routes} in_features={}", self.hidden),
+            })?;
+        Ok(Sm121W4A4GroupedWorkspace {
+            capacity_rows: capacity,
+            top_k: self.top_k,
+            sorted_routes: DeviceBuffer::zeroed(routes)?,
+            group_experts: DeviceBuffer::zeroed(routes)?,
+            group_starts: DeviceBuffer::zeroed(routes)?,
+            group_lengths: DeviceBuffer::zeroed(routes)?,
+            group_count: DeviceBuffer::zeroed(1)?,
+            input_tiles: DeviceBuffer::zeroed(input_tiles)?,
+            input_scales: DeviceBuffer::zeroed(input_scales)?,
+        })
+    }
+
     /// Runs routed gate/up for one input row and retains BF16 output.
     pub fn run_bf16_on_stream(
         &self,
@@ -538,6 +605,115 @@ impl Sm121W4A16GateUp {
         self.launch(indices, input, &workspace.output_bf16, None, batch, stream)
     }
 
+    /// Runs an active prefix and writes BF16-rounded values in F32 storage.
+    pub fn run_batch_f32_prefix_on_stream(
+        &self,
+        workspace: &Sm121W4A16GateUpBatchWorkspace,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        output: DeviceOutput<'_, f32>,
+        batch: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let routes = batch.saturating_mul(self.top_k);
+        let output_len = routes.saturating_mul(self.gate_up);
+        if batch == 0
+            || batch > workspace.capacity
+            || indices.len() < routes
+            || input.len() < batch.saturating_mul(self.hidden)
+            || output.len() < output_len
+        {
+            return Err(Error::Shape {
+                label: "SM121 W4A16 active F32 batch",
+                expected: format!(
+                    "batch=1..={} indices>={routes} input>={} output>={output_len}",
+                    workspace.capacity,
+                    batch.saturating_mul(self.hidden),
+                ),
+                actual: format!(
+                    "batch={batch} indices={} input={} output={}",
+                    indices.len(),
+                    input.len(),
+                    output.len(),
+                ),
+            });
+        }
+        self.launch(
+            indices,
+            input,
+            &workspace.output_bf16,
+            Some(output),
+            batch,
+            stream,
+        )
+    }
+
+    /// Runs an active routed batch with direct SM121 W4A4 MMA.
+    #[cfg(feature = "cuda-oxide")]
+    pub fn run_w4a4_grouped_f32_prefix_on_stream(
+        &self,
+        workspace: &Sm121W4A4GroupedWorkspace,
+        indices: &DeviceBuffer<u32>,
+        input: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let routes = rows.saturating_mul(self.top_k);
+        let output_len = routes.saturating_mul(self.gate_up);
+        if rows == 0
+            || rows > workspace.capacity_rows
+            || workspace.top_k != self.top_k
+            || indices.len() < routes
+            || input.len() < rows.saturating_mul(self.hidden)
+            || output.len() < output_len
+            || rows > u32::MAX as usize
+            || self.experts > u32::MAX as usize
+            || self.top_k > u32::MAX as usize
+            || self.gate_up > u32::MAX as usize
+            || self.hidden > u32::MAX as usize
+        {
+            return Err(Error::Shape {
+                label: "SM121 grouped W4A4 active batch",
+                expected: format!(
+                    "rows=1..={} indices>={routes} input>={} output>={output_len}",
+                    workspace.capacity_rows,
+                    rows.saturating_mul(self.hidden),
+                ),
+                actual: format!(
+                    "rows={rows} indices={} input={} output={} top_k={}",
+                    indices.len(),
+                    input.len(),
+                    output.len(),
+                    self.top_k,
+                ),
+            });
+        }
+        unsafe {
+            sm121_w4a4_oxide::launch(
+                indices.ptr,
+                input.ptr,
+                self.tiled_weight.ptr,
+                self.weight_scale.ptr,
+                self.global_scale.ptr,
+                workspace.sorted_routes.ptr,
+                workspace.group_experts.ptr,
+                workspace.group_starts.ptr,
+                workspace.group_lengths.ptr,
+                workspace.group_count.ptr,
+                workspace.input_tiles.ptr,
+                workspace.input_scales.ptr,
+                output.buffer_mut().ptr,
+                rows as u32,
+                self.experts as u32,
+                self.top_k as u32,
+                self.gate_up as u32,
+                self.hidden as u32,
+                stream.as_raw(),
+            )
+        }
+    }
+
     /// Returns the persistent one-row BF16 output.
     pub fn output_bf16(&self) -> &DeviceBuffer<u16> {
         &self.output_bf16
@@ -637,6 +813,20 @@ impl Sm121W4A16GateUpBatchWorkspace {
     /// Returns the number of device bytes owned by this workspace.
     pub fn device_bytes(&self) -> usize {
         self.output_bf16.device_bytes()
+    }
+}
+
+#[cfg(feature = "cuda-oxide")]
+impl Sm121W4A4GroupedWorkspace {
+    /// Returns the number of device bytes owned by this workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.sorted_routes.device_bytes()
+            + self.group_experts.device_bytes()
+            + self.group_starts.device_bytes()
+            + self.group_lengths.device_bytes()
+            + self.group_count.device_bytes()
+            + self.input_tiles.device_bytes()
+            + self.input_scales.device_bytes()
     }
 }
 

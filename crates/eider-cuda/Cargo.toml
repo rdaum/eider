@@ -100,6 +100,11 @@ name = "qwen38_grouped_moe_prefill"
 harness = false
 
 [[bench]]
+name = "qwen38_oxide_moe"
+harness = false
+required-features = ["cuda-oxide"]
+
+[[bench]]
 name = "qwen36_prefill_projections"
 harness = false
 

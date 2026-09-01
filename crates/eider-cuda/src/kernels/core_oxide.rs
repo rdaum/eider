@@ -19,6 +19,10 @@ struct Functions {
     round_to_bf16: Kernel,
     f32_to_bf16: Kernel,
     bf16_to_f32: Kernel,
+    paged_bf16_rows_to_f32: Kernel,
+    moe_topk_normalized: Kernel,
+    moe_weighted_accumulate_contiguous: Kernel,
+    qwen36_ffn_finalize_batch: Kernel,
     copy_bf16_rows_to_f32_indexed: Kernel,
     copy_fp8_rows_to_f32_indexed: Kernel,
     concat_f32_rows: Kernel,
@@ -82,6 +86,12 @@ impl Functions {
             round_to_bf16: Kernel::load(c"round_f32_to_bf16")?,
             f32_to_bf16: Kernel::load(c"f32_to_bf16")?,
             bf16_to_f32: Kernel::load(c"convert_bf16_to_f32")?,
+            paged_bf16_rows_to_f32: Kernel::load(c"paged_bf16_rows_to_f32")?,
+            moe_topk_normalized: Kernel::load(c"moe_topk_normalized_f32")?,
+            moe_weighted_accumulate_contiguous: Kernel::load(
+                c"moe_weighted_accumulate_contiguous_f32",
+            )?,
+            qwen36_ffn_finalize_batch: Kernel::load(c"qwen36_ffn_finalize_batch_f32")?,
             copy_bf16_rows_to_f32_indexed: Kernel::load(c"copy_bf16_rows_to_f32_indexed")?,
             copy_fp8_rows_to_f32_indexed: Kernel::load(c"copy_fp8_rows_to_f32_indexed")?,
             concat_f32_rows: Kernel::load(c"concat_f32_rows")?,
@@ -427,6 +437,169 @@ pub(crate) unsafe fn bf16_to_f32(
     ];
     unsafe {
         functions()?.bf16_to_f32.launch(
+            LaunchConfig::new(grid(len), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches mapped-host paged BF16 row gathering into f32 output.
+///
+/// # Safety
+///
+/// The mapped buffers must contain the supplied rows and offsets. All buffers
+/// must remain valid until `stream` completes.
+pub(crate) unsafe fn paged_bf16_rows_to_f32(
+    pages: *const u8,
+    offsets: *const u32,
+    output: *mut f32,
+    rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "cuda-oxide paged BF16 gather",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let mut pages_arg = pages;
+    let mut offsets_arg = offsets;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut pages_arg as *mut *const u8).cast::<c_void>(),
+        (&mut offsets_arg as *mut *const u32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.paged_bf16_rows_to_f32.launch(
+            LaunchConfig::new(grid(len), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches normalized MoE top-k selection for independent rows.
+///
+/// # Safety
+///
+/// Buffers must satisfy `rows * experts` logits and `rows * top_k` outputs.
+pub(crate) unsafe fn moe_topk_normalized(
+    logits: *const f32,
+    indices: *mut u32,
+    weights: *mut f32,
+    rows: u32,
+    experts: u32,
+    top_k: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut logits_arg = logits;
+    let mut indices_arg = indices;
+    let mut weights_arg = weights;
+    let mut experts_arg = experts;
+    let mut top_k_arg = top_k;
+    let mut parameters = [
+        (&mut logits_arg as *mut *const f32).cast::<c_void>(),
+        (&mut indices_arg as *mut *mut u32).cast::<c_void>(),
+        (&mut weights_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut experts_arg as *mut u32).cast::<c_void>(),
+        (&mut top_k_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.moe_topk_normalized.launch(
+            LaunchConfig::new([rows, 1, 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches weighted accumulation from contiguous route-major expert rows.
+///
+/// # Safety
+///
+/// Buffers must satisfy the supplied row, route, and column dimensions.
+pub(crate) unsafe fn moe_weighted_accumulate_contiguous(
+    route_weights: *const f32,
+    routed: *const f32,
+    output: *mut f32,
+    rows: u32,
+    routes_per_row: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "cuda-oxide MoE weighted accumulation",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let mut route_weights_arg = route_weights;
+    let mut routed_arg = routed;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut routes_per_row_arg = routes_per_row;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut route_weights_arg as *mut *const f32).cast::<c_void>(),
+        (&mut routed_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut routes_per_row_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.moe_weighted_accumulate_contiguous.launch(
+            LaunchConfig::new(grid(len), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches Qwen routed/shared FFN finalization for independent rows.
+///
+/// # Safety
+///
+/// Buffers must satisfy `rows * cols`, except `shared_gate`, which has `rows`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_finalize_batch(
+    routed: *const f32,
+    shared_gate: *const f32,
+    shared: *const f32,
+    residual: *const f32,
+    output: *mut f32,
+    rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "cuda-oxide Qwen FFN finalization",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let mut routed_arg = routed;
+    let mut shared_gate_arg = shared_gate;
+    let mut shared_arg = shared;
+    let mut residual_arg = residual;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut routed_arg as *mut *const f32).cast::<c_void>(),
+        (&mut shared_gate_arg as *mut *const f32).cast::<c_void>(),
+        (&mut shared_arg as *mut *const f32).cast::<c_void>(),
+        (&mut residual_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.qwen36_ffn_finalize_batch.launch(
             LaunchConfig::new(grid(len), block(), 0),
             stream,
             &mut parameters,

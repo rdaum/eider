@@ -41,6 +41,15 @@ hf download Inferact/Qwen3.8-Flash-Next-NVFP4 \
 scripts/run-eider-qwen38-flash-next.sh
 ```
 
+Use the cuda-oxide backend for all custom Eider kernels in this model path:
+
+```sh
+scripts/run-eider-qwen38-flash-next.sh --cuda-oxide --offline
+```
+
+This option still uses the CUDA runtime and cuBLASLt. The server can contain
+NVCC-built kernels for other models, but Flash Next does not dispatch them.
+
 In a second terminal, start Pi:
 
 ```sh

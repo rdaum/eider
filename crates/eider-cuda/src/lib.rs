@@ -75,6 +75,8 @@ pub use kernels::deepseek4::{
     swiglu_pair_f32_batch_into_on_stream,
 };
 pub use kernels::gemma4_attention::Gemma4LocalPrefillAttention;
+#[cfg(feature = "cuda-oxide")]
+pub use kernels::non_gemm::moe_weighted_accumulate_contiguous_f32_batch_on_stream;
 pub use kernels::non_gemm::{
     ArgmaxResult, DFlash2SelectorPlan, DFlash2SelectorWorkspace, GPU_SAMPLING_MAX_TOP_K,
     GpuSampledToken, GpuSamplingRow, GpuTokenSampler, GpuTopKCandidate, GroupedGemvAddressBuffers,
@@ -235,6 +237,8 @@ pub use kernels::sm12x_mma::{
     moe_silu_quantize_slot_addresses_residual_on_stream, quantize_dynamic_vector_on_stream,
     quantize_dynamic_vectors_residual2_on_stream, quantize_fixed_scale_vector_on_stream,
 };
+#[cfg(feature = "cuda-oxide")]
+pub use kernels::sm121_w4a16::Sm121W4A4GroupedWorkspace;
 pub use kernels::sm121_w4a16::{
     Sm121W4A16GateUp, Sm121W4A16GateUpBatchWorkspace, Sm121W4A16HostWeight, Sm121W4A16Linear,
     Sm121W4A16LinearBatchWorkspace,

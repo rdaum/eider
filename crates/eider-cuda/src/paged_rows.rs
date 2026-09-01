@@ -1,8 +1,13 @@
 //! Direct-I/O backed BF16 embedding-row gathers for coherent unified memory.
 
-use crate::cuda::{CudaEvent, CudaStream, DeviceOutput, PageableHostBuffer, check_cuda};
+#[cfg(not(feature = "cuda-oxide"))]
+use crate::cuda::check_cuda;
+use crate::cuda::{CudaEvent, CudaStream, DeviceOutput, PageableHostBuffer};
 use crate::error::{Error, Result};
+#[cfg(not(feature = "cuda-oxide"))]
 use crate::ffi;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::core_oxide;
 use eider_format::SafeTensorShard;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -352,6 +357,18 @@ impl PagedBf16RowBatch {
                 actual: output.len().to_string(),
             });
         }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            core_oxide::paged_bf16_rows_to_f32(
+                self.pages.as_ptr(),
+                self.offsets.as_ptr(),
+                output.as_mut_ptr().cast(),
+                self.row_count as u32,
+                self.cols as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
                 "infer_paged_bf16_rows_to_f32_on_stream",

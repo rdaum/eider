@@ -66,12 +66,13 @@ DFlash2 kernels. It includes W4A16, compact FP4 KV, GDN, IMRoPE, sampling,
 fused LM-head top-1, and DFlash2 operations. Both builds use the same safe Rust
 API and device layouts.
 
-The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
-It still uses the CUDA driver, CUDA runtime, and cuBLASLt. The server build can
-include NVCC and CUTLASS kernels for other model paths.
+The Qwen3.8 27B and Flash Next paths do not dispatch custom Eider kernels built
+with NVCC. They still use the CUDA driver, CUDA runtime, and cuBLASLt. The
+server build can include NVCC and CUTLASS kernels for other model paths.
 
-The separate Qwen3.8 Flash Next runtime has cuda-oxide hyperconnection, PLE,
-and QSA primitives. Its complete execution path has not yet been audited.
+The Flash Next path uses Oxide for QSA, GDN, hyperconnections, PLE, compact KV,
+sampling, and FFN finalization. Its MoE uses W4A16 for decode and grouped W4A4
+for prefill. Both paths use one prepared expert-weight layout.
 
 The `eider-api/cuda-oxide` feature enables this backend in a production server
 build.
@@ -79,6 +80,7 @@ build.
 ```sh
 scripts/setup-cuda-oxide.sh
 scripts/run-eider-qwen38.sh --cuda-oxide --offline
+scripts/run-eider-qwen38-flash-next.sh --cuda-oxide --offline
 ```
 
 See [`../../backends/cuda-oxide/README.md`](../../backends/cuda-oxide/README.md)

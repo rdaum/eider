@@ -63,6 +63,11 @@ use eider_cuda::{
     scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
     sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
 };
+#[cfg(feature = "cuda-oxide")]
+use eider_cuda::{
+    Sm121W4A16GateUpBatchWorkspace, moe_weighted_accumulate_contiguous_f32_batch_on_stream,
+    silu_mul_halves_f32_batch_into_on_stream,
+};
 use eider_format::SafeTensorInfo;
 use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
@@ -2722,6 +2727,8 @@ pub struct Qwen36MoeWeights {
     gate_up_storage: Qwen36GateUpStorage,
     grouped: Option<Qwen36GroupedMoeWeights>,
     fp8_experts: Option<Qwen36Fp8Experts>,
+    #[cfg(feature = "cuda-oxide")]
+    oxide_routed: Option<Qwen36OxideMoeWeights>,
     shared: Qwen36SharedExpertStorage,
     shared_gate: Bf16Linear,
     _sm12x_down: Vec<Sm12xFp4DeviceGemmWeight>,
@@ -2846,8 +2853,16 @@ impl Qwen36ExpertStaging {
 
 enum Qwen36GateUpStorage {
     CutlassW4A4,
+    #[cfg(feature = "cuda-oxide")]
+    OxideW4A16,
     Paged,
     Fp8,
+}
+
+#[cfg(feature = "cuda-oxide")]
+struct Qwen36OxideMoeWeights {
+    gate_up: Sm121W4A16GateUp,
+    down: Sm121W4A16GateUp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3014,6 +3029,12 @@ pub struct Qwen36MoeWorkspace {
     pub grouped_gate_up: Option<GroupedGemvWorkspace>,
     w4a16_gate_up_output: DeviceBuffer<f32>,
     w4a16_gate_up_table: DeviceBuffer<DeviceAddress<f32>>,
+    #[cfg(feature = "cuda-oxide")]
+    oxide_down_input: DeviceBuffer<f32>,
+    #[cfg(feature = "cuda-oxide")]
+    oxide_down_output: DeviceBuffer<f32>,
+    #[cfg(feature = "cuda-oxide")]
+    oxide_down_batch: Option<Sm121W4A16GateUpBatchWorkspace>,
     fp8_hidden_input: DeviceBuffer<u8>,
     fp8_hidden_input_scale: DeviceBuffer<f32>,
     fp8_down_input: DeviceBuffer<u8>,
@@ -3547,7 +3568,128 @@ impl Qwen36MoeWeights {
         artifact_root: &std::path::Path,
         layer: usize,
     ) -> Result<Self> {
-        Self::load_with_down_storage(checkpoint, manifest, artifact_root, layer, false, false)
+        #[cfg(feature = "cuda-oxide")]
+        {
+            let _ = artifact_root;
+            Self::load_checkpoint_layout_oxide(checkpoint, manifest, layer)
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        {
+            Self::load_with_down_storage(checkpoint, manifest, artifact_root, layer, false, false)
+        }
+    }
+
+    #[cfg(feature = "cuda-oxide")]
+    fn load_checkpoint_layout_oxide(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        layer: usize,
+    ) -> Result<Self> {
+        let (experts, experts_per_token, expert_intermediate, norm_topk_prob) = match manifest.ffn {
+            QwenFfnConfig::Moe {
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                norm_topk_prob,
+            } => (
+                experts,
+                experts_per_token,
+                expert_intermediate,
+                norm_topk_prob,
+            ),
+            QwenFfnConfig::Dense => {
+                return Err(Error::Format {
+                    label: "Qwen Oxide MoE FFN",
+                    detail: "expected MoE config, got Dense".to_string(),
+                });
+            }
+        };
+        let prefix = format!("{}.layers.{layer}.mlp", manifest.tensor_prefix);
+        let router = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.gate.weight"),
+            experts,
+            manifest.hidden,
+        )?;
+        let mut gate_up = Sm121W4A16GateUp::new_empty_slots_with_top_k(
+            experts,
+            experts_per_token,
+            expert_intermediate * 2,
+            manifest.hidden,
+        )?;
+        let mut down = Sm121W4A16GateUp::new_empty_slots_with_top_k(
+            experts,
+            1,
+            manifest.hidden,
+            expert_intermediate,
+        )?;
+        for expert in 0..experts {
+            let expert_prefix = format!("{prefix}.experts.{expert}");
+            let gate = checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.gate_proj"))?;
+            let up = checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.up_proj"))?;
+            let gate_up_weight = ModelOptNvfp4Linear::concat_out_features(
+                format!("{expert_prefix}.gate_up_proj"),
+                &gate,
+                &up,
+            )?;
+            gate_up.load_slot(
+                expert,
+                &Sm121W4A16HostWeight::from_modelopt(&gate_up_weight)?,
+            )?;
+
+            let down_weight =
+                checkpoint.load_nvfp4_linear(&format!("{expert_prefix}.down_proj"))?;
+            down.load_slot(expert, &Sm121W4A16HostWeight::from_modelopt(&down_weight)?)?;
+        }
+
+        let (shared, _) = load_shared_expert(checkpoint, &prefix, manifest.hidden)?;
+        let shared_gate = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.shared_expert_gate.weight"),
+            1,
+            manifest.hidden,
+        )?;
+        let null = vec![DeviceAddress::null(); experts];
+        let ones = vec![1.0; experts];
+        let expert_ptrs = MoeExpertPointerTables {
+            gate_up_values: DeviceBuffer::from_host(&null)?,
+            gate_up_scales: DeviceBuffer::from_host(&null)?,
+            gate_up_grouped_values: DeviceBuffer::from_host(&null)?,
+            gate_up_grouped_scales: DeviceBuffer::from_host(&null)?,
+            down_values: DeviceBuffer::from_host(&null)?,
+            down_scales: DeviceBuffer::from_host(&null)?,
+            down_grouped_values: DeviceBuffer::from_host(&null)?,
+            down_grouped_scales: DeviceBuffer::from_host(&null)?,
+            down_input_scales: DeviceBuffer::from_host(&ones)?,
+            down_alphas: DeviceBuffer::from_host(&ones)?,
+            shared_gate_up_input_scale: None,
+            gate_up_alphas: DeviceBuffer::from_host(&ones)?,
+        };
+        Ok(Self {
+            router,
+            experts: Vec::new(),
+            expert_ptrs,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&ones)?,
+            storage_plan: Qwen36MoeStoragePlan {
+                down: Qwen36DownStorage::Legacy,
+            },
+            gate_up_storage: Qwen36GateUpStorage::OxideW4A16,
+            grouped: None,
+            fp8_experts: None,
+            oxide_routed: Some(Qwen36OxideMoeWeights { gate_up, down }),
+            shared,
+            shared_gate,
+            _sm12x_down: Vec::new(),
+            sm12x_down_tiles: None,
+            sm12x_down_scales: None,
+            sm12x_down_m_tiles: 0,
+            sm12x_down_k_tiles: 0,
+            num_experts: experts,
+            experts_per_token,
+            expert_intermediate,
+            norm_topk_prob,
+            expert_pager: std::cell::RefCell::new(None),
+        })
     }
 
     fn load_with_down_storage(
@@ -3735,6 +3877,8 @@ impl Qwen36MoeWeights {
             gate_up_storage,
             grouped,
             fp8_experts: None,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_routed: None,
             shared,
             shared_gate,
             _sm12x_down: sm12x_down,
@@ -3846,6 +3990,8 @@ impl Qwen36MoeWeights {
             gate_up_storage: Qwen36GateUpStorage::Paged,
             grouped: None,
             fp8_experts: None,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_routed: None,
             shared,
             shared_gate,
             _sm12x_down: Vec::new(),
@@ -3940,6 +4086,8 @@ impl Qwen36MoeWeights {
             gate_up_storage: Qwen36GateUpStorage::Fp8,
             grouped: None,
             fp8_experts: Some(fp8_experts),
+            #[cfg(feature = "cuda-oxide")]
+            oxide_routed: None,
             shared,
             shared_gate,
             _sm12x_down: Vec::new(),
@@ -3975,13 +4123,84 @@ impl Qwen36MoeWeights {
         Ok(())
     }
 
-    fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36MoeWorkspace> {
-        let enable_grouped = true;
+    pub(crate) fn workspace(&self, manifest: &QwenModelManifest) -> Result<Qwen36MoeWorkspace> {
+        let enable_grouped = matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4);
         Qwen36MoeWorkspace::new_for_paths(
             manifest,
             enable_grouped,
-            self.storage_plan.down == Qwen36DownStorage::Sm12x,
+            enable_grouped && self.storage_plan.down == Qwen36DownStorage::Sm12x,
         )
+    }
+
+    fn uses_oxide_routed(&self) -> bool {
+        #[cfg(feature = "cuda-oxide")]
+        {
+            self.oxide_routed.is_some()
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        {
+            false
+        }
+    }
+
+    fn run_oxide_routed(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        {
+            let weights = self.oxide_routed.as_ref().ok_or_else(|| Error::Format {
+                label: "Qwen Oxide routed MoE",
+                detail: "resident Oxide expert weights are unavailable".to_string(),
+            })?;
+            weights.gate_up.run_on_stream(
+                &workspace.route.indices,
+                ffn_norm,
+                workspace.w4a16_gate_up_output.output(),
+                stream,
+            )?;
+            silu_mul_halves_f32_batch_into_on_stream(
+                &workspace.w4a16_gate_up_output,
+                workspace.oxide_down_input.output(),
+                self.experts_per_token,
+                self.expert_intermediate,
+                stream,
+            )?;
+            if workspace.oxide_down_batch.is_none() {
+                workspace.oxide_down_batch =
+                    Some(weights.down.new_batch_workspace(self.experts_per_token)?);
+            }
+            weights.down.run_batch_f32_prefix_on_stream(
+                workspace
+                    .oxide_down_batch
+                    .as_ref()
+                    .expect("Oxide down workspace initialized"),
+                &workspace.route.indices,
+                &workspace.oxide_down_input,
+                workspace.oxide_down_output.output(),
+                self.experts_per_token,
+                stream,
+            )?;
+            moe_weighted_accumulate_contiguous_f32_batch_on_stream(
+                &workspace.route.weights,
+                &workspace.oxide_down_output,
+                workspace.moe_out.output(),
+                1,
+                self.experts_per_token,
+                ffn_norm.len(),
+                stream,
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        {
+            let _ = (workspace, ffn_norm, stream);
+            Err(Error::Format {
+                label: "Qwen Oxide routed MoE",
+                detail: "the cuda-oxide feature is disabled".to_string(),
+            })
+        }
     }
 
     /// Prepares routing and any activation state required by the selected gate/up path.
@@ -4019,6 +4238,19 @@ impl Qwen36MoeWeights {
     ) -> Result<()> {
         match &self.gate_up_storage {
             Qwen36GateUpStorage::CutlassW4A4 => self.run_grouped_gate_up_only(workspace, stream),
+            #[cfg(feature = "cuda-oxide")]
+            Qwen36GateUpStorage::OxideW4A16 => {
+                let weights = self.oxide_routed.as_ref().ok_or_else(|| Error::Format {
+                    label: "Qwen Oxide routed gate/up",
+                    detail: "resident Oxide expert weights are unavailable".to_string(),
+                })?;
+                weights.gate_up.run_on_stream(
+                    &workspace.route.indices,
+                    ffn_norm,
+                    workspace.w4a16_gate_up_output.output(),
+                    stream,
+                )
+            }
             Qwen36GateUpStorage::Paged => Err(Error::Format {
                 label: "Qwen3.6 paged routed gate/up",
                 detail: "resolve resident expert slots before routed execution".to_string(),
@@ -4151,6 +4383,13 @@ impl Qwen36MoeWeights {
                     .output
             }
             Qwen36GateUpStorage::Fp8 => &workspace.w4a16_gate_up_table,
+            #[cfg(feature = "cuda-oxide")]
+            Qwen36GateUpStorage::OxideW4A16 => {
+                return Err(Error::Format {
+                    label: "Qwen Oxide routed down",
+                    detail: "use the contiguous Oxide routed path".to_string(),
+                });
+            }
             Qwen36GateUpStorage::Paged => {
                 return Err(Error::Format {
                     label: "Qwen3.6 paged grouped down",
@@ -4628,15 +4867,17 @@ impl Qwen36MoeWeights {
         ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
+        let resident_cutlass = matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4)
+            && self.grouped.is_some();
+        let resident_oxide = self.uses_oxide_routed();
         if ffn_norm.len() < 2 * manifest.hidden
             || self.storage_plan.down != Qwen36DownStorage::Legacy
-            || !matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4)
-            || self.grouped.is_none()
+            || (!resident_cutlass && !resident_oxide)
             || self.expert_pager.borrow().is_some()
         {
             return Err(Error::Format {
                 label: "Qwen exact MoE pair",
-                detail: "requires two rows of resident W4A4 experts with legacy down storage"
+                detail: "requires two rows of resident experts with legacy down storage"
                     .to_string(),
             });
         }
@@ -4689,47 +4930,51 @@ impl Qwen36MoeWeights {
                     self.experts_per_token,
                     stream,
                 )?;
-            quantize_nvfp4_col_major_f32_device_into_on_stream(
-                manifest.hidden,
-                1,
-                &workspace.inputs[row],
-                &mut row_workspace.gate_up_input,
-                1.0,
-                stream,
-            )?;
-            self.run_grouped_gate_up_only(row_workspace, stream)?;
-            let gate_up_table = &row_workspace
-                .grouped_gate_up
-                .as_ref()
-                .expect("resident W4A4 gate/up workspace")
-                .output;
-            let grouped_down = row_workspace
-                .grouped_down
-                .as_mut()
-                .expect("resident W4A4 down workspace");
-            moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
-                MoeSiluQuantizeAddressSlotBuffers {
-                    indices: &row_workspace.route.indices,
-                    gate_up_table,
-                    packed_table: grouped_down.input_values.output(),
-                    scales_table: grouped_down.input_scales.output(),
-                    input_scale_table: &self.expert_ptrs.down_input_scales,
-                    gate_up_alpha_table: &self.gate_up_unity_alphas,
-                },
-                grouped_down.inputs[0].rows,
-                stream,
-            )?;
-            fill_f32_into_on_stream(row_workspace.moe_out.output(), 0.0, stream)?;
-            if !grouped_down.run_prequantized_device_route(
-                &row_workspace.route,
-                &self.expert_ptrs,
-                &mut row_workspace.moe_out,
-                stream,
-            )? {
-                return Err(Error::Format {
-                    label: "Qwen exact MoE pair",
-                    detail: "grouped down rejected a canonical route".to_string(),
-                });
+            if resident_oxide {
+                self.run_oxide_routed(row_workspace, &workspace.inputs[row], stream)?;
+            } else {
+                quantize_nvfp4_col_major_f32_device_into_on_stream(
+                    manifest.hidden,
+                    1,
+                    &workspace.inputs[row],
+                    &mut row_workspace.gate_up_input,
+                    1.0,
+                    stream,
+                )?;
+                self.run_grouped_gate_up_only(row_workspace, stream)?;
+                let gate_up_table = &row_workspace
+                    .grouped_gate_up
+                    .as_ref()
+                    .expect("resident W4A4 gate/up workspace")
+                    .output;
+                let grouped_down = row_workspace
+                    .grouped_down
+                    .as_mut()
+                    .expect("resident W4A4 down workspace");
+                moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream(
+                    MoeSiluQuantizeAddressSlotBuffers {
+                        indices: &row_workspace.route.indices,
+                        gate_up_table,
+                        packed_table: grouped_down.input_values.output(),
+                        scales_table: grouped_down.input_scales.output(),
+                        input_scale_table: &self.expert_ptrs.down_input_scales,
+                        gate_up_alpha_table: &self.gate_up_unity_alphas,
+                    },
+                    grouped_down.inputs[0].rows,
+                    stream,
+                )?;
+                fill_f32_into_on_stream(row_workspace.moe_out.output(), 0.0, stream)?;
+                if !grouped_down.run_prequantized_device_route(
+                    &row_workspace.route,
+                    &self.expert_ptrs,
+                    &mut row_workspace.moe_out,
+                    stream,
+                )? {
+                    return Err(Error::Format {
+                        label: "Qwen exact MoE pair",
+                        detail: "grouped down rejected a canonical route".to_string(),
+                    });
+                }
             }
             self.run_shared_gate_up(row_workspace, &workspace.inputs[row], stream)?;
             silu_mul_halves_f32_into_on_stream(
@@ -4875,7 +5120,27 @@ impl Qwen36MoeWeights {
             && self.sm12x_down_scales.is_some();
         let use_device_route = workspace.grouped_down.is_some();
         let used_pager = self.expert_pager.borrow().is_some();
-        let used_grouped = if used_pager {
+        let used_grouped = if self.uses_oxide_routed() {
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, topk_ms) = timed_cuda(stream, || {
+                    workspace
+                        .route
+                        .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)
+                })?;
+                profile.qwen36_router_topk_ms += topk_ms;
+                profile.qwen36_router_ms += topk_ms;
+                let (_, routed_ms) = timed_cuda(stream, || {
+                    self.run_oxide_routed(workspace, ffn_norm, stream)
+                })?;
+                profile.qwen36_routed_down_ms += routed_ms;
+            } else {
+                workspace
+                    .route
+                    .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
+                self.run_oxide_routed(workspace, ffn_norm, stream)?;
+            }
+            true
+        } else if used_pager {
             if let Some(profile) = profile.as_deref_mut() {
                 let (_, topk_ms) = timed_cuda(stream, || {
                     workspace
@@ -5722,6 +5987,21 @@ impl Qwen36MoeWorkspace {
                 .map_or(0, GroupedGemvWorkspace::device_bytes)
             + self.w4a16_gate_up_output.device_bytes()
             + self.w4a16_gate_up_table.device_bytes()
+            + {
+                #[cfg(feature = "cuda-oxide")]
+                {
+                    self.oxide_down_input.device_bytes()
+                        + self.oxide_down_output.device_bytes()
+                        + self
+                            .oxide_down_batch
+                            .as_ref()
+                            .map_or(0, Sm121W4A16GateUpBatchWorkspace::device_bytes)
+                }
+                #[cfg(not(feature = "cuda-oxide"))]
+                {
+                    0
+                }
+            }
             + self.fp8_hidden_input.device_bytes()
             + self.fp8_hidden_input_scale.device_bytes()
             + self.fp8_down_input.device_bytes()
@@ -5806,6 +6086,12 @@ impl Qwen36MoeWorkspace {
             grouped_gate_up,
             w4a16_gate_up_output,
             w4a16_gate_up_table,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_down_output: DeviceBuffer::zeroed(experts_per_token * hidden)?,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_down_batch: None,
             fp8_hidden_input: DeviceBuffer::zeroed(hidden)?,
             fp8_hidden_input_scale: DeviceBuffer::zeroed(1)?,
             fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,

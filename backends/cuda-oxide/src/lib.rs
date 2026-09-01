@@ -684,6 +684,347 @@ mod kernels {
         }
     }
 
+    /// Sorts route IDs by expert and builds compact groups of at most 16 rows.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn w4a4_build_route_groups(
+        indices: *const u32,
+        sorted_routes: *mut u32,
+        group_experts: *mut u32,
+        group_starts: *mut u32,
+        group_lengths: *mut u32,
+        group_count: *mut u32,
+        routes: u32,
+        experts: u32,
+    ) {
+        static mut COUNTS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        static mut CURSORS: SharedArray<u32, 1024> = SharedArray::UNINIT;
+        let counts = unsafe { SharedArray::as_raw_mut_ptr(&raw mut COUNTS) };
+        let cursors = unsafe { SharedArray::as_raw_mut_ptr(&raw mut CURSORS) };
+        let thread_index = thread::threadIdx_x();
+        let mut expert = thread_index;
+        while expert < experts {
+            unsafe { counts.add(expert as usize).write(0) };
+            expert += thread::blockDim_x();
+        }
+        thread::sync_threads();
+
+        let mut route = thread_index;
+        while route < routes {
+            let expert = unsafe { *indices.add(route as usize) };
+            if expert < experts {
+                unsafe {
+                    BlockAtomicU32::from_ptr(counts.add(expert as usize))
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+            route += thread::blockDim_x();
+        }
+        thread::sync_threads();
+
+        if thread_index == 0 {
+            let mut offset = 0u32;
+            expert = 0;
+            while expert < experts {
+                unsafe { cursors.add(expert as usize).write(offset) };
+                offset += unsafe { *counts.add(expert as usize) };
+                expert += 1;
+            }
+            route = 0;
+            while route < routes {
+                let expert = unsafe { *indices.add(route as usize) };
+                if expert < experts {
+                    let cursor = unsafe { *cursors.add(expert as usize) };
+                    unsafe {
+                        sorted_routes.add(cursor as usize).write(route);
+                        cursors.add(expert as usize).write(cursor + 1);
+                    }
+                }
+                route += 1;
+            }
+            let mut groups = 0u32;
+            let mut start = 0u32;
+            expert = 0;
+            while expert < experts {
+                let count = unsafe { *counts.add(expert as usize) };
+                let mut consumed = 0u32;
+                while consumed < count {
+                    let length = (count - consumed).min(16);
+                    unsafe {
+                        group_experts.add(groups as usize).write(expert);
+                        group_starts.add(groups as usize).write(start + consumed);
+                        group_lengths.add(groups as usize).write(length);
+                    }
+                    groups += 1;
+                    consumed += length;
+                }
+                start += count;
+                expert += 1;
+            }
+            unsafe { group_count.write(groups) };
+        }
+    }
+
+    /// Quantizes sorted route groups into native SM121 FP4 A fragments.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 2, coordinates = u32, block = (128, 1, 1))]
+    pub unsafe fn w4a4_quantize_route_groups_f32(
+        input: *const f32,
+        sorted_routes: *const u32,
+        group_starts: *const u32,
+        group_lengths: *const u32,
+        group_count: *const u32,
+        tiles: *mut u8,
+        scales: *mut u32,
+        top_k: u32,
+        in_features: u32,
+        workers: u32,
+    ) {
+        static mut SCALE_CODES: SharedArray<u8, 64> = SharedArray::UNINIT;
+        let scale_codes = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCALE_CODES) };
+        let k_tile = thread::blockIdx_x();
+        let worker = thread::blockIdx_y();
+        let thread_index = thread::threadIdx_x();
+        let k_tiles = in_features / 64;
+        let groups = unsafe { *group_count };
+        let mut group = worker;
+        while group < groups {
+            let start = unsafe { *group_starts.add(group as usize) };
+            let length = unsafe { *group_lengths.add(group as usize) };
+            if thread_index < 64 {
+                let row = thread_index / 4;
+                let k_block = thread_index & 3;
+                let mut maximum = 0.0f32;
+                if row < length {
+                    let route = unsafe { *sorted_routes.add((start + row) as usize) };
+                    let input_row = route / top_k;
+                    let mut offset = 0u32;
+                    while offset < 16 {
+                        let value = unsafe {
+                            *input.add(
+                                (input_row * in_features + k_tile * 64 + k_block * 16 + offset)
+                                    as usize,
+                            )
+                        };
+                        if value.is_finite() {
+                            maximum = maximum.max(value.abs());
+                        }
+                        offset += 1;
+                    }
+                }
+                unsafe {
+                    scale_codes
+                        .add(thread_index as usize)
+                        .write(if maximum == 0.0 {
+                            0
+                        } else {
+                            ue4m3_code(maximum / 6.0)
+                        });
+                }
+            }
+            thread::sync_threads();
+            let tile = unsafe { tiles.add(((group * k_tiles + k_tile) * 512) as usize) };
+            let mut byte = thread_index;
+            while byte < 512 {
+                let mut packed = 0u8;
+                let mut nibble = 0u32;
+                while nibble < 2 {
+                    let index = byte * 2 + nibble;
+                    let fragment_lane = index / 32;
+                    let value_index = index & 31;
+                    let t0 = fragment_lane & 3;
+                    let t1 = fragment_lane >> 2;
+                    let v0 = value_index & 7;
+                    let v1 = (value_index >> 3) & 1;
+                    let v2 = (value_index >> 4) & 1;
+                    let row = t1 + 8 * v1;
+                    let col = t0 * 8 + v0 + 32 * v2;
+                    let value = if row < length {
+                        let route = unsafe { *sorted_routes.add((start + row) as usize) };
+                        let input_row = route / top_k;
+                        unsafe {
+                            *input.add(
+                                (input_row * in_features + k_tile * 64 + col) as usize,
+                            )
+                        }
+                    } else {
+                        0.0
+                    };
+                    let scale = e4m3_value(unsafe {
+                        *scale_codes.add((row * 4 + col / 16) as usize)
+                    });
+                    packed |= e2m1_code(if scale == 0.0 { 0.0 } else { value / scale })
+                        << (nibble * 4);
+                    nibble += 1;
+                }
+                unsafe { tile.add(byte as usize).write(packed) };
+                byte += thread::blockDim_x();
+            }
+            if thread_index < 16 {
+                unsafe {
+                    scales
+                        .add(((group * k_tiles + k_tile) * 16 + thread_index) as usize)
+                        .write(scale_word(scale_codes.add((thread_index * 4) as usize)));
+                }
+            }
+            thread::sync_threads();
+            group += workers;
+        }
+    }
+
+    /// Runs grouped SM121 W4A4 GEMM and restores route-major output order.
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(domain = 2, coordinates = u32, block = (32, 1, 1))]
+    pub unsafe fn w4a4_route_groups_f32(
+        sorted_routes: *const u32,
+        group_experts: *const u32,
+        group_starts: *const u32,
+        group_lengths: *const u32,
+        group_count: *const u32,
+        input_tiles: *const u8,
+        input_scales: *const u32,
+        tiled_weight: *const u8,
+        tiled_scales: *const u8,
+        global_scales: *const f32,
+        output: *mut f32,
+        out_features: u32,
+        in_features: u32,
+        workers: u32,
+    ) {
+        let out_tile8 = thread::blockIdx_x();
+        let worker = thread::blockIdx_y();
+        let lane = warp::lane_id();
+        let k_tiles16 = in_features / 16;
+        let k_tiles64 = in_features / 64;
+        let out_tiles16 = out_features / 16;
+        let expert_weight_stride = out_features * in_features / 2;
+        let expert_scale_stride = out_features * in_features / 16;
+        let groups = unsafe { *group_count };
+        let mut group = worker;
+        while group < groups {
+            let expert = unsafe { *group_experts.add(group as usize) };
+            let start = unsafe { *group_starts.add(group as usize) };
+            let length = unsafe { *group_lengths.add(group as usize) };
+            let expert_weight = unsafe {
+                tiled_weight.add((expert * expert_weight_stride) as usize)
+            };
+            let expert_scales = unsafe {
+                tiled_scales.add((expert * expert_scale_stride) as usize)
+            };
+            let mut accumulators = [0.0f32; 4];
+            let output_col = out_tile8 * 8 + lane / 4;
+            let out_tile16 = output_col / 16;
+            let output_row = output_col & 15;
+            let t0 = lane & 3;
+            let mut k_tile64 = 0u32;
+            while k_tile64 < k_tiles64 {
+                let input_tile = unsafe {
+                    input_tiles.add(((group * k_tiles64 + k_tile64) * 512) as usize)
+                };
+                let input_lane = unsafe { input_tile.add((lane * 16) as usize) };
+                let a = unsafe {
+                    [
+                        load_u32(input_lane, 0),
+                        load_u32(input_lane, 1),
+                        load_u32(input_lane, 2),
+                        load_u32(input_lane, 3),
+                    ]
+                };
+                let first_k16 = k_tile64 * 4 + t0 / 2;
+                let second_k16 = first_k16 + 2;
+                let half = (t0 & 1) * 4;
+                let first_tile = unsafe {
+                    expert_weight.add(
+                        ((out_tile16 * k_tiles16 + first_k16) * PACKED_TILE_BYTES as u32
+                            + output_row * 8
+                            + half) as usize,
+                    )
+                };
+                let second_tile = unsafe {
+                    expert_weight.add(
+                        ((out_tile16 * k_tiles16 + second_k16) * PACKED_TILE_BYTES as u32
+                            + output_row * 8
+                            + half) as usize,
+                    )
+                };
+                let b = unsafe { [load_u32(first_tile, 0), load_u32(second_tile, 0)] };
+                let scale_a = if t0 < 2 {
+                    let scale_row = lane / 4 + 8 * t0;
+                    unsafe {
+                        *input_scales.add(
+                            ((group * k_tiles64 + k_tile64) * 16 + scale_row) as usize,
+                        )
+                    }
+                } else {
+                    0
+                };
+                let scale_b = if t0 == 0 {
+                    let mut word = 0u32;
+                    let mut block = 0u32;
+                    while block < 4 {
+                        let scale = unsafe {
+                            *expert_scales.add(
+                                ((out_tile16 * k_tiles16 + k_tile64 * 4 + block)
+                                    * SCALE_TILE_BYTES as u32
+                                    + output_row) as usize,
+                            )
+                        };
+                        word |= u32::from(scale) << (block * 8);
+                        block += 1;
+                    }
+                    word
+                } else {
+                    0
+                };
+                accumulators = unsafe {
+                    mma_m16n8k64_nvfp4(a, b, scale_a, scale_b, accumulators)
+                };
+                k_tile64 += 1;
+            }
+            let global_scale = unsafe { *global_scales.add(expert as usize) };
+            let column = (lane & 3) * 2;
+            let row0 = lane / 4;
+            let row1 = row0 + 8;
+            if row0 < length {
+                let route = unsafe { *sorted_routes.add((start + row0) as usize) };
+                let index = route * out_features + out_tile8 * 8 + column;
+                let packed = convert::cvt_bf16x2_f32(
+                    accumulators[0] * global_scale,
+                    accumulators[1] * global_scale,
+                );
+                unsafe {
+                    output
+                        .add(index as usize)
+                        .write(convert::cvt_f32_bf16x2_lo(packed));
+                    output
+                        .add((index + 1) as usize)
+                        .write(convert::cvt_f32_bf16x2_hi(packed));
+                }
+            }
+            if row1 < length {
+                let route = unsafe { *sorted_routes.add((start + row1) as usize) };
+                let index = route * out_features + out_tile8 * 8 + column;
+                let packed = convert::cvt_bf16x2_f32(
+                    accumulators[2] * global_scale,
+                    accumulators[3] * global_scale,
+                );
+                unsafe {
+                    output
+                        .add(index as usize)
+                        .write(convert::cvt_f32_bf16x2_lo(packed));
+                    output
+                        .add((index + 1) as usize)
+                        .write(convert::cvt_f32_bf16x2_hi(packed));
+                }
+            }
+            group += workers;
+        }
+        let _ = out_tiles16;
+    }
+
     /// Computes one row-major ModelOpt W4A16 matrix-vector product.
     #[kernel]
     #[launch_bounds(1024)]
@@ -1332,6 +1673,218 @@ mod kernels {
                     .write(bf16_to_f32(*input.add(index as usize)))
             };
         }
+    }
+
+    /// Gathers mapped-host BF16 rows from byte offsets into contiguous f32 rows.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn paged_bf16_rows_to_f32(
+        pages: *const u8,
+        row_offsets: *const u32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if index >= rows * cols {
+            return;
+        }
+        let row = index / cols;
+        let col = index - row * cols;
+        let offset = unsafe { *row_offsets.add(row as usize) } as usize;
+        let values = unsafe { pages.add(offset).cast::<u16>() };
+        unsafe {
+            output
+                .add(index as usize)
+                .write(bf16_to_f32(*values.add(col as usize)))
+        };
+    }
+
+    /// Selects and normalizes the largest MoE router logits for each row.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn moe_topk_normalized_f32(
+        logits: *const f32,
+        out_indices: *mut u32,
+        out_weights: *mut f32,
+        experts: u32,
+        top_k: u32,
+    ) {
+        static mut REDUCTION_VALUES: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut REDUCTION_INDICES: SharedArray<u32, 256> = SharedArray::UNINIT;
+        static mut SELECTED: SharedArray<u8, 1024> = SharedArray::UNINIT;
+        static mut TOP_VALUES: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let reduction_values =
+            unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION_VALUES) };
+        let reduction_indices =
+            unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION_INDICES) };
+        let selected = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SELECTED) };
+        let top_values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TOP_VALUES) };
+        let row = thread::blockIdx_x();
+        let lane = thread::threadIdx_x();
+        let logits = unsafe { logits.add((row * experts) as usize) };
+        let out_indices = unsafe { out_indices.add((row * top_k) as usize) };
+        let out_weights = unsafe { out_weights.add((row * top_k) as usize) };
+
+        let mut expert = lane;
+        while expert < experts {
+            unsafe { selected.add(expert as usize).write(0) };
+            expert += thread::blockDim_x();
+        }
+        thread::sync_threads();
+
+        let mut slot = 0;
+        while slot < top_k {
+            let mut best_value = f32::NEG_INFINITY;
+            let mut best_index = u32::MAX;
+            expert = lane;
+            while expert < experts {
+                if unsafe { *selected.add(expert as usize) } == 0 {
+                    let mut value = unsafe { *logits.add(expert as usize) };
+                    if value.is_nan() {
+                        value = f32::NEG_INFINITY;
+                    } else if value == f32::INFINITY {
+                        value = f32::MAX;
+                    } else if value == 0.0 {
+                        value = 0.0;
+                    }
+                    if value > best_value || (value == best_value && expert < best_index) {
+                        best_value = value;
+                        best_index = expert;
+                    }
+                }
+                expert += thread::blockDim_x();
+            }
+            unsafe {
+                reduction_values.add(lane as usize).write(best_value);
+                reduction_indices.add(lane as usize).write(best_index);
+            }
+            thread::sync_threads();
+            let mut stride = thread::blockDim_x() / 2;
+            while stride != 0 {
+                if lane < stride {
+                    let other_value = unsafe { *reduction_values.add((lane + stride) as usize) };
+                    let other_index = unsafe { *reduction_indices.add((lane + stride) as usize) };
+                    let value = unsafe { *reduction_values.add(lane as usize) };
+                    let index = unsafe { *reduction_indices.add(lane as usize) };
+                    if other_value > value || (other_value == value && other_index < index) {
+                        unsafe {
+                            reduction_values.add(lane as usize).write(other_value);
+                            reduction_indices.add(lane as usize).write(other_index);
+                        }
+                    }
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            if lane == 0 {
+                let index = unsafe { *reduction_indices };
+                let value = unsafe { *reduction_values };
+                unsafe {
+                    out_indices.add(slot as usize).write(index);
+                    top_values.add(slot as usize).write(value);
+                    if index < experts {
+                        selected.add(index as usize).write(1);
+                    }
+                }
+            }
+            thread::sync_threads();
+            slot += 1;
+        }
+
+        if lane == 0 {
+            let maximum = unsafe { *top_values };
+            if !maximum.is_finite() {
+                slot = 0;
+                while slot < top_k {
+                    unsafe {
+                        out_indices.add(slot as usize).write(slot);
+                        out_weights
+                            .add(slot as usize)
+                            .write(if slot == 0 { 1.0 } else { 0.0 });
+                    }
+                    slot += 1;
+                }
+                return;
+            }
+            let mut sum = 0.0f32;
+            slot = 0;
+            while slot < top_k {
+                let probability = (unsafe { *top_values.add(slot as usize) } - maximum).exp();
+                unsafe { top_values.add(slot as usize).write(probability) };
+                sum += probability;
+                slot += 1;
+            }
+            slot = 0;
+            while slot < top_k {
+                unsafe {
+                    out_weights
+                        .add(slot as usize)
+                        .write(*top_values.add(slot as usize) / sum)
+                };
+                slot += 1;
+            }
+        }
+    }
+
+    /// Combines contiguous route-major expert rows with router weights.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn moe_weighted_accumulate_contiguous_f32(
+        route_weights: *const f32,
+        routed: *const f32,
+        output: *mut f32,
+        rows: u32,
+        routes_per_row: u32,
+        cols: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if index >= rows * cols {
+            return;
+        }
+        let row = index / cols;
+        let col = index - row * cols;
+        let route_base = row * routes_per_row;
+        let mut sum = 0.0f32;
+        let mut slot = 0;
+        while slot < routes_per_row {
+            let route = route_base + slot;
+            sum += unsafe {
+                *routed.add((route * cols + col) as usize)
+                    * *route_weights.add(route as usize)
+            };
+            slot += 1;
+        }
+        unsafe { output.add(index as usize).write(sum) };
+    }
+
+    /// Finalizes routed and shared Qwen MoE rows with BF16 residual rounding.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn qwen36_ffn_finalize_batch_f32(
+        routed: *const f32,
+        shared_gate: *const f32,
+        shared: *const f32,
+        residual: *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if index >= rows * cols {
+            return;
+        }
+        let row = index / cols;
+        let shared_scale = sigmoid(unsafe { *shared_gate.add(row as usize) });
+        let value = unsafe {
+            *residual.add(index as usize)
+                + *routed.add(index as usize)
+                + *shared.add(index as usize) * shared_scale
+        };
+        unsafe { output.add(index as usize).write(round_to_bf16(value)) };
     }
 
     /// Gathers BF16 embedding rows into row-major f32 output.

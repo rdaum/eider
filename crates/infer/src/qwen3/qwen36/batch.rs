@@ -39,6 +39,10 @@ use eider_cuda::{
     scatter_f32_pointer_rows_on_stream, scatter_f32_pointer_rows_range_on_stream,
     sigmoid_mul_f32_prefix_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
 };
+#[cfg(feature = "cuda-oxide")]
+use eider_cuda::{
+    Sm121W4A4GroupedWorkspace, moe_weighted_accumulate_contiguous_f32_batch_on_stream,
+};
 
 const GDN_HEADS: usize = 32;
 const GDN_HEAD_DIM: usize = 128;
@@ -1748,7 +1752,7 @@ struct BatchMoeWorkspace {
     shared_gate_plan: BatchBf16LinearPlan,
     shared_gate_up_plan: Option<BatchNvfp4LinearPlan>,
     shared_down_plan: Option<BatchNvfp4LinearPlan>,
-    grouped: BatchGroupedMoeWorkspace,
+    routed: BatchRoutedMoeWorkspace,
     output: DeviceBuffer<f32>,
 }
 
@@ -1783,6 +1787,71 @@ struct BatchGroupedMoeWorkspace {
     gate_up_output_table: DeviceBuffer<DeviceAddress<u16>>,
     down_output_table: DeviceBuffer<DeviceAddress<u16>>,
     routed_output: DeviceBuffer<f32>,
+}
+
+enum BatchRoutedMoeWorkspace {
+    Cutlass(Box<BatchGroupedMoeWorkspace>),
+    #[cfg(feature = "cuda-oxide")]
+    Oxide(Box<BatchOxideMoeWorkspace>),
+}
+
+#[cfg(feature = "cuda-oxide")]
+struct BatchOxideMoeWorkspace {
+    gate_up_batch: Sm121W4A4GroupedWorkspace,
+    down_batch: Sm121W4A4GroupedWorkspace,
+    gate_up: DeviceBuffer<f32>,
+    down_input: DeviceBuffer<f32>,
+    down: DeviceBuffer<f32>,
+    routed_output: DeviceBuffer<f32>,
+}
+
+impl BatchRoutedMoeWorkspace {
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Cutlass(workspace) => workspace.device_bytes(),
+            #[cfg(feature = "cuda-oxide")]
+            Self::Oxide(workspace) => workspace.device_bytes(),
+        }
+    }
+
+    fn routed_output(&self) -> &DeviceBuffer<f32> {
+        match self {
+            Self::Cutlass(workspace) => &workspace.routed_output,
+            #[cfg(feature = "cuda-oxide")]
+            Self::Oxide(workspace) => &workspace.routed_output,
+        }
+    }
+}
+
+#[cfg(feature = "cuda-oxide")]
+impl BatchOxideMoeWorkspace {
+    fn new(model: &dyn Qwen36BatchModel, weights: &Qwen36MoeWeights, rows: usize) -> Result<Self> {
+        let routed = weights
+            .oxide_routed
+            .as_ref()
+            .ok_or_else(|| eider_cuda::Error::Format {
+                label: "Qwen Oxide batch MoE",
+                detail: "resident Oxide expert weights are unavailable".to_string(),
+            })?;
+        let routes = rows * weights.experts_per_token;
+        Ok(Self {
+            gate_up_batch: routed.gate_up.new_w4a4_grouped_workspace(rows)?,
+            down_batch: routed.down.new_w4a4_grouped_workspace(routes)?,
+            gate_up: DeviceBuffer::zeroed(routes * weights.expert_intermediate * 2)?,
+            down_input: DeviceBuffer::zeroed(routes * weights.expert_intermediate)?,
+            down: DeviceBuffer::zeroed(routes * model.batch_manifest().hidden)?,
+            routed_output: DeviceBuffer::zeroed(rows * model.batch_manifest().hidden)?,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.gate_up_batch.device_bytes()
+            + self.down_batch.device_bytes()
+            + self.gate_up.device_bytes()
+            + self.down_input.device_bytes()
+            + self.down.device_bytes()
+            + self.routed_output.device_bytes()
+    }
 }
 
 impl BatchGroupedMoeWorkspace {
@@ -2010,18 +2079,6 @@ impl BatchMoeWorkspace {
         weights: &Qwen36MoeWeights,
         capacity: usize,
     ) -> Result<Self> {
-        if !matches!(weights.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4) {
-            return Err(eider_cuda::Error::Format {
-                label: "Qwen3.6 batched routed gate/up",
-                detail: "the current model does not use resident CUTLASS W4A4 experts".to_string(),
-            });
-        }
-        if weights.grouped.is_none() {
-            return Err(eider_cuda::Error::Format {
-                label: "Qwen3.6 batched routed gate/up",
-                detail: "grouped W4A4 expert weights are unavailable".to_string(),
-            });
-        }
         let routes = capacity * weights.experts_per_token;
         let gate_up_width = weights.expert_intermediate * 2;
         let (shared_gate_up_plan, shared_down_plan) = match &weights.shared {
@@ -2042,7 +2099,33 @@ impl BatchMoeWorkspace {
                 });
             }
         };
-        let grouped = BatchGroupedMoeWorkspace::new(model, weights, capacity)?;
+        let routed = if weights.uses_oxide_routed() {
+            #[cfg(feature = "cuda-oxide")]
+            {
+                BatchRoutedMoeWorkspace::Oxide(Box::new(BatchOxideMoeWorkspace::new(
+                    model, weights, capacity,
+                )?))
+            }
+            #[cfg(not(feature = "cuda-oxide"))]
+            {
+                return Err(eider_cuda::Error::Format {
+                    label: "Qwen Oxide batch MoE",
+                    detail: "the cuda-oxide feature is disabled".to_string(),
+                });
+            }
+        } else {
+            if !matches!(weights.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4)
+                || weights.grouped.is_none()
+            {
+                return Err(eider_cuda::Error::Format {
+                    label: "Qwen3.6 batched routed gate/up",
+                    detail: "resident grouped expert weights are unavailable".to_string(),
+                });
+            }
+            BatchRoutedMoeWorkspace::Cutlass(Box::new(BatchGroupedMoeWorkspace::new(
+                model, weights, capacity,
+            )?))
+        };
         Ok(Self {
             router_logits: DeviceBuffer::zeroed(capacity * weights.num_experts)?,
             router_plan: BatchBf16LinearPlan::new(model, &weights.router, capacity)?,
@@ -2055,7 +2138,7 @@ impl BatchMoeWorkspace {
             shared_gate_plan: BatchBf16LinearPlan::new(model, &weights.shared_gate, capacity)?,
             shared_gate_up_plan,
             shared_down_plan,
-            grouped,
+            routed,
             output: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
         })
     }
@@ -2084,7 +2167,7 @@ impl BatchMoeWorkspace {
                     .sum::<usize>()
                     + plan.activation.device_bytes()
             })
-            + self.grouped.device_bytes()
+            + self.routed.device_bytes()
             + self.output.device_bytes()
     }
 }
@@ -3461,8 +3544,8 @@ impl Qwen36TextModel {
                     .copy_prefix_to_host(active_rows * weights.experts_per_token, stream)?
                     .into_vec(),
                 workspace
-                    .grouped
-                    .routed_output
+                    .routed
+                    .routed_output()
                     .copy_prefix_to_host(values, stream)?
                     .into_vec(),
                 workspace
@@ -5888,72 +5971,113 @@ impl Qwen36MoeWeights {
             self.norm_topk_prob,
             stream,
         )?;
-        let weights = self
-            .grouped
-            .as_ref()
-            .expect("batch workspace construction requires grouped W4A4 weights");
-        {
-            let grouped = &mut workspace.grouped;
-            grouped.set_rows(capacity)?;
-            grouped
-                .sorted_routes
-                .sort_on_stream(&workspace.route_indices, stream)?;
-            grouped.gate_up_input.gather_quantize_on_stream(
-                ffn_norm,
-                &grouped.sorted_routes,
-                stream,
-            )?;
-            grouped.gate_up_input.build_pointer_tables_on_stream(
-                &grouped.sorted_routes,
-                &mut grouped.gate_up,
-                &mut grouped.gate_up_output_table,
-                self.expert_intermediate * 2,
-                stream,
-            )?;
-            grouped.gate_up_plan.run_on_stream(
-                &weights.gate_up_values,
-                &weights.gate_up_scales,
-                grouped.gate_up_input.packed_table(),
-                grouped.gate_up_input.scale_table(),
-                &grouped.gate_up_output_table,
-                &weights.gate_up_alpha_table,
-                grouped.sorted_routes.expert_counts(),
-                stream,
-            )?;
-            grouped
-                .down_input
-                .silu_mul_halves_quantize_sorted_on_stream(
-                    &grouped.gate_up,
+        match &mut workspace.routed {
+            BatchRoutedMoeWorkspace::Cutlass(grouped) => {
+                let weights = self
+                    .grouped
+                    .as_ref()
+                    .expect("CUTLASS batch workspace requires grouped W4A4 weights");
+                grouped.set_rows(capacity)?;
+                grouped
+                    .sorted_routes
+                    .sort_on_stream(&workspace.route_indices, stream)?;
+                grouped.gate_up_input.gather_quantize_on_stream(
+                    ffn_norm,
                     &grouped.sorted_routes,
                     stream,
                 )?;
-            grouped.down_input.build_pointer_tables_on_stream(
-                &grouped.sorted_routes,
-                &mut grouped.down,
-                &mut grouped.down_output_table,
-                model.batch_manifest().hidden,
-                stream,
-            )?;
-            grouped.down_plan.run_on_stream(
-                &weights.down_values,
-                &weights.down_scales,
-                grouped.down_input.packed_table(),
-                grouped.down_input.scale_table(),
-                &grouped.down_output_table,
-                &weights.down_alpha_table,
-                grouped.sorted_routes.expert_counts(),
-                stream,
-            )?;
-            moe_weighted_accumulate_sorted_bf16_batch_on_stream(
-                &grouped.sorted_routes,
-                &workspace.route_weights,
-                &grouped.down,
-                grouped.routed_output.output(),
-                capacity,
-                self.experts_per_token,
-                model.batch_manifest().hidden,
-                stream,
-            )?;
+                grouped.gate_up_input.build_pointer_tables_on_stream(
+                    &grouped.sorted_routes,
+                    &mut grouped.gate_up,
+                    &mut grouped.gate_up_output_table,
+                    self.expert_intermediate * 2,
+                    stream,
+                )?;
+                grouped.gate_up_plan.run_on_stream(
+                    &weights.gate_up_values,
+                    &weights.gate_up_scales,
+                    grouped.gate_up_input.packed_table(),
+                    grouped.gate_up_input.scale_table(),
+                    &grouped.gate_up_output_table,
+                    &weights.gate_up_alpha_table,
+                    grouped.sorted_routes.expert_counts(),
+                    stream,
+                )?;
+                grouped
+                    .down_input
+                    .silu_mul_halves_quantize_sorted_on_stream(
+                        &grouped.gate_up,
+                        &grouped.sorted_routes,
+                        stream,
+                    )?;
+                grouped.down_input.build_pointer_tables_on_stream(
+                    &grouped.sorted_routes,
+                    &mut grouped.down,
+                    &mut grouped.down_output_table,
+                    model.batch_manifest().hidden,
+                    stream,
+                )?;
+                grouped.down_plan.run_on_stream(
+                    &weights.down_values,
+                    &weights.down_scales,
+                    grouped.down_input.packed_table(),
+                    grouped.down_input.scale_table(),
+                    &grouped.down_output_table,
+                    &weights.down_alpha_table,
+                    grouped.sorted_routes.expert_counts(),
+                    stream,
+                )?;
+                moe_weighted_accumulate_sorted_bf16_batch_on_stream(
+                    &grouped.sorted_routes,
+                    &workspace.route_weights,
+                    &grouped.down,
+                    grouped.routed_output.output(),
+                    capacity,
+                    self.experts_per_token,
+                    model.batch_manifest().hidden,
+                    stream,
+                )?;
+            }
+            #[cfg(feature = "cuda-oxide")]
+            BatchRoutedMoeWorkspace::Oxide(oxide) => {
+                let weights = self
+                    .oxide_routed
+                    .as_ref()
+                    .expect("Oxide batch workspace requires Oxide expert weights");
+                weights.gate_up.run_w4a4_grouped_f32_prefix_on_stream(
+                    &oxide.gate_up_batch,
+                    &workspace.route_indices,
+                    ffn_norm,
+                    oxide.gate_up.output(),
+                    capacity,
+                    stream,
+                )?;
+                let routes = capacity * self.experts_per_token;
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &oxide.gate_up,
+                    oxide.down_input.output(),
+                    routes,
+                    self.expert_intermediate,
+                    stream,
+                )?;
+                weights.down.run_w4a4_grouped_f32_prefix_on_stream(
+                    &oxide.down_batch,
+                    &workspace.route_indices,
+                    &oxide.down_input,
+                    oxide.down.output(),
+                    routes,
+                    stream,
+                )?;
+                moe_weighted_accumulate_contiguous_f32_batch_on_stream(
+                    &workspace.route_weights,
+                    &oxide.down,
+                    oxide.routed_output.output(),
+                    capacity,
+                    self.experts_per_token,
+                    model.batch_manifest().hidden,
+                    stream,
+                )?;
+            }
         }
         if let Some(parallel_moe) = parallel_moe {
             parallel_moe
@@ -5971,7 +6095,7 @@ impl Qwen36MoeWeights {
             )?;
         }
         qwen36_ffn_finalize_batch_f32_into_on_stream(
-            &workspace.grouped.routed_output,
+            workspace.routed.routed_output(),
             &workspace.shared_gate,
             &workspace.shared_output,
             residual,

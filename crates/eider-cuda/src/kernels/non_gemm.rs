@@ -68,6 +68,54 @@ pub fn repeat_row_address_table_f32_into_on_stream(
     }
 }
 
+/// Writes weighted route-major expert rows into one dense output per input row.
+#[cfg(feature = "cuda-oxide")]
+pub fn moe_weighted_accumulate_contiguous_f32_batch_on_stream(
+    route_weights: &DeviceBuffer<f32>,
+    routed: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    routes_per_row: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let routes = rows.saturating_mul(routes_per_row);
+    let routed_len = routes.saturating_mul(cols);
+    let output_len = rows.saturating_mul(cols);
+    if rows == 0
+        || routes_per_row == 0
+        || cols == 0
+        || route_weights.len() < routes
+        || routed.len() < routed_len
+        || output.len() < output_len
+        || rows > u32::MAX as usize
+        || routes_per_row > u32::MAX as usize
+        || cols > u32::MAX as usize
+    {
+        return Err(Error::Shape {
+            label: "contiguous MoE weighted accumulation",
+            expected: format!("weights>={routes} routed>={routed_len} output>={output_len}"),
+            actual: format!(
+                "weights={} routed={} output={} rows={rows} routes={routes_per_row} cols={cols}",
+                route_weights.len(),
+                routed.len(),
+                output.len()
+            ),
+        });
+    }
+    unsafe {
+        core_oxide::moe_weighted_accumulate_contiguous(
+            route_weights.ptr,
+            routed.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            routes_per_row as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+}
+
 /// Enqueues row-wise RMSNorm into an existing output buffer on `stream`.
 pub fn rms_norm_f32_into_on_stream(
     rows: usize,
@@ -2047,6 +2095,20 @@ pub fn moe_topk_f32_batch_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    if norm_topk_prob && k <= 32 && experts <= 1024 {
+        return unsafe {
+            core_oxide::moe_topk_normalized(
+                logits.ptr,
+                out_indices.buffer_mut().ptr,
+                out_weights.buffer_mut().ptr,
+                rows as u32,
+                experts as u32,
+                k as u32,
+                stream.as_raw(),
+            )
+        };
+    }
     unsafe {
         check_cuda(
             "infer_moe_topk_f32_batch_on_stream",
@@ -3235,6 +3297,20 @@ pub fn qwen36_ffn_finalize_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen36_ffn_finalize_batch(
+            moe_output.ptr,
+            shared_gate_logit.ptr,
+            shared_output.ptr,
+            residual.ptr,
+            output.buffer_mut().ptr,
+            1,
+            len as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_ffn_finalize_f32_on_stream",
@@ -3288,6 +3364,20 @@ pub fn qwen36_ffn_finalize_batch_f32_into_on_stream(
             ),
         });
     }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::qwen36_ffn_finalize_batch(
+            routed_output.ptr,
+            shared_gate_logit.ptr,
+            shared_output.ptr,
+            residual.ptr,
+            output.buffer_mut().ptr,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
     unsafe {
         check_cuda(
             "infer_qwen36_ffn_finalize_batch_f32_on_stream",
@@ -16944,6 +17034,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "cuda-oxide")]
+    #[test]
+    fn oxide_contiguous_moe_accumulation_matches_cpu_reference() {
+        const ROWS: usize = 2;
+        const ROUTES: usize = 3;
+        const COLS: usize = 17;
+        let weights = [0.5f32, 0.25, 0.25, 0.2, 0.3, 0.5];
+        let routed = (0..ROWS * ROUTES * COLS)
+            .map(|index| ((index * 13 % 41) as f32 - 20.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; ROWS * COLS];
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                for route in 0..ROUTES {
+                    expected[row * COLS + col] +=
+                        weights[row * ROUTES + route] * routed[(row * ROUTES + route) * COLS + col];
+                }
+            }
+        }
+        let weights = DeviceBuffer::from_host(&weights).expect("weights");
+        let routed = DeviceBuffer::from_host(&routed).expect("routed rows");
+        let mut output = DeviceBuffer::zeroed(ROWS * COLS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        moe_weighted_accumulate_contiguous_f32_batch_on_stream(
+            &weights,
+            &routed,
+            output.output(),
+            ROWS,
+            ROUTES,
+            COLS,
+            &stream,
+        )
+        .expect("Oxide accumulation");
+        assert_close(
+            &output.copy_to_host(&stream).expect("output download"),
+            &expected,
+            1.0e-6,
+            "Oxide contiguous accumulation",
+        );
+    }
+
+    #[cfg(feature = "cuda-oxide")]
+    #[test]
+    fn oxide_qwen36_batch_finalize_matches_composed_reference() {
+        const ROWS: usize = 2;
+        const COLS: usize = 33;
+        let routed = (0..ROWS * COLS)
+            .map(|index| ((index * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let shared = (0..ROWS * COLS)
+            .map(|index| ((index * 11 % 31) as f32 - 15.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let residual = (0..ROWS * COLS)
+            .map(|index| ((index * 17 % 37) as f32 - 18.0) * 0.125)
+            .collect::<Vec<_>>();
+        let gates = [-0.75f32, 0.5];
+        let expected = (0..ROWS * COLS)
+            .map(|index| {
+                let row = index / COLS;
+                residual[index] + routed[index] + shared[index] / (1.0 + (-gates[row]).exp())
+            })
+            .collect::<Vec<_>>();
+        let routed = DeviceBuffer::from_host(&routed).expect("routed");
+        let shared = DeviceBuffer::from_host(&shared).expect("shared");
+        let residual = DeviceBuffer::from_host(&residual).expect("residual");
+        let gates = DeviceBuffer::from_host(&gates).expect("gates");
+        let expected = DeviceBuffer::from_host(&expected).expect("expected");
+        let mut rounded = DeviceBuffer::zeroed(ROWS * COLS).expect("rounded");
+        let mut output = DeviceBuffer::zeroed(ROWS * COLS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        round_f32_to_bf16_into_on_stream(&expected, rounded.output(), &stream)
+            .expect("reference round");
+        qwen36_ffn_finalize_batch_f32_into_on_stream(
+            &routed,
+            &gates,
+            &shared,
+            &residual,
+            output.output(),
+            ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("Oxide finalization");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("output download"),
+            rounded.copy_to_host(&stream).expect("reference download")
+        );
     }
 
     #[test]

@@ -1749,6 +1749,7 @@ unsafe extern "C" {
         routes_per_row: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_ffn_finalize_f32_on_stream(
         moe_output: *const f32,
         shared_gate_logit: *const f32,
@@ -1758,6 +1759,7 @@ unsafe extern "C" {
         len: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen36_ffn_finalize_batch_f32_on_stream(
         routed_output: *const f32,
         shared_gate_logit: *const f32,
@@ -2089,6 +2091,7 @@ unsafe extern "C" {
         cols: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_paged_bf16_rows_to_f32_on_stream(
         pages: *const u8,
         row_offsets: *const u32,

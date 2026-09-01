@@ -733,7 +733,7 @@ impl Qwen38FlashNextModel {
             )?,
             attention_output: DeviceBuffer::zeroed(hidden)?,
             mlp_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
-            moe: Qwen36MoeWorkspace::new(&mtp.manifest)?,
+            moe: mtp.moe.workspace(&mtp.manifest)?,
             final_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
             final_hidden: DeviceBuffer::zeroed(hidden)?,
             lm_head: Qwen36LmHeadWorkspace::new(self.config.vocab, hidden)?,
@@ -1792,7 +1792,15 @@ impl Qwen38FlashNextModel {
             attention_workspaces,
             attention_states,
             rollback_linear_states,
-            moe: Qwen36MoeWorkspace::new(&self.manifest)?,
+            moe: self
+                .layers
+                .first()
+                .ok_or_else(|| Error::Format {
+                    label: "Qwen3.8 Flash Next decode workspace",
+                    detail: "model has no layers".to_string(),
+                })?
+                .moe
+                .workspace(&self.manifest)?,
             ple_pager: Qwen38PagedPle::open(&self.checkpoint, &self.config, 1)?,
             ple_window: Qwen38PleTokenWindow::new(
                 self.config.ngram_size,

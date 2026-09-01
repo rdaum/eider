@@ -10,8 +10,9 @@ to produce an `sm_121a` CUBIN and embeds that CUBIN in `eider-cuda`.
 The `cuda-oxide` feature selects these kernels at compile time. The stable host
 API, CUDA streams, device buffers, and weight layouts do not change.
 
-The production path supports Qwen3.8 27B target prefill and decode with
-DFlash2 speculation. It includes these Eider kernel groups:
+The production paths support Qwen3.8 27B and Qwen3.8 Flash Next. The dense path
+supports target prefill, target decode, and DFlash2 speculation. It includes
+these Eider kernel groups:
 
 - dense SM121 W4A16
 - compact FP4 KV cache and attention
@@ -22,16 +23,28 @@ DFlash2 speculation. It includes these Eider kernel groups:
 - token sampling and DFlash2 path selection
 - DFlash2 convolution, attention, projection, and state capture.
 
-The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
-It still uses the CUDA driver, CUDA runtime, and cuBLASLt.
+Flash Next adds these kernel groups:
+
+- Qwen Sparse Attention and its index cache
+- paged BF16 PLE row gathering and PLE transforms
+- hyperconnection mixing and finalization
+- normalized 512-expert top-10 routing
+- W4A16 routed MoE decode
+- grouped W4A4 routed MoE prefill
+- routed and shared FFN finalization.
+
+Both Qwen3.8 paths avoid custom Eider kernels built with NVCC. They still use
+the CUDA driver, CUDA runtime, and cuBLASLt.
 
 The server build can include NVCC and CUTLASS kernels for other model paths.
 The operations in the list do not use silent native-kernel fallbacks.
 
-`scripts/run-eider-qwen38.sh` defaults to the dense `qwen3.8-27b` catalogue
-entry. The separate `qwen3.8-flash-next` runtime has cuda-oxide
-hyperconnection, PLE, and QSA primitives. Its complete execution path has not
-yet been audited.
+Use the matching launcher for each model:
+
+```sh
+scripts/run-eider-qwen38.sh --cuda-oxide --offline
+scripts/run-eider-qwen38-flash-next.sh --cuda-oxide --offline
+```
 
 ## Requirements
 
@@ -96,6 +109,17 @@ CARGO_OXIDE=/path/to/cargo-oxide \
   cargo bench -p eider-cuda --features cuda-oxide \
   --bench qwen36_chunked_gdn
 ```
+
+Run the Flash Next MoE benchmark after a routed-kernel change:
+
+```sh
+CARGO_OXIDE=/path/to/cargo-oxide \
+  cargo bench -p eider-cuda --features cuda-oxide \
+  --bench qwen38_oxide_moe
+```
+
+The benchmark checks grouped W4A4 output against the W4A16 reference before
+it records timing data.
 
 The CUBIN loads once into the CUDA primary context. Eider launches its kernels
 on the stream that the caller supplies.
