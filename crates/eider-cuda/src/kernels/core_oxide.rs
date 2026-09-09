@@ -20,6 +20,7 @@ struct Functions {
     f32_to_bf16: Kernel,
     bf16_to_f32: Kernel,
     paged_bf16_rows_to_f32: Kernel,
+    paged_fp8_rows_to_f32: Kernel,
     moe_topk_normalized: Kernel,
     moe_weighted_accumulate_contiguous: Kernel,
     qwen36_ffn_finalize_batch: Kernel,
@@ -30,6 +31,12 @@ struct Functions {
     fp8_linear_quantized_channel_scaled: Kernel,
     bf16_linear_logits_batch: Kernel,
     bf16_linear_logits_batch_scalar: Kernel,
+    bf16_linear_logits_exact_rows: Kernel,
+    block_fp8_f32_scale_linear_batch: Kernel,
+    block_fp8_f32_scale_linear_pair: Kernel,
+    block_fp8_f32_scale_moe_gate_up: Kernel,
+    block_fp8_f32_scale_moe_down: Kernel,
+    dequant_block_fp8_f32_scale_to_bf16: Kernel,
     quantize_nvfp4_col_major: Kernel,
     rms_norm: Kernel,
     gated_rms_norm: Kernel,
@@ -87,6 +94,7 @@ impl Functions {
             f32_to_bf16: Kernel::load(c"f32_to_bf16")?,
             bf16_to_f32: Kernel::load(c"convert_bf16_to_f32")?,
             paged_bf16_rows_to_f32: Kernel::load(c"paged_bf16_rows_to_f32")?,
+            paged_fp8_rows_to_f32: Kernel::load(c"paged_fp8_rows_to_f32")?,
             moe_topk_normalized: Kernel::load(c"moe_topk_normalized_f32")?,
             moe_weighted_accumulate_contiguous: Kernel::load(
                 c"moe_weighted_accumulate_contiguous_f32",
@@ -101,6 +109,16 @@ impl Functions {
             )?,
             bf16_linear_logits_batch: Kernel::load(c"bf16_linear_logits_f32_batch")?,
             bf16_linear_logits_batch_scalar: Kernel::load(c"bf16_linear_logits_f32_batch_scalar")?,
+            bf16_linear_logits_exact_rows: Kernel::load(c"bf16_linear_logits_f32_exact_rows")?,
+            block_fp8_f32_scale_linear_batch: Kernel::load(
+                c"block_fp8_f32_scale_linear_f32_batch",
+            )?,
+            block_fp8_f32_scale_linear_pair: Kernel::load(c"block_fp8_f32_scale_linear_pair_f32")?,
+            block_fp8_f32_scale_moe_gate_up: Kernel::load(c"block_fp8_f32_scale_moe_gate_up_f32")?,
+            block_fp8_f32_scale_moe_down: Kernel::load(c"block_fp8_f32_scale_moe_down_f32")?,
+            dequant_block_fp8_f32_scale_to_bf16: Kernel::load(
+                c"dequant_block_fp8_f32_scale_to_bf16",
+            )?,
             quantize_nvfp4_col_major: Kernel::load(c"quantize_nvfp4_col_major_f32")?,
             rms_norm: Kernel::load(c"rms_norm_f32")?,
             gated_rms_norm: Kernel::load(c"gated_rms_norm_f32")?,
@@ -484,6 +502,49 @@ pub(crate) unsafe fn paged_bf16_rows_to_f32(
     }
 }
 
+/// Launches mapped-host paged E4M3 row gathering into scaled f32 output.
+///
+/// # Safety
+///
+/// The mapped buffers must contain the supplied rows and offsets. All buffers
+/// must remain valid until `stream` completes.
+pub(crate) unsafe fn paged_fp8_rows_to_f32(
+    pages: *const u8,
+    offsets: *const u32,
+    output: *mut f32,
+    rows: u32,
+    cols: u32,
+    scale: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "cuda-oxide paged FP8 gather",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let mut pages_arg = pages;
+    let mut offsets_arg = offsets;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut scale_arg = scale;
+    let mut parameters = [
+        (&mut pages_arg as *mut *const u8).cast::<c_void>(),
+        (&mut offsets_arg as *mut *const u32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+        (&mut scale_arg as *mut f32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.paged_fp8_rows_to_f32.launch(
+            LaunchConfig::new(grid(len), block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
 /// Launches normalized MoE top-k selection for independent rows.
 ///
 /// # Safety
@@ -840,6 +901,11 @@ pub(crate) unsafe fn bf16_linear_logits_batch(
     let mut batch_size_arg = batch_size;
     let mut rows_arg = rows;
     let mut cols_arg = cols;
+    if batch_size == 1 && rows <= 8 && cols >= 1_024 {
+        return unsafe {
+            bf16_linear_logits_exact_rows(input, weight, logits, batch_size, rows, cols, stream)
+        };
+    }
     let mut parameters = [
         (&mut input_arg as *mut *const f32).cast::<c_void>(),
         (&mut weight_arg as *mut *const u16).cast::<c_void>(),
@@ -856,6 +922,270 @@ pub(crate) unsafe fn bf16_linear_logits_batch(
     unsafe {
         kernel.launch(
             LaunchConfig::new([rows.div_ceil(8), batch_size.div_ceil(8), 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches independent BF16 projections with a full block per output row.
+///
+/// # Safety
+///
+/// The buffers must satisfy the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn bf16_linear_logits_exact_rows(
+    input: *const f32,
+    weight: *const u16,
+    logits: *mut f32,
+    batch_size: u32,
+    rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut weight_arg = weight;
+    let mut logits_arg = logits;
+    let mut batch_size_arg = batch_size;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut weight_arg as *mut *const u16).cast::<c_void>(),
+        (&mut logits_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut batch_size_arg as *mut u32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.bf16_linear_logits_exact_rows.launch(
+            LaunchConfig::new([rows, batch_size, 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches a batched f32 projection through row-major E4M3 weights and exact
+/// 128-by-128 F32 block scales.
+///
+/// # Safety
+///
+/// The buffers must satisfy the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn block_fp8_f32_scale_linear_batch(
+    input: *const f32,
+    weight: *const u8,
+    scales: *const f32,
+    output: *mut f32,
+    batch_rows: u32,
+    rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut weight_arg = weight;
+    let mut scales_arg = scales;
+    let mut output_arg = output;
+    let mut batch_rows_arg = batch_rows;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut weight_arg as *mut *const u8).cast::<c_void>(),
+        (&mut scales_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut batch_rows_arg as *mut u32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.block_fp8_f32_scale_linear_batch.launch(
+            LaunchConfig::new([rows.div_ceil(8), batch_rows.div_ceil(8), 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches two f32 projections through row-major E4M3 weights in one grid.
+///
+/// # Safety
+///
+/// The buffers must satisfy the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn block_fp8_f32_scale_linear_pair(
+    input: *const f32,
+    first_weight: *const u8,
+    first_scales: *const f32,
+    second_weight: *const u8,
+    second_scales: *const f32,
+    first_output: *mut f32,
+    second_output: *mut f32,
+    first_rows: u32,
+    second_rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut input_arg = input;
+    let mut first_weight_arg = first_weight;
+    let mut first_scales_arg = first_scales;
+    let mut second_weight_arg = second_weight;
+    let mut second_scales_arg = second_scales;
+    let mut first_output_arg = first_output;
+    let mut second_output_arg = second_output;
+    let mut first_rows_arg = first_rows;
+    let mut second_rows_arg = second_rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut first_weight_arg as *mut *const u8).cast::<c_void>(),
+        (&mut first_scales_arg as *mut *const f32).cast::<c_void>(),
+        (&mut second_weight_arg as *mut *const u8).cast::<c_void>(),
+        (&mut second_scales_arg as *mut *const f32).cast::<c_void>(),
+        (&mut first_output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut second_output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut first_rows_arg as *mut u32).cast::<c_void>(),
+        (&mut second_rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.block_fp8_f32_scale_linear_pair.launch(
+            LaunchConfig::new([(first_rows + second_rows).div_ceil(8), 1, 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches routed gate and up projections with F32 block scales.
+///
+/// # Safety
+///
+/// All pointers must describe the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn block_fp8_f32_scale_moe_gate_up(
+    indices: *const u32,
+    input: *const f32,
+    gate_weights: *const *const u8,
+    gate_scales: *const *const f32,
+    up_weights: *const *const u8,
+    up_scales: *const *const f32,
+    output: *mut f32,
+    rows: u32,
+    cols: u32,
+    slots: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut indices_arg = indices;
+    let mut input_arg = input;
+    let mut gate_weights_arg = gate_weights;
+    let mut gate_scales_arg = gate_scales;
+    let mut up_weights_arg = up_weights;
+    let mut up_scales_arg = up_scales;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut slots_arg = slots;
+    let mut parameters = [
+        (&mut indices_arg as *mut *const u32).cast::<c_void>(),
+        (&mut input_arg as *mut *const f32).cast::<c_void>(),
+        (&mut gate_weights_arg as *mut *const *const u8).cast::<c_void>(),
+        (&mut gate_scales_arg as *mut *const *const f32).cast::<c_void>(),
+        (&mut up_weights_arg as *mut *const *const u8).cast::<c_void>(),
+        (&mut up_scales_arg as *mut *const *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+        (&mut slots_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.block_fp8_f32_scale_moe_gate_up.launch(
+            LaunchConfig::new([rows.div_ceil(8) * slots, 1, 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches routed down projections with F32 block scales.
+///
+/// # Safety
+///
+/// All pointers must describe the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn block_fp8_f32_scale_moe_down(
+    indices: *const u32,
+    inputs: *const f32,
+    weights: *const *const u8,
+    scales: *const *const f32,
+    outputs: *const *mut f32,
+    rows: u32,
+    cols: u32,
+    slots: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut indices_arg = indices;
+    let mut inputs_arg = inputs;
+    let mut weights_arg = weights;
+    let mut scales_arg = scales;
+    let mut outputs_arg = outputs;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut slots_arg = slots;
+    let mut parameters = [
+        (&mut indices_arg as *mut *const u32).cast::<c_void>(),
+        (&mut inputs_arg as *mut *const f32).cast::<c_void>(),
+        (&mut weights_arg as *mut *const *const u8).cast::<c_void>(),
+        (&mut scales_arg as *mut *const *const f32).cast::<c_void>(),
+        (&mut outputs_arg as *mut *const *mut f32).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+        (&mut slots_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.block_fp8_f32_scale_moe_down.launch(
+            LaunchConfig::new([rows.div_ceil(8) * slots, 1, 1], block(), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches exact F32-block-scaled E4M3 to BF16 weight expansion.
+///
+/// # Safety
+///
+/// The buffers must satisfy the supplied matrix dimensions and remain valid
+/// until `stream` completes.
+pub(crate) unsafe fn dequant_block_fp8_f32_scale_to_bf16(
+    weight: *const u8,
+    scales: *const f32,
+    output: *mut u16,
+    rows: u32,
+    cols: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut weight_arg = weight;
+    let mut scales_arg = scales;
+    let mut output_arg = output;
+    let mut rows_arg = rows;
+    let mut cols_arg = cols;
+    let mut parameters = [
+        (&mut weight_arg as *mut *const u8).cast::<c_void>(),
+        (&mut scales_arg as *mut *const f32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut u16).cast::<c_void>(),
+        (&mut rows_arg as *mut u32).cast::<c_void>(),
+        (&mut cols_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.dequant_block_fp8_f32_scale_to_bf16.launch(
+            LaunchConfig::new(grid(rows * cols), block(), 0),
             stream,
             &mut parameters,
         )

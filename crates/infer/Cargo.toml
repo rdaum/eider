@@ -93,5 +93,17 @@ name = "qwen38_flash_next_prefill"
 harness = false
 
 [[bench]]
+name = "qwen38_flash_next_gdn_prefill"
+harness = false
+
+[[bench]]
 name = "qwen38_flash_next_ple"
+harness = false
+
+[[bench]]
+name = "qwen38_flash_next_target_layer"
+harness = false
+
+[[bench]]
+name = "qwen38_flash_next_mtp_moe"
 harness = false

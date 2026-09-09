@@ -77,20 +77,18 @@ impl Qwen38FlashNextConfig {
 
     pub(crate) fn from_value(root: &Value) -> Result<Self> {
         let model_type = required_str(root, "model_type")?;
-        if model_type != "qwen3_8_flash_next" {
-            return Err(Error::Format {
-                label: "Qwen3.8 Flash Next config",
-                detail: format!("unsupported model_type {model_type}"),
-            });
-        }
         let text = root.get("text_config").ok_or_else(|| Error::Format {
             label: "Qwen3.8 Flash Next config",
             detail: "missing text_config".to_string(),
         })?;
-        if required_str(text, "model_type")? != "qwen3_8_flash_next_text" {
+        let text_model_type = required_str(text, "model_type")?;
+        if !matches!(
+            (model_type, text_model_type),
+            ("qwen3_8_flash_next", "qwen3_8_flash_next_text") | ("qwen4_exp", "qwen4_exp_text")
+        ) {
             return Err(Error::Format {
-                label: "Qwen3.8 Flash Next text config",
-                detail: "unsupported text model_type".to_string(),
+                label: "Qwen3.8 Flash Next config",
+                detail: format!("unsupported model types root={model_type} text={text_model_type}"),
             });
         }
 
@@ -370,5 +368,13 @@ mod tests {
         assert_eq!(config.ngram_heads(), 16);
         assert_eq!(config.ngram_head_dim(), 160);
         assert_eq!(config.indexer_budget, 2048);
+
+        let mut qwen4 = value;
+        qwen4["model_type"] = json!("qwen4_exp");
+        qwen4["text_config"]["model_type"] = json!("qwen4_exp_text");
+        Qwen38FlashNextConfig::from_value(&qwen4).expect("Qwen4-Exp config names");
+
+        qwen4["text_config"]["model_type"] = json!("qwen3_8_flash_next_text");
+        assert!(Qwen38FlashNextConfig::from_value(&qwen4).is_err());
     }
 }

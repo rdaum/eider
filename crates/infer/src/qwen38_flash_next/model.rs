@@ -8,17 +8,17 @@ use super::{
 };
 use crate::qwen3::infer::{QwenLayerKind, QwenModelManifest};
 use crate::qwen3::qwen36::{
-    Bf16Linear, Qwen36BatchModelView, Qwen36Embedding, Qwen36ExactMoePairWorkspace,
+    Bf16Linear, Qwen36BatchModelView, Qwen36Embedding, Qwen36ExactMoeRowsWorkspace,
     Qwen36HybridPrefillWorkspace, Qwen36LinearAttentionState, Qwen36LinearAttentionWeights,
     Qwen36LinearAttentionWorkspace, Qwen36LmHead, Qwen36LmHeadWorkspace, Qwen36MoeProbeSnapshot,
     Qwen36MoeWeights, Qwen36MoeWorkspace, load_hybrid_full_attention, load_hybrid_linear_attention,
     read_bf16_vector_delta_as_f32_device,
 };
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
-    qwen38_flash_next_cache_error,
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextPageBackend, Qwen38FlashNextSequence,
+    Qwen38FlashNextSequenceCache, qwen38_flash_next_cache_error,
 };
-use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageTable};
+use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPage, Sm12xPageTable};
 use eider_cuda::{
     CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
     Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
@@ -36,6 +36,9 @@ enum Qwen38AttentionWeights {
     Qsa(Qwen38QsaWeights),
 }
 
+// These workspaces live with a sequence. Boxing the larger variant adds an
+// allocation and indirection to every QSA layer for a negligible size saving.
+#[allow(clippy::large_enum_variant)]
 enum Qwen38AttentionWorkspace {
     Linear(Qwen36LinearAttentionWorkspace),
     Qsa(Qwen38QsaWorkspace),
@@ -191,7 +194,11 @@ pub(crate) struct Qwen38FlashNextPrefillWorkspace {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Qwen38LayerProbeStage {
+    LayerInput,
     Ple,
+    AttentionMix,
+    AttentionOutput,
+    AttentionInject,
     Attention,
     MlpMix,
     MlpFfn,
@@ -275,10 +282,10 @@ impl Qwen38ExactGdnPrefillWorkspace {
                 rms_eps,
                 stream,
             )?;
-            if row == 0
+            if row + 1 < tokens
                 && let Some((hybrid, layer)) = snapshot.as_mut()
             {
-                hybrid.capture_gdn_state_snapshot(*layer, 0, stream)?;
+                hybrid.capture_gdn_state_snapshot(*layer, row, stream)?;
             }
             self.output.copy_range_from_device_on_stream(
                 row * hidden_width,
@@ -293,7 +300,7 @@ impl Qwen38ExactGdnPrefillWorkspace {
 }
 
 struct Qwen38ExactMoePrefillWorkspace {
-    pair: Qwen36ExactMoePairWorkspace,
+    rows: Qwen36ExactMoeRowsWorkspace,
     oracle_inputs: Vec<DeviceBuffer<f32>>,
     oracle_rows: Vec<Qwen36MoeWorkspace>,
     zero_hidden: DeviceBuffer<f32>,
@@ -302,19 +309,19 @@ struct Qwen38ExactMoePrefillWorkspace {
 
 impl Qwen38ExactMoePrefillWorkspace {
     fn new(manifest: &QwenModelManifest, token_capacity: usize) -> Result<Self> {
-        if token_capacity != 2 {
+        if token_capacity < 2 {
             return Err(Error::Shape {
                 label: "Qwen3.8 exact MoE verifier capacity",
-                expected: "exactly two rows".to_string(),
+                expected: "at least two rows".to_string(),
                 actual: token_capacity.to_string(),
             });
         }
         Ok(Self {
-            pair: Qwen36ExactMoePairWorkspace::new(manifest)?,
-            oracle_inputs: (0..2)
+            rows: Qwen36ExactMoeRowsWorkspace::new(manifest, token_capacity)?,
+            oracle_inputs: (0..token_capacity)
                 .map(|_| DeviceBuffer::zeroed(manifest.hidden))
                 .collect::<Result<Vec<_>>>()?,
-            oracle_rows: (0..2)
+            oracle_rows: (0..token_capacity)
                 .map(|_| Qwen36MoeWorkspace::new(manifest))
                 .collect::<Result<Vec<_>>>()?,
             zero_hidden: DeviceBuffer::zeroed(manifest.hidden)?,
@@ -333,18 +340,18 @@ impl Qwen38ExactMoePrefillWorkspace {
         capture_oracle: bool,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
-        if tokens != 2 {
+        if tokens < 2 || tokens > self.oracle_rows.len() {
             return Err(Error::Shape {
                 label: "Qwen3.8 exact MoE verifier rows",
-                expected: "exactly two rows".to_string(),
+                expected: format!("2..={} rows", self.oracle_rows.len()),
                 actual: tokens.to_string(),
             });
         }
-        weights.run_exact_pair(&mut self.pair, manifest, hidden, stream)?;
+        weights.run_exact_rows(&mut self.rows, manifest, hidden, tokens, stream)?;
         self.oracle_snapshots = None;
         if capture_oracle {
-            let mut snapshots = Vec::with_capacity(2);
-            for row in 0..2 {
+            let mut snapshots = Vec::with_capacity(tokens);
+            for row in 0..tokens {
                 self.oracle_inputs[row].copy_range_from_device_on_stream(
                     0,
                     hidden,
@@ -366,7 +373,7 @@ impl Qwen38ExactMoePrefillWorkspace {
             }
             self.oracle_snapshots = Some(snapshots);
         }
-        Ok(self.pair.output())
+        Ok(self.rows.output())
     }
 
     fn probe_snapshots(
@@ -374,7 +381,7 @@ impl Qwen38ExactMoePrefillWorkspace {
         weights: &Qwen36MoeWeights,
         stream: &CudaStream,
     ) -> Result<Vec<Qwen36MoeProbeSnapshot>> {
-        let mut snapshots = weights.probe_repeat_exact_pair_gate_up(&mut self.pair, stream)?;
+        let mut snapshots = weights.probe_repeat_exact_rows_gate_up(&mut self.rows, stream)?;
         if let Some(oracle) = self.oracle_snapshots.as_ref() {
             for (snapshot, oracle) in snapshots.iter_mut().zip(oracle) {
                 snapshot.oracle_routed_gate_up = Some(oracle.routed_gate_up.clone());
@@ -432,7 +439,10 @@ pub(crate) struct Qwen38FlashNextSpeculativeOutcome {
 
 pub(crate) struct Qwen38FlashNextSpeculativeWorkspace {
     verify: Qwen38FlashNextVectorVerifierProbeWorkspace,
+    draft_tokens: DeviceBuffer<u32>,
+    chained_streams: DeviceBuffer<f32>,
     host_tokens: Vec<u32>,
+    drafts: usize,
 }
 
 pub(crate) struct Qwen38FlashNextVectorVerifierProbeWorkspace {
@@ -690,6 +700,14 @@ impl Qwen38FlashNextModel {
                 actual: "0".to_string(),
             });
         }
+        let attention_capacity = max_tokens
+            .div_ceil(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            .checked_mul(eider_cuda::SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next MTP attention capacity",
+                expected: "page-rounded capacity without overflow".to_string(),
+                actual: max_tokens.to_string(),
+            })?;
         let mtp_model = Qwen36BatchModelView::new(&self.lt, &mtp.manifest, &[false]);
         let prefill = Qwen38FlashNextMtpPrefillWorkspace {
             token_capacity: prefill_token_capacity,
@@ -729,7 +747,7 @@ impl Qwen38FlashNextModel {
                 &self.config,
                 &mtp.manifest,
                 &mtp.attention,
-                max_tokens,
+                attention_capacity,
             )?,
             attention_output: DeviceBuffer::zeroed(hidden)?,
             mlp_hyper: Qwen38HyperConnectionWorkspace::new(&self.config, 1)?,
@@ -745,17 +763,22 @@ impl Qwen38FlashNextModel {
         &self,
         drafts: usize,
     ) -> Result<Qwen38FlashNextSpeculativeWorkspace> {
-        if drafts != 1 {
+        if drafts == 0 {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next speculative drafts",
-                expected: "exactly one draft in the initial native MTP path".to_string(),
+                expected: "at least one draft".to_string(),
                 actual: drafts.to_string(),
             });
         }
         Ok(Qwen38FlashNextSpeculativeWorkspace {
-            verify: self
-                .new_vector_verifier_probe_workspace(2, Qwen38VectorVerifierProbeMode::Exact)?,
-            host_tokens: Vec::with_capacity(2),
+            verify: self.new_vector_verifier_probe_workspace(
+                drafts + 1,
+                Qwen38VectorVerifierProbeMode::Exact,
+            )?,
+            draft_tokens: DeviceBuffer::zeroed(drafts)?,
+            chained_streams: DeviceBuffer::zeroed(self.config.hidden * self.config.hc_count)?,
+            host_tokens: Vec::with_capacity(drafts + 1),
+            drafts,
         })
     }
 
@@ -800,7 +823,7 @@ impl Qwen38FlashNextModel {
         verify.canonical_moe_linears = mode.canonical_moe_linears();
         verify.exact_hyper_projections = mode.exact_hyper_projections();
         if mode.exact_ple() {
-            verify.exact_ple = Some(Qwen38ExactPleWorkspace::new(&self.config)?);
+            verify.exact_ple = Some(Qwen38ExactPleWorkspace::new(&self.config, rows)?);
         }
         if mode.exact_moe() {
             verify.exact_moe = Some(Qwen38ExactMoePrefillWorkspace::new(&self.manifest, rows)?);
@@ -879,10 +902,6 @@ impl Qwen38FlashNextModel {
         logits: bool,
         stream: &CudaStream,
     ) -> Result<Option<Qwen38NextToken>> {
-        let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
-            label: "Qwen3.8 Flash Next MTP forward",
-            detail: "MTP weights are not enabled".to_string(),
-        })?;
         if state.position >= state.max_tokens {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next MTP position",
@@ -890,16 +909,93 @@ impl Qwen38FlashNextModel {
                 actual: state.position.to_string(),
             });
         }
+        workspace.token.copy_from_host(&[token])?;
+        let reservation = cache
+            .reserve_append(
+                state.cache_id,
+                1,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let body = cache
+            .with_append_pages(&reservation, |backend, pages| {
+                let page = pages.iter().next().ok_or_else(|| Error::Format {
+                    label: "Qwen3.8 Flash Next MTP QSA append",
+                    detail: "one-token reservation contains no physical page".to_string(),
+                })?;
+                self.mtp_forward_reserved_token(
+                    workspace,
+                    backend,
+                    state.page_table.device(),
+                    page.page(),
+                    page.segment().page_offset(),
+                    previous_target_streams,
+                    state.position,
+                    logits,
+                    stream,
+                )
+            })
+            .map_err(qwen38_flash_next_cache_error);
+        if let Err(error) = body {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut state.page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        cache
+            .commit_append(
+                reservation,
+                1,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        state.position += 1;
+        if logits {
+            let (id, value) = workspace.lm_head.read_top1(stream)?;
+            Ok(Some(Qwen38NextToken { id, value }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_forward_reserved_token(
+        &self,
+        workspace: &mut Qwen38FlashNextMtpWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page_table: &DeviceBuffer<u32>,
+        page: &Sm12xPage,
+        page_offset: usize,
+        previous_streams: &DeviceBuffer<f32>,
+        position: usize,
+        logits: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let mtp = self.mtp.as_deref().ok_or_else(|| Error::Format {
+            label: "Qwen3.8 Flash Next MTP forward",
+            detail: "MTP weights are not enabled".to_string(),
+        })?;
         let hidden = self.config.hidden;
         let hc_dim = hidden * self.config.hc_count;
-        if previous_target_streams.len() < hc_dim {
+        if previous_streams.len() < hc_dim {
             return Err(Error::Shape {
                 label: "Qwen3.8 Flash Next MTP target streams",
                 expected: format!("at least {hc_dim} values"),
-                actual: previous_target_streams.len().to_string(),
+                actual: previous_streams.len().to_string(),
             });
         }
-        workspace.token.copy_from_host(&[token])?;
         self.embedding.gather_prefix(
             self.config.vocab,
             hidden,
@@ -925,7 +1021,7 @@ impl Qwen38FlashNextModel {
         rms_norm_f32_into_on_stream(
             1,
             hc_dim,
-            previous_target_streams,
+            previous_streams,
             &mtp.pre_fc_norm_hidden,
             workspace.normed_hidden.output(),
             self.config.rms_eps(),
@@ -957,88 +1053,53 @@ impl Qwen38FlashNextModel {
             1,
             stream,
         )?;
-
-        let reservation = cache
-            .reserve_append(
-                state.cache_id,
-                1,
-                &mut Sm12xCacheContext {
-                    stream,
-                    page_table: &mut state.page_table,
-                },
-            )
-            .map_err(qwen38_flash_next_cache_error)?;
-        let attention = cache
-            .with_append_pages(&reservation, |backend, pages| {
-                let page = pages.iter().next().ok_or_else(|| Error::Format {
-                    label: "Qwen3.8 Flash Next MTP QSA append",
-                    detail: "one-token reservation contains no physical page".to_string(),
-                })?;
-                let output = mtp.attention.run_one_token(
-                    &mut workspace.attention,
-                    backend,
-                    state.page_table.device(),
-                    page.page(),
-                    page.segment().page_offset(),
-                    &self.config,
-                    &mtp.manifest,
-                    workspace.attention_hyper.mixed(),
-                    0,
-                    state.position,
-                    stream,
-                )?;
-                workspace
-                    .attention_output
-                    .copy_prefix_from_device_on_stream(output, hidden, stream)?;
-                Ok(())
-            })
-            .map_err(qwen38_flash_next_cache_error);
-        if let Err(error) = attention {
-            cache
-                .abort_append(
-                    reservation,
-                    &mut Sm12xCacheContext {
-                        stream,
-                        page_table: &mut state.page_table,
-                    },
-                )
-                .map_err(qwen38_flash_next_cache_error)?;
-            return Err(error);
-        }
-        let body = (|| -> Result<Option<Qwen38NextToken>> {
-            mtp.attention_hyper.combine(
-                &workspace.streams_a,
-                &workspace.attention_output,
-                &mut workspace.attention_hyper,
-                &mut workspace.streams_b,
-                1,
-                stream,
-            )?;
-            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
-            mtp.mlp_hyper
-                .mix(&workspace.streams_a, &mut workspace.mlp_hyper, 1, stream)?;
-            let ffn = mtp.moe.run_one_token(
-                &self.lt,
-                &mut workspace.moe,
-                &mtp.manifest,
-                workspace.mlp_hyper.mixed(),
-                &workspace.zero_hidden,
-                stream,
-                None,
-                None,
-            )?;
-            mtp.mlp_hyper.combine(
-                &workspace.streams_a,
-                ffn.ffn_out,
-                &mut workspace.mlp_hyper,
-                &mut workspace.streams_b,
-                1,
-                stream,
-            )?;
-            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
-            if !logits {
-                return Ok(None);
-            }
+        let output = mtp.attention.run_one_token(
+            &mut workspace.attention,
+            backend,
+            page_table,
+            page,
+            page_offset,
+            &self.config,
+            &mtp.manifest,
+            workspace.attention_hyper.mixed(),
+            0,
+            position,
+            stream,
+        )?;
+        workspace
+            .attention_output
+            .copy_prefix_from_device_on_stream(output, hidden, stream)?;
+        mtp.attention_hyper.combine(
+            &workspace.streams_a,
+            &workspace.attention_output,
+            &mut workspace.attention_hyper,
+            &mut workspace.streams_b,
+            1,
+            stream,
+        )?;
+        std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+        mtp.mlp_hyper
+            .mix(&workspace.streams_a, &mut workspace.mlp_hyper, 1, stream)?;
+        let ffn = mtp.moe.run_one_token(
+            &self.lt,
+            &mut workspace.moe,
+            &mtp.manifest,
+            workspace.mlp_hyper.mixed(),
+            &workspace.zero_hidden,
+            stream,
+            None,
+            None,
+        )?;
+        mtp.mlp_hyper.combine(
+            &workspace.streams_a,
+            ffn.ffn_out,
+            &mut workspace.mlp_hyper,
+            &mut workspace.streams_b,
+            1,
+            stream,
+        )?;
+        std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+        if logits {
             mtp.final_mixer
                 .mix(&workspace.streams_a, &mut workspace.final_hyper, 1, stream)?;
             workspace.final_hidden.copy_prefix_from_device_on_stream(
@@ -1052,37 +1113,8 @@ impl Qwen38FlashNextModel {
                 &mut workspace.lm_head,
                 stream,
             )?;
-            let (id, value) = workspace.lm_head.read_top1(stream)?;
-            Ok(Some(Qwen38NextToken { id, value }))
-        })();
-        match body {
-            Ok(next) => {
-                cache
-                    .commit_append(
-                        reservation,
-                        1,
-                        &mut Sm12xCacheContext {
-                            stream,
-                            page_table: &mut state.page_table,
-                        },
-                    )
-                    .map_err(qwen38_flash_next_cache_error)?;
-                state.position += 1;
-                Ok(next)
-            }
-            Err(error) => {
-                cache
-                    .abort_append(
-                        reservation,
-                        &mut Sm12xCacheContext {
-                            stream,
-                            page_table: &mut state.page_table,
-                        },
-                    )
-                    .map_err(qwen38_flash_next_cache_error)?;
-                Err(error)
-            }
         }
+        Ok(())
     }
 
     /// Advances the native MTP prompt cache without evaluating discarded
@@ -1307,9 +1339,126 @@ impl Qwen38FlashNextModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn mtp_draft_chain_argmax(
+        &self,
+        workspace: &mut Qwen38FlashNextSpeculativeWorkspace,
+        frontier: &Qwen38FlashNextSpeculativeFrontier,
+        state: &mut Qwen38FlashNextMtpSequenceState,
+        mtp_workspace: &mut Qwen38FlashNextMtpWorkspace,
+        cache: &mut Qwen38FlashNextMtpSequenceCache,
+        drafts: usize,
+        stream: &CudaStream,
+    ) -> Result<(AppendReservation, Vec<u32>)> {
+        if drafts == 0 || drafts > workspace.drafts {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next active speculative drafts",
+                expected: format!("1..={} drafts", workspace.drafts),
+                actual: drafts.to_string(),
+            });
+        }
+        let end = state
+            .position
+            .checked_add(drafts)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 Flash Next MTP draft position",
+                expected: "position + drafts without overflow".to_string(),
+                actual: format!("position={} drafts={drafts}", state.position),
+            })?;
+        if end > state.max_tokens {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next MTP draft position",
+                expected: format!("end <= {}", state.max_tokens),
+                actual: end.to_string(),
+            });
+        }
+        mtp_workspace.token.copy_from_host(&[frontier.token])?;
+        let reservation = cache
+            .reserve_append(
+                state.cache_id,
+                drafts,
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        let body = cache
+            .with_append_pages(&reservation, |backend, pages| {
+                let mut step = 0usize;
+                for page in pages.iter() {
+                    let segment = page.segment();
+                    for offset in 0..segment.rows() {
+                        let previous_streams = if step == 0 {
+                            &frontier.previous_streams
+                        } else {
+                            &workspace.chained_streams
+                        };
+                        self.mtp_forward_reserved_token(
+                            mtp_workspace,
+                            backend,
+                            state.page_table.device(),
+                            page.page(),
+                            segment.page_offset() + offset,
+                            previous_streams,
+                            state.position + step,
+                            true,
+                            stream,
+                        )?;
+                        workspace
+                            .chained_streams
+                            .copy_prefix_from_device_on_stream(
+                                &mtp_workspace.streams_a,
+                                mtp_workspace.streams_a.len(),
+                                stream,
+                            )?;
+                        workspace.draft_tokens.copy_range_from_device_on_stream(
+                            step,
+                            mtp_workspace.lm_head.next_index(),
+                            0,
+                            1,
+                            stream,
+                        )?;
+                        mtp_workspace.token.copy_prefix_from_device_on_stream(
+                            mtp_workspace.lm_head.next_index(),
+                            1,
+                            stream,
+                        )?;
+                        step += 1;
+                    }
+                }
+                if step != drafts {
+                    return Err(Error::Format {
+                        label: "Qwen3.8 Flash Next MTP draft reservation",
+                        detail: format!("reservation exposed {step} rows for {drafts} drafts"),
+                    });
+                }
+                Ok(())
+            })
+            .map_err(qwen38_flash_next_cache_error);
+        if let Err(error) = body {
+            cache
+                .abort_append(
+                    reservation,
+                    &mut Sm12xCacheContext {
+                        stream,
+                        page_table: &mut state.page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            return Err(error);
+        }
+        let draft_tokens = workspace
+            .draft_tokens
+            .copy_prefix_to_host(drafts, stream)?
+            .into_vec();
+        Ok((reservation, draft_tokens))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn speculative_cycle_argmax(
         &mut self,
         workspace: &mut Qwen38FlashNextSpeculativeWorkspace,
+        active_drafts: usize,
         frontier: &mut Qwen38FlashNextSpeculativeFrontier,
         target_state: &mut Qwen38FlashNextDecodeState,
         target_cache: &mut Qwen38FlashNextSequenceCache,
@@ -1319,29 +1468,24 @@ impl Qwen38FlashNextModel {
         mtp_workspace: &mut Qwen38FlashNextMtpWorkspace,
         mtp_cache: &mut Qwen38FlashNextMtpSequenceCache,
     ) -> Result<Qwen38FlashNextSpeculativeOutcome> {
-        let draft = self
-            .mtp_forward_token(
-                mtp_state,
-                mtp_workspace,
-                mtp_cache,
-                frontier.token,
-                &frontier.previous_streams,
-                true,
-                &target_state.stream,
-            )?
-            .ok_or_else(|| Error::Format {
-                label: "Qwen3.8 Flash Next MTP draft",
-                detail: "draft step produced no vocabulary result".to_string(),
-            })?;
+        let (mtp_reservation, drafted) = self.mtp_draft_chain_argmax(
+            workspace,
+            frontier,
+            mtp_state,
+            mtp_workspace,
+            mtp_cache,
+            active_drafts,
+            &target_state.stream,
+        )?;
         let old_frontier = Qwen38NextToken {
             id: frontier.token,
             value: frontier.logit,
         };
         workspace.host_tokens.clear();
         workspace.host_tokens.push(frontier.token);
-        workspace.host_tokens.push(draft.id);
+        workspace.host_tokens.extend_from_slice(&drafted);
         let rows = workspace.host_tokens.len();
-        let reservation = target_cache
+        let reservation = match target_cache
             .reserve_append(
                 target_cache_id,
                 rows,
@@ -1350,7 +1494,22 @@ impl Qwen38FlashNextModel {
                     page_table: target_page_table,
                 },
             )
-            .map_err(qwen38_flash_next_cache_error)?;
+            .map_err(qwen38_flash_next_cache_error)
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                mtp_cache
+                    .abort_append(
+                        mtp_reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &target_state.stream,
+                            page_table: &mut mtp_state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                return Err(error);
+            }
+        };
         if let Err(error) = target_state.begin_append() {
             target_cache
                 .abort_append(
@@ -1358,6 +1517,15 @@ impl Qwen38FlashNextModel {
                     &mut Sm12xCacheContext {
                         stream: &target_state.stream,
                         page_table: target_page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            mtp_cache
+                .abort_append(
+                    mtp_reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &target_state.stream,
+                        page_table: &mut mtp_state.page_table,
                     },
                 )
                 .map_err(qwen38_flash_next_cache_error)?;
@@ -1376,6 +1544,15 @@ impl Qwen38FlashNextModel {
                     &mut Sm12xCacheContext {
                         stream: &target_state.stream,
                         page_table: target_page_table,
+                    },
+                )
+                .map_err(qwen38_flash_next_cache_error)?;
+            mtp_cache
+                .abort_append(
+                    mtp_reservation,
+                    &mut Sm12xCacheContext {
+                        stream: &target_state.stream,
+                        page_table: &mut mtp_state.page_table,
                     },
                 )
                 .map_err(qwen38_flash_next_cache_error)?;
@@ -1406,31 +1583,46 @@ impl Qwen38FlashNextModel {
                         },
                     )
                     .map_err(qwen38_flash_next_cache_error)?;
+                mtp_cache
+                    .abort_append(
+                        mtp_reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &target_state.stream,
+                            page_table: &mut mtp_state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
                 return Err(error);
             }
         };
-        let target_next = verification[0];
-        let accepted = usize::from(target_next.id == draft.id);
+        let mut accepted = 0usize;
+        while accepted < active_drafts && verification[accepted].id == drafted[accepted] {
+            accepted += 1;
+        }
         let committed_rows = accepted + 1;
         let hc_dim = self.config.hidden * self.config.hc_count;
-        if accepted == 0 {
+        if accepted < active_drafts {
             let restore = (|| -> Result<()> {
                 workspace
                     .verify
                     .verify
                     .hybrid
-                    .restore_gdn_state_snapshot(0, &target_state.stream)?;
+                    .restore_gdn_state_snapshot(accepted, &target_state.stream)?;
                 workspace
                     .verify
                     .verify
                     .exact_ple
                     .as_ref()
                     .expect("exact verifier has a PLE workspace")
-                    .restore_frontier_state(&mut target_state.ple_state, &target_state.stream)?;
+                    .restore_state_snapshot(
+                        &mut target_state.ple_state,
+                        accepted,
+                        &target_state.stream,
+                    )?;
                 target_state.streams_a.copy_range_from_device_on_stream(
                     0,
                     &workspace.verify.verify.streams_a,
-                    0,
+                    accepted * hc_dim,
                     hc_dim,
                     &target_state.stream,
                 )
@@ -1446,9 +1638,30 @@ impl Qwen38FlashNextModel {
                         },
                     )
                     .map_err(qwen38_flash_next_cache_error)?;
+                mtp_cache
+                    .abort_append(
+                        mtp_reservation,
+                        &mut Sm12xCacheContext {
+                            stream: &target_state.stream,
+                            page_table: &mut mtp_state.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
                 return Err(error);
             }
         }
+        let mtp_committed_rows = committed_rows.min(active_drafts);
+        mtp_cache
+            .commit_append(
+                mtp_reservation,
+                mtp_committed_rows,
+                &mut Sm12xCacheContext {
+                    stream: &target_state.stream,
+                    page_table: &mut mtp_state.page_table,
+                },
+            )
+            .map_err(qwen38_flash_next_cache_error)?;
+        mtp_state.position += mtp_committed_rows;
         if let Err(error) = target_cache
             .commit_append(
                 reservation,
@@ -1463,22 +1676,29 @@ impl Qwen38FlashNextModel {
             target_state.abort_append()?;
             return Err(error);
         }
-        if accepted == 0 {
+        if accepted < active_drafts {
             target_state
                 .ple_window
-                .commit_append_prefix(&workspace.host_tokens[..1])?;
+                .commit_append_prefix(&workspace.host_tokens[..committed_rows])?;
             target_state.ple_state.commit_append()?;
-            target_state.position += 1;
+            target_state.position += committed_rows;
         } else {
             target_state.commit_append(rows)?;
         }
 
-        let mut committed = vec![old_frontier];
-        if accepted == 1 {
+        let mut committed = Vec::with_capacity(committed_rows);
+        committed.push(old_frontier);
+        for (index, &token) in drafted.iter().take(accepted).enumerate() {
+            committed.push(Qwen38NextToken {
+                id: token,
+                value: verification[index].value,
+            });
+        }
+        if accepted == active_drafts {
             frontier.previous_streams.copy_range_from_device_on_stream(
                 0,
                 &workspace.verify.verify.streams_a,
-                0,
+                (accepted - 1) * hc_dim,
                 hc_dim,
                 &target_state.stream,
             )?;
@@ -1486,15 +1706,11 @@ impl Qwen38FlashNextModel {
                 mtp_state,
                 mtp_workspace,
                 mtp_cache,
-                draft.id,
+                drafted[accepted - 1],
                 &frontier.previous_streams,
                 false,
                 &target_state.stream,
             )?;
-            committed.push(Qwen38NextToken {
-                id: draft.id,
-                value: target_next.value,
-            });
         }
         frontier.token = verification[accepted].id;
         frontier.logit = verification[accepted].value;
@@ -1518,9 +1734,10 @@ impl Qwen38FlashNextModel {
         stream: &CudaStream,
     ) -> Result<Vec<Qwen38NextToken>> {
         if workspace.exact_hyper_projections {
-            self.final_mixer.mix_exact_two_rows(
+            self.final_mixer.mix_exact_rows(
                 &workspace.verify.streams_a,
                 &mut workspace.final_hyper,
+                rows,
                 stream,
             )?;
         } else {
@@ -1537,18 +1754,12 @@ impl Qwen38FlashNextModel {
             stream,
         )?;
         if workspace.exact_output_head {
-            if rows != 2 {
-                return Err(Error::Shape {
-                    label: "Qwen3.8 exact verifier output head",
-                    expected: "exactly two rows".to_string(),
-                    actual: rows.to_string(),
-                });
-            }
-            self.lm_head.run_bf16_exact_two_rows_top1(
+            self.lm_head.run_bf16_exact_rows_top1(
                 &workspace.final_hidden,
                 &mut workspace.exact_logits,
                 &mut workspace.argmax_indices,
                 &mut workspace.argmax_values,
+                rows,
                 stream,
             )?;
         } else {
@@ -1698,6 +1909,86 @@ impl Qwen38FlashNextModel {
             .streams_a
             .copy_to_host(&sequence.state.stream)
             .map(|streams| streams.into_vec())
+    }
+
+    pub(crate) fn probe_target_state_mismatch(
+        &self,
+        left: &Qwen38FlashNextSequence,
+        right: &Qwen38FlashNextSequence,
+    ) -> Result<Option<&'static str>> {
+        let left_state = &left.state;
+        let right_state = &right.state;
+        left_state.stream.synchronize()?;
+        right_state.stream.synchronize()?;
+        if left_state.position != right_state.position {
+            return Ok(Some("position"));
+        }
+        if left_state.ple_window != right_state.ple_window {
+            return Ok(Some("PLE token window"));
+        }
+        let equal_device_f32 = |left: &DeviceBuffer<f32>,
+                                right: &DeviceBuffer<f32>,
+                                stream: &CudaStream|
+         -> Result<bool> {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            let left = left.copy_to_host(stream)?;
+            let right = right.copy_to_host(stream)?;
+            Ok(left
+                .iter()
+                .zip(right.iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits()))
+        };
+        if !equal_device_f32(
+            &left_state.streams_a,
+            &right_state.streams_a,
+            &left_state.stream,
+        )? {
+            return Ok(Some("residual streams"));
+        }
+        let left_ple = left_state
+            .ple_state
+            .snapshot_on_stream(&left_state.stream)?;
+        let right_ple = right_state
+            .ple_state
+            .snapshot_on_stream(&right_state.stream)?;
+        if !equal_device_f32(&left_ple, &right_ple, &left_state.stream)? {
+            return Ok(Some("PLE convolution"));
+        }
+        if left_state.attention_states.len() != right_state.attention_states.len() {
+            return Ok(Some("attention topology"));
+        }
+        for (left_attention, right_attention) in left_state
+            .attention_states
+            .iter()
+            .zip(&right_state.attention_states)
+        {
+            match (left_attention, right_attention) {
+                (
+                    Qwen38AttentionState::Linear(left_linear),
+                    Qwen38AttentionState::Linear(right_linear),
+                ) => {
+                    if !equal_device_f32(
+                        &left_linear.conv_state,
+                        &right_linear.conv_state,
+                        &left_state.stream,
+                    )? {
+                        return Ok(Some("GDN convolution"));
+                    }
+                    if !equal_device_f32(
+                        &left_linear.recurrent_state,
+                        &right_linear.recurrent_state,
+                        &left_state.stream,
+                    )? {
+                        return Ok(Some("GDN recurrent state"));
+                    }
+                }
+                (Qwen38AttentionState::Qsa, Qwen38AttentionState::Qsa) => {}
+                _ => return Ok(Some("attention topology")),
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn probe_decode_token_trace(
@@ -2208,14 +2499,25 @@ impl Qwen38FlashNextModel {
         }
         workspace.hybrid.finish_gdn_prefill()?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            if let Some(trace) = workspace.layer_trace.as_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::LayerInput,
+                    token_count,
+                    self.config.hidden * self.config.hc_count,
+                    &workspace.streams_a,
+                    &state.stream,
+                )?);
+            }
             if layer_index == self.config.ple_layer {
                 let ple = if let Some(exact_ple) = workspace.exact_ple.as_mut() {
                     self.ple_weights
-                        .run_exact_two_rows(
+                        .run_exact_rows(
                             &mut workspace.ple_pager,
                             &workspace.streams_a,
                             &mut state.ple_state,
                             exact_ple,
+                            token_count,
                             &state.stream,
                         )?
                         .0
@@ -2251,9 +2553,10 @@ impl Qwen38FlashNextModel {
             }
 
             if workspace.exact_hyper_projections {
-                layer.attention_hyper.mix_exact_two_rows(
+                layer.attention_hyper.mix_exact_rows(
                     &workspace.streams_a,
                     &mut workspace.attention_hyper,
+                    token_count,
                     &state.stream,
                 )?;
             } else {
@@ -2263,6 +2566,16 @@ impl Qwen38FlashNextModel {
                     token_count,
                     &state.stream,
                 )?;
+            }
+            if let Some(trace) = workspace.layer_trace.as_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionMix,
+                    token_count,
+                    self.config.hidden,
+                    workspace.attention_hyper.mixed(),
+                    &state.stream,
+                )?);
             }
             let attention_output = match (
                 &layer.attention,
@@ -2346,20 +2659,40 @@ impl Qwen38FlashNextModel {
                             .with_append_pages(reservation, |backend, pages| {
                                 for page in pages.iter() {
                                     let segment = page.segment();
-                                    for offset in 0..segment.rows() {
-                                        let row = segment.input_offset() + offset;
-                                        weights.run_prepared_prefill_row(
-                                            &model,
+                                    let start_position = state.position + segment.input_offset();
+                                    let dense_rows = self
+                                        .config
+                                        .indexer_budget
+                                        .saturating_sub(start_position)
+                                        .min(segment.rows());
+                                    if dense_rows != 0 {
+                                        weights.run_prepared_prefill_dense_rows(
                                             &mut workspace.qsa,
-                                            qsa_workspace,
                                             backend,
                                             page_table.device(),
                                             page.page(),
-                                            segment.page_offset() + offset,
+                                            segment.page_offset(),
                                             &self.config,
-                                            row,
+                                            segment.input_offset(),
+                                            dense_rows,
                                             layer_index,
-                                            state.position + row,
+                                            start_position,
+                                            &state.stream,
+                                        )?;
+                                    }
+                                    let sparse_rows = segment.rows() - dense_rows;
+                                    if sparse_rows != 0 {
+                                        weights.run_prepared_prefill_sparse_rows(
+                                            &mut workspace.qsa,
+                                            backend,
+                                            page_table.device(),
+                                            page.page(),
+                                            segment.page_offset() + dense_rows,
+                                            &self.config,
+                                            segment.input_offset() + dense_rows,
+                                            sparse_rows,
+                                            layer_index,
+                                            start_position + dense_rows,
                                             &state.stream,
                                         )?;
                                     }
@@ -2382,12 +2715,23 @@ impl Qwen38FlashNextModel {
                     });
                 }
             };
+            if let Some(trace) = workspace.layer_trace.as_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionOutput,
+                    token_count,
+                    self.config.hidden,
+                    attention_output,
+                    &state.stream,
+                )?);
+            }
             if workspace.exact_hyper_projections {
-                layer.attention_hyper.combine_exact_two_rows(
+                layer.attention_hyper.combine_exact_rows(
                     &workspace.streams_a,
                     attention_output,
                     &mut workspace.attention_hyper,
                     &mut workspace.streams_b,
+                    token_count,
                     &state.stream,
                 )?;
             } else {
@@ -2399,6 +2743,16 @@ impl Qwen38FlashNextModel {
                     token_count,
                     &state.stream,
                 )?;
+            }
+            if let Some(trace) = workspace.layer_trace.as_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionInject,
+                    token_count,
+                    self.config.hc_count,
+                    workspace.attention_hyper.inject_logits(),
+                    &state.stream,
+                )?);
             }
             std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
             if let Some(trace) = workspace.layer_trace.as_mut() {
@@ -2413,9 +2767,10 @@ impl Qwen38FlashNextModel {
             }
 
             if workspace.exact_hyper_projections {
-                layer.mlp_hyper.mix_exact_two_rows(
+                layer.mlp_hyper.mix_exact_rows(
                     &workspace.streams_a,
                     &mut workspace.mlp_hyper,
+                    token_count,
                     &state.stream,
                 )?;
             } else {
@@ -2475,11 +2830,12 @@ impl Qwen38FlashNextModel {
                 )?);
             }
             if workspace.exact_hyper_projections {
-                layer.mlp_hyper.combine_exact_two_rows(
+                layer.mlp_hyper.combine_exact_rows(
                     &workspace.streams_a,
                     ffn,
                     &mut workspace.mlp_hyper,
                     &mut workspace.streams_b,
+                    token_count,
                     &state.stream,
                 )?;
             } else {
@@ -2701,6 +3057,16 @@ impl Qwen38FlashNextModel {
         )?;
 
         for (layer_index, layer) in self.layers.iter().enumerate() {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::LayerInput,
+                    1,
+                    self.config.hidden * self.config.hc_count,
+                    &state.streams_a,
+                    &state.stream,
+                )?);
+            }
             if layer_index == self.config.ple_layer {
                 let (ple, _) = self.ple_weights.run(
                     &mut state.ple_pager,
@@ -2735,6 +3101,16 @@ impl Qwen38FlashNextModel {
                 1,
                 &state.stream,
             )?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionMix,
+                    1,
+                    self.config.hidden,
+                    state.attention_hyper.mixed(),
+                    &state.stream,
+                )?);
+            }
             let attention_output = match (
                 &layer.attention,
                 &mut state.attention_workspaces[layer_index],
@@ -2794,6 +3170,16 @@ impl Qwen38FlashNextModel {
                     });
                 }
             };
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionOutput,
+                    1,
+                    self.config.hidden,
+                    attention_output,
+                    &state.stream,
+                )?);
+            }
             layer.attention_hyper.combine(
                 &state.streams_a,
                 attention_output,
@@ -2802,6 +3188,16 @@ impl Qwen38FlashNextModel {
                 1,
                 &state.stream,
             )?;
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.push(capture_layer_probe_trace(
+                    layer_index,
+                    Qwen38LayerProbeStage::AttentionInject,
+                    1,
+                    self.config.hc_count,
+                    state.attention_hyper.inject_logits(),
+                    &state.stream,
+                )?);
+            }
             std::mem::swap(&mut state.streams_a, &mut state.streams_b);
             if let Some(trace) = trace.as_deref_mut() {
                 trace.push(capture_layer_probe_trace(
@@ -2857,9 +3253,11 @@ impl Qwen38FlashNextModel {
             )?;
             std::mem::swap(&mut state.streams_a, &mut state.streams_b);
             if trace.is_some() {
-                let snapshot = layer
-                    .moe
-                    .probe_repeat_workspace_gate_up(&mut state.moe, &state.stream)?;
+                let snapshot = layer.moe.probe_repeat_workspace_gate_up(
+                    &mut state.moe,
+                    state.mlp_hyper.mixed(),
+                    &state.stream,
+                )?;
                 if let Some(ffn_trace) = trace.as_deref_mut().and_then(|trace| {
                     trace.iter_mut().rev().find(|entry| {
                         entry.layer == layer_index && entry.stage == Qwen38LayerProbeStage::MlpFfn
@@ -3342,8 +3740,15 @@ mod tests {
         let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_MODEL_DIR") else {
             return;
         };
-        run_released_layer(Path::new(&model_dir), 0).expect("released linear layer");
-        run_released_layer(Path::new(&model_dir), 3).expect("released full layer");
+        let layers = std::env::var("EIDER_QWEN38_FLASH_NEXT_TEST_LAYERS")
+            .unwrap_or_else(|_| "0,3".to_string());
+        for layer in layers.split(',').map(|layer| {
+            layer
+                .parse::<usize>()
+                .expect("EIDER_QWEN38_FLASH_NEXT_TEST_LAYERS contains layer numbers")
+        }) {
+            run_released_layer(Path::new(&model_dir), layer).expect("released layer");
+        }
     }
 
     #[test]
@@ -3468,9 +3873,10 @@ mod tests {
                 .expect("serial MoE readback"),
             );
         }
-        let mut exact_pair = Qwen36ExactMoePairWorkspace::new(&manifest).expect("exact MoE pair");
+        let mut exact_pair =
+            Qwen36ExactMoeRowsWorkspace::new(&manifest, 2).expect("exact MoE rows");
         let exact_pair = moe
-            .run_exact_pair(&mut exact_pair, &manifest, &batch_input, &stream)
+            .run_exact_rows(&mut exact_pair, &manifest, &batch_input, 2, &stream)
             .expect("exact pair MoE")
             .copy_to_host(&stream)
             .expect("exact pair MoE readback");
@@ -3525,7 +3931,7 @@ mod tests {
         let stream = CudaStream::new_non_blocking().expect("stream");
         let zero = DeviceBuffer::zeroed(config.hidden).expect("zero residual");
         let mut serial = Qwen36MoeWorkspace::new(&manifest).expect("serial MoE");
-        let mut exact = Qwen36ExactMoePairWorkspace::new(&manifest).expect("exact MoE pair");
+        let mut exact = Qwen36ExactMoeRowsWorkspace::new(&manifest, 2).expect("exact MoE rows");
 
         for layer in 0..2 {
             let weights = Qwen36MoeWeights::load_checkpoint_layout(
@@ -3543,13 +3949,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let batch_input = DeviceBuffer::from_host(&input_host).expect("batch input");
             let exact_output = weights
-                .run_exact_pair(&mut exact, &manifest, &batch_input, &stream)
+                .run_exact_rows(&mut exact, &manifest, &batch_input, 2, &stream)
                 .expect("exact pair")
                 .copy_to_host(&stream)
                 .expect("exact readback")
                 .into_vec();
             let replay = weights
-                .probe_repeat_exact_pair_gate_up(&mut exact, &stream)
+                .probe_repeat_exact_rows_gate_up(&mut exact, &stream)
                 .expect("gate/up replay");
             for (row, snapshot) in replay.iter().enumerate() {
                 assert_eq!(
@@ -3601,7 +4007,7 @@ mod tests {
                 )
                 .expect("duplicate input");
                 weights
-                    .run_exact_pair(&mut exact, &manifest, &duplicate_input, &stream)
+                    .run_exact_rows(&mut exact, &manifest, &duplicate_input, 2, &stream)
                     .expect("duplicate exact pair");
                 let duplicate = exact
                     .probe_snapshots(
@@ -3633,7 +4039,7 @@ mod tests {
         let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_MODEL_DIR") else {
             return;
         };
-        const TOKENS: usize = 4;
+        const TOKENS: usize = 8;
         const LAYER: usize = 3;
         let config = Qwen38FlashNextConfig::load(&model_dir).expect("config");
         let manifest = config.qwen_manifest();
@@ -3702,8 +4108,6 @@ mod tests {
             config.indexer_head_dim,
         )
         .expect("batch backend");
-        let mut batch_workspace =
-            Qwen38QsaWorkspace::new(&config, &manifest, &weights, 128).expect("batch workspace");
         let lt = CublasLt::new().expect("cuBLASLt");
         let batch_model = Qwen36BatchModelView::new(&lt, &manifest, &layer_mask);
         let mut prefill_workspace = weights
@@ -3720,24 +4124,21 @@ mod tests {
                 &stream,
             )
             .expect("prepare batch QSA");
-        for row in 0..TOKENS {
-            weights
-                .run_prepared_prefill_row(
-                    &batch_model,
-                    &mut prefill_workspace,
-                    &mut batch_workspace,
-                    &mut batch_backend,
-                    &page_table,
-                    &page,
-                    row,
-                    &config,
-                    row,
-                    LAYER,
-                    row,
-                    &stream,
-                )
-                .expect("batch QSA");
-        }
+        weights
+            .run_prepared_prefill_dense_rows(
+                &mut prefill_workspace,
+                &mut batch_backend,
+                &page_table,
+                &page,
+                0,
+                &config,
+                0,
+                TOKENS,
+                LAYER,
+                0,
+                &stream,
+            )
+            .expect("batch QSA");
         let batch_output = weights
             .finish_prefill(&batch_model, &mut prefill_workspace, TOKENS, &stream)
             .expect("finish batch QSA")

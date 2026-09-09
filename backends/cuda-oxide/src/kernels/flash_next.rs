@@ -3,7 +3,7 @@
 use crate::common::*;
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
 use cuda_device::{
-    SharedArray, convert, cuda_module, kernel, launch_bounds, launch_contract, thread,
+    SharedArray, convert, cuda_module, kernel, launch_bounds, launch_contract, thread, warp,
 };
 
 /// CUDA entry points specific to Qwen3.8 Flash Next.
@@ -329,9 +329,11 @@ mod device {
         projection: *const f32,
         q_norm: *const f32,
         query: *mut f32,
+        heads: u32,
         head_dim: u32,
         rotary_dim: u32,
-        position: u32,
+        input_row_offset: u32,
+        start_position: u32,
         eps: f32,
         theta: f32,
     ) {
@@ -340,9 +342,13 @@ mod device {
         let values = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VALUES) };
         let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
         let head = thread::blockIdx_x();
+        let row = thread::blockIdx_y();
         let dim = thread::threadIdx_x();
         let index = (head * head_dim + dim) as usize;
-        let value = unsafe { *projection.add(index) };
+        let projection_stride = (heads + 1) * head_dim;
+        let projection_index = ((input_row_offset + row) * projection_stride) as usize + index;
+        let value = unsafe { *projection.add(projection_index) };
+        let query = unsafe { query.add((row * heads * head_dim) as usize) };
         unsafe {
             values.add(dim as usize).write(value);
             reduction.add(dim as usize).write(value * value);
@@ -362,16 +368,23 @@ mod device {
         unsafe {
             query
                 .add(index)
-                .write(qwen38_rope_value(values, dim, rotary_dim, position, theta))
+                .write(qwen38_rope_value(
+                    values,
+                    dim,
+                    rotary_dim,
+                    start_position + row,
+                    theta,
+                ))
         };
     }
 
-    /// Appends the raw BF16 QSA index key for one Qwen3.8 Flash Next token.
+    /// Appends raw BF16 QSA index keys for Qwen3.8 Flash Next tokens.
     #[kernel]
     #[launch_bounds(128)]
-    pub unsafe fn qwen38_qsa_append_key_f32(
+    pub unsafe fn qwen38_qsa_append_keys_f32(
         projection: *const f32,
         key_pool_bf16: *mut u16,
+        input_row_offset: u32,
         slot: u32,
         page_offset: u32,
         page_tokens: u32,
@@ -379,9 +392,13 @@ mod device {
         head_dim: u32,
     ) {
         let dim = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let row = thread::blockIdx_y();
         if dim < head_dim {
-            let source = (heads * head_dim + dim) as usize;
-            let destination = ((slot * page_tokens + page_offset) * head_dim + dim) as usize;
+            let projection_stride = (heads + 1) * head_dim;
+            let source = ((input_row_offset + row) * projection_stride + heads * head_dim + dim)
+                as usize;
+            let destination =
+                ((slot * page_tokens + page_offset + row) * head_dim + dim) as usize;
             let encoded = convert::cvt_bf16x2_f32(unsafe { *projection.add(source) }, 0.0) as u16;
             unsafe { key_pool_bf16.add(destination).write(encoded) };
         }
@@ -400,6 +417,9 @@ mod device {
         heads: u32,
         head_dim: u32,
         rotary_dim: u32,
+        start_cache_len: u32,
+        rows: u32,
+        max_blocks: u32,
         eps: f32,
         theta: f32,
     ) {
@@ -409,6 +429,9 @@ mod device {
         let reduction = unsafe { SharedArray::as_raw_mut_ptr(&raw mut REDUCTION) };
         let block = thread::blockIdx_x();
         let dim = thread::threadIdx_x();
+        if block >= (start_cache_len + rows - 1) / 4 {
+            return;
+        }
         let token = block * 4;
         let page_slot = unsafe { *page_table.add((token / page_tokens) as usize) };
         let page_offset = token % page_tokens;
@@ -441,34 +464,42 @@ mod device {
         unsafe { *values.add(dim as usize) = pooled * inverse_rms * *k_norm.add(dim as usize) };
         thread::sync_threads();
         let key = unsafe { qwen38_rope_value(values, dim, rotary_dim, token, theta) };
-        let mut score = 0.0f32;
-        let mut head = 0;
-        while head < heads {
-            let dot = unsafe { *query.add((head * head_dim + dim) as usize) } * key;
-            unsafe { reduction.add(dim as usize).write(dot) };
-            thread::sync_threads();
-            stride = head_dim / 2;
-            while stride != 0 {
-                if dim < stride {
+        let mut row_index = 0;
+        while row_index < rows {
+            if block < (start_cache_len + row_index) / 4 {
+                let row_query = unsafe { query.add((row_index * heads * head_dim) as usize) };
+                let mut score = 0.0f32;
+                let mut head = 0;
+                while head < heads {
+                    let dot = unsafe { *row_query.add((head * head_dim + dim) as usize) } * key;
+                    unsafe { reduction.add(dim as usize).write(dot) };
+                    thread::sync_threads();
+                    stride = head_dim / 2;
+                    while stride != 0 {
+                        if dim < stride {
+                            unsafe {
+                                *reduction.add(dim as usize) +=
+                                    *reduction.add((dim + stride) as usize)
+                            };
+                        }
+                        thread::sync_threads();
+                        stride /= 2;
+                    }
+                    if dim == 0 {
+                        score += unsafe { *reduction }.max(0.0);
+                    }
+                    thread::sync_threads();
+                    head += 1;
+                }
+                if dim == 0 {
                     unsafe {
-                        *reduction.add(dim as usize) += *reduction.add((dim + stride) as usize)
+                        scores
+                            .add((row_index * max_blocks + block) as usize)
+                            .write(score / (head_dim as f32).sqrt())
                     };
                 }
-                thread::sync_threads();
-                stride /= 2;
             }
-            if dim == 0 {
-                score += unsafe { *reduction }.max(0.0);
-            }
-            thread::sync_threads();
-            head += 1;
-        }
-        if dim == 0 {
-            unsafe {
-                scores
-                    .add(block as usize)
-                    .write(score / (head_dim as f32).sqrt())
-            };
+            row_index += 1;
         }
     }
 
@@ -478,9 +509,9 @@ mod device {
     pub unsafe fn qwen38_qsa_select_blocks_f32(
         scores: *const f32,
         selected_blocks: *mut u8,
-        complete_blocks: u32,
-        selected_complete_blocks: u32,
-        tail_tokens: u32,
+        start_cache_len: u32,
+        max_blocks: u32,
+        selected_budget_blocks: u32,
     ) {
         static mut HISTOGRAM: SharedArray<u32, 256> = SharedArray::UNINIT;
         static mut REDUCTION: SharedArray<u32, 256> = SharedArray::UNINIT;
@@ -494,6 +525,13 @@ mod device {
         let rank = unsafe { SharedArray::as_raw_mut_ptr(&raw mut RANK) };
         let count = unsafe { SharedArray::as_raw_mut_ptr(&raw mut COUNT) };
         let tie_cutoff = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TIE_CUTOFF) };
+        let row = thread::blockIdx_x();
+        let cache_len = start_cache_len + row;
+        let complete_blocks = cache_len / 4;
+        let selected_complete_blocks = complete_blocks.min(selected_budget_blocks);
+        let tail_tokens = cache_len % 4;
+        let scores = unsafe { scores.add((row * max_blocks) as usize) };
+        let selected_blocks = unsafe { selected_blocks.add((row * max_blocks) as usize) };
         let lane = thread::threadIdx_x();
         if complete_blocks <= selected_complete_blocks {
             let mut block = lane;
@@ -641,24 +679,112 @@ mod device {
 
     /// Builds the selected compact-attention tile mask from QSA micro-blocks.
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(32)]
     pub unsafe fn qwen38_qsa_build_tile_mask(
         selected_blocks: *const u8,
         selected_tiles: *mut u8,
-        visible_blocks: u32,
+        selected_block_indices: *mut u32,
+        selected_token_tiles: *mut u32,
+        selected_context_tiles: *mut u32,
+        selected_counts: *mut u32,
+        start_cache_len: u32,
+        max_blocks: u32,
+        max_tiles: u32,
+        index_capacity: u32,
     ) {
-        let tile = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
-        let block_start = tile * 16;
-        if block_start >= visible_blocks {
-            return;
+        let row = thread::blockIdx_x();
+        let lane = thread::threadIdx_x();
+        let cache_len = start_cache_len + row;
+        let visible_blocks = cache_len.div_ceil(4);
+        let selected_blocks = unsafe { selected_blocks.add((row * max_blocks) as usize) };
+        let selected_tiles = unsafe { selected_tiles.add((row * max_tiles) as usize) };
+        let selected_block_indices =
+            unsafe { selected_block_indices.add((row * index_capacity) as usize) };
+        let selected_token_tiles =
+            unsafe { selected_token_tiles.add((row * index_capacity) as usize) };
+        let selected_context_tiles =
+            unsafe { selected_context_tiles.add((row * index_capacity) as usize) };
+        let mut block_count = 0;
+        let mut base = 0;
+        while base < visible_blocks {
+            let block = base + lane;
+            let selected = block < visible_blocks
+                && unsafe { *selected_blocks.add(block as usize) } != 0;
+            let ballot = warp::ballot_sync(u32::MAX, selected);
+            let prefix = (ballot & warp::lanemask_lt()).count_ones();
+            if selected && block_count + prefix < index_capacity {
+                unsafe {
+                    selected_block_indices
+                        .add((block_count + prefix) as usize)
+                        .write(block)
+                };
+            }
+            block_count += ballot.count_ones();
+            base += 32;
         }
-        let block_end = (block_start + 16).min(visible_blocks);
-        let mut selected = false;
-        let mut block = block_start;
-        while block < block_end {
-            selected |= unsafe { *selected_blocks.add(block as usize) } != 0;
-            block += 1;
+        let visible_token_tiles = visible_blocks.div_ceil(2);
+        let mut token_tile_count = 0;
+        base = 0;
+        while base < visible_token_tiles {
+            let token_tile = base + lane;
+            let first_block = token_tile * 2;
+            let selected = token_tile < visible_token_tiles
+                && (unsafe { *selected_blocks.add(first_block as usize) } != 0
+                    || (first_block + 1 < visible_blocks
+                        && unsafe { *selected_blocks.add((first_block + 1) as usize) } != 0));
+            let ballot = warp::ballot_sync(u32::MAX, selected);
+            let prefix = (ballot & warp::lanemask_lt()).count_ones();
+            if selected && token_tile_count + prefix < index_capacity {
+                unsafe {
+                    selected_token_tiles
+                        .add((token_tile_count + prefix) as usize)
+                        .write(token_tile)
+                };
+            }
+            token_tile_count += ballot.count_ones();
+            base += 32;
         }
-        unsafe { selected_tiles.add(tile as usize).write(u8::from(selected)) };
+        let visible_context_tiles = visible_blocks.div_ceil(16);
+        let mut context_tile_count = 0;
+        base = 0;
+        while base < visible_context_tiles {
+            let context_tile = base + lane;
+            let mut selected = false;
+            if context_tile < visible_context_tiles {
+                let first_block = context_tile * 16;
+                let mut block = first_block;
+                while block < (first_block + 16).min(visible_blocks) {
+                    selected |= unsafe { *selected_blocks.add(block as usize) } != 0;
+                    block += 1;
+                }
+            }
+            let ballot = warp::ballot_sync(u32::MAX, selected);
+            let prefix = (ballot & warp::lanemask_lt()).count_ones();
+            if selected {
+                unsafe { selected_tiles.add(context_tile as usize).write(1) };
+                if context_tile_count + prefix < index_capacity {
+                    unsafe {
+                        selected_context_tiles
+                            .add((context_tile_count + prefix) as usize)
+                            .write(context_tile)
+                    };
+                }
+            }
+            context_tile_count += ballot.count_ones();
+            base += 32;
+        }
+        if lane == 0 {
+            unsafe {
+                selected_counts
+                    .add((row * 3) as usize)
+                    .write(block_count.min(index_capacity));
+                selected_counts
+                    .add((row * 3 + 1) as usize)
+                    .write(token_tile_count.min(index_capacity));
+                selected_counts
+                    .add((row * 3 + 2) as usize)
+                    .write(context_tile_count.min(index_capacity));
+            }
+        }
     }
 }

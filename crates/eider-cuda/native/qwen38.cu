@@ -59,15 +59,21 @@ __global__ void qwen38_qsa_prepare_query_kernel(
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t rotary_dim,
-    std::uint32_t position,
+    std::uint32_t input_row_offset,
+    std::uint32_t start_position,
     float eps,
     float theta) {
     const std::uint32_t head = blockIdx.x;
+    const std::uint32_t row = blockIdx.y;
     const std::uint32_t dim = threadIdx.x;
     if (head >= heads || dim >= head_dim) {
         return;
     }
-    const float* input = projection + static_cast<std::size_t>(head) * head_dim;
+    const std::size_t projection_stride = static_cast<std::size_t>(heads + 1) * head_dim;
+    const float* input = projection +
+        static_cast<std::size_t>(input_row_offset + row) * projection_stride +
+        static_cast<std::size_t>(head) * head_dim;
+    query += static_cast<std::size_t>(row) * heads * head_dim;
     extern __shared__ float scratch[];
     const float value = input[dim];
     scratch[dim] = value * value;
@@ -82,24 +88,30 @@ __global__ void qwen38_qsa_prepare_query_kernel(
     scratch[dim] = value * inverse_rms * q_norm[dim];
     __syncthreads();
     query[static_cast<std::size_t>(head) * head_dim + dim] = qwen38_rope_value(
-        scratch, dim, rotary_dim, position, theta);
+        scratch, dim, rotary_dim, start_position + row, theta);
 }
 
-__global__ void qwen38_qsa_append_key_kernel(
+__global__ void qwen38_qsa_append_keys_kernel(
     const float* projection,
     __nv_bfloat16* key_pool,
+    std::uint32_t input_row_offset,
     std::uint32_t slot,
     std::uint32_t page_offset,
     std::uint32_t page_tokens,
     std::uint32_t heads,
     std::uint32_t head_dim) {
     const std::uint32_t dim = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = blockIdx.y;
     if (dim >= head_dim) {
         return;
     }
-    const float* key = projection + static_cast<std::size_t>(heads) * head_dim;
+    const std::size_t projection_stride =
+        static_cast<std::size_t>(heads + 1) * head_dim;
+    const float* key = projection +
+        static_cast<std::size_t>(input_row_offset + row) * projection_stride +
+        static_cast<std::size_t>(heads) * head_dim;
     const std::size_t destination =
-        (static_cast<std::size_t>(slot) * page_tokens + page_offset) * head_dim + dim;
+        (static_cast<std::size_t>(slot) * page_tokens + page_offset + row) * head_dim + dim;
     key_pool[destination] = __float2bfloat16_rn(key[dim]);
 }
 
@@ -109,16 +121,18 @@ __global__ void qwen38_qsa_score_blocks_kernel(
     const std::uint32_t* page_table,
     const float* k_norm,
     float* scores,
-    std::uint32_t complete_blocks,
     std::uint32_t page_tokens,
     std::uint32_t heads,
     std::uint32_t head_dim,
     std::uint32_t rotary_dim,
+    std::uint32_t start_cache_len,
+    std::uint32_t rows,
+    std::uint32_t max_blocks,
     float eps,
     float theta) {
     const std::uint32_t block = blockIdx.x;
     const std::uint32_t dim = threadIdx.x;
-    if (block >= complete_blocks || dim >= head_dim) {
+    if (block >= (start_cache_len + rows - 1) / 4 || dim >= head_dim) {
         return;
     }
     const std::uint32_t token = block * 4;
@@ -147,17 +161,25 @@ __global__ void qwen38_qsa_score_blocks_kernel(
     scratch[dim] = pooled * inverse_rms * k_norm[dim];
     __syncthreads();
     const float key = qwen38_rope_value(scratch, dim, rotary_dim, token, theta);
-    float score = 0.0f;
-    for (std::uint32_t head = 0; head < heads; ++head) {
-        float dot = query[static_cast<std::size_t>(head) * head_dim + dim] * key;
-        dot = block_sum(dot);
-        if (threadIdx.x == 0) {
-            score += fmaxf(dot, 0.0f);
+    for (std::uint32_t row_index = 0; row_index < rows; ++row_index) {
+        if (block >= (start_cache_len + row_index) / 4) {
+            continue;
         }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        scores[block] = score * rsqrtf(static_cast<float>(head_dim));
+        const float* row_query =
+            query + static_cast<std::size_t>(row_index) * heads * head_dim;
+        float score = 0.0f;
+        for (std::uint32_t head = 0; head < heads; ++head) {
+            float dot = row_query[static_cast<std::size_t>(head) * head_dim + dim] * key;
+            dot = block_sum(dot);
+            if (threadIdx.x == 0) {
+                score += fmaxf(dot, 0.0f);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            scores[static_cast<std::size_t>(row_index) * max_blocks + block] =
+                score * rsqrtf(static_cast<float>(head_dim));
+        }
     }
 }
 
@@ -165,9 +187,16 @@ template <int ItemsPerThread>
 __global__ void qwen38_qsa_sort_blocks_kernel(
     const float* scores,
     std::uint8_t* selected_blocks,
-    std::uint32_t complete_blocks,
-    std::uint32_t selected_complete_blocks,
-    std::uint32_t tail_tokens) {
+    std::uint32_t start_cache_len,
+    std::uint32_t max_blocks,
+    std::uint32_t selected_budget_blocks) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t cache_len = start_cache_len + row;
+    const std::uint32_t complete_blocks = cache_len / 4;
+    const std::uint32_t selected_complete_blocks = min(complete_blocks, selected_budget_blocks);
+    const std::uint32_t tail_tokens = cache_len % 4;
+    scores += static_cast<std::size_t>(row) * max_blocks;
+    selected_blocks += static_cast<std::size_t>(row) * max_blocks;
     using BlockSort = cub::BlockRadixSort<unsigned long long, 256, ItemsPerThread>;
     __shared__ typename BlockSort::TempStorage sort_storage;
     unsigned long long keys[ItemsPerThread];
@@ -201,9 +230,16 @@ __global__ void qwen38_qsa_sort_blocks_kernel(
 __global__ void qwen38_qsa_select_blocks_kernel(
     const float* scores,
     std::uint8_t* selected_blocks,
-    std::uint32_t complete_blocks,
-    std::uint32_t selected_complete_blocks,
-    std::uint32_t tail_tokens) {
+    std::uint32_t start_cache_len,
+    std::uint32_t max_blocks,
+    std::uint32_t selected_budget_blocks) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t cache_len = start_cache_len + row;
+    const std::uint32_t complete_blocks = cache_len / 4;
+    const std::uint32_t selected_complete_blocks = min(complete_blocks, selected_budget_blocks);
+    const std::uint32_t tail_tokens = cache_len % 4;
+    scores += static_cast<std::size_t>(row) * max_blocks;
+    selected_blocks += static_cast<std::size_t>(row) * max_blocks;
     if (complete_blocks <= selected_complete_blocks) {
         for (std::uint32_t block = threadIdx.x; block < complete_blocks;
              block += blockDim.x) {
@@ -292,18 +328,76 @@ __global__ void qwen38_qsa_select_blocks_kernel(
 __global__ void qwen38_qsa_build_tile_mask_kernel(
     const std::uint8_t* selected_blocks,
     std::uint8_t* selected_tiles,
-    std::uint32_t visible_blocks) {
-    const std::uint32_t tile = blockIdx.x * blockDim.x + threadIdx.x;
-    const std::uint32_t block_start = tile * 16;
-    if (block_start >= visible_blocks) {
-        return;
+    std::uint32_t* selected_block_indices,
+    std::uint32_t* selected_token_tiles,
+    std::uint32_t* selected_context_tiles,
+    std::uint32_t* selected_counts,
+    std::uint32_t start_cache_len,
+    std::uint32_t max_blocks,
+    std::uint32_t max_tiles,
+    std::uint32_t index_capacity) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t lane = threadIdx.x;
+    const std::uint32_t cache_len = start_cache_len + row;
+    const std::uint32_t visible_blocks = (cache_len + 3) / 4;
+    selected_blocks += static_cast<std::size_t>(row) * max_blocks;
+    selected_tiles += static_cast<std::size_t>(row) * max_tiles;
+    selected_block_indices += static_cast<std::size_t>(row) * index_capacity;
+    selected_token_tiles += static_cast<std::size_t>(row) * index_capacity;
+    selected_context_tiles += static_cast<std::size_t>(row) * index_capacity;
+    std::uint32_t block_count = 0;
+    for (std::uint32_t base = 0; base < visible_blocks; base += 32) {
+        const std::uint32_t block = base + lane;
+        const bool selected = block < visible_blocks && selected_blocks[block] != 0;
+        const std::uint32_t ballot = __ballot_sync(0xffffffffu, selected);
+        const std::uint32_t prefix = __popc(ballot & ((1u << lane) - 1u));
+        if (selected && block_count + prefix < index_capacity) {
+            selected_block_indices[block_count + prefix] = block;
+        }
+        block_count += __popc(ballot);
     }
-    bool selected = false;
-    for (std::uint32_t block = block_start;
-         block < min(block_start + 16, visible_blocks); ++block) {
-        selected |= selected_blocks[block] != 0;
+    const std::uint32_t visible_token_tiles = (visible_blocks + 1) / 2;
+    std::uint32_t token_tile_count = 0;
+    for (std::uint32_t base = 0; base < visible_token_tiles; base += 32) {
+        const std::uint32_t token_tile = base + lane;
+        const std::uint32_t first_block = token_tile * 2;
+        const bool selected = token_tile < visible_token_tiles &&
+            (selected_blocks[first_block] != 0 ||
+             (first_block + 1 < visible_blocks && selected_blocks[first_block + 1] != 0));
+        const std::uint32_t ballot = __ballot_sync(0xffffffffu, selected);
+        const std::uint32_t prefix = __popc(ballot & ((1u << lane) - 1u));
+        if (selected && token_tile_count + prefix < index_capacity) {
+            selected_token_tiles[token_tile_count + prefix] = token_tile;
+        }
+        token_tile_count += __popc(ballot);
     }
-    selected_tiles[tile] = selected ? 1 : 0;
+    const std::uint32_t visible_context_tiles = (visible_blocks + 15) / 16;
+    std::uint32_t context_tile_count = 0;
+    for (std::uint32_t base = 0; base < visible_context_tiles; base += 32) {
+        const std::uint32_t context_tile = base + lane;
+        bool selected = false;
+        if (context_tile < visible_context_tiles) {
+            const std::uint32_t first_block = context_tile * 16;
+            for (std::uint32_t block = first_block;
+                 block < min(first_block + 16, visible_blocks); ++block) {
+                selected |= selected_blocks[block] != 0;
+            }
+        }
+        const std::uint32_t ballot = __ballot_sync(0xffffffffu, selected);
+        const std::uint32_t prefix = __popc(ballot & ((1u << lane) - 1u));
+        if (selected) {
+            selected_tiles[context_tile] = 1;
+            if (context_tile_count + prefix < index_capacity) {
+                selected_context_tiles[context_tile_count + prefix] = context_tile;
+            }
+        }
+        context_tile_count += __popc(ballot);
+    }
+    if (lane == 0) {
+        selected_counts[row * 3] = min(block_count, index_capacity);
+        selected_counts[row * 3 + 1] = min(token_tile_count, index_capacity);
+        selected_counts[row * 3 + 2] = min(context_tile_count, index_capacity);
+    }
 }
 
 __global__ void qwen38_hc_norm_kernel(const float* input,
@@ -631,6 +725,10 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
         float* scores,
         std::uint8_t* selected_blocks,
         std::uint8_t* selected_tiles,
+        std::uint32_t* selected_block_indices,
+        std::uint32_t* selected_token_tiles,
+        std::uint32_t* selected_context_tiles,
+        std::uint32_t* selected_counts,
         std::uint32_t slot,
         std::uint32_t page_offset,
         std::uint32_t cache_len,
@@ -642,24 +740,26 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
         std::uint32_t rotary_dim,
         std::uint32_t compress_ratio,
         std::uint32_t budget,
+        std::uint32_t index_capacity,
         float eps,
         float theta,
         cudaStream_t stream) {
     if (projection == nullptr || q_norm == nullptr || k_norm == nullptr ||
         key_pool_bf16 == nullptr || page_table == nullptr || query == nullptr ||
         scores == nullptr || selected_blocks == nullptr || selected_tiles == nullptr ||
+        selected_block_indices == nullptr || selected_token_tiles == nullptr ||
+        selected_context_tiles == nullptr || selected_counts == nullptr ||
         cache_len == 0 || cache_len > max_tokens || page_tokens == 0 ||
         page_slots == 0 || slot >= page_slots || page_offset >= page_tokens ||
         heads == 0 || head_dim == 0 || head_dim > 1024 ||
         (head_dim & (head_dim - 1)) != 0 || rotary_dim == 0 ||
         rotary_dim > head_dim || (rotary_dim % 2) != 0 ||
         compress_ratio != 4 || budget == 0 || (budget % compress_ratio) != 0 ||
+        index_capacity < budget / compress_ratio + 1 ||
         eps <= 0.0f || !isfinite(theta) || theta <= 0.0f) {
         return cudaErrorInvalidValue;
     }
     const std::uint32_t complete_blocks = cache_len / compress_ratio;
-    const std::uint32_t tail_tokens = cache_len % compress_ratio;
-    const std::uint32_t visible_blocks = complete_blocks + (tail_tokens != 0);
     const std::uint32_t max_blocks = (max_tokens + compress_ratio - 1) / compress_ratio;
     const std::uint32_t max_tiles = (max_tokens + 63) / 64;
     cudaError_t status = cudaMemsetAsync(selected_blocks, 0, max_blocks, stream);
@@ -668,24 +768,24 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
     if (status != cudaSuccess) return status;
 
     qwen38_qsa_prepare_query_kernel<<<
-        heads, head_dim, head_dim * sizeof(float), stream>>>(
+        dim3(heads, 1), head_dim, head_dim * sizeof(float), stream>>>(
         projection, q_norm, query, heads, head_dim, rotary_dim,
-        cache_len - 1, eps, theta);
+        0, cache_len - 1, eps, theta);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     constexpr std::uint32_t kAppendThreads = 128;
-    qwen38_qsa_append_key_kernel<<<
+    qwen38_qsa_append_keys_kernel<<<
         (head_dim + kAppendThreads - 1) / kAppendThreads, kAppendThreads, 0, stream>>>(
-        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16), slot,
+        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16), 0, slot,
         page_offset, page_tokens, heads, head_dim);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     if (complete_blocks != 0) {
         qwen38_qsa_score_blocks_kernel<<<
-            complete_blocks, head_dim, 2 * head_dim * sizeof(float), stream>>>(
+            dim3(complete_blocks, 1), head_dim, 2 * head_dim * sizeof(float), stream>>>(
             query, reinterpret_cast<const __nv_bfloat16*>(key_pool_bf16),
-            page_table, k_norm, scores, complete_blocks, page_tokens, heads,
-            head_dim, rotary_dim, eps, theta);
+            page_table, k_norm, scores, page_tokens, heads,
+            head_dim, rotary_dim, cache_len, 1, max_blocks, eps, theta);
         status = cudaGetLastError();
         if (status != cudaSuccess) return status;
     }
@@ -694,28 +794,120 @@ extern "C" cudaError_t infer_qwen38_qsa_prepare_and_select_on_stream(
         min(complete_blocks, budget / compress_ratio);
     if (complete_blocks <= selected_complete_blocks) {
         qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
-            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+            scores, selected_blocks, cache_len, max_blocks, budget / compress_ratio);
     } else if (complete_blocks <= 2048) {
         qwen38_qsa_sort_blocks_kernel<8><<<1, kSelectThreads, 0, stream>>>(
-            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+            scores, selected_blocks, cache_len, max_blocks, budget / compress_ratio);
     } else if (complete_blocks <= 4096) {
         qwen38_qsa_sort_blocks_kernel<16><<<1, kSelectThreads, 0, stream>>>(
-            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+            scores, selected_blocks, cache_len, max_blocks, budget / compress_ratio);
     } else {
         qwen38_qsa_select_blocks_kernel<<<1, kSelectThreads, 0, stream>>>(
-            scores, selected_blocks, complete_blocks, selected_complete_blocks, tail_tokens);
+            scores, selected_blocks, cache_len, max_blocks, budget / compress_ratio);
     }
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    constexpr std::uint32_t kTileThreads = 256;
-    const std::uint32_t visible_tiles = (cache_len + 63) / 64;
-    qwen38_qsa_build_tile_mask_kernel<<<
-        (visible_tiles + kTileThreads - 1) / kTileThreads, kTileThreads, 0, stream>>>(
-        selected_blocks, selected_tiles, visible_blocks);
+    qwen38_qsa_build_tile_mask_kernel<<<1, 32, 0, stream>>>(
+        selected_blocks, selected_tiles, selected_block_indices, selected_token_tiles,
+        selected_context_tiles, selected_counts, cache_len, max_blocks, max_tiles,
+        index_capacity);
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t infer_qwen38_qsa_append_key_on_stream(
+extern "C" cudaError_t infer_qwen38_qsa_select_appended_rows_on_stream(
+        const float* projection,
+        const float* q_norm,
+        const float* k_norm,
+        const std::uint16_t* key_pool_bf16,
+        const std::uint32_t* page_table,
+        float* queries,
+        float* scores,
+        std::uint8_t* selected_blocks,
+        std::uint8_t* selected_tiles,
+        std::uint32_t* selected_block_indices,
+        std::uint32_t* selected_token_tiles,
+        std::uint32_t* selected_context_tiles,
+        std::uint32_t* selected_counts,
+        std::uint32_t input_row_offset,
+        std::uint32_t start_cache_len,
+        std::uint32_t rows,
+        std::uint32_t max_tokens,
+        std::uint32_t page_tokens,
+        std::uint32_t heads,
+        std::uint32_t head_dim,
+        std::uint32_t rotary_dim,
+        std::uint32_t compress_ratio,
+        std::uint32_t budget,
+        std::uint32_t index_capacity,
+        float eps,
+        float theta,
+        cudaStream_t stream) {
+    if (projection == nullptr || q_norm == nullptr || k_norm == nullptr ||
+        key_pool_bf16 == nullptr || page_table == nullptr || queries == nullptr ||
+        scores == nullptr || selected_blocks == nullptr || selected_tiles == nullptr ||
+        selected_block_indices == nullptr || selected_token_tiles == nullptr ||
+        selected_context_tiles == nullptr || selected_counts == nullptr ||
+        start_cache_len == 0 || rows == 0 || start_cache_len > max_tokens ||
+        rows - 1 > max_tokens - start_cache_len || page_tokens == 0 || heads == 0 ||
+        head_dim == 0 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0 ||
+        rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 ||
+        compress_ratio != 4 || budget == 0 || (budget % compress_ratio) != 0 ||
+        index_capacity < budget / compress_ratio + 1 ||
+        eps <= 0.0f || !isfinite(theta) || theta <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t final_cache_len = start_cache_len + rows - 1;
+    const std::uint32_t complete_blocks = final_cache_len / compress_ratio;
+    const std::uint32_t max_blocks = (max_tokens + compress_ratio - 1) / compress_ratio;
+    const std::uint32_t max_tiles = (max_tokens + 63) / 64;
+    cudaError_t status = cudaMemsetAsync(
+        selected_blocks, 0, static_cast<std::size_t>(rows) * max_blocks, stream);
+    if (status != cudaSuccess) return status;
+    status = cudaMemsetAsync(
+        selected_tiles, 0, static_cast<std::size_t>(rows) * max_tiles, stream);
+    if (status != cudaSuccess) return status;
+
+    qwen38_qsa_prepare_query_kernel<<<
+        dim3(heads, rows), head_dim, head_dim * sizeof(float), stream>>>(
+        projection, q_norm, queries, heads, head_dim, rotary_dim,
+        input_row_offset, start_cache_len - 1, eps, theta);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    if (complete_blocks != 0) {
+        qwen38_qsa_score_blocks_kernel<<<
+            complete_blocks, head_dim, 2 * head_dim * sizeof(float), stream>>>(
+            queries, reinterpret_cast<const __nv_bfloat16*>(key_pool_bf16),
+            page_table, k_norm, scores, page_tokens, heads, head_dim, rotary_dim,
+            start_cache_len, rows, max_blocks, eps, theta);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) return status;
+    }
+    constexpr std::uint32_t kSelectThreads = 256;
+    const std::uint32_t selected_complete_blocks =
+        min(complete_blocks, budget / compress_ratio);
+    if (complete_blocks <= selected_complete_blocks) {
+        qwen38_qsa_select_blocks_kernel<<<rows, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, start_cache_len, max_blocks, budget / compress_ratio);
+    } else if (complete_blocks <= 2048) {
+        qwen38_qsa_sort_blocks_kernel<8><<<rows, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, start_cache_len, max_blocks, budget / compress_ratio);
+    } else if (complete_blocks <= 4096) {
+        qwen38_qsa_sort_blocks_kernel<16><<<rows, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, start_cache_len, max_blocks, budget / compress_ratio);
+    } else {
+        qwen38_qsa_select_blocks_kernel<<<rows, kSelectThreads, 0, stream>>>(
+            scores, selected_blocks, start_cache_len, max_blocks, budget / compress_ratio);
+    }
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    qwen38_qsa_build_tile_mask_kernel<<<rows, 32, 0, stream>>>(
+        selected_blocks, selected_tiles, selected_block_indices, selected_token_tiles,
+        selected_context_tiles, selected_counts, start_cache_len, max_blocks, max_tiles,
+        index_capacity);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_qwen38_qsa_append_keys_on_stream(
         const float* projection,
         std::uint16_t* key_pool_bf16,
         std::uint32_t slot,
@@ -724,16 +916,18 @@ extern "C" cudaError_t infer_qwen38_qsa_append_key_on_stream(
         std::uint32_t page_slots,
         std::uint32_t heads,
         std::uint32_t head_dim,
+        std::uint32_t input_row_offset,
+        std::uint32_t rows,
         cudaStream_t stream) {
     if (projection == nullptr || key_pool_bf16 == nullptr || page_tokens == 0 ||
         page_slots == 0 || slot >= page_slots || page_offset >= page_tokens ||
-        heads == 0 || head_dim == 0) {
+        heads == 0 || head_dim == 0 || rows == 0 || rows > page_tokens - page_offset) {
         return cudaErrorInvalidValue;
     }
     constexpr std::uint32_t kThreads = 128;
-    qwen38_qsa_append_key_kernel<<<
-        (head_dim + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16), slot,
-        page_offset, page_tokens, heads, head_dim);
+    const dim3 grid((head_dim + kThreads - 1) / kThreads, rows);
+    qwen38_qsa_append_keys_kernel<<<grid, kThreads, 0, stream>>>(
+        projection, reinterpret_cast<__nv_bfloat16*>(key_pool_bf16),
+        input_row_offset, slot, page_offset, page_tokens, heads, head_dim);
     return cudaGetLastError();
 }

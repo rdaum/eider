@@ -1,8 +1,11 @@
-use eider_cuda::{CudaStream, DeviceBuffer, PagedBf16ReadStats};
+//! Measures sparse PLE row reads with repeated, synthetic, and representative tokens.
+
+use eider_cuda::{CudaStream, DeviceBuffer, PagedRowReadStats};
 use eider_format::ModelOptCheckpoint;
 use eider_inference::qwen38_flash_next::{
     Qwen38FlashNextConfig, Qwen38PagedPle, Qwen38PleTokenWindow,
 };
+use eider_runtime::chat::{ChatMessage, ChatTemplateOptions, CheckpointChatTemplate};
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
     ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
@@ -43,7 +46,7 @@ impl PleReadCase {
         }
     }
 
-    fn read(&mut self, stream: &CudaStream) -> (Duration, PagedBf16ReadStats) {
+    fn read(&mut self, stream: &CudaStream) -> (Duration, PagedRowReadStats) {
         self.window.begin_append().expect("begin PLE append");
         let started = Instant::now();
         self.pager
@@ -65,6 +68,7 @@ struct PlePagingBench {
     stream: CudaStream,
     repeated: PleReadCase,
     diverse: PleReadCase,
+    representative: PleReadCase,
 }
 
 impl PlePagingBench {
@@ -78,23 +82,34 @@ impl PlePagingBench {
         let token_count = bench_tokens();
         let repeated_tokens = vec![17; token_count];
         let diverse_tokens = diverse_tokens(token_count, config.vocab, config.eos_token_id);
+        let representative_tokens = representative_tokens(&model_dir, token_count);
         let stream = CudaStream::new_non_blocking().expect("PLE stream");
         let mut repeated = PleReadCase::new(&checkpoint, &config, repeated_tokens, io_workers);
         let mut diverse = PleReadCase::new(&checkpoint, &config, diverse_tokens, io_workers);
+        let mut representative =
+            PleReadCase::new(&checkpoint, &config, representative_tokens, io_workers);
 
         let (_, repeated_stats) = repeated.read(&stream);
         let (_, diverse_stats) = diverse.read(&stream);
+        let (_, representative_stats) = representative.read(&stream);
         assert!(
             repeated_stats.unique_rows < diverse_stats.unique_rows,
             "repeated PLE rows must have more reuse: repeated={} diverse={}",
             repeated_stats.unique_rows,
             diverse_stats.unique_rows
         );
+        assert!(
+            repeated_stats.unique_rows < representative_stats.unique_rows,
+            "repeated PLE rows must have more reuse: repeated={} representative={}",
+            repeated_stats.unique_rows,
+            representative_stats.unique_rows
+        );
 
         Self {
             stream,
             repeated,
             diverse,
+            representative,
         }
     }
 
@@ -155,6 +170,15 @@ fn diverse_sample(
     PlePagingBench::measure(&mut context.diverse, &context.stream)
 }
 
+fn representative_sample(
+    context: &mut PlePagingBench,
+    chunk_size: usize,
+    _chunk_number: usize,
+) -> BenchSampleResult {
+    assert_eq!(chunk_size, 1);
+    PlePagingBench::measure(&mut context.representative, &context.stream)
+}
+
 fn validate_batch_matches_serial(
     checkpoint: &ModelOptCheckpoint,
     config: &Qwen38FlashNextConfig,
@@ -195,6 +219,38 @@ fn diverse_tokens(count: usize, vocab: usize, eos_token_id: u32) -> Vec<u32> {
             token
         })
         .collect()
+}
+
+fn representative_tokens(model_dir: &std::path::Path, count: usize) -> Vec<u32> {
+    const PROMPT: &str = concat!(
+        "Review the following Rust inference project. Trace CUDA streams, buffer ownership, ",
+        "cache transactions, and error paths. Identify correctness defects and avoid ",
+        "speculative fixes.\n\n",
+        include_str!("../../../README.md")
+    );
+    let prompt = match std::env::var_os("QWEN38_PLE_BENCH_PROMPT_FILE") {
+        Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read QWEN38_PLE_BENCH_PROMPT_FILE {}: {error}",
+                PathBuf::from(path).display()
+            )
+        }),
+        None => PROMPT.to_string(),
+    };
+    let template = CheckpointChatTemplate::from_model_dir(model_dir).expect("chat template");
+    let rendered = template
+        .render_and_tokenize(
+            &[ChatMessage::user(prompt)],
+            &[],
+            ChatTemplateOptions::default(),
+        )
+        .expect("representative prompt tokens");
+    assert!(
+        rendered.token_ids.len() >= count,
+        "representative prompt has {} tokens, but the benchmark needs {count}",
+        rendered.token_ids.len()
+    );
+    rendered.token_ids[..count].to_vec()
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -238,7 +294,7 @@ fn main() {
         BenchmarkMainOptions {
             suite: Some("qwen38-flash-next-ple".to_string()),
             comparison_policy: ComparisonPolicy::None,
-            save_results: false,
+            save_results: true,
             runtime: BenchmarkRuntimeOptions {
                 warm_up_duration: Duration::from_millis(100),
                 benchmark_duration: Duration::from_millis(500),
@@ -254,6 +310,7 @@ fn main() {
                     .measurement_domain(MeasurementDomain::Io);
                 group.bench_sample("repeated_tokens", repeated_sample);
                 group.bench_sample("diverse_tokens", diverse_sample);
+                group.bench_sample("representative_prompt", representative_sample);
             });
         },
     );

@@ -15,6 +15,7 @@ struct Args {
     prompt: String,
     prompt_file: Option<PathBuf>,
     cycles: usize,
+    rows: Vec<usize>,
     prefill_tokens: usize,
     modes: Vec<Qwen38VectorVerifierProbeMode>,
     trace_layers: bool,
@@ -45,81 +46,92 @@ fn main() -> Result<()> {
     let load_started = Instant::now();
     let mut model = Qwen38FlashNextModel::open(&args.model_dir, args.artifact_dir)?;
     eprintln!(
-        "loaded Flash Next in {:.2}s; prompt_tokens={} cycles={} prefill_tokens={}",
+        "loaded Flash Next in {:.2}s; prompt_tokens={} cycles={} rows={:?} prefill_tokens={}",
         load_started.elapsed().as_secs_f64(),
         rendered.token_ids.len(),
         args.cycles,
+        args.rows,
         args.prefill_tokens
     );
-    for mode in args.modes {
-        println!("mode: {}", mode_name(mode));
-        let report = probe_verification_paths(
-            &mut model,
-            &rendered.token_ids,
-            args.cycles,
-            args.prefill_tokens,
-            mode,
-            args.trace_layers,
-        )?;
+    for rows in args.rows {
+        for &mode in &args.modes {
+            println!(
+                "mode: {} rows={} drafts={}",
+                mode_name(mode),
+                rows,
+                rows - 1
+            );
+            let report = probe_verification_paths(
+                &mut model,
+                &rendered.token_ids,
+                args.cycles,
+                rows,
+                args.prefill_tokens,
+                mode,
+                args.trace_layers,
+            )?;
 
-        println!(
-            "argmax agreement: {}/{} ({:.2}%)",
-            report.matching_rows,
-            report.compared_rows,
-            100.0 * report.matching_rows as f64 / report.compared_rows as f64
-        );
-        println!(
-            "serial decode: {:.3} tokens/sec ({:.3}s)",
-            report.serial_tokens_per_second(),
-            report.serial_duration.as_secs_f64()
-        );
-        println!(
-            "two-row verifier: {:.3} tokens/sec ({:.3}s)",
-            report.verification_tokens_per_second(),
-            report.verification_duration.as_secs_f64()
-        );
-        println!(
-            "worst residual difference: max_abs={:.6} cosine={:.9} relative_rmse={:.9}",
-            report.worst_stream_difference.maximum_absolute_error,
-            report.worst_stream_difference.cosine_similarity,
-            report.worst_stream_difference.relative_rmse
-        );
-        match report.first_mismatch {
-            Some(mismatch) => {
-                let input = decode_token(template.tokenizer(), mismatch.input_token)?;
-                let serial = decode_token(template.tokenizer(), mismatch.serial.id)?;
-                let verification = decode_token(template.tokenizer(), mismatch.verification.id)?;
+            println!(
+                "argmax agreement: {}/{} ({:.2}%)",
+                report.matching_rows,
+                report.compared_rows,
+                100.0 * report.matching_rows as f64 / report.compared_rows as f64
+            );
+            println!(
+                "serial decode: {:.3} tokens/sec ({:.3}s)",
+                report.serial_tokens_per_second(),
+                report.serial_duration.as_secs_f64()
+            );
+            println!(
+                "{}-row verifier: {:.3} tokens/sec ({:.3}s)",
+                report.rows_per_cycle,
+                report.verification_tokens_per_second(),
+                report.verification_duration.as_secs_f64()
+            );
+            println!(
+                "worst residual difference: max_abs={:.6} cosine={:.9} relative_rmse={:.9}",
+                report.worst_stream_difference.maximum_absolute_error,
+                report.worst_stream_difference.cosine_similarity,
+                report.worst_stream_difference.relative_rmse
+            );
+            match report.first_mismatch {
+                Some(mismatch) => {
+                    let input = decode_token(template.tokenizer(), mismatch.input_token)?;
+                    let serial = decode_token(template.tokenizer(), mismatch.serial.id)?;
+                    let verification =
+                        decode_token(template.tokenizer(), mismatch.verification.id)?;
+                    println!(
+                        "first divergence: cycle={} row={} output_index={} input={} {:?} serial={} {:?} verifier={} {:?}",
+                        mismatch.cycle,
+                        mismatch.row,
+                        mismatch.output_index,
+                        mismatch.input_token,
+                        input,
+                        mismatch.serial.id,
+                        serial,
+                        mismatch.verification.id,
+                        verification
+                    );
+                }
+                None => println!(
+                    "first divergence: none across {} target rows",
+                    report.compared_rows
+                ),
+            }
+            if let Some(divergence) = report.first_layer_divergence {
                 println!(
-                    "first divergence: cycle={} row={} output_index={} input={} {:?} serial={} {:?} verifier={} {:?}",
-                    mismatch.cycle,
-                    mismatch.row,
-                    mismatch.output_index,
-                    mismatch.input_token,
-                    input,
-                    mismatch.serial.id,
-                    serial,
-                    mismatch.verification.id,
-                    verification
+                    "first layer-state divergence: cycle={} row={} layer={} stage={} component={} mismatched_values={} max_abs={:.9} cosine={:.12} relative_rmse={:.12}",
+                    divergence.cycle,
+                    divergence.row,
+                    divergence.layer,
+                    divergence.stage,
+                    divergence.moe_component.unwrap_or("unclassified"),
+                    divergence.mismatched_values,
+                    divergence.difference.maximum_absolute_error,
+                    divergence.difference.cosine_similarity,
+                    divergence.difference.relative_rmse,
                 );
             }
-            None => println!(
-                "first divergence: none across {} target rows",
-                report.compared_rows
-            ),
-        }
-        if let Some(divergence) = report.first_layer_divergence {
-            println!(
-                "first layer-state divergence: cycle={} row={} layer={} stage={} component={} mismatched_values={} max_abs={:.9} cosine={:.12} relative_rmse={:.12}",
-                divergence.cycle,
-                divergence.row,
-                divergence.layer,
-                divergence.stage,
-                divergence.moe_component.unwrap_or("unclassified"),
-                divergence.mismatched_values,
-                divergence.difference.maximum_absolute_error,
-                divergence.difference.cosine_similarity,
-                divergence.difference.relative_rmse,
-            );
         }
     }
     Ok(())
@@ -160,6 +172,7 @@ fn parse_args() -> Result<Args> {
         .repeat(4);
     let mut prompt_file = None;
     let mut cycles = 32usize;
+    let mut rows = vec![2usize];
     let mut prefill_tokens = 64usize;
     let mut modes = vec![Qwen38VectorVerifierProbeMode::Fast];
     let mut trace_layers = false;
@@ -174,6 +187,7 @@ fn parse_args() -> Result<Args> {
                 prompt_file = Some(PathBuf::from(next_arg(&mut iter, "--prompt-file")?));
             }
             "--cycles" => cycles = parse_value(&mut iter, "--cycles")?,
+            "--rows" => rows = parse_rows(&next_arg(&mut iter, "--rows")?)?,
             "--prefill-tokens" => {
                 prefill_tokens = parse_value(&mut iter, "--prefill-tokens")?;
             }
@@ -187,8 +201,10 @@ fn parse_args() -> Result<Args> {
     }
     let model_dir = model_dir.ok_or_else(|| usage("<model-dir>"))?;
     let artifact_dir = artifact_dir.unwrap_or(default_artifact_dir()?);
-    if cycles == 0 || prefill_tokens == 0 {
-        return Err(usage("cycle and prefill values must be positive"));
+    if cycles == 0 || rows.iter().any(|&rows| rows < 2) || prefill_tokens == 0 {
+        return Err(usage(
+            "cycles and prefill must be positive; rows must be at least two",
+        ));
     }
     Ok(Args {
         model_dir,
@@ -196,6 +212,7 @@ fn parse_args() -> Result<Args> {
         prompt,
         prompt_file,
         cycles,
+        rows,
         prefill_tokens,
         modes,
         trace_layers,
@@ -223,6 +240,24 @@ fn parse_modes(value: &str) -> Result<Vec<Qwen38VectorVerifierProbeMode>> {
         _ => return Err(usage(value)),
     };
     Ok(modes)
+}
+
+fn parse_rows(value: &str) -> Result<Vec<usize>> {
+    let rows = value
+        .split(',')
+        .map(|row| {
+            row.parse::<usize>().map_err(|error| Error::Format {
+                label: "Qwen3.8 Flash Next probe rows",
+                detail: format!("{row}: {error}"),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if rows.is_empty() || rows.iter().any(|&rows| rows < 2) {
+        return Err(usage(
+            "--rows requires comma-separated values of at least two",
+        ));
+    }
+    Ok(rows)
 }
 
 fn next_arg(iter: &mut impl Iterator<Item = String>, label: &str) -> Result<String> {
@@ -260,7 +295,8 @@ fn usage(unexpected: &str) -> Error {
         label: "usage",
         detail: format!(
             "qwen38-flash-next-spec-probe <model-dir> [--artifact-dir path] \
-             [--prompt text | --prompt-file path] [--cycles n] [--prefill-tokens n]; \
+             [--prompt text | --prompt-file path] [--cycles n] [--rows 2,3,5] \
+             [--prefill-tokens n]; \
              [--mode fast|serial-gdn|canonical-moe-linears|\
              canonical-moe-linears-serial-gdn|exact-moe|exact|all]; \
              [--trace-layers]; \

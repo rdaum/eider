@@ -173,6 +173,33 @@ mod device {
         };
     }
 
+    /// Gathers mapped-host E4M3 rows and applies one tensor scale.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
+    pub unsafe fn paged_fp8_rows_to_f32(
+        pages: *const u8,
+        row_offsets: *const u32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        scale: f32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if index >= rows * cols {
+            return;
+        }
+        let row = index / cols;
+        let col = index - row * cols;
+        let offset = unsafe { *row_offsets.add(row as usize) } as usize;
+        let values = unsafe { pages.add(offset) };
+        unsafe {
+            output
+                .add(index as usize)
+                .write(e4m3_value(*values.add(col as usize)) * scale)
+        };
+    }
+
     /// Selects and normalizes the largest MoE router logits for each row.
     #[kernel]
     #[launch_bounds(256)]

@@ -141,6 +141,16 @@ pub(crate) fn e4m3_value(code: u8) -> f32 {
 }
 
 #[inline(always)]
+pub(crate) fn e4m3x2_values(first: u8, second: u8) -> (f32, f32) {
+    let packed = u16::from(first) | (u16::from(second) << 8);
+    let half2 = convert::cvt_rn_f16x2_e4m3x2(packed);
+    (
+        convert::cvt_f32_f16x2_lo(half2),
+        convert::cvt_f32_f16x2_hi(half2),
+    )
+}
+
+#[inline(always)]
 pub(crate) fn dequant_bf16_pair(packed: u8, scale: f32) -> u32 {
     convert::cvt_bf16x2_f32(
         e2m1_value(packed & 0x0f) * scale,

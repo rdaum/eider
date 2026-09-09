@@ -112,6 +112,24 @@ __global__ void gather_paged_bf16_rows_kernel(
     output[index] = __bfloat162float(row[col]);
 }
 
+__global__ void gather_paged_fp8_rows_kernel(
+    const std::uint8_t* __restrict__ pages,
+    const std::uint32_t* __restrict__ row_offsets,
+    float* __restrict__ output,
+    std::uint32_t row_count,
+    std::uint32_t cols,
+    float scale) {
+    const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t values = row_count * cols;
+    if (index >= values) {
+        return;
+    }
+    const std::uint32_t output_row = index / cols;
+    const std::uint32_t col = index % cols;
+    const auto* row = pages + row_offsets[output_row];
+    output[index] = e4m3_value(row[col]) * scale;
+}
+
 template <typename Rows>
 __global__ void fused_embedding_kernel(
     Rows bank,
@@ -238,6 +256,30 @@ extern "C" cudaError_t infer_paged_bf16_rows_to_f32_on_stream(
         (static_cast<std::uint32_t>(values) + kThreads - 1) / kThreads;
     gather_paged_bf16_rows_kernel<<<blocks, kThreads, 0, stream>>>(
         pages, row_offsets, output, row_count, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_paged_fp8_rows_to_f32_on_stream(
+    const std::uint8_t* pages,
+    const std::uint32_t* row_offsets,
+    float* output,
+    std::uint32_t row_count,
+    std::uint32_t cols,
+    float scale,
+    cudaStream_t stream) {
+    if (pages == nullptr || row_offsets == nullptr || output == nullptr ||
+        row_count == 0 || cols == 0 || !isfinite(scale) || scale <= 0.0f) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint64_t values =
+        static_cast<std::uint64_t>(row_count) * static_cast<std::uint64_t>(cols);
+    if (values > static_cast<std::uint64_t>(UINT32_MAX)) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t blocks =
+        (static_cast<std::uint32_t>(values) + kThreads - 1) / kThreads;
+    gather_paged_fp8_rows_kernel<<<blocks, kThreads, 0, stream>>>(
+        pages, row_offsets, output, row_count, cols, scale);
     return cudaGetLastError();
 }
 

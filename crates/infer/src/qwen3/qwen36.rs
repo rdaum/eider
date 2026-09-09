@@ -34,9 +34,15 @@ use eider_cuda::{
     PinnedHostBuffer, Result, Sm12xFp4DeviceGemmWeight, Sm12xFp4GemmVector, Sm12xFp4GemmWeight,
     Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool, Sm121W4A16GateUp,
     Sm121W4A16HostWeight, add_f32_into_on_stream, argmax_f32_batch_into_on_stream,
-    argmax_f32_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
-    bf16_linear_logits_f32_into_on_stream, bf16_linear_pair_logits_f32_into_on_stream,
-    bf16_linear_two_rows_f32_into_on_stream, copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
+    argmax_f32_into_on_stream, bf16_linear_exact_rows_f32_into_on_stream,
+    bf16_linear_logits_f32_batch_into_on_stream, bf16_linear_logits_f32_into_on_stream,
+    bf16_linear_pair_logits_f32_into_on_stream,
+    block_fp8_f32_scale_linear_f32_batch_into_on_stream,
+    block_fp8_f32_scale_linear_f32_into_on_stream,
+    block_fp8_f32_scale_linear_pair_f32_into_on_stream,
+    block_fp8_f32_scale_moe_down_f32_into_on_stream,
+    block_fp8_f32_scale_moe_gate_up_f32_into_on_stream,
+    copy_bf16_rows_to_f32_indexed_prefix_into_on_stream,
     copy_fp8_rows_to_f32_indexed_prefix_into_on_stream, device_weight_gemv_on_stream,
     fill_f32_into_on_stream, fp8_linear_channel_scaled_dynamic_quantized_f32_into_on_stream,
     fp8_linear_channel_scaled_f32_into_on_stream, fp8_linear_configured_f32_into_on_stream,
@@ -49,9 +55,8 @@ use eider_cuda::{
     ling3_sigmoid_gated_rms_norm_f32_into_on_stream, lm_head_top1_f32_batch_into_on_stream,
     moe_silu_quantize_fp8_slots_f32_into_on_stream, moe_silu_quantize_slot_addresses_on_stream,
     moe_silu_quantize_slots_nvfp4_simple_scale_addresses_on_stream,
-    moe_topk_f32_batch_into_on_stream, moe_weighted_accumulate_slot_addresses_f32_on_stream,
-    nvfp4_w4a16_matvec_f32_into_on_stream, nvfp4_w4a16_top1_f32_into_on_stream,
-    quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
+    moe_weighted_accumulate_slot_addresses_f32_on_stream, nvfp4_w4a16_matvec_f32_into_on_stream,
+    nvfp4_w4a16_top1_f32_into_on_stream, quantize_fp8_e4m3_bf16_channel_scaled_into_on_stream,
     quantize_fp8_e4m3_dynamic_f32_into_on_stream,
     quantize_nvfp4_col_major_f32_device_into_on_stream, qwen36_ffn_finalize_f32_into_on_stream,
     qwen36_ffn_finalize_routed_addresses_f32_into_on_stream,
@@ -61,15 +66,17 @@ use eider_cuda::{
     rope_neox_partial_f32_indexed_into_on_stream, rope_neox_partial_f32_into_on_stream,
     round_f32_to_bf16_in_place_on_stream, scale_channel_f32_device_scalar_in_place_on_stream,
     scaled_add_f32_into_on_stream, sigmoid_mul_f32_into_on_stream,
-    sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_into_on_stream,
+    sigmoid_scale_scalar_f32_into_on_stream, silu_mul_halves_f32_batch_into_on_stream,
+    silu_mul_halves_f32_into_on_stream,
 };
 #[cfg(feature = "cuda-oxide")]
 use eider_cuda::{
     Sm121W4A16GateUpBatchWorkspace, moe_weighted_accumulate_contiguous_f32_batch_on_stream,
-    silu_mul_halves_f32_batch_into_on_stream,
 };
 use eider_format::SafeTensorInfo;
-use eider_format::{ModelOptCheckpoint, ModelOptFp8Linear, ModelOptNvfp4Linear};
+use eider_format::{
+    ModelOptCheckpoint, ModelOptF32BlockScaledFp8Linear, ModelOptFp8Linear, ModelOptNvfp4Linear,
+};
 
 use super::infer::{
     GroupedGemvWorkspace, MoeExpertPointerTables, MoeGroupedDownWorkspace, MoeRouteWorkspace,
@@ -164,6 +171,17 @@ pub struct Qwen36FullAttentionWeights {
     o: Qwen36Linear,
     q_norm_weight: DeviceBuffer<f32>,
     k_norm_weight: DeviceBuffer<f32>,
+}
+
+struct PagedSparseSelection<'a> {
+    block_mask: &'a DeviceBuffer<u8>,
+    tile_mask: &'a DeviceBuffer<u8>,
+    selected_tokens: usize,
+    block_indices: &'a DeviceBuffer<u32>,
+    token_tiles: &'a DeviceBuffer<u32>,
+    context_tiles: &'a DeviceBuffer<u32>,
+    counts: &'a DeviceBuffer<u32>,
+    index_capacity: usize,
 }
 
 /// Mutable one-token decode workspace for a Qwen3.6 full-attention layer.
@@ -270,8 +288,16 @@ struct Fp8Linear {
     weight_only: bool,
 }
 
+struct F32BlockFp8Linear {
+    weight: DeviceBuffer<u8>,
+    weight_scale: DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+}
+
 enum Qwen36Linear {
     Nvfp4(Nvfp4DeviceLinear),
+    BlockFp8(F32BlockFp8Linear),
     Fp8(Fp8Linear),
     Bf16(Bf16Linear),
 }
@@ -904,6 +930,34 @@ impl Qwen36FullAttentionWeights {
         })
     }
 
+    /// Runs one token against every visible row in a page-table cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_one_token_paged<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36FullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        position: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<Qwen36FullAttentionStep<'a>> {
+        self.run_one_token_paged_impl(
+            workspace,
+            pool,
+            page_table,
+            None,
+            manifest,
+            hidden,
+            position,
+            slot,
+            page_offset,
+            stream,
+        )
+    }
+
     /// Runs one token against a page-table cache restricted by a sparse token mask.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_one_token_paged_sparse<'a>(
@@ -914,6 +968,48 @@ impl Qwen36FullAttentionWeights {
         selected_blocks: &DeviceBuffer<u8>,
         selected_tiles: &DeviceBuffer<u8>,
         selected_tokens: usize,
+        selected_block_indices: &DeviceBuffer<u32>,
+        selected_token_tiles: &DeviceBuffer<u32>,
+        selected_context_tiles: &DeviceBuffer<u32>,
+        selected_counts: &DeviceBuffer<u32>,
+        selected_index_capacity: usize,
+        manifest: &QwenModelManifest,
+        hidden: &DeviceBuffer<f32>,
+        position: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<Qwen36FullAttentionStep<'a>> {
+        self.run_one_token_paged_impl(
+            workspace,
+            pool,
+            page_table,
+            Some(PagedSparseSelection {
+                block_mask: selected_blocks,
+                tile_mask: selected_tiles,
+                selected_tokens,
+                block_indices: selected_block_indices,
+                token_tiles: selected_token_tiles,
+                context_tiles: selected_context_tiles,
+                counts: selected_counts,
+                index_capacity: selected_index_capacity,
+            }),
+            manifest,
+            hidden,
+            position,
+            slot,
+            page_offset,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_one_token_paged_impl<'a>(
+        &'a self,
+        workspace: &'a mut Qwen36FullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        selection: Option<PagedSparseSelection<'_>>,
         manifest: &QwenModelManifest,
         hidden: &DeviceBuffer<f32>,
         position: usize,
@@ -976,21 +1072,41 @@ impl Qwen36FullAttentionWeights {
             0,
             stream,
         )?;
-        workspace
-            .compact_attention
-            .attention_paged_sparse_offsets_into_on_stream(
-                pool,
-                page_table,
-                position + 1,
-                selected_blocks,
-                selected_tiles,
-                selected_tokens,
-                &workspace.q_rope,
-                0,
-                workspace.attn.output(),
-                0,
-                stream,
-            )?;
+        if let Some(selection) = selection {
+            workspace
+                .compact_attention
+                .attention_paged_sparse_offsets_into_on_stream(
+                    pool,
+                    page_table,
+                    position + 1,
+                    selection.block_mask,
+                    selection.tile_mask,
+                    selection.selected_tokens,
+                    selection.block_indices,
+                    selection.token_tiles,
+                    selection.context_tiles,
+                    selection.counts,
+                    selection.index_capacity,
+                    &workspace.q_rope,
+                    0,
+                    workspace.attn.output(),
+                    0,
+                    stream,
+                )?;
+        } else {
+            workspace
+                .compact_attention
+                .attention_paged_offsets_into_on_stream(
+                    pool,
+                    page_table,
+                    position + 1,
+                    &workspace.q_rope,
+                    0,
+                    workspace.attn.output(),
+                    0,
+                    stream,
+                )?;
+        }
         sigmoid_mul_f32_into_on_stream(
             &workspace.gate,
             &workspace.attn,
@@ -1326,6 +1442,23 @@ impl Qwen36LinearAttentionWeights {
                 qkv.cols,
                 stream,
             );
+        }
+        if let (Qwen36Linear::BlockFp8(qkv), Qwen36Linear::BlockFp8(z)) = (&self.qkv, &self.z) {
+            block_fp8_f32_scale_linear_pair_f32_into_on_stream(
+                hidden,
+                &qkv.weight,
+                &qkv.weight_scale,
+                &z.weight,
+                &z.weight_scale,
+                workspace.qkv_output.output(),
+                workspace.z_output.output(),
+                qkv.rows,
+                z.rows,
+                qkv.cols,
+                stream,
+            )?;
+            maybe_round_device_f32_to_bf16(&mut workspace.qkv_output, stream)?;
+            return maybe_round_device_f32_to_bf16(&mut workspace.z_output, stream);
         }
         if let (Qwen36Linear::Fp8(qkv), Qwen36Linear::Fp8(z)) = (&self.qkv, &self.z)
             && self.fp8.plans.is_none()
@@ -1817,6 +1950,55 @@ impl Qwen36FullAttentionState {
     }
 }
 
+impl F32BlockFp8Linear {
+    fn from_host(host: &ModelOptF32BlockScaledFp8Linear) -> Result<Self> {
+        Ok(Self {
+            weight: DeviceBuffer::from_host(&host.weight)?,
+            weight_scale: DeviceBuffer::from_host(&host.weight_scale)?,
+            rows: host.out_features,
+            cols: host.in_features,
+        })
+    }
+
+    fn run_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        block_fp8_f32_scale_linear_f32_into_on_stream(
+            input,
+            &self.weight,
+            &self.weight_scale,
+            output.output(),
+            self.rows,
+            self.cols,
+            stream,
+        )?;
+        maybe_round_device_f32_to_bf16(output, stream)
+    }
+
+    fn run_batch_into(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        batch_rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+            input,
+            &self.weight,
+            &self.weight_scale,
+            output.output(),
+            batch_rows,
+            self.rows,
+            self.cols,
+            stream,
+        )?;
+        maybe_round_device_f32_to_bf16(output, stream)
+    }
+}
+
 impl Fp8Linear {
     fn from_host(host: &ModelOptFp8Linear) -> Result<Self> {
         Self::from_reordered_host(host, host.weight.clone())
@@ -2010,6 +2192,15 @@ impl Fp8Linear {
     }
 }
 
+fn uses_float_block_fp8(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<bool> {
+    let scale_name = format!("{prefix}.weight_scale_inv");
+    if !checkpoint.contains_tensor(&scale_name) {
+        return Ok(false);
+    }
+    let scale = checkpoint.tensor_info(&scale_name)?;
+    Ok(matches!(scale.dtype.as_str(), "BF16" | "F32") && scale.shape.len() == 2)
+}
+
 impl Qwen36Linear {
     fn load(
         checkpoint: &ModelOptCheckpoint,
@@ -2021,7 +2212,11 @@ impl Qwen36Linear {
         fp8_nvfp4_cache: &Qwen36Fp8Nvfp4Cache,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
-        let linear = if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
+        let linear = if uses_float_block_fp8(checkpoint, prefix)? {
+            Self::BlockFp8(F32BlockFp8Linear::from_host(
+                &checkpoint.load_weight_scale_inv_block_fp8_linear_f32(prefix)?,
+            )?)
+        } else if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
             || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
         {
             Self::Nvfp4(Nvfp4DeviceLinear::load(checkpoint, prefix)?)
@@ -2070,6 +2265,15 @@ impl Qwen36Linear {
         let rows = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
+        if uses_float_block_fp8(checkpoint, prefix)? {
+            let host = reorder_f32_block_fp8_v_rows(
+                checkpoint.load_weight_scale_inv_block_fp8_linear_f32(prefix)?,
+                key_heads,
+                value_heads,
+                head_dim,
+            )?;
+            return Ok(Self::BlockFp8(F32BlockFp8Linear::from_host(&host)?));
+        }
         if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
             || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
         {
@@ -2132,6 +2336,15 @@ impl Qwen36Linear {
         let cols = value_heads * head_dim;
         let weight_name = format!("{prefix}.weight");
         let info = checkpoint.tensor_info(&weight_name)?;
+        if uses_float_block_fp8(checkpoint, prefix)? {
+            let host = reorder_f32_block_fp8_v_cols(
+                checkpoint.load_weight_scale_inv_block_fp8_linear_f32(prefix)?,
+                key_heads,
+                value_heads,
+                head_dim,
+            )?;
+            return Ok(Self::BlockFp8(F32BlockFp8Linear::from_host(&host)?));
+        }
         if checkpoint.contains_tensor(&format!("{prefix}.weight_scale_2"))
             || checkpoint.contains_tensor(&format!("{prefix}.weight_global_scale"))
         {
@@ -2183,6 +2396,7 @@ impl Qwen36Linear {
     fn rows(&self) -> usize {
         match self {
             Self::Nvfp4(linear) => linear.out_features,
+            Self::BlockFp8(linear) => linear.rows,
             Self::Fp8(linear) => linear.rows,
             Self::Bf16(linear) => linear.rows,
         }
@@ -2191,6 +2405,7 @@ impl Qwen36Linear {
     fn cols(&self) -> usize {
         match self {
             Self::Nvfp4(linear) => linear.in_features,
+            Self::BlockFp8(linear) => linear.cols,
             Self::Fp8(linear) => linear.cols,
             Self::Bf16(linear) => linear.cols,
         }
@@ -2206,6 +2421,7 @@ impl Qwen36Linear {
     ) -> Result<()> {
         match self {
             Self::Nvfp4(linear) => linear.run_f32_into(input, output, stream),
+            Self::BlockFp8(linear) => linear.run_into(input, output, stream),
             Self::Fp8(linear) => {
                 linear.run_into(input, output, dynamic_input, dynamic_input_scale, stream)
             }
@@ -2281,16 +2497,18 @@ impl Bf16Linear {
         )
     }
 
-    pub(crate) fn run_exact_two_rows_into(
+    pub(crate) fn run_exact_rows_into(
         &self,
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
+        rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        bf16_linear_two_rows_f32_into_on_stream(
+        bf16_linear_exact_rows_f32_into_on_stream(
             input,
             &self.weight,
             output.output(),
+            rows,
             self.rows,
             self.cols,
             stream,
@@ -2460,6 +2678,98 @@ fn reorder_bf16_v_cols(
         }
     }
     out
+}
+
+/// Reorders V-head output rows and their 128-by-128 F32 scale blocks.
+fn reorder_f32_block_fp8_v_rows(
+    mut host: ModelOptF32BlockScaledFp8Linear,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+) -> Result<ModelOptF32BlockScaledFp8Linear> {
+    if key_heads == value_heads || host.out_features != value_heads * head_dim {
+        return Ok(host);
+    }
+    if !head_dim.is_multiple_of(128) || !value_heads.is_multiple_of(key_heads) {
+        return Err(Error::Shape {
+            label: "Qwen F32 block-FP8 V-row reorder",
+            expected: "head dimension multiple of 128 and value heads divisible by key heads"
+                .to_string(),
+            actual: format!("key_heads={key_heads} value_heads={value_heads} head_dim={head_dim}"),
+        });
+    }
+    let v_per_k = value_heads / key_heads;
+    let row_bytes = head_dim * host.in_features;
+    let scale_cols = host.in_features / 128;
+    let scale_rows_per_head = head_dim / 128;
+    let scale_head_len = scale_rows_per_head * scale_cols;
+    let mut weight = vec![0u8; host.weight.len()];
+    let mut scales = vec![0.0f32; host.weight_scale.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let dst_head = v_sub * key_heads + k_head;
+        let src_weight = v_k_head * row_bytes;
+        let dst_weight = dst_head * row_bytes;
+        weight[dst_weight..dst_weight + row_bytes]
+            .copy_from_slice(&host.weight[src_weight..src_weight + row_bytes]);
+        let src_scale = v_k_head * scale_head_len;
+        let dst_scale = dst_head * scale_head_len;
+        scales[dst_scale..dst_scale + scale_head_len]
+            .copy_from_slice(&host.weight_scale[src_scale..src_scale + scale_head_len]);
+    }
+    host.weight = weight;
+    host.weight_scale = scales;
+    Ok(host)
+}
+
+/// Reorders V-head input columns and their 128-by-128 F32 scale blocks.
+fn reorder_f32_block_fp8_v_cols(
+    mut host: ModelOptF32BlockScaledFp8Linear,
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+) -> Result<ModelOptF32BlockScaledFp8Linear> {
+    if key_heads == value_heads || host.in_features != value_heads * head_dim {
+        return Ok(host);
+    }
+    if !head_dim.is_multiple_of(128) || !value_heads.is_multiple_of(key_heads) {
+        return Err(Error::Shape {
+            label: "Qwen F32 block-FP8 V-column reorder",
+            expected: "head dimension multiple of 128 and value heads divisible by key heads"
+                .to_string(),
+            actual: format!("key_heads={key_heads} value_heads={value_heads} head_dim={head_dim}"),
+        });
+    }
+    let v_per_k = value_heads / key_heads;
+    let scale_cols = host.in_features / 128;
+    let scale_head_cols = head_dim / 128;
+    let scale_rows = host.out_features / 128;
+    let mut weight = vec![0u8; host.weight.len()];
+    let mut scales = vec![0.0f32; host.weight_scale.len()];
+    for v_k_head in 0..value_heads {
+        let k_head = v_k_head / v_per_k;
+        let v_sub = v_k_head % v_per_k;
+        let dst_head = v_sub * key_heads + k_head;
+        let src_col = v_k_head * head_dim;
+        let dst_col = dst_head * head_dim;
+        for row in 0..host.out_features {
+            let src = row * host.in_features + src_col;
+            let dst = row * host.in_features + dst_col;
+            weight[dst..dst + head_dim].copy_from_slice(&host.weight[src..src + head_dim]);
+        }
+        let src_scale_col = v_k_head * scale_head_cols;
+        let dst_scale_col = dst_head * scale_head_cols;
+        for scale_row in 0..scale_rows {
+            let src = scale_row * scale_cols + src_scale_col;
+            let dst = scale_row * scale_cols + dst_scale_col;
+            scales[dst..dst + scale_head_cols]
+                .copy_from_slice(&host.weight_scale[src..src + scale_head_cols]);
+        }
+    }
+    host.weight = weight;
+    host.weight_scale = scales;
+    Ok(host)
 }
 
 /// Reorders V rows in an FP8 ModelOpt linear weight.
@@ -2727,6 +3037,7 @@ pub struct Qwen36MoeWeights {
     gate_up_storage: Qwen36GateUpStorage,
     grouped: Option<Qwen36GroupedMoeWeights>,
     fp8_experts: Option<Qwen36Fp8Experts>,
+    block_fp8_experts: Option<Qwen36BlockFp8Experts>,
     #[cfg(feature = "cuda-oxide")]
     oxide_routed: Option<Qwen36OxideMoeWeights>,
     shared: Qwen36SharedExpertStorage,
@@ -2857,6 +3168,7 @@ enum Qwen36GateUpStorage {
     OxideW4A16,
     Paged,
     Fp8,
+    BlockFp8,
 }
 
 #[cfg(feature = "cuda-oxide")]
@@ -2870,6 +3182,7 @@ enum Qwen36DownStorage {
     Legacy,
     Sm12x,
     Fp8,
+    BlockFp8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2915,8 +3228,25 @@ struct Qwen36Fp8Experts {
     down: Qwen36Fp8ExpertTable,
 }
 
+struct Qwen36BlockFp8ExpertTable {
+    _weights: DeviceBuffer<u8>,
+    _scales: DeviceBuffer<f32>,
+    weights: DeviceBuffer<DeviceAddress<u8>>,
+    scales: DeviceBuffer<DeviceAddress<f32>>,
+}
+
+struct Qwen36BlockFp8Experts {
+    gate: Qwen36BlockFp8ExpertTable,
+    up: Qwen36BlockFp8ExpertTable,
+    down: Qwen36BlockFp8ExpertTable,
+}
+
 enum Qwen36SharedExpertStorage {
     Nvfp4(Qwen36SharedExpert),
+    BlockFp8 {
+        gate_up: F32BlockFp8Linear,
+        down: F32BlockFp8Linear,
+    },
     Fp8 {
         gate_up: Fp8Linear,
         down: Fp8Linear,
@@ -3039,6 +3369,7 @@ pub struct Qwen36MoeWorkspace {
     fp8_hidden_input_scale: DeviceBuffer<f32>,
     fp8_down_input: DeviceBuffer<u8>,
     fp8_down_input_scales: DeviceBuffer<f32>,
+    block_fp8_down_input: DeviceBuffer<f32>,
     fp8_shared_input: DeviceBuffer<u8>,
     fp8_shared_input_scale: DeviceBuffer<f32>,
     sm12x_down: Sm12xGateUpWorkspace,
@@ -3056,8 +3387,8 @@ pub struct Qwen36MoeWorkspace {
     pub ffn_residual: DeviceBuffer<f32>,
 }
 
-/// Two-row MoE verifier workspace that retains canonical per-row expert math.
-pub(crate) struct Qwen36ExactMoePairWorkspace {
+/// Short-row MoE verifier workspace that retains canonical per-row expert math.
+pub(crate) struct Qwen36ExactMoeRowsWorkspace {
     inputs: Vec<DeviceBuffer<f32>>,
     rows: Vec<Qwen36MoeWorkspace>,
     router_logits: DeviceBuffer<f32>,
@@ -3065,6 +3396,7 @@ pub(crate) struct Qwen36ExactMoePairWorkspace {
     route_weights: DeviceBuffer<f32>,
     zero_hidden: DeviceBuffer<f32>,
     output: DeviceBuffer<f32>,
+    active_rows: usize,
 }
 
 pub(crate) struct Qwen36MoeProbeSnapshot {
@@ -3568,6 +3900,20 @@ impl Qwen36MoeWeights {
         artifact_root: &std::path::Path,
         layer: usize,
     ) -> Result<Self> {
+        let first_gate = format!(
+            "{}.layers.{layer}.mlp.experts.0.gate_proj",
+            manifest.tensor_prefix
+        );
+        if uses_float_block_fp8(checkpoint, &first_gate)? {
+            return Self::load_with_down_storage(
+                checkpoint,
+                manifest,
+                artifact_root,
+                layer,
+                false,
+                false,
+            );
+        }
         #[cfg(feature = "cuda-oxide")]
         {
             let _ = artifact_root;
@@ -3676,6 +4022,7 @@ impl Qwen36MoeWeights {
             gate_up_storage: Qwen36GateUpStorage::OxideW4A16,
             grouped: None,
             fp8_experts: None,
+            block_fp8_experts: None,
             oxide_routed: Some(Qwen36OxideMoeWeights { gate_up, down }),
             shared,
             shared_gate,
@@ -3730,6 +4077,18 @@ impl Qwen36MoeWeights {
         let uses_nvfp4 = checkpoint.contains_tensor(&format!("{first_gate}.weight_scale_2"))
             || checkpoint.contains_tensor(&format!("{first_gate}.weight_global_scale"));
         if !uses_nvfp4 {
+            if uses_float_block_fp8(checkpoint, &first_gate)? {
+                return Self::load_block_fp8(
+                    checkpoint,
+                    manifest,
+                    prefix,
+                    router,
+                    experts,
+                    experts_per_token,
+                    expert_intermediate,
+                    norm_topk_prob,
+                );
+            }
             return Self::load_fp8(
                 checkpoint,
                 manifest,
@@ -3817,6 +4176,9 @@ impl Qwen36MoeWeights {
                 Qwen36DownStorage::Fp8 => {
                     unreachable!("NVFP4 loader cannot select FP8 down storage")
                 }
+                Qwen36DownStorage::BlockFp8 => {
+                    unreachable!("NVFP4 loader cannot select block-FP8 down storage")
+                }
             }
 
             if storage_plan.down == Qwen36DownStorage::Sm12x {
@@ -3877,6 +4239,7 @@ impl Qwen36MoeWeights {
             gate_up_storage,
             grouped,
             fp8_experts: None,
+            block_fp8_experts: None,
             #[cfg(feature = "cuda-oxide")]
             oxide_routed: None,
             shared,
@@ -3990,6 +4353,7 @@ impl Qwen36MoeWeights {
             gate_up_storage: Qwen36GateUpStorage::Paged,
             grouped: None,
             fp8_experts: None,
+            block_fp8_experts: None,
             #[cfg(feature = "cuda-oxide")]
             oxide_routed: None,
             shared,
@@ -4086,6 +4450,95 @@ impl Qwen36MoeWeights {
             gate_up_storage: Qwen36GateUpStorage::Fp8,
             grouped: None,
             fp8_experts: Some(fp8_experts),
+            block_fp8_experts: None,
+            #[cfg(feature = "cuda-oxide")]
+            oxide_routed: None,
+            shared,
+            shared_gate,
+            _sm12x_down: Vec::new(),
+            sm12x_down_tiles: None,
+            sm12x_down_scales: None,
+            sm12x_down_m_tiles: 0,
+            sm12x_down_k_tiles: 0,
+            num_experts: experts,
+            experts_per_token,
+            expert_intermediate,
+            norm_topk_prob,
+            expert_pager: std::cell::RefCell::new(None),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_block_fp8(
+        checkpoint: &ModelOptCheckpoint,
+        manifest: &QwenModelManifest,
+        prefix: String,
+        router: Bf16Linear,
+        experts: usize,
+        experts_per_token: usize,
+        expert_intermediate: usize,
+        norm_topk_prob: bool,
+    ) -> Result<Self> {
+        let expert_prefix =
+            |expert: usize, projection: &str| format!("{prefix}.experts.{expert}.{projection}");
+        let block_fp8_experts = Qwen36BlockFp8Experts {
+            gate: Qwen36BlockFp8ExpertTable::load(
+                checkpoint,
+                experts,
+                expert_intermediate,
+                manifest.hidden,
+                |expert| expert_prefix(expert, "gate_proj"),
+            )?,
+            up: Qwen36BlockFp8ExpertTable::load(
+                checkpoint,
+                experts,
+                expert_intermediate,
+                manifest.hidden,
+                |expert| expert_prefix(expert, "up_proj"),
+            )?,
+            down: Qwen36BlockFp8ExpertTable::load(
+                checkpoint,
+                experts,
+                manifest.hidden,
+                expert_intermediate,
+                |expert| expert_prefix(expert, "down_proj"),
+            )?,
+        };
+        let (shared, _) = load_shared_expert(checkpoint, &prefix, manifest.hidden)?;
+        let shared_gate = Bf16Linear::load(
+            checkpoint,
+            &format!("{prefix}.shared_expert_gate.weight"),
+            1,
+            manifest.hidden,
+        )?;
+        let null_u8 = vec![DeviceAddress::null(); experts];
+        let ones = vec![1.0; experts];
+        let expert_ptrs = MoeExpertPointerTables {
+            gate_up_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_scales: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            gate_up_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_values: DeviceBuffer::from_host(&null_u8)?,
+            down_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_values: DeviceBuffer::from_host(&null_u8)?,
+            down_grouped_scales: DeviceBuffer::from_host(&null_u8)?,
+            down_input_scales: DeviceBuffer::from_host(&ones)?,
+            down_alphas: DeviceBuffer::from_host(&ones)?,
+            shared_gate_up_input_scale: None,
+            gate_up_alphas: DeviceBuffer::from_host(&ones)?,
+        };
+        Ok(Self {
+            router,
+            experts: Vec::new(),
+            expert_ptrs,
+            gate_up_unity_alphas: DeviceBuffer::from_host(&ones)?,
+            storage_plan: Qwen36MoeStoragePlan {
+                down: Qwen36DownStorage::BlockFp8,
+            },
+            gate_up_storage: Qwen36GateUpStorage::BlockFp8,
+            grouped: None,
+            fp8_experts: None,
+            block_fp8_experts: Some(block_fp8_experts),
             #[cfg(feature = "cuda-oxide")]
             oxide_routed: None,
             shared,
@@ -4128,7 +4581,10 @@ impl Qwen36MoeWeights {
         Qwen36MoeWorkspace::new_for_paths(
             manifest,
             enable_grouped,
-            enable_grouped && self.storage_plan.down == Qwen36DownStorage::Sm12x,
+            matches!(
+                self.storage_plan.down,
+                Qwen36DownStorage::Sm12x | Qwen36DownStorage::BlockFp8
+            ),
         )
     }
 
@@ -4203,6 +4659,61 @@ impl Qwen36MoeWeights {
         }
     }
 
+    fn run_block_fp8_routed(
+        &self,
+        workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let weights = self
+            .block_fp8_experts
+            .as_ref()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen block-FP8 routed MoE",
+                detail: "block-FP8 expert tables are unavailable".to_string(),
+            })?;
+        block_fp8_f32_scale_moe_gate_up_f32_into_on_stream(
+            &workspace.route.indices,
+            ffn_norm,
+            &weights.gate.weights,
+            &weights.gate.scales,
+            &weights.up.weights,
+            &weights.up.scales,
+            workspace.w4a16_gate_up_output.output(),
+            self.expert_intermediate,
+            ffn_norm.len(),
+            self.experts_per_token,
+            stream,
+        )?;
+        silu_mul_halves_f32_batch_into_on_stream(
+            &workspace.w4a16_gate_up_output,
+            workspace.block_fp8_down_input.output(),
+            self.experts_per_token,
+            self.expert_intermediate,
+            stream,
+        )?;
+        fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+        block_fp8_f32_scale_moe_down_f32_into_on_stream(
+            &workspace.route.indices,
+            &workspace.block_fp8_down_input,
+            &weights.down.weights,
+            &weights.down.scales,
+            &workspace.sm12x_down.indexed_d,
+            ffn_norm.len(),
+            self.expert_intermediate,
+            self.experts_per_token,
+            stream,
+        )?;
+        moe_weighted_accumulate_slot_addresses_f32_on_stream(
+            &workspace.route.indices,
+            &workspace.route.weights,
+            &workspace.sm12x_down.indexed_d,
+            &self.expert_ptrs.down_alphas,
+            workspace.moe_out.inout(),
+            stream,
+        )
+    }
+
     /// Prepares routing and any activation state required by the selected gate/up path.
     pub fn prepare_routed_gate_up(
         &self,
@@ -4274,6 +4785,28 @@ impl Qwen36MoeWeights {
                     &fp8.gate.scales,
                     &fp8.up.weights,
                     &fp8.up.scales,
+                    workspace.w4a16_gate_up_output.output(),
+                    self.expert_intermediate,
+                    ffn_norm.len(),
+                    self.experts_per_token,
+                    stream,
+                )
+            }
+            Qwen36GateUpStorage::BlockFp8 => {
+                let weights = self
+                    .block_fp8_experts
+                    .as_ref()
+                    .ok_or_else(|| Error::Format {
+                        label: "Qwen block-FP8 routed gate/up",
+                        detail: "block-FP8 expert tables are unavailable".to_string(),
+                    })?;
+                block_fp8_f32_scale_moe_gate_up_f32_into_on_stream(
+                    &workspace.route.indices,
+                    ffn_norm,
+                    &weights.gate.weights,
+                    &weights.gate.scales,
+                    &weights.up.weights,
+                    &weights.up.scales,
                     workspace.w4a16_gate_up_output.output(),
                     self.expert_intermediate,
                     ffn_norm.len(),
@@ -4383,6 +4916,16 @@ impl Qwen36MoeWeights {
                     .output
             }
             Qwen36GateUpStorage::Fp8 => &workspace.w4a16_gate_up_table,
+            Qwen36GateUpStorage::BlockFp8 => {
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &workspace.w4a16_gate_up_output,
+                    workspace.block_fp8_down_input.output(),
+                    self.experts_per_token,
+                    self.expert_intermediate,
+                    stream,
+                )?;
+                return Ok(());
+            }
             #[cfg(feature = "cuda-oxide")]
             Qwen36GateUpStorage::OxideW4A16 => {
                 return Err(Error::Format {
@@ -4439,6 +4982,35 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
+        if self.storage_plan.down == Qwen36DownStorage::BlockFp8 {
+            let weights = self
+                .block_fp8_experts
+                .as_ref()
+                .ok_or_else(|| Error::Format {
+                    label: "Qwen block-FP8 routed down",
+                    detail: "block-FP8 expert tables are unavailable".to_string(),
+                })?;
+            fill_f32_into_on_stream(workspace.moe_out.output(), 0.0, stream)?;
+            block_fp8_f32_scale_moe_down_f32_into_on_stream(
+                &workspace.route.indices,
+                &workspace.block_fp8_down_input,
+                &weights.down.weights,
+                &weights.down.scales,
+                &workspace.sm12x_down.indexed_d,
+                workspace.moe_out.len(),
+                self.expert_intermediate,
+                self.experts_per_token,
+                stream,
+            )?;
+            return moe_weighted_accumulate_slot_addresses_f32_on_stream(
+                &workspace.route.indices,
+                &workspace.route.weights,
+                &workspace.sm12x_down.indexed_d,
+                &self.expert_ptrs.down_alphas,
+                workspace.moe_out.inout(),
+                stream,
+            );
+        }
         let grouped_down = workspace
             .grouped_down
             .as_mut()
@@ -4613,6 +5185,26 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
+        if self.storage_plan.down == Qwen36DownStorage::BlockFp8 {
+            let weights = self
+                .block_fp8_experts
+                .as_ref()
+                .ok_or_else(|| Error::Format {
+                    label: "Qwen block-FP8 routed down",
+                    detail: "block-FP8 expert tables are unavailable".to_string(),
+                })?;
+            return block_fp8_f32_scale_moe_down_f32_into_on_stream(
+                &workspace.route.indices,
+                &workspace.block_fp8_down_input,
+                &weights.down.weights,
+                &weights.down.scales,
+                &workspace.sm12x_down.indexed_d,
+                workspace.moe_out.len(),
+                self.expert_intermediate,
+                self.experts_per_token,
+                stream,
+            );
+        }
         let grouped_down = workspace
             .grouped_down
             .as_mut()
@@ -4658,6 +5250,16 @@ impl Qwen36MoeWeights {
         workspace: &mut Qwen36MoeWorkspace,
         stream: &CudaStream,
     ) -> Result<()> {
+        if self.storage_plan.down == Qwen36DownStorage::BlockFp8 {
+            return moe_weighted_accumulate_slot_addresses_f32_on_stream(
+                &workspace.route.indices,
+                &workspace.route.weights,
+                &workspace.sm12x_down.indexed_d,
+                &self.expert_ptrs.down_alphas,
+                workspace.moe_out.inout(),
+                stream,
+            );
+        }
         let grouped_down = workspace
             .grouped_down
             .as_ref()
@@ -4698,6 +5300,9 @@ impl Qwen36MoeWeights {
                     .gate_up
                     .run_f32_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
             }
+            Qwen36SharedExpertStorage::BlockFp8 { gate_up, .. } => {
+                gate_up.run_into(ffn_norm, &mut workspace.shared_gate_up_output, stream)
+            }
             Qwen36SharedExpertStorage::Fp8 { gate_up, .. } => gate_up.run_into(
                 ffn_norm,
                 &mut workspace.shared_gate_up_output,
@@ -4718,6 +5323,11 @@ impl Qwen36MoeWeights {
     ) -> Result<()> {
         match &self.shared {
             Qwen36SharedExpertStorage::Nvfp4(shared) => shared.down.run_f32_into(
+                &workspace.shared_activated,
+                &mut workspace.shared_output,
+                stream,
+            ),
+            Qwen36SharedExpertStorage::BlockFp8 { down, .. } => down.run_into(
                 &workspace.shared_activated,
                 &mut workspace.shared_output,
                 stream,
@@ -4858,50 +5468,47 @@ impl Qwen36MoeWeights {
         )
     }
 
-    /// Runs two rows with one exact router/top-k batch and canonical per-row
+    /// Runs a short batch with one exact router/top-k pass and canonical per-row
     /// routed and shared expert kernels.
-    pub(crate) fn run_exact_pair<'a>(
+    pub(crate) fn run_exact_rows<'a>(
         &self,
-        workspace: &'a mut Qwen36ExactMoePairWorkspace,
+        workspace: &'a mut Qwen36ExactMoeRowsWorkspace,
         manifest: &QwenModelManifest,
         ffn_norm: &DeviceBuffer<f32>,
+        rows: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         let resident_cutlass = matches!(self.gate_up_storage, Qwen36GateUpStorage::CutlassW4A4)
             && self.grouped.is_some();
         let resident_oxide = self.uses_oxide_routed();
-        if ffn_norm.len() < 2 * manifest.hidden
-            || self.storage_plan.down != Qwen36DownStorage::Legacy
-            || (!resident_cutlass && !resident_oxide)
+        let resident_block_fp8 = self.block_fp8_experts.is_some();
+        if rows == 0
+            || rows > workspace.rows.len()
+            || ffn_norm.len() < rows * manifest.hidden
+            || !matches!(
+                self.storage_plan.down,
+                Qwen36DownStorage::Legacy | Qwen36DownStorage::BlockFp8
+            )
+            || (!resident_cutlass && !resident_oxide && !resident_block_fp8)
             || self.expert_pager.borrow().is_some()
         {
             return Err(Error::Format {
-                label: "Qwen exact MoE pair",
-                detail: "requires two rows of resident experts with legacy down storage"
-                    .to_string(),
+                label: "Qwen exact MoE rows",
+                detail: "requires a nonempty in-capacity batch of resident experts with legacy down storage".to_string(),
             });
         }
 
-        bf16_linear_two_rows_f32_into_on_stream(
+        workspace.active_rows = rows;
+        bf16_linear_exact_rows_f32_into_on_stream(
             ffn_norm,
             &self.router.weight,
             workspace.router_logits.output(),
+            rows,
             self.num_experts,
             manifest.hidden,
             stream,
         )?;
-        moe_topk_f32_batch_into_on_stream(
-            &workspace.router_logits,
-            workspace.route_indices.output(),
-            workspace.route_weights.output(),
-            2,
-            self.num_experts,
-            self.experts_per_token,
-            self.norm_topk_prob,
-            stream,
-        )?;
-
-        for row in 0..2 {
+        for row in 0..rows {
             let row_workspace = &mut workspace.rows[row];
             workspace.inputs[row].copy_range_from_device_on_stream(
                 0,
@@ -4911,26 +5518,36 @@ impl Qwen36MoeWeights {
                 stream,
             )?;
             row_workspace
-                .route
-                .indices
+                .router_logits
                 .copy_range_from_device_on_stream(
                     0,
-                    &workspace.route_indices,
-                    row * self.experts_per_token,
-                    self.experts_per_token,
+                    &workspace.router_logits,
+                    row * self.num_experts,
+                    self.num_experts,
                     stream,
                 )?;
-            row_workspace
-                .route
-                .weights
-                .copy_range_from_device_on_stream(
-                    0,
-                    &workspace.route_weights,
-                    row * self.experts_per_token,
-                    self.experts_per_token,
-                    stream,
-                )?;
-            if resident_oxide {
+            row_workspace.route.run_topk(
+                &row_workspace.router_logits,
+                self.norm_topk_prob,
+                stream,
+            )?;
+            workspace.route_indices.copy_range_from_device_on_stream(
+                row * self.experts_per_token,
+                &row_workspace.route.indices,
+                0,
+                self.experts_per_token,
+                stream,
+            )?;
+            workspace.route_weights.copy_range_from_device_on_stream(
+                row * self.experts_per_token,
+                &row_workspace.route.weights,
+                0,
+                self.experts_per_token,
+                stream,
+            )?;
+            if resident_block_fp8 {
+                self.run_block_fp8_routed(row_workspace, &workspace.inputs[row], stream)?;
+            } else if resident_oxide {
                 self.run_oxide_routed(row_workspace, &workspace.inputs[row], stream)?;
             } else {
                 quantize_nvfp4_col_major_f32_device_into_on_stream(
@@ -4971,7 +5588,7 @@ impl Qwen36MoeWeights {
                     stream,
                 )? {
                     return Err(Error::Format {
-                        label: "Qwen exact MoE pair",
+                        label: "Qwen exact MoE rows",
                         detail: "grouped down rejected a canonical route".to_string(),
                     });
                 }
@@ -5009,9 +5626,9 @@ impl Qwen36MoeWeights {
         Ok(&workspace.output)
     }
 
-    pub(crate) fn probe_repeat_exact_pair_gate_up(
+    pub(crate) fn probe_repeat_exact_rows_gate_up(
         &self,
-        workspace: &mut Qwen36ExactMoePairWorkspace,
+        workspace: &mut Qwen36ExactMoeRowsWorkspace,
         stream: &CudaStream,
     ) -> Result<Vec<Qwen36MoeProbeSnapshot>> {
         let mut snapshots = workspace.probe_snapshots(
@@ -5021,14 +5638,9 @@ impl Qwen36MoeWeights {
             stream,
         )?;
         for (row, snapshot) in snapshots.iter_mut().enumerate() {
-            self.run_grouped_gate_up_only(&mut workspace.rows[row], stream)?;
-            snapshot.repeated_routed_gate_up = Some(
-                workspace.rows[row]
-                    .grouped_gate_up
-                    .as_ref()
-                    .expect("exact pair grouped gate/up")
-                    .copy_outputs_to_host(stream)?,
-            );
+            self.run_routed_gate_up_only(&mut workspace.rows[row], &workspace.inputs[row], stream)?;
+            snapshot.repeated_routed_gate_up =
+                Some(workspace.rows[row].routed_gate_up_to_host(stream)?);
         }
         Ok(snapshots)
     }
@@ -5036,17 +5648,12 @@ impl Qwen36MoeWeights {
     pub(crate) fn probe_repeat_workspace_gate_up(
         &self,
         workspace: &mut Qwen36MoeWorkspace,
+        ffn_norm: &DeviceBuffer<f32>,
         stream: &CudaStream,
     ) -> Result<Qwen36MoeProbeSnapshot> {
         let mut snapshot = workspace.probe_snapshot(stream)?;
-        self.run_grouped_gate_up_only(workspace, stream)?;
-        snapshot.repeated_routed_gate_up = Some(
-            workspace
-                .grouped_gate_up
-                .as_ref()
-                .expect("grouped gate/up workspace")
-                .copy_outputs_to_host(stream)?,
-        );
+        self.run_routed_gate_up_only(workspace, ffn_norm, stream)?;
+        snapshot.repeated_routed_gate_up = Some(workspace.routed_gate_up_to_host(stream)?);
         Ok(snapshot)
     }
 
@@ -5159,6 +5766,26 @@ impl Qwen36MoeWeights {
             let pager = pager.as_mut().expect("expert pager checked above");
             pager.resolve(&indices, &workspace.route.indices, stream)?;
             pager.run_routed(workspace, ffn_norm, stream)?;
+            true
+        } else if self.block_fp8_experts.is_some() {
+            if let Some(profile) = profile.as_deref_mut() {
+                let (_, topk_ms) = timed_cuda(stream, || {
+                    workspace
+                        .route
+                        .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)
+                })?;
+                profile.qwen36_router_topk_ms += topk_ms;
+                profile.qwen36_router_ms += topk_ms;
+                let (_, routed_ms) = timed_cuda(stream, || {
+                    self.run_block_fp8_routed(workspace, ffn_norm, stream)
+                })?;
+                profile.qwen36_routed_down_ms += routed_ms;
+            } else {
+                workspace
+                    .route
+                    .run_topk(&workspace.router_logits, self.norm_topk_prob, stream)?;
+                self.run_block_fp8_routed(workspace, ffn_norm, stream)?;
+            }
             true
         } else if let Some(fp8) = &self.fp8_experts {
             if let Some(profile) = profile.as_deref_mut() {
@@ -5952,6 +6579,67 @@ impl Qwen36Fp8ExpertTable {
     }
 }
 
+impl Qwen36BlockFp8ExpertTable {
+    fn load(
+        checkpoint: &ModelOptCheckpoint,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+        prefix: impl Fn(usize) -> String,
+    ) -> Result<Self> {
+        let matrix_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+            label: "Qwen block-FP8 expert table",
+            expected: "rows * cols fits usize".to_string(),
+            actual: format!("rows={rows} cols={cols}"),
+        })?;
+        let scale_len = (rows / 128)
+            .checked_mul(cols / 128)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen block-FP8 expert table",
+                expected: "block-scale dimensions fit usize".to_string(),
+                actual: format!("rows={rows} cols={cols}"),
+            })?;
+        let mut host_weights = Vec::with_capacity(experts.saturating_mul(matrix_len));
+        let mut host_scales = Vec::with_capacity(experts.saturating_mul(scale_len));
+        for expert in 0..experts {
+            let weight = checkpoint.load_weight_scale_inv_block_fp8_linear_f32(&prefix(expert))?;
+            if weight.out_features != rows
+                || weight.in_features != cols
+                || weight.weight.len() != matrix_len
+                || weight.weight_scale.len() != scale_len
+            {
+                return Err(Error::Shape {
+                    label: "Qwen block-FP8 expert table",
+                    expected: format!("{rows}x{cols} weight with {scale_len} block scales"),
+                    actual: format!(
+                        "expert={expert} shape={}x{} weight={} scales={}",
+                        weight.out_features,
+                        weight.in_features,
+                        weight.weight.len(),
+                        weight.weight_scale.len()
+                    ),
+                });
+            }
+            host_weights.extend_from_slice(&weight.weight);
+            host_scales.extend_from_slice(&weight.weight_scale);
+        }
+        let weights = DeviceBuffer::from_host(&host_weights)?;
+        let scales = DeviceBuffer::from_host(&host_scales)?;
+        let weight_addresses = (0..experts)
+            .map(|expert| weights.address_at(expert * matrix_len))
+            .collect::<Result<Vec<_>>>()?;
+        let scale_addresses = (0..experts)
+            .map(|expert| scales.address_at(expert * scale_len))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            _weights: weights,
+            _scales: scales,
+            weights: DeviceBuffer::from_host(&weight_addresses)?,
+            scales: DeviceBuffer::from_host(&scale_addresses)?,
+        })
+    }
+}
+
 impl Qwen36MoeWorkspace {
     /// Allocates one-token workspace for the Qwen3.6 MoE + shared-expert FFN.
     pub fn new(manifest: &QwenModelManifest) -> Result<Self> {
@@ -6006,6 +6694,7 @@ impl Qwen36MoeWorkspace {
             + self.fp8_hidden_input_scale.device_bytes()
             + self.fp8_down_input.device_bytes()
             + self.fp8_down_input_scales.device_bytes()
+            + self.block_fp8_down_input.device_bytes()
             + self.fp8_shared_input.device_bytes()
             + self.fp8_shared_input_scale.device_bytes()
             + self.sm12x_down.device_bytes()
@@ -6096,6 +6785,7 @@ impl Qwen36MoeWorkspace {
             fp8_hidden_input_scale: DeviceBuffer::zeroed(1)?,
             fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,
             fp8_down_input_scales: DeviceBuffer::zeroed(experts_per_token)?,
+            block_fp8_down_input: DeviceBuffer::zeroed(experts_per_token * expert_intermediate)?,
             fp8_shared_input: DeviceBuffer::zeroed(hidden.max(expert_intermediate))?,
             fp8_shared_input_scale: DeviceBuffer::zeroed(1)?,
             sm12x_down: Sm12xGateUpWorkspace::new(
@@ -6120,8 +6810,15 @@ impl Qwen36MoeWorkspace {
     }
 }
 
-impl Qwen36ExactMoePairWorkspace {
-    pub(crate) fn new(manifest: &QwenModelManifest) -> Result<Self> {
+impl Qwen36ExactMoeRowsWorkspace {
+    pub(crate) fn new(manifest: &QwenModelManifest, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::Shape {
+                label: "Qwen exact MoE workspace capacity",
+                expected: "at least one row".to_string(),
+                actual: capacity.to_string(),
+            });
+        }
         let (experts, routes) = match manifest.ffn {
             QwenFfnConfig::Moe {
                 experts,
@@ -6130,23 +6827,24 @@ impl Qwen36ExactMoePairWorkspace {
             } => (experts, experts_per_token),
             QwenFfnConfig::Dense => {
                 return Err(Error::Format {
-                    label: "Qwen exact MoE pair workspace",
+                    label: "Qwen exact MoE rows workspace",
                     detail: "manifest is not MoE".to_string(),
                 });
             }
         };
         Ok(Self {
-            inputs: (0..2)
+            inputs: (0..capacity)
                 .map(|_| DeviceBuffer::zeroed(manifest.hidden))
                 .collect::<Result<Vec<_>>>()?,
-            rows: (0..2)
+            rows: (0..capacity)
                 .map(|_| Qwen36MoeWorkspace::new(manifest))
                 .collect::<Result<Vec<_>>>()?,
-            router_logits: DeviceBuffer::zeroed(2 * experts)?,
-            route_indices: DeviceBuffer::zeroed(2 * routes)?,
-            route_weights: DeviceBuffer::zeroed(2 * routes)?,
+            router_logits: DeviceBuffer::zeroed(capacity * experts)?,
+            route_indices: DeviceBuffer::zeroed(capacity * routes)?,
+            route_weights: DeviceBuffer::zeroed(capacity * routes)?,
             zero_hidden: DeviceBuffer::zeroed(manifest.hidden)?,
-            output: DeviceBuffer::zeroed(2 * manifest.hidden)?,
+            output: DeviceBuffer::zeroed(capacity * manifest.hidden)?,
+            active_rows: 0,
         })
     }
 
@@ -6165,7 +6863,7 @@ impl Qwen36ExactMoePairWorkspace {
         let route_indices = self.route_indices.copy_to_host(stream)?;
         let route_weights = self.route_weights.copy_to_host(stream)?;
         let output = self.output.copy_to_host(stream)?;
-        (0..2)
+        (0..self.active_rows)
             .map(|row| {
                 let mut snapshot = self.rows[row].probe_snapshot(stream)?;
                 snapshot.router_logits = router_logits[row * experts..(row + 1) * experts].to_vec();
@@ -6179,6 +6877,13 @@ impl Qwen36ExactMoePairWorkspace {
 }
 
 impl Qwen36MoeWorkspace {
+    fn routed_gate_up_to_host(&self, stream: &CudaStream) -> Result<Vec<f32>> {
+        if let Some(workspace) = &self.grouped_gate_up {
+            return workspace.copy_outputs_to_host(stream);
+        }
+        Ok(self.w4a16_gate_up_output.copy_to_host(stream)?.into_vec())
+    }
+
     pub(crate) fn probe_snapshot(&self, stream: &CudaStream) -> Result<Qwen36MoeProbeSnapshot> {
         Ok(Qwen36MoeProbeSnapshot {
             router_logits: self.router_logits.copy_to_host(stream)?.into_vec(),
@@ -6187,12 +6892,7 @@ impl Qwen36MoeWorkspace {
             gate_up_input_values: self.gate_up_input.copy_values_to_host(stream)?.into_vec(),
             gate_up_input_scales: self.gate_up_input.copy_scales_to_host(stream)?.into_vec(),
             routed_output: self.moe_out.copy_to_host(stream)?.into_vec(),
-            routed_gate_up: self
-                .grouped_gate_up
-                .as_ref()
-                .map(|workspace| workspace.copy_outputs_to_host(stream))
-                .transpose()?
-                .unwrap_or_default(),
+            routed_gate_up: self.routed_gate_up_to_host(stream)?,
             repeated_routed_gate_up: None,
             oracle_routed_gate_up: None,
             routed_down_slots: self
@@ -6216,6 +6916,67 @@ fn load_shared_expert(
     let gate_prefix = format!("{mlp_prefix}.shared_expert.gate_proj");
     let up_prefix = format!("{mlp_prefix}.shared_expert.up_proj");
     let down_prefix = format!("{mlp_prefix}.shared_expert.down_proj");
+    let uses_block_fp8 = [
+        gate_prefix.as_str(),
+        up_prefix.as_str(),
+        down_prefix.as_str(),
+    ]
+    .into_iter()
+    .map(|prefix| uses_float_block_fp8(checkpoint, prefix))
+    .collect::<Result<Vec<_>>>()?;
+    if uses_block_fp8.iter().any(|uses| *uses) {
+        if !uses_block_fp8.iter().all(|uses| *uses) {
+            return Err(Error::Format {
+                label: "Qwen shared expert storage",
+                detail: "gate, up, and down projections use different quantization formats"
+                    .to_string(),
+            });
+        }
+        let gate = checkpoint.load_weight_scale_inv_block_fp8_linear_f32(&gate_prefix)?;
+        let up = checkpoint.load_weight_scale_inv_block_fp8_linear_f32(&up_prefix)?;
+        let down = checkpoint.load_weight_scale_inv_block_fp8_linear_f32(&down_prefix)?;
+        if gate.in_features != hidden
+            || gate.out_features != up.out_features
+            || gate.in_features != up.in_features
+            || down.in_features != gate.out_features
+            || down.out_features != hidden
+        {
+            return Err(Error::Shape {
+                label: "Qwen shared block-FP8 expert",
+                expected: format!(
+                    "gate/up in={hidden} with matching output, down reverses that shape"
+                ),
+                actual: format!(
+                    "gate=[{},{}] up=[{},{}] down=[{},{}]",
+                    gate.out_features,
+                    gate.in_features,
+                    up.out_features,
+                    up.in_features,
+                    down.out_features,
+                    down.in_features
+                ),
+            });
+        }
+        let intermediate = gate.out_features;
+        let mut gate_up_weight = gate.weight;
+        gate_up_weight.extend(up.weight);
+        let mut gate_up_scale = gate.weight_scale;
+        gate_up_scale.extend(up.weight_scale);
+        let gate_up = ModelOptF32BlockScaledFp8Linear {
+            prefix: format!("{mlp_prefix}.shared_expert.gate_up_proj"),
+            out_features: 2 * intermediate,
+            in_features: hidden,
+            weight: gate_up_weight,
+            weight_scale: gate_up_scale,
+        };
+        return Ok((
+            Qwen36SharedExpertStorage::BlockFp8 {
+                gate_up: F32BlockFp8Linear::from_host(&gate_up)?,
+                down: F32BlockFp8Linear::from_host(&down)?,
+            },
+            intermediate,
+        ));
+    }
     let uses_nvfp4 = checkpoint.contains_tensor(&format!("{gate_prefix}.weight_scale_2"))
         || checkpoint.contains_tensor(&format!("{gate_prefix}.weight_global_scale"));
     if uses_nvfp4 {
@@ -7506,24 +8267,26 @@ impl Qwen36LmHead {
         Ok(())
     }
 
-    pub(crate) fn run_bf16_exact_two_rows_top1(
+    pub(crate) fn run_bf16_exact_rows_top1(
         &self,
         input: &DeviceBuffer<f32>,
         logits: &mut DeviceBuffer<f32>,
         output_indices: &mut DeviceBuffer<u32>,
         output_values: &mut DeviceBuffer<f32>,
+        rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         let Self::Bf16(linear) = self else {
             return Err(Error::Format {
-                label: "Qwen exact two-row lm_head",
+                label: "Qwen exact-row lm_head",
                 detail: "the loaded vocabulary head is not BF16".to_string(),
             });
         };
-        bf16_linear_two_rows_f32_into_on_stream(
+        bf16_linear_exact_rows_f32_into_on_stream(
             input,
             &linear.weight,
             logits.output(),
+            rows,
             linear.rows,
             linear.cols,
             stream,
@@ -7532,7 +8295,7 @@ impl Qwen36LmHead {
             logits,
             output_indices.output(),
             output_values.output(),
-            2,
+            rows,
             linear.rows,
             stream,
         )
@@ -7634,6 +8397,10 @@ impl Qwen36LmHeadWorkspace {
         let index = self.next_index.copy_to_host(stream)?;
         let value = self.next_value.copy_to_host(stream)?;
         Ok((index[0], value[0]))
+    }
+
+    pub(crate) fn next_index(&self) -> &DeviceBuffer<u32> {
+        &self.next_index
     }
 
     pub(crate) fn logits(&self) -> &DeviceBuffer<f32> {
@@ -8619,10 +9386,11 @@ impl Qwen36TextModel {
 mod tests {
     use super::{
         Qwen36LinearAttentionState, Qwen36SequenceState, reorder_bf16_v_cols, reorder_bf16_v_rows,
-        reorder_fp8_v_cols, reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
+        reorder_f32_block_fp8_v_cols, reorder_f32_block_fp8_v_rows, reorder_fp8_v_cols,
+        reorder_fp8_v_rows, reorder_nvfp4_v_cols, reorder_nvfp4_v_rows,
     };
     use eider_cuda::{CudaStream, DeviceBuffer, PinnedHostBuffer};
-    use eider_format::{ModelOptFp8Linear, ModelOptNvfp4Linear};
+    use eider_format::{ModelOptF32BlockScaledFp8Linear, ModelOptFp8Linear, ModelOptNvfp4Linear};
 
     #[test]
     fn recurrent_append_transaction_restores_and_commits_explicitly() {
@@ -8714,6 +9482,60 @@ mod tests {
             reordered.channel_weight_scale,
             Some(vec![100.0, 101.0, 104.0, 105.0, 102.0, 103.0, 106.0, 107.0])
         );
+    }
+
+    #[test]
+    fn reorder_f32_block_fp8_v_rows_moves_scale_blocks_with_heads() {
+        let mut weight = Vec::new();
+        for head in 0..4u8 {
+            weight.extend(std::iter::repeat_n(head, 128 * 128));
+        }
+        let reordered = reorder_f32_block_fp8_v_rows(
+            ModelOptF32BlockScaledFp8Linear {
+                prefix: "z".to_string(),
+                out_features: 512,
+                in_features: 128,
+                weight,
+                weight_scale: vec![10.0, 11.0, 12.0, 13.0],
+            },
+            2,
+            4,
+            128,
+        )
+        .expect("reorder rows");
+        assert_eq!(
+            [0, 128, 256, 384].map(|row| reordered.weight[row * 128]),
+            [0, 2, 1, 3]
+        );
+        assert_eq!(reordered.weight_scale, vec![10.0, 12.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    fn reorder_f32_block_fp8_v_cols_moves_scale_blocks_with_heads() {
+        let mut weight = vec![0u8; 128 * 512];
+        for row in weight.chunks_exact_mut(512) {
+            for head in 0..4u8 {
+                row[head as usize * 128..(head as usize + 1) * 128].fill(head);
+            }
+        }
+        let reordered = reorder_f32_block_fp8_v_cols(
+            ModelOptF32BlockScaledFp8Linear {
+                prefix: "out".to_string(),
+                out_features: 128,
+                in_features: 512,
+                weight,
+                weight_scale: vec![10.0, 11.0, 12.0, 13.0],
+            },
+            2,
+            4,
+            128,
+        )
+        .expect("reorder columns");
+        assert_eq!(
+            [0, 128, 256, 384].map(|col| reordered.weight[col]),
+            [0, 2, 1, 3]
+        );
+        assert_eq!(reordered.weight_scale, vec![10.0, 12.0, 11.0, 13.0]);
     }
 
     #[test]

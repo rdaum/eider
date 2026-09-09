@@ -46,6 +46,7 @@ fn functions() -> Result<&'static Functions> {
 ///
 /// All pointers must address the validated chunked-GDN buffers and remain
 /// valid until `stream` completes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn cumsum(
     gate: *const u16,
     gate_cumsum: *mut f32,
@@ -53,6 +54,7 @@ pub(crate) unsafe fn cumsum(
     chunk_indices: *const i32,
     total_tokens: u32,
     chunk_count: u32,
+    heads: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut gate_arg = gate;
@@ -60,16 +62,18 @@ pub(crate) unsafe fn cumsum(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_indices_arg = chunk_indices;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut parameters = [
         (&mut gate_arg as *mut *const u16).cast::<c_void>(),
         (&mut gate_cumsum_arg as *mut *mut f32).cast::<c_void>(),
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_indices_arg as *mut *const i32).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.cumsum.launch(
-            LaunchConfig::new([chunk_count, 32, 1], [64, 1, 1], 0),
+            LaunchConfig::new([chunk_count, heads, 1], [64, 1, 1], 0),
             stream,
             &mut parameters,
         )
@@ -92,6 +96,7 @@ pub(crate) unsafe fn kkt(
     chunk_indices: *const i32,
     total_tokens: u32,
     chunk_count: u32,
+    heads: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut key_arg = key;
@@ -101,6 +106,7 @@ pub(crate) unsafe fn kkt(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_indices_arg = chunk_indices;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut parameters = [
         (&mut key_arg as *mut *const u16).cast::<c_void>(),
         (&mut beta_arg as *mut *const u16).cast::<c_void>(),
@@ -109,10 +115,11 @@ pub(crate) unsafe fn kkt(
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_indices_arg as *mut *const i32).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.kkt.launch(
-            LaunchConfig::new([chunk_count, 32, 1], [512, 1, 1], 0),
+            LaunchConfig::new([chunk_count, heads, 1], [512, 1, 1], 0),
             stream,
             &mut parameters,
         )
@@ -133,6 +140,7 @@ pub(crate) unsafe fn solve(
     chunk_indices: *const i32,
     total_tokens: u32,
     chunk_count: u32,
+    heads: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut a_arg = a;
@@ -140,16 +148,18 @@ pub(crate) unsafe fn solve(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_indices_arg = chunk_indices;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut parameters = [
         (&mut a_arg as *mut *mut f32).cast::<c_void>(),
         (&mut a_inverse_arg as *mut *mut u16).cast::<c_void>(),
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_indices_arg as *mut *const i32).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.solve.launch(
-            LaunchConfig::new([chunk_count, 32, 1], [256, 1, 1], 0),
+            LaunchConfig::new([chunk_count, heads, 1], [256, 1, 1], 0),
             stream,
             &mut parameters,
         )
@@ -174,6 +184,7 @@ pub(crate) unsafe fn wu(
     chunk_indices: *const i32,
     total_tokens: u32,
     chunk_count: u32,
+    heads: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut key_arg = key;
@@ -185,6 +196,7 @@ pub(crate) unsafe fn wu(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_indices_arg = chunk_indices;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut parameters = [
         (&mut key_arg as *mut *const u16).cast::<c_void>(),
         (&mut value_arg as *mut *const u16).cast::<c_void>(),
@@ -195,10 +207,11 @@ pub(crate) unsafe fn wu(
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_indices_arg as *mut *const i32).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.wu.launch(
-            LaunchConfig::new([chunk_count, 32, 1], [512, 1, 1], 0),
+            LaunchConfig::new([chunk_count, heads, 1], [512, 1, 1], 0),
             stream,
             &mut parameters,
         )
@@ -224,6 +237,7 @@ pub(crate) unsafe fn h(
     chunk_offsets: *const i64,
     sequence_count: u32,
     total_tokens: u32,
+    heads: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut key_arg = key;
@@ -236,6 +250,7 @@ pub(crate) unsafe fn h(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_offsets_arg = chunk_offsets;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut parameters = [
         (&mut key_arg as *mut *const u16).cast::<c_void>(),
         (&mut u_arg as *mut *const u16).cast::<c_void>(),
@@ -247,10 +262,11 @@ pub(crate) unsafe fn h(
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_offsets_arg as *mut *const i64).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.h.launch(
-            LaunchConfig::new([4, sequence_count, 32], [512, 1, 1], 0),
+            LaunchConfig::new([4, sequence_count, heads], [512, 1, 1], 0),
             stream,
             &mut parameters,
         )
@@ -275,6 +291,7 @@ pub(crate) unsafe fn output(
     chunk_indices: *const i32,
     total_tokens: u32,
     chunk_count: u32,
+    heads: u32,
     scale: f32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
@@ -287,6 +304,7 @@ pub(crate) unsafe fn output(
     let mut cu_seqlens_arg = cu_seqlens;
     let mut chunk_indices_arg = chunk_indices;
     let mut total_tokens_arg = total_tokens;
+    let mut heads_arg = heads;
     let mut scale_arg = scale;
     let mut parameters = [
         (&mut query_arg as *mut *const u16).cast::<c_void>(),
@@ -298,11 +316,12 @@ pub(crate) unsafe fn output(
         (&mut cu_seqlens_arg as *mut *const i32).cast::<c_void>(),
         (&mut chunk_indices_arg as *mut *const i32).cast::<c_void>(),
         (&mut total_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
         (&mut scale_arg as *mut f32).cast::<c_void>(),
     ];
     unsafe {
         functions()?.output.launch(
-            LaunchConfig::new([2, chunk_count, 32], [512, 1, 1], 0),
+            LaunchConfig::new([2, chunk_count, heads], [512, 1, 1], 0),
             stream,
             &mut parameters,
         )

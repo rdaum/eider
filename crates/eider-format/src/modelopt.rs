@@ -4,6 +4,7 @@
 //! contain no CUDA allocation, stream, or prepared kernel representation.
 
 use crate::{Error, Result, SafeTensorCheckpoint, SafeTensorInfo, SafeTensorShard};
+use std::mem::size_of;
 
 /// Metadata and raw host bytes for one ModelOpt NVFP4 linear weight.
 #[derive(Clone, Debug)]
@@ -48,7 +49,7 @@ pub struct ModelOptFp8Linear {
 /// Weights are E4M3 in row-major `[out, in]` order. One unsigned E8M0 scale
 /// applies to each 128 by 128 weight block.
 #[derive(Clone, Debug)]
-pub struct ModelOptBlockScaledFp8Linear {
+pub struct ModelOptBlockScaledFp8Linear<S = Vec<u8>> {
     /// Tensor name prefix.
     pub prefix: String,
     /// Output feature count.
@@ -57,9 +58,12 @@ pub struct ModelOptBlockScaledFp8Linear {
     pub in_features: usize,
     /// E4M3 weight bytes from `<prefix>.weight`.
     pub weight: Vec<u8>,
-    /// E8M0 block-scale bytes.
-    pub weight_scale: Vec<u8>,
+    /// Block scales in the checkpoint's native scalar type.
+    pub weight_scale: S,
 }
+
+/// A block-scaled E4M3 linear with F32 inverse scales.
+pub type ModelOptF32BlockScaledFp8Linear = ModelOptBlockScaledFp8Linear<Vec<f32>>;
 
 /// Model-family interpretation of a sharded ModelOpt safetensors checkpoint.
 ///
@@ -370,6 +374,41 @@ impl ModelOptCheckpoint {
             "weight_scale_inv",
             &["F8_E8M0FNU", "F8_E8M0"],
         )
+    }
+
+    /// Imports a block-scaled E4M3 linear and converts inverse scales to F32.
+    pub fn load_weight_scale_inv_block_fp8_linear_f32(
+        &self,
+        prefix: &str,
+    ) -> Result<ModelOptF32BlockScaledFp8Linear> {
+        let weight_name = format!("{prefix}.weight");
+        let scale_name = format!("{prefix}.weight_scale_inv");
+        let weight = self.open_shard_for_tensor(&weight_name)?;
+        let scales = self.open_shard_for_tensor(&scale_name)?;
+        let (out_features, in_features) =
+            validate_fp8_weight(weight.require_tensor(&weight_name)?)?;
+        validate_float_block_scaled_fp8_scales(
+            scales.require_tensor(&scale_name)?,
+            out_features,
+            in_features,
+        )?;
+        let weight_scale = scales.read_float_tensor_as_f32(&scale_name)?;
+        if weight_scale
+            .iter()
+            .any(|scale| !scale.is_finite() || *scale < 0.0)
+        {
+            return Err(Error::Format {
+                label: "ModelOpt block-scaled FP8 scale",
+                detail: format!("{scale_name} contains a negative or non-finite scale"),
+            });
+        }
+        Ok(ModelOptBlockScaledFp8Linear {
+            prefix: prefix.to_string(),
+            out_features,
+            in_features,
+            weight: weight.read_tensor_bytes(&weight_name)?,
+            weight_scale,
+        })
     }
 
     fn input_scale_or_unity(&self, name: &str) -> Result<f32> {
@@ -1015,6 +1054,43 @@ fn validate_block_scaled_fp8_scales(
     Ok(())
 }
 
+fn validate_float_block_scaled_fp8_scales(
+    info: &SafeTensorInfo,
+    out_features: usize,
+    in_features: usize,
+) -> Result<()> {
+    if !out_features.is_multiple_of(128) || !in_features.is_multiple_of(128) {
+        return Err(Error::Shape {
+            label: "ModelOpt block-scaled FP8 dimensions",
+            expected: "out and in divisible by 128".to_string(),
+            actual: format!("out={out_features} in={in_features}"),
+        });
+    }
+    let expected_shape = [out_features / 128, in_features / 128];
+    let element_bytes = match info.dtype.as_str() {
+        "BF16" => size_of::<u16>(),
+        "F32" => size_of::<f32>(),
+        _ => 0,
+    };
+    let expected_bytes = expected_shape[0] * expected_shape[1] * element_bytes;
+    if element_bytes == 0
+        || info.shape != expected_shape
+        || info.byte_len() != expected_bytes as u64
+    {
+        return Err(Error::Shape {
+            label: "ModelOpt block-scaled FP8 floating-point scale",
+            expected: format!("dtype in [BF16, F32] shape={expected_shape:?}"),
+            actual: format!(
+                "dtype={} shape={:?} bytes={}",
+                info.dtype,
+                info.shape,
+                info.byte_len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn read_single_f32(shard: &SafeTensorShard, name: &str, label: &'static str) -> Result<f32> {
     let values = shard.read_float_tensor_as_f32(name)?;
     if values.len() != 1 {
@@ -1158,7 +1234,11 @@ fn cublaslt_scale_offset(outer: usize, block: usize, inner: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelOptFp8Linear, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt};
+    use super::{
+        ModelOptFp8Linear, ModelOptNvfp4Linear, modelopt_scales_to_cublaslt,
+        validate_float_block_scaled_fp8_scales,
+    };
+    use crate::SafeTensorInfo;
 
     fn bf16(value: f32) -> u16 {
         let bits = value.to_bits();
@@ -1216,5 +1296,22 @@ mod tests {
         assert_eq!(packed[0], source[0]);
         assert_eq!(packed[16], source[5]);
         assert_eq!(packed[4], source[32 * 5]);
+    }
+
+    #[test]
+    fn floating_block_scales_accept_bf16_and_f32_storage() {
+        for (dtype, bytes) in [("BF16", 8), ("F32", 16)] {
+            validate_float_block_scaled_fp8_scales(
+                &SafeTensorInfo {
+                    dtype: dtype.to_string(),
+                    shape: vec![2, 2],
+                    data_begin: 0,
+                    data_end: bytes,
+                },
+                256,
+                256,
+            )
+            .expect("supported floating-point block scales");
+        }
     }
 }

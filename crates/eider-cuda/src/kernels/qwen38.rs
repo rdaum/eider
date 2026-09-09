@@ -21,11 +21,17 @@ pub struct Qwen38QsaSelectionWorkspace {
     scores: DeviceBuffer<f32>,
     selected_blocks: DeviceBuffer<u8>,
     selected_tiles: DeviceBuffer<u8>,
+    selected_block_indices: DeviceBuffer<u32>,
+    selected_token_tiles: DeviceBuffer<u32>,
+    selected_context_tiles: DeviceBuffer<u32>,
+    selected_counts: DeviceBuffer<u32>,
     max_tokens: usize,
     heads: usize,
     head_dim: usize,
     compress_ratio: usize,
     budget: usize,
+    mask_row_capacity: usize,
+    index_capacity: usize,
 }
 
 /// Sparse masks and effective token count produced for one QSA query.
@@ -34,6 +40,16 @@ pub struct Qwen38QsaSelection<'a> {
     pub selected_blocks: &'a DeviceBuffer<u8>,
     /// One byte per 64-token compact-attention tile.
     pub selected_tiles: &'a DeviceBuffer<u8>,
+    /// Ascending selected four-token block indices.
+    pub selected_block_indices: &'a DeviceBuffer<u32>,
+    /// Ascending eight-token key-tile indices containing selected blocks.
+    pub selected_token_tiles: &'a DeviceBuffer<u32>,
+    /// Ascending 64-token value-tile indices containing selected blocks.
+    pub selected_context_tiles: &'a DeviceBuffer<u32>,
+    /// Three counts per row: blocks, key tiles, and value tiles.
+    pub selected_counts: &'a DeviceBuffer<u32>,
+    /// Number of entries reserved for each row in every index array.
+    pub index_capacity: usize,
     /// Number of visible tokens selected by QSA, including the incomplete tail.
     pub selected_tokens: usize,
 }
@@ -113,6 +129,21 @@ impl Qwen38QsaIndexPool {
         heads: usize,
         stream: &CudaStream,
     ) -> Result<()> {
+        self.append_keys_at_offset_on_stream(projection, 0, slot, page_offset, 1, heads, stream)
+    }
+
+    /// Appends consecutive raw index keys from a larger projection buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_keys_at_offset_on_stream(
+        &mut self,
+        projection: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        slot: usize,
+        page_offset: usize,
+        rows: usize,
+        heads: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let projection_values =
             (heads + 1)
                 .checked_mul(self.head_dim)
@@ -121,21 +152,37 @@ impl Qwen38QsaIndexPool {
                     expected: "projection size without overflow".to_string(),
                     actual: format!("heads={heads} head_dim={}", self.head_dim),
                 })?;
-        if projection.len() != projection_values
+        let projection_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(projection_values));
+        if rows == 0
+            || projection_end.is_none_or(|end| end > projection.len())
             || slot >= self.page_slots
-            || page_offset >= SM12X_KV_PAGE_TOKENS
+            || page_offset
+                .checked_add(rows)
+                .is_none_or(|end| end > SM12X_KV_PAGE_TOKENS)
             || heads == 0
-            || [slot, page_offset, heads, self.head_dim]
-                .into_iter()
-                .any(|value| value > u32::MAX as usize)
+            || input_row_offset
+                .checked_add(rows)
+                .is_none_or(|end| end > u32::MAX as usize)
+            || [
+                input_row_offset,
+                slot,
+                page_offset,
+                rows,
+                heads,
+                self.head_dim,
+            ]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
         {
             return Err(Error::Shape {
                 label: "Qwen3.8 QSA index-key append",
                 expected: format!(
-                    "projection={projection_values}, valid slot/page offset, and positive heads"
+                    "projection rows of {projection_values} values within one page, and positive heads"
                 ),
                 actual: format!(
-                    "projection={} slot={slot}/{} page_offset={page_offset} heads={heads} head_dim={}",
+                    "projection={} input_row_offset={input_row_offset} rows={rows} slot={slot}/{} page_offset={page_offset} heads={heads} head_dim={}",
                     projection.len(),
                     self.page_slots,
                     self.head_dim
@@ -144,22 +191,24 @@ impl Qwen38QsaIndexPool {
         }
         #[cfg(feature = "cuda-oxide")]
         unsafe {
-            qwen38_oxide::qsa_append_key(
+            qwen38_oxide::qsa_append_keys(
                 projection.ptr,
                 self.values.ptr,
+                input_row_offset as u32,
                 slot as u32,
                 page_offset as u32,
                 SM12X_KV_PAGE_TOKENS as u32,
                 heads as u32,
                 self.head_dim as u32,
+                rows as u32,
                 stream.as_raw(),
             )
         }
         #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
             check_cuda(
-                "infer_qwen38_qsa_append_key_on_stream",
-                ffi::infer_qwen38_qsa_append_key_on_stream(
+                "infer_qwen38_qsa_append_keys_on_stream",
+                ffi::infer_qwen38_qsa_append_keys_on_stream(
                     projection.ptr,
                     self.values.ptr,
                     slot as u32,
@@ -168,6 +217,8 @@ impl Qwen38QsaIndexPool {
                     self.page_slots as u32,
                     heads as u32,
                     self.head_dim as u32,
+                    input_row_offset as u32,
+                    rows as u32,
                     stream.as_raw(),
                 ),
             )
@@ -184,13 +235,26 @@ impl Qwen38QsaSelectionWorkspace {
         compress_ratio: usize,
         budget: usize,
     ) -> Result<Self> {
+        Self::new_with_mask_rows(max_tokens, heads, head_dim, compress_ratio, budget, 1)
+    }
+
+    /// Allocates selection scratch and independent masks for several prompt rows.
+    pub fn new_with_mask_rows(
+        max_tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        compress_ratio: usize,
+        budget: usize,
+        mask_row_capacity: usize,
+    ) -> Result<Self> {
         if max_tokens == 0
             || heads == 0
             || head_dim == 0
             || compress_ratio != 4
             || budget == 0
+            || mask_row_capacity == 0
             || !budget.is_multiple_of(compress_ratio)
-            || [max_tokens, heads, head_dim, budget]
+            || [max_tokens, heads, head_dim, budget, mask_row_capacity]
                 .into_iter()
                 .any(|value| value > u32::MAX as usize)
         {
@@ -199,22 +263,58 @@ impl Qwen38QsaSelectionWorkspace {
                 expected: "positive u32 dimensions, four-token compression, and divisible budget"
                     .to_string(),
                 actual: format!(
-                    "max_tokens={max_tokens} heads={heads} head_dim={head_dim} compress={compress_ratio} budget={budget}"
+                    "max_tokens={max_tokens} heads={heads} head_dim={head_dim} compress={compress_ratio} budget={budget} mask_rows={mask_row_capacity}"
                 ),
             });
         }
         let blocks = max_tokens.div_ceil(compress_ratio);
         let tiles = max_tokens.div_ceil(64);
+        let block_values = blocks
+            .checked_mul(mask_row_capacity)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 QSA selection block masks",
+                expected: "mask size without overflow".to_string(),
+                actual: format!("blocks={blocks} rows={mask_row_capacity}"),
+            })?;
+        let tile_values = tiles
+            .checked_mul(mask_row_capacity)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 QSA selection tile masks",
+                expected: "mask size without overflow".to_string(),
+                actual: format!("tiles={tiles} rows={mask_row_capacity}"),
+            })?;
+        let query_values = heads
+            .checked_mul(head_dim)
+            .and_then(|values| values.checked_mul(mask_row_capacity))
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 QSA selection queries",
+                expected: "query size without overflow".to_string(),
+                actual: format!("heads={heads} head_dim={head_dim} rows={mask_row_capacity}"),
+            })?;
+        let index_capacity = budget / compress_ratio + 1;
+        let index_values = index_capacity
+            .checked_mul(mask_row_capacity)
+            .ok_or_else(|| Error::Shape {
+                label: "Qwen3.8 QSA selection indices",
+                expected: "index size without overflow".to_string(),
+                actual: format!("capacity={index_capacity} rows={mask_row_capacity}"),
+            })?;
         Ok(Self {
-            query: DeviceBuffer::zeroed(heads * head_dim)?,
-            scores: DeviceBuffer::zeroed(blocks)?,
-            selected_blocks: DeviceBuffer::zeroed(blocks)?,
-            selected_tiles: DeviceBuffer::zeroed(tiles)?,
+            query: DeviceBuffer::zeroed(query_values)?,
+            scores: DeviceBuffer::zeroed(block_values)?,
+            selected_blocks: DeviceBuffer::zeroed(block_values)?,
+            selected_tiles: DeviceBuffer::zeroed(tile_values)?,
+            selected_block_indices: DeviceBuffer::zeroed(index_values)?,
+            selected_token_tiles: DeviceBuffer::zeroed(index_values)?,
+            selected_context_tiles: DeviceBuffer::zeroed(index_values)?,
+            selected_counts: DeviceBuffer::zeroed(mask_row_capacity * 3)?,
             max_tokens,
             heads,
             head_dim,
             compress_ratio,
             budget,
+            mask_row_capacity,
+            index_capacity,
         })
     }
 
@@ -235,9 +335,178 @@ impl Qwen38QsaSelectionWorkspace {
         theta: f32,
         stream: &CudaStream,
     ) -> Result<Qwen38QsaSelection<'a>> {
+        self.prepare_and_select_impl_on_stream(
+            projection,
+            0,
+            q_norm,
+            k_norm,
+            pool,
+            page_table,
+            slot,
+            page_offset,
+            cache_len,
+            rotary_dim,
+            eps,
+            theta,
+            stream,
+        )
+    }
+
+    /// Selects independent masks for consecutive queries after key append.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_appended_rows_at_offset_on_stream(
+        &mut self,
+        projection: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        q_norm: &DeviceBuffer<f32>,
+        k_norm: &DeviceBuffer<f32>,
+        pool: &Qwen38QsaIndexPool,
+        page_table: &DeviceBuffer<u32>,
+        start_cache_len: usize,
+        rows: usize,
+        rotary_dim: usize,
+        eps: f32,
+        theta: f32,
+        stream: &CudaStream,
+    ) -> Result<()> {
         let projection_values = (self.heads + 1) * self.head_dim;
+        let projection_end = input_row_offset
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(projection_values));
+        let final_cache_len = start_cache_len.saturating_add(rows.saturating_sub(1));
+        let logical_pages = final_cache_len.div_ceil(SM12X_KV_PAGE_TOKENS);
+        if rows == 0
+            || rows > self.mask_row_capacity
+            || projection_end.is_none_or(|end| end > projection.len())
+            || q_norm.len() != self.head_dim
+            || k_norm.len() != self.head_dim
+            || pool.head_dim != self.head_dim
+            || start_cache_len == 0
+            || final_cache_len > self.max_tokens
+            || page_table.len() < logical_pages
+            || rotary_dim == 0
+            || rotary_dim > self.head_dim
+            || !rotary_dim.is_multiple_of(2)
+            || eps <= 0.0
+            || !theta.is_finite()
+            || theta <= 0.0
+            || [input_row_offset, start_cache_len, rows]
+                .into_iter()
+                .any(|value| value > u32::MAX as usize)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA batched selection",
+                expected: format!(
+                    "1..={} valid projection rows and cache positions through {}",
+                    self.mask_row_capacity, self.max_tokens
+                ),
+                actual: format!(
+                    "projection={} input_row_offset={input_row_offset} rows={rows} cache={start_cache_len}..={final_cache_len} pages={}/{logical_pages}",
+                    projection.len(),
+                    page_table.len()
+                ),
+            });
+        }
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            qwen38_oxide::qsa_select_appended_rows(
+                projection.ptr,
+                q_norm.ptr,
+                k_norm.ptr,
+                pool.values.ptr,
+                page_table.as_const_ptr().cast(),
+                self.query.ptr,
+                self.scores.ptr,
+                self.selected_blocks.ptr,
+                self.selected_tiles.ptr,
+                self.selected_block_indices.ptr,
+                self.selected_token_tiles.ptr,
+                self.selected_context_tiles.ptr,
+                self.selected_counts.ptr,
+                input_row_offset as u32,
+                start_cache_len as u32,
+                rows as u32,
+                self.max_tokens as u32,
+                SM12X_KV_PAGE_TOKENS as u32,
+                self.heads as u32,
+                self.head_dim as u32,
+                rotary_dim as u32,
+                self.compress_ratio as u32,
+                self.budget as u32,
+                self.index_capacity as u32,
+                eps,
+                theta,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        unsafe {
+            check_cuda(
+                "infer_qwen38_qsa_select_appended_rows_on_stream",
+                ffi::infer_qwen38_qsa_select_appended_rows_on_stream(
+                    projection.ptr,
+                    q_norm.ptr,
+                    k_norm.ptr,
+                    pool.values.ptr,
+                    page_table.as_const_ptr().cast(),
+                    self.query.ptr,
+                    self.scores.ptr,
+                    self.selected_blocks.ptr,
+                    self.selected_tiles.ptr,
+                    self.selected_block_indices.ptr,
+                    self.selected_token_tiles.ptr,
+                    self.selected_context_tiles.ptr,
+                    self.selected_counts.ptr,
+                    input_row_offset as u32,
+                    start_cache_len as u32,
+                    rows as u32,
+                    self.max_tokens as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    self.heads as u32,
+                    self.head_dim as u32,
+                    rotary_dim as u32,
+                    self.compress_ratio as u32,
+                    self.budget as u32,
+                    self.index_capacity as u32,
+                    eps,
+                    theta,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_and_select_impl_on_stream<'a>(
+        &'a mut self,
+        projection: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        q_norm: &DeviceBuffer<f32>,
+        k_norm: &DeviceBuffer<f32>,
+        pool: &mut Qwen38QsaIndexPool,
+        page_table: &DeviceBuffer<u32>,
+        slot: usize,
+        page_offset: usize,
+        cache_len: usize,
+        rotary_dim: usize,
+        eps: f32,
+        theta: f32,
+        stream: &CudaStream,
+    ) -> Result<Qwen38QsaSelection<'a>> {
+        let projection_values = (self.heads + 1) * self.head_dim;
+        let projection_offset =
+            input_row_offset
+                .checked_mul(projection_values)
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 QSA selection projection",
+                    expected: "row offset without overflow".to_string(),
+                    actual: format!(
+                        "input_row_offset={input_row_offset} row_values={projection_values}"
+                    ),
+                })?;
+        let projection_end = projection_offset.checked_add(projection_values);
         let logical_pages = cache_len.div_ceil(SM12X_KV_PAGE_TOKENS);
-        if projection.len() != projection_values
+        if projection_end.is_none_or(|end| end > projection.len())
             || q_norm.len() != self.head_dim
             || k_norm.len() != self.head_dim
             || pool.head_dim != self.head_dim
@@ -260,7 +529,7 @@ impl Qwen38QsaSelectionWorkspace {
                     self.head_dim
                 ),
                 actual: format!(
-                    "projection={} q_norm={} k_norm={} slot={slot}/{} page_offset={page_offset} cache_len={cache_len}/{} pages={} needed={logical_pages} rotary_dim={rotary_dim} eps={eps} theta={theta}",
+                    "projection={} input_row_offset={input_row_offset} q_norm={} k_norm={} slot={slot}/{} page_offset={page_offset} cache_len={cache_len}/{} pages={} needed={logical_pages} rotary_dim={rotary_dim} eps={eps} theta={theta}",
                     projection.len(),
                     q_norm.len(),
                     k_norm.len(),
@@ -273,7 +542,7 @@ impl Qwen38QsaSelectionWorkspace {
         #[cfg(feature = "cuda-oxide")]
         unsafe {
             qwen38_oxide::qsa_prepare_and_select(
-                projection.ptr,
+                projection.ptr.add(projection_offset),
                 q_norm.ptr,
                 k_norm.ptr,
                 pool.values.ptr,
@@ -282,6 +551,10 @@ impl Qwen38QsaSelectionWorkspace {
                 self.scores.ptr,
                 self.selected_blocks.ptr,
                 self.selected_tiles.ptr,
+                self.selected_block_indices.ptr,
+                self.selected_token_tiles.ptr,
+                self.selected_context_tiles.ptr,
+                self.selected_counts.ptr,
                 slot as u32,
                 page_offset as u32,
                 cache_len as u32,
@@ -292,6 +565,7 @@ impl Qwen38QsaSelectionWorkspace {
                 rotary_dim as u32,
                 self.compress_ratio as u32,
                 self.budget as u32,
+                self.index_capacity as u32,
                 eps,
                 theta,
                 stream.as_raw(),
@@ -302,7 +576,7 @@ impl Qwen38QsaSelectionWorkspace {
             check_cuda(
                 "infer_qwen38_qsa_prepare_and_select_on_stream",
                 ffi::infer_qwen38_qsa_prepare_and_select_on_stream(
-                    projection.ptr,
+                    projection.ptr.add(projection_offset),
                     q_norm.ptr,
                     k_norm.ptr,
                     pool.values.ptr,
@@ -311,6 +585,10 @@ impl Qwen38QsaSelectionWorkspace {
                     self.scores.ptr,
                     self.selected_blocks.ptr,
                     self.selected_tiles.ptr,
+                    self.selected_block_indices.ptr,
+                    self.selected_token_tiles.ptr,
+                    self.selected_context_tiles.ptr,
+                    self.selected_counts.ptr,
                     slot as u32,
                     page_offset as u32,
                     cache_len as u32,
@@ -322,6 +600,7 @@ impl Qwen38QsaSelectionWorkspace {
                     rotary_dim as u32,
                     self.compress_ratio as u32,
                     self.budget as u32,
+                    self.index_capacity as u32,
                     eps,
                     theta,
                     stream.as_raw(),
@@ -335,6 +614,11 @@ impl Qwen38QsaSelectionWorkspace {
         Ok(Qwen38QsaSelection {
             selected_blocks: &self.selected_blocks,
             selected_tiles: &self.selected_tiles,
+            selected_block_indices: &self.selected_block_indices,
+            selected_token_tiles: &self.selected_token_tiles,
+            selected_context_tiles: &self.selected_context_tiles,
+            selected_counts: &self.selected_counts,
+            index_capacity: self.index_capacity,
             selected_tokens,
         })
     }
@@ -349,12 +633,56 @@ impl Qwen38QsaSelectionWorkspace {
         &self.scores
     }
 
+    /// Returns all row-major four-token selection masks.
+    pub fn selected_blocks(&self) -> &DeviceBuffer<u8> {
+        &self.selected_blocks
+    }
+
+    /// Returns all row-major 64-token tile masks.
+    pub fn selected_tiles(&self) -> &DeviceBuffer<u8> {
+        &self.selected_tiles
+    }
+
+    /// Returns ascending selected four-token block indices for all rows.
+    pub fn selected_block_indices(&self) -> &DeviceBuffer<u32> {
+        &self.selected_block_indices
+    }
+
+    /// Returns ascending selected eight-token key-tile indices for all rows.
+    pub fn selected_token_tiles(&self) -> &DeviceBuffer<u32> {
+        &self.selected_token_tiles
+    }
+
+    /// Returns ascending selected 64-token value-tile indices for all rows.
+    pub fn selected_context_tiles(&self) -> &DeviceBuffer<u32> {
+        &self.selected_context_tiles
+    }
+
+    /// Returns three list lengths per row: blocks, key tiles, and value tiles.
+    pub fn selected_counts(&self) -> &DeviceBuffer<u32> {
+        &self.selected_counts
+    }
+
+    /// Returns the number of list entries retained for each row.
+    pub fn index_capacity(&self) -> usize {
+        self.index_capacity
+    }
+
+    /// Returns the number of independently retained mask rows.
+    pub fn mask_row_capacity(&self) -> usize {
+        self.mask_row_capacity
+    }
+
     /// Returns the exact bytes owned by selection scratch.
     pub fn device_bytes(&self) -> usize {
         self.query.device_bytes()
             + self.scores.device_bytes()
             + self.selected_blocks.device_bytes()
             + self.selected_tiles.device_bytes()
+            + self.selected_block_indices.device_bytes()
+            + self.selected_token_tiles.device_bytes()
+            + self.selected_context_tiles.device_bytes()
+            + self.selected_counts.device_bytes()
     }
 }
 
@@ -1020,6 +1348,8 @@ mod tests {
             .expect("clear append pool");
         let mut selector =
             Qwen38QsaSelectionWorkspace::new(128, HEADS, HEAD_DIM, 4, 128).expect("selector");
+        let mut append_selector = Qwen38QsaSelectionWorkspace::new(128, HEADS, HEAD_DIM, 4, 128)
+            .expect("append selector");
         selector
             .prepare_and_select_on_stream(
                 &projection,
@@ -1039,6 +1369,22 @@ mod tests {
         append_pool
             .append_key_on_stream(&projection, 0, 0, HEADS, &stream)
             .expect("append only");
+        append_selector
+            .select_appended_rows_at_offset_on_stream(
+                &projection,
+                0,
+                &norm,
+                &norm,
+                &append_pool,
+                &page_table,
+                1,
+                1,
+                64,
+                1e-6,
+                10_000_000.0,
+                &stream,
+            )
+            .expect("selection after append");
         assert_eq!(
             selected_pool
                 .values
@@ -1049,6 +1395,253 @@ mod tests {
                 .copy_to_host(&stream)
                 .expect("append pool readback")
         );
+        assert_eq!(
+            selector
+                .query
+                .copy_to_host(&stream)
+                .expect("query readback"),
+            append_selector
+                .query
+                .copy_to_host(&stream)
+                .expect("append query readback")
+        );
+        assert_eq!(
+            selector
+                .selected_blocks
+                .copy_to_host(&stream)
+                .expect("selected blocks readback"),
+            append_selector
+                .selected_blocks
+                .copy_to_host(&stream)
+                .expect("append selected blocks readback")
+        );
+    }
+
+    #[test]
+    fn qsa_batched_index_key_append_matches_individual_rows() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 128;
+        const INPUT_ROWS: usize = 5;
+        const INPUT_OFFSET: usize = 1;
+        const ROWS: usize = 3;
+        const PAGE_OFFSET: usize = 7;
+        let row_values = (HEADS + 1) * HEAD_DIM;
+        let projection_host = (0..INPUT_ROWS * row_values)
+            .map(|index| (index as f32 - 919.0) / 137.0)
+            .collect::<Vec<_>>();
+        let projection = DeviceBuffer::from_host(&projection_host).expect("projection");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut batched_pool = Qwen38QsaIndexPool::new(1, HEAD_DIM).expect("batched pool");
+        let mut serial_pool = Qwen38QsaIndexPool::new(1, HEAD_DIM).expect("serial pool");
+        let empty_page = vec![0u16; crate::SM12X_KV_PAGE_TOKENS * HEAD_DIM];
+        batched_pool
+            .values
+            .copy_from_host(&empty_page)
+            .expect("clear batched pool");
+        serial_pool
+            .values
+            .copy_from_host(&empty_page)
+            .expect("clear serial pool");
+
+        batched_pool
+            .append_keys_at_offset_on_stream(
+                &projection,
+                INPUT_OFFSET,
+                0,
+                PAGE_OFFSET,
+                ROWS,
+                HEADS,
+                &stream,
+            )
+            .expect("batched append");
+        for row in 0..ROWS {
+            let start = (INPUT_OFFSET + row) * row_values;
+            let row_projection =
+                DeviceBuffer::from_host(&projection_host[start..start + row_values])
+                    .expect("row projection");
+            serial_pool
+                .append_key_on_stream(&row_projection, 0, PAGE_OFFSET + row, HEADS, &stream)
+                .expect("serial append");
+        }
+
+        assert_eq!(
+            batched_pool
+                .values
+                .copy_to_host(&stream)
+                .expect("batched readback"),
+            serial_pool
+                .values
+                .copy_to_host(&stream)
+                .expect("serial readback")
+        );
+    }
+
+    #[test]
+    fn qsa_batched_sparse_selection_matches_individual_rows() {
+        const HEADS: usize = 4;
+        const HEAD_DIM: usize = 128;
+        const MAX_TOKENS: usize = 128;
+        const BUDGET: usize = 64;
+        const START_CACHE_LEN: usize = 65;
+        const ROWS: usize = 4;
+        let projection_rows = START_CACHE_LEN + ROWS - 1;
+        let projection_width = (HEADS + 1) * HEAD_DIM;
+        let projection = DeviceBuffer::from_host(
+            &(0..projection_rows * projection_width)
+                .map(|index| ((index * 17 + 11) % 509) as f32 / 127.0 - 2.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("projection");
+        let norm = DeviceBuffer::from_host(
+            &(0..HEAD_DIM)
+                .map(|index| 0.75 + index as f32 / 512.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("norm");
+        let page_table = DeviceBuffer::from_host(&[0u32]).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut pool = Qwen38QsaIndexPool::new(1, HEAD_DIM).expect("index pool");
+        pool.append_keys_at_offset_on_stream(&projection, 0, 0, 0, projection_rows, HEADS, &stream)
+            .expect("append keys");
+
+        let mut batched = Qwen38QsaSelectionWorkspace::new_with_mask_rows(
+            MAX_TOKENS, HEADS, HEAD_DIM, 4, BUDGET, ROWS,
+        )
+        .expect("batched selector");
+        batched
+            .select_appended_rows_at_offset_on_stream(
+                &projection,
+                START_CACHE_LEN - 1,
+                &norm,
+                &norm,
+                &pool,
+                &page_table,
+                START_CACHE_LEN,
+                ROWS,
+                64,
+                1e-6,
+                10_000_000.0,
+                &stream,
+            )
+            .expect("batched selection");
+        let batch_queries = batched.query.copy_to_host(&stream).expect("batch queries");
+        let batch_scores = batched.scores.copy_to_host(&stream).expect("batch scores");
+        let batch_blocks = batched
+            .selected_blocks
+            .copy_to_host(&stream)
+            .expect("batch blocks");
+        let batch_tiles = batched
+            .selected_tiles
+            .copy_to_host(&stream)
+            .expect("batch tiles");
+        let batch_block_indices = batched
+            .selected_block_indices
+            .copy_to_host(&stream)
+            .expect("batch block indices");
+        let batch_token_tiles = batched
+            .selected_token_tiles
+            .copy_to_host(&stream)
+            .expect("batch token tiles");
+        let batch_context_tiles = batched
+            .selected_context_tiles
+            .copy_to_host(&stream)
+            .expect("batch context tiles");
+        let batch_counts = batched
+            .selected_counts
+            .copy_to_host(&stream)
+            .expect("batch counts");
+
+        let query_values = HEADS * HEAD_DIM;
+        let block_values = MAX_TOKENS.div_ceil(4);
+        let tile_values = MAX_TOKENS.div_ceil(64);
+        let index_capacity = batched.index_capacity;
+        for row in 0..ROWS {
+            let mut serial =
+                Qwen38QsaSelectionWorkspace::new(MAX_TOKENS, HEADS, HEAD_DIM, 4, BUDGET)
+                    .expect("serial selector");
+            serial
+                .select_appended_rows_at_offset_on_stream(
+                    &projection,
+                    START_CACHE_LEN - 1 + row,
+                    &norm,
+                    &norm,
+                    &pool,
+                    &page_table,
+                    START_CACHE_LEN + row,
+                    1,
+                    64,
+                    1e-6,
+                    10_000_000.0,
+                    &stream,
+                )
+                .expect("serial selection");
+            let serial_query = serial.query.copy_to_host(&stream).expect("serial query");
+            let serial_scores = serial.scores.copy_to_host(&stream).expect("serial scores");
+            let serial_blocks = serial
+                .selected_blocks
+                .copy_to_host(&stream)
+                .expect("serial blocks");
+            let serial_tiles = serial
+                .selected_tiles
+                .copy_to_host(&stream)
+                .expect("serial tiles");
+            let serial_block_indices = serial
+                .selected_block_indices
+                .copy_to_host(&stream)
+                .expect("serial block indices");
+            let serial_token_tiles = serial
+                .selected_token_tiles
+                .copy_to_host(&stream)
+                .expect("serial token tiles");
+            let serial_context_tiles = serial
+                .selected_context_tiles
+                .copy_to_host(&stream)
+                .expect("serial context tiles");
+            let serial_counts = serial
+                .selected_counts
+                .copy_to_host(&stream)
+                .expect("serial counts");
+            assert_eq!(
+                &batch_queries[row * query_values..(row + 1) * query_values],
+                serial_query.as_slice()
+            );
+            assert_eq!(
+                &batch_scores[row * block_values..(row + 1) * block_values],
+                serial_scores.as_slice()
+            );
+            assert_eq!(
+                &batch_blocks[row * block_values..(row + 1) * block_values],
+                serial_blocks.as_slice()
+            );
+            assert_eq!(
+                &batch_tiles[row * tile_values..(row + 1) * tile_values],
+                serial_tiles.as_slice()
+            );
+            assert_eq!(
+                &batch_counts[row * 3..row * 3 + 3],
+                serial_counts.as_slice()
+            );
+            let row_indices = row * index_capacity;
+            for (batch_values, serial_values, count) in [
+                (
+                    &batch_block_indices,
+                    &serial_block_indices,
+                    serial_counts[0],
+                ),
+                (&batch_token_tiles, &serial_token_tiles, serial_counts[1]),
+                (
+                    &batch_context_tiles,
+                    &serial_context_tiles,
+                    serial_counts[2],
+                ),
+            ] {
+                let count = count as usize;
+                assert_eq!(
+                    &batch_values[row_indices..row_indices + count],
+                    &serial_values[..count]
+                );
+            }
+        }
     }
 
     fn rms_norm(values: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {

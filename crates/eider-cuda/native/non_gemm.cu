@@ -8138,6 +8138,33 @@ extern "C" cudaError_t infer_bf16_linear_two_rows_f32_on_stream(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t infer_bf16_linear_exact_rows_f32_on_stream(
+    const float* input,
+    const std::uint16_t* weight,
+    float* logits,
+    std::uint32_t batch_size,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || logits == nullptr || batch_size == 0 ||
+        rows == 0 || cols == 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr int kThreads = 256;
+    const std::size_t shmem =
+        kThreads * sizeof(float) + static_cast<std::size_t>(cols) * sizeof(float);
+    const cudaError_t shared_memory_status = cudaFuncSetAttribute(
+        infer_bf16_matvec_logits_batch_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shmem));
+    if (shared_memory_status != cudaSuccess) {
+        return shared_memory_status;
+    }
+    infer_bf16_matvec_logits_batch_kernel<<<dim3(rows, batch_size, 1), kThreads, shmem, stream>>>(
+        input, weight, logits, batch_size, rows, cols);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t infer_bf16_linear_pair_logits_f32_on_stream(
     const float* input,
     const std::uint16_t* first_weight,

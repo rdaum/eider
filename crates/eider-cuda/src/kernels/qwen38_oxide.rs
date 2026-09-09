@@ -18,7 +18,7 @@ struct Functions {
     ple_conv_update: Kernel,
     qsa_clear_masks: Kernel,
     qsa_prepare_query: Kernel,
-    qsa_append_key: Kernel,
+    qsa_append_keys: Kernel,
     qsa_score_blocks: Kernel,
     qsa_select_blocks: Kernel,
     qsa_build_tile_mask: Kernel,
@@ -36,7 +36,7 @@ impl Functions {
             ple_conv_update: Kernel::load(c"qwen38_ple_conv_update_f32")?,
             qsa_clear_masks: Kernel::load(c"qwen38_qsa_clear_masks")?,
             qsa_prepare_query: Kernel::load(c"qwen38_qsa_prepare_query_f32")?,
-            qsa_append_key: Kernel::load(c"qwen38_qsa_append_key_f32")?,
+            qsa_append_keys: Kernel::load(c"qwen38_qsa_append_keys_f32")?,
             qsa_score_blocks: Kernel::load(c"qwen38_qsa_score_blocks_f32")?,
             qsa_select_blocks: Kernel::load(c"qwen38_qsa_select_blocks_f32")?,
             qsa_build_tile_mask: Kernel::load(c"qwen38_qsa_build_tile_mask")?,
@@ -342,18 +342,21 @@ pub(crate) unsafe fn ple_conv_update(
 ///
 /// The buffers must match the validated QSA page geometry.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn qsa_append_key(
+pub(crate) unsafe fn qsa_append_keys(
     projection: *const f32,
     key_pool_bf16: *mut u16,
+    input_row_offset: u32,
     slot: u32,
     page_offset: u32,
     page_tokens: u32,
     heads: u32,
     head_dim: u32,
+    rows: u32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
     let mut projection_arg = projection;
     let mut key_pool_arg = key_pool_bf16;
+    let mut input_row_offset_arg = input_row_offset;
     let mut slot_arg = slot;
     let mut page_offset_arg = page_offset;
     let mut page_tokens_arg = page_tokens;
@@ -362,6 +365,7 @@ pub(crate) unsafe fn qsa_append_key(
     let mut parameters = [
         (&mut projection_arg as *mut *const f32).cast::<c_void>(),
         (&mut key_pool_arg as *mut *mut u16).cast::<c_void>(),
+        (&mut input_row_offset_arg as *mut u32).cast::<c_void>(),
         (&mut slot_arg as *mut u32).cast::<c_void>(),
         (&mut page_offset_arg as *mut u32).cast::<c_void>(),
         (&mut page_tokens_arg as *mut u32).cast::<c_void>(),
@@ -369,8 +373,12 @@ pub(crate) unsafe fn qsa_append_key(
         (&mut head_dim_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
-        functions()?.qsa_append_key.launch(
-            LaunchConfig::new(grid(u64::from(head_dim), 128), block(128), 0),
+        functions()?.qsa_append_keys.launch(
+            LaunchConfig::new(
+                [u64::from(head_dim).div_ceil(128) as u32, rows, 1],
+                block(128),
+                0,
+            ),
             stream,
             &mut parameters,
         )
@@ -378,6 +386,208 @@ pub(crate) unsafe fn qsa_append_key(
 }
 
 /// Prepares, scores, and selects Qwen3.8 Flash Next QSA blocks.
+///
+/// # Safety
+///
+/// The buffers must match the validated QSA workspace and page geometry.
+#[allow(clippy::too_many_arguments)]
+unsafe fn qsa_select_rows(
+    projection: *const f32,
+    q_norm: *const f32,
+    k_norm: *const f32,
+    key_pool_bf16: *mut u16,
+    page_table: *const u32,
+    query: *mut f32,
+    scores: *mut f32,
+    selected_blocks: *mut u8,
+    selected_tiles: *mut u8,
+    selected_block_indices: *mut u32,
+    selected_token_tiles: *mut u32,
+    selected_context_tiles: *mut u32,
+    selected_counts: *mut u32,
+    input_row_offset: u32,
+    start_cache_len: u32,
+    rows: u32,
+    slot: u32,
+    page_offset: u32,
+    max_tokens: u32,
+    page_tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    compress_ratio: u32,
+    budget: u32,
+    index_capacity: u32,
+    append_key: bool,
+    eps: f32,
+    theta: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let final_cache_len = start_cache_len + rows - 1;
+    let complete_blocks = final_cache_len / compress_ratio;
+    let max_blocks = max_tokens.div_ceil(compress_ratio);
+    let max_tiles = max_tokens.div_ceil(64);
+
+    let mut selected_blocks_arg = selected_blocks;
+    let mut selected_tiles_arg = selected_tiles;
+    let mask_blocks = max_blocks * rows;
+    let mask_tiles = max_tiles * rows;
+    let mut max_blocks_arg = mask_blocks;
+    let mut max_tiles_arg = mask_tiles;
+    let mut clear_parameters = [
+        (&mut selected_blocks_arg as *mut *mut u8).cast::<c_void>(),
+        (&mut selected_tiles_arg as *mut *mut u8).cast::<c_void>(),
+        (&mut max_blocks_arg as *mut u32).cast::<c_void>(),
+        (&mut max_tiles_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.qsa_clear_masks.launch(
+            LaunchConfig::new(
+                grid(u64::from(mask_blocks.max(mask_tiles)), THREADS),
+                block(THREADS),
+                0,
+            ),
+            stream,
+            &mut clear_parameters,
+        )?;
+    }
+
+    let mut projection_arg = projection;
+    let mut q_norm_arg = q_norm;
+    let mut query_arg = query;
+    let mut heads_arg = heads;
+    let mut head_dim_arg = head_dim;
+    let mut rotary_dim_arg = rotary_dim;
+    let mut input_row_offset_arg = input_row_offset;
+    let mut start_position_arg = start_cache_len - 1;
+    let mut eps_arg = eps;
+    let mut theta_arg = theta;
+    let mut query_parameters = [
+        (&mut projection_arg as *mut *const f32).cast::<c_void>(),
+        (&mut q_norm_arg as *mut *const f32).cast::<c_void>(),
+        (&mut query_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut heads_arg as *mut u32).cast::<c_void>(),
+        (&mut head_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
+        (&mut input_row_offset_arg as *mut u32).cast::<c_void>(),
+        (&mut start_position_arg as *mut u32).cast::<c_void>(),
+        (&mut eps_arg as *mut f32).cast::<c_void>(),
+        (&mut theta_arg as *mut f32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.qsa_prepare_query.launch(
+            LaunchConfig::new([heads, rows, 1], block(head_dim), 0),
+            stream,
+            &mut query_parameters,
+        )?;
+        if append_key {
+            qsa_append_keys(
+                projection,
+                key_pool_bf16,
+                input_row_offset,
+                slot,
+                page_offset,
+                page_tokens,
+                heads,
+                head_dim,
+                rows,
+                stream,
+            )?;
+        }
+    }
+
+    if complete_blocks != 0 {
+        let mut query_arg = query;
+        let mut key_pool_arg = key_pool_bf16.cast_const();
+        let mut page_table_arg = page_table;
+        let mut k_norm_arg = k_norm;
+        let mut scores_arg = scores;
+        let mut page_tokens_arg = page_tokens;
+        let mut heads_arg = heads;
+        let mut head_dim_arg = head_dim;
+        let mut rotary_dim_arg = rotary_dim;
+        let mut start_cache_len_arg = start_cache_len;
+        let mut rows_arg = rows;
+        let mut max_blocks_arg = max_blocks;
+        let mut eps_arg = eps;
+        let mut theta_arg = theta;
+        let mut score_parameters = [
+            (&mut query_arg as *mut *mut f32).cast::<c_void>(),
+            (&mut key_pool_arg as *mut *const u16).cast::<c_void>(),
+            (&mut page_table_arg as *mut *const u32).cast::<c_void>(),
+            (&mut k_norm_arg as *mut *const f32).cast::<c_void>(),
+            (&mut scores_arg as *mut *mut f32).cast::<c_void>(),
+            (&mut page_tokens_arg as *mut u32).cast::<c_void>(),
+            (&mut heads_arg as *mut u32).cast::<c_void>(),
+            (&mut head_dim_arg as *mut u32).cast::<c_void>(),
+            (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
+            (&mut start_cache_len_arg as *mut u32).cast::<c_void>(),
+            (&mut rows_arg as *mut u32).cast::<c_void>(),
+            (&mut max_blocks_arg as *mut u32).cast::<c_void>(),
+            (&mut eps_arg as *mut f32).cast::<c_void>(),
+            (&mut theta_arg as *mut f32).cast::<c_void>(),
+        ];
+        unsafe {
+            functions()?.qsa_score_blocks.launch(
+                LaunchConfig::new([complete_blocks, 1, 1], block(head_dim), 0),
+                stream,
+                &mut score_parameters,
+            )?;
+        }
+    }
+
+    let mut scores_arg = scores.cast_const();
+    let mut selected_blocks_arg = selected_blocks;
+    let mut start_cache_len_arg = start_cache_len;
+    let mut max_blocks_arg = max_blocks;
+    let mut selected_budget_blocks_arg = budget / compress_ratio;
+    let mut select_parameters = [
+        (&mut scores_arg as *mut *const f32).cast::<c_void>(),
+        (&mut selected_blocks_arg as *mut *mut u8).cast::<c_void>(),
+        (&mut start_cache_len_arg as *mut u32).cast::<c_void>(),
+        (&mut max_blocks_arg as *mut u32).cast::<c_void>(),
+        (&mut selected_budget_blocks_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.qsa_select_blocks.launch(
+            LaunchConfig::new([rows, 1, 1], block(THREADS), 0),
+            stream,
+            &mut select_parameters,
+        )?;
+    }
+
+    let mut selected_blocks_arg = selected_blocks.cast_const();
+    let mut selected_tiles_arg = selected_tiles;
+    let mut selected_block_indices_arg = selected_block_indices;
+    let mut selected_token_tiles_arg = selected_token_tiles;
+    let mut selected_context_tiles_arg = selected_context_tiles;
+    let mut selected_counts_arg = selected_counts;
+    let mut start_cache_len_arg = start_cache_len;
+    let mut max_blocks_arg = max_blocks;
+    let mut max_tiles_arg = max_tiles;
+    let mut index_capacity_arg = index_capacity;
+    let mut tile_parameters = [
+        (&mut selected_blocks_arg as *mut *const u8).cast::<c_void>(),
+        (&mut selected_tiles_arg as *mut *mut u8).cast::<c_void>(),
+        (&mut selected_block_indices_arg as *mut *mut u32).cast::<c_void>(),
+        (&mut selected_token_tiles_arg as *mut *mut u32).cast::<c_void>(),
+        (&mut selected_context_tiles_arg as *mut *mut u32).cast::<c_void>(),
+        (&mut selected_counts_arg as *mut *mut u32).cast::<c_void>(),
+        (&mut start_cache_len_arg as *mut u32).cast::<c_void>(),
+        (&mut max_blocks_arg as *mut u32).cast::<c_void>(),
+        (&mut max_tiles_arg as *mut u32).cast::<c_void>(),
+        (&mut index_capacity_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.qsa_build_tile_mask.launch(
+            LaunchConfig::new([rows, 1, 1], block(32), 0),
+            stream,
+            &mut tile_parameters,
+        )
+    }
+}
+
+/// Appends one raw key and selects blocks for one QSA query.
 ///
 /// # Safety
 ///
@@ -393,6 +603,10 @@ pub(crate) unsafe fn qsa_prepare_and_select(
     scores: *mut f32,
     selected_blocks: *mut u8,
     selected_tiles: *mut u8,
+    selected_block_indices: *mut u32,
+    selected_token_tiles: *mut u32,
+    selected_context_tiles: *mut u32,
+    selected_counts: *mut u32,
     slot: u32,
     page_offset: u32,
     cache_len: u32,
@@ -403,142 +617,114 @@ pub(crate) unsafe fn qsa_prepare_and_select(
     rotary_dim: u32,
     compress_ratio: u32,
     budget: u32,
+    index_capacity: u32,
     eps: f32,
     theta: f32,
     stream: ffi::cudaStream_t,
 ) -> Result<()> {
-    let complete_blocks = cache_len / compress_ratio;
-    let tail_tokens = cache_len % compress_ratio;
-    let visible_blocks = complete_blocks + u32::from(tail_tokens != 0);
-    let max_blocks = max_tokens.div_ceil(compress_ratio);
-    let max_tiles = max_tokens.div_ceil(64);
-    let visible_tiles = cache_len.div_ceil(64);
-
-    let mut selected_blocks_arg = selected_blocks;
-    let mut selected_tiles_arg = selected_tiles;
-    let mut max_blocks_arg = max_blocks;
-    let mut max_tiles_arg = max_tiles;
-    let mut clear_parameters = [
-        (&mut selected_blocks_arg as *mut *mut u8).cast::<c_void>(),
-        (&mut selected_tiles_arg as *mut *mut u8).cast::<c_void>(),
-        (&mut max_blocks_arg as *mut u32).cast::<c_void>(),
-        (&mut max_tiles_arg as *mut u32).cast::<c_void>(),
-    ];
     unsafe {
-        functions()?.qsa_clear_masks.launch(
-            LaunchConfig::new(
-                grid(u64::from(max_blocks.max(max_tiles)), THREADS),
-                block(THREADS),
-                0,
-            ),
-            stream,
-            &mut clear_parameters,
-        )?;
-    }
-
-    let mut projection_arg = projection;
-    let mut q_norm_arg = q_norm;
-    let mut query_arg = query;
-    let mut head_dim_arg = head_dim;
-    let mut rotary_dim_arg = rotary_dim;
-    let mut position_arg = cache_len - 1;
-    let mut eps_arg = eps;
-    let mut theta_arg = theta;
-    let mut query_parameters = [
-        (&mut projection_arg as *mut *const f32).cast::<c_void>(),
-        (&mut q_norm_arg as *mut *const f32).cast::<c_void>(),
-        (&mut query_arg as *mut *mut f32).cast::<c_void>(),
-        (&mut head_dim_arg as *mut u32).cast::<c_void>(),
-        (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
-        (&mut position_arg as *mut u32).cast::<c_void>(),
-        (&mut eps_arg as *mut f32).cast::<c_void>(),
-        (&mut theta_arg as *mut f32).cast::<c_void>(),
-    ];
-    unsafe {
-        functions()?.qsa_prepare_query.launch(
-            LaunchConfig::new([heads, 1, 1], block(head_dim), 0),
-            stream,
-            &mut query_parameters,
-        )?;
-        qsa_append_key(
+        qsa_select_rows(
             projection,
+            q_norm,
+            k_norm,
             key_pool_bf16,
+            page_table,
+            query,
+            scores,
+            selected_blocks,
+            selected_tiles,
+            selected_block_indices,
+            selected_token_tiles,
+            selected_context_tiles,
+            selected_counts,
+            0,
+            cache_len,
+            1,
             slot,
             page_offset,
+            max_tokens,
             page_tokens,
             heads,
             head_dim,
+            rotary_dim,
+            compress_ratio,
+            budget,
+            index_capacity,
+            true,
+            eps,
+            theta,
             stream,
-        )?;
+        )
     }
+}
 
-    if complete_blocks != 0 {
-        let mut query_arg = query;
-        let mut key_pool_arg = key_pool_bf16.cast_const();
-        let mut page_table_arg = page_table;
-        let mut k_norm_arg = k_norm;
-        let mut scores_arg = scores;
-        let mut page_tokens_arg = page_tokens;
-        let mut heads_arg = heads;
-        let mut head_dim_arg = head_dim;
-        let mut rotary_dim_arg = rotary_dim;
-        let mut eps_arg = eps;
-        let mut theta_arg = theta;
-        let mut score_parameters = [
-            (&mut query_arg as *mut *mut f32).cast::<c_void>(),
-            (&mut key_pool_arg as *mut *const u16).cast::<c_void>(),
-            (&mut page_table_arg as *mut *const u32).cast::<c_void>(),
-            (&mut k_norm_arg as *mut *const f32).cast::<c_void>(),
-            (&mut scores_arg as *mut *mut f32).cast::<c_void>(),
-            (&mut page_tokens_arg as *mut u32).cast::<c_void>(),
-            (&mut heads_arg as *mut u32).cast::<c_void>(),
-            (&mut head_dim_arg as *mut u32).cast::<c_void>(),
-            (&mut rotary_dim_arg as *mut u32).cast::<c_void>(),
-            (&mut eps_arg as *mut f32).cast::<c_void>(),
-            (&mut theta_arg as *mut f32).cast::<c_void>(),
-        ];
-        unsafe {
-            functions()?.qsa_score_blocks.launch(
-                LaunchConfig::new([complete_blocks, 1, 1], block(head_dim), 0),
-                stream,
-                &mut score_parameters,
-            )?;
-        }
-    }
-
-    let mut scores_arg = scores.cast_const();
-    let mut selected_blocks_arg = selected_blocks;
-    let mut complete_blocks_arg = complete_blocks;
-    let mut selected_complete_blocks_arg = complete_blocks.min(budget / compress_ratio);
-    let mut tail_tokens_arg = tail_tokens;
-    let mut select_parameters = [
-        (&mut scores_arg as *mut *const f32).cast::<c_void>(),
-        (&mut selected_blocks_arg as *mut *mut u8).cast::<c_void>(),
-        (&mut complete_blocks_arg as *mut u32).cast::<c_void>(),
-        (&mut selected_complete_blocks_arg as *mut u32).cast::<c_void>(),
-        (&mut tail_tokens_arg as *mut u32).cast::<c_void>(),
-    ];
+/// Selects independent masks for consecutive queries after their keys are appended.
+///
+/// # Safety
+///
+/// The buffers must match the validated batched QSA geometry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qsa_select_appended_rows(
+    projection: *const f32,
+    q_norm: *const f32,
+    k_norm: *const f32,
+    key_pool_bf16: *const u16,
+    page_table: *const u32,
+    queries: *mut f32,
+    scores: *mut f32,
+    selected_blocks: *mut u8,
+    selected_tiles: *mut u8,
+    selected_block_indices: *mut u32,
+    selected_token_tiles: *mut u32,
+    selected_context_tiles: *mut u32,
+    selected_counts: *mut u32,
+    input_row_offset: u32,
+    start_cache_len: u32,
+    rows: u32,
+    max_tokens: u32,
+    page_tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    compress_ratio: u32,
+    budget: u32,
+    index_capacity: u32,
+    eps: f32,
+    theta: f32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
     unsafe {
-        functions()?.qsa_select_blocks.launch(
-            LaunchConfig::new([1, 1, 1], block(THREADS), 0),
+        qsa_select_rows(
+            projection,
+            q_norm,
+            k_norm,
+            key_pool_bf16.cast_mut(),
+            page_table,
+            queries,
+            scores,
+            selected_blocks,
+            selected_tiles,
+            selected_block_indices,
+            selected_token_tiles,
+            selected_context_tiles,
+            selected_counts,
+            input_row_offset,
+            start_cache_len,
+            rows,
+            0,
+            0,
+            max_tokens,
+            page_tokens,
+            heads,
+            head_dim,
+            rotary_dim,
+            compress_ratio,
+            budget,
+            index_capacity,
+            false,
+            eps,
+            theta,
             stream,
-            &mut select_parameters,
-        )?;
-    }
-
-    let mut selected_blocks_arg = selected_blocks.cast_const();
-    let mut selected_tiles_arg = selected_tiles;
-    let mut visible_blocks_arg = visible_blocks;
-    let mut tile_parameters = [
-        (&mut selected_blocks_arg as *mut *const u8).cast::<c_void>(),
-        (&mut selected_tiles_arg as *mut *mut u8).cast::<c_void>(),
-        (&mut visible_blocks_arg as *mut u32).cast::<c_void>(),
-    ];
-    unsafe {
-        functions()?.qsa_build_tile_mask.launch(
-            LaunchConfig::new(grid(u64::from(visible_tiles), THREADS), block(THREADS), 0),
-            stream,
-            &mut tile_parameters,
         )
     }
 }

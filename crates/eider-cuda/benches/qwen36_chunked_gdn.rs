@@ -318,7 +318,7 @@ impl BenchContext for ChunkedGdnBench {
             .flat_map(|chunk| [0, chunk as i32])
             .collect::<Vec<_>>();
         let mut context = Self {
-            kernel: Qwen36ChunkedGdn::new().expect("native launcher"),
+            kernel: Qwen36ChunkedGdn::new(HEADS).expect("native launcher"),
             stream: CudaStream::new_non_blocking().expect("stream"),
             start: CudaEvent::new().expect("start event"),
             stop: CudaEvent::new().expect("stop event"),

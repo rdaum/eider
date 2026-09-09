@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn nvfp4_requires_complete_scale_blocks() {
-        let error = NgramNvfp4Rows::quantize(2, 17, &vec![0.0; 34]).expect_err("invalid width");
+        let error = NgramNvfp4Rows::quantize(2, 17, &[0.0; 34]).expect_err("invalid width");
         assert!(error.to_string().contains("divisible by 16"));
     }
 }

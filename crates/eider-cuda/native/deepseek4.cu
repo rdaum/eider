@@ -1,4 +1,6 @@
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -21,6 +23,13 @@ __device__ __forceinline__ float e4m3_value(std::uint8_t code) {
         return __uint_as_float(sign | 0x7fffffffU);
     }
     return __uint_as_float(sign | ((exp + 120U) << 23) | (mant << 20));
+}
+
+__device__ __forceinline__ float2 e4m3x2_values(std::uint8_t first, std::uint8_t second) {
+    const __nv_fp8x2_storage_t packed = static_cast<__nv_fp8x2_storage_t>(first)
+        | (static_cast<__nv_fp8x2_storage_t>(second) << 8);
+    const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(packed, __NV_E4M3);
+    return __half22float2(*reinterpret_cast<const __half2*>(&raw));
 }
 
 __device__ __forceinline__ float e8m0_value(std::uint8_t code) {
@@ -103,6 +112,218 @@ __global__ void block_fp8_linear_f32_kernel(
     if (threadIdx.x == 0) {
         output[static_cast<std::size_t>(batch) * rows + row] = sum;
     }
+}
+
+__global__ void block_fp8_f32_scale_linear_f32_kernel(
+    const float* __restrict__ input,
+    const std::uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    float* __restrict__ output,
+    std::uint32_t batch_rows,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t row = blockIdx.x * 8 + warp;
+    const std::uint32_t batch_base = blockIdx.y * 8;
+    if (row >= rows || batch_base >= batch_rows) {
+        return;
+    }
+
+    const std::uint32_t scale_cols = cols / kScaleBlock;
+    const std::uint32_t scale_row = row / kScaleBlock;
+    const std::size_t weight_base = static_cast<std::size_t>(row) * cols;
+    const std::uint32_t active = min(8u, batch_rows - batch_base);
+    float sums[8] = {};
+    for (std::uint32_t scale_col = 0; scale_col < scale_cols; ++scale_col) {
+        const float scale = scales[static_cast<std::size_t>(scale_row) * scale_cols + scale_col];
+        const std::uint32_t block_col = scale_col * kScaleBlock;
+#pragma unroll
+        for (std::uint32_t offset = lane; offset < kScaleBlock; offset += 64) {
+            const std::uint32_t first_col = block_col + offset;
+            const std::uint32_t second_col = first_col + 32;
+            const float2 values = e4m3x2_values(
+                weight[weight_base + first_col], weight[weight_base + second_col]);
+            const float first_weight = values.x * scale;
+            const float second_weight = values.y * scale;
+#pragma unroll
+            for (std::uint32_t batch = 0; batch < active; ++batch) {
+                const std::size_t input_base =
+                    static_cast<std::size_t>(batch_base + batch) * cols;
+                sums[batch] += input[input_base + first_col] * first_weight;
+                sums[batch] += input[input_base + second_col] * second_weight;
+            }
+        }
+    }
+#pragma unroll
+    for (std::uint32_t batch = 0; batch < active; ++batch) {
+        const float sum = warp_sum(sums[batch]);
+        if (lane == 0) {
+            output[static_cast<std::size_t>(batch_base + batch) * rows + row] = sum;
+        }
+    }
+}
+
+__global__ void block_fp8_f32_scale_linear_pair_f32_kernel(
+    const float* __restrict__ input,
+    const std::uint8_t* __restrict__ first_weight,
+    const float* __restrict__ first_scales,
+    const std::uint8_t* __restrict__ second_weight,
+    const float* __restrict__ second_scales,
+    float* __restrict__ first_output,
+    float* __restrict__ second_output,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t cols) {
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t combined_row = blockIdx.x * 8 + warp;
+    if (combined_row >= first_rows + second_rows) {
+        return;
+    }
+
+    const bool first = combined_row < first_rows;
+    const std::uint32_t row = first ? combined_row : combined_row - first_rows;
+    const std::uint8_t* weight = first ? first_weight : second_weight;
+    const float* scales = first ? first_scales : second_scales;
+    float* output = first ? first_output : second_output;
+    const std::uint32_t scale_cols = cols / kScaleBlock;
+    const std::size_t weight_base = static_cast<std::size_t>(row) * cols;
+    const std::size_t scale_base = static_cast<std::size_t>(row / kScaleBlock) * scale_cols;
+    float sum = 0.0f;
+    for (std::uint32_t scale_col = 0; scale_col < scale_cols; ++scale_col) {
+        const float scale = scales[scale_base + scale_col];
+        const std::uint32_t block_col = scale_col * kScaleBlock;
+#pragma unroll
+        for (std::uint32_t offset = lane; offset < kScaleBlock; offset += 64) {
+            const std::uint32_t first_col = block_col + offset;
+            const std::uint32_t second_col = first_col + 32;
+            const float2 values = e4m3x2_values(
+                weight[weight_base + first_col], weight[weight_base + second_col]);
+            sum += input[first_col] * (values.x * scale);
+            sum += input[second_col] * (values.y * scale);
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        output[row] = sum;
+    }
+}
+
+__global__ void block_fp8_f32_scale_moe_gate_up_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* __restrict__ input,
+    const std::uint8_t* const* __restrict__ gate_weights,
+    const float* const* __restrict__ gate_scales,
+    const std::uint8_t* const* __restrict__ up_weights,
+    const float* const* __restrict__ up_scales,
+    float* __restrict__ output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots) {
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t row_blocks = (rows + 7) / 8;
+    const std::uint32_t slot = blockIdx.x / row_blocks;
+    const std::uint32_t row = (blockIdx.x % row_blocks) * 8 + warp;
+    if (slot >= slots || row >= rows) {
+        return;
+    }
+    const std::uint32_t expert = indices[slot];
+    const std::uint8_t* gate = gate_weights[expert] + static_cast<std::size_t>(row) * cols;
+    const std::uint8_t* up = up_weights[expert] + static_cast<std::size_t>(row) * cols;
+    const float* gate_scale = gate_scales[expert];
+    const float* up_scale = up_scales[expert];
+    const std::uint32_t scale_cols = cols / kScaleBlock;
+    const std::uint32_t scale_base = (row / kScaleBlock) * scale_cols;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (std::uint32_t scale_col = 0; scale_col < scale_cols; ++scale_col) {
+        const std::uint32_t block_col = scale_col * kScaleBlock;
+        const float gs = gate_scale[scale_base + scale_col];
+        const float us = up_scale[scale_base + scale_col];
+#pragma unroll
+        for (std::uint32_t offset = lane; offset < kScaleBlock; offset += 64) {
+            const std::uint32_t first_col = block_col + offset;
+            const std::uint32_t second_col = first_col + 32;
+            const float first_activation = input[first_col];
+            const float second_activation = input[second_col];
+            const float2 gate_values = e4m3x2_values(gate[first_col], gate[second_col]);
+            const float2 up_values = e4m3x2_values(up[first_col], up[second_col]);
+            gate_sum += first_activation * gate_values.x * gs;
+            gate_sum += second_activation * gate_values.y * gs;
+            up_sum += first_activation * up_values.x * us;
+            up_sum += second_activation * up_values.y * us;
+        }
+    }
+    gate_sum = warp_sum(gate_sum);
+    up_sum = warp_sum(up_sum);
+    if (lane == 0) {
+        const std::size_t base = static_cast<std::size_t>(slot) * rows * 2;
+        output[base + row] = gate_sum;
+        output[base + rows + row] = up_sum;
+    }
+}
+
+__global__ void block_fp8_f32_scale_moe_down_f32_kernel(
+    const std::uint32_t* __restrict__ indices,
+    const float* __restrict__ inputs,
+    const std::uint8_t* const* __restrict__ weights,
+    const float* const* __restrict__ scales,
+    float* const* __restrict__ outputs,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots) {
+    const std::uint32_t warp = threadIdx.x >> 5;
+    const std::uint32_t lane = threadIdx.x & 31;
+    const std::uint32_t row_blocks = (rows + 7) / 8;
+    const std::uint32_t slot = blockIdx.x / row_blocks;
+    const std::uint32_t row = (blockIdx.x % row_blocks) * 8 + warp;
+    if (slot >= slots || row >= rows) {
+        return;
+    }
+    const std::uint32_t expert = indices[slot];
+    const float* input = inputs + static_cast<std::size_t>(slot) * cols;
+    const std::uint8_t* weight = weights[expert] + static_cast<std::size_t>(row) * cols;
+    const float* scale = scales[expert];
+    const std::uint32_t scale_cols = cols / kScaleBlock;
+    const std::uint32_t scale_base = (row / kScaleBlock) * scale_cols;
+    float sum = 0.0f;
+    for (std::uint32_t scale_col = 0; scale_col < scale_cols; ++scale_col) {
+        const std::uint32_t block_col = scale_col * kScaleBlock;
+        const float block_scale = scale[scale_base + scale_col];
+#pragma unroll
+        for (std::uint32_t offset = lane; offset < kScaleBlock; offset += 64) {
+            const std::uint32_t first_col = block_col + offset;
+            const std::uint32_t second_col = first_col + 32;
+            const float2 values = e4m3x2_values(weight[first_col], weight[second_col]);
+            sum += input[first_col] * values.x * block_scale;
+            sum += input[second_col] * values.y * block_scale;
+        }
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        outputs[slot][row] = sum;
+    }
+}
+
+__global__ void dequant_block_fp8_f32_scale_to_bf16_kernel(
+    const std::uint8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t length = static_cast<std::size_t>(rows) * cols;
+    if (index >= length) {
+        return;
+    }
+    const std::uint32_t row = index / cols;
+    const std::uint32_t col = index - static_cast<std::size_t>(row) * cols;
+    const std::uint32_t scale_cols = cols / kScaleBlock;
+    const float scale = scales[static_cast<std::size_t>(row / kScaleBlock) * scale_cols
+        + col / kScaleBlock];
+    output[index] = __float2bfloat16_rn(e4m3_value(weight[index]) * scale);
 }
 
 __global__ void block_fp8_grouped_linear_f32_kernel(
@@ -1250,6 +1471,116 @@ extern "C" cudaError_t infer_deepseek4_block_fp8_linear_f32_on_stream(
     const dim3 grid(rows, batch_rows);
     block_fp8_linear_f32_kernel<<<grid, kThreads, 0, stream>>>(
         input, weight, scales, output, batch_rows, rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_block_fp8_f32_scale_linear_f32_on_stream(
+    const float* input,
+    const std::uint8_t* weight,
+    const float* scales,
+    float* output,
+    std::uint32_t batch_rows,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || weight == nullptr || scales == nullptr || output == nullptr
+        || batch_rows == 0 || rows == 0 || cols == 0
+        || rows % kScaleBlock != 0 || cols % kScaleBlock != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 grid((rows + 7) / 8, (batch_rows + 7) / 8, 1);
+    block_fp8_f32_scale_linear_f32_kernel<<<grid, kThreads, 0, stream>>>(
+        input, weight, scales, output, batch_rows, rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_block_fp8_f32_scale_linear_pair_f32_on_stream(
+    const float* input,
+    const std::uint8_t* first_weight,
+    const float* first_scales,
+    const std::uint8_t* second_weight,
+    const float* second_scales,
+    float* first_output,
+    float* second_output,
+    std::uint32_t first_rows,
+    std::uint32_t second_rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (input == nullptr || first_weight == nullptr || first_scales == nullptr
+        || second_weight == nullptr || second_scales == nullptr || first_output == nullptr
+        || second_output == nullptr || first_rows == 0 || second_rows == 0 || cols == 0
+        || first_rows % kScaleBlock != 0 || second_rows % kScaleBlock != 0
+        || cols % kScaleBlock != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t combined_rows = first_rows + second_rows;
+    const dim3 grid((combined_rows + 7) / 8, 1, 1);
+    block_fp8_f32_scale_linear_pair_f32_kernel<<<grid, kThreads, 0, stream>>>(
+        input, first_weight, first_scales, second_weight, second_scales,
+        first_output, second_output, first_rows, second_rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_dequant_block_fp8_f32_scale_to_bf16_on_stream(
+    const std::uint8_t* weight,
+    const float* scales,
+    __nv_bfloat16* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    cudaStream_t stream) {
+    if (weight == nullptr || scales == nullptr || output == nullptr || rows == 0 || cols == 0
+        || rows % kScaleBlock != 0 || cols % kScaleBlock != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::size_t length = static_cast<std::size_t>(rows) * cols;
+    const std::uint32_t blocks = static_cast<std::uint32_t>((length + kThreads - 1) / kThreads);
+    dequant_block_fp8_f32_scale_to_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        weight, scales, output, rows, cols);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_block_fp8_f32_scale_moe_gate_up_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* input,
+    const std::uint8_t* const* gate_weights,
+    const float* const* gate_scales,
+    const std::uint8_t* const* up_weights,
+    const float* const* up_scales,
+    float* output,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots,
+    cudaStream_t stream) {
+    if (indices == nullptr || input == nullptr || gate_weights == nullptr || gate_scales == nullptr
+        || up_weights == nullptr || up_scales == nullptr || output == nullptr || rows == 0
+        || cols == 0 || slots == 0 || rows % kScaleBlock != 0 || cols % kScaleBlock != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 grid(((rows + 7) / 8) * slots);
+    block_fp8_f32_scale_moe_gate_up_f32_kernel<<<grid, kThreads, 0, stream>>>(
+        indices, input, gate_weights, gate_scales, up_weights, up_scales, output,
+        rows, cols, slots);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_block_fp8_f32_scale_moe_down_f32_on_stream(
+    const std::uint32_t* indices,
+    const float* inputs,
+    const std::uint8_t* const* weights,
+    const float* const* scales,
+    float* const* outputs,
+    std::uint32_t rows,
+    std::uint32_t cols,
+    std::uint32_t slots,
+    cudaStream_t stream) {
+    if (indices == nullptr || inputs == nullptr || weights == nullptr || scales == nullptr
+        || outputs == nullptr || rows == 0 || cols == 0 || slots == 0
+        || rows % kScaleBlock != 0 || cols % kScaleBlock != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const dim3 grid(((rows + 7) / 8) * slots);
+    block_fp8_f32_scale_moe_down_f32_kernel<<<grid, kThreads, 0, stream>>>(
+        indices, inputs, weights, scales, outputs, rows, cols, slots);
     return cudaGetLastError();
 }
 

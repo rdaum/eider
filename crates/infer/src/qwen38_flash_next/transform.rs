@@ -3,7 +3,7 @@
 use super::{Qwen38FlashNextConfig, Qwen38PagedPle};
 use crate::qwen3::qwen36::{Bf16Linear, read_bf16_flat_host, read_bf16_vector_as_f32_device};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, PagedBf16ReadStats, Result, qwen38_hc_norm_f32_into_on_stream,
+    CudaStream, DeviceBuffer, Error, PagedRowReadStats, Result, qwen38_hc_norm_f32_into_on_stream,
     qwen38_ple_conv_update_f32_into_on_stream, qwen38_ple_gate_value_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
@@ -42,13 +42,14 @@ pub struct Qwen38PleWorkspace {
     ple_dim: usize,
 }
 
-/// Two-row PLE verifier workspace with canonical row-serial transforms.
+/// Short-batch PLE verifier workspace with canonical row-serial transforms.
 pub(crate) struct Qwen38ExactPleWorkspace {
     gathered: DeviceBuffer<f32>,
     row_query: DeviceBuffer<f32>,
     row: Qwen38PleWorkspace,
     output: DeviceBuffer<f32>,
-    frontier_conv: DeviceBuffer<f32>,
+    state_snapshots: DeviceBuffer<f32>,
+    token_capacity: usize,
 }
 
 /// Per-sequence causal PLE convolution state with transactional rollback.
@@ -128,7 +129,7 @@ impl Qwen38PleWeights {
         workspace: &'a mut Qwen38PleWorkspace,
         tokens: usize,
         stream: &CudaStream,
-    ) -> Result<(&'a DeviceBuffer<f32>, PagedBf16ReadStats)> {
+    ) -> Result<(&'a DeviceBuffer<f32>, PagedRowReadStats)> {
         workspace.require(self, tokens)?;
         state.require(self)?;
         let read = pager.gather_into_on_stream(workspace.embeddings.output(), stream)?;
@@ -191,17 +192,25 @@ impl Qwen38PleWeights {
         Ok((&workspace.output, read))
     }
 
-    pub(crate) fn run_exact_two_rows<'a>(
+    pub(crate) fn run_exact_rows<'a>(
         &self,
         pager: &mut Qwen38PagedPle,
         query_streams: &DeviceBuffer<f32>,
         state: &mut Qwen38PleState,
         workspace: &'a mut Qwen38ExactPleWorkspace,
+        tokens: usize,
         stream: &CudaStream,
-    ) -> Result<(&'a DeviceBuffer<f32>, PagedBf16ReadStats)> {
+    ) -> Result<(&'a DeviceBuffer<f32>, PagedRowReadStats)> {
+        if tokens < 2 || tokens > workspace.token_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 exact PLE rows",
+                expected: format!("2..={} rows", workspace.token_capacity),
+                actual: tokens.to_string(),
+            });
+        }
         let read = pager.gather_into_on_stream(workspace.gathered.output(), stream)?;
         let hc_dim = self.hidden * self.hc_count;
-        for row in 0..2 {
+        for row in 0..tokens {
             workspace.row.embeddings.copy_range_from_device_on_stream(
                 0,
                 &workspace.gathered,
@@ -280,9 +289,11 @@ impl Qwen38PleWeights {
                 self.conv_dilation,
                 stream,
             )?;
-            if row == 0 {
-                workspace.frontier_conv.copy_prefix_from_device_on_stream(
+            if row + 1 < tokens {
+                workspace.state_snapshots.copy_range_from_device_on_stream(
+                    row * state.conv.len(),
                     &state.conv,
+                    0,
                     state.conv.len(),
                     stream,
                 )?;
@@ -300,38 +311,56 @@ impl Qwen38PleWeights {
 }
 
 impl Qwen38ExactPleWorkspace {
-    pub(crate) fn new(config: &Qwen38FlashNextConfig) -> Result<Self> {
+    pub(crate) fn new(config: &Qwen38FlashNextConfig, token_capacity: usize) -> Result<Self> {
+        if token_capacity < 2 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 exact PLE capacity",
+                expected: "at least two rows".to_string(),
+                actual: token_capacity.to_string(),
+            });
+        }
         let hc_dim = config.hidden * config.hc_count;
+        let state_values = hc_dim * (config.ple_conv_kernel - 1) * config.ngram_size;
         Ok(Self {
-            gathered: DeviceBuffer::zeroed(2 * config.ple_embedding_dim)?,
+            gathered: DeviceBuffer::zeroed(token_capacity * config.ple_embedding_dim)?,
             row_query: DeviceBuffer::zeroed(hc_dim)?,
             row: Qwen38PleWorkspace::new(config, 1)?,
-            output: DeviceBuffer::zeroed(2 * hc_dim)?,
-            frontier_conv: DeviceBuffer::zeroed(
-                hc_dim * (config.ple_conv_kernel - 1) * config.ngram_size,
-            )?,
+            output: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            state_snapshots: DeviceBuffer::zeroed((token_capacity - 1) * state_values)?,
+            token_capacity,
         })
     }
 
-    pub(crate) fn restore_frontier_state(
+    pub(crate) fn restore_state_snapshot(
         &self,
         state: &mut Qwen38PleState,
+        slot: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        if !state.append_pending || self.frontier_conv.len() != state.conv.len() {
+        if !state.append_pending
+            || slot >= self.token_capacity - 1
+            || self.state_snapshots.len() != (self.token_capacity - 1) * state.conv.len()
+        {
             return Err(Error::Shape {
-                label: "Qwen3.8 exact PLE frontier state",
-                expected: format!("pending state with {} values", self.frontier_conv.len()),
+                label: "Qwen3.8 exact PLE state snapshot",
+                expected: format!(
+                    "pending state and slot < {} with {} values per slot",
+                    self.token_capacity - 1,
+                    state.conv.len()
+                ),
                 actual: format!(
-                    "pending={} state_values={}",
+                    "pending={} slot={slot} snapshot_values={} state_values={}",
                     state.append_pending,
+                    self.state_snapshots.len(),
                     state.conv.len()
                 ),
             });
         }
-        state.conv.copy_prefix_from_device_on_stream(
-            &self.frontier_conv,
-            self.frontier_conv.len(),
+        state.conv.copy_range_from_device_on_stream(
+            0,
+            &self.state_snapshots,
+            slot * state.conv.len(),
+            state.conv.len(),
             stream,
         )
     }

@@ -125,13 +125,14 @@ impl Qwen38HyperConnectionWeights {
         self.mix_inner(streams, workspace, tokens, false, stream)
     }
 
-    pub(crate) fn mix_exact_two_rows<'a>(
+    pub(crate) fn mix_exact_rows<'a>(
         &self,
         streams: &DeviceBuffer<f32>,
         workspace: &'a mut Qwen38HyperConnectionWorkspace,
+        tokens: usize,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
-        self.mix_inner(streams, workspace, 2, true, stream)
+        self.mix_inner(streams, workspace, tokens, true, stream)
     }
 
     fn mix_inner<'a>(
@@ -139,7 +140,7 @@ impl Qwen38HyperConnectionWeights {
         streams: &DeviceBuffer<f32>,
         workspace: &'a mut Qwen38HyperConnectionWorkspace,
         tokens: usize,
-        exact_two_rows: bool,
+        exact_rows: bool,
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         workspace.require(self, tokens)?;
@@ -153,7 +154,7 @@ impl Qwen38HyperConnectionWeights {
             self.eps,
             stream,
         )?;
-        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+        if !exact_rows && let Some(batch) = workspace.batch.as_mut() {
             f32_to_bf16_prefix_into_on_stream(
                 &workspace.normed,
                 batch.normed.output(),
@@ -174,10 +175,11 @@ impl Qwen38HyperConnectionWeights {
                 workspace.lowrank.output(),
                 stream,
             )?;
-        } else if exact_two_rows {
-            self.mix_down.run_exact_two_rows_into(
+        } else if exact_rows {
+            self.mix_down.run_exact_rows_into(
                 &workspace.normed,
                 &mut workspace.lowrank,
+                tokens,
                 stream,
             )?;
         } else {
@@ -194,7 +196,7 @@ impl Qwen38HyperConnectionWeights {
             self.hc_count,
             stream,
         )?;
-        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+        if !exact_rows && let Some(batch) = workspace.batch.as_mut() {
             f32_to_bf16_prefix_into_on_stream(
                 &workspace.lowrank,
                 batch.lowrank.output(),
@@ -215,10 +217,11 @@ impl Qwen38HyperConnectionWeights {
                 workspace.gate_logits.output(),
                 stream,
             )?;
-        } else if exact_two_rows {
-            self.mix_up.run_exact_two_rows_into(
+        } else if exact_rows {
+            self.mix_up.run_exact_rows_into(
                 &workspace.lowrank,
                 &mut workspace.gate_logits,
+                tokens,
                 stream,
             )?;
         } else {
@@ -262,12 +265,13 @@ impl Qwen38HyperConnectionWeights {
         )
     }
 
-    pub(crate) fn combine_exact_two_rows(
+    pub(crate) fn combine_exact_rows(
         &self,
         residual_streams: &DeviceBuffer<f32>,
         block_output: &DeviceBuffer<f32>,
         workspace: &mut Qwen38HyperConnectionWorkspace,
         output_streams: &mut DeviceBuffer<f32>,
+        tokens: usize,
         stream: &CudaStream,
     ) -> Result<()> {
         self.combine_inner(
@@ -275,7 +279,7 @@ impl Qwen38HyperConnectionWeights {
             block_output,
             workspace,
             output_streams,
-            2,
+            tokens,
             true,
             stream,
         )
@@ -289,7 +293,7 @@ impl Qwen38HyperConnectionWeights {
         workspace: &mut Qwen38HyperConnectionWorkspace,
         output_streams: &mut DeviceBuffer<f32>,
         tokens: usize,
-        exact_two_rows: bool,
+        exact_rows: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         workspace.require(self, tokens)?;
@@ -297,7 +301,7 @@ impl Qwen38HyperConnectionWeights {
             label: "Qwen3.8 hyperconnection combine",
             detail: "the final mixer has no block injection weight".to_string(),
         })?;
-        if !exact_two_rows && let Some(batch) = workspace.batch.as_mut() {
+        if !exact_rows && let Some(batch) = workspace.batch.as_mut() {
             batch_plan(
                 &mut batch.inject,
                 &batch.lt,
@@ -312,10 +316,11 @@ impl Qwen38HyperConnectionWeights {
                 workspace.inject_logits.output(),
                 stream,
             )?;
-        } else if exact_two_rows {
-            inject.run_exact_two_rows_into(
+        } else if exact_rows {
+            inject.run_exact_rows_into(
                 &workspace.normed,
                 &mut workspace.inject_logits,
+                tokens,
                 stream,
             )?;
         } else {
@@ -401,6 +406,14 @@ impl Qwen38HyperConnectionWorkspace {
     /// Most recent mixed `[tokens, hidden]` activation.
     pub fn mixed(&self) -> &DeviceBuffer<f32> {
         &self.mixed
+    }
+
+    pub(crate) fn normed(&self) -> &DeviceBuffer<f32> {
+        &self.normed
+    }
+
+    pub(crate) fn inject_logits(&self) -> &DeviceBuffer<f32> {
+        &self.inject_logits
     }
 
     pub(crate) fn device_bytes(&self) -> usize {

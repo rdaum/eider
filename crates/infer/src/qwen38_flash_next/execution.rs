@@ -74,7 +74,7 @@ impl Qwen38FlashNextExecutionState {
             },
         )?;
         let gpu_sampler = GpuTokenSampler::new(1, model.config().vocab)?;
-        let mtp_sequence_cache = (config.speculative_drafts == 1)
+        let mtp_sequence_cache = (config.speculative_drafts > 0)
             .then(|| {
                 let target_qsa_layers = model
                     .manifest()
@@ -91,13 +91,13 @@ impl Qwen38FlashNextExecutionState {
                 )
             })
             .transpose()?;
-        let mtp_workspace = (config.speculative_drafts == 1)
+        let mtp_workspace = (config.speculative_drafts > 0)
             .then(|| {
                 model.new_mtp_workspace(config.max_context_tokens, config.prefill_token_capacity)
             })
             .transpose()?;
-        let speculative_workspace = (config.speculative_drafts == 1)
-            .then(|| model.new_speculative_workspace(1))
+        let speculative_workspace = (config.speculative_drafts > 0)
+            .then(|| model.new_speculative_workspace(config.speculative_drafts))
             .transpose()?;
 
         Ok(Self {

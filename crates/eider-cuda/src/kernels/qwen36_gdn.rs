@@ -9,21 +9,32 @@ use crate::ffi;
 #[cfg(feature = "cuda-oxide")]
 use crate::kernels::qwen36_gdn_oxide;
 
+#[cfg(test)]
 const HEADS: usize = 32;
 const HEAD_DIM: usize = 128;
 const CHUNK_TOKENS: usize = 64;
 
-/// Native CUDA implementation of 64-token Qwen3.6 chunked Gated DeltaNet.
-pub struct Qwen36ChunkedGdn;
+/// CUDA implementation of 64-token Qwen-family chunked Gated DeltaNet.
+pub struct Qwen36ChunkedGdn {
+    heads: usize,
+}
 
 impl Qwen36ChunkedGdn {
-    /// Creates the stateless native CUDA launcher.
-    pub fn new() -> Result<Self> {
-        Ok(Self)
+    /// Creates a launcher for the requested number of 128-element value heads.
+    pub fn new(heads: usize) -> Result<Self> {
+        if heads == 0 || heads > 65_535 {
+            return Err(Error::Shape {
+                label: "Qwen chunked GDN heads",
+                expected: "a head count in 1..=65535".to_string(),
+                actual: heads.to_string(),
+            });
+        }
+        Ok(Self { heads })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn validate(
+        &self,
         query: &DeviceBuffer<u16>,
         key: &DeviceBuffer<u16>,
         value: &DeviceBuffer<u16>,
@@ -46,7 +57,7 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
     ) -> Result<()> {
         let vectors = total_tokens
-            .checked_mul(HEADS)
+            .checked_mul(self.heads)
             .and_then(|values| values.checked_mul(HEAD_DIM))
             .ok_or_else(|| Error::Shape {
                 label: "Qwen3.6 chunked GDN",
@@ -54,7 +65,7 @@ impl Qwen36ChunkedGdn {
                 actual: total_tokens.to_string(),
             })?;
         let token_heads = total_tokens
-            .checked_mul(HEADS)
+            .checked_mul(self.heads)
             .ok_or_else(|| Error::Shape {
                 label: "Qwen3.6 chunked GDN",
                 expected: "token-head size without overflow".to_string(),
@@ -67,7 +78,7 @@ impl Qwen36ChunkedGdn {
                 expected: "attention workspace size without overflow".to_string(),
                 actual: token_heads.to_string(),
             })?;
-        let recurrent_values = HEADS * HEAD_DIM * HEAD_DIM;
+        let recurrent_values = self.heads * HEAD_DIM * HEAD_DIM;
         let state_values = sequence_count
             .checked_mul(recurrent_values)
             .ok_or_else(|| Error::Shape {
@@ -151,6 +162,7 @@ impl Qwen36ChunkedGdn {
                 chunk_indices.as_const_ptr().cast(),
                 total_tokens as u32,
                 chunk_count as u32,
+                self.heads as u32,
                 stream.as_raw(),
             )
         }
@@ -165,6 +177,7 @@ impl Qwen36ChunkedGdn {
                     chunk_indices.as_const_ptr().cast(),
                     total_tokens as u32,
                     chunk_count as u32,
+                    self.heads as u32,
                     stream.as_raw(),
                 ),
             )
@@ -196,6 +209,7 @@ impl Qwen36ChunkedGdn {
                 chunk_indices.as_const_ptr().cast(),
                 total_tokens as u32,
                 chunk_count as u32,
+                self.heads as u32,
                 stream.as_raw(),
             )
         }
@@ -212,6 +226,7 @@ impl Qwen36ChunkedGdn {
                     chunk_indices.as_const_ptr().cast(),
                     total_tokens as u32,
                     chunk_count as u32,
+                    self.heads as u32,
                     stream.as_raw(),
                 ),
             )
@@ -239,6 +254,7 @@ impl Qwen36ChunkedGdn {
                 chunk_indices.as_const_ptr().cast(),
                 total_tokens as u32,
                 chunk_count as u32,
+                self.heads as u32,
                 stream.as_raw(),
             )
         }
@@ -253,6 +269,7 @@ impl Qwen36ChunkedGdn {
                     chunk_indices.as_const_ptr().cast(),
                     total_tokens as u32,
                     chunk_count as u32,
+                    self.heads as u32,
                     stream.as_raw(),
                 ),
             )
@@ -288,6 +305,7 @@ impl Qwen36ChunkedGdn {
                 chunk_indices.as_const_ptr().cast(),
                 total_tokens as u32,
                 chunk_count as u32,
+                self.heads as u32,
                 stream.as_raw(),
             )
         }
@@ -306,6 +324,7 @@ impl Qwen36ChunkedGdn {
                     chunk_indices.as_const_ptr().cast(),
                     total_tokens as u32,
                     chunk_count as u32,
+                    self.heads as u32,
                     stream.as_raw(),
                 ),
             )
@@ -343,6 +362,7 @@ impl Qwen36ChunkedGdn {
                 chunk_offsets.as_const_ptr().cast(),
                 sequence_count as u32,
                 total_tokens as u32,
+                self.heads as u32,
                 stream.as_raw(),
             )
         }
@@ -362,6 +382,7 @@ impl Qwen36ChunkedGdn {
                     chunk_offsets.as_const_ptr().cast(),
                     sequence_count as u32,
                     total_tokens as u32,
+                    self.heads as u32,
                     stream.as_raw(),
                 ),
             )
@@ -397,6 +418,7 @@ impl Qwen36ChunkedGdn {
                 chunk_indices.as_const_ptr().cast(),
                 total_tokens as u32,
                 chunk_count as u32,
+                self.heads as u32,
                 (HEAD_DIM as f32).sqrt().recip(),
                 stream.as_raw(),
             )
@@ -416,6 +438,7 @@ impl Qwen36ChunkedGdn {
                     chunk_indices.as_const_ptr().cast(),
                     total_tokens as u32,
                     chunk_count as u32,
+                    self.heads as u32,
                     (HEAD_DIM as f32).sqrt().recip(),
                     stream.as_raw(),
                 ),
@@ -449,7 +472,7 @@ impl Qwen36ChunkedGdn {
         chunk_count: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        Self::validate(
+        self.validate(
             query,
             key,
             value,
@@ -611,7 +634,7 @@ mod tests {
                 .map(|index| bf16_to_f32(f32_to_bf16(((index % 23) as f32 - 11.0) / 1024.0)))
                 .collect::<Vec<_>>();
             Self {
-                kernels: Qwen36ChunkedGdn::new().expect("native GDN launcher"),
+                kernels: Qwen36ChunkedGdn::new(HEADS).expect("native GDN launcher"),
                 query_host: query_bf16.iter().copied().map(bf16_to_f32).collect(),
                 key_host: key_bf16.iter().copied().map(bf16_to_f32).collect(),
                 value_host: value_bf16.iter().copied().map(bf16_to_f32).collect(),
@@ -1007,7 +1030,7 @@ mod tests {
         let mut value_new = DeviceBuffer::zeroed(vectors).expect("value-new allocation");
         let mut output = DeviceBuffer::zeroed(vectors).expect("output allocation");
         let stream = CudaStream::new_blocking().expect("test stream");
-        Qwen36ChunkedGdn::new()
+        Qwen36ChunkedGdn::new(HEADS)
             .expect("native GDN launcher")
             .run_on_stream(
                 &query,

@@ -8775,6 +8775,87 @@ pub fn bf16_linear_two_rows_f32_into_on_stream(
     }
 }
 
+/// Enqueues BF16-weight projections with the one-row accumulation order.
+///
+/// Rows are independent CUDA blocks. This is intended for short verifier
+/// batches where stable argmax results matter more than weight reuse.
+pub fn bf16_linear_exact_rows_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u16>,
+    mut logits: DeviceOutput<'_, f32>,
+    batch_size: usize,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_size.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "exact-row BF16 linear input",
+        expected: "batch_size * cols without overflow".to_string(),
+        actual: format!("batch_size={batch_size} cols={cols}"),
+    })?;
+    let weight_len = rows.checked_mul(cols).ok_or_else(|| Error::Shape {
+        label: "exact-row BF16 linear weight",
+        expected: "rows * cols without overflow".to_string(),
+        actual: format!("rows={rows} cols={cols}"),
+    })?;
+    let output_len = batch_size.checked_mul(rows).ok_or_else(|| Error::Shape {
+        label: "exact-row BF16 linear output",
+        expected: "batch_size * rows without overflow".to_string(),
+        actual: format!("batch_size={batch_size} rows={rows}"),
+    })?;
+    if batch_size == 0
+        || rows == 0
+        || cols == 0
+        || batch_size > u32::MAX as usize
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || input.len() < input_len
+        || weight.len() != weight_len
+        || logits.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "exact-row BF16 linear buffers",
+            expected: format!("input={input_len} weight={weight_len} output={output_len}"),
+            actual: format!(
+                "input={} weight={} output={}",
+                input.len(),
+                weight.len(),
+                logits.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        for batch in 0..batch_size {
+            core_oxide::bf16_linear_logits_batch(
+                input.ptr.add(batch * cols),
+                weight.ptr,
+                logits.buffer_mut().ptr.add(batch * rows),
+                1,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            )?;
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_bf16_linear_exact_rows_f32_on_stream",
+            ffi::infer_bf16_linear_exact_rows_f32_on_stream(
+                input.ptr,
+                weight.ptr,
+                logits.buffer_mut().ptr,
+                batch_size as u32,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
 /// Enqueues two BF16-weight projections over the same f32 input as one CUDA grid.
 #[allow(clippy::too_many_arguments)]
 pub fn bf16_linear_pair_logits_f32_into_on_stream(
@@ -19905,6 +19986,39 @@ mod tests {
     }
 
     #[test]
+    fn bf16_linear_wide_small_output_matches_reference() {
+        let rows = 4;
+        let cols = 10_240;
+        let input = vec![0.125f32; cols];
+        let weight = (0..rows)
+            .flat_map(|row| {
+                let value = format::f32_to_bf16((row + 1) as f32 / 1_024.0);
+                std::iter::repeat_n(value, cols)
+            })
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&input).expect("input upload");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight upload");
+        let mut output = DeviceBuffer::zeroed(rows).expect("output allocation");
+        let stream = CudaStream::new_non_blocking().expect("stream create");
+
+        bf16_linear_logits_f32_into_on_stream(
+            &input,
+            &weight,
+            output.output(),
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("wide BF16 projection");
+
+        let actual = output.copy_to_host(&stream).expect("output download");
+        for (row, &actual) in actual.iter().enumerate() {
+            let expected = cols as f32 * 0.125 * (row + 1) as f32 / 1_024.0;
+            assert_eq!(actual, expected, "wide BF16 projection row {row}");
+        }
+    }
+
+    #[test]
     fn bf16_linear_pair_matches_separate_projections() {
         let cols = 19usize;
         let rows = [5usize, 3];
@@ -20074,6 +20188,104 @@ mod tests {
                 &actual[input_row * rows..(input_row + 1) * rows],
                 expected.as_slice(),
                 "two-row BF16 projection row {input_row}",
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_linear_exact_rows_matches_independent_rows_bitwise() {
+        let batch_size = 4usize;
+        let rows = 7usize;
+        let cols = 20usize;
+        let input = (0..batch_size * cols)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 37) as f32 - 18.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(batch_size * rows).expect("actual");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        bf16_linear_exact_rows_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            batch_size,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("exact-row projection");
+        let actual = actual.copy_to_host(&stream).expect("actual download");
+        for input_row in 0..batch_size {
+            let row_input =
+                DeviceBuffer::from_host(&input[input_row * cols..(input_row + 1) * cols])
+                    .expect("row input");
+            let mut expected = DeviceBuffer::zeroed(rows).expect("expected");
+            bf16_linear_logits_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                &stream,
+            )
+            .expect("independent projection");
+            let expected = expected.copy_to_host(&stream).expect("expected download");
+            assert_eq!(
+                &actual[input_row * rows..(input_row + 1) * rows],
+                expected.as_slice(),
+                "exact-row BF16 projection row {input_row}",
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_linear_exact_wide_rows_match_independent_rows_bitwise() {
+        let batch_size = 4usize;
+        let rows = 4usize;
+        let cols = 10_240usize;
+        let input = (0..batch_size * cols)
+            .map(|idx| ((idx * 7 % 29) as f32 - 14.0) * 0.0625)
+            .collect::<Vec<_>>();
+        let weight = (0..rows * cols)
+            .map(|idx| format::f32_to_bf16(((idx * 11 % 37) as f32 - 18.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let input_device = DeviceBuffer::from_host(&input).expect("input");
+        let weight_device = DeviceBuffer::from_host(&weight).expect("weight");
+        let mut actual = DeviceBuffer::zeroed(batch_size * rows).expect("actual");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        bf16_linear_exact_rows_f32_into_on_stream(
+            &input_device,
+            &weight_device,
+            actual.output(),
+            batch_size,
+            rows,
+            cols,
+            &stream,
+        )
+        .expect("exact wide-row projection");
+        let actual = actual.copy_to_host(&stream).expect("actual download");
+        for input_row in 0..batch_size {
+            let row_input =
+                DeviceBuffer::from_host(&input[input_row * cols..(input_row + 1) * cols])
+                    .expect("row input");
+            let mut expected = DeviceBuffer::zeroed(rows).expect("expected");
+            bf16_linear_logits_f32_into_on_stream(
+                &row_input,
+                &weight_device,
+                expected.output(),
+                rows,
+                cols,
+                &stream,
+            )
+            .expect("independent wide projection");
+            let expected = expected.copy_to_host(&stream).expect("expected download");
+            assert_eq!(
+                &actual[input_row * rows..(input_row + 1) * rows],
+                expected.as_slice(),
+                "exact wide-row BF16 projection row {input_row}",
             );
         }
     }

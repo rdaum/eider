@@ -101,14 +101,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 actual: format!("{} tokens", config.max_context_tokens),
             });
         }
-        if config.speculative_drafts > 1 {
-            return Err(Error::Shape {
-                label: "Qwen3.8 Flash Next speculative decoding",
-                expected: "zero or one native MTP draft".to_string(),
-                actual: config.speculative_drafts.to_string(),
-            });
-        }
-        if config.speculative_drafts == 1 && !model.mtp_enabled() {
+        if config.speculative_drafts > 0 && !model.mtp_enabled() {
             return Err(Error::Format {
                 label: "Qwen3.8 Flash Next speculative decoding",
                 detail: "native MTP weights were not enabled while loading the model".to_string(),
@@ -342,7 +335,7 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 sampling_bytes,
             )?;
             let cached_prompt_tokens = sequence.position();
-            let (mtp_sequence, speculative_frontier) = if self.config.speculative_drafts == 1
+            let (mtp_sequence, speculative_frontier) = if self.config.speculative_drafts > 0
                 && request.generation.sampling.uses_fast_argmax()
                 && request.generation.max_new_tokens != 0
             {
@@ -693,11 +686,16 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 value: frontier.logit,
             }]
         } else {
+            let active_drafts = self
+                .config
+                .speculative_drafts
+                .min(remaining.saturating_sub(1));
             let outcome = self.execution.model.speculative_cycle_argmax(
                 self.execution
                     .speculative_workspace
                     .as_mut()
                     .expect("speculative workspace was allocated"),
+                active_drafts,
                 sequence
                     .speculative_frontier
                     .as_mut()

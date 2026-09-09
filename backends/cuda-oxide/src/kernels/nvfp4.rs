@@ -723,8 +723,8 @@ mod device {
 
     /// Runs grouped SM121 W4A4 GEMM and restores route-major output order.
     #[kernel]
-    #[launch_bounds(32)]
-    #[launch_contract(domain = 2, coordinates = u32, block = (32, 1, 1))]
+    #[launch_bounds(128)]
+    #[launch_contract(domain = 2, coordinates = u32, block = (128, 1, 1))]
     pub unsafe fn w4a4_route_groups_f32(
         sorted_routes: *const u32,
         group_experts: *const u32,
@@ -741,12 +741,20 @@ mod device {
         in_features: u32,
         workers: u32,
     ) {
-        let out_tile8 = thread::blockIdx_x();
+        let shared_tiles = DynamicSharedArray::<u32>::get();
+        let thread_index = thread::threadIdx_x();
+        let warp_index = thread_index / 32;
+        let warps = thread::blockDim_x() / 32;
+        let out_tile8 = thread::blockIdx_x() * warps + warp_index;
         let worker = thread::blockIdx_y();
         let lane = warp::lane_id();
         let k_tiles16 = in_features / 16;
         let k_tiles64 = in_features / 64;
+        let input_tile_words = k_tiles64 * 128;
+        let input_scale_words = k_tiles64 * 16;
+        let shared_scales = unsafe { shared_tiles.add(input_tile_words as usize) };
         let out_tiles16 = out_features / 16;
+        let active = out_tile8 * 8 < out_features;
         let expert_weight_stride = out_features * in_features / 2;
         let expert_scale_stride = out_features * in_features / 16;
         let groups = unsafe { *group_count };
@@ -764,72 +772,105 @@ mod device {
             let out_tile16 = output_col / 16;
             let output_row = output_col & 15;
             let t0 = lane & 3;
-            let mut k_tile64 = 0u32;
-            while k_tile64 < k_tiles64 {
-                let input_tile =
-                    unsafe { input_tiles.add(((group * k_tiles64 + k_tile64) * 512) as usize) };
-                let input_lane = unsafe { input_tile.add((lane * 16) as usize) };
-                let a = unsafe {
-                    [
-                        load_u32(input_lane, 0),
-                        load_u32(input_lane, 1),
-                        load_u32(input_lane, 2),
-                        load_u32(input_lane, 3),
-                    ]
+            let group_tiles = unsafe {
+                input_tiles
+                    .cast::<u32>()
+                    .add((group * input_tile_words) as usize)
+            };
+            let group_scales = unsafe {
+                input_scales.add((group * input_scale_words) as usize)
+            };
+            let mut word = thread_index;
+            while word < input_tile_words {
+                unsafe {
+                    shared_tiles
+                        .add(word as usize)
+                        .write(*group_tiles.add(word as usize))
                 };
-                let first_k16 = k_tile64 * 4 + t0 / 2;
-                let second_k16 = first_k16 + 2;
-                let half = (t0 & 1) * 4;
-                let first_tile = unsafe {
-                    expert_weight.add(
-                        ((out_tile16 * k_tiles16 + first_k16) * PACKED_TILE_BYTES as u32
-                            + output_row * 8
-                            + half) as usize,
-                    )
+                word += thread::blockDim_x();
+            }
+            word = thread_index;
+            while word < input_scale_words {
+                unsafe {
+                    shared_scales
+                        .add(word as usize)
+                        .write(*group_scales.add(word as usize))
                 };
-                let second_tile = unsafe {
-                    expert_weight.add(
-                        ((out_tile16 * k_tiles16 + second_k16) * PACKED_TILE_BYTES as u32
-                            + output_row * 8
-                            + half) as usize,
-                    )
-                };
-                let b = unsafe { [load_u32(first_tile, 0), load_u32(second_tile, 0)] };
-                let scale_a = if t0 < 2 {
-                    let scale_row = lane / 4 + 8 * t0;
-                    unsafe {
-                        *input_scales
-                            .add(((group * k_tiles64 + k_tile64) * 16 + scale_row) as usize)
-                    }
-                } else {
-                    0
-                };
-                let scale_b = if t0 == 0 {
-                    let mut word = 0u32;
-                    let mut block = 0u32;
-                    while block < 4 {
-                        let scale = unsafe {
-                            *expert_scales.add(
-                                ((out_tile16 * k_tiles16 + k_tile64 * 4 + block)
-                                    * SCALE_TILE_BYTES as u32
-                                    + output_row) as usize,
-                            )
-                        };
-                        word |= u32::from(scale) << (block * 8);
-                        block += 1;
-                    }
-                    word
-                } else {
-                    0
-                };
-                accumulators = unsafe { mma_m16n8k64_nvfp4(a, b, scale_a, scale_b, accumulators) };
-                k_tile64 += 1;
+                word += thread::blockDim_x();
+            }
+            thread::sync_threads();
+            if active {
+                let mut k_tile64 = 0u32;
+                while k_tile64 < k_tiles64 {
+                    let input_tile = unsafe {
+                        shared_tiles
+                            .cast::<u8>()
+                            .add((k_tile64 * 512) as usize)
+                    };
+                    let input_lane = unsafe { input_tile.add((lane * 16) as usize) };
+                    let a = unsafe {
+                        [
+                            load_u32(input_lane, 0),
+                            load_u32(input_lane, 1),
+                            load_u32(input_lane, 2),
+                            load_u32(input_lane, 3),
+                        ]
+                    };
+                    let first_k16 = k_tile64 * 4 + t0 / 2;
+                    let second_k16 = first_k16 + 2;
+                    let half = (t0 & 1) * 4;
+                    let first_tile = unsafe {
+                        expert_weight.add(
+                            ((out_tile16 * k_tiles16 + first_k16) * PACKED_TILE_BYTES as u32
+                                + output_row * 8
+                                + half) as usize,
+                        )
+                    };
+                    let second_tile = unsafe {
+                        expert_weight.add(
+                            ((out_tile16 * k_tiles16 + second_k16) * PACKED_TILE_BYTES as u32
+                                + output_row * 8
+                                + half) as usize,
+                        )
+                    };
+                    let b = unsafe { [load_u32(first_tile, 0), load_u32(second_tile, 0)] };
+                    let scale_a = if t0 < 2 {
+                        let scale_row = lane / 4 + 8 * t0;
+                        unsafe {
+                            *shared_scales.add((k_tile64 * 16 + scale_row) as usize)
+                        }
+                    } else {
+                        0
+                    };
+                    let scale_b = if t0 == 0 {
+                        let mut word = 0u32;
+                        let mut block = 0u32;
+                        while block < 4 {
+                            let scale = unsafe {
+                                *expert_scales.add(
+                                    ((out_tile16 * k_tiles16 + k_tile64 * 4 + block)
+                                        * SCALE_TILE_BYTES as u32
+                                        + output_row) as usize,
+                                )
+                            };
+                            word |= u32::from(scale) << (block * 8);
+                            block += 1;
+                        }
+                        word
+                    } else {
+                        0
+                    };
+                    accumulators = unsafe {
+                        mma_m16n8k64_nvfp4(a, b, scale_a, scale_b, accumulators)
+                    };
+                    k_tile64 += 1;
+                }
             }
             let global_scale = unsafe { *global_scales.add(expert as usize) };
             let column = (lane & 3) * 2;
             let row0 = lane / 4;
             let row1 = row0 + 8;
-            if row0 < length {
+            if active && row0 < length {
                 let route = unsafe { *sorted_routes.add((start + row0) as usize) };
                 let index = route * out_features + out_tile8 * 8 + column;
                 let packed = convert::cvt_bf16x2_f32(
@@ -845,7 +886,7 @@ mod device {
                         .write(convert::cvt_f32_bf16x2_hi(packed));
                 }
             }
-            if row1 < length {
+            if active && row1 < length {
                 let route = unsafe { *sorted_routes.add((start + row1) as usize) };
                 let index = route * out_features + out_tile8 * 8 + column;
                 let packed = convert::cvt_bf16x2_f32(
@@ -861,6 +902,7 @@ mod device {
                         .write(convert::cvt_f32_bf16x2_hi(packed));
                 }
             }
+            thread::sync_threads();
             group += workers;
         }
         let _ = out_tiles16;

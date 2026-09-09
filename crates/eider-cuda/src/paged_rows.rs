@@ -1,4 +1,4 @@
-//! Direct-I/O backed BF16 embedding-row gathers for coherent unified memory.
+//! Direct-I/O backed embedding-row gathers for coherent unified memory.
 
 #[cfg(not(feature = "cuda-oxide"))]
 use crate::cuda::check_cuda;
@@ -23,7 +23,7 @@ const PAGE_SLOT_BYTES: usize = 2 * DIRECT_IO_ALIGNMENT;
 const MAX_DIRECT_IO_WORKERS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Bf16RowShard {
+struct PagedRowShard {
     first_row: usize,
     rows: usize,
     file_offset: u64,
@@ -39,7 +39,7 @@ struct DirectRowRead {
 
 /// Statistics for one logical row batch populated from direct storage.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PagedBf16ReadStats {
+pub struct PagedRowReadStats {
     /// Requested rows, including duplicates.
     pub logical_rows: usize,
     /// Distinct rows issued to storage.
@@ -50,16 +50,58 @@ pub struct PagedBf16ReadStats {
     pub elapsed: Duration,
 }
 
-/// One BF16 row table split across numbered tensors in a safetensors shard.
-pub struct PagedBf16RowSource {
+/// Storage type for one paged row table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PagedRowFormat {
+    /// BF16 values requiring no tensor scale.
+    Bf16,
+    /// E4M3 values with one positive scale for the complete table.
+    Fp8E4m3 {
+        /// Multiplier applied after converting each E4M3 value.
+        scale: f32,
+    },
+}
+
+impl PagedRowFormat {
+    fn dtype(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::Fp8E4m3 { .. } => "F8_E4M3",
+        }
+    }
+
+    fn element_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::Fp8E4m3 { .. } => 1,
+        }
+    }
+
+    fn validate(self) -> Result<Self> {
+        if let Self::Fp8E4m3 { scale } = self
+            && (!scale.is_finite() || scale <= 0.0)
+        {
+            return Err(Error::Shape {
+                label: "paged FP8 row scale",
+                expected: "positive finite scale".to_string(),
+                actual: scale.to_string(),
+            });
+        }
+        Ok(self)
+    }
+}
+
+/// One row table split across numbered tensors in a safetensors shard.
+pub struct PagedRowSource {
     readers: DirectRowReaderPool,
-    shards: Vec<Bf16RowShard>,
+    shards: Vec<PagedRowShard>,
     rows: usize,
     cols: usize,
     row_bytes: usize,
+    format: PagedRowFormat,
 }
 
-impl PagedBf16RowSource {
+impl PagedRowSource {
     /// Opens `prefix{index}suffix` tensors as one logical row table.
     pub fn open_numbered(
         shard: &SafeTensorShard,
@@ -67,12 +109,13 @@ impl PagedBf16RowSource {
         suffix: &str,
         shard_count: usize,
         cols: usize,
+        format: PagedRowFormat,
     ) -> Result<Self> {
         let workers = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
             .min(MAX_DIRECT_IO_WORKERS);
-        Self::open_numbered_with_workers(shard, prefix, suffix, shard_count, cols, workers)
+        Self::open_numbered_with_workers(shard, prefix, suffix, shard_count, cols, format, workers)
     }
 
     /// Opens numbered tensors with an explicit direct-I/O worker count.
@@ -82,23 +125,27 @@ impl PagedBf16RowSource {
         suffix: &str,
         shard_count: usize,
         cols: usize,
+        format: PagedRowFormat,
         workers: usize,
     ) -> Result<Self> {
         if shard_count == 0 || cols == 0 || workers == 0 {
             return Err(Error::Shape {
-                label: "paged BF16 row source",
+                label: "paged row source",
                 expected: "positive shard count, columns, and workers".to_string(),
                 actual: format!("shards={shard_count} cols={cols} workers={workers}"),
             });
         }
-        let row_bytes = cols.checked_mul(2).ok_or_else(|| Error::Shape {
-            label: "paged BF16 row bytes",
-            expected: "cols * 2 without overflow".to_string(),
-            actual: cols.to_string(),
-        })?;
+        let format = format.validate()?;
+        let row_bytes = cols
+            .checked_mul(format.element_bytes())
+            .ok_or_else(|| Error::Shape {
+                label: "paged row bytes",
+                expected: "cols * element bytes without overflow".to_string(),
+                actual: cols.to_string(),
+            })?;
         if row_bytes > DIRECT_IO_ALIGNMENT {
             return Err(Error::Shape {
-                label: "paged BF16 row bytes",
+                label: "paged row bytes",
                 expected: format!("at most {DIRECT_IO_ALIGNMENT} bytes"),
                 actual: row_bytes.to_string(),
             });
@@ -109,34 +156,34 @@ impl PagedBf16RowSource {
         for index in 0..shard_count {
             let name = format!("{prefix}{index}{suffix}");
             let info = shard.require_tensor(&name)?;
-            if info.dtype != "BF16" || info.shape.len() != 2 || info.shape[1] != cols {
+            if info.dtype != format.dtype() || info.shape.len() != 2 || info.shape[1] != cols {
                 return Err(Error::Shape {
-                    label: "paged BF16 row tensor",
-                    expected: format!("dtype=BF16 shape=[rows, {cols}]"),
+                    label: "paged row tensor",
+                    expected: format!("dtype={} shape=[rows, {cols}]", format.dtype()),
                     actual: format!("{name}: dtype={} shape={:?}", info.dtype, info.shape),
                 });
             }
             let rows = info.shape[0];
             let range = shard.tensor_file_range(&name)?;
             let expected_bytes = rows.checked_mul(row_bytes).ok_or_else(|| Error::Shape {
-                label: "paged BF16 row tensor bytes",
+                label: "paged row tensor bytes",
                 expected: "rows * row bytes without overflow".to_string(),
                 actual: format!("rows={rows} row_bytes={row_bytes}"),
             })?;
             if range.end - range.start != expected_bytes as u64 {
                 return Err(Error::Shape {
-                    label: "paged BF16 row tensor bytes",
+                    label: "paged row tensor bytes",
                     expected: expected_bytes.to_string(),
                     actual: (range.end - range.start).to_string(),
                 });
             }
-            shards.push(Bf16RowShard {
+            shards.push(PagedRowShard {
                 first_row,
                 rows,
                 file_offset: range.start,
             });
             first_row = first_row.checked_add(rows).ok_or_else(|| Error::Shape {
-                label: "paged BF16 row count",
+                label: "paged row count",
                 expected: "row sum without overflow".to_string(),
                 actual: format!("current={first_row} next={rows}"),
             })?;
@@ -153,6 +200,7 @@ impl PagedBf16RowSource {
             rows: first_row,
             cols,
             row_bytes,
+            format,
         })
     }
 
@@ -161,7 +209,7 @@ impl PagedBf16RowSource {
         self.rows
     }
 
-    /// Width of each BF16 row.
+    /// Width of each row.
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -170,13 +218,25 @@ impl PagedBf16RowSource {
     pub fn read_rows(
         &mut self,
         row_ids: &[u32],
-        batch: &mut PagedBf16RowBatch,
-    ) -> Result<PagedBf16ReadStats> {
-        if row_ids.is_empty() || row_ids.len() > batch.capacity || batch.cols != self.cols {
+        batch: &mut PagedRowBatch,
+    ) -> Result<PagedRowReadStats> {
+        if row_ids.is_empty()
+            || row_ids.len() > batch.capacity
+            || batch.cols != self.cols
+            || batch.format != self.format
+        {
             return Err(Error::Shape {
-                label: "paged BF16 row batch",
-                expected: format!("1..={} rows with {} columns", batch.capacity, self.cols),
-                actual: format!("rows={} cols={}", row_ids.len(), batch.cols),
+                label: "paged row batch",
+                expected: format!(
+                    "1..={} rows with {} columns and {:?}",
+                    batch.capacity, self.cols, self.format
+                ),
+                actual: format!(
+                    "rows={} cols={} format={:?}",
+                    row_ids.len(),
+                    batch.cols,
+                    batch.format
+                ),
             });
         }
         let started = Instant::now();
@@ -186,7 +246,7 @@ impl PagedBf16RowSource {
             let row_id = row_id as usize;
             if row_id >= self.rows {
                 return Err(Error::Shape {
-                    label: "paged BF16 row ID",
+                    label: "paged row ID",
                     expected: format!("row < {}", self.rows),
                     actual: row_id.to_string(),
                 });
@@ -212,13 +272,13 @@ impl PagedBf16RowSource {
                 .checked_mul(PAGE_SLOT_BYTES)
                 .and_then(|value| value.checked_add(reads[slot].row_offset))
                 .ok_or_else(|| Error::Shape {
-                    label: "paged BF16 row offset",
+                    label: "paged row offset",
                     expected: "slot offset without overflow".to_string(),
                     actual: format!("slot={slot} row_offset={}", reads[slot].row_offset),
                 })?;
             batch.offsets.as_mut_slice()[output_row] =
                 u32::try_from(offset).map_err(|_| Error::Shape {
-                    label: "paged BF16 row offset",
+                    label: "paged row offset",
                     expected: "offset fitting u32".to_string(),
                     actual: offset.to_string(),
                 })?;
@@ -231,7 +291,7 @@ impl PagedBf16RowSource {
             self.row_bytes,
         )?;
         batch.row_count = row_ids.len();
-        Ok(PagedBf16ReadStats {
+        Ok(PagedRowReadStats {
             logical_rows: row_ids.len(),
             unique_rows: reads.len(),
             bytes_read: reads.iter().map(|read| read.bytes).sum(),
@@ -246,14 +306,14 @@ impl PagedBf16RowSource {
             .rev()
             .find(|shard| row >= shard.first_row)
             .ok_or_else(|| Error::Shape {
-                label: "paged BF16 row shard",
+                label: "paged row shard",
                 expected: "row covered by a shard".to_string(),
                 actual: row.to_string(),
             })?;
         let local_row = row - shard.first_row;
         if local_row >= shard.rows {
             return Err(Error::Shape {
-                label: "paged BF16 row shard",
+                label: "paged row shard",
                 expected: format!("local row < {}", shard.rows),
                 actual: local_row.to_string(),
             });
@@ -261,7 +321,7 @@ impl PagedBf16RowSource {
         let row_offset = local_row
             .checked_mul(self.row_bytes)
             .ok_or_else(|| Error::Shape {
-                label: "paged BF16 row file offset",
+                label: "paged row file offset",
                 expected: "local row * row bytes without overflow".to_string(),
                 actual: format!("local_row={local_row} row_bytes={}", self.row_bytes),
             })?;
@@ -269,7 +329,7 @@ impl PagedBf16RowSource {
             .file_offset
             .checked_add(row_offset as u64)
             .ok_or_else(|| Error::Shape {
-                label: "paged BF16 row file offset",
+                label: "paged row file offset",
                 expected: "tensor offset + row offset without overflow".to_string(),
                 actual: format!(
                     "tensor={} local_row={} row_bytes={}",
@@ -280,20 +340,21 @@ impl PagedBf16RowSource {
 }
 
 /// Reusable direct-read pages and stable row-offset storage.
-pub struct PagedBf16RowBatch {
+pub struct PagedRowBatch {
     pages: PageableHostBuffer<u8>,
     offsets: PageableHostBuffer<u32>,
     capacity: usize,
     cols: usize,
     row_count: usize,
+    format: PagedRowFormat,
 }
 
-impl PagedBf16RowBatch {
+impl PagedRowBatch {
     /// Allocates stable direct-I/O pages for at most `capacity` gathered rows.
-    pub fn new(capacity: usize, cols: usize) -> Result<Self> {
+    pub fn new(capacity: usize, cols: usize, format: PagedRowFormat) -> Result<Self> {
         if capacity == 0 || cols == 0 {
             return Err(Error::Shape {
-                label: "paged BF16 row batch",
+                label: "paged row batch",
                 expected: "positive capacity and columns".to_string(),
                 actual: format!("capacity={capacity} cols={cols}"),
             });
@@ -301,13 +362,13 @@ impl PagedBf16RowBatch {
         let page_bytes = capacity
             .checked_mul(PAGE_SLOT_BYTES)
             .ok_or_else(|| Error::Shape {
-                label: "paged BF16 page storage",
+                label: "paged row page storage",
                 expected: "capacity * page slot bytes without overflow".to_string(),
                 actual: capacity.to_string(),
             })?;
         if page_bytes > u32::MAX as usize {
             return Err(Error::Shape {
-                label: "paged BF16 page storage",
+                label: "paged row page storage",
                 expected: "page offsets fitting u32".to_string(),
                 actual: page_bytes.to_string(),
             });
@@ -318,6 +379,7 @@ impl PagedBf16RowBatch {
             capacity,
             cols,
             row_count: 0,
+            format: format.validate()?,
         })
     }
 
@@ -336,7 +398,7 @@ impl PagedBf16RowBatch {
         self.pages.bytes() + self.offsets.bytes()
     }
 
-    /// Gathers the most recently read BF16 rows into contiguous F32 rows.
+    /// Gathers the most recently read rows into contiguous F32 rows.
     pub fn gather_into_on_stream(
         &self,
         mut output: DeviceOutput<'_, f32>,
@@ -346,74 +408,107 @@ impl PagedBf16RowBatch {
             .row_count
             .checked_mul(self.cols)
             .ok_or_else(|| Error::Shape {
-                label: "paged BF16 gather output",
+                label: "paged row gather output",
                 expected: "rows * cols without overflow".to_string(),
                 actual: format!("rows={} cols={}", self.row_count, self.cols),
             })?;
         if self.row_count == 0 || output.len() < values {
             return Err(Error::Shape {
-                label: "paged BF16 gather output",
+                label: "paged row gather output",
                 expected: format!("at least {values} values for a non-empty batch"),
                 actual: output.len().to_string(),
             });
         }
-        #[cfg(feature = "cuda-oxide")]
-        unsafe {
-            core_oxide::paged_bf16_rows_to_f32(
-                self.pages.as_ptr(),
-                self.offsets.as_ptr(),
-                output.as_mut_ptr().cast(),
-                self.row_count as u32,
-                self.cols as u32,
-                stream.as_raw(),
-            )
-        }
-        #[cfg(not(feature = "cuda-oxide"))]
-        unsafe {
-            check_cuda(
-                "infer_paged_bf16_rows_to_f32_on_stream",
-                ffi::infer_paged_bf16_rows_to_f32_on_stream(
-                    self.pages.as_ptr(),
-                    self.offsets.as_ptr(),
-                    output.as_mut_ptr().cast(),
-                    self.row_count as u32,
-                    self.cols as u32,
-                    stream.as_raw(),
-                ),
-            )
+        match self.format {
+            PagedRowFormat::Bf16 => unsafe {
+                #[cfg(feature = "cuda-oxide")]
+                {
+                    core_oxide::paged_bf16_rows_to_f32(
+                        self.pages.as_ptr(),
+                        self.offsets.as_ptr(),
+                        output.as_mut_ptr().cast(),
+                        self.row_count as u32,
+                        self.cols as u32,
+                        stream.as_raw(),
+                    )
+                }
+                #[cfg(not(feature = "cuda-oxide"))]
+                {
+                    check_cuda(
+                        "infer_paged_bf16_rows_to_f32_on_stream",
+                        ffi::infer_paged_bf16_rows_to_f32_on_stream(
+                            self.pages.as_ptr(),
+                            self.offsets.as_ptr(),
+                            output.as_mut_ptr().cast(),
+                            self.row_count as u32,
+                            self.cols as u32,
+                            stream.as_raw(),
+                        ),
+                    )
+                }
+            },
+            PagedRowFormat::Fp8E4m3 { scale } => unsafe {
+                #[cfg(feature = "cuda-oxide")]
+                {
+                    core_oxide::paged_fp8_rows_to_f32(
+                        self.pages.as_ptr(),
+                        self.offsets.as_ptr(),
+                        output.as_mut_ptr().cast(),
+                        self.row_count as u32,
+                        self.cols as u32,
+                        scale,
+                        stream.as_raw(),
+                    )
+                }
+                #[cfg(not(feature = "cuda-oxide"))]
+                {
+                    check_cuda(
+                        "infer_paged_fp8_rows_to_f32_on_stream",
+                        ffi::infer_paged_fp8_rows_to_f32_on_stream(
+                            self.pages.as_ptr(),
+                            self.offsets.as_ptr(),
+                            output.as_mut_ptr().cast(),
+                            self.row_count as u32,
+                            self.cols as u32,
+                            scale,
+                            stream.as_raw(),
+                        ),
+                    )
+                }
+            },
         }
     }
 }
 
-struct PagedBf16BatchSlot {
+struct PagedRowBatchSlot {
     index: usize,
-    batch: PagedBf16RowBatch,
+    batch: PagedRowBatch,
 }
 
-struct PagedBf16ReadRequest {
+struct PagedRowReadRequest {
     row_ids: Vec<u32>,
-    slot: PagedBf16BatchSlot,
+    slot: PagedRowBatchSlot,
 }
 
-struct PagedBf16ReadResponse {
+struct PagedRowReadResponse {
     row_ids: Vec<u32>,
-    slot: PagedBf16BatchSlot,
-    result: Result<PagedBf16ReadStats>,
+    slot: PagedRowBatchSlot,
+    result: Result<PagedRowReadStats>,
 }
 
-/// Double-buffered asynchronous reader for a paged BF16 row source.
+/// Double-buffered asynchronous reader for a paged row source.
 ///
 /// Call [`Self::begin_rows`] before unrelated GPU work, then call
 /// [`Self::gather_into_on_stream`] at the first consumer. The gather waits only
 /// for any storage work that did not overlap. A per-batch CUDA event prevents
 /// the reader threads from overwriting pages still visible to the GPU.
-pub struct PagedBf16RowReader {
-    requests: Option<SyncSender<PagedBf16ReadRequest>>,
-    responses: Receiver<PagedBf16ReadResponse>,
+pub struct PagedRowReader {
+    requests: Option<SyncSender<PagedRowReadRequest>>,
+    responses: Receiver<PagedRowReadResponse>,
     worker: Option<JoinHandle<()>>,
-    free: Vec<PagedBf16BatchSlot>,
-    busy: Vec<PagedBf16BatchSlot>,
-    ready: Option<(PagedBf16BatchSlot, PagedBf16ReadStats)>,
+    free: Vec<PagedRowBatchSlot>,
+    busy: Vec<PagedRowBatchSlot>,
+    ready: Option<(PagedRowBatchSlot, PagedRowReadStats)>,
     reuse_events: Vec<CudaEvent>,
     row_id_buffers: Vec<Vec<u32>>,
     row_capacity: usize,
@@ -422,12 +517,12 @@ pub struct PagedBf16RowReader {
     pending: bool,
 }
 
-impl PagedBf16RowReader {
+impl PagedRowReader {
     /// Starts a dedicated reader around `source` with two reusable batches.
-    pub fn new(source: PagedBf16RowSource, row_capacity: usize) -> Result<Self> {
+    pub fn new(source: PagedRowSource, row_capacity: usize) -> Result<Self> {
         if row_capacity == 0 {
             return Err(Error::Shape {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 expected: "positive row capacity".to_string(),
                 actual: "0".to_string(),
             });
@@ -437,22 +532,22 @@ impl PagedBf16RowReader {
         let mut reuse_events = Vec::with_capacity(2);
         let mut storage_bytes = 0usize;
         for index in 0..2 {
-            let batch = PagedBf16RowBatch::new(row_capacity, cols)?;
+            let batch = PagedRowBatch::new(row_capacity, cols, source.format)?;
             storage_bytes = storage_bytes.saturating_add(batch.storage_bytes());
-            free.push(PagedBf16BatchSlot { index, batch });
+            free.push(PagedRowBatchSlot { index, batch });
             reuse_events.push(CudaEvent::new_sync()?);
         }
 
-        let (request_tx, request_rx) = mpsc::sync_channel::<PagedBf16ReadRequest>(1);
-        let (response_tx, responses) = mpsc::channel::<PagedBf16ReadResponse>();
+        let (request_tx, request_rx) = mpsc::sync_channel::<PagedRowReadRequest>(1);
+        let (response_tx, responses) = mpsc::channel::<PagedRowReadResponse>();
         let worker = std::thread::Builder::new()
-            .name("eider-paged-bf16".to_string())
+            .name("eider-paged-rows".to_string())
             .spawn(move || {
                 let mut source = source;
                 while let Ok(mut request) = request_rx.recv() {
                     let result = source.read_rows(&request.row_ids, &mut request.slot.batch);
                     if response_tx
-                        .send(PagedBf16ReadResponse {
+                        .send(PagedRowReadResponse {
                             row_ids: request.row_ids,
                             slot: request.slot,
                             result,
@@ -464,7 +559,7 @@ impl PagedBf16RowReader {
                 }
             })
             .map_err(|error| Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: format!("spawn coordinator: {error}"),
             })?;
         Ok(Self {
@@ -487,14 +582,14 @@ impl PagedBf16RowReader {
     pub fn begin_rows(&mut self, row_ids: &[u32]) -> Result<()> {
         if row_ids.is_empty() || row_ids.len() > self.row_capacity {
             return Err(Error::Shape {
-                label: "paged BF16 asynchronous rows",
+                label: "paged asynchronous rows",
                 expected: format!("1..={} rows", self.row_capacity),
                 actual: row_ids.len().to_string(),
             });
         }
         if self.pending || self.ready.is_some() {
             return Err(Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: "the previous row batch has not been gathered".to_string(),
             });
         }
@@ -503,7 +598,7 @@ impl PagedBf16RowReader {
             slot
         } else {
             let slot = self.busy.pop().ok_or_else(|| Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: "no reusable batch is available".to_string(),
             })?;
             self.reuse_events[slot.index].synchronize()?;
@@ -514,13 +609,13 @@ impl PagedBf16RowReader {
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(self.row_capacity));
         owned_ids.extend_from_slice(row_ids);
-        let request = PagedBf16ReadRequest {
+        let request = PagedRowReadRequest {
             row_ids: owned_ids,
             slot,
         };
         let Some(sender) = &self.requests else {
             return Err(Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: "reader coordinator has stopped".to_string(),
             });
         };
@@ -530,7 +625,7 @@ impl PagedBf16RowReader {
             self.row_id_buffers.push(request.row_ids);
             self.free.push(request.slot);
             return Err(Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: "reader coordinator has stopped".to_string(),
             });
         }
@@ -539,18 +634,18 @@ impl PagedBf16RowReader {
     }
 
     /// Waits for the active storage read while retaining its batch for gather.
-    pub fn wait_ready(&mut self) -> Result<PagedBf16ReadStats> {
+    pub fn wait_ready(&mut self) -> Result<PagedRowReadStats> {
         if let Some((_, stats)) = self.ready.as_ref() {
             return Ok(*stats);
         }
         if !self.pending {
             return Err(Error::Format {
-                label: "paged BF16 asynchronous reader",
+                label: "paged asynchronous row reader",
                 detail: "no row batch is in flight".to_string(),
             });
         }
         let mut response = self.responses.recv().map_err(|error| Error::Format {
-            label: "paged BF16 asynchronous reader",
+            label: "paged asynchronous row reader",
             detail: format!("reader coordinator stopped: {error}"),
         })?;
         self.pending = false;
@@ -573,7 +668,7 @@ impl PagedBf16RowReader {
         &mut self,
         output: DeviceOutput<'_, f32>,
         stream: &CudaStream,
-    ) -> Result<PagedBf16ReadStats> {
+    ) -> Result<PagedRowReadStats> {
         let stats = self.wait_ready()?;
         let (slot, _) = self.ready.take().expect("wait_ready populated batch");
         if let Err(error) = slot.batch.gather_into_on_stream(output, stream) {
@@ -594,13 +689,13 @@ impl PagedBf16RowReader {
         self.storage_bytes
     }
 
-    /// Width of each gathered BF16 row.
+    /// Width of each gathered row.
     pub fn cols(&self) -> usize {
         self.cols
     }
 }
 
-impl Drop for PagedBf16RowReader {
+impl Drop for PagedRowReader {
     fn drop(&mut self) {
         self.requests.take();
         if let Some(worker) = self.worker.take() {
@@ -801,15 +896,15 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 
 fn row_io_error(operation: &'static str, path: &Path, error: std::io::Error) -> Error {
     Error::Format {
-        label: "paged BF16 row source",
+        label: "paged row source",
         detail: format!("{operation} {}: {error}", path.display()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PagedBf16RowBatch, PagedBf16RowReader, PagedBf16RowSource};
-    use crate::format::{bf16_to_f32, f32_to_bf16};
+    use super::{PagedRowBatch, PagedRowFormat, PagedRowReader, PagedRowSource};
+    use crate::format::{bf16_to_f32, e4m3_value, f32_to_bf16};
     use crate::{CudaStream, DeviceBuffer};
     use eider_format::SafeTensorShard;
     use serde_json::json;
@@ -829,14 +924,20 @@ mod tests {
         write_fixture(&path, &rows);
 
         let shard = SafeTensorShard::open(&path).expect("fixture shard");
-        let mut source =
-            PagedBf16RowSource::open_numbered(&shard, "table.shard_", ".weight", 2, COLS)
-                .expect("paged source");
+        let mut source = PagedRowSource::open_numbered(
+            &shard,
+            "table.shard_",
+            ".weight",
+            2,
+            COLS,
+            PagedRowFormat::Bf16,
+        )
+        .expect("paged source");
         assert_eq!(source.rows(), 5);
         assert_eq!(source.cols(), COLS);
 
         let ids = [4, 0, 4, 2];
-        let mut batch = PagedBf16RowBatch::new(ids.len(), COLS).expect("batch");
+        let mut batch = PagedRowBatch::new(ids.len(), COLS, PagedRowFormat::Bf16).expect("batch");
         let stats = source.read_rows(&ids, &mut batch).expect("direct rows");
         assert_eq!(stats.logical_rows, 4);
         assert_eq!(stats.unique_rows, 3);
@@ -872,9 +973,16 @@ mod tests {
         write_fixture(&path, &rows);
 
         let shard = SafeTensorShard::open(&path).expect("fixture shard");
-        let source = PagedBf16RowSource::open_numbered(&shard, "table.shard_", ".weight", 2, COLS)
-            .expect("paged source");
-        let mut reader = PagedBf16RowReader::new(source, 2).expect("asynchronous reader");
+        let source = PagedRowSource::open_numbered(
+            &shard,
+            "table.shard_",
+            ".weight",
+            2,
+            COLS,
+            PagedRowFormat::Bf16,
+        )
+        .expect("paged source");
+        let mut reader = PagedRowReader::new(source, 2).expect("asynchronous reader");
         let stream = CudaStream::new_non_blocking().expect("stream");
         let mut output = DeviceBuffer::zeroed(2 * COLS).expect("output");
 
@@ -898,6 +1006,40 @@ mod tests {
         assert_eq!(actual.as_slice(), expected);
 
         drop(reader);
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn direct_paged_rows_scale_fp8_tensors() {
+        let path = fixture_path();
+        let rows = (0..5 * COLS)
+            .map(|index| [0x00, 0x28, 0x30, 0x38, 0xb8][index % 5])
+            .collect::<Vec<_>>();
+        write_fp8_fixture(&path, &rows);
+        let shard = SafeTensorShard::open(&path).expect("fixture shard");
+        let format = PagedRowFormat::Fp8E4m3 { scale: 0.25 };
+        let mut source =
+            PagedRowSource::open_numbered(&shard, "table.shard_", ".weight", 2, COLS, format)
+                .expect("paged source");
+        let ids = [4, 0, 2];
+        let mut batch = PagedRowBatch::new(ids.len(), COLS, format).expect("batch");
+        source.read_rows(&ids, &mut batch).expect("direct rows");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut output = DeviceBuffer::zeroed(ids.len() * COLS).expect("output");
+        batch
+            .gather_into_on_stream(output.output(), &stream)
+            .expect("gather");
+        let actual = output.copy_to_host(&stream).expect("readback");
+        let expected = ids
+            .iter()
+            .flat_map(|&row| {
+                let row = row as usize;
+                rows[row * COLS..(row + 1) * COLS]
+                    .iter()
+                    .map(|&code| e4m3_value(code) * 0.25)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_slice(), expected);
         fs::remove_file(path).expect("remove fixture");
     }
 
@@ -938,6 +1080,33 @@ mod tests {
         for &value in rows {
             file.write_all(&value.to_le_bytes()).expect("row value");
         }
+        file.set_len(8192).expect("direct-I/O padding");
+        file.sync_all().expect("sync fixture");
+    }
+
+    fn write_fp8_fixture(path: &PathBuf, rows: &[u8]) {
+        let first_bytes = 2 * COLS;
+        let header = json!({
+            "table.shard_0.weight": {
+                "dtype": "F8_E4M3",
+                "shape": [2, COLS],
+                "data_offsets": [0, first_bytes]
+            },
+            "table.shard_1.weight": {
+                "dtype": "F8_E4M3",
+                "shape": [3, COLS],
+                "data_offsets": [first_bytes, rows.len()]
+            }
+        });
+        let mut header = serde_json::to_vec(&header).expect("header");
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = File::create(path).expect("create fixture");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("header length");
+        file.write_all(&header).expect("header");
+        file.write_all(rows).expect("row values");
         file.set_len(8192).expect("direct-I/O padding");
         file.sync_all().expect("sync fixture");
     }

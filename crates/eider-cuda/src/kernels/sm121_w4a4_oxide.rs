@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 const WORKERS: u32 = 4;
+const GEMM_WARPS: u32 = 4;
 
 struct Functions {
     build_routes: Kernel,
@@ -95,11 +96,17 @@ pub(crate) unsafe fn launch(
         (&mut experts_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
-        functions.build_routes.launch(
-            LaunchConfig::new([1, 1, 1], [256, 1, 1], 0),
-            stream,
-            &mut route_parameters,
-        )?;
+        functions
+            .build_routes
+            .launch(
+                LaunchConfig::new([1, 1, 1], [256, 1, 1], 0),
+                stream,
+                &mut route_parameters,
+            )
+            .map_err(|error| Error::Format {
+                label: "cuda-oxide grouped W4A4 route launch",
+                detail: error.to_string(),
+            })?;
     }
 
     let mut input_arg = input;
@@ -121,11 +128,17 @@ pub(crate) unsafe fn launch(
         (&mut workers_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
-        functions.quantize.launch(
-            LaunchConfig::new([in_features / 64, WORKERS, 1], [128, 1, 1], 0),
-            stream,
-            &mut quantize_parameters,
-        )?;
+        functions
+            .quantize
+            .launch(
+                LaunchConfig::new([in_features / 64, WORKERS, 1], [128, 1, 1], 0),
+                stream,
+                &mut quantize_parameters,
+            )
+            .map_err(|error| Error::Format {
+                label: "cuda-oxide grouped W4A4 quantization launch",
+                detail: error.to_string(),
+            })?;
     }
 
     let mut tiled_weight_arg = tiled_weight;
@@ -133,6 +146,13 @@ pub(crate) unsafe fn launch(
     let mut global_scales_arg = global_scales;
     let mut output_arg = output;
     let mut out_features_arg = out_features;
+    let gemm_shared_bytes = (in_features / 64)
+        .checked_mul(512 + 16 * 4)
+        .ok_or_else(|| Error::Shape {
+            label: "cuda-oxide grouped W4A4 shared memory",
+            expected: "a byte count without overflow".to_string(),
+            actual: in_features.to_string(),
+        })?;
     let mut gemm_parameters = [
         (&mut sorted_routes_arg as *mut *mut u32).cast::<c_void>(),
         (&mut group_experts_arg as *mut *mut u32).cast::<c_void>(),
@@ -150,10 +170,20 @@ pub(crate) unsafe fn launch(
         (&mut workers_arg as *mut u32).cast::<c_void>(),
     ];
     unsafe {
-        functions.gemm.launch(
-            LaunchConfig::new([out_features / 8, WORKERS, 1], [32, 1, 1], 0),
-            stream,
-            &mut gemm_parameters,
-        )
+        functions
+            .gemm
+            .launch(
+                LaunchConfig::new(
+                    [out_features.div_ceil(8 * GEMM_WARPS), WORKERS, 1],
+                    [32 * GEMM_WARPS, 1, 1],
+                    gemm_shared_bytes,
+                ),
+                stream,
+                &mut gemm_parameters,
+            )
+            .map_err(|error| Error::Format {
+                label: "cuda-oxide grouped W4A4 GEMM launch",
+                detail: error.to_string(),
+            })
     }
 }

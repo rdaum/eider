@@ -1734,6 +1734,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
                 0,
                 1,
                 u32::MAX,
@@ -1843,6 +1848,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 0,
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
@@ -2159,6 +2169,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
                 input_row_offset as u32,
                 rows as u32,
                 start_position as u32,
@@ -2197,6 +2212,193 @@ impl Sm12xKvAttentionWorkspace {
                     self.head_dim as u32,
                     window_tokens.unwrap_or(0) as u32,
                     self.causal_row_capacity as u32,
+                    stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Computes causal sparse attention for rows with independent QSA masks.
+    ///
+    /// Each mask row covers the complete logical cache capacity. The selected
+    /// complete-token count excludes the current incomplete four-token block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_paged_sparse_causal_rows_at_offset_into_on_stream(
+        &mut self,
+        pool: &Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        start_position: usize,
+        selected_blocks: &DeviceBuffer<u8>,
+        selected_tiles: &DeviceBuffer<u8>,
+        selected_block_indices: &DeviceBuffer<u32>,
+        selected_token_tiles: &DeviceBuffer<u32>,
+        selected_context_tiles: &DeviceBuffer<u32>,
+        selected_counts: &DeviceBuffer<u32>,
+        selected_index_capacity: usize,
+        selected_complete_tokens: usize,
+        query: &DeviceBuffer<f32>,
+        input_row_offset: usize,
+        rows: usize,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_capacity = page_table
+            .len()
+            .checked_mul(SM12X_KV_PAGE_TOKENS)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged sparse causal row capacity",
+                expected: "page-table capacity without overflow".to_string(),
+                actual: page_table.len().to_string(),
+            })?;
+        let blocks_per_row = logical_capacity.div_ceil(4);
+        let tiles_per_row = logical_capacity.div_ceil(64);
+        let q_width = self.q_heads * self.head_dim;
+        let row_end = input_row_offset
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged sparse causal row attention",
+                expected: "input row range without overflow".to_string(),
+                actual: format!("input_row_offset={input_row_offset} rows={rows}"),
+            })?;
+        let q_end = row_end.checked_mul(q_width).ok_or_else(|| Error::Shape {
+            label: "SM12x paged sparse causal row attention",
+            expected: "query row range without overflow".to_string(),
+            actual: format!("row_end={row_end} q_width={q_width}"),
+        })?;
+        let cache_end = start_position
+            .checked_add(rows)
+            .ok_or_else(|| Error::Shape {
+                label: "SM12x paged sparse causal row attention",
+                expected: "cache row range without overflow".to_string(),
+                actual: format!("start={start_position} rows={rows}"),
+            })?;
+        let required_blocks = rows.saturating_mul(blocks_per_row);
+        let required_tiles = rows.saturating_mul(tiles_per_row);
+        let required_indices = rows.saturating_mul(selected_index_capacity);
+        if logical_capacity > self.max_tokens
+            || pool.kv_heads != self.kv_heads
+            || pool.head_dim != self.head_dim
+            || rows == 0
+            || rows > self.causal_row_capacity
+            || rows > V_TOKEN_BLOCK - start_position % V_TOKEN_BLOCK
+            || input_row_offset > u32::MAX as usize
+            || start_position > u32::MAX as usize
+            || cache_end > logical_capacity
+            || selected_complete_tokens == 0
+            || !selected_complete_tokens.is_multiple_of(4)
+            || selected_complete_tokens > start_position
+            || selected_blocks.len() < required_blocks
+            || selected_tiles.len() < required_tiles
+            || selected_index_capacity == 0
+            || selected_block_indices.len() < required_indices
+            || selected_token_tiles.len() < required_indices
+            || selected_context_tiles.len() < required_indices
+            || selected_counts.len() < rows.saturating_mul(3)
+            || q_end > query.len()
+            || q_end > output.len()
+        {
+            return Err(Error::Shape {
+                label: "SM12x paged sparse causal row attention buffers",
+                expected: format!(
+                    "1..={} rows within one tail, masks >= {required_blocks}/{required_tiles}, and q/output >= {q_end}",
+                    self.causal_row_capacity
+                ),
+                actual: format!(
+                    "start={start_position} rows={rows} selected={selected_complete_tokens} masks={}/{} indices={}/{}/{}/{} counts={} query={} output={} capacity={logical_capacity}",
+                    selected_blocks.len(),
+                    selected_tiles.len(),
+                    selected_block_indices.len(),
+                    selected_token_tiles.len(),
+                    selected_context_tiles.len(),
+                    selected_index_capacity,
+                    selected_counts.len(),
+                    query.len(),
+                    output.len()
+                ),
+            });
+        }
+        let layout = &pool.layout;
+        #[cfg(feature = "cuda-oxide")]
+        unsafe {
+            super::sm12x_kv_cache_oxide::attention(
+                query.as_const_ptr().cast(),
+                pool.component_ptr(layout.key_values),
+                pool.component_ptr(layout.key_scales),
+                pool.component_ptr(layout.key_tail).cast(),
+                pool.component_ptr(layout.value_values),
+                pool.component_ptr(layout.value_scales),
+                pool.component_ptr(layout.value_tail).cast(),
+                self.query_tiles.as_mut_ptr().cast(),
+                self.query_scales.as_mut_ptr().cast(),
+                self.scores.as_mut_ptr().cast(),
+                self.probability_tiles.as_mut_ptr().cast(),
+                self.probability_scales.as_mut_ptr().cast(),
+                self.pv_partials.as_mut_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                0,
+                std::ptr::null(),
+                logical_capacity as u32,
+                self.q_heads as u32,
+                self.kv_heads as u32,
+                self.head_dim as u32,
+                1,
+                0,
+                page_table.as_const_ptr().cast(),
+                SM12X_KV_PAGE_TOKENS as u32,
+                layout.total_bytes as u32,
+                selected_blocks.as_const_ptr().cast(),
+                selected_tiles.as_const_ptr().cast(),
+                selected_complete_tokens as u32,
+                selected_block_indices.as_const_ptr().cast(),
+                selected_token_tiles.as_const_ptr().cast(),
+                selected_context_tiles.as_const_ptr().cast(),
+                selected_counts.as_const_ptr().cast(),
+                selected_index_capacity as u32,
+                input_row_offset as u32,
+                rows as u32,
+                start_position as u32,
+                0,
+                input_row_offset as u32,
+                stream.as_raw(),
+            )
+        }
+        #[cfg(not(feature = "cuda-oxide"))]
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_paged_sparse_causal_attention_rows_on_stream",
+                crate::ffi::infer_sm12x_kv_paged_sparse_causal_attention_rows_on_stream(
+                    query.as_const_ptr().cast(),
+                    pool.component_ptr(layout.key_values),
+                    pool.component_ptr(layout.key_scales),
+                    pool.component_ptr(layout.value_values),
+                    pool.component_ptr(layout.value_scales),
+                    pool.component_ptr(layout.key_tail).cast(),
+                    pool.component_ptr(layout.value_tail).cast(),
+                    page_table.as_const_ptr().cast(),
+                    selected_blocks.as_const_ptr().cast(),
+                    selected_tiles.as_const_ptr().cast(),
+                    selected_block_indices.as_const_ptr().cast(),
+                    selected_token_tiles.as_const_ptr().cast(),
+                    selected_context_tiles.as_const_ptr().cast(),
+                    selected_counts.as_const_ptr().cast(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    input_row_offset as u32,
+                    start_position as u32,
+                    rows as u32,
+                    selected_complete_tokens as u32,
+                    logical_capacity as u32,
+                    SM12X_KV_PAGE_TOKENS as u32,
+                    layout.total_bytes as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    self.causal_row_capacity as u32,
+                    selected_index_capacity as u32,
                     stream.as_raw(),
                 ),
             )
@@ -2283,6 +2485,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 0,
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
@@ -2405,6 +2612,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
                 0,
                 1,
                 u32::MAX,
@@ -2480,6 +2692,11 @@ impl Sm12xKvAttentionWorkspace {
         selected_blocks: &DeviceBuffer<u8>,
         selected_tiles: &DeviceBuffer<u8>,
         selected_tokens: usize,
+        selected_block_indices: &DeviceBuffer<u32>,
+        selected_token_tiles: &DeviceBuffer<u32>,
+        selected_context_tiles: &DeviceBuffer<u32>,
+        selected_counts: &DeviceBuffer<u32>,
+        selected_index_capacity: usize,
         query: &DeviceBuffer<f32>,
         query_offset: usize,
         mut output: DeviceOutput<'_, f32>,
@@ -2503,6 +2720,11 @@ impl Sm12xKvAttentionWorkspace {
             || selected_tokens > cache_len
             || selected_blocks.len() < required_blocks
             || selected_tiles.len() < required_tiles
+            || selected_index_capacity == 0
+            || selected_block_indices.len() < selected_index_capacity
+            || selected_token_tiles.len() < selected_index_capacity
+            || selected_context_tiles.len() < selected_index_capacity
+            || selected_counts.len() < 3
             || pool.kv_heads != self.kv_heads
             || pool.head_dim != self.head_dim
         {
@@ -2513,9 +2735,14 @@ impl Sm12xKvAttentionWorkspace {
                     self.kv_heads, self.head_dim
                 ),
                 actual: format!(
-                    "cache_len={cache_len} selected_tokens={selected_tokens} masks={}/{} workspace_max={} pool_shape={}/{}",
+                    "cache_len={cache_len} selected_tokens={selected_tokens} masks={}/{} indices={}/{}/{}/{} counts={} workspace_max={} pool_shape={}/{}",
                     selected_blocks.len(),
                     selected_tiles.len(),
+                    selected_block_indices.len(),
+                    selected_token_tiles.len(),
+                    selected_context_tiles.len(),
+                    selected_index_capacity,
+                    selected_counts.len(),
                     self.max_tokens,
                     pool.kv_heads,
                     pool.head_dim
@@ -2573,6 +2800,11 @@ impl Sm12xKvAttentionWorkspace {
                 selected_blocks.as_const_ptr().cast(),
                 selected_tiles.as_const_ptr().cast(),
                 selected_tokens as u32,
+                selected_block_indices.as_const_ptr().cast(),
+                selected_token_tiles.as_const_ptr().cast(),
+                selected_context_tiles.as_const_ptr().cast(),
+                selected_counts.as_const_ptr().cast(),
+                selected_index_capacity as u32,
                 0,
                 1,
                 u32::MAX,
@@ -2596,6 +2828,10 @@ impl Sm12xKvAttentionWorkspace {
                     page_table.as_const_ptr().cast(),
                     selected_blocks.as_const_ptr().cast(),
                     selected_tiles.as_const_ptr().cast(),
+                    selected_block_indices.as_const_ptr().cast(),
+                    selected_token_tiles.as_const_ptr().cast(),
+                    selected_context_tiles.as_const_ptr().cast(),
+                    selected_counts.as_const_ptr().cast(),
                     self.query_tiles.as_mut_ptr().cast(),
                     self.query_scales.as_mut_ptr().cast(),
                     self.scores.as_mut_ptr().cast(),
@@ -2606,6 +2842,7 @@ impl Sm12xKvAttentionWorkspace {
                     cache_len as u32,
                     selected_tokens as u32,
                     logical_capacity as u32,
+                    selected_index_capacity as u32,
                     SM12X_KV_PAGE_TOKENS as u32,
                     layout.total_bytes as u32,
                     self.q_heads as u32,
@@ -2707,6 +2944,11 @@ impl Sm12xKvAttentionWorkspace {
                 page_table.as_const_ptr().cast(),
                 SM12X_KV_PAGE_TOKENS as u32,
                 layout.total_bytes as u32,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
@@ -2819,6 +3061,11 @@ impl Sm12xKvAttentionWorkspace {
                 std::ptr::null(),
                 0,
                 0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
@@ -3022,6 +3269,50 @@ mod tests {
     use super::*;
     use crate::format::bf16_to_f32;
 
+    fn sparse_index_buffers(
+        selected_blocks: &[u8],
+    ) -> (
+        DeviceBuffer<u32>,
+        DeviceBuffer<u32>,
+        DeviceBuffer<u32>,
+        DeviceBuffer<u32>,
+        usize,
+    ) {
+        let mut block_indices = Vec::new();
+        let mut token_tiles = Vec::new();
+        let mut context_tiles = Vec::new();
+        for (block, selected) in selected_blocks.iter().copied().enumerate() {
+            if selected == 0 {
+                continue;
+            }
+            block_indices.push(block as u32);
+            let token_tile = (block / 2) as u32;
+            if token_tiles.last() != Some(&token_tile) {
+                token_tiles.push(token_tile);
+            }
+            let context_tile = (block / 16) as u32;
+            if context_tiles.last() != Some(&context_tile) {
+                context_tiles.push(context_tile);
+            }
+        }
+        let counts = [
+            block_indices.len() as u32,
+            token_tiles.len() as u32,
+            context_tiles.len() as u32,
+        ];
+        let capacity = block_indices.len().max(1);
+        block_indices.resize(capacity, 0);
+        token_tiles.resize(capacity, 0);
+        context_tiles.resize(capacity, 0);
+        (
+            DeviceBuffer::from_host(&block_indices).expect("selected block indices"),
+            DeviceBuffer::from_host(&token_tiles).expect("selected token tiles"),
+            DeviceBuffer::from_host(&context_tiles).expect("selected context tiles"),
+            DeviceBuffer::from_host(&counts).expect("selected counts"),
+            capacity,
+        )
+    }
+
     fn set_nibble(packed: &mut [u8], index: usize, value: u8) {
         let byte = &mut packed[index / 2];
         if index & 1 == 0 {
@@ -3193,8 +3484,16 @@ mod tests {
                     &stream,
                 )
                 .expect("paged attention");
+            let selected_blocks_host = vec![1u8; CAPACITY.div_ceil(4)];
+            let (
+                selected_block_indices,
+                selected_token_tiles,
+                selected_context_tiles,
+                selected_counts,
+                selected_index_capacity,
+            ) = sparse_index_buffers(&selected_blocks_host[..cache_len.div_ceil(4)]);
             let selected_blocks =
-                DeviceBuffer::from_host(&vec![1u8; CAPACITY.div_ceil(4)]).expect("selected blocks");
+                DeviceBuffer::from_host(&selected_blocks_host).expect("selected blocks");
             let selected_tiles =
                 DeviceBuffer::from_host(&vec![1u8; CAPACITY.div_ceil(64)]).expect("selected tiles");
             let mut sparse_output =
@@ -3207,6 +3506,11 @@ mod tests {
                     &selected_blocks,
                     &selected_tiles,
                     cache_len,
+                    &selected_block_indices,
+                    &selected_token_tiles,
+                    &selected_context_tiles,
+                    &selected_counts,
+                    selected_index_capacity,
                     &query,
                     0,
                     sparse_output.output(),
@@ -3276,6 +3580,13 @@ mod tests {
                 sparse_blocks[block] = 1;
                 sparse_tiles[(block * 4) / 64] = 1;
             }
+            let (
+                selected_block_indices,
+                selected_token_tiles,
+                selected_context_tiles,
+                selected_counts,
+                selected_index_capacity,
+            ) = sparse_index_buffers(&sparse_blocks);
             let sparse_blocks =
                 DeviceBuffer::from_host(&sparse_blocks).expect("sparse window blocks");
             let sparse_tiles = DeviceBuffer::from_host(&sparse_tiles).expect("sparse window tiles");
@@ -3289,6 +3600,11 @@ mod tests {
                     &sparse_blocks,
                     &sparse_tiles,
                     cache_len - sparse_window_start,
+                    &selected_block_indices,
+                    &selected_token_tiles,
+                    &selected_context_tiles,
+                    &selected_counts,
+                    selected_index_capacity,
                     &query,
                     0,
                     paged_sparse_window.output(),
@@ -3885,6 +4201,129 @@ mod tests {
                 )
                 .expect("repeated attention");
         }
+        assert_eq!(
+            batched_output.copy_to_host(&stream).expect("batched read"),
+            repeated_output
+                .copy_to_host(&stream)
+                .expect("repeated read")
+        );
+    }
+
+    #[test]
+    fn paged_causal_rows_match_repeated_qsa_attention_at_512_tokens() {
+        const PREFIX: usize = 504;
+        const ROWS: usize = 8;
+        const CAPACITY: usize = 512;
+        const KV_HEADS: usize = 2;
+        const Q_HEADS: usize = 24;
+        const HEAD_DIM: usize = 256;
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let q_width = Q_HEADS * HEAD_DIM;
+        let prefix_key = DeviceBuffer::from_host(
+            &(0..PREFIX * kv_width)
+                .map(|index| ((index * 17 + 3) % 251) as f32 / 96.0 - 1.25)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefix K");
+        let prefix_value = DeviceBuffer::from_host(
+            &(0..PREFIX * kv_width)
+                .map(|index| ((index * 29 + 7) % 257) as f32 / 112.0 - 1.0)
+                .collect::<Vec<_>>(),
+        )
+        .expect("prefix V");
+        let key = DeviceBuffer::from_host(
+            &(0..ROWS * kv_width)
+                .map(|index| ((index * 19 + 11) % 263) as f32 / 128.0 - 0.75)
+                .collect::<Vec<_>>(),
+        )
+        .expect("K rows");
+        let value = DeviceBuffer::from_host(
+            &(0..ROWS * kv_width)
+                .map(|index| ((index * 31 + 13) % 269) as f32 / 144.0 - 0.625)
+                .collect::<Vec<_>>(),
+        )
+        .expect("V rows");
+        let query = DeviceBuffer::from_host(
+            &(0..ROWS * q_width)
+                .map(|index| ((index * 37 + 5) % 271) as f32 / 160.0 - 0.75)
+                .collect::<Vec<_>>(),
+        )
+        .expect("query rows");
+        let page_table = DeviceBuffer::from_host(&[0_u32, 1, 2, 3]).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut batched_pool = Sm12xKvPagePool::new(4, KV_HEADS, HEAD_DIM).expect("batched pool");
+        let mut repeated_pool = Sm12xKvPagePool::new(4, KV_HEADS, HEAD_DIM).expect("repeated pool");
+        let mut input_row = 0;
+        while input_row < PREFIX {
+            let page_offset = input_row % SM12X_KV_PAGE_TOKENS;
+            let rows = (PREFIX - input_row).min(SM12X_KV_PAGE_TOKENS - page_offset);
+            let slot = input_row / SM12X_KV_PAGE_TOKENS;
+            for pool in [&mut batched_pool, &mut repeated_pool] {
+                pool.append_rows_at_offset_on_stream(
+                    slot,
+                    page_offset,
+                    &prefix_key,
+                    &prefix_value,
+                    input_row,
+                    rows,
+                    &stream,
+                )
+                .expect("prefix append");
+            }
+            input_row += rows;
+        }
+
+        batched_pool
+            .append_rows_at_offset_on_stream(3, 120, &key, &value, 0, ROWS, &stream)
+            .expect("batched append");
+        let mut batched_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa_batched(CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM, ROWS)
+                .expect("batched workspace");
+        let mut batched_output = DeviceBuffer::zeroed(ROWS * q_width).expect("batched output");
+        batched_workspace
+            .attention_paged_causal_rows_at_offset_into_on_stream(
+                &batched_pool,
+                &page_table,
+                PREFIX,
+                &query,
+                0,
+                ROWS,
+                None,
+                batched_output.output(),
+                &stream,
+            )
+            .expect("batched attention");
+
+        let mut repeated_workspace =
+            Sm12xKvAttentionWorkspace::new_gqa(CAPACITY, Q_HEADS, KV_HEADS, HEAD_DIM)
+                .expect("repeated workspace");
+        let mut repeated_output = DeviceBuffer::zeroed(ROWS * q_width).expect("repeated output");
+        for row in 0..ROWS {
+            repeated_pool
+                .append_at_offsets_on_stream(
+                    3,
+                    120 + row,
+                    &key,
+                    row * kv_width,
+                    &value,
+                    row * kv_width,
+                    &stream,
+                )
+                .expect("repeated append");
+            repeated_workspace
+                .attention_paged_offsets_into_on_stream(
+                    &repeated_pool,
+                    &page_table,
+                    PREFIX + row + 1,
+                    &query,
+                    row * q_width,
+                    repeated_output.output(),
+                    row * q_width,
+                    &stream,
+                )
+                .expect("repeated attention");
+        }
+
         assert_eq!(
             batched_output.copy_to_host(&stream).expect("batched read"),
             repeated_output

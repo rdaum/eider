@@ -1,6 +1,6 @@
 use eider_cuda::CudaEvent;
 use eider_inference::qwen38_flash_next::benchmark::{
-    Qwen38HyperPrefillMicrobench, Qwen38QsaPrefillMicrobench,
+    Qwen38HyperPrefillMicrobench, Qwen38QsaPrefillMicrobench, Qwen38QsaPrefillProfile,
 };
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
@@ -11,6 +11,7 @@ use std::time::Duration;
 
 struct QsaPrefillBench {
     qsa: Qwen38QsaPrefillMicrobench,
+    profile: Qwen38QsaPrefillProfile,
     start: CudaEvent,
     stop: CudaEvent,
 }
@@ -62,8 +63,10 @@ impl BenchContext for QsaPrefillBench {
                 && quality.relative_rmse <= 0.01,
             "batched QSA quality: {quality:?}"
         );
+        let profile = qsa.profile().expect("profile batched QSA prefill");
         Self {
             qsa,
+            profile,
             start: CudaEvent::new().expect("start event"),
             stop: CudaEvent::new().expect("stop event"),
         }
@@ -124,10 +127,18 @@ fn batched_sample(
         .elapsed_ms_until(&context.stop)
         .expect("batched elapsed") as f64;
     black_box(context.qsa.serial_output_address());
-    BenchSampleResult::operations(chunk_size as u64).push_metric(
+    let mut sample = BenchSampleResult::operations(chunk_size as u64).push_metric(
         MetricValue::new("cuda_event_ms", elapsed_ms / chunk_size as f64, "ms")
             .with_display_name("CUDA event"),
-    )
+    );
+    for (name, value) in [
+        ("prepare_ms", context.profile.prepare_ms),
+        ("rows_ms", context.profile.rows_ms),
+        ("finish_ms", context.profile.finish_ms),
+    ] {
+        sample = sample.push_metric(MetricValue::new(name, value as f64, "ms"));
+    }
+    sample
 }
 
 fn serial_hyper_sample(

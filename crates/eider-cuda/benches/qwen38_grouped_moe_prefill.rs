@@ -1,3 +1,5 @@
+//! Measures the complete Qwen3.8 grouped W4A4 prefill pipeline and its stages.
+
 use eider_cuda::{
     CudaEvent, CudaStream, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer,
     MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, format,
@@ -303,20 +305,29 @@ impl Qwen38GroupedMoePrefillBench {
         );
     }
 
-    fn measure(&mut self, enqueue: impl FnOnce(&mut Self)) -> BenchSampleResult {
+    fn measure(
+        &mut self,
+        iterations: usize,
+        mut enqueue: impl FnMut(&mut Self),
+    ) -> BenchSampleResult {
         self.start.record_on_stream(&self.stream).expect("start");
-        enqueue(self);
+        for _ in 0..iterations {
+            enqueue(self);
+        }
         self.stop.record_on_stream(&self.stream).expect("stop");
         self.stop.synchronize().expect("synchronize");
         black_box(self.routed_output.cuda_address());
         black_box(self.gate_up_weights[0].values_address());
         black_box(self.down_weights[0].values_address());
         black_box(self.alpha.cuda_address());
-        BenchSampleResult::operations(self.rows as u64).push_metric(MetricValue::new(
-            "cuda_event_ms",
-            self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64,
-            "ms/chunk",
-        ))
+        BenchSampleResult::operations((self.rows * iterations) as u64).push_metric(
+            MetricValue::new(
+                "cuda_event_ms",
+                self.start.elapsed_ms_until(&self.stop).expect("elapsed") as f64
+                    / iterations as f64,
+                "ms/chunk",
+            ),
+        )
     }
 }
 
@@ -325,10 +336,6 @@ impl BenchContext for Qwen38GroupedMoePrefillBench {
         let mut context = Self::new();
         context.validate();
         context
-    }
-
-    fn chunk_size() -> Option<usize> {
-        Some(1)
     }
 }
 
@@ -339,8 +346,7 @@ macro_rules! sample {
             chunk_size: usize,
             _: usize,
         ) -> BenchSampleResult {
-            assert_eq!(chunk_size, 1);
-            context.measure($enqueue)
+            context.measure(chunk_size, $enqueue)
         }
     };
 }
@@ -421,7 +427,7 @@ fn main() {
         BenchmarkMainOptions {
             suite: Some("qwen38-grouped-moe-prefill".to_string()),
             comparison_policy: ComparisonPolicy::None,
-            save_results: false,
+            save_results: true,
             runtime: BenchmarkRuntimeOptions {
                 warm_up_duration: Duration::from_millis(50),
                 benchmark_duration: Duration::from_millis(250),

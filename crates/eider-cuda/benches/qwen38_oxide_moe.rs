@@ -6,13 +6,13 @@ use eider_cuda::{
 use eider_format::ModelOptNvfp4Linear;
 use micromeasure::{
     BenchContext, BenchSampleResult, BenchmarkMainOptions, BenchmarkRuntimeOptions,
-    ComparisonPolicy, MetricValue, Throughput, black_box, run_benchmark_main,
+    ComparisonPolicy, MeasurementDomain, MetricValue, Throughput, black_box, run_benchmark_main,
 };
 use std::time::Duration;
 
 const HIDDEN: usize = 2_560;
 const INTERMEDIATE: usize = 640;
-const EXPERTS: usize = 16;
+const EXPERTS: usize = 512;
 const TOP_K: usize = 10;
 
 struct Qwen38OxideMoeBench<const ROWS: usize> {
@@ -36,10 +36,6 @@ impl<const ROWS: usize> BenchContext for Qwen38OxideMoeBench<ROWS> {
     fn prepare(_num_chunks: usize) -> Self {
         Self::new().expect("prepare Qwen3.8 Oxide MoE benchmark")
     }
-
-    fn chunk_size() -> Option<usize> {
-        Some(if ROWS == 1 { 50 } else { 2 })
-    }
 }
 
 impl<const ROWS: usize> Qwen38OxideMoeBench<ROWS> {
@@ -49,11 +45,7 @@ impl<const ROWS: usize> Qwen38OxideMoeBench<ROWS> {
         let gate_up = Sm121W4A16GateUp::new_with_top_k(&gate_up_weights, TOP_K)?;
         let down = Sm121W4A16GateUp::new_with_top_k(&down_weights, 1)?;
         let routes = ROWS * TOP_K;
-        let indices = DeviceBuffer::from_host(
-            &(0..routes)
-                .map(|route| ((route * 7 + route / TOP_K) % EXPERTS) as u32)
-                .collect::<Vec<_>>(),
-        )?;
+        let indices = DeviceBuffer::from_host(&benchmark_route_indices(routes))?;
         let route_weights = DeviceBuffer::from_host(&vec![1.0 / TOP_K as f32; routes])?;
         let input = DeviceBuffer::from_host(&vec![0.125f32; ROWS * HIDDEN])?;
         let mut bench = Self {
@@ -113,7 +105,21 @@ impl<const ROWS: usize> Qwen38OxideMoeBench<ROWS> {
         )
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&mut self) -> Result<()> {
+        self.validate_outputs()?;
+        if ROWS * TOP_K > 16 {
+            self.indices
+                .copy_from_host(&split_group_route_indices(ROWS * TOP_K))?;
+            self.enqueue()?;
+            self.validate_outputs()?;
+            self.indices
+                .copy_from_host(&benchmark_route_indices(ROWS * TOP_K))?;
+            self.enqueue()?;
+        }
+        Ok(())
+    }
+
+    fn validate_outputs(&self) -> Result<()> {
         let reference_workspace = self.gate_up.new_batch_workspace(ROWS)?;
         let mut reference_gate_up = DeviceBuffer::zeroed(ROWS * TOP_K * INTERMEDIATE * 2)?;
         self.gate_up.run_batch_f32_prefix_on_stream(
@@ -142,7 +148,38 @@ impl<const ROWS: usize> Qwen38OxideMoeBench<ROWS> {
             }
         }
 
+        let reference_down_workspace = self.down.new_batch_workspace(ROWS * TOP_K)?;
+        let mut reference_down = DeviceBuffer::zeroed(ROWS * TOP_K * HIDDEN)?;
+        self.down.run_batch_f32_prefix_on_stream(
+            &reference_down_workspace,
+            &self.indices,
+            &self.down_input,
+            reference_down.output(),
+            ROWS * TOP_K,
+            &self.stream,
+        )?;
+        let reference_down = reference_down.copy_to_host(&self.stream)?;
         let down = self.down_output.copy_to_host(&self.stream)?;
+        let mut squared_error = 0.0f64;
+        let mut reference_norm = 0.0f64;
+        for (index, (actual, expected)) in down.iter().zip(reference_down.iter()).enumerate() {
+            if !actual.is_finite() {
+                return Err(eider_cuda::Error::Format {
+                    label: "Qwen3.8 Oxide grouped W4A4 benchmark",
+                    detail: format!("down index={index} is not finite: {actual}"),
+                });
+            }
+            let error = f64::from(*actual) - f64::from(*expected);
+            squared_error += error * error;
+            reference_norm += f64::from(*expected) * f64::from(*expected);
+        }
+        let down_nrmse = (squared_error / reference_norm.max(f64::MIN_POSITIVE)).sqrt();
+        if !down_nrmse.is_finite() || down_nrmse > 0.10 {
+            return Err(eider_cuda::Error::Format {
+                label: "Qwen3.8 Oxide grouped W4A4 benchmark",
+                detail: format!("down W4A4 versus W4A16 nrmse={down_nrmse:.6}"),
+            });
+        }
         let routed = self.routed_output.copy_to_host(&self.stream)?;
         for row in 0..ROWS {
             for col in 0..HIDDEN {
@@ -163,6 +200,16 @@ impl<const ROWS: usize> Qwen38OxideMoeBench<ROWS> {
         }
         Ok(())
     }
+}
+
+fn benchmark_route_indices(routes: usize) -> Vec<u32> {
+    (0..routes)
+        .map(|route| ((route * 7 + route / TOP_K) % EXPERTS) as u32)
+        .collect()
+}
+
+fn split_group_route_indices(routes: usize) -> Vec<u32> {
+    (0..routes).map(|route| (route % 64) as u32).collect()
 }
 
 fn synthetic_weights(
@@ -217,7 +264,7 @@ fn main() {
     let options = BenchmarkMainOptions {
         suite: Some("qwen38-oxide-moe".to_string()),
         comparison_policy: ComparisonPolicy::None,
-        save_results: false,
+        save_results: true,
         runtime: BenchmarkRuntimeOptions {
             warm_up_duration: Duration::from_millis(100),
             benchmark_duration: Duration::from_millis(400),
@@ -228,12 +275,16 @@ fn main() {
     };
     run_benchmark_main(options, |runner| {
         runner.group::<Qwen38OxideMoeBench<1>>("Qwen3.8 Oxide MoE decode", |group| {
-            group.throughput(Throughput::per_operation(1, "tokens"));
+            group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu);
             group.bench_sample("w4a4_top10", sample::<1>);
         });
-        runner.group::<Qwen38OxideMoeBench<64>>("Qwen3.8 Oxide MoE prefill", |group| {
-            group.throughput(Throughput::per_operation(1, "tokens"));
-            group.bench_sample("w4a4_top10", sample::<64>);
+        runner.group::<Qwen38OxideMoeBench<512>>("Qwen3.8 Oxide MoE prefill", |group| {
+            group
+                .throughput(Throughput::per_operation(1, "tokens"))
+                .measurement_domain(MeasurementDomain::Gpu);
+            group.bench_sample("w4a4_top10", sample::<512>);
         });
     });
 }

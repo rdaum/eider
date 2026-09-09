@@ -490,6 +490,11 @@ pub(crate) unsafe fn append_causal_attention_rows(
                 core::ptr::null(),
                 core::ptr::null(),
                 0,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
                 input_row,
                 batch_rows,
                 position,
@@ -542,6 +547,11 @@ pub(crate) unsafe fn attention(
     selected_blocks: *const u8,
     selected_tiles: *const u8,
     selected_tokens: u32,
+    selected_block_indices: *const u32,
+    selected_token_tiles: *const u32,
+    selected_context_tiles: *const u32,
+    selected_counts: *const u32,
+    selected_index_capacity: u32,
     input_row_offset: u32,
     rows: u32,
     causal_start_position: u32,
@@ -578,12 +588,16 @@ pub(crate) unsafe fn attention(
                 actual: format!("start={causal_start_position} rows={rows}"),
             })?
     };
-    let token_tiles = if indexed {
+    let token_tiles = if !selected_token_tiles.is_null() {
+        selected_index_capacity.min(launch_cache_len.div_ceil(8))
+    } else if indexed {
         max_tokens.div_ceil(8)
     } else {
         launch_cache_len.div_ceil(8)
     };
-    let context_tiles = if indexed {
+    let context_tiles = if !selected_context_tiles.is_null() {
+        selected_index_capacity.min(launch_cache_len.div_ceil(64))
+    } else if indexed {
         max_tokens.div_ceil(64)
     } else {
         launch_cache_len.div_ceil(64)
@@ -625,6 +639,11 @@ pub(crate) unsafe fn attention(
     let mut page_tokens_arg = page_tokens;
     let mut page_stride_bytes_arg = page_stride_bytes;
     let mut selected_blocks_arg = selected_blocks;
+    let mut selected_block_indices_arg = selected_block_indices;
+    let mut selected_token_tiles_arg = selected_token_tiles;
+    let mut selected_context_tiles_arg = selected_context_tiles;
+    let mut selected_counts_arg = selected_counts;
+    let mut selected_index_capacity_arg = selected_index_capacity;
     let mut causal_start_position_arg = causal_start_position;
     let mut window_tokens_arg = window_tokens;
     let mut qk_parameters = [
@@ -645,6 +664,9 @@ pub(crate) unsafe fn attention(
         (&mut page_tokens_arg as *mut u32).cast::<c_void>(),
         (&mut page_stride_bytes_arg as *mut u32).cast::<c_void>(),
         (&mut selected_blocks_arg as *mut *const u8).cast::<c_void>(),
+        (&mut selected_token_tiles_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_counts_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_index_capacity_arg as *mut u32).cast::<c_void>(),
         (&mut causal_start_position_arg as *mut u32).cast::<c_void>(),
         (&mut window_tokens_arg as *mut u32).cast::<c_void>(),
     ];
@@ -664,6 +686,9 @@ pub(crate) unsafe fn attention(
         (&mut max_tokens_arg as *mut u32).cast::<c_void>(),
         (&mut q_heads_arg as *mut u32).cast::<c_void>(),
         (&mut selected_blocks_arg as *mut *const u8).cast::<c_void>(),
+        (&mut selected_block_indices_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_counts_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_index_capacity_arg as *mut u32).cast::<c_void>(),
         (&mut causal_start_position_arg as *mut u32).cast::<c_void>(),
         (&mut window_tokens_arg as *mut u32).cast::<c_void>(),
     ];
@@ -690,6 +715,9 @@ pub(crate) unsafe fn attention(
         (&mut kv_heads_arg as *mut u32).cast::<c_void>(),
         (&mut selected_blocks_arg as *mut *const u8).cast::<c_void>(),
         (&mut selected_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut selected_context_tiles_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_counts_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_index_capacity_arg as *mut u32).cast::<c_void>(),
         (&mut causal_start_position_arg as *mut u32).cast::<c_void>(),
         (&mut window_tokens_arg as *mut u32).cast::<c_void>(),
     ];
@@ -730,6 +758,9 @@ pub(crate) unsafe fn attention(
         (&mut page_stride_bytes_arg as *mut u32).cast::<c_void>(),
         (&mut selected_tiles_arg as *mut *const u8).cast::<c_void>(),
         (&mut selected_tokens_arg as *mut u32).cast::<c_void>(),
+        (&mut selected_context_tiles_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_counts_arg as *mut *const u32).cast::<c_void>(),
+        (&mut selected_index_capacity_arg as *mut u32).cast::<c_void>(),
         (&mut causal_start_position_arg as *mut u32).cast::<c_void>(),
         (&mut window_tokens_arg as *mut u32).cast::<c_void>(),
         (&mut output_row_offset_arg as *mut u32).cast::<c_void>(),

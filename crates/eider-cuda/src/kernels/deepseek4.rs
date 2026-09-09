@@ -5,6 +5,8 @@
 use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
+#[cfg(feature = "cuda-oxide")]
+use crate::kernels::core_oxide;
 use crate::kernels::non_gemm::MoeSortedRoutes;
 
 const SCALE_BLOCK: usize = 128;
@@ -203,6 +205,419 @@ pub fn block_fp8_linear_f32_into_on_stream(
         cols,
         stream,
     )
+}
+
+/// Applies row-major E4M3 weights with exact F32 scales for each 128-by-128
+/// block to F32 activation rows.
+#[allow(clippy::too_many_arguments)]
+pub fn block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    weight_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, f32>,
+    batch_rows: usize,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = batch_rows.saturating_mul(cols);
+    let weight_len = rows.saturating_mul(cols);
+    let scale_len = (rows / SCALE_BLOCK).saturating_mul(cols / SCALE_BLOCK);
+    let output_len = batch_rows.saturating_mul(rows);
+    if batch_rows == 0
+        || rows == 0
+        || cols == 0
+        || !rows.is_multiple_of(SCALE_BLOCK)
+        || !cols.is_multiple_of(SCALE_BLOCK)
+        || [batch_rows, rows, cols]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || input.len() < input_len
+        || weight.len() != weight_len
+        || weight_scale.len() != scale_len
+        || output.len() < output_len
+    {
+        return Err(Error::Shape {
+            label: "F32 block-scaled FP8 linear",
+            expected: format!(
+                "batch>0 rows/cols multiple of {SCALE_BLOCK}, input>={input_len} weight={weight_len} scales={scale_len} output>={output_len}"
+            ),
+            actual: format!(
+                "batch={batch_rows} rows={rows} cols={cols} input={} weight={} scales={} output={}",
+                input.len(),
+                weight.len(),
+                weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::block_fp8_f32_scale_linear_batch(
+            input.as_const_ptr().cast(),
+            weight.as_const_ptr().cast(),
+            weight_scale.as_const_ptr().cast(),
+            output.as_mut_ptr().cast(),
+            batch_rows as u32,
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_block_fp8_f32_scale_linear_f32_on_stream",
+            ffi::infer_block_fp8_f32_scale_linear_f32_on_stream(
+                input.as_const_ptr().cast(),
+                weight.as_const_ptr().cast(),
+                weight_scale.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                batch_rows as u32,
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies row-major E4M3 weights with exact F32 block scales to one F32 row.
+pub fn block_fp8_f32_scale_linear_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<u8>,
+    weight_scale: &DeviceBuffer<f32>,
+    output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+        input,
+        weight,
+        weight_scale,
+        output,
+        1,
+        rows,
+        cols,
+        stream,
+    )
+}
+
+/// Applies two row-major E4M3 weights with exact F32 block scales to the same
+/// F32 activation row in one CUDA grid.
+#[allow(clippy::too_many_arguments)]
+pub fn block_fp8_f32_scale_linear_pair_f32_into_on_stream(
+    input: &DeviceBuffer<f32>,
+    first_weight: &DeviceBuffer<u8>,
+    first_weight_scale: &DeviceBuffer<f32>,
+    second_weight: &DeviceBuffer<u8>,
+    second_weight_scale: &DeviceBuffer<f32>,
+    mut first_output: DeviceOutput<'_, f32>,
+    mut second_output: DeviceOutput<'_, f32>,
+    first_rows: usize,
+    second_rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let first_weight_len = first_rows.saturating_mul(cols);
+    let second_weight_len = second_rows.saturating_mul(cols);
+    let scale_cols = cols / SCALE_BLOCK;
+    let first_scale_len = (first_rows / SCALE_BLOCK).saturating_mul(scale_cols);
+    let second_scale_len = (second_rows / SCALE_BLOCK).saturating_mul(scale_cols);
+    let combined_rows = first_rows.saturating_add(second_rows);
+    if first_rows == 0
+        || second_rows == 0
+        || cols == 0
+        || !first_rows.is_multiple_of(SCALE_BLOCK)
+        || !second_rows.is_multiple_of(SCALE_BLOCK)
+        || !cols.is_multiple_of(SCALE_BLOCK)
+        || [first_rows, second_rows, cols, combined_rows]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || input.len() < cols
+        || first_weight.len() != first_weight_len
+        || first_weight_scale.len() != first_scale_len
+        || second_weight.len() != second_weight_len
+        || second_weight_scale.len() != second_scale_len
+        || first_output.len() != first_rows
+        || second_output.len() != second_rows
+    {
+        return Err(Error::Shape {
+            label: "F32 block-scaled FP8 linear pair",
+            expected: format!(
+                "rows/cols multiple of {SCALE_BLOCK}, input>={cols}, first weight/scales/output={first_weight_len}/{first_scale_len}/{first_rows}, second weight/scales/output={second_weight_len}/{second_scale_len}/{second_rows}"
+            ),
+            actual: format!(
+                "input={} first={}/{}/{} second={}/{}/{} rows={first_rows}+{second_rows} cols={cols}",
+                input.len(),
+                first_weight.len(),
+                first_weight_scale.len(),
+                first_output.len(),
+                second_weight.len(),
+                second_weight_scale.len(),
+                second_output.len(),
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::block_fp8_f32_scale_linear_pair(
+            input.as_const_ptr().cast(),
+            first_weight.as_const_ptr().cast(),
+            first_weight_scale.as_const_ptr().cast(),
+            second_weight.as_const_ptr().cast(),
+            second_weight_scale.as_const_ptr().cast(),
+            first_output.as_mut_ptr().cast(),
+            second_output.as_mut_ptr().cast(),
+            first_rows as u32,
+            second_rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_block_fp8_f32_scale_linear_pair_f32_on_stream",
+            ffi::infer_block_fp8_f32_scale_linear_pair_f32_on_stream(
+                input.as_const_ptr().cast(),
+                first_weight.as_const_ptr().cast(),
+                first_weight_scale.as_const_ptr().cast(),
+                second_weight.as_const_ptr().cast(),
+                second_weight_scale.as_const_ptr().cast(),
+                first_output.as_mut_ptr().cast(),
+                second_output.as_mut_ptr().cast(),
+                first_rows as u32,
+                second_rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies device-routed gate and up projections with exact F32 block scales.
+#[allow(clippy::too_many_arguments)]
+pub fn block_fp8_f32_scale_moe_gate_up_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    input: &DeviceBuffer<f32>,
+    gate_weights: &DeviceBuffer<DeviceAddress<u8>>,
+    gate_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    up_weights: &DeviceBuffer<DeviceAddress<u8>>,
+    up_scales: &DeviceBuffer<DeviceAddress<f32>>,
+    mut output: DeviceOutput<'_, f32>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let output_len = slots.saturating_mul(rows).saturating_mul(2);
+    if rows == 0
+        || cols == 0
+        || slots == 0
+        || !rows.is_multiple_of(SCALE_BLOCK)
+        || !cols.is_multiple_of(SCALE_BLOCK)
+        || [rows, cols, slots, rows.saturating_mul(slots)]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || indices.len() < slots
+        || input.len() != cols
+        || gate_weights.len() != gate_scales.len()
+        || gate_weights.len() != up_weights.len()
+        || gate_weights.len() != up_scales.len()
+        || output.len() != output_len
+    {
+        return Err(Error::Shape {
+            label: "block-scaled FP8 routed gate/up",
+            expected: format!(
+                "indices>={slots} input={cols} matching expert tables output={output_len}"
+            ),
+            actual: format!(
+                "indices={} input={} gate_weights={} gate_scales={} up_weights={} up_scales={} output={}",
+                indices.len(),
+                input.len(),
+                gate_weights.len(),
+                gate_scales.len(),
+                up_weights.len(),
+                up_scales.len(),
+                output.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::block_fp8_f32_scale_moe_gate_up(
+            indices.as_const_ptr().cast(),
+            input.as_const_ptr().cast(),
+            gate_weights.as_const_ptr().cast(),
+            gate_scales.as_const_ptr().cast(),
+            up_weights.as_const_ptr().cast(),
+            up_scales.as_const_ptr().cast(),
+            output.as_mut_ptr().cast(),
+            rows as u32,
+            cols as u32,
+            slots as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_block_fp8_f32_scale_moe_gate_up_f32_on_stream",
+            ffi::infer_block_fp8_f32_scale_moe_gate_up_f32_on_stream(
+                indices.as_const_ptr().cast(),
+                input.as_const_ptr().cast(),
+                gate_weights.as_const_ptr().cast(),
+                gate_scales.as_const_ptr().cast(),
+                up_weights.as_const_ptr().cast(),
+                up_scales.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                slots as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies device-routed down projections with exact F32 block scales.
+#[allow(clippy::too_many_arguments)]
+pub fn block_fp8_f32_scale_moe_down_f32_into_on_stream(
+    indices: &DeviceBuffer<u32>,
+    inputs: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<DeviceAddress<u8>>,
+    scales: &DeviceBuffer<DeviceAddress<f32>>,
+    outputs: &DeviceBuffer<DeviceAddress<f32>>,
+    rows: usize,
+    cols: usize,
+    slots: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let input_len = slots.saturating_mul(cols);
+    if rows == 0
+        || cols == 0
+        || slots == 0
+        || !rows.is_multiple_of(SCALE_BLOCK)
+        || !cols.is_multiple_of(SCALE_BLOCK)
+        || [rows, cols, slots, rows.saturating_mul(slots)]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+        || indices.len() < slots
+        || inputs.len() != input_len
+        || weights.len() != scales.len()
+        || outputs.len() != slots
+    {
+        return Err(Error::Shape {
+            label: "block-scaled FP8 routed down",
+            expected: format!(
+                "indices>={slots} inputs={input_len} matching expert tables outputs={slots}"
+            ),
+            actual: format!(
+                "indices={} inputs={} weights={} scales={} outputs={}",
+                indices.len(),
+                inputs.len(),
+                weights.len(),
+                scales.len(),
+                outputs.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::block_fp8_f32_scale_moe_down(
+            indices.as_const_ptr().cast(),
+            inputs.as_const_ptr().cast(),
+            weights.as_const_ptr().cast(),
+            scales.as_const_ptr().cast(),
+            outputs.as_const_ptr().cast(),
+            rows as u32,
+            cols as u32,
+            slots as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_block_fp8_f32_scale_moe_down_f32_on_stream",
+            ffi::infer_block_fp8_f32_scale_moe_down_f32_on_stream(
+                indices.as_const_ptr().cast(),
+                inputs.as_const_ptr().cast(),
+                weights.as_const_ptr().cast(),
+                scales.as_const_ptr().cast(),
+                outputs.as_const_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                slots as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Expands row-major E4M3 weights with exact F32 scales for each 128-by-128
+/// block into reusable BF16 storage.
+pub fn dequant_block_fp8_f32_scale_to_bf16_into_on_stream(
+    weight: &DeviceBuffer<u8>,
+    weight_scale: &DeviceBuffer<f32>,
+    mut output: DeviceOutput<'_, u16>,
+    rows: usize,
+    cols: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let weight_len = rows.saturating_mul(cols);
+    let scale_len = (rows / SCALE_BLOCK).saturating_mul(cols / SCALE_BLOCK);
+    if rows == 0
+        || cols == 0
+        || !rows.is_multiple_of(SCALE_BLOCK)
+        || !cols.is_multiple_of(SCALE_BLOCK)
+        || rows > u32::MAX as usize
+        || cols > u32::MAX as usize
+        || weight_len > u32::MAX as usize
+        || weight.len() != weight_len
+        || weight_scale.len() != scale_len
+        || output.len() < weight_len
+    {
+        return Err(Error::Shape {
+            label: "F32 block-scaled FP8 to BF16",
+            expected: format!(
+                "rows/cols multiple of {SCALE_BLOCK}, weight={weight_len} scales={scale_len} output>={weight_len}"
+            ),
+            actual: format!(
+                "rows={rows} cols={cols} weight={} scales={} output={}",
+                weight.len(),
+                weight_scale.len(),
+                output.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        core_oxide::dequant_block_fp8_f32_scale_to_bf16(
+            weight.as_const_ptr().cast(),
+            weight_scale.as_const_ptr().cast(),
+            output.as_mut_ptr().cast(),
+            rows as u32,
+            cols as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_dequant_block_fp8_f32_scale_to_bf16_on_stream",
+            ffi::infer_dequant_block_fp8_f32_scale_to_bf16_on_stream(
+                weight.as_const_ptr().cast(),
+                weight_scale.as_const_ptr().cast(),
+                output.as_mut_ptr().cast(),
+                rows as u32,
+                cols as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
 }
 
 /// Computes exact DeepSeek V4 mHC post/combination weights and collapsed input.
@@ -1439,11 +1854,16 @@ mod tests {
     use super::{
         Deepseek4AttentionBatch, Deepseek4CausalAttentionBatch, HYPER_MIX, HYPER_STREAMS,
         SCALE_BLOCK, arithmetic_positions_u32_into_on_stream, attention_f32_batch_into_on_stream,
+        block_fp8_f32_scale_linear_f32_batch_into_on_stream,
+        block_fp8_f32_scale_linear_pair_f32_into_on_stream,
+        block_fp8_f32_scale_moe_down_f32_into_on_stream,
+        block_fp8_f32_scale_moe_gate_up_f32_into_on_stream,
         block_fp8_grouped_linear_f32_batch_into_on_stream,
         block_fp8_linear_f32_batch_into_on_stream, causal_attention_f32_batch_into_on_stream,
-        compress_windows_f32_into_on_stream, hyper_apply_f32_batch_into_on_stream,
-        hyper_head_f32_batch_into_on_stream, hyper_prepare_f32_batch_into_on_stream,
-        indexer_topk_f32_batch_into_on_stream, repeat_hyper_streams_f32_into_on_stream,
+        compress_windows_f32_into_on_stream, dequant_block_fp8_f32_scale_to_bf16_into_on_stream,
+        hyper_apply_f32_batch_into_on_stream, hyper_head_f32_batch_into_on_stream,
+        hyper_prepare_f32_batch_into_on_stream, indexer_topk_f32_batch_into_on_stream,
+        repeat_hyper_streams_f32_into_on_stream,
         rope_interleaved_trailing_f32_indexed_in_place_on_stream,
         routed_accumulate_f32_batch_into_on_stream,
         routed_accumulate_sorted_f32_batch_into_on_stream, router_hash_f32_batch_into_on_stream,
@@ -1451,7 +1871,7 @@ mod tests {
         swiglu_pair_clamped_f32_batch_into_on_stream, swiglu_pair_f32_batch_into_on_stream,
     };
     use crate::{
-        CudaStream, DeviceBuffer, MoeSortedRoutes, format,
+        CudaStream, DeviceAddress, DeviceBuffer, MoeSortedRoutes, Result, format,
         gather_sorted_route_rows_f32_into_on_stream,
     };
 
@@ -1510,6 +1930,257 @@ mod tests {
                 "mismatch at {index}: actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn f32_block_scaled_fp8_linear_matches_cpu_reference() {
+        const BATCH: usize = 2;
+        const ROWS: usize = 256;
+        const COLS: usize = 256;
+        let input = (0..BATCH * COLS)
+            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
+            .collect::<Vec<_>>();
+        let weight = (0..ROWS * COLS)
+            .map(|index| format::cuda_e4m3_code(((index % 11) as f32 - 5.0) / 4.0))
+            .collect::<Vec<_>>();
+        let scales = [0.75f32, 1.125, 0.625, 1.375];
+        let mut expected = Vec::with_capacity(BATCH * ROWS);
+        for batch in 0..BATCH {
+            let input_row = &input[batch * COLS..(batch + 1) * COLS];
+            for row in 0..ROWS {
+                expected.push(
+                    (0..COLS)
+                        .map(|col| {
+                            let scale = scales
+                                [(row / SCALE_BLOCK) * (COLS / SCALE_BLOCK) + col / SCALE_BLOCK];
+                            input_row[col] * format::e4m3_value(weight[row * COLS + col]) * scale
+                        })
+                        .sum::<f32>(),
+                );
+            }
+        }
+        let input = DeviceBuffer::from_host(&input).expect("input");
+        let weight = DeviceBuffer::from_host(&weight).expect("weight");
+        let scales = DeviceBuffer::from_host(&scales).expect("scales");
+        let mut output = DeviceBuffer::zeroed(BATCH * ROWS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+            &input,
+            &weight,
+            &scales,
+            output.output(),
+            BATCH,
+            ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("linear");
+        let actual = output.copy_to_host(&stream).expect("read output");
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let allowed = 2.0e-4 + 2.0e-4 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= allowed,
+                "mismatch at {index}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn f32_block_scaled_fp8_linear_pair_matches_separate_projections() {
+        const COLS: usize = 256;
+        const FIRST_ROWS: usize = 128;
+        const SECOND_ROWS: usize = 256;
+        let input = (0..COLS)
+            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
+            .collect::<Vec<_>>();
+        let make_weight = |rows: usize, offset: usize| {
+            (0..rows * COLS)
+                .map(|index| format::cuda_e4m3_code((((index + offset) % 11) as f32 - 5.0) / 4.0))
+                .collect::<Vec<_>>()
+        };
+        let first_weight = make_weight(FIRST_ROWS, 0);
+        let second_weight = make_weight(SECOND_ROWS, 3);
+        let first_scales = [0.75f32, 1.125];
+        let second_scales = [0.625f32, 1.375, 0.5, 1.25];
+        let input = DeviceBuffer::from_host(&input).expect("input");
+        let first_weight = DeviceBuffer::from_host(&first_weight).expect("first weight");
+        let second_weight = DeviceBuffer::from_host(&second_weight).expect("second weight");
+        let first_scales = DeviceBuffer::from_host(&first_scales).expect("first scales");
+        let second_scales = DeviceBuffer::from_host(&second_scales).expect("second scales");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut expected_first = DeviceBuffer::zeroed(FIRST_ROWS).expect("first reference");
+        let mut expected_second = DeviceBuffer::zeroed(SECOND_ROWS).expect("second reference");
+        block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+            &input,
+            &first_weight,
+            &first_scales,
+            expected_first.output(),
+            1,
+            FIRST_ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("first separate projection");
+        block_fp8_f32_scale_linear_f32_batch_into_on_stream(
+            &input,
+            &second_weight,
+            &second_scales,
+            expected_second.output(),
+            1,
+            SECOND_ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("second separate projection");
+        let expected_first = expected_first
+            .copy_to_host(&stream)
+            .expect("read first reference");
+        let expected_second = expected_second
+            .copy_to_host(&stream)
+            .expect("read second reference");
+
+        let mut actual_first = DeviceBuffer::zeroed(FIRST_ROWS).expect("first output");
+        let mut actual_second = DeviceBuffer::zeroed(SECOND_ROWS).expect("second output");
+        block_fp8_f32_scale_linear_pair_f32_into_on_stream(
+            &input,
+            &first_weight,
+            &first_scales,
+            &second_weight,
+            &second_scales,
+            actual_first.output(),
+            actual_second.output(),
+            FIRST_ROWS,
+            SECOND_ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("paired projections");
+        let actual_first = actual_first
+            .copy_to_host(&stream)
+            .expect("read first output");
+        let actual_second = actual_second
+            .copy_to_host(&stream)
+            .expect("read second output");
+        assert_eq!(actual_first.as_ref(), expected_first.as_ref());
+        assert_eq!(actual_second.as_ref(), expected_second.as_ref());
+    }
+
+    #[test]
+    fn f32_block_scaled_fp8_dequantizes_exactly_to_bf16() {
+        const ROWS: usize = 256;
+        const COLS: usize = 256;
+        let weight = (0..ROWS * COLS)
+            .map(|index| format::cuda_e4m3_code(((index % 11) as f32 - 5.0) / 4.0))
+            .collect::<Vec<_>>();
+        let scales = [0.75f32, 1.125, 0.625, 1.375];
+        let expected = weight
+            .iter()
+            .enumerate()
+            .map(|(index, &code)| {
+                let row = index / COLS;
+                let col = index % COLS;
+                let scale = scales[(row / SCALE_BLOCK) * (COLS / SCALE_BLOCK) + col / SCALE_BLOCK];
+                format::f32_to_bf16(format::e4m3_value(code) * scale)
+            })
+            .collect::<Vec<_>>();
+        let weight = DeviceBuffer::from_host(&weight).expect("weight");
+        let scales = DeviceBuffer::from_host(&scales).expect("scales");
+        let mut output = DeviceBuffer::zeroed(ROWS * COLS).expect("output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        dequant_block_fp8_f32_scale_to_bf16_into_on_stream(
+            &weight,
+            &scales,
+            output.output(),
+            ROWS,
+            COLS,
+            &stream,
+        )
+        .expect("dequantize");
+        assert_eq!(
+            output.copy_to_host(&stream).expect("read output").as_ref(),
+            expected
+        );
+    }
+
+    #[test]
+    fn f32_block_scaled_fp8_routed_experts_follow_device_indices() {
+        const SLOTS: usize = 2;
+        const ROWS: usize = 128;
+        const COLS: usize = 128;
+        let one = format::cuda_e4m3_code(1.0);
+        let two = format::cuda_e4m3_code(2.0);
+        let input = DeviceBuffer::from_host(&vec![0.25f32; COLS]).expect("input");
+        let indices = DeviceBuffer::from_host(&[1u32, 0]).expect("indices");
+        let gate =
+            DeviceBuffer::from_host(&[vec![one; ROWS * COLS], vec![two; ROWS * COLS]].concat())
+                .expect("gate weights");
+        let up =
+            DeviceBuffer::from_host(&[vec![two; ROWS * COLS], vec![one; ROWS * COLS]].concat())
+                .expect("up weights");
+        let scales = DeviceBuffer::from_host(&[0.5f32, 1.5]).expect("scales");
+        let table = |buffer: &DeviceBuffer<u8>| -> Result<DeviceBuffer<DeviceAddress<u8>>> {
+            DeviceBuffer::from_host(&[buffer.address_at(0)?, buffer.address_at(ROWS * COLS)?])
+        };
+        let scale_table = DeviceBuffer::from_host(&[
+            scales.address_at(0).expect("scale 0"),
+            scales.address_at(1).expect("scale 1"),
+        ])
+        .expect("scale table");
+        let gate_table = table(&gate).expect("gate table");
+        let up_table = table(&up).expect("up table");
+        let mut gate_up = DeviceBuffer::zeroed(SLOTS * ROWS * 2).expect("gate/up output");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        block_fp8_f32_scale_moe_gate_up_f32_into_on_stream(
+            &indices,
+            &input,
+            &gate_table,
+            &scale_table,
+            &up_table,
+            &scale_table,
+            gate_up.output(),
+            ROWS,
+            COLS,
+            SLOTS,
+            &stream,
+        )
+        .expect("gate/up");
+        let actual = gate_up.copy_to_host(&stream).expect("read gate/up");
+        for row in 0..ROWS {
+            assert!((actual[row] - 96.0).abs() < 1.0e-4);
+            assert!((actual[ROWS + row] - 48.0).abs() < 1.0e-4);
+            assert!((actual[ROWS * 2 + row] - 16.0).abs() < 1.0e-4);
+            assert!((actual[ROWS * 3 + row] - 32.0).abs() < 1.0e-4);
+        }
+
+        let down_input = DeviceBuffer::from_host(&vec![0.25f32; SLOTS * COLS]).expect("down input");
+        let mut down_outputs = (0..SLOTS)
+            .map(|_| DeviceBuffer::zeroed(ROWS))
+            .collect::<Result<Vec<_>>>()
+            .expect("down outputs");
+        let down_output_table = DeviceBuffer::from_host(
+            &down_outputs
+                .iter_mut()
+                .map(|output| output.address_at(0))
+                .collect::<Result<Vec<_>>>()
+                .expect("down addresses"),
+        )
+        .expect("down output table");
+        block_fp8_f32_scale_moe_down_f32_into_on_stream(
+            &indices,
+            &down_input,
+            &gate_table,
+            &scale_table,
+            &down_output_table,
+            ROWS,
+            COLS,
+            SLOTS,
+            &stream,
+        )
+        .expect("down");
+        let first = down_outputs[0].copy_to_host(&stream).expect("down slot 0");
+        let second = down_outputs[1].copy_to_host(&stream).expect("down slot 1");
+        assert!(first.iter().all(|value| (*value - 96.0).abs() < 1.0e-4));
+        assert!(second.iter().all(|value| (*value - 16.0).abs() < 1.0e-4));
     }
 
     #[test]
@@ -2731,11 +3402,11 @@ mod tests {
         rope_dim: usize,
         direction: f32,
     ) {
-        for batch in 0..batch_rows {
+        for (batch, &position) in positions.iter().take(batch_rows).enumerate() {
             for head in 0..heads {
                 let base = (batch * heads + head) * head_dim + head_dim - rope_dim;
                 for (pair, &frequency) in inv_freq.iter().enumerate() {
-                    let angle = positions[batch] as f32 * frequency * direction;
+                    let angle = position as f32 * frequency * direction;
                     let (sine, cosine) = angle.sin_cos();
                     let even = values[base + 2 * pair];
                     let odd = values[base + 2 * pair + 1];

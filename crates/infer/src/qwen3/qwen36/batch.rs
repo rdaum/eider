@@ -21,7 +21,8 @@ use eider_cuda::{
     Sm12xKvAttentionWorkspace, Sm12xKvPagePool, add_f32_prefix_into_on_stream,
     argmax_f32_batch_into_on_stream, bf16_linear_logits_f32_batch_into_on_stream,
     bf16_linear_two_rows_f32_into_on_stream, bf16_to_f32_prefix_into_on_stream,
-    dflash2_capture_f32_into_on_stream, f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
+    dequant_block_fp8_f32_scale_to_bf16_into_on_stream, dflash2_capture_f32_into_on_stream,
+    f32_to_bf16_prefix_into_on_stream, fill_f32_into_on_stream,
     gated_delta_net_128_f32_batch_into_on_stream, gated_delta_net_128_f32_chunks_into_on_stream,
     gated_rms_norm_f32_into_on_stream, gated_rms_norm_quantize_nvfp4_col_major_f32_into_on_stream,
     gather_f32_pointer_rows_into_on_stream, gather_f32_pointer_rows_range_into_on_stream,
@@ -44,10 +45,8 @@ use eider_cuda::{
     Sm121W4A4GroupedWorkspace, moe_weighted_accumulate_contiguous_f32_batch_on_stream,
 };
 
-const GDN_HEADS: usize = 32;
 const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
-const GDN_STATE_VALUES: usize = GDN_HEADS * GDN_HEAD_DIM * GDN_HEAD_DIM;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
 
 pub(crate) trait Qwen36BatchModel {
@@ -507,14 +506,69 @@ impl BatchBf16LinearPlan {
     }
 }
 
+enum BatchBlockFp8LinearPlan {
+    Direct,
+    Bf16 {
+        plans: HashMap<usize, Bf16TnMatmulPlan>,
+        weight: DeviceBuffer<u16>,
+        input: DeviceBuffer<u16>,
+    },
+}
+
+impl BatchBlockFp8LinearPlan {
+    fn new(
+        model: &dyn Qwen36BatchModel,
+        linear: &super::F32BlockFp8Linear,
+        capacity: usize,
+    ) -> Result<Self> {
+        if capacity <= 8 {
+            return Ok(Self::Direct);
+        }
+        let mut plans = HashMap::new();
+        plans.insert(
+            capacity,
+            Bf16TnMatmulPlan::new(
+                model.batch_lt(),
+                GemmShape::new(linear.rows, capacity, linear.cols),
+                8 << 20,
+            )?,
+        );
+        Ok(Self::Bf16 {
+            plans,
+            weight: DeviceBuffer::zeroed(linear.rows * linear.cols)?,
+            input: DeviceBuffer::zeroed(capacity * linear.cols)?,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::Bf16 {
+                plans,
+                weight,
+                input,
+            } => {
+                plans
+                    .values()
+                    .map(Bf16TnMatmulPlan::workspace_bytes)
+                    .sum::<usize>()
+                    + weight.device_bytes()
+                    + input.device_bytes()
+            }
+        }
+    }
+}
+
 enum BatchLinearPlan {
     Bf16(BatchBf16LinearPlan),
+    BlockFp8(BatchBlockFp8LinearPlan),
     Fp8(BatchFp8LinearPlan),
     Nvfp4(BatchNvfp4LinearPlan),
 }
 
 struct BatchLinearPlanSet {
     bf16: Option<BatchBf16LinearPlan>,
+    block_fp8: Option<BatchBlockFp8LinearPlan>,
     fp8: Option<BatchFp8LinearPlan>,
     nvfp4: Option<BatchNvfp4LinearPlan>,
 }
@@ -527,11 +581,15 @@ impl BatchLinearPlanSet {
     ) -> Result<Self> {
         let mut plans = Self {
             bf16: None,
+            block_fp8: None,
             fp8: None,
             nvfp4: None,
         };
         for linear in linears {
             match linear {
+                Qwen36Linear::BlockFp8(linear) if plans.block_fp8.is_none() => {
+                    plans.block_fp8 = Some(BatchBlockFp8LinearPlan::new(model, linear, capacity)?);
+                }
                 Qwen36Linear::Bf16(linear) if plans.bf16.is_none() => {
                     plans.bf16 = Some(BatchBf16LinearPlan::new(model, linear, capacity)?);
                 }
@@ -541,7 +599,10 @@ impl BatchLinearPlanSet {
                 Qwen36Linear::Nvfp4(linear) if plans.nvfp4.is_none() => {
                     plans.nvfp4 = Some(new_nvfp4_batch_linear_plan(model, linear, capacity)?);
                 }
-                Qwen36Linear::Bf16(_) | Qwen36Linear::Fp8(_) | Qwen36Linear::Nvfp4(_) => {}
+                Qwen36Linear::BlockFp8(_)
+                | Qwen36Linear::Bf16(_)
+                | Qwen36Linear::Fp8(_)
+                | Qwen36Linear::Nvfp4(_) => {}
             }
         }
         Ok(plans)
@@ -551,6 +612,10 @@ impl BatchLinearPlanSet {
         self.bf16
             .as_ref()
             .map_or(0, BatchBf16LinearPlan::device_bytes)
+            + self
+                .block_fp8
+                .as_ref()
+                .map_or(0, BatchBlockFp8LinearPlan::device_bytes)
             + self
                 .fp8
                 .as_ref()
@@ -569,6 +634,7 @@ impl BatchLinearPlan {
     fn storage_name(&self) -> &'static str {
         match self {
             Self::Bf16(_) => "BF16",
+            Self::BlockFp8(_) => "F32 block-FP8",
             Self::Fp8(_) => "FP8",
             Self::Nvfp4(_) => "NVFP4",
         }
@@ -579,6 +645,7 @@ impl BatchLinearPlan {
     fn device_bytes(&self) -> usize {
         match self {
             Self::Bf16(plan) => plan.device_bytes(),
+            Self::BlockFp8(plan) => plan.device_bytes(),
             Self::Fp8(plan) => plan.device_bytes(),
             Self::Nvfp4(plan) => {
                 plan.plans
@@ -614,6 +681,9 @@ fn new_batch_linear_plan(
     capacity: usize,
 ) -> Result<Option<BatchLinearPlan>> {
     match linear {
+        Qwen36Linear::BlockFp8(linear) => Ok(Some(BatchLinearPlan::BlockFp8(
+            BatchBlockFp8LinearPlan::new(model, linear, capacity)?,
+        ))),
         Qwen36Linear::Fp8(linear) => Ok(Some(BatchLinearPlan::Fp8(BatchFp8LinearPlan::new(
             model, linear, capacity,
         )?))),
@@ -864,6 +934,56 @@ fn run_bf16_batch(
     maybe_round_device_f32_to_bf16(output, stream)
 }
 
+fn run_block_fp8_batch(
+    model: &dyn Qwen36BatchModel,
+    linear: &super::F32BlockFp8Linear,
+    plan: &mut BatchBlockFp8LinearPlan,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    rows: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    if rows <= 8 {
+        return linear.run_batch_into(input, output, rows, stream);
+    }
+    let BatchBlockFp8LinearPlan::Bf16 {
+        plans,
+        weight,
+        input: bf16_input,
+    } = plan
+    else {
+        return Err(eider_cuda::Error::Shape {
+            label: "Qwen block-FP8 batch plan",
+            expected: "BF16 expansion storage for more than 8 rows".to_string(),
+            actual: "decode-only direct plan".to_string(),
+        });
+    };
+    dequant_block_fp8_f32_scale_to_bf16_into_on_stream(
+        &linear.weight,
+        &linear.weight_scale,
+        weight.output(),
+        linear.rows,
+        linear.cols,
+        stream,
+    )?;
+    f32_to_bf16_prefix_into_on_stream(input, bf16_input.output(), rows * linear.cols, stream)?;
+    if let std::collections::hash_map::Entry::Vacant(entry) = plans.entry(rows) {
+        entry.insert(Bf16TnMatmulPlan::new(
+            model.batch_lt(),
+            GemmShape::new(linear.rows, rows, linear.cols),
+            8 << 20,
+        )?);
+    }
+    plans[&rows].run_on_stream(
+        model.batch_lt(),
+        weight,
+        bf16_input,
+        output.output(),
+        stream,
+    )?;
+    maybe_round_device_f32_to_bf16(output, stream)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_linear_batch(
     model: &dyn Qwen36BatchModel,
@@ -880,6 +1000,25 @@ fn run_linear_batch(
     stream: &CudaStream,
 ) -> Result<()> {
     match linear {
+        Qwen36Linear::BlockFp8(linear) => {
+            let Some(plan) = plan.as_mut() else {
+                return Err(eider_cuda::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: "block-FP8 projection has no batch plan".to_string(),
+                });
+            };
+            let actual = plan.storage_name();
+            let BatchLinearPlan::BlockFp8(plan) = plan else {
+                return Err(eider_cuda::Error::Format {
+                    label: "Qwen batch linear plan",
+                    detail: format!(
+                        "block-FP8 projection [{}, {}] has a {actual} plan",
+                        linear.rows, linear.cols
+                    ),
+                });
+            };
+            run_block_fp8_batch(model, linear, plan, raw_input, output, rows, stream)
+        }
         Qwen36Linear::Nvfp4(linear) => {
             let Some(plan) = plan.as_mut() else {
                 return Err(eider_cuda::Error::Format {
@@ -978,6 +1117,21 @@ fn run_linear_batch_from_set(
     stream: &CudaStream,
 ) -> Result<()> {
     match linear {
+        Qwen36Linear::BlockFp8(linear) => run_block_fp8_batch(
+            model,
+            linear,
+            plans
+                .block_fp8
+                .as_mut()
+                .ok_or_else(|| eider_cuda::Error::Format {
+                    label: "Qwen dense batch plan",
+                    detail: "block-FP8 projection has no block-FP8 plan".to_string(),
+                })?,
+            raw_input,
+            output,
+            rows,
+            stream,
+        ),
         Qwen36Linear::Nvfp4(linear) => run_nvfp4_batch(
             model,
             linear,
@@ -1224,6 +1378,8 @@ impl BatchLinearAttentionStateSnapshots {
 }
 
 struct BatchChunkedGdnWorkspace {
+    heads: usize,
+    state_values: usize,
     kernels: Qwen36ChunkedGdn,
     q: DeviceBuffer<u16>,
     k: DeviceBuffer<u16>,
@@ -1249,13 +1405,16 @@ struct BatchChunkedGdnWorkspace {
 }
 
 impl BatchChunkedGdnWorkspace {
-    fn new(token_capacity: usize, sequence_capacity: usize) -> Result<Self> {
-        let vectors = token_capacity * GDN_HEADS * GDN_HEAD_DIM;
-        let token_heads = token_capacity * GDN_HEADS;
+    fn new(token_capacity: usize, sequence_capacity: usize, heads: usize) -> Result<Self> {
+        let vectors = token_capacity * heads * GDN_HEAD_DIM;
+        let token_heads = token_capacity * heads;
+        let state_values = heads * GDN_HEAD_DIM * GDN_HEAD_DIM;
         let max_chunks = token_capacity.div_ceil(GDN_CHUNK_TOKENS) + sequence_capacity;
         let a_values = token_heads * GDN_CHUNK_TOKENS;
         Ok(Self {
-            kernels: Qwen36ChunkedGdn::new()?,
+            heads,
+            state_values,
+            kernels: Qwen36ChunkedGdn::new(heads)?,
             q: DeviceBuffer::zeroed(vectors)?,
             k: DeviceBuffer::zeroed(vectors)?,
             v: DeviceBuffer::zeroed(vectors)?,
@@ -1268,8 +1427,8 @@ impl BatchChunkedGdnWorkspace {
             w: DeviceBuffer::zeroed(vectors)?,
             u: DeviceBuffer::zeroed(vectors)?,
             value_new: DeviceBuffer::zeroed(vectors)?,
-            h: DeviceBuffer::zeroed(max_chunks * GDN_STATE_VALUES)?,
-            state: DeviceBuffer::zeroed(sequence_capacity * GDN_STATE_VALUES)?,
+            h: DeviceBuffer::zeroed(max_chunks * state_values)?,
+            state: DeviceBuffer::zeroed(sequence_capacity * state_values)?,
             cu_seqlens: DeviceBuffer::zeroed(sequence_capacity + 1)?,
             chunk_indices: DeviceBuffer::zeroed(max_chunks * 2)?,
             chunk_offsets: DeviceBuffer::zeroed(sequence_capacity + 1)?,
@@ -1329,13 +1488,13 @@ impl BatchChunkedGdnWorkspace {
         total_tokens: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let vectors = total_tokens * GDN_HEADS * GDN_HEAD_DIM;
+        let vectors = total_tokens * self.heads * GDN_HEAD_DIM;
         gather_f32_pointer_rows_into_on_stream(
             state_table,
             state_table_offset,
             self.state.output(),
             sequence_count,
-            GDN_STATE_VALUES,
+            self.state_values,
             stream,
         )?;
         self.kernels.run_on_stream(
@@ -1366,7 +1525,7 @@ impl BatchChunkedGdnWorkspace {
             state_table,
             state_table_offset,
             sequence_count,
-            GDN_STATE_VALUES,
+            self.state_values,
             stream,
         )?;
         bf16_to_f32_prefix_into_on_stream(&self.output, output_f32, vectors, stream)
@@ -1445,11 +1604,12 @@ impl BatchLinearAttentionWorkspace {
             z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
             out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
             alpha_beta_plan: BatchBf16LinearPlan::new(model, &weights.alpha_beta, row_capacity)?,
-            // The optimised chunked kernel is specialised to Qwen3.6's 32
-            // value heads. Other Qwen3.5-family shapes use the generic ragged
-            // GDN kernel below.
-            chunked_gdn: (chunked_prefill && linear.value_heads == GDN_HEADS)
-                .then(|| BatchChunkedGdnWorkspace::new(row_capacity, state_capacity))
+            // The chunked tensor-core kernel supports any value-head count
+            // with the 128-element head shape used by this model family.
+            chunked_gdn: (chunked_prefill && linear.value_head_dim == GDN_HEAD_DIM)
+                .then(|| {
+                    BatchChunkedGdnWorkspace::new(row_capacity, state_capacity, linear.value_heads)
+                })
                 .transpose()?,
         })
     }
@@ -1678,7 +1838,7 @@ impl BatchFullAttentionWorkspace {
             model.batch_manifest().q_heads,
             model.batch_manifest().kv_heads,
             model.batch_manifest().head_dim,
-            8,
+            16,
         )?;
         Ok(Self {
             hidden_quantized: DeviceBuffer::zeroed(capacity * model.batch_manifest().hidden)?,
@@ -1750,8 +1910,8 @@ struct BatchMoeWorkspace {
     shared_output: DeviceBuffer<f32>,
     shared_gate: DeviceBuffer<f32>,
     shared_gate_plan: BatchBf16LinearPlan,
-    shared_gate_up_plan: Option<BatchNvfp4LinearPlan>,
-    shared_down_plan: Option<BatchNvfp4LinearPlan>,
+    shared_gate_up_plan: Option<BatchLinearPlan>,
+    shared_down_plan: Option<BatchLinearPlan>,
     routed: BatchRoutedMoeWorkspace,
     output: DeviceBuffer<f32>,
 }
@@ -2083,12 +2243,24 @@ impl BatchMoeWorkspace {
         let gate_up_width = weights.expert_intermediate * 2;
         let (shared_gate_up_plan, shared_down_plan) = match &weights.shared {
             Qwen36SharedExpertStorage::Nvfp4(shared) => (
-                Some(new_nvfp4_batch_linear_plan(
+                Some(BatchLinearPlan::Nvfp4(new_nvfp4_batch_linear_plan(
                     model,
                     &shared.gate_up,
                     capacity,
-                )?),
-                Some(new_nvfp4_batch_linear_plan(model, &shared.down, capacity)?),
+                )?)),
+                Some(BatchLinearPlan::Nvfp4(new_nvfp4_batch_linear_plan(
+                    model,
+                    &shared.down,
+                    capacity,
+                )?)),
+            ),
+            Qwen36SharedExpertStorage::BlockFp8 { gate_up, down } => (
+                Some(BatchLinearPlan::BlockFp8(BatchBlockFp8LinearPlan::new(
+                    model, gate_up, capacity,
+                )?)),
+                Some(BatchLinearPlan::BlockFp8(BatchBlockFp8LinearPlan::new(
+                    model, down, capacity,
+                )?)),
             ),
             Qwen36SharedExpertStorage::Bf16 { .. } => (None, None),
             Qwen36SharedExpertStorage::Fp8 { .. } => {
@@ -2153,20 +2325,14 @@ impl BatchMoeWorkspace {
             + self.shared_output.device_bytes()
             + self.shared_gate.device_bytes()
             + self.shared_gate_plan.device_bytes()
-            + self.shared_gate_up_plan.as_ref().map_or(0, |plan| {
-                plan.plans
-                    .values()
-                    .map(Fp4TnMatmulPlan::workspace_bytes)
-                    .sum::<usize>()
-                    + plan.activation.device_bytes()
-            })
-            + self.shared_down_plan.as_ref().map_or(0, |plan| {
-                plan.plans
-                    .values()
-                    .map(Fp4TnMatmulPlan::workspace_bytes)
-                    .sum::<usize>()
-                    + plan.activation.device_bytes()
-            })
+            + self
+                .shared_gate_up_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
+            + self
+                .shared_down_plan
+                .as_ref()
+                .map_or(0, BatchLinearPlan::device_bytes)
             + self.routed.device_bytes()
             + self.output.device_bytes()
     }
@@ -4065,7 +4231,9 @@ impl Qwen36TextModel {
                         .expect("FP8 lm head has a batch plan")
                     {
                         BatchLinearPlan::Fp8(plan) => plan,
-                        BatchLinearPlan::Bf16(_) | BatchLinearPlan::Nvfp4(_) => {
+                        BatchLinearPlan::Bf16(_)
+                        | BatchLinearPlan::BlockFp8(_)
+                        | BatchLinearPlan::Nvfp4(_) => {
                             unreachable!("FP8 lm head has an FP8 plan")
                         }
                     },
@@ -4752,23 +4920,6 @@ impl Qwen36TextModel {
             let _ = mtp_state.truncate(initial_mtp_len);
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::align_speculative_committed_logits;
-
-    #[test]
-    fn speculative_logits_align_with_frontier_then_accepted_drafts() {
-        assert_eq!(
-            align_speculative_committed_logits(0.5, &[1.5, 2.5, 3.5], 0),
-            [0.5]
-        );
-        assert_eq!(
-            align_speculative_committed_logits(0.5, &[1.5, 2.5, 3.5], 2),
-            [0.5, 1.5, 2.5]
-        );
     }
 }
 
@@ -5478,45 +5629,98 @@ impl Qwen36FullAttentionWeights {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn enqueue_qsa_prefill_row(
+    pub(crate) fn enqueue_qsa_prefill_dense_rows(
         &self,
-        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut BatchFullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        input_row_offset: usize,
+        start_position: usize,
+        slot: usize,
+        page_offset: usize,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let row_capacity = if cfg!(feature = "cuda-oxide") { 4 } else { 8 };
+        let mut processed = 0;
+        while processed < rows {
+            let position = start_position + processed;
+            let chunk_rows = (rows - processed).min(16 - position % 16).min(row_capacity);
+            pool.append_rows_at_offset_on_stream(
+                slot,
+                page_offset + processed,
+                &workspace.k_rope,
+                &workspace.v,
+                input_row_offset + processed,
+                chunk_rows,
+                stream,
+            )?;
+            workspace
+                .compact_attention
+                .attention_paged_causal_rows_at_offset_into_on_stream(
+                    pool,
+                    page_table,
+                    position,
+                    &workspace.q_rope,
+                    input_row_offset + processed,
+                    chunk_rows,
+                    None,
+                    workspace.attention.output(),
+                    stream,
+                )?;
+            processed += chunk_rows;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_qsa_prefill_sparse_rows(
+        &self,
         workspace: &mut BatchFullAttentionWorkspace,
         pool: &mut Sm12xKvPagePool,
         page_table: &DeviceBuffer<u32>,
         selected_blocks: &DeviceBuffer<u8>,
         selected_tiles: &DeviceBuffer<u8>,
-        selected_tokens: usize,
-        row: usize,
-        position: usize,
+        selected_block_indices: &DeviceBuffer<u32>,
+        selected_token_tiles: &DeviceBuffer<u32>,
+        selected_context_tiles: &DeviceBuffer<u32>,
+        selected_counts: &DeviceBuffer<u32>,
+        selected_index_capacity: usize,
+        selected_complete_tokens: usize,
+        input_row_offset: usize,
+        start_position: usize,
         slot: usize,
         page_offset: usize,
+        rows: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
-        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
-        pool.append_at_offsets_on_stream(
+        pool.append_rows_at_offset_on_stream(
             slot,
             page_offset,
             &workspace.k_rope,
-            row * kv_width,
             &workspace.v,
-            row * kv_width,
+            input_row_offset,
+            rows,
             stream,
         )?;
         workspace
             .compact_attention
-            .attention_paged_sparse_offsets_into_on_stream(
+            .attention_paged_sparse_causal_rows_at_offset_into_on_stream(
                 pool,
                 page_table,
-                position + 1,
+                start_position,
                 selected_blocks,
                 selected_tiles,
-                selected_tokens,
+                selected_block_indices,
+                selected_token_tiles,
+                selected_context_tiles,
+                selected_counts,
+                selected_index_capacity,
+                selected_complete_tokens,
                 &workspace.q_rope,
-                row * q_width,
+                input_row_offset,
+                rows,
                 workspace.attention.output(),
-                row * q_width,
                 stream,
             )
     }
@@ -5850,6 +6054,12 @@ impl Qwen36MoeWeights {
                         detail: "NVFP4 shared gate/up has no batch plan".to_string(),
                     }
                 })?;
+                let BatchLinearPlan::Nvfp4(gate_up_plan) = gate_up_plan else {
+                    return Err(eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "NVFP4 shared gate/up has a different storage plan".to_string(),
+                    });
+                };
                 run_nvfp4_batch(
                     model,
                     &shared.gate_up,
@@ -5872,9 +6082,66 @@ impl Qwen36MoeWeights {
                         detail: "NVFP4 shared down has no batch plan".to_string(),
                     }
                 })?;
+                let BatchLinearPlan::Nvfp4(down_plan) = down_plan else {
+                    return Err(eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "NVFP4 shared down has a different storage plan".to_string(),
+                    });
+                };
                 run_nvfp4_batch(
                     model,
                     &shared.down,
+                    down_plan,
+                    &workspace.shared_activated,
+                    &mut workspace.shared_output,
+                    capacity,
+                    stream,
+                )?;
+            }
+            Qwen36SharedExpertStorage::BlockFp8 { gate_up, down } => {
+                let gate_up_plan = workspace.shared_gate_up_plan.as_mut().ok_or_else(|| {
+                    eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "block-FP8 shared gate/up has no batch plan".to_string(),
+                    }
+                })?;
+                let BatchLinearPlan::BlockFp8(gate_up_plan) = gate_up_plan else {
+                    return Err(eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "block-FP8 shared gate/up has a different storage plan".to_string(),
+                    });
+                };
+                run_block_fp8_batch(
+                    model,
+                    gate_up,
+                    gate_up_plan,
+                    ffn_norm,
+                    &mut workspace.shared_gate_up,
+                    capacity,
+                    stream,
+                )?;
+                silu_mul_halves_f32_batch_into_on_stream(
+                    &workspace.shared_gate_up,
+                    workspace.shared_activated.output(),
+                    capacity,
+                    self.expert_intermediate,
+                    stream,
+                )?;
+                let down_plan = workspace.shared_down_plan.as_mut().ok_or_else(|| {
+                    eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "block-FP8 shared down has no batch plan".to_string(),
+                    }
+                })?;
+                let BatchLinearPlan::BlockFp8(down_plan) = down_plan else {
+                    return Err(eider_cuda::Error::Format {
+                        label: "Qwen3.6 batched shared expert",
+                        detail: "block-FP8 shared down has a different storage plan".to_string(),
+                    });
+                };
+                run_block_fp8_batch(
+                    model,
+                    down,
                     down_plan,
                     &workspace.shared_activated,
                     &mut workspace.shared_output,
@@ -6105,5 +6372,22 @@ impl Qwen36MoeWeights {
             stream,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::align_speculative_committed_logits;
+
+    #[test]
+    fn speculative_logits_align_with_frontier_then_accepted_drafts() {
+        assert_eq!(
+            align_speculative_committed_logits(0.5, &[1.5, 2.5, 3.5], 0),
+            [0.5]
+        );
+        assert_eq!(
+            align_speculative_committed_logits(0.5, &[1.5, 2.5, 3.5], 2),
+            [0.5, 1.5, 2.5]
+        );
     }
 }

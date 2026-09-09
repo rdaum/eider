@@ -602,6 +602,9 @@ mod device {
         page_tokens: u32,
         page_stride_bytes: u32,
         selected_blocks: *const u8,
+        selected_token_tiles: *const u32,
+        selected_counts: *const u32,
+        selected_index_capacity: u32,
         causal_start_position: u32,
         window_tokens: u32,
     ) {
@@ -622,8 +625,25 @@ mod device {
                 cache_len - window_tokens
             };
         }
+        let selected_blocks = if selected_blocks.is_null() || causal_start_position == u32::MAX {
+            selected_blocks
+        } else {
+            unsafe {
+                selected_blocks.add((batch_row * max_tokens.div_ceil(4)) as usize)
+            }
+        };
         let group = thread::blockIdx_x();
-        let token_tile = thread::blockIdx_y();
+        let mut token_tile = thread::blockIdx_y();
+        if !selected_token_tiles.is_null() {
+            let selected_count = unsafe { *selected_counts.add((batch_row * 3 + 1) as usize) };
+            if thread::blockIdx_y() >= selected_count {
+                return;
+            }
+            token_tile = unsafe {
+                *selected_token_tiles
+                    .add((batch_row * selected_index_capacity + thread::blockIdx_y()) as usize)
+            };
+        }
         if cache_len == 0 || cache_len > max_tokens || token_tile >= cache_len.div_ceil(8) {
             return;
         }
@@ -839,6 +859,9 @@ mod device {
         max_tokens: u32,
         q_heads: u32,
         selected_blocks: *const u8,
+        selected_block_indices: *const u32,
+        selected_counts: *const u32,
+        selected_index_capacity: u32,
         causal_start_position: u32,
         window_tokens: u32,
     ) {
@@ -859,22 +882,56 @@ mod device {
                 cache_len - window_tokens
             };
         }
+        let selected_blocks = if selected_blocks.is_null() || causal_start_position == u32::MAX {
+            selected_blocks
+        } else {
+            unsafe {
+                selected_blocks.add((batch_row * max_tokens.div_ceil(4)) as usize)
+            }
+        };
         if cache_len == 0 || cache_len > max_tokens {
             return;
         }
         let head = thread::blockIdx_x();
         let lane = thread::threadIdx_x();
         let row = unsafe { scores.add(((batch_row * q_heads + head) * max_tokens) as usize) };
-        let mut maximum = f32::NEG_INFINITY;
-        let mut token = lane;
-        token += window_start;
-        while token < cache_len {
-            if selected_blocks.is_null()
-                || unsafe { *selected_blocks.add((token / 4) as usize) } != 0
-            {
-                maximum = maximum.max(unsafe { *row.add(token as usize) });
+        let selected_block_indices = if selected_block_indices.is_null() {
+            selected_block_indices
+        } else {
+            unsafe {
+                selected_block_indices.add((batch_row * selected_index_capacity) as usize)
             }
-            token += thread::blockDim_x();
+        };
+        let selected_count = if selected_block_indices.is_null() {
+            0
+        } else {
+            unsafe { *selected_counts.add((batch_row * 3) as usize) }
+        };
+        let mut maximum = f32::NEG_INFINITY;
+        if selected_block_indices.is_null() {
+            let mut token = window_start + lane;
+            while token < cache_len {
+                if selected_blocks.is_null()
+                    || unsafe { *selected_blocks.add((token / 4) as usize) } != 0
+                {
+                    maximum = maximum.max(unsafe { *row.add(token as usize) });
+                }
+                token += thread::blockDim_x();
+            }
+        } else {
+            let mut rank = lane;
+            while rank < selected_count {
+                let first_token = unsafe { *selected_block_indices.add(rank as usize) } * 4;
+                let mut offset = 0;
+                while offset < 4 {
+                    let token = first_token + offset;
+                    if token >= window_start && token < cache_len {
+                        maximum = maximum.max(unsafe { *row.add(token as usize) });
+                    }
+                    offset += 1;
+                }
+                rank += thread::blockDim_x();
+            }
         }
         unsafe { partial.add(lane as usize).write(maximum) };
         thread::sync_threads();
@@ -892,14 +949,30 @@ mod device {
         }
         maximum = unsafe { *partial };
         let mut sum = 0.0f32;
-        token = window_start + lane;
-        while token < cache_len {
-            if selected_blocks.is_null()
-                || unsafe { *selected_blocks.add((token / 4) as usize) } != 0
-            {
-                sum += (unsafe { *row.add(token as usize) } - maximum).exp();
+        if selected_block_indices.is_null() {
+            let mut token = window_start + lane;
+            while token < cache_len {
+                if selected_blocks.is_null()
+                    || unsafe { *selected_blocks.add((token / 4) as usize) } != 0
+                {
+                    sum += (unsafe { *row.add(token as usize) } - maximum).exp();
+                }
+                token += thread::blockDim_x();
             }
-            token += thread::blockDim_x();
+        } else {
+            let mut rank = lane;
+            while rank < selected_count {
+                let first_token = unsafe { *selected_block_indices.add(rank as usize) } * 4;
+                let mut offset = 0;
+                while offset < 4 {
+                    let token = first_token + offset;
+                    if token >= window_start && token < cache_len {
+                        sum += (unsafe { *row.add(token as usize) } - maximum).exp();
+                    }
+                    offset += 1;
+                }
+                rank += thread::blockDim_x();
+            }
         }
         unsafe { partial.add(lane as usize).write(sum) };
         thread::sync_threads();
@@ -912,20 +985,40 @@ mod device {
             stride /= 2;
         }
         let inverse_sum = 1.0 / unsafe { *partial };
-        token = window_start + lane;
-        while token < cache_len {
-            unsafe {
-                let value = row.add(token as usize);
-                value.write(
-                    if selected_blocks.is_null() || *selected_blocks.add((token / 4) as usize) != 0
-                    {
-                        (*value - maximum).exp() * inverse_sum
-                    } else {
-                        0.0
-                    },
-                );
+        if selected_block_indices.is_null() {
+            let mut token = window_start + lane;
+            while token < cache_len {
+                unsafe {
+                    let value = row.add(token as usize);
+                    value.write(
+                        if selected_blocks.is_null()
+                            || *selected_blocks.add((token / 4) as usize) != 0
+                        {
+                            (*value - maximum).exp() * inverse_sum
+                        } else {
+                            0.0
+                        },
+                    );
+                }
+                token += thread::blockDim_x();
             }
-            token += thread::blockDim_x();
+        } else {
+            let mut rank = lane;
+            while rank < selected_count {
+                let first_token = unsafe { *selected_block_indices.add(rank as usize) } * 4;
+                let mut offset = 0;
+                while offset < 4 {
+                    let token = first_token + offset;
+                    if token >= window_start && token < cache_len {
+                        unsafe {
+                            let value = row.add(token as usize);
+                            value.write((*value - maximum).exp() * inverse_sum);
+                        }
+                    }
+                    offset += 1;
+                }
+                rank += thread::blockDim_x();
+            }
         }
         let _ = q_heads;
     }
@@ -945,7 +1038,10 @@ mod device {
         q_heads: u32,
         kv_heads: u32,
         selected_blocks: *const u8,
-        selected_tokens: u32,
+        mut selected_tokens: u32,
+        selected_context_tiles: *const u32,
+        selected_counts: *const u32,
+        selected_index_capacity: u32,
         causal_start_position: u32,
         window_tokens: u32,
     ) {
@@ -966,8 +1062,26 @@ mod device {
                 cache_len - window_tokens
             };
         }
+        let selected_blocks = if selected_blocks.is_null() || causal_start_position == u32::MAX {
+            selected_blocks
+        } else {
+            selected_tokens += cache_len % 4;
+            unsafe {
+                selected_blocks.add((batch_row * max_tokens.div_ceil(4)) as usize)
+            }
+        };
         let group = thread::blockIdx_x();
-        let context_tile = thread::blockIdx_y();
+        let mut context_tile = thread::blockIdx_y();
+        if !selected_context_tiles.is_null() {
+            let selected_count = unsafe { *selected_counts.add((batch_row * 3 + 2) as usize) };
+            if thread::blockIdx_y() >= selected_count {
+                return;
+            }
+            context_tile = unsafe {
+                *selected_context_tiles
+                    .add((batch_row * selected_index_capacity + thread::blockIdx_y()) as usize)
+            };
+        }
         if cache_len == 0 || cache_len > max_tokens || context_tile >= cache_len.div_ceil(64) {
             return;
         }
@@ -1100,7 +1214,10 @@ mod device {
         page_tokens: u32,
         page_stride_bytes: u32,
         selected_tiles: *const u8,
-        selected_tokens: u32,
+        mut selected_tokens: u32,
+        selected_context_tiles: *const u32,
+        selected_counts: *const u32,
+        selected_index_capacity: u32,
         causal_start_position: u32,
         window_tokens: u32,
         output_row_offset: u32,
@@ -1123,6 +1240,14 @@ mod device {
                 cache_len - window_tokens
             };
         }
+        let selected_tiles = if selected_tiles.is_null() || causal_start_position == u32::MAX {
+            selected_tiles
+        } else {
+            selected_tokens += cache_len % 4;
+            unsafe {
+                selected_tiles.add((batch_row * max_tokens.div_ceil(64)) as usize)
+            }
+        };
         if cache_len == 0 || cache_len > max_tokens {
             return;
         }
@@ -1158,18 +1283,31 @@ mod device {
             selected_tokens
         });
         let first_context_tile = window_start / 64;
-        let active_context_tiles = context_tiles - first_context_tile;
-        let context_begin = first_context_tile + active_context_tiles * split / pv_splits;
-        let context_end = first_context_tile + active_context_tiles * (split + 1) / pv_splits;
+        let active_context_tiles = if selected_context_tiles.is_null() {
+            context_tiles - first_context_tile
+        } else {
+            unsafe { *selected_counts.add((batch_row * 3 + 2) as usize) }
+        };
+        let context_begin = active_context_tiles * split / pv_splits;
+        let context_end = active_context_tiles * (split + 1) / pv_splits;
         let dim = lane >> 2;
         let t0 = lane & 3;
         let mut accumulators = [0.0f32; 4];
-        let mut context_tile = context_begin;
-        while context_tile < context_end {
+        let mut context_rank = context_begin;
+        while context_rank < context_end {
+            let context_tile = if selected_context_tiles.is_null() {
+                first_context_tile + context_rank
+            } else {
+                unsafe {
+                    *selected_context_tiles.add(
+                        (batch_row * selected_index_capacity + context_rank) as usize,
+                    )
+                }
+            };
             if !selected_tiles.is_null()
                 && unsafe { *selected_tiles.add(context_tile as usize) } == 0
             {
-                context_tile += 1;
+                context_rank += 1;
                 continue;
             }
             let probability_tile = unsafe {
@@ -1307,7 +1445,7 @@ mod device {
                 | (u32::from(scale_codes[3]) << 24);
             accumulators = unsafe { mma_m16n8k64_nvfp4(a, b, scale_a, scale_b, accumulators) };
             thread::sync_threads();
-            context_tile += 1;
+            context_rank += 1;
         }
         let output_row = lane >> 2;
         let output_col = (lane & 3) * 2;

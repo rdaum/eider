@@ -2,8 +2,8 @@
 
 use super::Qwen38FlashNextConfig;
 use eider_cuda::{
-    CudaStream, DeviceOutput, Error, PagedBf16ReadStats, PagedBf16RowReader, PagedBf16RowSource,
-    Result,
+    CudaStream, DeviceOutput, Error, PagedRowFormat, PagedRowReadStats, PagedRowReader,
+    PagedRowSource, Result,
 };
 use eider_format::ModelOptCheckpoint;
 
@@ -304,7 +304,7 @@ pub struct Qwen38PlePagingStats {
 /// Released BF16 PLE table backed directly by its safetensors shard.
 pub struct Qwen38PagedPle {
     hash: Qwen38PleHashPlan,
-    reader: PagedBf16RowReader,
+    reader: PagedRowReader,
     row_ids: Vec<u32>,
     token_capacity: usize,
     stats: Qwen38PlePagingStats,
@@ -359,12 +359,14 @@ impl Qwen38PagedPle {
         let shard = checkpoint.open_shard_for_tensor(&first_tensor)?;
         let tensor_prefix = format!("{prefix}.ngram_embedding.shard_");
         let io_workers = io_workers.unwrap_or(row_capacity.min(MAX_PLE_IO_WORKERS));
-        let source = PagedBf16RowSource::open_numbered_with_workers(
+        let format = ple_row_format(checkpoint, &prefix)?;
+        let source = PagedRowSource::open_numbered_with_workers(
             &shard,
             &tensor_prefix,
             ".weight",
             config.ngram_shards,
             config.ngram_head_dim(),
+            format,
             io_workers,
         )?;
         let expected_rows = align_up(hash.table_rows(), config.ngram_vocab_alignment)?;
@@ -377,7 +379,7 @@ impl Qwen38PagedPle {
         }
         Ok(Self {
             hash,
-            reader: PagedBf16RowReader::new(source, row_capacity)?,
+            reader: PagedRowReader::new(source, row_capacity)?,
             row_ids: Vec::with_capacity(row_capacity),
             token_capacity,
             stats: Qwen38PlePagingStats::default(),
@@ -412,7 +414,7 @@ impl Qwen38PagedPle {
     }
 
     /// Waits for a previously started PLE read.
-    pub fn wait_read(&mut self) -> Result<PagedBf16ReadStats> {
+    pub fn wait_read(&mut self) -> Result<PagedRowReadStats> {
         let read = self.reader.wait_ready()?;
         self.account_read(read);
         Ok(read)
@@ -423,12 +425,12 @@ impl Qwen38PagedPle {
         &mut self,
         window: &mut Qwen38PleTokenWindow,
         tokens: &[u32],
-    ) -> Result<PagedBf16ReadStats> {
+    ) -> Result<PagedRowReadStats> {
         self.begin_read_tokens(window, tokens)?;
         self.wait_read()
     }
 
-    fn account_read(&mut self, read: PagedBf16ReadStats) {
+    fn account_read(&mut self, read: PagedRowReadStats) {
         if self.read_accounted {
             return;
         }
@@ -451,7 +453,7 @@ impl Qwen38PagedPle {
         &mut self,
         output: DeviceOutput<'_, f32>,
         stream: &CudaStream,
-    ) -> Result<PagedBf16ReadStats> {
+    ) -> Result<PagedRowReadStats> {
         let read = self.reader.gather_into_on_stream(output, stream)?;
         self.account_read(read);
         Ok(read)
@@ -475,6 +477,47 @@ impl Qwen38PagedPle {
 
 fn ple_embedding_prefix(layer: usize) -> String {
     format!("{TEXT_PREFIX}.layers.{layer}.ple.ple_embedding")
+}
+
+fn ple_row_format(checkpoint: &ModelOptCheckpoint, prefix: &str) -> Result<PagedRowFormat> {
+    let first_weight = format!("{prefix}.ngram_embedding.shard_0.weight");
+    match checkpoint.tensor_info(&first_weight)?.dtype.as_str() {
+        "BF16" => Ok(PagedRowFormat::Bf16),
+        "F8_E4M3" => {
+            let scale_name = format!("{prefix}.ngram_embedding.weight_scale");
+            let info = checkpoint.tensor_info(&scale_name)?;
+            if info.shape != [1] {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 FP8 PLE scale",
+                    expected: format!("{scale_name}: one floating-point value"),
+                    actual: format!("dtype={} shape={:?}", info.dtype, info.shape),
+                });
+            }
+            let scale = checkpoint
+                .open_shard_for_tensor(&scale_name)?
+                .read_float_tensor_as_f32(&scale_name)?;
+            let &[scale] = scale.as_slice() else {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 FP8 PLE scale",
+                    expected: "one value".to_string(),
+                    actual: scale.len().to_string(),
+                });
+            };
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 FP8 PLE scale",
+                    expected: "positive finite value".to_string(),
+                    actual: scale.to_string(),
+                });
+            }
+            Ok(PagedRowFormat::Fp8E4m3 { scale })
+        }
+        dtype => Err(Error::Shape {
+            label: "Qwen3.8 paged PLE storage",
+            expected: "BF16 or F8_E4M3 weights".to_string(),
+            actual: dtype.to_string(),
+        }),
+    }
 }
 
 fn read_i64_vector(

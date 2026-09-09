@@ -33,8 +33,11 @@ pub(crate) struct Qwen38QsaWorkspace {
 /// Shared batched projection and attention storage for one QSA prompt chunk.
 pub(crate) struct Qwen38QsaPrefillWorkspace {
     index_projection: DeviceBuffer<f32>,
+    selection: Qwen38QsaSelectionWorkspace,
     attention: BatchFullAttentionWorkspace,
 }
+
+const QSA_SPARSE_PREFILL_ROWS: usize = 16;
 
 impl Qwen38QsaWeights {
     pub(crate) fn load(
@@ -103,6 +106,27 @@ impl Qwen38QsaWeights {
             .run_into(hidden, &mut workspace.index_projection, stream)?;
         round_f32_to_bf16_in_place_on_stream(workspace.index_projection.inout(), stream)?;
         let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
+        if position < config.indexer_budget {
+            index_pool.append_key_on_stream(
+                &workspace.index_projection,
+                page.slot(),
+                page_offset,
+                config.indexer_heads,
+                stream,
+            )?;
+            let step = self.attention.run_one_token_paged(
+                &mut workspace.attention,
+                kv_pool,
+                page_table,
+                manifest,
+                hidden,
+                position,
+                page.slot(),
+                page_offset,
+                stream,
+            )?;
+            return Ok(step.output);
+        }
         let selection = workspace.selection.prepare_and_select_on_stream(
             &workspace.index_projection,
             &self.q_norm,
@@ -124,6 +148,11 @@ impl Qwen38QsaWeights {
             selection.selected_blocks,
             selection.selected_tiles,
             selection.selected_tokens,
+            selection.selected_block_indices,
+            selection.selected_token_tiles,
+            selection.selected_context_tiles,
+            selection.selected_counts,
+            selection.index_capacity,
             manifest,
             hidden,
             position,
@@ -193,6 +222,14 @@ impl Qwen38QsaWeights {
             (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
         Ok(Qwen38QsaPrefillWorkspace {
             index_projection: DeviceBuffer::zeroed(token_capacity * projection_rows)?,
+            selection: Qwen38QsaSelectionWorkspace::new_with_mask_rows(
+                max_context_tokens,
+                config.indexer_heads,
+                config.indexer_head_dim,
+                config.indexer_compress_ratio,
+                config.indexer_budget,
+                QSA_SPARSE_PREFILL_ROWS,
+            )?,
             attention: BatchFullAttentionWorkspace::new(
                 model,
                 &self.attention,
@@ -232,62 +269,138 @@ impl Qwen38QsaWeights {
         )
     }
 
+    /// Appends and evaluates consecutive dense-prefix rows in one page segment.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_prepared_prefill_row(
+    pub(crate) fn run_prepared_prefill_dense_rows(
         &self,
-        model: &Qwen36BatchModelView<'_>,
         workspace: &mut Qwen38QsaPrefillWorkspace,
-        row_workspace: &mut Qwen38QsaWorkspace,
         backend: &mut Qwen38FlashNextPageBackend,
         page_table: &DeviceBuffer<u32>,
         page: &Sm12xPage,
         page_offset: usize,
         config: &Qwen38FlashNextConfig,
-        row: usize,
+        input_row_offset: usize,
+        rows: usize,
         layer: usize,
-        position: usize,
+        start_position: usize,
         stream: &CudaStream,
     ) -> Result<()> {
-        let projection_rows =
-            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
-        row_workspace
-            .index_projection
-            .copy_range_from_device_on_stream(
-                0,
-                &workspace.index_projection,
-                row * projection_rows,
-                projection_rows,
-                stream,
-            )?;
+        if rows == 0
+            || start_position
+                .checked_add(rows)
+                .is_none_or(|end| end > config.indexer_budget)
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA dense prefill rows",
+                expected: format!("non-empty rows ending by {}", config.indexer_budget),
+                actual: format!("start={start_position} rows={rows}"),
+            });
+        }
         let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
-        let selection = row_workspace.selection.prepare_and_select_on_stream(
-            &row_workspace.index_projection,
-            &self.q_norm,
-            &self.k_norm,
-            index_pool,
-            page_table,
+        index_pool.append_keys_at_offset_on_stream(
+            &workspace.index_projection,
+            input_row_offset,
             page.slot(),
             page_offset,
-            position + 1,
-            config.rotary_dim.min(config.indexer_head_dim),
-            config.rms_eps(),
-            config.rope_theta(),
+            rows,
+            config.indexer_heads,
             stream,
         )?;
-        self.attention.enqueue_qsa_prefill_row(
-            model,
+        self.attention.enqueue_qsa_prefill_dense_rows(
             &mut workspace.attention,
             kv_pool,
             page_table,
-            selection.selected_blocks,
-            selection.selected_tiles,
-            selection.selected_tokens,
-            row,
-            position,
+            input_row_offset,
+            start_position,
             page.slot(),
             page_offset,
+            rows,
             stream,
         )
+    }
+
+    /// Appends and evaluates consecutive sparse rows in one page segment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_prepared_prefill_sparse_rows(
+        &self,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page_table: &DeviceBuffer<u32>,
+        page: &Sm12xPage,
+        page_offset: usize,
+        config: &Qwen38FlashNextConfig,
+        input_row_offset: usize,
+        rows: usize,
+        layer: usize,
+        start_position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if rows == 0
+            || start_position < config.indexer_budget
+            || start_position.checked_add(rows).is_none()
+        {
+            return Err(Error::Shape {
+                label: "Qwen3.8 QSA sparse prefill rows",
+                expected: format!(
+                    "non-empty rows starting at or after {} without position overflow",
+                    config.indexer_budget
+                ),
+                actual: format!("start={start_position} rows={rows}"),
+            });
+        }
+        let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
+        index_pool.append_keys_at_offset_on_stream(
+            &workspace.index_projection,
+            input_row_offset,
+            page.slot(),
+            page_offset,
+            rows,
+            config.indexer_heads,
+            stream,
+        )?;
+        let row_capacity = workspace.selection.mask_row_capacity();
+        let mut processed = 0;
+        while processed < rows {
+            let position = start_position + processed;
+            let chunk_rows = (rows - processed).min(16 - position % 16).min(row_capacity);
+            workspace
+                .selection
+                .select_appended_rows_at_offset_on_stream(
+                    &workspace.index_projection,
+                    input_row_offset + processed,
+                    &self.q_norm,
+                    &self.k_norm,
+                    index_pool,
+                    page_table,
+                    position + 1,
+                    chunk_rows,
+                    config.rotary_dim.min(config.indexer_head_dim),
+                    config.rms_eps(),
+                    config.rope_theta(),
+                    stream,
+                )?;
+            self.attention.enqueue_qsa_prefill_sparse_rows(
+                &mut workspace.attention,
+                kv_pool,
+                page_table,
+                workspace.selection.selected_blocks(),
+                workspace.selection.selected_tiles(),
+                workspace.selection.selected_block_indices(),
+                workspace.selection.selected_token_tiles(),
+                workspace.selection.selected_context_tiles(),
+                workspace.selection.selected_counts(),
+                workspace.selection.index_capacity(),
+                config.indexer_budget,
+                input_row_offset + processed,
+                position,
+                page.slot(),
+                page_offset + processed,
+                chunk_rows,
+                stream,
+            )?;
+            processed += chunk_rows;
+        }
+        Ok(())
     }
 
     /// Appends one prepared row to the index and attention caches without

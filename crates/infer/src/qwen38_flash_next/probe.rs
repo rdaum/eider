@@ -6,11 +6,12 @@ use super::{
     Qwen38VectorVerifierProbeMode,
 };
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
-    new_qwen38_flash_next_sequence_cache_with_config, qwen38_flash_next_cache_error,
+    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSpeculativeFrontier,
+    new_qwen38_flash_next_mtp_sequence_cache, new_qwen38_flash_next_sequence_cache_with_config,
+    qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
-use eider_cuda::{Error, Result};
+use eider_cuda::{DeviceBuffer, Error, Result};
 use std::time::{Duration, Instant};
 
 /// First target-token disagreement between serial decode and verification.
@@ -37,6 +38,7 @@ pub struct Qwen38VerificationStreamDifference {
 pub struct Qwen38VerificationProbeReport {
     pub prompt_tokens: usize,
     pub cycles: usize,
+    pub rows_per_cycle: usize,
     pub compared_rows: usize,
     pub matching_rows: usize,
     pub initial_frontier: Qwen38NextToken,
@@ -45,6 +47,43 @@ pub struct Qwen38VerificationProbeReport {
     pub verification_duration: Duration,
     pub worst_stream_difference: Qwen38VerificationStreamDifference,
     pub first_layer_divergence: Option<Qwen38LayerDivergence>,
+}
+
+/// First token disagreement during a native MTP transaction probe.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Qwen38SpeculativeMismatch {
+    pub cycle: usize,
+    pub output_index: usize,
+    pub expected: Qwen38NextToken,
+    pub actual: Qwen38NextToken,
+}
+
+/// Result of comparing native MTP cycles with canonical target decode.
+#[derive(Clone, Debug)]
+pub struct Qwen38SpeculativeProbeReport {
+    pub prompt_tokens: usize,
+    pub cycles: usize,
+    pub drafts: usize,
+    pub committed_tokens: usize,
+    pub accepted_drafts: usize,
+    pub first_token_mismatch: Option<Qwen38SpeculativeMismatch>,
+    pub first_state_mismatch: Option<(usize, &'static str)>,
+    pub canonical_duration: Duration,
+    pub speculative_duration: Duration,
+}
+
+impl Qwen38SpeculativeProbeReport {
+    pub fn accepted_drafts_per_cycle(&self) -> f64 {
+        self.accepted_drafts as f64 / self.cycles.max(1) as f64
+    }
+
+    pub fn canonical_tokens_per_second(&self) -> f64 {
+        self.committed_tokens as f64 / self.canonical_duration.as_secs_f64().max(1e-9)
+    }
+
+    pub fn speculative_tokens_per_second(&self) -> f64 {
+        self.committed_tokens as f64 / self.speculative_duration.as_secs_f64().max(1e-9)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,7 +111,7 @@ impl Qwen38VerificationProbeReport {
     }
 }
 
-/// Compares canonical decode with the exact two-row speculative verifier.
+/// Compares canonical decode with the vector target verifier.
 ///
 /// Both sequences consume the canonical input tokens. This keeps their token
 /// histories aligned while exposing numerical state and argmax divergence.
@@ -80,6 +119,7 @@ pub fn probe_verification_paths(
     model: &mut Qwen38FlashNextModel,
     prompt_tokens: &[u32],
     cycles: usize,
+    rows_per_cycle: usize,
     prefill_chunk_tokens: usize,
     mode: Qwen38VectorVerifierProbeMode,
     trace_layers: bool,
@@ -91,18 +131,20 @@ pub fn probe_verification_paths(
             actual: "0".to_string(),
         });
     }
-    if cycles == 0 || prefill_chunk_tokens == 0 {
+    if cycles == 0 || rows_per_cycle < 2 || prefill_chunk_tokens == 0 {
         return Err(Error::Shape {
             label: "Qwen3.8 Flash Next verification probe",
-            expected: "positive cycle and prefill capacities".to_string(),
-            actual: format!("cycles={cycles} prefill={prefill_chunk_tokens}"),
+            expected: "positive cycles and prefill capacity with at least two rows".to_string(),
+            actual: format!("cycles={cycles} rows={rows_per_cycle} prefill={prefill_chunk_tokens}"),
         });
     }
-    let compared_rows = cycles.checked_mul(2).ok_or_else(|| Error::Shape {
-        label: "Qwen3.8 Flash Next verification probe rows",
-        expected: "cycle count without overflow".to_string(),
-        actual: cycles.to_string(),
-    })?;
+    let compared_rows = cycles
+        .checked_mul(rows_per_cycle)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next verification probe rows",
+            expected: "cycle count without overflow".to_string(),
+            actual: format!("cycles={cycles} rows={rows_per_cycle}"),
+        })?;
     let capacity = prompt_tokens
         .len()
         .checked_add(compared_rows)
@@ -194,7 +236,8 @@ pub fn probe_verification_paths(
         });
     }
 
-    let mut verification_workspace = model.new_vector_verifier_probe_workspace(2, mode)?;
+    let mut verification_workspace =
+        model.new_vector_verifier_probe_workspace(rows_per_cycle, mode)?;
     let mut frontier = serial_frontier;
     let mut matching_rows = 0usize;
     let mut first_mismatch = None;
@@ -210,20 +253,23 @@ pub fn probe_verification_paths(
     for cycle in 0..cycles {
         let serial_started = Instant::now();
         let capture_trace = trace_layers && first_layer_divergence.is_none();
-        let (first, first_trace, second, second_trace) = if capture_trace {
-            let (first, first_trace) =
-                model.probe_decode_token_trace(&mut serial, &mut cache, frontier.id)?;
-            let (second, second_trace) =
-                model.probe_decode_token_trace(&mut serial, &mut cache, first.id)?;
-            (first, first_trace, second, second_trace)
-        } else {
-            let first = serial.decode_token(model, &mut cache, frontier.id)?;
-            let second = serial.decode_token(model, &mut cache, first.id)?;
-            (first, Vec::new(), second, Vec::new())
-        };
+        let mut inputs = Vec::with_capacity(rows_per_cycle);
+        let mut expected = Vec::with_capacity(rows_per_cycle);
+        let mut serial_traces = Vec::with_capacity(rows_per_cycle);
+        let mut input = frontier.id;
+        for _ in 0..rows_per_cycle {
+            inputs.push(input);
+            let (next, trace) = if capture_trace {
+                model.probe_decode_token_trace(&mut serial, &mut cache, input)?
+            } else {
+                (serial.decode_token(model, &mut cache, input)?, Vec::new())
+            };
+            expected.push(next);
+            serial_traces.push(trace);
+            input = next.id;
+        }
         serial_duration += serial_started.elapsed();
 
-        let inputs = [frontier.id, first.id];
         let verification_started = Instant::now();
         let (actual, verification_trace) = if capture_trace {
             model.probe_verification_argmax_trace(
@@ -246,10 +292,9 @@ pub fn probe_verification_paths(
         verification_duration += verification_started.elapsed();
         if capture_trace {
             first_layer_divergence =
-                compare_layer_traces(cycle, [&first_trace, &second_trace], &verification_trace)?;
+                compare_layer_traces(cycle, &serial_traces, &verification_trace, rows_per_cycle)?;
         }
-        let expected = [first, second];
-        for row in 0..2 {
+        for row in 0..rows_per_cycle {
             if expected[row].id == actual[row].id {
                 matching_rows += 1;
             } else if first_mismatch.is_none() {
@@ -270,7 +315,7 @@ pub fn probe_verification_paths(
         if difference.relative_rmse > worst_stream_difference.relative_rmse {
             worst_stream_difference = difference;
         }
-        frontier = second;
+        frontier = *expected.last().expect("positive verifier rows");
     }
 
     serial.finish(&mut cache)?;
@@ -278,6 +323,7 @@ pub fn probe_verification_paths(
     Ok(Qwen38VerificationProbeReport {
         prompt_tokens: prompt_tokens.len(),
         cycles,
+        rows_per_cycle,
         compared_rows,
         matching_rows,
         initial_frontier: serial_frontier,
@@ -286,6 +332,214 @@ pub fn probe_verification_paths(
         verification_duration,
         worst_stream_difference,
         first_layer_divergence,
+    })
+}
+
+/// Runs native MTP draft, target verification, and transactional commit cycles.
+///
+/// A second target sequence consumes the committed tokens with canonical
+/// one-token decode. Each cycle compares emitted tokens and persistent target
+/// state after the speculative transaction commits or restores its prefix.
+pub fn probe_speculative_cycles(
+    model: &mut Qwen38FlashNextModel,
+    prompt_tokens: &[u32],
+    cycles: usize,
+    drafts: usize,
+    prefill_chunk_tokens: usize,
+) -> Result<Qwen38SpeculativeProbeReport> {
+    if prompt_tokens.is_empty() || cycles == 0 || drafts == 0 || prefill_chunk_tokens == 0 {
+        return Err(Error::Shape {
+            label: "Qwen3.8 Flash Next MTP probe",
+            expected: "nonempty prompt and positive cycles, drafts, and prefill capacity"
+                .to_string(),
+            actual: format!(
+                "prompt={} cycles={cycles} drafts={drafts} prefill={prefill_chunk_tokens}",
+                prompt_tokens.len()
+            ),
+        });
+    }
+    model.enable_mtp()?;
+    let generated_capacity = cycles
+        .checked_mul(drafts + 1)
+        .and_then(|tokens| tokens.checked_add(1))
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP probe capacity",
+            expected: "cycle capacity without overflow".to_string(),
+            actual: format!("cycles={cycles} drafts={drafts}"),
+        })?;
+    let capacity = prompt_tokens
+        .len()
+        .checked_add(generated_capacity)
+        .ok_or_else(|| Error::Shape {
+            label: "Qwen3.8 Flash Next MTP probe capacity",
+            expected: "prompt and generated capacity without overflow".to_string(),
+            actual: format!(
+                "prompt={} generated={generated_capacity}",
+                prompt_tokens.len()
+            ),
+        })?;
+    if capacity > model.config().max_position_embeddings {
+        return Err(Error::Shape {
+            label: "Qwen3.8 Flash Next MTP probe capacity",
+            expected: format!("at most {} tokens", model.config().max_position_embeddings),
+            actual: capacity.to_string(),
+        });
+    }
+
+    let mut target_cache = new_qwen38_flash_next_sequence_cache_with_config(
+        model,
+        2,
+        capacity,
+        Qwen38FlashNextCacheConfig {
+            max_retained_bytes: 0,
+        },
+    )?;
+    let mut mtp_cache = new_qwen38_flash_next_mtp_sequence_cache(model, 1, capacity, 0)?;
+    let mut canonical = Qwen38FlashNextSequence::admit(model, &mut target_cache, capacity)?;
+    let mut speculative = Qwen38FlashNextSequence::admit(model, &mut target_cache, capacity)?;
+    let mut canonical_prefill = model.new_prefill_workspace(prefill_chunk_tokens)?;
+    let mut speculative_prefill = model.new_prefill_workspace(prefill_chunk_tokens)?;
+    let mut mtp_workspace = model.new_mtp_workspace(capacity, prefill_chunk_tokens)?;
+    let mut mtp_state = model.new_mtp_sequence_state(
+        &mut mtp_cache,
+        capacity,
+        prompt_tokens,
+        speculative.state.stream(),
+    )?;
+    let hc_dim = model.config().hidden * model.config().hc_count;
+    let mut previous_target_streams = DeviceBuffer::zeroed(hc_dim)?;
+    let mut canonical_frontier = None;
+    let mut speculative_frontier = None;
+    for (chunk_index, chunk) in prompt_tokens.chunks(prefill_chunk_tokens).enumerate() {
+        let final_chunk = (chunk_index + 1) * prefill_chunk_tokens >= prompt_tokens.len();
+        let logits = if final_chunk {
+            Qwen38LogitsMode::Top1
+        } else {
+            Qwen38LogitsMode::None
+        };
+        canonical_frontier = canonical.forward_tokens(
+            model,
+            &mut canonical_prefill,
+            &mut target_cache,
+            chunk,
+            logits,
+        )?;
+        speculative_frontier = speculative.forward_tokens(
+            model,
+            &mut speculative_prefill,
+            &mut target_cache,
+            chunk,
+            logits,
+        )?;
+        model.mtp_prefill_tokens(
+            &mut mtp_state,
+            &mut mtp_workspace,
+            &mut mtp_cache,
+            chunk,
+            &speculative_prefill,
+            &previous_target_streams,
+            speculative.state.stream(),
+        )?;
+        model.copy_prefill_target_streams(
+            &speculative_prefill,
+            chunk.len() - 1,
+            &mut previous_target_streams,
+            speculative.state.stream(),
+        )?;
+    }
+    let mut canonical_frontier = canonical_frontier.ok_or_else(|| Error::Format {
+        label: "Qwen3.8 Flash Next MTP probe prefill",
+        detail: "canonical prefill did not produce a frontier".to_string(),
+    })?;
+    let speculative_frontier = speculative_frontier.ok_or_else(|| Error::Format {
+        label: "Qwen3.8 Flash Next MTP probe prefill",
+        detail: "speculative prefill did not produce a frontier".to_string(),
+    })?;
+    if canonical_frontier.id != speculative_frontier.id {
+        return Err(Error::Format {
+            label: "Qwen3.8 Flash Next MTP probe prefill",
+            detail: format!(
+                "canonical frontier {} differs from speculative frontier {}",
+                canonical_frontier.id, speculative_frontier.id
+            ),
+        });
+    }
+    let mut frontier = Qwen38FlashNextSpeculativeFrontier {
+        token: speculative_frontier.id,
+        logit: speculative_frontier.value,
+        previous_streams: previous_target_streams,
+    };
+    let mut workspace = model.new_speculative_workspace(drafts)?;
+    let mut committed_tokens = 0usize;
+    let mut accepted_drafts = 0usize;
+    let mut first_token_mismatch = None;
+    let mut first_state_mismatch = None;
+    let mut canonical_duration = Duration::ZERO;
+    let mut speculative_duration = Duration::ZERO;
+
+    for cycle in 0..cycles {
+        let speculative_started = Instant::now();
+        let outcome = model.speculative_cycle_argmax(
+            &mut workspace,
+            drafts,
+            &mut frontier,
+            &mut speculative.state,
+            &mut target_cache,
+            speculative.cache_id,
+            &mut speculative.page_table,
+            &mut mtp_state,
+            &mut mtp_workspace,
+            &mut mtp_cache,
+        )?;
+        speculative_duration += speculative_started.elapsed();
+        accepted_drafts += outcome.accepted_drafts;
+
+        let canonical_started = Instant::now();
+        for actual in outcome.committed {
+            if first_token_mismatch.is_none() && actual.id != canonical_frontier.id {
+                first_token_mismatch = Some(Qwen38SpeculativeMismatch {
+                    cycle,
+                    output_index: committed_tokens,
+                    expected: canonical_frontier,
+                    actual,
+                });
+            }
+            canonical_frontier =
+                canonical.decode_token(model, &mut target_cache, canonical_frontier.id)?;
+            committed_tokens += 1;
+        }
+        canonical_duration += canonical_started.elapsed();
+        if first_token_mismatch.is_none() && frontier.token != canonical_frontier.id {
+            first_token_mismatch = Some(Qwen38SpeculativeMismatch {
+                cycle,
+                output_index: committed_tokens,
+                expected: canonical_frontier,
+                actual: Qwen38NextToken {
+                    id: frontier.token,
+                    value: frontier.logit,
+                },
+            });
+        }
+        if first_state_mismatch.is_none()
+            && let Some(component) = model.probe_target_state_mismatch(&canonical, &speculative)?
+        {
+            first_state_mismatch = Some((cycle, component));
+        }
+    }
+
+    mtp_state.finish(&mut mtp_cache, speculative.state.stream())?;
+    canonical.finish(&mut target_cache)?;
+    speculative.finish(&mut target_cache)?;
+    Ok(Qwen38SpeculativeProbeReport {
+        prompt_tokens: prompt_tokens.len(),
+        cycles,
+        drafts,
+        committed_tokens,
+        accepted_drafts,
+        first_token_mismatch,
+        first_state_mismatch,
+        canonical_duration,
+        speculative_duration,
     })
 }
 
@@ -363,25 +617,30 @@ fn stream_difference(
 
 fn compare_layer_traces(
     cycle: usize,
-    serial: [&[Qwen38LayerProbeTrace]; 2],
+    serial: &[Vec<Qwen38LayerProbeTrace>],
     verification: &[Qwen38LayerProbeTrace],
+    rows: usize,
 ) -> Result<Option<Qwen38LayerDivergence>> {
-    if serial[0].len() != verification.len() || serial[1].len() != verification.len() {
+    if serial.len() != rows || serial.iter().any(|trace| trace.len() != verification.len()) {
         return Err(Error::Shape {
             label: "Qwen3.8 layer probe trace",
-            expected: format!("{} stages per path", verification.len()),
-            actual: format!("serial rows {} and {}", serial[0].len(), serial[1].len()),
+            expected: format!("{rows} rows with {} stages per path", verification.len()),
+            actual: format!(
+                "{} rows with stage counts {:?}",
+                serial.len(),
+                serial.iter().map(Vec::len).collect::<Vec<_>>()
+            ),
         });
     }
     for (stage_index, vector) in verification.iter().enumerate() {
-        if vector.rows != 2 || vector.streams.len() % 2 != 0 {
+        if vector.rows != rows || vector.streams.len() % rows != 0 {
             return Err(Error::Shape {
                 label: "Qwen3.8 vector layer probe trace",
-                expected: "two equal stream rows".to_string(),
+                expected: format!("{rows} equal stream rows"),
                 actual: format!("rows={} values={}", vector.rows, vector.streams.len()),
             });
         }
-        let row_width = vector.streams.len() / 2;
+        let row_width = vector.streams.len() / rows;
         for (row, serial_trace) in serial.iter().enumerate() {
             let expected = &serial_trace[stage_index];
             if expected.layer != vector.layer
@@ -493,7 +752,11 @@ fn f32_bits_equal(left: &[f32], right: &[f32]) -> bool {
 
 fn layer_probe_stage_name(stage: Qwen38LayerProbeStage) -> &'static str {
     match stage {
+        Qwen38LayerProbeStage::LayerInput => "layer input",
         Qwen38LayerProbeStage::Ple => "PLE",
+        Qwen38LayerProbeStage::AttentionMix => "attention mix",
+        Qwen38LayerProbeStage::AttentionOutput => "attention output",
+        Qwen38LayerProbeStage::AttentionInject => "attention injection",
         Qwen38LayerProbeStage::Attention => "attention",
         Qwen38LayerProbeStage::MlpMix => "MLP mix",
         Qwen38LayerProbeStage::MlpFfn => "MLP FFN",

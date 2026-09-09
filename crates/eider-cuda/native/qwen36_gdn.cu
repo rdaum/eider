@@ -9,7 +9,6 @@ namespace {
 
 namespace wmma = nvcuda::wmma;
 
-constexpr int kHeads = 32;
 constexpr int kDim = 128;
 constexpr int kChunk = 64;
 constexpr int kTile = 16;
@@ -41,16 +40,18 @@ __device__ __forceinline__ float2 load_bf16_pair(const std::uint16_t* values,
     return __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(values + index)[0]);
 }
 
-__device__ __forceinline__ std::size_t vector_index(int token, int head, int feature) {
-    return (static_cast<std::size_t>(token) * kHeads + head) * kDim + feature;
+__device__ __forceinline__ std::size_t vector_index(
+    int heads, int token, int head, int feature) {
+    return (static_cast<std::size_t>(token) * heads + head) * kDim + feature;
 }
 
-__device__ __forceinline__ std::size_t scalar_index(int token, int head) {
-    return static_cast<std::size_t>(token) * kHeads + head;
+__device__ __forceinline__ std::size_t scalar_index(int heads, int token, int head) {
+    return static_cast<std::size_t>(token) * heads + head;
 }
 
-__device__ __forceinline__ std::size_t triangle_index(int token, int head, int col) {
-    return (static_cast<std::size_t>(token) * kHeads + head) * kChunk + col;
+__device__ __forceinline__ std::size_t triangle_index(
+    int heads, int token, int head, int col) {
+    return (static_cast<std::size_t>(token) * heads + head) * kChunk + col;
 }
 
 __device__ __forceinline__ void accumulator_coordinate(int item, int& row, int& col) {
@@ -78,7 +79,8 @@ __global__ void qwen36_gdn_cumsum_kernel(const std::uint16_t* gate,
                                          float* gate_cumsum,
                                          const std::int32_t* cu_seqlens,
                                          const std::int32_t* chunk_indices,
-                                         int total_tokens) {
+                                         int total_tokens,
+                                         int heads) {
     const int chunk = blockIdx.x;
     const int head = blockIdx.y;
     int sequence;
@@ -89,7 +91,7 @@ __global__ void qwen36_gdn_cumsum_kernel(const std::uint16_t* gate,
     const int lane = token % 32;
     const int warp = token / 32;
     float sum = token < length
-        ? __bfloat162float(load_bf16(gate, scalar_index(start + token, head)))
+        ? __bfloat162float(load_bf16(gate, scalar_index(heads, start + token, head)))
         : 0.0f;
     for (int offset = 1; offset < 32; offset *= 2) {
         const float previous = __shfl_up_sync(0xffffffff, sum, offset);
@@ -100,7 +102,7 @@ __global__ void qwen36_gdn_cumsum_kernel(const std::uint16_t* gate,
     __syncthreads();
     if (warp == 1) sum += warp_totals[0];
     if (token < length) {
-        gate_cumsum[scalar_index(start + token, head)] = sum;
+        gate_cumsum[scalar_index(heads, start + token, head)] = sum;
     }
 }
 
@@ -110,7 +112,8 @@ __global__ void qwen36_gdn_kkt_kernel(const std::uint16_t* key,
                                       float* a,
                                       const std::int32_t* cu_seqlens,
                                       const std::int32_t* chunk_indices,
-                                      int total_tokens) {
+                                      int total_tokens,
+                                      int heads) {
     __shared__ Bf16 shared_key[kChunk * kDim];
     const int chunk = blockIdx.x;
     const int head = blockIdx.y;
@@ -123,7 +126,7 @@ __global__ void qwen36_gdn_kkt_kernel(const std::uint16_t* key,
         const int token = index / kDim;
         const int feature = index % kDim;
         shared_key[index] = token < length
-            ? load_bf16(key, vector_index(start + token, head, feature))
+            ? load_bf16(key, vector_index(heads, start + token, head, feature))
             : __float2bfloat16(0.0f);
     }
     __syncthreads();
@@ -149,16 +152,16 @@ __global__ void qwen36_gdn_kkt_kernel(const std::uint16_t* key,
         if (row >= length) continue;
         float value = 0.0f;
         if (row == col) {
-            value = __bfloat162float(load_bf16(beta, scalar_index(start + row, head)));
+            value = __bfloat162float(load_bf16(beta, scalar_index(heads, start + row, head)));
         } else if (col < row) {
             const float row_beta =
-                __bfloat162float(load_bf16(beta, scalar_index(start + row, head)));
+                __bfloat162float(load_bf16(beta, scalar_index(heads, start + row, head)));
             const float decay = expf(
-                gate_cumsum[scalar_index(start + row, head)] -
-                gate_cumsum[scalar_index(start + col, head)]);
+                gate_cumsum[scalar_index(heads, start + row, head)] -
+                gate_cumsum[scalar_index(heads, start + col, head)]);
             value = row_beta * decay * accumulator.x[item];
         }
-        a[triangle_index(start + row, head, col)] = value;
+        a[triangle_index(heads, start + row, head, col)] = value;
     }
 }
 
@@ -166,7 +169,8 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
                                         std::uint16_t* a_inverse,
                                         const std::int32_t* cu_seqlens,
                                         const std::int32_t* chunk_indices,
-                                        int total_tokens) {
+                                        int total_tokens,
+                                        int heads) {
     __shared__ float transform[kChunk * kChunk];
     __shared__ float lower_row[kChunk];
     const int chunk = blockIdx.x;
@@ -179,7 +183,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
         const int col = threadIdx.x;
         for (int row = 0; row < length; ++row) {
             if (col < kChunk) {
-                lower_row[col] = a[triangle_index(start + row, head, col)];
+                lower_row[col] = a[triangle_index(heads, start + row, head, col)];
             }
             __syncthreads();
             if (col < kChunk) {
@@ -199,7 +203,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
             for (int row = 0; row < length; ++row) {
                 store_bf16(
                     a_inverse,
-                    triangle_index(start + row, head, col),
+                    triangle_index(heads, start + row, head, col),
                     transform[row * kChunk + col]);
             }
         }
@@ -210,7 +214,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
     __shared__ float product[16 * 16];
     const int thread = threadIdx.x;
     if (thread < kChunk) {
-        diagonal[thread] = a[triangle_index(start + thread, head, thread)];
+        diagonal[thread] = a[triangle_index(heads, start + thread, head, thread)];
     }
     __syncthreads();
 
@@ -225,12 +229,12 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
             if (lane < local_row) {
                 for (int inner = lane; inner < local_row; ++inner) {
                     inverse -=
-                        a[triangle_index(start + row, head, block_start + inner)] *
-                        a[triangle_index(start + block_start + inner, head, col)];
+                        a[triangle_index(heads, start + row, head, block_start + inner)] *
+                        a[triangle_index(heads, start + block_start + inner, head, col)];
                 }
             }
             __syncwarp(0x0000ffff);
-            a[triangle_index(start + row, head, col)] =
+            a[triangle_index(heads, start + row, head, col)] =
                 lane <= local_row ? inverse : 0.0f;
             __syncwarp(0x0000ffff);
         }
@@ -241,7 +245,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
         const int row = index / kChunk;
         const int col = index % kChunk;
         transform[index] = row / 16 == col / 16
-            ? a[triangle_index(start + row, head, col)] * diagonal[col]
+            ? a[triangle_index(heads, start + row, head, col)] * diagonal[col]
             : 0.0f;
     }
     __syncthreads();
@@ -256,7 +260,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
             for (int middle_block = block_col; middle_block < block_row; ++middle_block) {
                 for (int inner = 0; inner < 16; ++inner) {
                     sum +=
-                        a[triangle_index(
+                        a[triangle_index(heads,
                             start + row,
                             head,
                             middle_block * 16 + inner)] *
@@ -268,7 +272,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
             float solved = 0.0f;
             for (int inner = 0; inner < 16; ++inner) {
                 solved -=
-                    a[triangle_index(
+                    a[triangle_index(heads,
                         start + block_row * 16 + local_row,
                         head,
                         block_row * 16 + inner)] *
@@ -284,7 +288,7 @@ __global__ void qwen36_gdn_solve_kernel(float* a,
         const int col = index % kChunk;
         store_bf16(
             a_inverse,
-            triangle_index(start + row, head, col),
+            triangle_index(heads, start + row, head, col),
             transform[index]);
     }
 }
@@ -297,7 +301,8 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
                                      std::uint16_t* u,
                                      const std::int32_t* cu_seqlens,
                                      const std::int32_t* chunk_indices,
-                                     int total_tokens) {
+                                     int total_tokens,
+                                     int heads) {
     __shared__ Bf16 scaled_key[kChunk * kDim];
     const int chunk = blockIdx.x;
     const int head = blockIdx.y;
@@ -310,8 +315,8 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
         const int feature = index % kDim;
         scaled_key[index] = token < length
             ? __float2bfloat16_rn(
-                  expf(gate_cumsum[scalar_index(start + token, head)]) *
-                  __bfloat162float(load_bf16(key, vector_index(start + token, head, feature))))
+                  expf(gate_cumsum[scalar_index(heads, start + token, head)]) *
+                  __bfloat162float(load_bf16(key, vector_index(heads, start + token, head, feature))))
             : __float2bfloat16(0.0f);
     }
     __syncthreads();
@@ -325,16 +330,16 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
             for (int source = 0; source < length; ++source) {
                 const float transform = __bfloat162float(load_bf16(
                     a_inverse,
-                    triangle_index(start + token, head, source)));
+                    triangle_index(heads, start + token, head, source)));
                 transformed_key += transform *
                     __bfloat162float(scaled_key[source * kDim + feature]);
                 transformed_value += transform *
                     __bfloat162float(load_bf16(
                         value,
-                        vector_index(start + source, head, feature)));
+                        vector_index(heads, start + source, head, feature)));
             }
-            store_bf16(w, vector_index(start + token, head, feature), transformed_key);
-            store_bf16(u, vector_index(start + token, head, feature), transformed_value);
+            store_bf16(w, vector_index(heads, start + token, head, feature), transformed_key);
+            store_bf16(u, vector_index(heads, start + token, head, feature), transformed_value);
         }
         return;
     }
@@ -355,8 +360,8 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
             wmma::load_matrix_sync(
                 transform_fragment,
                 reinterpret_cast<const Bf16*>(a_inverse) +
-                    triangle_index(start + tile_row * kTile, head, source),
-                kHeads * kChunk);
+                    triangle_index(heads, start + tile_row * kTile, head, source),
+                heads * kChunk);
             wmma::load_matrix_sync(
                 input_fragment,
                 scaled_key + source * kDim + tile_col * kTile,
@@ -366,8 +371,8 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
             wmma::load_matrix_sync(
                 input_fragment,
                 reinterpret_cast<const Bf16*>(value) +
-                    vector_index(start + source, head, tile_col * kTile),
-                kHeads * kDim);
+                    vector_index(heads, start + source, head, tile_col * kTile),
+                heads * kDim);
             wmma::mma_sync(
                 u_accumulator, transform_fragment, input_fragment, u_accumulator);
         }
@@ -380,7 +385,7 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
             if (row < length) {
                 store_bf16_pair(
                     w,
-                    vector_index(start + row, head, feature),
+                    vector_index(heads, start + row, head, feature),
                     w_accumulator.x[item],
                     w_accumulator.x[item + 1]);
             }
@@ -394,7 +399,7 @@ __global__ void qwen36_gdn_wu_kernel(const std::uint16_t* key,
             if (row < length) {
                 store_bf16_pair(
                     u,
-                    vector_index(start + row, head, feature),
+                    vector_index(heads, start + row, head, feature),
                     u_accumulator.x[item],
                     u_accumulator.x[item + 1]);
             }
@@ -411,7 +416,8 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
                                     float* state,
                                     const std::int32_t* cu_seqlens,
                                     const std::int64_t* chunk_offsets,
-                                    int total_tokens) {
+                                    int total_tokens,
+                                    int heads) {
     constexpr int kValuePartition = 32;
     constexpr int kVectorElements = 8;
     constexpr int kMatrixElements = kChunk * kDim;
@@ -433,13 +439,13 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
     const int first_chunk = static_cast<int>(chunk_offsets[sequence]);
     const int end_chunk = static_cast<int>(chunk_offsets[sequence + 1]);
     float* head_state = state +
-        (static_cast<std::size_t>(sequence) * kHeads + head) * kDim * kDim;
+        (static_cast<std::size_t>(sequence) * heads + head) * kDim * kDim;
 
     for (int chunk = first_chunk; chunk < end_chunk; ++chunk) {
         const int start = sequence_start + (chunk - first_chunk) * kChunk;
         const int length = max(0, min(kChunk, sequence_end - start));
         std::uint16_t* chunk_h = h +
-            (static_cast<std::size_t>(chunk) * kHeads + head) * kDim * kDim;
+            (static_cast<std::size_t>(chunk) * heads + head) * kDim * kDim;
 
         for (int index = threadIdx.x;
              index < kPartitionStateElements;
@@ -461,7 +467,7 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
             if (token < length) {
                 packed = reinterpret_cast<const uint4*>(
                     reinterpret_cast<const Bf16*>(w) +
-                    vector_index(start + token, head, feature))[0];
+                    vector_index(heads, start + token, head, feature))[0];
             }
             reinterpret_cast<uint4*>(shared_matrix + element)[0] = packed;
         }
@@ -475,7 +481,7 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
             if (token < length) {
                 packed = reinterpret_cast<const uint4*>(
                     reinterpret_cast<const Bf16*>(u) +
-                    vector_index(start + token, head, first_value + local_value))[0];
+                    vector_index(heads, start + token, head, first_value + local_value))[0];
             }
             reinterpret_cast<uint4*>(shared_value + element)[0] = packed;
         }
@@ -535,7 +541,7 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
                 if (token < length) {
                     store_bf16_pair(
                         value_new,
-                        vector_index(start + token, head, first_value + local_value),
+                        vector_index(heads, start + token, head, first_value + local_value),
                         first,
                         second);
                 }
@@ -543,11 +549,11 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
         }
         __syncthreads();
 
-        const float chunk_gate = gate_cumsum[scalar_index(start + length - 1, head)];
+        const float chunk_gate = gate_cumsum[scalar_index(heads, start + length - 1, head)];
         if (threadIdx.x < kChunk) {
             shared_decay[threadIdx.x] = threadIdx.x < length
                 ? expf(chunk_gate -
-                       gate_cumsum[scalar_index(start + threadIdx.x, head)])
+                       gate_cumsum[scalar_index(heads, start + threadIdx.x, head)])
                 : 0.0f;
         }
         __syncthreads();
@@ -559,7 +565,7 @@ __global__ void qwen36_gdn_h_kernel(const std::uint16_t* key,
             if (token < length) {
                 values = load_bf16_pair(
                     key,
-                    vector_index(start + token, head, feature));
+                    vector_index(heads, start + token, head, feature));
             }
             const float decay = shared_decay[token];
             reinterpret_cast<__nv_bfloat162*>(shared_matrix + element)[0] =
@@ -639,6 +645,7 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
                                          const std::int32_t* cu_seqlens,
                                          const std::int32_t* chunk_indices,
                                          int total_tokens,
+                                         int heads,
                                          float scale) {
     constexpr int kPartitionTokens = 32;
     constexpr int kVectorElements = 8;
@@ -663,7 +670,7 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
     int length;
     chunk_bounds(chunk, cu_seqlens, chunk_indices, total_tokens, sequence, start, length);
     const Bf16* chunk_h = reinterpret_cast<const Bf16*>(h) +
-        (static_cast<std::size_t>(chunk) * kHeads + head) * kStateElements;
+        (static_cast<std::size_t>(chunk) * heads + head) * kStateElements;
 
     for (int segment = threadIdx.x;
          segment < kQueryElements / kVectorElements;
@@ -676,7 +683,7 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
         if (token < length) {
             packed = reinterpret_cast<const uint4*>(
                 reinterpret_cast<const Bf16*>(query) +
-                vector_index(start + token, head, feature))[0];
+                vector_index(heads, start + token, head, feature))[0];
         }
         reinterpret_cast<uint4*>(shared_query + element)[0] = packed;
     }
@@ -691,10 +698,10 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
         if (token < length) {
             packed_key = reinterpret_cast<const uint4*>(
                 reinterpret_cast<const Bf16*>(key) +
-                vector_index(start + token, head, feature))[0];
+                vector_index(heads, start + token, head, feature))[0];
             packed_value = reinterpret_cast<const uint4*>(
                 reinterpret_cast<const Bf16*>(value_new) +
-                vector_index(start + token, head, feature))[0];
+                vector_index(heads, start + token, head, feature))[0];
         }
         reinterpret_cast<uint4*>(shared_key + element)[0] = packed_key;
         reinterpret_cast<uint4*>(shared_value + element)[0] = packed_value;
@@ -755,13 +762,13 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
             float second_attention = 0.0f;
             if (row < length && col <= row && col < length) {
                 first_attention = attention_accumulators[accumulator].x[item] *
-                    expf(gate_cumsum[scalar_index(start + row, head)] -
-                         gate_cumsum[scalar_index(start + col, head)]);
+                    expf(gate_cumsum[scalar_index(heads, start + row, head)] -
+                         gate_cumsum[scalar_index(heads, start + col, head)]);
             }
             if (row < length && col + 1 <= row && col + 1 < length) {
                 second_attention = attention_accumulators[accumulator].x[item + 1] *
-                    expf(gate_cumsum[scalar_index(start + row, head)] -
-                         gate_cumsum[scalar_index(start + col + 1, head)]);
+                    expf(gate_cumsum[scalar_index(heads, start + row, head)] -
+                         gate_cumsum[scalar_index(heads, start + col + 1, head)]);
             }
             store_bf16_pair(
                 shared_attention,
@@ -776,7 +783,7 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
     if (threadIdx.x < kPartitionTokens) {
         const int token = first_token + threadIdx.x;
         query_decay[threadIdx.x] = token < length
-            ? expf(gate_cumsum[scalar_index(start + token, head)])
+            ? expf(gate_cumsum[scalar_index(heads, start + token, head)])
             : 0.0f;
     }
     __syncthreads();
@@ -865,7 +872,7 @@ __global__ void qwen36_gdn_output_kernel(const std::uint16_t* query,
             if (row < length) {
                 store_bf16_pair(
                     output,
-                    vector_index(start + row, head, feature),
+                    vector_index(heads, start + row, head, feature),
                     scale * output_accumulators[accumulator].x[item],
                     scale * output_accumulators[accumulator].x[item + 1]);
             }
@@ -895,12 +902,14 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_cumsum_on_stream(
     const std::int32_t* chunk_indices,
     std::uint32_t total_tokens,
     std::uint32_t chunk_count,
+    std::uint32_t heads,
     cudaStream_t stream) {
     const cudaError_t valid = validate_common(
         gate, gate_cumsum, cu_seqlens, chunk_indices, total_tokens, chunk_count);
-    if (valid != cudaSuccess) return valid;
-    qwen36_gdn_cumsum_kernel<<<dim3(chunk_count, kHeads), 64, 0, stream>>>(
-        gate, gate_cumsum, cu_seqlens, chunk_indices, static_cast<int>(total_tokens));
+    if (valid != cudaSuccess || heads == 0) return cudaErrorInvalidValue;
+    qwen36_gdn_cumsum_kernel<<<dim3(chunk_count, heads), 64, 0, stream>>>(
+        gate, gate_cumsum, cu_seqlens, chunk_indices,
+        static_cast<int>(total_tokens), static_cast<int>(heads));
     return cudaGetLastError();
 }
 
@@ -913,14 +922,16 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_kkt_on_stream(
     const std::int32_t* chunk_indices,
     std::uint32_t total_tokens,
     std::uint32_t chunk_count,
+    std::uint32_t heads,
     cudaStream_t stream) {
     const cudaError_t valid = validate_common(
         key, a, cu_seqlens, chunk_indices, total_tokens, chunk_count);
-    if (valid != cudaSuccess || beta == nullptr || gate_cumsum == nullptr) {
+    if (valid != cudaSuccess || beta == nullptr || gate_cumsum == nullptr || heads == 0) {
         return cudaErrorInvalidValue;
     }
-    qwen36_gdn_kkt_kernel<<<dim3(chunk_count, kHeads), 512, 0, stream>>>(
-        key, beta, gate_cumsum, a, cu_seqlens, chunk_indices, static_cast<int>(total_tokens));
+    qwen36_gdn_kkt_kernel<<<dim3(chunk_count, heads), 512, 0, stream>>>(
+        key, beta, gate_cumsum, a, cu_seqlens, chunk_indices,
+        static_cast<int>(total_tokens), static_cast<int>(heads));
     return cudaGetLastError();
 }
 
@@ -931,12 +942,14 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_solve_on_stream(
     const std::int32_t* chunk_indices,
     std::uint32_t total_tokens,
     std::uint32_t chunk_count,
+    std::uint32_t heads,
     cudaStream_t stream) {
     const cudaError_t valid = validate_common(
         a, a_inverse, cu_seqlens, chunk_indices, total_tokens, chunk_count);
-    if (valid != cudaSuccess) return valid;
-    qwen36_gdn_solve_kernel<<<dim3(chunk_count, kHeads), 256, 0, stream>>>(
-        a, a_inverse, cu_seqlens, chunk_indices, static_cast<int>(total_tokens));
+    if (valid != cudaSuccess || heads == 0) return cudaErrorInvalidValue;
+    qwen36_gdn_solve_kernel<<<dim3(chunk_count, heads), 256, 0, stream>>>(
+        a, a_inverse, cu_seqlens, chunk_indices,
+        static_cast<int>(total_tokens), static_cast<int>(heads));
     return cudaGetLastError();
 }
 
@@ -951,14 +964,15 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_wu_on_stream(
     const std::int32_t* chunk_indices,
     std::uint32_t total_tokens,
     std::uint32_t chunk_count,
+    std::uint32_t heads,
     cudaStream_t stream) {
     const cudaError_t valid = validate_common(
         key, w, cu_seqlens, chunk_indices, total_tokens, chunk_count);
     if (valid != cudaSuccess || value == nullptr || a_inverse == nullptr ||
-        gate_cumsum == nullptr || u == nullptr) {
+        gate_cumsum == nullptr || u == nullptr || heads == 0) {
         return cudaErrorInvalidValue;
     }
-    qwen36_gdn_wu_kernel<<<dim3(chunk_count, kHeads), 512, 0, stream>>>(
+    qwen36_gdn_wu_kernel<<<dim3(chunk_count, heads), 512, 0, stream>>>(
         key,
         value,
         a_inverse,
@@ -967,7 +981,8 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_wu_on_stream(
         u,
         cu_seqlens,
         chunk_indices,
-        static_cast<int>(total_tokens));
+        static_cast<int>(total_tokens),
+        static_cast<int>(heads));
     return cudaGetLastError();
 }
 
@@ -983,13 +998,14 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_h_on_stream(
     const std::int64_t* chunk_offsets,
     std::uint32_t sequence_count,
     std::uint32_t total_tokens,
+    std::uint32_t heads,
     cudaStream_t stream) {
     if (key == nullptr || u == nullptr || w == nullptr || value_new == nullptr ||
         gate_cumsum == nullptr || h == nullptr || state == nullptr || cu_seqlens == nullptr ||
-        chunk_offsets == nullptr || sequence_count == 0 || total_tokens == 0) {
+        chunk_offsets == nullptr || sequence_count == 0 || total_tokens == 0 || heads == 0) {
         return cudaErrorInvalidValue;
     }
-    qwen36_gdn_h_kernel<<<dim3(4, sequence_count, kHeads), 128, 0, stream>>>(
+    qwen36_gdn_h_kernel<<<dim3(4, sequence_count, heads), 128, 0, stream>>>(
         key,
         u,
         w,
@@ -999,7 +1015,8 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_h_on_stream(
         state,
         cu_seqlens,
         chunk_offsets,
-        static_cast<int>(total_tokens));
+        static_cast<int>(total_tokens),
+        static_cast<int>(heads));
     return cudaGetLastError();
 }
 
@@ -1014,12 +1031,13 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_output_on_stream(
     const std::int32_t* chunk_indices,
     std::uint32_t total_tokens,
     std::uint32_t chunk_count,
+    std::uint32_t heads,
     float scale,
     cudaStream_t stream) {
     const cudaError_t valid = validate_common(
         query, output, cu_seqlens, chunk_indices, total_tokens, chunk_count);
     if (valid != cudaSuccess || key == nullptr || value_new == nullptr || h == nullptr ||
-        gate_cumsum == nullptr) {
+        gate_cumsum == nullptr || heads == 0) {
         return cudaErrorInvalidValue;
     }
     const cudaError_t attribute = cudaFuncSetAttribute(
@@ -1028,7 +1046,7 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_output_on_stream(
         kOutputSharedBytes);
     if (attribute != cudaSuccess) return attribute;
     qwen36_gdn_output_kernel<<<
-        dim3(2, chunk_count, kHeads), 128, kOutputSharedBytes, stream>>>(
+        dim3(2, chunk_count, heads), 128, kOutputSharedBytes, stream>>>(
         query,
         key,
         value_new,
@@ -1038,6 +1056,7 @@ extern "C" cudaError_t infer_qwen36_gdn_chunk_output_on_stream(
         cu_seqlens,
         chunk_indices,
         static_cast<int>(total_tokens),
+        static_cast<int>(heads),
         scale);
     return cudaGetLastError();
 }

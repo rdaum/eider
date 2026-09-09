@@ -8,23 +8,22 @@ use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, thread, warp}
 mod device {
     use super::*;
 
-    const GDN_HEADS: usize = 32;
     const GDN_DIM: usize = 128;
     const GDN_CHUNK: usize = 64;
 
     #[inline(always)]
-    fn gdn_vector_index(token: usize, head: usize, feature: usize) -> usize {
-        (token * GDN_HEADS + head) * GDN_DIM + feature
+    fn gdn_vector_index(heads: usize, token: usize, head: usize, feature: usize) -> usize {
+        (token * heads + head) * GDN_DIM + feature
     }
 
     #[inline(always)]
-    fn gdn_scalar_index(token: usize, head: usize) -> usize {
-        token * GDN_HEADS + head
+    fn gdn_scalar_index(heads: usize, token: usize, head: usize) -> usize {
+        token * heads + head
     }
 
     #[inline(always)]
-    fn gdn_triangle_index(token: usize, head: usize, col: usize) -> usize {
-        (token * GDN_HEADS + head) * GDN_CHUNK + col
+    fn gdn_triangle_index(heads: usize, token: usize, head: usize, col: usize) -> usize {
+        (token * heads + head) * GDN_CHUNK + col
     }
 
     #[inline(always)]
@@ -32,6 +31,7 @@ mod device {
         beta: *const u16,
         gate_cumsum: *const f32,
         a: *mut f32,
+        heads: usize,
         start: usize,
         head: usize,
         length: usize,
@@ -43,12 +43,12 @@ mod device {
             return;
         }
         let value = if row == col {
-            bf16_to_f32(unsafe { *beta.add(gdn_scalar_index(start + row, head)) })
+            bf16_to_f32(unsafe { *beta.add(gdn_scalar_index(heads, start + row, head)) })
         } else if col < row && col < length {
-            let row_beta = bf16_to_f32(unsafe { *beta.add(gdn_scalar_index(start + row, head)) });
+            let row_beta = bf16_to_f32(unsafe { *beta.add(gdn_scalar_index(heads, start + row, head)) });
             let decay = (unsafe {
-                *gate_cumsum.add(gdn_scalar_index(start + row, head))
-                    - *gate_cumsum.add(gdn_scalar_index(start + col, head))
+                *gate_cumsum.add(gdn_scalar_index(heads, start + row, head))
+                    - *gate_cumsum.add(gdn_scalar_index(heads, start + col, head))
             })
             .exp();
             row_beta * decay * dot
@@ -56,7 +56,7 @@ mod device {
             0.0
         };
         unsafe {
-            a.add(gdn_triangle_index(start + row, head, col))
+            a.add(gdn_triangle_index(heads, start + row, head, col))
                 .write(value)
         };
     }
@@ -86,9 +86,11 @@ mod device {
         cu_seqlens: *const i32,
         chunk_indices: *const i32,
         total_tokens: u32,
+        heads: u32,
     ) {
         static mut WARP_TOTALS: SharedArray<f32, 2> = SharedArray::UNINIT;
         let warp_totals = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WARP_TOTALS) };
+        let heads = heads as usize;
         let chunk = thread::blockIdx_x() as usize;
         let head = thread::blockIdx_y() as usize;
         let token = thread::threadIdx_x() as usize;
@@ -97,7 +99,7 @@ mod device {
         let (_, start, length) =
             unsafe { gdn_chunk_bounds(chunk, cu_seqlens, chunk_indices, total_tokens as usize) };
         let mut sum = if token < length {
-            bf16_to_f32(unsafe { *gate.add(gdn_scalar_index(start + token, head)) })
+            bf16_to_f32(unsafe { *gate.add(gdn_scalar_index(heads, start + token, head)) })
         } else {
             0.0
         };
@@ -119,7 +121,7 @@ mod device {
         if token < length {
             unsafe {
                 gate_cumsum
-                    .add(gdn_scalar_index(start + token, head))
+                    .add(gdn_scalar_index(heads, start + token, head))
                     .write(sum)
             };
         }
@@ -136,9 +138,11 @@ mod device {
         cu_seqlens: *const i32,
         chunk_indices: *const i32,
         total_tokens: u32,
+        heads: u32,
     ) {
         static mut KEY: SharedArray<u16, 8192> = SharedArray::UNINIT;
         let shared_key = unsafe { SharedArray::as_raw_mut_ptr(&raw mut KEY) };
+        let heads = heads as usize;
         let chunk = thread::blockIdx_x() as usize;
         let head = thread::blockIdx_y() as usize;
         let lane = (thread::threadIdx_x() & 31) as usize;
@@ -149,7 +153,7 @@ mod device {
         while index < GDN_CHUNK * GDN_DIM {
             let token = index / GDN_DIM;
             let value = if token < length {
-                unsafe { *key.add(gdn_vector_index(start + token, head, index % GDN_DIM)) }
+                unsafe { *key.add(gdn_vector_index(heads, start + token, head, index % GDN_DIM)) }
             } else {
                 0
             };
@@ -212,11 +216,14 @@ mod device {
 
             let col = tile_col + col_in_tile;
             unsafe {
-                store_gdn_kkt_element(beta, gate_cumsum, a, start, head, length, row0, col, d[0]);
+                store_gdn_kkt_element(
+                    beta, gate_cumsum, a, heads, start, head, length, row0, col, d[0],
+                );
                 store_gdn_kkt_element(
                     beta,
                     gate_cumsum,
                     a,
+                    heads,
                     start,
                     head,
                     length,
@@ -224,11 +231,14 @@ mod device {
                     col + 1,
                     d[1],
                 );
-                store_gdn_kkt_element(beta, gate_cumsum, a, start, head, length, row1, col, d[2]);
+                store_gdn_kkt_element(
+                    beta, gate_cumsum, a, heads, start, head, length, row1, col, d[2],
+                );
                 store_gdn_kkt_element(
                     beta,
                     gate_cumsum,
                     a,
+                    heads,
                     start,
                     head,
                     length,
@@ -250,6 +260,7 @@ mod device {
         cu_seqlens: *const i32,
         chunk_indices: *const i32,
         total_tokens: u32,
+        heads: u32,
     ) {
         static mut TRANSFORM: SharedArray<f32, 4096> = SharedArray::UNINIT;
         static mut LOWER_ROW: SharedArray<f32, 64> = SharedArray::UNINIT;
@@ -259,6 +270,7 @@ mod device {
         let lower_row = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LOWER_ROW) };
         let diagonal = unsafe { SharedArray::as_raw_mut_ptr(&raw mut DIAGONAL) };
         let product = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PRODUCT) };
+        let heads = heads as usize;
         let chunk = thread::blockIdx_x() as usize;
         let head = thread::blockIdx_y() as usize;
         let col = thread::threadIdx_x() as usize;
@@ -272,7 +284,7 @@ mod device {
                     unsafe {
                         lower_row
                             .add(col)
-                            .write(*a.add(gdn_triangle_index(start + row, head, col)))
+                            .write(*a.add(gdn_triangle_index(heads, start + row, head, col)))
                     };
                 }
                 thread::sync_threads();
@@ -305,7 +317,7 @@ mod device {
                     let value = unsafe { *transform.add(row * GDN_CHUNK + col) };
                     unsafe {
                         a_inverse
-                            .add(gdn_triangle_index(start + row, head, col))
+                            .add(gdn_triangle_index(heads, start + row, head, col))
                             .write(f32_pair_to_bf16(value, 0.0) as u16)
                     };
                     row += 1;
@@ -318,7 +330,7 @@ mod device {
             unsafe {
                 diagonal
                     .add(col)
-                    .write(*a.add(gdn_triangle_index(start + col, head, col)))
+                    .write(*a.add(gdn_triangle_index(heads, start + col, head, col)))
             };
         }
         thread::sync_threads();
@@ -336,8 +348,8 @@ mod device {
                     let mut inner = lane;
                     while inner < local_row {
                         inverse -= unsafe {
-                            *a.add(gdn_triangle_index(start + row, head, block_start + inner))
-                                * *a.add(gdn_triangle_index(
+                            *a.add(gdn_triangle_index(heads, start + row, head, block_start + inner))
+                                * *a.add(gdn_triangle_index(heads,
                                     start + block_start + inner,
                                     head,
                                     matrix_col,
@@ -348,7 +360,7 @@ mod device {
                 }
                 warp::sync_mask(0x0000_ffff);
                 unsafe {
-                    a.add(gdn_triangle_index(start + row, head, matrix_col))
+                    a.add(gdn_triangle_index(heads, start + row, head, matrix_col))
                         .write(if lane <= local_row { inverse } else { 0.0 })
                 };
                 warp::sync_mask(0x0000_ffff);
@@ -363,7 +375,7 @@ mod device {
             let matrix_col = index % GDN_CHUNK;
             let value = if row / 16 == matrix_col / 16 {
                 unsafe {
-                    *a.add(gdn_triangle_index(start + row, head, matrix_col))
+                    *a.add(gdn_triangle_index(heads, start + row, head, matrix_col))
                         * *diagonal.add(matrix_col)
                 }
             } else {
@@ -388,7 +400,7 @@ mod device {
                     let mut inner = 0;
                     while inner < 16 {
                         sum += unsafe {
-                            *a.add(gdn_triangle_index(
+                            *a.add(gdn_triangle_index(heads,
                                 start + row,
                                 head,
                                 middle_block * 16 + inner,
@@ -405,7 +417,7 @@ mod device {
                 let mut inner = 0;
                 while inner < 16 {
                     solved -= unsafe {
-                        *a.add(gdn_triangle_index(
+                        *a.add(gdn_triangle_index(heads,
                             start + block_row * 16 + local_row,
                             head,
                             block_row * 16 + inner,
@@ -427,7 +439,7 @@ mod device {
             let value = unsafe { *transform.add(index) };
             unsafe {
                 a_inverse
-                    .add(gdn_triangle_index(start + row, head, matrix_col))
+                    .add(gdn_triangle_index(heads, start + row, head, matrix_col))
                     .write(f32_pair_to_bf16(value, 0.0) as u16)
             };
             index += thread::blockDim_x() as usize;
@@ -447,9 +459,11 @@ mod device {
         cu_seqlens: *const i32,
         chunk_indices: *const i32,
         total_tokens: u32,
+        heads: u32,
     ) {
         static mut SCALED_KEY: SharedArray<u16, 8192> = SharedArray::UNINIT;
         let scaled_key = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCALED_KEY) };
+        let heads = heads as usize;
         let chunk = thread::blockIdx_x() as usize;
         let head = thread::blockIdx_y() as usize;
         let lane = (thread::threadIdx_x() & 31) as usize;
@@ -461,9 +475,9 @@ mod device {
             let token = index / GDN_DIM;
             let packed = if token < length {
                 let decay =
-                    unsafe { *gate_cumsum.add(gdn_scalar_index(start + token, head)) }.exp();
+                    unsafe { *gate_cumsum.add(gdn_scalar_index(heads, start + token, head)) }.exp();
                 let value = bf16_to_f32(unsafe {
-                    *key.add(gdn_vector_index(start + token, head, index % GDN_DIM))
+                    *key.add(gdn_vector_index(heads, start + token, head, index % GDN_DIM))
                 });
                 f32_pair_to_bf16(decay * value, 0.0) as u16
             } else {
@@ -490,7 +504,7 @@ mod device {
                 let source1 = source0 + 8;
                 let load_transform = |row: usize, col: usize| -> u16 {
                     if row < length && col < length {
-                        unsafe { *a_inverse.add(gdn_triangle_index(start + row, head, col)) }
+                        unsafe { *a_inverse.add(gdn_triangle_index(heads, start + row, head, col)) }
                     } else {
                         0
                     }
@@ -521,7 +535,7 @@ mod device {
                 };
                 let load_value = |token: usize| -> u16 {
                     if token < length {
-                        unsafe { *value.add(gdn_vector_index(start + token, head, output_col)) }
+                        unsafe { *value.add(gdn_vector_index(heads, start + token, head, output_col)) }
                     } else {
                         0
                     }
@@ -543,13 +557,13 @@ mod device {
                 unsafe {
                     store_bf16_pair(
                         w,
-                        gdn_vector_index(start + row0, head, col),
+                        gdn_vector_index(heads, start + row0, head, col),
                         w_acc[0],
                         w_acc[1],
                     );
                     store_bf16_pair(
                         u,
-                        gdn_vector_index(start + row0, head, col),
+                        gdn_vector_index(heads, start + row0, head, col),
                         u_acc[0],
                         u_acc[1],
                     );
@@ -559,13 +573,13 @@ mod device {
                 unsafe {
                     store_bf16_pair(
                         w,
-                        gdn_vector_index(start + row1, head, col),
+                        gdn_vector_index(heads, start + row1, head, col),
                         w_acc[2],
                         w_acc[3],
                     );
                     store_bf16_pair(
                         u,
-                        gdn_vector_index(start + row1, head, col),
+                        gdn_vector_index(heads, start + row1, head, col),
                         u_acc[2],
                         u_acc[3],
                     );
@@ -589,11 +603,13 @@ mod device {
         cu_seqlens: *const i32,
         chunk_offsets: *const i64,
         total_tokens: u32,
+        heads: u32,
     ) {
         static mut MATRIX: SharedArray<u16, 8192> = SharedArray::UNINIT;
         static mut STATE: SharedArray<u16, 4096> = SharedArray::UNINIT;
         static mut VALUE: SharedArray<u16, 2048> = SharedArray::UNINIT;
         static mut DECAY: SharedArray<f32, 64> = SharedArray::UNINIT;
+        let heads = heads as usize;
         let shared_matrix = unsafe { SharedArray::as_raw_mut_ptr(&raw mut MATRIX) };
         let shared_state = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STATE) };
         let shared_value = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VALUE) };
@@ -609,7 +625,7 @@ mod device {
             (unsafe { *cu_seqlens.add(sequence + 1) } as usize).min(total_tokens as usize);
         let first_chunk = unsafe { *chunk_offsets.add(sequence) } as usize;
         let end_chunk = unsafe { *chunk_offsets.add(sequence + 1) } as usize;
-        let head_state = unsafe { state.add((sequence * GDN_HEADS + head) * GDN_DIM * GDN_DIM) };
+        let head_state = unsafe { state.add((sequence * heads + head) * GDN_DIM * GDN_DIM) };
 
         let group = lane >> 2;
         let lane_in_group = lane & 3;
@@ -617,7 +633,7 @@ mod device {
         while chunk < end_chunk {
             let start = sequence_start + (chunk - first_chunk) * GDN_CHUNK;
             let length = sequence_end.saturating_sub(start).min(GDN_CHUNK);
-            let chunk_h = unsafe { h.add((chunk * GDN_HEADS + head) * GDN_DIM * GDN_DIM) };
+            let chunk_h = unsafe { h.add((chunk * heads + head) * GDN_DIM * GDN_DIM) };
 
             let mut index = thread::threadIdx_x() as usize;
             while index < 32 * GDN_DIM {
@@ -635,7 +651,7 @@ mod device {
             while index < GDN_CHUNK * GDN_DIM {
                 let token = index / GDN_DIM;
                 let packed = if token < length {
-                    unsafe { *w.add(gdn_vector_index(start + token, head, index % GDN_DIM)) }
+                    unsafe { *w.add(gdn_vector_index(heads, start + token, head, index % GDN_DIM)) }
                 } else {
                     0
                 };
@@ -648,7 +664,7 @@ mod device {
                 let local_value = index % 32;
                 let packed = if token < length {
                     unsafe {
-                        *u.add(gdn_vector_index(
+                        *u.add(gdn_vector_index(heads,
                             start + token,
                             head,
                             first_value + local_value,
@@ -704,7 +720,7 @@ mod device {
                 if token0 < length {
                     let shared_base = token0 * 32 + output_value;
                     let output_base =
-                        gdn_vector_index(start + token0, head, first_value + output_value);
+                        gdn_vector_index(heads, start + token0, head, first_value + output_value);
                     let first =
                         bf16_to_f32(unsafe { *shared_value.add(shared_base) }) - correction[0];
                     let second =
@@ -717,7 +733,7 @@ mod device {
                 if token1 < length {
                     let shared_base = token1 * 32 + output_value;
                     let output_base =
-                        gdn_vector_index(start + token1, head, first_value + output_value);
+                        gdn_vector_index(heads, start + token1, head, first_value + output_value);
                     let first =
                         bf16_to_f32(unsafe { *shared_value.add(shared_base) }) - correction[2];
                     let second =
@@ -732,13 +748,13 @@ mod device {
             thread::sync_threads();
 
             let chunk_gate =
-                unsafe { *gate_cumsum.add(gdn_scalar_index(start + length - 1, head)) };
+                unsafe { *gate_cumsum.add(gdn_scalar_index(heads, start + length - 1, head)) };
             let chunk_decay = chunk_gate.exp();
             if thread::threadIdx_x() < GDN_CHUNK as u32 {
                 let token = thread::threadIdx_x() as usize;
                 let decay = if token < length {
                     (chunk_gate
-                        - unsafe { *gate_cumsum.add(gdn_scalar_index(start + token, head)) })
+                        - unsafe { *gate_cumsum.add(gdn_scalar_index(heads, start + token, head)) })
                     .exp()
                 } else {
                     0.0
@@ -751,7 +767,7 @@ mod device {
                 let token = index / GDN_DIM;
                 let value = if token < length {
                     bf16_to_f32(unsafe {
-                        *key.add(gdn_vector_index(start + token, head, index % GDN_DIM))
+                        *key.add(gdn_vector_index(heads, start + token, head, index % GDN_DIM))
                     }) * unsafe { *shared_decay.add(token) }
                 } else {
                     0.0
@@ -847,9 +863,11 @@ mod device {
         cu_seqlens: *const i32,
         chunk_indices: *const i32,
         total_tokens: u32,
+        heads: u32,
         scale: f32,
     ) {
         static mut ATTENTION: SharedArray<u16, 2048> = SharedArray::UNINIT;
+        let heads = heads as usize;
         let attention = unsafe { SharedArray::as_raw_mut_ptr(&raw mut ATTENTION) };
         let token_partition = thread::blockIdx_x() as usize;
         let chunk = thread::blockIdx_y() as usize;
@@ -859,7 +877,7 @@ mod device {
         let first_token = token_partition * 32;
         let (_, start, length) =
             unsafe { gdn_chunk_bounds(chunk, cu_seqlens, chunk_indices, total_tokens as usize) };
-        let chunk_h = unsafe { h.add((chunk * GDN_HEADS + head) * GDN_DIM * GDN_DIM) };
+        let chunk_h = unsafe { h.add((chunk * heads + head) * GDN_DIM * GDN_DIM) };
         let group = lane >> 2;
         let lane_in_group = lane & 3;
 
@@ -880,8 +898,8 @@ mod device {
                 }
                 unsafe {
                     pack_bf16(
-                        *query.add(gdn_vector_index(start + token, head, first_feature)),
-                        *query.add(gdn_vector_index(start + token, head, first_feature + 1)),
+                        *query.add(gdn_vector_index(heads, start + token, head, first_feature)),
+                        *query.add(gdn_vector_index(heads, start + token, head, first_feature + 1)),
                     )
                 }
             };
@@ -897,8 +915,8 @@ mod device {
                 }
                 unsafe {
                     pack_bf16(
-                        *key.add(gdn_vector_index(start + key_token, head, first_feature)),
-                        *key.add(gdn_vector_index(start + key_token, head, first_feature + 1)),
+                        *key.add(gdn_vector_index(heads, start + key_token, head, first_feature)),
+                        *key.add(gdn_vector_index(heads, start + key_token, head, first_feature + 1)),
                     )
                 }
             };
@@ -910,8 +928,8 @@ mod device {
             if row < length && col <= row && col < length {
                 value
                     * (unsafe {
-                        *gate_cumsum.add(gdn_scalar_index(start + row, head))
-                            - *gate_cumsum.add(gdn_scalar_index(start + col, head))
+                        *gate_cumsum.add(gdn_scalar_index(heads, start + row, head))
+                            - *gate_cumsum.add(gdn_scalar_index(heads, start + col, head))
                     })
                     .exp()
             } else {
@@ -955,12 +973,12 @@ mod device {
                         return 0;
                     }
                     let decay =
-                        unsafe { *gate_cumsum.add(gdn_scalar_index(start + token, head)) }.exp();
+                        unsafe { *gate_cumsum.add(gdn_scalar_index(heads, start + token, head)) }.exp();
                     let first = bf16_to_f32(unsafe {
-                        *query.add(gdn_vector_index(start + token, head, first_key))
+                        *query.add(gdn_vector_index(heads, start + token, head, first_key))
                     });
                     let second = bf16_to_f32(unsafe {
-                        *query.add(gdn_vector_index(start + token, head, first_key + 1))
+                        *query.add(gdn_vector_index(heads, start + token, head, first_key + 1))
                     });
                     f32_pair_to_bf16(decay * first, decay * second)
                 };
@@ -1003,7 +1021,7 @@ mod device {
                 let load_value_pair = |first_source: usize| -> u32 {
                     let first = if first_source < length {
                         unsafe {
-                            *value_new.add(gdn_vector_index(
+                            *value_new.add(gdn_vector_index(heads,
                                 start + first_source,
                                 head,
                                 output_feature,
@@ -1014,7 +1032,7 @@ mod device {
                     };
                     let second = if first_source + 1 < length {
                         unsafe {
-                            *value_new.add(gdn_vector_index(
+                            *value_new.add(gdn_vector_index(heads,
                                 start + first_source + 1,
                                 head,
                                 output_feature,
@@ -1036,7 +1054,7 @@ mod device {
                 unsafe {
                     store_bf16_pair(
                         output,
-                        gdn_vector_index(start + global_output_row0, head, output_col),
+                        gdn_vector_index(heads, start + global_output_row0, head, output_col),
                         scale * values[0],
                         scale * values[1],
                     )
@@ -1046,7 +1064,7 @@ mod device {
                 unsafe {
                     store_bf16_pair(
                         output,
-                        gdn_vector_index(start + global_output_row1, head, output_col),
+                        gdn_vector_index(heads, start + global_output_row1, head, output_col),
                         scale * values[2],
                         scale * values[3],
                     )

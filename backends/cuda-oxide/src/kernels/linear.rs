@@ -126,6 +126,346 @@ mod device {
         }
     }
 
+    /// Projects independent f32 rows through a small number of wide BF16 weight rows.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn bf16_linear_logits_f32_exact_rows(
+        input: *const f32,
+        weight: *const u16,
+        logits: *mut f32,
+        batch_size: u32,
+        rows: u32,
+        cols: u32,
+    ) {
+        static mut PARTIAL: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let partial = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PARTIAL) };
+        let row = thread::blockIdx_x();
+        if row >= rows {
+            return;
+        }
+        let batch = thread::blockIdx_y();
+        if batch >= batch_size {
+            return;
+        }
+        let thread_index = thread::threadIdx_x();
+        let lane = thread_index & 31;
+        let warp_index = thread_index >> 5;
+        let row_weight = unsafe { weight.add(row as usize * cols as usize) };
+        let mut sum = 0.0f32;
+        let mut col = thread_index;
+        while col < cols {
+            sum = bf16_to_f32(unsafe { *row_weight.add(col as usize) }).mul_add(
+                unsafe { *input.add((batch * cols + col) as usize) },
+                sum,
+            );
+            col += thread::blockDim_x();
+        }
+        sum = warp_sum(sum);
+        if lane == 0 {
+            unsafe { partial.add(warp_index as usize).write(sum) };
+        }
+        thread::sync_threads();
+        if thread_index == 0 {
+            let mut total = 0.0f32;
+            let mut warp = 0;
+            while warp < 8 {
+                total += unsafe { *partial.add(warp as usize) };
+                warp += 1;
+            }
+            unsafe {
+                logits
+                    .add((batch * rows + row) as usize)
+                    .write(total)
+            };
+        }
+    }
+
+    /// Projects f32 activation rows through row-major E4M3 weights with exact
+    /// 128-by-128 F32 block scales.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn block_fp8_f32_scale_linear_f32_batch(
+        input: *const f32,
+        weight: *const u8,
+        scales: *const f32,
+        output: *mut f32,
+        batch_rows: u32,
+        rows: u32,
+        cols: u32,
+    ) {
+        let warp = thread::threadIdx_x() >> 5;
+        let lane = thread::threadIdx_x() & 31;
+        let row = thread::blockIdx_x() * 8 + warp;
+        let batch_base = thread::blockIdx_y() * 8;
+        if row >= rows || batch_base >= batch_rows {
+            return;
+        }
+        let row_weight = unsafe { weight.add(row as usize * cols as usize) };
+        let scale_row = row / 128;
+        let scale_cols = cols / 128;
+        let active = 8u32.min(batch_rows - batch_base);
+        let mut sums = [0.0f32; 8];
+        let mut scale_col = 0;
+        while scale_col < scale_cols {
+            let scale = unsafe { *scales.add((scale_row * scale_cols + scale_col) as usize) };
+            let block_col = scale_col * 128;
+            let mut offset = lane;
+            while offset < 128 {
+                let first_col = block_col + offset;
+                let second_col = first_col + 32;
+                let (first, second) = e4m3x2_values(
+                    unsafe { *row_weight.add(first_col as usize) },
+                    unsafe { *row_weight.add(second_col as usize) },
+                );
+                let first_weight = first * scale;
+                let second_weight = second * scale;
+                let mut batch = 0;
+                while batch < active {
+                    let input_row = unsafe {
+                        input.add((batch_base + batch) as usize * cols as usize)
+                    };
+                    sums[batch as usize] = unsafe {
+                        first_weight
+                            .mul_add(*input_row.add(first_col as usize), sums[batch as usize])
+                    };
+                    sums[batch as usize] = unsafe {
+                        second_weight
+                            .mul_add(*input_row.add(second_col as usize), sums[batch as usize])
+                    };
+                    batch += 1;
+                }
+                offset += 64;
+            }
+            scale_col += 1;
+        }
+        let mut batch = 0;
+        while batch < active {
+            let sum = warp_sum(sums[batch as usize]);
+            if lane == 0 {
+                unsafe {
+                    output
+                        .add((batch_base + batch) as usize * rows as usize + row as usize)
+                        .write(sum)
+                };
+            }
+            batch += 1;
+        }
+    }
+
+    /// Projects one f32 activation row through two independent row-major E4M3
+    /// weights in one grid.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn block_fp8_f32_scale_linear_pair_f32(
+        input: *const f32,
+        first_weight: *const u8,
+        first_scales: *const f32,
+        second_weight: *const u8,
+        second_scales: *const f32,
+        first_output: *mut f32,
+        second_output: *mut f32,
+        first_rows: u32,
+        second_rows: u32,
+        cols: u32,
+    ) {
+        let warp = thread::threadIdx_x() >> 5;
+        let lane = thread::threadIdx_x() & 31;
+        let combined_row = thread::blockIdx_x() * 8 + warp;
+        if combined_row >= first_rows + second_rows {
+            return;
+        }
+        let first = combined_row < first_rows;
+        let row = if first {
+            combined_row
+        } else {
+            combined_row - first_rows
+        };
+        let weight = if first { first_weight } else { second_weight };
+        let scales = if first { first_scales } else { second_scales };
+        let output = if first { first_output } else { second_output };
+        let row_weight = unsafe { weight.add(row as usize * cols as usize) };
+        let scale_cols = cols / 128;
+        let scale_base = row / 128 * scale_cols;
+        let mut sum = 0.0f32;
+        let mut scale_col = 0;
+        while scale_col < scale_cols {
+            let scale = unsafe { *scales.add((scale_base + scale_col) as usize) };
+            let block_col = scale_col * 128;
+            let mut offset = lane;
+            while offset < 128 {
+                let first_col = block_col + offset;
+                let second_col = first_col + 32;
+                let (first, second) = e4m3x2_values(
+                    unsafe { *row_weight.add(first_col as usize) },
+                    unsafe { *row_weight.add(second_col as usize) },
+                );
+                sum = (first * scale)
+                    .mul_add(unsafe { *input.add(first_col as usize) }, sum);
+                sum = (second * scale)
+                    .mul_add(unsafe { *input.add(second_col as usize) }, sum);
+                offset += 64;
+            }
+            scale_col += 1;
+        }
+        sum = warp_sum(sum);
+        if lane == 0 {
+            unsafe { output.add(row as usize).write(sum) };
+        }
+    }
+
+    /// Applies routed gate and up projections with 128-by-128 F32 block scales.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn block_fp8_f32_scale_moe_gate_up_f32(
+        indices: *const u32,
+        input: *const f32,
+        gate_weights: *const *const u8,
+        gate_scales: *const *const f32,
+        up_weights: *const *const u8,
+        up_scales: *const *const f32,
+        output: *mut f32,
+        rows: u32,
+        cols: u32,
+        slots: u32,
+    ) {
+        let warp = thread::threadIdx_x() >> 5;
+        let lane = thread::threadIdx_x() & 31;
+        let row_blocks = rows.div_ceil(8);
+        let slot = thread::blockIdx_x() / row_blocks;
+        let row = thread::blockIdx_x() % row_blocks * 8 + warp;
+        if slot >= slots || row >= rows {
+            return;
+        }
+        let expert = unsafe { *indices.add(slot as usize) } as usize;
+        let gate = unsafe {
+            (*gate_weights.add(expert)).add(row as usize * cols as usize)
+        };
+        let up = unsafe { (*up_weights.add(expert)).add(row as usize * cols as usize) };
+        let gate_scale = unsafe { *gate_scales.add(expert) };
+        let up_scale = unsafe { *up_scales.add(expert) };
+        let scale_cols = cols / 128;
+        let scale_base = row / 128 * scale_cols;
+        let mut gate_sum = 0.0f32;
+        let mut up_sum = 0.0f32;
+        let mut scale_col = 0;
+        while scale_col < scale_cols {
+            let block_col = scale_col * 128;
+            let gs = unsafe { *gate_scale.add((scale_base + scale_col) as usize) };
+            let us = unsafe { *up_scale.add((scale_base + scale_col) as usize) };
+            let mut offset = lane;
+            while offset < 128 {
+                let first_col = block_col + offset;
+                let second_col = first_col + 32;
+                let first_activation = unsafe { *input.add(first_col as usize) };
+                let second_activation = unsafe { *input.add(second_col as usize) };
+                let (first_gate, second_gate) = e4m3x2_values(
+                    unsafe { *gate.add(first_col as usize) },
+                    unsafe { *gate.add(second_col as usize) },
+                );
+                let (first_up, second_up) = e4m3x2_values(
+                    unsafe { *up.add(first_col as usize) },
+                    unsafe { *up.add(second_col as usize) },
+                );
+                gate_sum = (first_gate * gs).mul_add(first_activation, gate_sum);
+                gate_sum = (second_gate * gs).mul_add(second_activation, gate_sum);
+                up_sum = (first_up * us).mul_add(first_activation, up_sum);
+                up_sum = (second_up * us).mul_add(second_activation, up_sum);
+                offset += 64;
+            }
+            scale_col += 1;
+        }
+        gate_sum = warp_sum(gate_sum);
+        up_sum = warp_sum(up_sum);
+        if lane == 0 {
+            let base = slot as usize * rows as usize * 2;
+            unsafe {
+                output.add(base + row as usize).write(gate_sum);
+                output.add(base + rows as usize + row as usize).write(up_sum);
+            }
+        }
+    }
+
+    /// Applies routed down projections with 128-by-128 F32 block scales.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn block_fp8_f32_scale_moe_down_f32(
+        indices: *const u32,
+        inputs: *const f32,
+        weights: *const *const u8,
+        scales: *const *const f32,
+        outputs: *const *mut f32,
+        rows: u32,
+        cols: u32,
+        slots: u32,
+    ) {
+        let warp = thread::threadIdx_x() >> 5;
+        let lane = thread::threadIdx_x() & 31;
+        let row_blocks = rows.div_ceil(8);
+        let slot = thread::blockIdx_x() / row_blocks;
+        let row = thread::blockIdx_x() % row_blocks * 8 + warp;
+        if slot >= slots || row >= rows {
+            return;
+        }
+        let expert = unsafe { *indices.add(slot as usize) } as usize;
+        let input = unsafe { inputs.add(slot as usize * cols as usize) };
+        let weight = unsafe { (*weights.add(expert)).add(row as usize * cols as usize) };
+        let scale = unsafe { *scales.add(expert) };
+        let scale_cols = cols / 128;
+        let scale_base = row / 128 * scale_cols;
+        let mut sum = 0.0f32;
+        let mut scale_col = 0;
+        while scale_col < scale_cols {
+            let block_col = scale_col * 128;
+            let block_scale = unsafe { *scale.add((scale_base + scale_col) as usize) };
+            let mut offset = lane;
+            while offset < 128 {
+                let first_col = block_col + offset;
+                let second_col = first_col + 32;
+                let (first, second) = e4m3x2_values(
+                    unsafe { *weight.add(first_col as usize) },
+                    unsafe { *weight.add(second_col as usize) },
+                );
+                sum = (first * block_scale)
+                    .mul_add(unsafe { *input.add(first_col as usize) }, sum);
+                sum = (second * block_scale)
+                    .mul_add(unsafe { *input.add(second_col as usize) }, sum);
+                offset += 64;
+            }
+            scale_col += 1;
+        }
+        sum = warp_sum(sum);
+        if lane == 0 {
+            unsafe { (*outputs.add(slot as usize)).add(row as usize).write(sum) };
+        }
+    }
+
+    /// Expands row-major E4M3 weights with 128-by-128 F32 block scales to BF16.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn dequant_block_fp8_f32_scale_to_bf16(
+        weight: *const u8,
+        scales: *const f32,
+        output: *mut u16,
+        rows: u32,
+        cols: u32,
+    ) {
+        let index = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let length = rows * cols;
+        if index >= length {
+            return;
+        }
+        let row = index / cols;
+        let col = index - row * cols;
+        let scale_cols = cols / 128;
+        let scale = unsafe { *scales.add((row / 128 * scale_cols + col / 128) as usize) };
+        let value = e4m3_value(unsafe { *weight.add(index as usize) }) * scale;
+        unsafe {
+            output
+                .add(index as usize)
+                .write(f32_pair_to_bf16(value, 0.0) as u16)
+        };
+    }
+
     /// Quantizes a column-major f32 matrix to cuBLASLt NVFP4 layout.
     #[kernel]
     #[launch_bounds(32)]
