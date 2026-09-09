@@ -18,8 +18,9 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. A live Pi session reaches about 200 tokens/sec for cold
-prefill and 12–14 tokens/sec for MTP-assisted decode.
+day, August 26, 2026. A focused server run reaches about 620 tokens/sec for
+cold prefill. An earlier live Pi session reached 12–14 tokens/sec for
+MTP-assisted decode.
 
 The server runs the [Inferact NVFP4
 checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4). Eider
@@ -58,21 +59,27 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Performance
 
-These rounded results come from Eider telemetry during a live Pi tool-use
-session. The server used the native 262K context profile.
+These rounded results come from Eider server telemetry. The current prefill
+gate used a 16K context and one active sequence. The live Pi session used the
+native 262K context profile.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold prefill | About 200 tokens/sec | 5.8K prompt tokens, no cached prefix |
-| Cold time to first token | About 29 sec | Same first turn |
+| Cold prefill | About 620 tokens/sec | 5.8K prompt tokens, no cached prefix |
+| Cold time to first token | About 9 sec | Same focused server run |
 | Cached prefill | About 170 tokens/sec | About 200 new tokens after a 5.8K-token cache hit |
 | Cached time to first token | About 1 sec | Same follow-up turn |
 | Decode | About 13 tokens/sec | MTP-assisted follow-up turn |
 | Resident memory | About 95 GiB | Active Pi use |
 
-The prefill path batches QSA projections and uses BF16 tensor cores for
-hyperconnection projections. It processes up to 512 prompt tokens per prefill
-iteration to reuse routed expert weights.
+The prefill path batches QSA projections, selection, and attention. It uses
+BF16 tensor cores for hyperconnection projections. Both backends process 16
+sparse QSA rows per launch. Dense cuda-oxide attention uses four rows to meet
+the same numerical gate. A 64-token tensor-core GDN path supports the model's
+48 value heads.
+
+The prefill path processes up to 512 prompt tokens per iteration. This chunk
+size reuses the routed expert weights.
 
 The MTP prompt path batches its input and QSA projections. It appends only the
 index and attention cache state that future drafts need.
