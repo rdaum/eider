@@ -75,11 +75,11 @@ scripts/run-eider-qwen38.sh --cuda-oxide --offline
 You can also enable the Eider feature directly:
 
 ```sh
-CARGO_OXIDE="$PWD/.deps/cuda-oxide/bin/cargo-oxide" \
-  cargo build --release -p eider-api --features cuda-oxide
+cargo build --release -p eider-api --features cuda-oxide
 ```
 
-If `cargo-oxide` is not on `PATH`, set its full path:
+The build checks `CARGO_OXIDE`, `.deps/cuda-oxide/bin/cargo-oxide`, and then
+`PATH`. Set the full path to use a different executable:
 
 ```sh
 CARGO_OXIDE=/path/to/cargo-oxide \

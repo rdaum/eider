@@ -307,9 +307,16 @@ fn main() {
     let cuda_oxide_target = PathBuf::from(&out_dir).join("cuda-oxide-target");
     let cuda_oxide_artifacts = PathBuf::from(&out_dir).join("cuda-oxide-artifacts");
     if cuda_oxide {
+        let repository_cargo_oxide = default_deps_dir.join("cuda-oxide/bin/cargo-oxide");
         let cargo_oxide = std::env::var_os("CARGO_OXIDE")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("cargo-oxide"));
+            .unwrap_or_else(|| {
+                if repository_cargo_oxide.is_file() {
+                    repository_cargo_oxide
+                } else {
+                    PathBuf::from("cargo-oxide")
+                }
+            });
         let backend_dir = workspace_root.join("backends/cuda-oxide");
         let oxide_status = std::process::Command::new(&cargo_oxide)
             .current_dir(&backend_dir)

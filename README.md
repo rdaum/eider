@@ -425,20 +425,22 @@ speculation. It includes dense W4A16, compact FP4 KV, GDN, IMRoPE, sampling,
 fused LM-head top-1, and DFlash2 kernels. Both builds use the same safe Rust
 host API and device layouts.
 
-The Qwen3.8 27B path does not dispatch custom Eider kernels built with NVCC.
-It still uses the CUDA driver, CUDA runtime, and cuBLASLt. The server build can
-include NVCC and CUTLASS kernels for other model paths.
+The Qwen3.8 27B and Flash Next paths do not dispatch custom Eider kernels built
+with NVCC. They still use the CUDA driver, CUDA runtime, and cuBLASLt. The
+server build can include NVCC and CUTLASS kernels for other model paths.
 
 The launcher defaults to the dense `qwen3.8-27b` catalogue entry. The separate
-`qwen3.8-flash-next` runtime also has cuda-oxide hyperconnection, PLE, and QSA
-primitives, but its complete execution path has not yet been audited.
+Flash Next launcher selects its catalogue entry.
 
 ```sh
 scripts/setup-cuda-oxide.sh
-CARGO_OXIDE="$PWD/.deps/cuda-oxide/bin/cargo-oxide" \
-  cargo build --release -p eider-api --features cuda-oxide
+cargo build --release -p eider-api --features cuda-oxide
 scripts/run-eider-qwen38.sh --cuda-oxide --offline
+scripts/run-eider-qwen38-flash-next.sh --cuda-oxide --offline
 ```
+
+The build finds the repository-local `cargo-oxide` installation. Set
+`CARGO_OXIDE` only to use a different executable.
 
 The cuda-oxide build keeps nightly Rust outside the stable workspace. Read the
 [cuda-oxide backend guide](backends/cuda-oxide/README.md) before you enable it.

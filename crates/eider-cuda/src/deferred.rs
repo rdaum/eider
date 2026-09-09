@@ -391,7 +391,8 @@ mod tests {
         }
 
         fn discard(&self, encoder: Self::Encoder) -> Option<Self::Fence> {
-            Some(self.submit(encoder))
+            self.submit(encoder);
+            Some(())
         }
     }
 
