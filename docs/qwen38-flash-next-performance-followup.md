@@ -73,8 +73,12 @@ The complete cuda-oxide probe matched all output tokens and persistent state.
 The target reached approximately 15 tok/s. Depth-one MTP reached approximately
 14 tok/s, so target-only decode remained faster on this prompt.
 
-Dense and sparse QSA batching, compact traversal, and 48-head chunked GDN
-increased cold full-model prefill from approximately 200 to 620 tokens/sec.
+Compact QSA traversal remains useful. Multi-row QSA attention and 48-head
+chunked GDN failed a later full-model gate and are not production paths.
+
+The corrected path batches QSA projections and evaluates attention one row at
+a time. It uses recurrent GDN for the 48-head Flash Next shape. A 5,840-token
+probe reached approximately 300 tokens/sec and matched the reference token.
 
 The direct PLE work from llama.cpp validates Eider's existing design. The
 sparse QSA work exposed a remaining problem in Eider: packed cache storage did
@@ -203,6 +207,11 @@ recurrence kernel instead.
 The chunked workspace and both CUDA launch paths now use the model's value-head
 count. The released-checkpoint serial comparison passed with 48 heads on both
 backends. The existing 32-head regression test also passed on both backends.
+
+These isolated comparisons did not predict full-model behaviour. The 48-head
+path caused large residual-stream drift across the complete 48-layer model.
+Production Flash Next therefore uses recurrent GDN. Qwen3.6 keeps its validated
+32-head chunked path.
 
 The 512-token complete GDN layer gave these results:
 
@@ -357,15 +366,19 @@ E4M3 conversion produced most of the gain.
 The benchmark covers one complete target layer with fixed routing inputs. It
 does not measure model loading, PLE reads, MTP acceptance, or serving overhead.
 
-### QSA prompt batching
+### Experimental QSA prompt batching
 
-The QSA selector returns every visible token before the context exceeds the
-2,048-token indexer budget. Eider now bypasses scoring and selection in this
-range. It still appends the raw index keys for later sparse attention.
+This section records the rejected multi-row path. Production still batches
+the QSA projections, but it processes attention one row at a time.
 
-The dense prefix now uses the existing causal paged-attention kernel. The
-native path processes eight rows per launch. The cuda-oxide path processes four
-rows per launch because an eight-row batch exceeded the numerical gate.
+The experimental QSA selector returns every visible token before the context
+exceeds the 2,048-token indexer budget. This path bypasses scoring and
+selection in this range. It still appends the raw index keys for later sparse
+attention.
+
+The experimental dense prefix uses the existing causal paged-attention kernel.
+The native path processes eight rows per launch. The cuda-oxide path processes
+four rows per launch because an eight-row batch exceeded the numerical gate.
 
 The 512-token Inferact benchmark gave these median GPU times:
 
@@ -383,7 +396,7 @@ execution before it records timing. Native CUDA and cuda-oxide passed this
 gate for 512 rows. A mixed prompt range across the 2,048-token boundary also
 passed.
 
-The sparse path now retains 16 independent selections. It batches QSA
+The experimental sparse path retains 16 independent selections. It batches QSA
 selection, cache updates, and attention for 16 causal rows. Selection also
 builds ordered lists of selected blocks, 8-token key tiles, and 64-token value
 tiles. The attention kernels traverse these lists instead of launching and
@@ -401,9 +414,9 @@ the complete QSA layer:
 | Reused scores and 16-row batches | 19.5 ms | 21.4 ms |
 | Compact attention traversal | 19.0 ms | 20.6 ms |
 
-The final native path is approximately 71% faster than the original sparse
-path. The cuda-oxide comparison starts after key-append consolidation and
-shows an approximately 76% decrease.
+The final experimental native path is approximately 71% faster than the
+original sparse path. The cuda-oxide comparison starts after key-append
+consolidation and shows an approximately 76% decrease.
 
 The compact traversal matters more as the logical context grows. A second
 512-token benchmark starts at position 32,768 with a 65,536-token workspace:
@@ -428,13 +441,51 @@ first-token latency.
 Two cold requests after compact traversal had 5,796 and 5,801 uncached tokens.
 Both reached approximately 490 tokens/sec with 12-second first-token latency.
 
-Two final cold requests also used 48-head chunked GDN. Each request had 5,801
-uncached tokens. They reached 619 and 621 tokens/sec with approximately
-9.4-second first-token latency.
+Two experimental requests also used 48-head chunked GDN and multi-row QSA.
+Each request had 5,801 uncached tokens. They reached approximately 620
+tokens/sec with approximately 9.4-second first-token latency.
+
+The result is not a valid production claim. The complete model generated a
+different frontier token than the serial reference.
 
 This server gate used a 16K context, one active sequence, 512-token prefill
 chunks, and no speculative workspace. The earlier 200-token/sec baseline used
 the 262K live Pi profile.
+
+### Full-model prefill gate
+
+The isolated GDN and QSA tests compared one layer. Their small errors grew
+across the complete model, so Eider added a full-model prefill probe.
+
+The probe rendered `README.md` through the checkpoint chat template. It then
+processed 5,840 tokens in 512-token chunks and compared the final token and
+residual streams.
+
+The `qwen38-flash-next-prefill-probe` binary implements this gate. It returns
+an error when production prefill selects a different token.
+
+The rejected production path selected token 248069. The serial reference
+selected token 1596. Its final residual-stream cosine similarity was 0.434.
+
+A run with serial GDN still selected the wrong token when multi-row QSA was
+active. A run with serial QSA selected the reference token despite 48-head
+chunked GDN drift. This isolated multi-row QSA as the direct token error.
+
+The corrected production path batches QSA projections and processes attention
+one row at a time. It also uses recurrent GDN for the 48-head model shape.
+
+The corrected path and the serial reference both selected token 1596. The
+corrected path processed the prompt in 19 seconds, or approximately 300
+tokens/sec. The fully serial reference took approximately 163 seconds.
+
+The corrected residual stream was not numerically identical to the serial
+reference. Its cosine similarity was 0.785. The production path still uses
+batched projections. Therefore, the token comparison remains a required gate.
+
+An API regression case requested the recent Git commits through a Bash tool.
+The server emitted one parsed tool call. It then consumed the tool result and
+returned a normal summary. It did not repeat planning text or expose raw tool
+syntax.
 
 ## llama.cpp status
 
@@ -805,14 +856,14 @@ The current Inferact depth comparison favours target-only decode. Repeat it
 with the complete Hybrid checkpoint before changing the production MTP
 default. The local Hybrid snapshot is partial and cannot provide this result.
 
-Keep dense and sparse QSA batching, compact sparse traversal, and 48-head
-chunked GDN. Both backends pass the independent serial layer gates. The
-combined changes increased cold full-model prefill from approximately 200 to
-620 tokens/sec. Compact traversal also halved the native 32K sparse-layer time.
+Keep batched QSA projections and compact sparse traversal. Process QSA
+attention one row at a time in production. Keep 48-head chunked GDN out of the
+Flash Next path. Its isolated test passed, but the complete model accumulated
+large residual-stream drift.
 
 Keep the four-warp cuda-oxide grouped MoE kernel. It reduced the complete
 released-checkpoint GDN layer from 14.28 ms to 13.47 ms.
 
-The final Inferact server gate used a 16K context and one active sequence. Two
-uncached README prompts reached approximately 620 tokens/sec. Target-only
-decode remained between 13 and 14 tokens/sec.
+The corrected full-model probe used 512-token chunks. Its 5,840-token README
+prompt reached approximately 300 tokens/sec and matched the serial-reference
+token. Target-only decode remained between 13 and 14 tokens/sec.

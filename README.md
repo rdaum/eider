@@ -18,9 +18,9 @@ Eider has three priorities:
 
 Eider served [Qwen3.8 Flash
 Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on its release
-day, August 26, 2026. A focused server run reaches about 620 tokens/sec for
-cold prefill. An earlier live Pi session reached 12–14 tokens/sec for
-MTP-assisted decode.
+day, August 26, 2026. A focused full-model probe reaches about 300 tokens/sec
+for uncached prefill. Live sessions reach 12–14 tokens/sec for MTP-assisted
+decode.
 
 The server runs the [Inferact NVFP4
 checkpoint](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4). Eider
@@ -59,24 +59,23 @@ scripts/run-pi-eider-qwen38-flash-next.sh
 
 ### Performance
 
-These rounded results come from Eider server telemetry. The current prefill
-gate used a 16K context and one active sequence. The live Pi session used the
-native 262K context profile.
+These rounded results come from the full-model correctness probe and Eider
+server telemetry. The prefill probe used 512-token chunks. The live Pi session
+used the native 262K context profile.
 
 | Measurement | Result | Workload |
 | --- | ---: | --- |
-| Cold prefill | About 620 tokens/sec | 5.8K prompt tokens, no cached prefix |
-| Cold time to first token | About 9 sec | Same focused server run |
-| Cached prefill | About 170 tokens/sec | About 200 new tokens after a 5.8K-token cache hit |
-| Cached time to first token | About 1 sec | Same follow-up turn |
+| Uncached prefill | About 300 tokens/sec | 5.8K prompt tokens, no cached prefix |
+| Prefill compute time | About 20 sec | Same full-model probe |
 | Decode | About 13 tokens/sec | MTP-assisted follow-up turn |
 | Resident memory | About 95 GiB | Active Pi use |
 
-The prefill path batches QSA projections, selection, and attention. It uses
-BF16 tensor cores for hyperconnection projections. Both backends process 16
-sparse QSA rows per launch. Dense cuda-oxide attention uses four rows to meet
-the same numerical gate. A 64-token tensor-core GDN path supports the model's
-48 value heads.
+The prefill path batches QSA projections, then evaluates QSA attention one row
+at a time. It uses BF16 tensor cores for hyperconnection projections. Flash
+Next uses the recurrent GDN path for its 48 value heads.
+
+Multi-row QSA attention and 48-head chunked GDN passed isolated layer tests.
+They failed the full-model correctness gate and are not production paths.
 
 The prefill path processes up to 512 prompt tokens per iteration. This chunk
 size reuses the routed expert weights.
@@ -94,9 +93,9 @@ preserved recurrent state bitwise.
 The shared radix cache retains the target prefix and the MTP QSA prefix. Pi
 follow-up turns keep MTP speculation after a prefix-cache hit.
 
-These values are server telemetry, not isolated kernel rates. The PLE n-gram
-table remains on NVMe, while the complete neural body stays resident in
-unified memory.
+The prefill value measures the complete model path, not an isolated kernel.
+The remaining values come from server telemetry. The PLE n-gram table remains
+on NVMe, while the complete neural body stays resident in unified memory.
 
 Send a Responses API request directly:
 

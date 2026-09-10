@@ -1,6 +1,6 @@
 //! Correctness probes for Flash Next target verification.
 
-use super::model::{Qwen38LayerProbeStage, Qwen38LayerProbeTrace};
+use super::model::{Qwen38FlashNextPrefillWorkspace, Qwen38LayerProbeStage, Qwen38LayerProbeTrace};
 use super::{
     Qwen38FlashNextCacheConfig, Qwen38FlashNextModel, Qwen38LogitsMode, Qwen38NextToken,
     Qwen38VectorVerifierProbeMode,
@@ -72,6 +72,30 @@ pub struct Qwen38SpeculativeProbeReport {
     pub speculative_duration: Duration,
 }
 
+/// Full-model comparison of production prefill with the canonical reference.
+#[derive(Clone, Debug)]
+pub struct Qwen38PrefillProbeReport {
+    /// Number of prompt tokens processed in each run.
+    pub prompt_tokens: usize,
+    /// Highest-logit token from the canonical reference.
+    pub reference_frontier: Qwen38NextToken,
+    /// Wall time for the canonical reference.
+    pub reference_duration: Duration,
+    /// Highest-logit token from production prefill.
+    pub production_frontier: Qwen38NextToken,
+    /// Wall time for production prefill.
+    pub production_duration: Duration,
+    /// Final production residual-stream difference from the reference.
+    pub production_difference: Qwen38VerificationStreamDifference,
+}
+
+impl Qwen38PrefillProbeReport {
+    /// Returns true when production and reference prefill select the same token.
+    pub fn frontier_matches(&self) -> bool {
+        self.production_frontier.id == self.reference_frontier.id
+    }
+}
+
 impl Qwen38SpeculativeProbeReport {
     pub fn accepted_drafts_per_cycle(&self) -> f64 {
         self.accepted_drafts as f64 / self.cycles.max(1) as f64
@@ -109,6 +133,95 @@ impl Qwen38VerificationProbeReport {
     pub fn verification_tokens_per_second(&self) -> f64 {
         self.compared_rows as f64 / self.verification_duration.as_secs_f64().max(1e-9)
     }
+}
+
+/// Compares full-model production prefill with serial GDN and QSA references.
+pub fn probe_prefill_against_reference(
+    model: &mut Qwen38FlashNextModel,
+    prompt_tokens: &[u32],
+    prefill_chunk_tokens: usize,
+) -> Result<Qwen38PrefillProbeReport> {
+    if prompt_tokens.is_empty() || prefill_chunk_tokens == 0 {
+        return Err(Error::Shape {
+            label: "Qwen3.8 Flash Next prefill probe",
+            expected: "a nonempty prompt and positive chunk size".to_string(),
+            actual: format!(
+                "prompt={} chunk={prefill_chunk_tokens}",
+                prompt_tokens.len()
+            ),
+        });
+    }
+    if prompt_tokens.len() > model.config().max_position_embeddings {
+        return Err(Error::Shape {
+            label: "Qwen3.8 Flash Next prefill probe prompt",
+            expected: format!("at most {} tokens", model.config().max_position_embeddings),
+            actual: prompt_tokens.len().to_string(),
+        });
+    }
+
+    let reference_workspace = model.new_reference_prefill_workspace(prefill_chunk_tokens)?;
+    let (reference_frontier, reference_streams, reference_duration) = run_prefill(
+        model,
+        prompt_tokens,
+        prefill_chunk_tokens,
+        reference_workspace,
+    )?;
+    let production_workspace = model.new_prefill_workspace(prefill_chunk_tokens)?;
+    let (production_frontier, production_streams, production_duration) = run_prefill(
+        model,
+        prompt_tokens,
+        prefill_chunk_tokens,
+        production_workspace,
+    )?;
+    Ok(Qwen38PrefillProbeReport {
+        prompt_tokens: prompt_tokens.len(),
+        reference_frontier,
+        reference_duration,
+        production_frontier,
+        production_duration,
+        production_difference: stream_difference(&reference_streams, &production_streams)?,
+    })
+}
+
+fn run_prefill(
+    model: &mut Qwen38FlashNextModel,
+    prompt_tokens: &[u32],
+    prefill_chunk_tokens: usize,
+    mut workspace: Qwen38FlashNextPrefillWorkspace,
+) -> Result<(Qwen38NextToken, Vec<f32>, Duration)> {
+    let mut cache = new_qwen38_flash_next_sequence_cache_with_config(
+        model,
+        1,
+        prompt_tokens.len(),
+        Qwen38FlashNextCacheConfig {
+            max_retained_bytes: 0,
+        },
+    )?;
+    let mut sequence = Qwen38FlashNextSequence::admit(model, &mut cache, prompt_tokens.len())?;
+    let started = Instant::now();
+    let mut frontier = None;
+    for (index, chunk) in prompt_tokens.chunks(prefill_chunk_tokens).enumerate() {
+        let final_chunk = (index + 1) * prefill_chunk_tokens >= prompt_tokens.len();
+        frontier = sequence.forward_tokens(
+            model,
+            &mut workspace,
+            &mut cache,
+            chunk,
+            if final_chunk {
+                Qwen38LogitsMode::Top1
+            } else {
+                Qwen38LogitsMode::None
+            },
+        )?;
+    }
+    let duration = started.elapsed();
+    let frontier = frontier.ok_or_else(|| Error::Format {
+        label: "Qwen3.8 Flash Next prefill probe",
+        detail: "prefill produced no frontier token".to_string(),
+    })?;
+    let streams = model.probe_target_streams(&sequence)?;
+    sequence.finish(&mut cache)?;
+    Ok((frontier, streams, duration))
 }
 
 /// Compares canonical decode with the vector target verifier.

@@ -29,9 +29,10 @@ pub(crate) use model::{
 };
 pub use ple::{Qwen38PagedPle, Qwen38PleHashPlan, Qwen38PleTokenWindow};
 pub use probe::{
-    Qwen38LayerDivergence, Qwen38SpeculativeMismatch, Qwen38SpeculativeProbeReport,
-    Qwen38VerificationMismatch, Qwen38VerificationProbeReport, Qwen38VerificationStreamDifference,
-    probe_speculative_cycles, probe_verification_paths,
+    Qwen38LayerDivergence, Qwen38PrefillProbeReport, Qwen38SpeculativeMismatch,
+    Qwen38SpeculativeProbeReport, Qwen38VerificationMismatch, Qwen38VerificationProbeReport,
+    Qwen38VerificationStreamDifference, probe_prefill_against_reference, probe_speculative_cycles,
+    probe_verification_paths,
 };
 pub use sequence::{
     Qwen38FlashNextCacheConfig, Qwen38FlashNextPageBackend, Qwen38FlashNextSequence,

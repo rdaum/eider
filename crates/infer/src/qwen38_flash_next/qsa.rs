@@ -269,6 +269,70 @@ impl Qwen38QsaWeights {
         )
     }
 
+    /// Evaluates one row after the shared prompt projections are complete.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_prepared_prefill_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        row_workspace: &mut Qwen38QsaWorkspace,
+        backend: &mut Qwen38FlashNextPageBackend,
+        page_table: &DeviceBuffer<u32>,
+        page: &Sm12xPage,
+        page_offset: usize,
+        config: &Qwen38FlashNextConfig,
+        row: usize,
+        layer: usize,
+        position: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        row_workspace
+            .index_projection
+            .copy_range_from_device_on_stream(
+                0,
+                &workspace.index_projection,
+                row * projection_rows,
+                projection_rows,
+                stream,
+            )?;
+        let (kv_pool, index_pool) = backend.qsa_pools_mut(layer)?;
+        let selection = row_workspace.selection.prepare_and_select_on_stream(
+            &row_workspace.index_projection,
+            &self.q_norm,
+            &self.k_norm,
+            index_pool,
+            page_table,
+            page.slot(),
+            page_offset,
+            position + 1,
+            config.rotary_dim.min(config.indexer_head_dim),
+            config.rms_eps(),
+            config.rope_theta(),
+            stream,
+        )?;
+        self.attention.enqueue_qsa_prefill_row(
+            model,
+            &mut workspace.attention,
+            kv_pool,
+            page_table,
+            selection.selected_blocks,
+            selection.selected_tiles,
+            selection.selected_tokens,
+            selection.selected_block_indices,
+            selection.selected_token_tiles,
+            selection.selected_context_tiles,
+            selection.selected_counts,
+            selection.index_capacity,
+            row,
+            position,
+            page.slot(),
+            page_offset,
+            stream,
+        )
+    }
+
     /// Appends and evaluates consecutive dense-prefix rows in one page segment.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_prepared_prefill_dense_rows(

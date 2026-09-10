@@ -188,6 +188,7 @@ pub(crate) struct Qwen38FlashNextPrefillWorkspace {
     serial_qsa_rows: bool,
     canonical_moe_linears: bool,
     exact_hyper_projections: bool,
+    capture_gdn_state_snapshots: bool,
     layer_trace: Option<Vec<Qwen38LayerProbeTrace>>,
     linear_layers: Vec<bool>,
 }
@@ -802,6 +803,7 @@ impl Qwen38FlashNextModel {
             .enable_state_snapshots(&batch_model, rows - 1)?;
         verify.serial_gdn_projections = mode.serial_gdn_projections();
         verify.serial_qsa_rows = true;
+        verify.capture_gdn_state_snapshots = true;
         if mode.serial_gdn_projections() {
             let first_linear = self
                 .layers
@@ -2183,12 +2185,40 @@ impl Qwen38FlashNextModel {
             exact_gdn: None,
             exact_moe: None,
             serial_gdn_projections: false,
+            // Share the prompt projections, then evaluate attention one row at
+            // a time. The multi-row QSA path fails the full-model gate.
             serial_qsa_rows: false,
             canonical_moe_linears: false,
             exact_hyper_projections: false,
+            capture_gdn_state_snapshots: false,
             layer_trace: None,
             linear_layers,
         })
+    }
+
+    pub(crate) fn new_reference_prefill_workspace(
+        &self,
+        token_capacity: usize,
+    ) -> Result<Qwen38FlashNextPrefillWorkspace> {
+        let mut workspace = self.new_prefill_workspace(token_capacity)?;
+        workspace.serial_qsa_rows = true;
+        let first_linear = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Qwen38AttentionWeights::Linear(weights) => Some(weights),
+                Qwen38AttentionWeights::Qsa(_) => None,
+            })
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 reference prefill",
+                detail: "model has no GDN layer".to_string(),
+            })?;
+        workspace.exact_gdn = Some(Qwen38ExactGdnPrefillWorkspace::new(
+            &self.manifest,
+            first_linear,
+            token_capacity,
+        )?);
+        Ok(workspace)
     }
 
     /// Copies recurrent GDN and PLE state for a retained prompt prefix.
@@ -2588,6 +2618,9 @@ impl Qwen38FlashNextModel {
                     Qwen38AttentionState::Linear(linear_state),
                 ) => {
                     if let Some(exact_gdn) = workspace.exact_gdn.as_mut() {
+                        let snapshots = workspace
+                            .capture_gdn_state_snapshots
+                            .then_some((&mut workspace.hybrid, layer_index));
                         exact_gdn.run(
                             weights,
                             linear_state,
@@ -2595,7 +2628,7 @@ impl Qwen38FlashNextModel {
                             token_count,
                             self.config.hidden,
                             self.config.rms_eps(),
-                            Some((&mut workspace.hybrid, layer_index)),
+                            snapshots,
                             &state.stream,
                         )?
                     } else {
@@ -2659,40 +2692,20 @@ impl Qwen38FlashNextModel {
                             .with_append_pages(reservation, |backend, pages| {
                                 for page in pages.iter() {
                                     let segment = page.segment();
-                                    let start_position = state.position + segment.input_offset();
-                                    let dense_rows = self
-                                        .config
-                                        .indexer_budget
-                                        .saturating_sub(start_position)
-                                        .min(segment.rows());
-                                    if dense_rows != 0 {
-                                        weights.run_prepared_prefill_dense_rows(
+                                    for offset in 0..segment.rows() {
+                                        let row = segment.input_offset() + offset;
+                                        weights.run_prepared_prefill_row(
+                                            &model,
                                             &mut workspace.qsa,
+                                            qsa_workspace,
                                             backend,
                                             page_table.device(),
                                             page.page(),
-                                            segment.page_offset(),
+                                            segment.page_offset() + offset,
                                             &self.config,
-                                            segment.input_offset(),
-                                            dense_rows,
+                                            row,
                                             layer_index,
-                                            start_position,
-                                            &state.stream,
-                                        )?;
-                                    }
-                                    let sparse_rows = segment.rows() - dense_rows;
-                                    if sparse_rows != 0 {
-                                        weights.run_prepared_prefill_sparse_rows(
-                                            &mut workspace.qsa,
-                                            backend,
-                                            page_table.device(),
-                                            page.page(),
-                                            segment.page_offset() + dense_rows,
-                                            &self.config,
-                                            segment.input_offset() + dense_rows,
-                                            sparse_rows,
-                                            layer_index,
-                                            start_position + dense_rows,
+                                            state.position + row,
                                             &state.stream,
                                         )?;
                                     }

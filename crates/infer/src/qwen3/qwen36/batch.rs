@@ -45,6 +45,7 @@ use eider_cuda::{
     Sm121W4A4GroupedWorkspace, moe_weighted_accumulate_contiguous_f32_batch_on_stream,
 };
 
+const GDN_HEADS: usize = 32;
 const GDN_HEAD_DIM: usize = 128;
 const GDN_CHUNK_TOKENS: usize = 64;
 const STATIC_FP8_PREFILL_MIN_ROWS: usize = 128;
@@ -1604,12 +1605,12 @@ impl BatchLinearAttentionWorkspace {
             z_plan: new_batch_linear_plan(model, &weights.z, row_capacity)?,
             out_plan: new_batch_linear_plan(model, &weights.out, row_capacity)?,
             alpha_beta_plan: BatchBf16LinearPlan::new(model, &weights.alpha_beta, row_capacity)?,
-            // The chunked tensor-core kernel supports any value-head count
-            // with the 128-element head shape used by this model family.
-            chunked_gdn: (chunked_prefill && linear.value_head_dim == GDN_HEAD_DIM)
-                .then(|| {
-                    BatchChunkedGdnWorkspace::new(row_capacity, state_capacity, linear.value_heads)
-                })
+            // The production chunked path is validated for Qwen3.6's 32-head
+            // shape. Other head counts use the recurrent path.
+            chunked_gdn: (chunked_prefill
+                && linear.value_heads == GDN_HEADS
+                && linear.value_head_dim == GDN_HEAD_DIM)
+                .then(|| BatchChunkedGdnWorkspace::new(row_capacity, state_capacity, GDN_HEADS))
                 .transpose()?,
         })
     }
@@ -5671,6 +5672,61 @@ impl Qwen36FullAttentionWeights {
             processed += chunk_rows;
         }
         Ok(())
+    }
+
+    /// Evaluates one prepared QSA row through compact sparse attention.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_qsa_prefill_row(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut BatchFullAttentionWorkspace,
+        pool: &mut Sm12xKvPagePool,
+        page_table: &DeviceBuffer<u32>,
+        selected_blocks: &DeviceBuffer<u8>,
+        selected_tiles: &DeviceBuffer<u8>,
+        selected_tokens: usize,
+        selected_block_indices: &DeviceBuffer<u32>,
+        selected_token_tiles: &DeviceBuffer<u32>,
+        selected_context_tiles: &DeviceBuffer<u32>,
+        selected_counts: &DeviceBuffer<u32>,
+        selected_index_capacity: usize,
+        row: usize,
+        position: usize,
+        slot: usize,
+        page_offset: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let q_width = model.batch_manifest().q_heads * model.batch_manifest().head_dim;
+        let kv_width = model.batch_manifest().kv_heads * model.batch_manifest().head_dim;
+        pool.append_at_offsets_on_stream(
+            slot,
+            page_offset,
+            &workspace.k_rope,
+            row * kv_width,
+            &workspace.v,
+            row * kv_width,
+            stream,
+        )?;
+        workspace
+            .compact_attention
+            .attention_paged_sparse_offsets_into_on_stream(
+                pool,
+                page_table,
+                position + 1,
+                selected_blocks,
+                selected_tiles,
+                selected_tokens,
+                selected_block_indices,
+                selected_token_tiles,
+                selected_context_tiles,
+                selected_counts,
+                selected_index_capacity,
+                &workspace.q_rope,
+                row * q_width,
+                workspace.attention.output(),
+                row * q_width,
+                stream,
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
