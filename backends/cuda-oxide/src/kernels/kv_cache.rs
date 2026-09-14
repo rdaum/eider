@@ -715,16 +715,12 @@ mod device {
         while k_tile < head_k_tiles {
             let query_tile =
                 unsafe { query_tiles.add(((group * head_k_tiles + k_tile) * 512) as usize) };
-            let mut index = lane;
-            while index < 512 {
-                unsafe { key_tile.add(index as usize).write(0) };
-                index += 32;
-            }
+            // No key_tile clear: the gather loop below packs the 8 bytes per
+            // lane the MMA load consumes before the post-build barrier; the
+            // remaining staging bytes are never read.
             let compact_tile_index =
                 (kv_head * storage_token_tiles + storage_token_tile) * head_k_tiles + k_tile;
             let compact_tile = unsafe { page_key_values.add(compact_tile_index as usize * 256) };
-            thread::sync_threads();
-
             let mut tail_scale_codes = [0u8; 4];
             let mut tail_scales = [0.0f32; 4];
             if !compact && row < tail_len {
@@ -1347,12 +1343,9 @@ mod device {
                     .cast::<f32>()
             };
             let compact_tile = unsafe { page_value_values.add(value_tile_index as usize * 256) };
-            let mut index = lane;
-            while index < 512 {
-                unsafe { value_tile.add(index as usize).write(0) };
-                index += 32;
-            }
-            thread::sync_threads();
+            // No value_tile clear: the gather loop below packs the 8 bytes per
+            // lane the MMA load consumes before the post-build barrier; the
+            // remaining staging bytes are never read.
             let mut scale_codes = [0u8; 4];
             let mut tail_scales = [0.0f32; 4];
             let mut k_block = 0;

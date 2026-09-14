@@ -1919,16 +1919,15 @@ __global__ void infer_sm12x_kv_qk_kernel(
 
     for (std::uint32_t kt = 0; kt < head_k_tiles; ++kt) {
         const std::uint8_t* a_tile = query_tiles + (group * head_k_tiles + kt) * 512;
-        for (int index = threadIdx.x; index < 512; index += blockDim.x) {
-            b_smem[index] = 0;
-        }
+        // No b_smem memset: the gather loop packs the 8 bytes per lane that
+        // the MMA load consumes (b0/b1) before the post-build __syncthreads;
+        // the remaining staging bytes are never read.
         const std::uint8_t* compact_tile = nullptr;
         std::uint32_t tile = 0;
         if (compact) {
             tile = (kv_head * storage_token_tiles + storage_token_tile) * head_k_tiles + kt;
             compact_tile = page_key_values + tile * 256;
         }
-        __syncthreads();
 
         const int lane = threadIdx.x;
         const int t0 = lane & 3;
@@ -2304,11 +2303,9 @@ __global__ void infer_sm12x_kv_pv_kernel(
         const std::uint8_t* page_value_values = value_values + page_slot * page_stride_bytes;
         const std::uint8_t* page_value_scales = value_scales + page_slot * page_stride_bytes;
         const std::uint8_t* compact_tile = page_value_values + value_tile_index * 256;
-        for (int index = threadIdx.x; index < 512; index += blockDim.x) {
-            b_smem[index] = 0;
-        }
-        __syncthreads();
-
+        // No b_smem memset: the gather loop packs the 8 bytes per lane that
+        // the MMA load consumes (b0/b1) before the post-build __syncthreads;
+        // the remaining staging bytes are never read.
         const int lane = threadIdx.x;
         const int t0 = lane & 3;
         const int dim = lane >> 2;
