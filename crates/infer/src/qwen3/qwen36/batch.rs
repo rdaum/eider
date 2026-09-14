@@ -5918,7 +5918,7 @@ impl Qwen36FullAttentionWeights {
                             let chunk_rows = if serial_rows {
                                 1
                             } else {
-                                (segment.rows() - processed).min(16 - position % 16).min(8)
+                                (segment.rows() - processed).min(16 - position % 16)
                             };
                             pool.append_rows_at_offset_on_stream(
                                 page.page().slot(),

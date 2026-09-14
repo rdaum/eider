@@ -807,6 +807,9 @@ struct CausalPrefillBench {
     batched_cache: Sm12xKvCache,
     batched_workspace: Sm12xKvAttentionWorkspace,
     batched_output: DeviceBuffer<f32>,
+    wide_cache: Sm12xKvCache,
+    wide_workspace: Sm12xKvAttentionWorkspace,
+    wide_output: DeviceBuffer<f32>,
 }
 
 impl BenchContext for CausalPrefillBench {
@@ -843,6 +846,10 @@ impl BenchContext for CausalPrefillBench {
         batched_cache
             .append_rows_at_offset_on_stream(&key, &value, 0, PREFILL_PREFIX, &stream)
             .expect("batched prefix");
+        let mut wide_cache = Sm12xKvCache::new(max_tokens, KV_HEADS, HEAD_DIM).expect("wide cache");
+        wide_cache
+            .append_rows_at_offset_on_stream(&key, &value, 0, PREFILL_PREFIX, &stream)
+            .expect("wide prefix");
         stream.synchronize().expect("prefix sync");
         Self {
             stream,
@@ -863,6 +870,12 @@ impl BenchContext for CausalPrefillBench {
             )
             .expect("batched workspace"),
             batched_output: DeviceBuffer::zeroed(max_tokens * q_width).expect("batched output"),
+            wide_cache,
+            wide_workspace: Sm12xKvAttentionWorkspace::new_gqa_batched(
+                max_tokens, Q_HEADS, KV_HEADS, HEAD_DIM, 16,
+            )
+            .expect("wide workspace"),
+            wide_output: DeviceBuffer::zeroed(max_tokens * q_width).expect("wide output"),
         }
     }
 
@@ -909,6 +922,25 @@ impl CausalPrefillBench {
             )
             .expect("batched causal prefill");
     }
+
+    fn run_wide(&mut self) {
+        self.wide_cache
+            .truncate(PREFILL_PREFIX)
+            .expect("truncate wide cache");
+        self.wide_workspace
+            .append_causal_rows_at_offset_into_on_stream(
+                &mut self.wide_cache,
+                &self.query,
+                &self.key,
+                &self.value,
+                PREFILL_PREFIX,
+                PREFILL_ROWS,
+                None,
+                self.wide_output.output(),
+                &self.stream,
+            )
+            .expect("wide causal prefill");
+    }
 }
 
 fn causal_prefill_serial_sample(
@@ -942,6 +974,25 @@ fn causal_prefill_batched_sample(
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
     black_box(ctx.batched_output.cuda_address());
+    BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms/chunk",
+    ))
+}
+
+fn causal_prefill_wide_sample(
+    ctx: &mut CausalPrefillBench,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_wide();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.wide_output.cuda_address());
     BenchSampleResult::operations((chunk * PREFILL_ROWS) as u64).push_metric(MetricValue::new(
         "cuda_event_ms",
         ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
@@ -993,6 +1044,7 @@ fn main() {
             runner.group::<CausalPrefillBench>("SM12x compact causal prefill 2K+128", |group| {
                 group.bench_sample("one_row_per_launch", causal_prefill_serial_sample);
                 group.bench_sample("eight_rows_per_launch", causal_prefill_batched_sample);
+                group.bench_sample("sixteen_rows_per_launch", causal_prefill_wide_sample);
             });
             runner.group::<KvAttentionBench<4_096>>("Qwen3.6 GQA 4K", |group| {
                 group.bench_sample("f32_cache", f32_sample::<4_096>);

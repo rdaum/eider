@@ -327,7 +327,18 @@ fn model_dir() -> PathBuf {
 }
 
 fn main() {
-    let model = Rc::new(Qwen36TextModel::open(model_dir()).expect("load Qwen3.6 model"));
+    let model = Rc::new(
+        match std::env::var_os("QWEN36_ARTIFACT_DIR") {
+            Some(artifact_dir) => Qwen36TextModel::open_with_storage_and_artifact_dir(
+                model_dir(),
+                PathBuf::from(artifact_dir),
+                eider_inference::qwen3::qwen36::Qwen36Bf16StorageConfig::default(),
+                eider_inference::qwen3::qwen36::Qwen36Fp8Storage::default(),
+            ),
+            None => Qwen36TextModel::open(model_dir()),
+        }
+        .expect("load Qwen3.6 model"),
+    );
     validate_prefill(&model);
     let options = BenchmarkMainOptions {
         suite: Some("qwen36-prefill".to_string()),
