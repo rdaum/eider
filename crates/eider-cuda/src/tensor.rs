@@ -213,7 +213,9 @@ impl Bf16Tensor2d {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn tensor_view_reports_explicit_metadata() {
         let view = Tensor2dView::new(7, 11, 16, Tensor2dLayout::ColumnMajor);

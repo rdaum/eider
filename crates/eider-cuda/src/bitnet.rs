@@ -472,6 +472,7 @@ fn dimension_overflow(label: &'static str) -> impl Fn(std::num::TryFromIntError)
 mod tests {
     use super::*;
     use crate::GemmShape;
+    use serial_test::serial;
 
     fn hf_pack(weights: &[i8], rows: usize, cols: usize) -> Vec<u8> {
         let packed_rows = rows / 4;
@@ -490,6 +491,7 @@ mod tests {
         output
     }
 
+    #[serial]
     #[test]
     fn transcodes_hf_output_packing_to_k_packed_rows() {
         let weights = [
@@ -511,6 +513,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn reference_uses_per_token_absmax_and_integer_dot_product() {
         let weights = [
@@ -534,6 +537,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn tiled_batch_gpu_matches_integer_reference() {
         const ROWS: usize = 12;
@@ -583,6 +587,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn int8_tensor_core_batch_matches_integer_reference() {
         const ROWS: usize = 16;
@@ -639,6 +644,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn rejects_reserved_ternary_code() {
         let error = BitNetPackedLinear::from_hf_packed("test", 4, 4, &[3, 0, 0, 0], 1.0)

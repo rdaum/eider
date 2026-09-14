@@ -968,7 +968,9 @@ fn table_cache_io(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn bit_packing_round_trips_all_alignments() {
         let mut packed = vec![0u8; 24];
@@ -980,6 +982,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn quantized_storage_uses_twenty_five_bits_per_eight_weights() {
         let values = (0..Q3_BLOCK_SIZE)
@@ -996,6 +999,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn q3_tracks_a_nonuniform_block() {
         let values = (0..Q3_BLOCK_SIZE)
@@ -1021,6 +1025,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn mixed_routed_kernel_matches_cold_q3_and_hot_nvfp4() {
         const EXPERTS: usize = 2;

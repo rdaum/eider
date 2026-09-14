@@ -296,7 +296,9 @@ mod tests {
     use super::*;
     use crate::format::{cuda_e4m3_code, e4m3_value};
     use crate::kernels::non_gemm::quantize_fp8_e4m3_f32_into_on_stream;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn fp8_tn_matches_quantized_cpu_reference() {
         const M: usize = 256;

@@ -1648,7 +1648,9 @@ pub fn q2_nvfp4_mixed_routed_matvec_f32_into_on_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn q2_quantization_uses_four_symmetric_levels_per_block() {
         let values = (-32..32)
@@ -1664,6 +1666,7 @@ mod tests {
         assert_eq!(quantized.scales.len(), 1);
     }
 
+    #[serial]
     #[test]
     fn zero_block_remains_finite() {
         let quantized = quantize_q2_row_major(2, 64, &[0.0; 128]).expect("quantize");
@@ -1671,6 +1674,7 @@ mod tests {
         assert!(values.iter().all(|&value| value == 0.0));
     }
 
+    #[serial]
     #[test]
     fn q2_bf16_scales_have_bounded_rounding_error() {
         for exponent in -32..=32 {
@@ -1688,6 +1692,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn q2_scale_fit_reduces_error_for_outlier_heavy_blocks() {
         let mut values = [0.0f32; Q2_BLOCK_SIZE];
@@ -1736,6 +1741,7 @@ mod tests {
         assert_eq!(quantized.storage_bytes(), 18);
     }
 
+    #[serial]
     #[test]
     fn modelopt_conversion_folds_all_weight_scales() {
         let values = (0..3 * 64)
@@ -1771,6 +1777,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[serial]
     #[test]
     fn q2_cache_round_trips() {
         let values = (0..2 * 64)
@@ -1792,6 +1799,7 @@ mod tests {
         assert_eq!(actual.scales, expected.scales);
     }
 
+    #[serial]
     #[test]
     fn q2_expert_table_cache_streams_to_device() {
         const EXPERTS: usize = 2;
@@ -1856,6 +1864,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn q2_device_matvec_matches_dequantized_reference() {
         let rows = 3;
@@ -1899,6 +1908,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn mixed_overlay_uses_nvfp4_only_for_installed_experts() {
         const EXPERTS: usize = 3;
@@ -2005,6 +2015,7 @@ mod tests {
         assert_eq!(overlay.resident_experts(), &[None]);
     }
 
+    #[serial]
     #[test]
     fn paired_hot_expert_preserves_independent_row_scales() {
         const COLS: usize = 64;

@@ -319,7 +319,9 @@ mod tests {
     use super::Nvfp4LinearSlots;
     use crate::{CudaStream, DeviceBuffer, PinnedHostBuffer, format};
     use eider_format::ModelOptNvfp4Linear;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn pinned_slot_upload_matches_modelopt_matvec() {
         const ROWS: usize = 37;

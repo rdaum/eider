@@ -620,6 +620,7 @@ fn validate_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const ROWS: usize = 19;
     const DIM: usize = 32;
@@ -709,6 +710,7 @@ mod tests {
         assert_close(&actual, &expected, tolerance);
     }
 
+    #[serial]
     #[test]
     fn bf16_bank_gather_and_fusion_match_reference() {
         let values = bank_values();
@@ -727,6 +729,7 @@ mod tests {
         check_bank(bank, &represented, 2.0e-4);
     }
 
+    #[serial]
     #[test]
     fn fp8_bank_gather_and_fusion_match_reference() {
         let host = NgramFp8Rows::quantize(ROWS, DIM, &bank_values()).expect("FP8 rows");
@@ -736,6 +739,7 @@ mod tests {
         check_bank(bank, &represented, 2.0e-4);
     }
 
+    #[serial]
     #[test]
     fn nvfp4_bank_gather_and_fusion_match_reference() {
         let host = NgramNvfp4Rows::quantize(ROWS, DIM, &bank_values()).expect("NVFP4 rows");
@@ -745,6 +749,7 @@ mod tests {
         check_bank(bank, &represented, 2.0e-4);
     }
 
+    #[serial]
     #[test]
     fn nvfp4_requires_complete_scale_blocks() {
         let error = NgramNvfp4Rows::quantize(2, 17, &[0.0; 34]).expect_err("invalid width");

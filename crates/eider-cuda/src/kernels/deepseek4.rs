@@ -1874,7 +1874,9 @@ mod tests {
         CudaStream, DeviceAddress, DeviceBuffer, MoeSortedRoutes, Result, format,
         gather_sorted_route_rows_f32_into_on_stream,
     };
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn block_scaled_fp8_linear_matches_cpu_reference() {
         const BATCH: usize = 2;
@@ -1932,6 +1934,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn f32_block_scaled_fp8_linear_matches_cpu_reference() {
         const BATCH: usize = 2;
@@ -1985,6 +1988,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn f32_block_scaled_fp8_linear_pair_matches_separate_projections() {
         const COLS: usize = 256;
@@ -2065,6 +2069,7 @@ mod tests {
         assert_eq!(actual_second.as_ref(), expected_second.as_ref());
     }
 
+    #[serial]
     #[test]
     fn f32_block_scaled_fp8_dequantizes_exactly_to_bf16() {
         const ROWS: usize = 256;
@@ -2102,6 +2107,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn f32_block_scaled_fp8_routed_experts_follow_device_indices() {
         const SLOTS: usize = 2;
@@ -2183,6 +2189,7 @@ mod tests {
         assert!(second.iter().all(|value| (*value - 16.0).abs() < 1.0e-4));
     }
 
+    #[serial]
     #[test]
     fn grouped_block_scaled_fp8_linear_uses_matching_input_group() {
         const BATCH: usize = 2;
@@ -2223,6 +2230,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn hyper_connection_matches_cpu_reference() {
         const BATCH: usize = 2;
@@ -2316,6 +2324,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn hyper_head_matches_cpu_reference() {
         const BATCH: usize = 2;
@@ -2392,6 +2401,7 @@ mod tests {
         output
     }
 
+    #[serial]
     #[test]
     fn trailing_interleaved_rope_matches_cpu_and_conjugates() {
         const BATCH: usize = 2;
@@ -2454,6 +2464,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn initial_hyper_streams_repeat_each_embedding_row() {
         const ROWS: usize = 3;
@@ -2479,6 +2490,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn attention_combines_ring_selected_compressed_and_sink() {
         const BATCH: usize = 2;
@@ -2557,6 +2569,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn causal_attention_masks_prior_current_and_compressed_entries() {
         const ROWS: usize = 3;
@@ -2663,6 +2676,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn indexer_topk_matches_causal_cpu_scores() {
         const ROWS: usize = 2;
@@ -2750,6 +2764,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn indexer_block_selection_matches_tokenwise_selection() {
         const ROWS: usize = 3;
@@ -2845,6 +2860,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn learned_and_hash_routers_match_sqrtsoftplus_reference() {
         const BATCH: usize = 2;
@@ -2920,6 +2936,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn compressor_matches_hca_and_overlapping_csa_reference() {
         for overlapping in [false, true] {
@@ -3022,6 +3039,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn clamped_swiglu_and_routed_accumulation_match_cpu() {
         const ROWS: usize = 2;
@@ -3082,6 +3100,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sorted_route_gather_and_accumulation_match_original_order() {
         const ROWS: usize = 3;
@@ -3175,6 +3194,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn unclamped_swiglu_pair_matches_cpu_and_preserves_capacity_tail() {
         const ROWS: usize = 2;

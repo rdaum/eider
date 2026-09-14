@@ -908,6 +908,7 @@ mod tests {
     use crate::{CudaStream, DeviceBuffer};
     use eider_format::SafeTensorShard;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
@@ -915,6 +916,7 @@ mod tests {
 
     const COLS: usize = 16;
 
+    #[serial]
     #[test]
     fn direct_paged_rows_match_numbered_bf16_tensors() {
         let path = fixture_path();
@@ -964,6 +966,7 @@ mod tests {
         fs::remove_file(path).expect("remove fixture");
     }
 
+    #[serial]
     #[test]
     fn asynchronous_reader_reuses_batches_after_cuda_gather() {
         let path = fixture_path();
@@ -1009,6 +1012,7 @@ mod tests {
         fs::remove_file(path).expect("remove fixture");
     }
 
+    #[serial]
     #[test]
     fn direct_paged_rows_scale_fp8_tensors() {
         let path = fixture_path();

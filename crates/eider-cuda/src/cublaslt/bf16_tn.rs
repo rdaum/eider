@@ -484,7 +484,9 @@ mod tests {
         prefill_gqa_attention_f32_into, unpack_heads_f32_into_on_stream,
     };
     use crate::{Sm12xKvCache, pack_token_heads_bf16_into_on_stream};
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn bf16_tn_matches_cpu_reference() {
         const M: usize = 96;
@@ -533,6 +535,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_tn_bf16_output_matches_cpu_reference() {
         const M: usize = 64;
@@ -581,6 +584,7 @@ mod tests {
         assert_eq!(output.copy_to_host(&stream).expect("copy output"), expected);
     }
 
+    #[serial]
     #[test]
     fn tensor_core_gqa_matches_dense_prefill_attention() {
         const TOKENS: usize = 8;

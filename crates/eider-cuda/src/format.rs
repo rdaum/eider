@@ -447,13 +447,16 @@ pub fn e2m1_oracle_values() -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn packs_e2m1_low_nibble_first() {
         assert_eq!(pack_e2m1(&[1.0, -1.0]), vec![0xa2]);
         assert_eq!(pack_e2m1(&[1.0, 0.0, -1.0]), vec![0x02, 0x0a]);
     }
 
+    #[serial]
     #[test]
     fn decodes_e8m0_powers_of_two_and_nan() {
         assert_eq!(e8m0_value(126), 0.5);
@@ -462,6 +465,7 @@ mod tests {
         assert!(e8m0_value(u8::MAX).is_nan());
     }
 
+    #[serial]
     #[test]
     fn ue4m3_encoder_matches_cuda_for_positive_scales() {
         for value in [
@@ -475,6 +479,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn signed_e4m3_encoder_round_trips_sign() {
         for value in [-448.0, -3.5, -0.25, 0.0, 0.25, 3.5, 448.0] {
@@ -484,6 +489,7 @@ mod tests {
         assert_eq!(e4m3_code(f32::NAN), 0);
     }
 
+    #[serial]
     #[test]
     fn quantizes_per_sixteen_value_block() {
         let values = (0..20).map(|i| (i as f32) - 10.0).collect::<Vec<_>>();
@@ -496,6 +502,7 @@ mod tests {
         assert_eq!(quantized.dequantized_values.len(), 20);
     }
 
+    #[serial]
     #[test]
     fn e2m1_matches_cuda_header_conversion() {
         for value in e2m1_oracle_values() {
@@ -508,6 +515,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn ue4m3_scale_layout_uses_cublaslt_tile_order() {
         assert_eq!(ue4m3_scale_layout_len(128, 128), 1024);

@@ -359,6 +359,7 @@ unsafe impl DeferredBackend for InlineBackend {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -396,6 +397,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn inline_submission_retains_resources_until_reclaim() {
         let mut recording = Recording::new(InlineBackend, vec![1_u32, 2, 3], "inline").unwrap();
@@ -407,6 +409,7 @@ mod tests {
         assert_eq!(submission.try_reclaim().ok().unwrap(), [1, 7, 3]);
     }
 
+    #[serial]
     #[test]
     fn submission_grouping_flushes_only_non_empty_tails() {
         let policy = SubmissionGroupPolicy::new(NonZeroUsize::new(2).unwrap());
@@ -419,6 +422,7 @@ mod tests {
         assert_eq!(grouping.pending_groups(), 0);
     }
 
+    #[serial]
     #[test]
     fn segmented_recording_retains_resources_behind_latest_fence() {
         let mut recording = Recording::new(InlineBackend, vec![1_u32], "first").unwrap();
@@ -431,6 +435,7 @@ mod tests {
         assert_eq!(submission.try_reclaim().ok().unwrap(), [1, 2, 3]);
     }
 
+    #[serial]
     #[test]
     fn dropping_eager_owners_waits_before_releasing_resources() {
         let backend = EagerDropBackend::default();

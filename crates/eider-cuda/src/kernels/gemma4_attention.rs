@@ -167,7 +167,9 @@ impl Gemma4LocalPrefillAttention {
 mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn local_attention_respects_causal_sliding_window() {
         let query_tokens = 65;
@@ -216,6 +218,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn local_attention_matches_cpu_reference() {
         let query_tokens = 5;
@@ -309,6 +312,7 @@ mod tests {
         assert!(max_error <= 0.04, "max attention error={max_error}");
     }
 
+    #[serial]
     #[test]
     fn compact_attention_matches_unpacked_cache() {
         let query_tokens = 65;

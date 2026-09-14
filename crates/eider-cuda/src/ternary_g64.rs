@@ -667,6 +667,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn synthetic_gguf(rows: usize, cols: usize) -> Vec<u8> {
         let groups = rows * (cols / TERNARY_G64_GROUP_SIZE);
@@ -686,6 +687,7 @@ mod tests {
         raw
     }
 
+    #[serial]
     #[test]
     fn imports_mainline_q2_0_g64_blocks_without_dequantizing_codes() {
         let linear =
@@ -705,6 +707,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn rejects_nonternary_code_three() {
         let mut raw = synthetic_gguf(1, 64);
@@ -714,6 +717,7 @@ mod tests {
         assert!(error.to_string().contains("reserved code 3"));
     }
 
+    #[serial]
     #[test]
     fn concatenates_rows_without_repacking_groups() {
         let left =
@@ -736,6 +740,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn gpu_row_lookup_matches_imported_weights() {
         const ROWS: usize = 7;
@@ -762,6 +767,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn gpu_matches_group_scaled_integer_reference_at_bonsai_hidden_shape() {
         const ROWS: usize = 4_096;
@@ -848,6 +854,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn tiled_gpu_projection_matches_reference_with_batch_and_row_tails() {
         const ROWS: usize = 37;
@@ -906,6 +913,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn bf16_tensor_prefill_matches_rounded_dense_reference() {
         const ROWS: usize = 96;
@@ -971,6 +979,7 @@ mod tests {
         assert_eq!(matrix.device_bytes(), packed_bytes + ROWS * COLS * 2);
     }
 
+    #[serial]
     #[test]
     fn nvfp4_tensor_prefill_tracks_ternary_dense_reference_for_unaligned_batch() {
         const ROWS: usize = 128;

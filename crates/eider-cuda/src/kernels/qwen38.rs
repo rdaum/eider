@@ -1159,7 +1159,9 @@ mod tests {
     };
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{CudaStream, DeviceBuffer};
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn qsa_paged_selector_matches_released_micro_block_formula() {
         assert_qsa_paged_selector(2_059, 2_176);
@@ -1324,6 +1326,7 @@ mod tests {
         assert_eq!(&*tiles_actual, &tiles_expected);
     }
 
+    #[serial]
     #[test]
     fn qsa_append_only_key_matches_selector_append() {
         const HEADS: usize = 4;
@@ -1417,6 +1420,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qsa_batched_index_key_append_matches_individual_rows() {
         const HEADS: usize = 4;
@@ -1476,6 +1480,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qsa_batched_sparse_selection_matches_individual_rows() {
         const HEADS: usize = 4;
@@ -1670,6 +1675,7 @@ mod tests {
         output
     }
 
+    #[serial]
     #[test]
     fn hyperconnection_elementwise_kernels_match_cpu_formula() {
         const TOKENS: usize = 2;
@@ -1819,6 +1825,7 @@ mod tests {
         assert_close(&activation_actual, &activation_expected, 2e-5);
     }
 
+    #[serial]
     #[test]
     fn ple_gate_and_dilated_convolution_match_cpu_formula() {
         const TOKENS: usize = 3;

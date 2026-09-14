@@ -1785,7 +1785,9 @@ impl<T> Drop for DeviceBuffer<T> {
 mod tests {
     use super::{CapturedGraph, CudaStream, DeviceBuffer, PinnedHostBuffer};
     use crate::fill_f32_into_on_stream;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn zeroed_allocation_is_ready_for_a_non_blocking_stream() {
         let stream = CudaStream::new_non_blocking().expect("CUDA stream");
@@ -1799,6 +1801,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn device_prefix_copy_reads_only_the_requested_values() {
         let stream = CudaStream::new_blocking().expect("CUDA stream");
@@ -1817,6 +1820,7 @@ mod tests {
         assert!(error.to_string().contains("at most 4 values"));
     }
 
+    #[serial]
     #[test]
     fn device_prefix_copy_reuses_pinned_host_memory() {
         let stream = CudaStream::new_non_blocking().expect("CUDA stream");
@@ -1837,6 +1841,7 @@ mod tests {
         assert_eq!(&host.as_slice()[2..], [0, 0]);
     }
 
+    #[serial]
     #[test]
     fn captured_graph_retains_its_device_buffer() {
         let stream = CudaStream::new_non_blocking().expect("CUDA stream");
@@ -1855,6 +1860,7 @@ mod tests {
         assert_eq!(values.as_slice(), [3.0]);
     }
 
+    #[serial]
     #[test]
     fn host_prefix_copy_preserves_the_device_suffix() {
         let stream = CudaStream::new_blocking().expect("CUDA stream");

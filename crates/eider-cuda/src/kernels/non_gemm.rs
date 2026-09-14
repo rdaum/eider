@@ -14747,7 +14747,9 @@ mod tests {
     use super::*;
     use crate::format::{bf16_to_f32, f32_to_bf16};
     use crate::{F32Matrix, synchronize_device};
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn grouped_gemv_address_gather_selects_typed_tables() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -14851,6 +14853,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn grammar_mask_applies_independent_rows_and_partial_words() {
         let cols = 35usize;
@@ -14886,6 +14889,7 @@ mod tests {
         assert!(masked[cols + 33].is_infinite() && masked[cols + 33].is_sign_negative());
     }
 
+    #[serial]
     #[test]
     fn dflash2_capture_interleaves_target_taps_by_row() {
         let input = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0]).expect("input");
@@ -14901,6 +14905,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn dflash2_grouped_convolution_resets_at_each_block() {
         let input =
@@ -14937,6 +14942,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn dflash2_attention_reads_future_proposal_rows() {
         let query = DeviceBuffer::from_host(&[1.0f32, 1.0]).expect("query");
@@ -14968,6 +14974,7 @@ mod tests {
         assert!((output[0] - output[1]).abs() < 1.0e-6);
     }
 
+    #[serial]
     #[test]
     fn dflash2_attention_matches_wrapped_multi_tile_reference() {
         let rows = 3;
@@ -15065,6 +15072,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn copies_active_rows_into_interleaved_feature_columns() {
         let input = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("input");
@@ -15081,6 +15089,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn active_prefix_elementwise_ops_preserve_padding() {
         let left = DeviceBuffer::from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0]).expect("left");
@@ -15155,6 +15164,7 @@ mod tests {
         assert_eq!(&actual[4..], [99.0, 99.0]);
     }
 
+    #[serial]
     #[test]
     fn moe_routes_are_grouped_by_expert_on_device() {
         let indices = DeviceBuffer::from_host(&[3u32, 1, 3, 0, 1, 2, 3, 2]).expect("route indices");
@@ -15195,6 +15205,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sorted_bf16_moe_accumulation_matches_route_order() {
         let rows = 2;
@@ -15265,6 +15276,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn speculative_acceptance_stops_at_first_mismatch_and_returns_bonus() {
         const SEQUENCES: usize = 3;
@@ -15316,6 +15328,7 @@ mod tests {
         drop(previous);
     }
 
+    #[serial]
     #[test]
     fn bf16_state_snapshot_selection_stays_on_device() {
         const SEQUENCES: usize = 3;
@@ -15364,6 +15377,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nemotron3_mamba_decode_matches_cpu_reference() {
         const HEADS: usize = 4;
@@ -15546,6 +15560,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn nemotron3_mamba_chunks_match_repeated_one_token_updates() {
         const HEADS: usize = 4;
@@ -15794,6 +15809,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nemotron3_sigmoid_topk_matches_grouped_cpu_reference() {
         const EXPERTS: usize = 512;
@@ -15887,6 +15903,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn nemotron3_sigmoid_topk_batch_matches_independent_rows() {
         const ROWS: usize = 3;
@@ -15966,6 +15983,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn relu_squared_matches_cpu_reference() {
         let values = [-3.0, -0.0, 0.25, 2.0, 7.5];
@@ -15980,6 +15998,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn clamped_silu_halves_matches_step_reference_for_single_and_batch_rows() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -16030,6 +16049,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn expert_indices_remap_through_device_slot_table() {
         let indices = DeviceBuffer::from_host(&[3u32, 0, 4, 9]).expect("indices");
@@ -16044,6 +16064,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn expert_indices_remap_accepts_source_offset() {
         let indices = DeviceBuffer::from_host(&[99u32, 3, 0, 4, 9, 99]).expect("indices");
@@ -16058,6 +16079,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn expert_usage_histogram_accumulates_and_clears_on_device() {
         let first = DeviceBuffer::from_host(&[3u32, 0, 3, 7, 1]).expect("first indices");
@@ -16078,6 +16100,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn indexed_f32_gather_multiply_stays_on_device() {
         let values = DeviceBuffer::from_host(&[0.25f32, -2.0, 4.0, 8.0]).expect("values");
@@ -16099,6 +16122,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn gpu_token_sampler_keeps_logits_on_device_and_applies_penalties() {
         let vocab = 64usize;
@@ -16151,6 +16175,7 @@ mod tests {
         assert_eq!(counts[2], 2);
     }
 
+    #[serial]
     #[test]
     fn gpu_token_top_k_candidates_match_cpu_ordering() {
         let vocab = 35_000usize;
@@ -16193,6 +16218,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[serial]
     #[test]
     fn dflash2_hidden_projection_matches_cpu_reference() {
         const ROWS: usize = 2;
@@ -16247,6 +16273,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn dflash2_device_selector_follows_the_selected_predecessor() {
         let bf16 = |values: &[f32]| values.iter().copied().map(f32_to_bf16).collect::<Vec<_>>();
@@ -16288,6 +16315,7 @@ mod tests {
         assert_eq!(&*tokens, [0, 2, 1]);
     }
 
+    #[serial]
     #[test]
     fn gpu_token_sampler_reduces_candidates_across_multiple_stages() {
         let vocab = 35_000usize;
@@ -16369,6 +16397,7 @@ mod tests {
         assert_eq!(sampled[1].id, 2_001, "equal logits prefer the lower ID");
     }
 
+    #[serial]
     #[test]
     fn rms_norm_f32_matches_cpu_reference() {
         let rows = 3;
@@ -16417,6 +16446,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn silu_mul_f32_matches_cpu_reference() {
         let gate = (0..257)
@@ -16447,6 +16477,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn gelu_tanh_f32_matches_cpu_reference() {
         let input = (0..513)
@@ -16470,6 +16501,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn gelu_tanh_mul_f32_matches_cpu_reference() {
         let gate = (0..513)
@@ -16502,6 +16534,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn gelu_tanh_mul_halves_matches_cpu_reference() {
         let len = 513;
@@ -16534,6 +16567,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn split_q_gate_f32_matches_cpu_reference() {
         let len = 257usize;
@@ -16567,6 +16601,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sigmoid_mul_f32_matches_cpu_reference() {
         let len = 257usize;
@@ -16605,6 +16640,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sigmoid_scale_scalar_f32_matches_cpu_reference() {
         let len = 257usize;
@@ -16638,6 +16674,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn softplus_scale_heads_f32_matches_cpu_reference() {
         let heads = 3usize;
@@ -16679,6 +16716,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_full_attn_prep_f32_matches_cpu_reference() {
         let q_heads = 3usize;
@@ -16747,6 +16785,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_full_attn_prep_batch_matches_independent_rows() {
         let batch = 2usize;
@@ -16814,6 +16853,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn moe_topk_f32_matches_cpu_reference() {
         let logits = [0.0f32, 3.0, 1.0, 2.0];
@@ -16874,6 +16914,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn step37_sigmoid_top8_matches_cpu_reference() {
         let logits = (0..288)
@@ -16930,6 +16971,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn step37_sigmoid_top8_batch_matches_independent_rows() {
         const EXPERTS: usize = 288;
@@ -16994,6 +17036,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn moe_top8_norm256_orders_ties_by_expert_index() {
         let mut logits = vec![-10.0f32; 256];
@@ -17021,6 +17064,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn moe_top10_norm512_batch_matches_cpu_reference() {
         const ROWS: usize = 2;
@@ -17118,6 +17162,7 @@ mod tests {
     }
 
     #[cfg(feature = "cuda-oxide")]
+    #[serial]
     #[test]
     fn oxide_contiguous_moe_accumulation_matches_cpu_reference() {
         const ROWS: usize = 2;
@@ -17159,6 +17204,7 @@ mod tests {
     }
 
     #[cfg(feature = "cuda-oxide")]
+    #[serial]
     #[test]
     fn oxide_qwen36_batch_finalize_matches_composed_reference() {
         const ROWS: usize = 2;
@@ -17206,6 +17252,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn moe_topk_batch_matches_independent_rows() {
         let rows = 3usize;
@@ -17256,6 +17303,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn rope_neox_f32_matches_cpu_reference() {
         let rows = 5;
@@ -17291,6 +17339,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn rope_neox_sequence_f32_matches_cpu_reference() {
         let tokens = 3;
@@ -17342,6 +17391,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn rope_neox_partial_sequence_f32_matches_cpu_reference() {
         let tokens = 3;
@@ -17394,6 +17444,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_neox_proportional_sequence_at_offset_matches_cpu_reference() {
         let capacity = 5;
@@ -17451,6 +17502,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn dual_rms_norm_rope_sequence_matches_staged_operations() {
         let capacity = 5;
@@ -17581,6 +17633,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn moe_gather_rms_norm_quantization_matches_staged_rows() {
         let rows = 3;
@@ -17651,6 +17704,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_neox_partial_f32_matches_cpu_reference() {
         let rows = 3usize;
@@ -17689,6 +17743,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_neox_proportional_f32_matches_cpu_reference() {
         let rows = 3usize;
@@ -17728,6 +17783,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_imrope_f32_matches_cpu_reference() {
         // Qwen3.6 full-attention: head_dim=256, partial_rotary=0.25 -> rotary_dim=64,
@@ -17777,6 +17833,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_imrope_text_positions_match_standard_partial_rope() {
         let rows = 16usize;
@@ -17819,6 +17876,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_imrope_text_batch_matches_per_row_partial_rope() {
         let batch_size = 3usize;
@@ -17873,6 +17931,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rope_imrope_extra_section_is_identity() {
         // When extra section has nonzero size and pos_extra=0, pairs in the
@@ -17942,6 +18001,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn add_f32_matches_cpu_reference() {
         let left = (0..513)
@@ -17970,6 +18030,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn concat_f32_rows_matches_cpu_reference() {
         const ROWS: usize = 3;
@@ -18007,6 +18068,7 @@ mod tests {
         assert_eq!(actual.as_ref(), expected.as_slice());
     }
 
+    #[serial]
     #[test]
     fn increment_u32_matches_cpu_reference() {
         let mut values = DeviceBuffer::from_host(&[0u32, 7, u32::MAX - 1]).expect("upload");
@@ -18016,6 +18078,7 @@ mod tests {
         assert_eq!(actual.as_ref(), &[2, 9, 0]);
     }
 
+    #[serial]
     #[test]
     fn store_u32_column_writes_sequence_major_drafts() {
         let input = DeviceBuffer::from_host(&[11u32, 21, 31]).expect("input upload");
@@ -18030,6 +18093,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn prepend_u32_rows_interleaves_sequence_inputs() {
         let first = DeviceBuffer::from_host(&[10u32, 20, 30]).expect("first upload");
@@ -18045,6 +18109,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn moe_weighted_accumulate_batch_matches_independent_rows() {
         const ROWS: usize = 3;
@@ -18123,6 +18188,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sorted_f32_moe_accumulation_matches_route_order() {
         const ROWS: usize = 3;
@@ -18210,6 +18276,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_routed_ffn_finalize_matches_unfused_sequence() {
         let len = 2048;
@@ -18307,6 +18374,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     #[ignore = "CUDA graph capture must not run alongside parallel default-stream CUDA tests"]
     fn add_f32_replays_from_cuda_graph() {
@@ -18342,6 +18410,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     #[ignore = "CUDA graph capture must not run alongside parallel default-stream CUDA tests"]
     fn decode_primitives_replay_from_cuda_graph() {
@@ -18413,6 +18482,7 @@ mod tests {
         assert_eq!(&cache[len..], actual.as_slice());
     }
 
+    #[serial]
     #[test]
     fn layout_transpose_and_copy_row_match_cpu_reference() {
         let rows = 3;
@@ -18463,6 +18533,7 @@ mod tests {
         assert_eq!(row_stream, input[2 * cols..3 * cols]);
     }
 
+    #[serial]
     #[test]
     fn gather_group_row_matches_cpu_reference() {
         const GROUPS: usize = 3;
@@ -18496,6 +18567,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn copy_bf16_row_to_f32_indexed_matches_cpu_reference() {
         let rows = 4;
@@ -18567,6 +18639,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn copy_bf16_rows_to_f32_indexed_matches_cpu_reference() {
         let vocab_rows = 4;
@@ -18605,6 +18678,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn copy_fp8_rows_to_f32_indexed_applies_selected_row_scales() {
         let rows = 3;
@@ -18647,6 +18721,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn quantize_nvfp4_col_major_f32_device_matches_host_quantizer() {
         let rows = 96;
@@ -18678,6 +18753,7 @@ mod tests {
         assert_eq!(scales, expected.scales);
     }
 
+    #[serial]
     #[test]
     fn fused_rms_norm_nvfp4_quantization_matches_staged_path() {
         let rows = 3;
@@ -18746,6 +18822,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fused_rms_norm_residual_paths_match_staged_operations() {
         let rows = 3;
@@ -18862,6 +18939,7 @@ mod tests {
         assert_f32_buffers_close(&actual, &expected, &stream, 2.0e-6);
     }
 
+    #[serial]
     #[test]
     fn fused_gemma_rms_sequences_match_staged_operations() {
         let rows = 3;
@@ -19025,6 +19103,7 @@ mod tests {
         assert!(max_error <= tolerance, "max_error={max_error}");
     }
 
+    #[serial]
     #[test]
     fn fused_gelu_nvfp4_quantization_matches_staged_path() {
         let rows = 3;
@@ -19081,6 +19160,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fused_head_unpack_nvfp4_quantization_matches_staged_path() {
         let tokens = 5;
@@ -19157,6 +19237,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fused_bf16_head_unpack_nvfp4_quantization_matches_staged_path() {
         let tokens = 3;
@@ -19226,6 +19307,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn single_token_gqa_attention_f32_matches_cpu_reference() {
         let q_heads = 8;
@@ -19248,6 +19330,7 @@ mod tests {
         assert_eq!(output, expected);
     }
 
+    #[serial]
     #[test]
     fn append_rows_f32_writes_into_destination_offset() {
         let rows = 2;
@@ -19272,6 +19355,7 @@ mod tests {
         assert_eq!(dst, expected);
     }
 
+    #[serial]
     #[test]
     fn single_token_gqa_attention_f32_from_cache_reads_position() {
         let q_heads = 8;
@@ -19313,6 +19397,7 @@ mod tests {
         assert_eq!(output, expected);
     }
 
+    #[serial]
     #[test]
     fn cached_gqa_attention_f32_matches_cpu_reference() {
         let q_heads = 8;
@@ -19365,6 +19450,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn indexed_cached_gqa_attention_matches_qwen36_long_cache() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -19422,6 +19508,7 @@ mod tests {
         assert!(max_error <= 2.0e-5, "max error {max_error}");
     }
 
+    #[serial]
     #[test]
     fn indexed_decode_primitives_match_host_parameter_variants() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -19582,6 +19669,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn prefill_gqa_attention_f32_matches_cpu_reference() {
         let tokens = 3;
@@ -19643,6 +19731,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn ragged_gqa_attention_matches_independent_sequence_reference() {
         const SEQUENCES: usize = 2;
@@ -19872,6 +19961,7 @@ mod tests {
         assert_close(&paged_output, &expected, 2.0e-6, "ragged paged GQA");
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_argmax_f32_matches_cpu_reference() {
         let rows = 17;
@@ -19914,6 +20004,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_logits_f32_matches_cpu_reference() {
         let rows = 17;
@@ -19966,6 +20057,7 @@ mod tests {
         assert!((argmax.value - expected_argmax.1).abs() <= 1.0e-6);
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_supports_laguna_dense_down_width() {
         let rows = 2;
@@ -19985,6 +20077,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_wide_small_output_matches_reference() {
         let rows = 4;
@@ -20018,6 +20111,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_pair_matches_separate_projections() {
         let cols = 19usize;
@@ -20097,6 +20191,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_batch_matches_independent_rows() {
         let batch_size = 3usize;
@@ -20145,6 +20240,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_two_rows_matches_independent_rows_bitwise() {
         let rows = 7usize;
@@ -20192,6 +20288,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_exact_rows_matches_independent_rows_bitwise() {
         let batch_size = 4usize;
@@ -20241,6 +20338,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_exact_wide_rows_match_independent_rows_bitwise() {
         let batch_size = 4usize;
@@ -20290,6 +20388,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn bf16_linear_two_rows_matches_qwen_router_shape_bitwise() {
         let rows = 512usize;
@@ -20337,6 +20436,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn lm_head_top1_f32_batch_matches_materialized_logits_exactly() {
         let batch_size = 3usize;
@@ -20415,6 +20515,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn lm_head_top1_f32_matches_cpu_reference_small() {
         // Small case: rows not a multiple of 8 to exercise the padding path.
@@ -20473,6 +20574,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn lm_head_top1_f32_matches_cpu_reference_full_vocab() {
         // Full Qwen3 vocab/hidden shape, controlled max at row 12345.
@@ -20534,6 +20636,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn bf16_matrix_to_f32_matches_cpu_reference() {
         let rows = 7;
@@ -20554,6 +20657,7 @@ mod tests {
         assert_eq!(output, expected);
     }
 
+    #[serial]
     #[test]
     fn gated_delta_net_128_matches_cpu_reference() {
         let heads = 2usize;
@@ -20608,6 +20712,7 @@ mod tests {
         assert_close(&actual_state, &expected_state, 2.0e-6, "gdn state");
     }
 
+    #[serial]
     #[test]
     fn ling3_kda_primitives_match_cpu_reference() {
         let heads = 2usize;
@@ -20713,6 +20818,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn ling3_chunked_gate_and_recurrence_match_repeated_tokens() {
         const ROWS: usize = 3;
@@ -20884,6 +20990,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn ling3_kda_prep_matches_causal_convolution_reference() {
         let heads = 2usize;
@@ -20948,6 +21055,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn ling3_contiguous_prep_matches_repeated_causal_convolution() {
         const ROWS: usize = 5;
@@ -21025,6 +21133,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn ling3_mla_pack_and_attention_match_cpu_reference() {
         let heads = 2usize;
@@ -21274,6 +21383,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_paired_batch_gates_match_separate_inputs() {
         let rows = 3usize;
@@ -21393,6 +21503,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn gated_delta_net_128_matches_cpu_after_long_recurrence() {
         let heads = 2usize;
@@ -21453,6 +21564,7 @@ mod tests {
         assert_close(&actual_state, &expected_state, 3.0e-5, "long GDN state");
     }
 
+    #[serial]
     #[test]
     fn qwen36_batched_gdn_matches_independent_sequence_updates() {
         let batch_size = 2usize;
@@ -21702,6 +21814,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn qwen36_chunked_gdn_matches_repeated_sequence_updates() {
         let tokens = 6usize;
@@ -21878,6 +21991,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_short_chunk_recurrence_is_bit_exact_to_single_token_batch() {
         let tokens = 3usize;
@@ -21985,6 +22099,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_long_chunk_recurrence_matches_cpu_reference() {
         let tokens = 1024usize;
@@ -22059,6 +22174,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn channel_scaled_bf16_to_fp8_quantization_uses_row_scales() {
         let rows = 2usize;
@@ -22097,6 +22213,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fp8_linear_schedules_match_cpu_reference() {
         let rows = 5usize;
@@ -22143,6 +22260,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn fp8_linear_batch_matches_independent_rows() {
         let batch = 3usize;
@@ -22193,6 +22311,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn fp8_channel_scaled_linear_batch_matches_independent_rows() {
         let batch = 3usize;
@@ -22247,6 +22366,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn segmented_fp8_linears_match_cpu_reference() {
         let cols = 7usize;
@@ -22346,6 +22466,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn fp8_linear_channel_scales_match_cpu_reference() {
         let rows = 5usize;
@@ -22385,6 +22506,7 @@ mod tests {
         assert_close(&output, &expected, 2.0e-6, "channel-scaled FP8 linear");
     }
 
+    #[serial]
     #[test]
     fn fp8_linear_dynamic_channel_scales_match_cpu_reference() {
         let rows = 5usize;
@@ -22480,6 +22602,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fp8_grouped_moe_matches_quantized_cpu_reference() {
         let experts = 3usize;
@@ -22711,6 +22834,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nvfp4_w4a16_warp_row_schedules_match_block_per_row() {
         let rows = 37usize;
@@ -22771,6 +22895,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nvfp4_w4a16_batch_matches_independent_rows() {
         let batch = 3usize;
@@ -22832,6 +22957,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nvfp4_grouped_inputs_match_independent_shared_inputs() {
         const BATCH: usize = 3;
@@ -22958,6 +23084,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nvfp4_w4a16_top1_matches_matvec_argmax() {
         let rows = 17usize;
@@ -23026,6 +23153,7 @@ mod tests {
         assert!((actual_value - expected.1).abs() <= 1.0e-5);
     }
 
+    #[serial]
     #[test]
     fn nvfp4_w4a16_grouped_matvec_matches_cpu_reference() {
         let experts = 3usize;
@@ -23124,6 +23252,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn nvfp4_w4a16_grouped_matvec_rejects_excess_shared_memory() {
         let max_shared_memory_bytes =
@@ -23165,6 +23294,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn qwen36_gdn_prep_matches_cpu_reference() {
         let key_heads = 1usize;
@@ -23294,6 +23424,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn qwen36_gdn_gate_matches_cpu_reference() {
         let heads = 4usize;
@@ -23344,6 +23475,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn gated_rms_norm_f32_matches_cpu_reference() {
         let rows = 3usize;
@@ -23385,6 +23517,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn gated_rms_norm_nvfp4_quantization_matches_staged_path() {
         let rows = 2usize;
@@ -23460,6 +23593,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn ling3_sigmoid_gated_rms_norm_matches_cpu_reference() {
         let rows = 3usize;

@@ -14,6 +14,7 @@ eider-format.workspace = true
 
 [dev-dependencies]
 micromeasure.workspace = true
+serial_test.workspace = true
 
 [[bench]]
 name = "fp4_cublaslt"

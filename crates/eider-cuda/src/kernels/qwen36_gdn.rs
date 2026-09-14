@@ -574,6 +574,7 @@ mod tests {
         chunk_output, gate_prefix_sum, propagate_chunk_state, recurrent_reference,
         solve_wy_transform, strict_lower_key_gram, transformed_w_u,
     };
+    use serial_test::serial;
 
     const TOKENS: usize = CHUNK_TOKENS;
     const VECTORS: usize = TOKENS * HEADS * HEAD_DIM;
@@ -822,6 +823,7 @@ mod tests {
         (prefix, lower, transform, w, u)
     }
 
+    #[serial]
     #[test]
     fn native_cumsum_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -835,6 +837,7 @@ mod tests {
         assert_close("cumsum", &actual, &expected, 1.0e-6);
     }
 
+    #[serial]
     #[test]
     fn native_kkt_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -849,6 +852,7 @@ mod tests {
         assert_close("KKT", &actual, &expected, 2.0e-4);
     }
 
+    #[serial]
     #[test]
     fn native_solve_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -862,6 +866,7 @@ mod tests {
         assert_close("WY solve", &actual, &expected, 2.0e-3);
     }
 
+    #[serial]
     #[test]
     fn native_wu_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -875,6 +880,7 @@ mod tests {
         assert_close("U", &actual_u, &expected_u, 4.0e-3);
     }
 
+    #[serial]
     #[test]
     fn native_h_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -911,6 +917,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn native_output_matches_cpu_stage() {
         let mut fixture = Fixture::new();
@@ -956,6 +963,7 @@ mod tests {
         assert_close("output", &actual, &expected, 8.0e-3);
     }
 
+    #[serial]
     #[test]
     fn native_ragged_chunks_match_recurrent_reference() {
         let lengths = [65usize, 17];

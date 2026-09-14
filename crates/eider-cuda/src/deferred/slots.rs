@@ -267,6 +267,7 @@ impl<B: DeferredBackend, R> BoundedExecutionSlots<B, R> {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -350,6 +351,7 @@ mod tests {
         generation: usize,
     }
 
+    #[serial]
     #[test]
     fn slots_apply_backpressure_and_recycle_observed_completion() {
         let backend = ManualBackend::default();
@@ -400,6 +402,7 @@ mod tests {
         assert_eq!(slots.status(0), Some(ExecutionSlotStatus::Completed));
     }
 
+    #[serial]
     #[test]
     fn failures_restore_deferred_resources() {
         let backend = ManualBackend::default();
@@ -426,6 +429,7 @@ mod tests {
         assert_eq!(slots.status(0), Some(ExecutionSlotStatus::Ready));
     }
 
+    #[serial]
     #[test]
     fn eager_recording_failure_retains_resources_until_completion() {
         let backend = ManualEagerBackend::default();
@@ -457,6 +461,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn inline_backend_uses_the_same_slot_lifecycle() {
         let mut slots = BoundedExecutionSlots::new(InlineBackend, [3_u32]).unwrap();

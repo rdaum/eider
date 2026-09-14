@@ -1460,6 +1460,7 @@ mod tests {
     use super::*;
     use crate::format;
     use crate::synchronize_device;
+    use serial_test::serial;
 
     struct Lcg(u64);
 
@@ -1540,6 +1541,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn qwen3_4b_inference_shapes_match_dense_layer_dimensions() {
         assert_eq!(
@@ -1568,21 +1570,25 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn randomized_quantized_fp4_tn_64_square() {
         assert_fp4_tn_matches_quantized_reference(64, 64, 64);
     }
 
+    #[serial]
     #[test]
     fn randomized_quantized_fp4_tn_128_square() {
         assert_fp4_tn_matches_quantized_reference(128, 128, 128);
     }
 
+    #[serial]
     #[test]
     fn randomized_quantized_fp4_tn_partial_scale_tiles() {
         assert_fp4_tn_matches_quantized_reference(96, 80, 96);
     }
 
+    #[serial]
     #[test]
     fn randomized_quantized_fp4_tn_f32_output() {
         let m = 64;
@@ -1643,6 +1649,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn randomized_cutlass_fp4_gemv_f32_output() {
         let m = 64;
@@ -1704,6 +1711,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn randomized_cutlass_fp4_grouped_gemv_f32_output() {
         let m = 64;
@@ -1811,6 +1819,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn randomized_cutlass_fp4_grouped_gemm_bf16_output() {
         let m = 128;
@@ -1934,6 +1943,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn randomized_cutlass_fp4_grouped_gemv_large_k_f32_output() {
         let m = 1024;
@@ -2025,6 +2035,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     #[ignore = "CUDA graph capture must not run alongside parallel default-stream CUDA tests"]
     fn fp4_tn_matmul_replays_from_cuda_graph() {
@@ -2079,6 +2090,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     #[ignore = "diagnostic probe for cuBLASLt FP4 output type support"]
     fn probe_fp4_tn_output_type_support() {

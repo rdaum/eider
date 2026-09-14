@@ -1068,7 +1068,9 @@ fn read_f32(reader: &mut impl Read) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn repacks_modelopt_rows_into_m16_k16_tiles() {
         let out_features = 16;
@@ -1107,6 +1109,7 @@ mod tests {
         assert_eq!(tiled.global_scale, 0.5);
     }
 
+    #[serial]
     #[test]
     fn prepared_cache_round_trips() {
         let source = ModelOptNvfp4Linear {

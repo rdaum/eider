@@ -2207,7 +2207,9 @@ mod tests {
     use super::*;
     use crate::F32Matrix;
     use crate::format::f32_to_bf16;
+    use serial_test::serial;
 
+    #[serial]
     #[test]
     fn sm12x_mma_zero_probe_runs() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2217,6 +2219,7 @@ mod tests {
         assert_eq!(actual, vec![0.0; 4]);
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_one_probe_accumulates_k64() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2228,6 +2231,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_tile_frag_host_images_accumulate_k64() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2241,6 +2245,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 128.0));
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_tile_frag_host_images_match_scaled_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2254,6 +2259,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 256.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_tile_frag_kloop_accumulates_two_tiles() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2269,6 +2275,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 384.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_tile_kloop_writes_logical_m16n8() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2284,6 +2291,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 384.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_tile_rows_are_final_storage_order() {
         let mut rows = [[0u8; 16]; 32];
@@ -2298,6 +2306,7 @@ mod tests {
         assert_eq!(tile.as_slice()[31 * 16 + 15], 511u16 as u8);
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_tile_rows_feed_mma_directly() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2314,6 +2323,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 128.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_ldmatrix_probe_loads_nonzero_registers() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2323,6 +2333,7 @@ mod tests {
         assert!(actual.iter().any(|value| *value != 0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_tile_basis_rows_sum_to_full_tile() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2352,6 +2363,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_tile_nonuniform_rows_are_deterministic() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2380,6 +2392,7 @@ mod tests {
         assert!(actual_a.contains(&96.0), "{actual_a:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_gemv_accumulates_m_and_k_tiles() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2403,6 +2416,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_gemv_preserves_m_tile_independence() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2424,6 +2438,7 @@ mod tests {
         assert!(actual[16..].iter().all(|value| *value == 0.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_owned_weight_gemv_matches_native_gemv() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2458,6 +2473,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sm12x_native_value_generation_feeds_gemv() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2485,6 +2501,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 128.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_packed_row_major_generation_feeds_gemv() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2503,6 +2520,7 @@ mod tests {
         assert!(actual.iter().all(|value| *value == 128.0), "{actual:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_qwen_gate_up_shape_matches_quantized_reference() {
         assert_sm12x_shape_matches_quantized_reference(
@@ -2512,6 +2530,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sm12x_qwen_down_shape_matches_quantized_reference() {
         assert_sm12x_shape_matches_quantized_reference(
@@ -2521,6 +2540,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn sm12x_indexed_grouped_gemv_matches_quantized_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2594,6 +2614,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sorted_bf16_moe_quantization_is_an_exact_permutation() {
         const ROWS: usize = 128;
@@ -2742,6 +2763,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_modelopt_uniform_scales_pack_to_k16_words() {
         let mut scales = vec![0u8; 32 * 8];
@@ -2754,6 +2776,7 @@ mod tests {
         assert_eq!(words, vec![0x3b3a3938, 0x43424140, 0x3b3a3938, 0x43424140]);
     }
 
+    #[serial]
     #[test]
     fn sm12x_modelopt_nonuniform_row_scales_are_rejected() {
         let mut scales = vec![0x38u8; 16 * 4];
@@ -2762,6 +2785,7 @@ mod tests {
         assert!(format!("{err}").contains("non-uniform scale"));
     }
 
+    #[serial]
     #[test]
     fn sm12x_modelopt_row_scale_words_preserve_each_m16_row() {
         let m = 32;
@@ -2785,6 +2809,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_row_scaled_grouped_gemv_matches_per_row_cpu_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -2873,6 +2898,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_residual_activation_improves_grouped_gemv_accuracy() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3069,6 +3095,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_requantized_f32_gemv_matches_cpu_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3107,6 +3134,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_mma_varied_b_rows_match_shared_scale_cpu_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3182,6 +3210,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_sfa_lane_mapping_matches_m16_rows() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3206,6 +3235,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_fixed_scale_quantized_vector_matches_cpu_reference() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3259,6 +3289,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn sm12x_indexed_gemv_selects_expert_tables() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3320,6 +3351,7 @@ mod tests {
         assert!(actual1.iter().all(|value| *value == 0.0), "{actual1:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_indexed_grouped_gemv_uses_per_group_b_vectors() {
         let stream = CudaStream::new_non_blocking().expect("stream");
@@ -3375,6 +3407,7 @@ mod tests {
         assert!(actual1.iter().all(|value| *value == 0.0), "{actual1:?}");
     }
 
+    #[serial]
     #[test]
     fn sm12x_owned_weight_rejects_shape_mismatch() {
         let err = Sm12xFp4GemmWeight::from_native_tiles(
@@ -3387,6 +3420,7 @@ mod tests {
         assert!(format!("{err}").contains("SM12x FP4 GEMV weight"));
     }
 
+    #[serial]
     #[test]
     fn sm12x_cache_validation_rejects_truncated_file() {
         let directory = std::env::temp_dir().join(format!(

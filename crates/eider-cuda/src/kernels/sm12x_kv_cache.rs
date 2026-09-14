@@ -3371,6 +3371,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use crate::format::bf16_to_f32;
 
@@ -3440,6 +3441,7 @@ mod tests {
         (code, crate::format::e4m3_value(code))
     }
 
+    #[serial]
     #[test]
     fn pv_split_policy_uses_measured_crossover() {
         assert_eq!(pv_split_count(1), 1);
@@ -3451,6 +3453,7 @@ mod tests {
         assert_eq!(pv_split_count(131_072), PV_SPLIT_CAPACITY);
     }
 
+    #[serial]
     #[test]
     fn aligned_prefix_copy_preserves_attention_across_capacities() {
         const TOKENS: usize = 128;
@@ -3514,6 +3517,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn paged_attention_matches_contiguous_cache_across_page_boundaries() {
         const TOKENS: usize = 257;
@@ -3785,6 +3789,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn compact_append_matches_k_and_transposed_v_reference_with_tails() {
         const MAX_TOKENS: usize = 65;
@@ -3959,6 +3964,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[test]
     fn speculative_tail_snapshot_restores_rows_overwritten_by_wraparound() {
         const MAX_TOKENS: usize = 32;
@@ -4058,6 +4064,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn paged_speculative_tail_snapshot_restores_muse_shaped_attention() {
         const PREFIX: usize = 3;
@@ -4182,6 +4189,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn paged_causal_rows_match_repeated_muse_shaped_attention_across_pages() {
         const PREFIX: usize = 123;
@@ -4314,6 +4322,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn paged_causal_rows_match_repeated_qsa_attention_at_512_tokens() {
         const PREFIX: usize = 504;
@@ -4437,6 +4446,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn fixed_window_row_attention_tracks_independent_full_cache_attention() {
         const TOKENS: usize = 6;
@@ -4518,6 +4528,7 @@ mod tests {
         assert!(max_abs <= 0.25, "fixed-window max_abs={max_abs}");
     }
 
+    #[serial]
     #[test]
     fn compact_causal_rows_match_repeated_append_and_attention() {
         const MAX_TOKENS: usize = 32;
@@ -4623,6 +4634,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn compact_causal_rows_support_step_sliding_gqa() {
         const MAX_TOKENS: usize = 32;
@@ -4711,6 +4723,7 @@ mod tests {
         assert_eq!(chunk_cache.len(), repeated_cache.len());
     }
 
+    #[serial]
     #[test]
     fn compact_mma_attention_tracks_f32_gqa_through_incomplete_tails() {
         const MAX_TOKENS: usize = 64;
@@ -4775,6 +4788,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn indexed_compact_append_and_attention_match_host_positions() {
         const MAX_TOKENS: usize = 64;
@@ -4845,6 +4859,7 @@ mod tests {
         assert!(max_abs <= 1.0e-6, "indexed attention max_abs={max_abs}");
     }
 
+    #[serial]
     #[test]
     fn compact_mma_attention_window_ignores_older_tokens() {
         const MAX_TOKENS: usize = 64;
@@ -4911,6 +4926,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn compact_mma_attention_tracks_f32_gqa_at_nemotron_shape() {
         const MAX_TOKENS: usize = 128;
@@ -4975,6 +4991,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn compact_mma_attention_tracks_f32_gqa_at_bitnet_shape_and_context() {
         const TOKENS: usize = 4_016;
@@ -5035,6 +5052,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn dense_row_offsets_match_independent_cache_and_attention() {
         const MAX_TOKENS: usize = 4;
@@ -5114,6 +5132,7 @@ mod tests {
         assert_eq!(&*direct_output, &offset_output[q_width..]);
     }
 
+    #[serial]
     #[test]
     fn compact_cache_unpacks_to_bf16_tensor_core_layouts() {
         const TOKENS: usize = 19;
@@ -5185,6 +5204,7 @@ mod tests {
         assert!(max_value_error < 0.20, "value max error {max_value_error}");
     }
 
+    #[serial]
     #[test]
     fn paged_compact_cache_unpack_matches_contiguous_across_page_boundary() {
         const TOKENS: usize = SM12X_KV_PAGE_TOKENS + 13;
