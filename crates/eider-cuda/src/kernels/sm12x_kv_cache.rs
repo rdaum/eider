@@ -3026,6 +3026,44 @@ impl Sm12xKvAttentionWorkspace {
         }
         let layout = &pool.layout;
         let pv_splits = pv_split_count(cache_len);
+        #[cfg(not(feature = "cuda-oxide"))]
+        if cache_len >= SM12X_PIPELINE_MIN_TOKENS {
+            unsafe {
+                return check_cuda(
+                    "infer_sm12x_kv_paged_attention_pipelined_on_stream",
+                    crate::ffi::infer_sm12x_kv_paged_attention_pipelined_on_stream(
+                        query.as_const_ptr().cast::<f32>().add(query_offset),
+                        pool.component_ptr(layout.key_values),
+                        pool.component_ptr(layout.key_scales),
+                        pool.component_ptr(layout.key_tail).cast(),
+                        pool.component_ptr(layout.value_values),
+                        pool.component_ptr(layout.value_scales),
+                        pool.component_ptr(layout.value_tail).cast(),
+                        page_table.as_const_ptr().cast(),
+                        self.query_tiles.as_mut_ptr().cast(),
+                        self.query_scales.as_mut_ptr().cast(),
+                        self.scores.as_mut_ptr().cast(),
+                        self.probability_tiles.as_mut_ptr().cast(),
+                        self.probability_scales.as_mut_ptr().cast(),
+                        self.pv_partials.as_mut_ptr().cast(),
+                        output.as_mut_ptr().cast::<f32>().add(output_offset),
+                        self.softmax_stats.as_mut_ptr().cast(),
+                        self.softmax_combined.as_mut_ptr().cast(),
+                        cache_len as u32,
+                        window_start as u32,
+                        logical_capacity as u32,
+                        SM12X_KV_PAGE_TOKENS as u32,
+                        layout.total_bytes as u32,
+                        self.q_heads as u32,
+                        self.kv_heads as u32,
+                        self.head_dim as u32,
+                        pv_splits as u32,
+                        stream.as_raw(),
+                        self.aux_stream.as_raw(),
+                    ),
+                );
+            }
+        }
         #[cfg(feature = "cuda-oxide")]
         unsafe {
             super::sm12x_kv_cache_oxide::attention(
@@ -3791,6 +3829,98 @@ mod tests {
             source_output
                 .copy_to_host(&stream)
                 .expect("source output read")
+        );
+    }
+
+    #[serial]
+    #[test]
+    fn paged_pipelined_attention_matches_serial_paged_across_chunks() {
+        const TOKENS: usize = SM12X_PIPELINE_MIN_TOKENS + 1_024;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = 64;
+        const Q_HEADS: usize = 8;
+        let pages = TOKENS.div_ceil(SM12X_KV_PAGE_TOKENS);
+        let kv_width = KV_HEADS * HEAD_DIM;
+        let key = (0..TOKENS * kv_width)
+            .map(|index| ((index * 17 + 11) % 251) as f32 / 64.0 - 1.5)
+            .collect::<Vec<_>>();
+        let value = (0..TOKENS * kv_width)
+            .map(|index| ((index * 29 + 7) % 257) as f32 / 80.0 - 1.25)
+            .collect::<Vec<_>>();
+        let query = (0..Q_HEADS * HEAD_DIM)
+            .map(|index| ((index * 13 + 5) % 127) as f32 / 48.0 - 1.0)
+            .collect::<Vec<_>>();
+        let key = DeviceBuffer::from_host(&key).expect("key");
+        let value = DeviceBuffer::from_host(&value).expect("value");
+        let query = DeviceBuffer::from_host(&query).expect("query");
+        let page_table =
+            DeviceBuffer::from_host(&(0..pages as u32).collect::<Vec<_>>()).expect("page table");
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let mut pool = Sm12xKvPagePool::new(pages, KV_HEADS, HEAD_DIM).expect("page pool");
+        let mut workspace = Sm12xKvAttentionWorkspace::new_gqa(TOKENS, Q_HEADS, KV_HEADS, HEAD_DIM)
+            .expect("attention workspace");
+        let rows_per_append = 8;
+        let mut token = 0;
+        while token < TOKENS {
+            let rows = rows_per_append.min(TOKENS - token);
+            for row in 0..rows {
+                let position = token + row;
+                pool.append_at_offsets_on_stream(
+                    position / SM12X_KV_PAGE_TOKENS,
+                    position % SM12X_KV_PAGE_TOKENS,
+                    &key,
+                    position * kv_width,
+                    &value,
+                    position * kv_width,
+                    &stream,
+                )
+                .expect("paged append");
+            }
+            token += rows;
+        }
+        let mut serial_output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("serial paged output");
+        // Independent reference: the fused F32 KV path the SM12x kernels are
+        // checked against elsewhere, so it does not share the pipelined
+        // dispatch under test.
+        crate::cached_gqa_attention_f32_into_on_stream(
+            &query,
+            &key,
+            &value,
+            serial_output.output(),
+            TOKENS,
+            Q_HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &stream,
+        )
+        .expect("reference f32 attention");
+        let mut pipelined_output =
+            DeviceBuffer::zeroed(Q_HEADS * HEAD_DIM).expect("pipelined paged output");
+        workspace
+            .attention_paged_offsets_into_on_stream(
+                &pool,
+                &page_table,
+                TOKENS,
+                &query,
+                0,
+                pipelined_output.output(),
+                0,
+                &stream,
+            )
+            .expect("pipelined paged attention");
+        let serial = serial_output.copy_to_host(&stream).expect("serial read");
+        let pipelined = pipelined_output
+            .copy_to_host(&stream)
+            .expect("pipelined read");
+        let max_abs = serial
+            .iter()
+            .zip(pipelined.iter())
+            .map(|(serial, pipelined)| (serial - pipelined).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= 0.20,
+            "paged pipeline differs from the F32 reference at {TOKENS} tokens: max_abs={max_abs}"
         );
     }
 

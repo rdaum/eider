@@ -2813,6 +2813,124 @@ extern "C" cudaError_t infer_sm12x_kv_paged_attention_on_stream(
         nullptr, nullptr, nullptr, nullptr, 0, stream);
 }
 
+// Paged, chunked QK/softmax pipeline for the decode hot path.
+//
+// Same S/P ping-pong analogue as the dense pipelined entry, but the token
+// tiles address the compact cache through a device page table. QK(range c+1)
+// on `stream` overlaps partial-softmax statistics for range c on
+// `aux_stream`; the statistics are combined, then the existing normalize,
+// probability-quantize, PV, and reduce launches run serially. `output` is a
+// single row; `pv_splits` must equal the plain paged path's split count.
+extern "C" cudaError_t infer_sm12x_kv_paged_attention_pipelined_on_stream(
+    const float* query, const std::uint8_t* key_values, const std::uint8_t* key_scales,
+    const float* key_tail, const std::uint8_t* value_values,
+    const std::uint8_t* value_scales, const float* value_tail,
+    const std::uint32_t* page_table,
+    std::uint8_t* query_tiles, std::uint32_t* query_scales, float* scores,
+    std::uint8_t* probability_tiles, std::uint32_t* probability_scales,
+    float* partial_output, float* output,
+    float* softmax_stats, float* softmax_combined,
+    std::uint32_t cache_len, std::uint32_t window_start, std::uint32_t max_tokens,
+    std::uint32_t page_tokens, std::uint32_t page_stride_bytes,
+    std::uint32_t q_heads, std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t pv_splits, cudaStream_t stream, cudaStream_t aux_stream)
+{
+    if (query == nullptr || key_values == nullptr || key_scales == nullptr || key_tail == nullptr ||
+        value_values == nullptr || value_scales == nullptr || value_tail == nullptr ||
+        page_table == nullptr || query_tiles == nullptr || query_scales == nullptr ||
+        scores == nullptr || probability_tiles == nullptr || probability_scales == nullptr ||
+        output == nullptr || softmax_stats == nullptr || softmax_combined == nullptr ||
+        cache_len < SM12X_PIPELINE_MIN_TOKENS || cache_len > max_tokens ||
+        window_start >= cache_len || q_heads == 0 || kv_heads == 0 ||
+        (q_heads % kv_heads) != 0 || head_dim == 0 || (head_dim % 64) != 0 ||
+        pv_splits == 0 || pv_splits > 32 || (pv_splits > 1 && partial_output == nullptr) ||
+        page_tokens == 0 || (page_tokens % 64) != 0 || (max_tokens % page_tokens) != 0 ||
+        page_stride_bytes == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t head_k_tiles = head_dim / 64;
+    const std::uint32_t token_tiles = (cache_len + 7) / 8;
+    const std::uint32_t context_tiles = (cache_len + 63) / 64;
+    const std::uint32_t query_groups = kv_heads * ((q_heads / kv_heads + 7) / 8);
+    infer_sm12x_kv_quantize_query_kernel<<<dim3(query_groups, head_k_tiles, 1), 128, 0, stream>>>(
+        query, query_tiles, query_scales, q_heads, kv_heads, head_dim, 0);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    cudaEvent_t qk_chunk_ready = nullptr;
+    cudaEvent_t stats_drained = nullptr;
+    status = cudaEventCreateWithFlags(&qk_chunk_ready, cudaEventDisableTiming);
+    if (status != cudaSuccess) return status;
+    status = cudaEventCreateWithFlags(&stats_drained, cudaEventDisableTiming);
+    if (status != cudaSuccess) {
+        cudaEventDestroy(qk_chunk_ready);
+        return status;
+    }
+    for (std::uint32_t chunk = 0; chunk < SM12X_PIPELINE_CHUNKS; ++chunk) {
+        const std::uint32_t tile_begin = chunk * token_tiles / SM12X_PIPELINE_CHUNKS;
+        const std::uint32_t tile_end = (chunk + 1) * token_tiles / SM12X_PIPELINE_CHUNKS;
+        const std::uint32_t tile_count = tile_end - tile_begin;
+        infer_sm12x_kv_qk_kernel<<<dim3(query_groups, tile_count, 1), 32, 0, stream>>>(
+            query_tiles, query_scales, key_values, key_scales, key_tail, scores,
+            cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim,
+            0xffffffffu, 0, page_table, page_tokens, page_stride_bytes,
+            nullptr, nullptr, nullptr, 0, tile_begin, tile_count);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) break;
+        status = cudaEventRecord(qk_chunk_ready, stream);
+        if (status != cudaSuccess) break;
+        status = cudaStreamWaitEvent(aux_stream, qk_chunk_ready, 0);
+        if (status != cudaSuccess) break;
+        std::uint32_t token_begin = tile_begin * 8;
+        if (token_begin < window_start) token_begin = window_start;
+        std::uint32_t token_end = tile_end * 8;
+        if (token_end > cache_len) token_end = cache_len;
+        infer_sm12x_kv_softmax_stats_kernel<<<q_heads, 256, 0, aux_stream>>>(
+            scores, softmax_stats, token_begin, token_end,
+            cache_len, max_tokens, q_heads, chunk, SM12X_PIPELINE_MAX_CHUNKS);
+        status = cudaGetLastError();
+        if (status != cudaSuccess) break;
+    }
+    if (status == cudaSuccess) status = cudaEventRecord(stats_drained, aux_stream);
+    if (status == cudaSuccess) status = cudaStreamWaitEvent(stream, stats_drained, 0);
+    if (status == cudaSuccess) {
+        const std::uint32_t combine_blocks = (q_heads + 255) / 256;
+        infer_sm12x_kv_stats_combine_kernel<<<combine_blocks, 256, 0, stream>>>(
+            softmax_stats, softmax_combined, q_heads,
+            SM12X_PIPELINE_CHUNKS, SM12X_PIPELINE_MAX_CHUNKS);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        infer_sm12x_kv_softmax_normalize_kernel<<<q_heads, 256, 0, stream>>>(
+            scores, softmax_combined, cache_len, max_tokens, q_heads);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        infer_sm12x_kv_quantize_probability_kernel<<<dim3(query_groups, context_tiles, 1), 128, 0, stream>>>(
+            scores, probability_tiles, probability_scales, cache_len, nullptr, window_start, max_tokens,
+            q_heads, kv_heads, 0xffffffffu, 0, nullptr, 0, nullptr, nullptr, 0);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess) {
+        infer_sm12x_kv_pv_kernel<<<dim3(query_groups, head_dim / 8, pv_splits), 32, 0, stream>>>(
+            probability_tiles, probability_scales, value_values, value_scales, value_tail,
+            output, cache_len, nullptr, window_start, max_tokens, q_heads, kv_heads, head_dim,
+            0xffffffffu, 0, 0, partial_output, pv_splits,
+            page_table, page_tokens, page_stride_bytes, nullptr, 0, nullptr, nullptr, 0);
+        status = cudaGetLastError();
+    }
+    if (status == cudaSuccess && pv_splits > 1) {
+        constexpr std::uint32_t kThreads = 256;
+        const std::uint32_t output_values = q_heads * head_dim;
+        infer_sm12x_kv_pv_reduce_kernel<<<
+            dim3((output_values + kThreads - 1) / kThreads, 1, 1), kThreads, 0, stream>>>(
+            partial_output, output, pv_splits, q_heads, head_dim, 0);
+        status = cudaGetLastError();
+    }
+    cudaEventDestroy(stats_drained);
+    cudaEventDestroy(qk_chunk_ready);
+    return status;
+}
+
 extern "C" cudaError_t infer_sm12x_kv_paged_sparse_attention_on_stream(
     const float* query, const std::uint8_t* key_values, const std::uint8_t* key_scales,
     const float* key_tail, const std::uint8_t* value_values,
