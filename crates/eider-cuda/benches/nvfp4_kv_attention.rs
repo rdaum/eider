@@ -292,6 +292,24 @@ impl<const CACHE_LEN: usize> CompactKvAttentionBench<CACHE_LEN> {
             max_abs <= 0.20,
             "SM12x indexed compact KV attention error too large at {CACHE_LEN} tokens: max_abs={max_abs}"
         );
+        if CACHE_LEN >= 16_384 {
+            workspace
+                .attention_pipelined_into_on_stream(&cache, &query, output.output(), &stream)
+                .expect("pipelined compact attention");
+            stream.synchronize().expect("pipelined attention sync");
+            let pipelined = output
+                .copy_to_host(&stream)
+                .expect("copy pipelined compact attention");
+            let max_abs = reference
+                .iter()
+                .zip(pipelined.iter())
+                .map(|(reference, actual)| (reference - actual).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 0.20,
+                "SM12x pipelined KV attention error too large at {CACHE_LEN} tokens: max_abs={max_abs}"
+            );
+        }
 
         let probabilities =
             DeviceBuffer::from_host(&vec![1.0 / CACHE_LEN as f32; Q_HEADS * CACHE_LEN])
@@ -315,6 +333,17 @@ impl<const CACHE_LEN: usize> CompactKvAttentionBench<CACHE_LEN> {
         self.workspace
             .attention_into_on_stream(&self.cache, &self.query, self.output.output(), &self.stream)
             .expect("compact attention");
+    }
+
+    fn run_pipelined_attention(&mut self) {
+        self.workspace
+            .attention_pipelined_into_on_stream(
+                &self.cache,
+                &self.query,
+                self.output.output(),
+                &self.stream,
+            )
+            .expect("pipelined compact attention");
     }
 
     fn run_qk(&mut self) {
@@ -444,6 +473,25 @@ fn compact_indexed_attention_sample<const CACHE_LEN: usize>(
     ctx.start.record_on_stream(&ctx.stream).expect("start");
     for _ in 0..chunk {
         ctx.run_indexed_attention();
+    }
+    ctx.stop.record_on_stream(&ctx.stream).expect("stop");
+    ctx.stop.synchronize().expect("sync");
+    black_box(ctx.output.cuda_address());
+    BenchSampleResult::operations(chunk as u64).push_metric(MetricValue::new(
+        "cuda_event_ms",
+        ctx.start.elapsed_ms_until(&ctx.stop).expect("elapsed") as f64 / chunk as f64,
+        "ms",
+    ))
+}
+
+fn compact_pipelined_attention_sample<const CACHE_LEN: usize>(
+    ctx: &mut CompactKvAttentionBench<CACHE_LEN>,
+    chunk: usize,
+    _: usize,
+) -> BenchSampleResult {
+    ctx.start.record_on_stream(&ctx.stream).expect("start");
+    for _ in 0..chunk {
+        ctx.run_pipelined_attention();
     }
     ctx.stop.record_on_stream(&ctx.stream).expect("stop");
     ctx.stop.synchronize().expect("sync");
@@ -1023,6 +1071,10 @@ fn main() {
                         compact_attention_sample::<32_768>,
                     );
                     group.bench_sample(
+                        "sm12x_pipelined_decode_32k",
+                        compact_pipelined_attention_sample::<32_768>,
+                    );
+                    group.bench_sample(
                         "sm12x_compact_indexed_decode_32k",
                         compact_indexed_attention_sample::<32_768>,
                     );
@@ -1059,6 +1111,10 @@ fn main() {
                     group.bench_sample(
                         "sm12x_compact_decode_128k",
                         compact_attention_sample::<131_072>,
+                    );
+                    group.bench_sample(
+                        "sm12x_pipelined_decode_128k",
+                        compact_pipelined_attention_sample::<131_072>,
                     );
                     group.bench_sample(
                         "sm12x_compact_indexed_decode_128k",

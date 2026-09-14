@@ -12,6 +12,13 @@ const COMPACT_TILE_BYTES: usize = MMA_N * MMA_K / 2;
 const SCALE_BYTES_PER_TILE: usize = MMA_K / 16;
 const PV_SPLIT_CAPACITY: usize = 32;
 const PV_SPLIT_MIN_TOKENS: usize = 1_024;
+/// Cache-length threshold for the chunked QK/softmax pipeline: below this
+/// the extra launches outweigh the overlap gain, so decode uses the serial
+/// launch sequence.
+pub(crate) const SM12X_PIPELINE_MIN_TOKENS: usize = 16_384;
+/// Chunk-slot capacity the pipeline stats buffer is sized for; must match
+/// the native SM12X_PIPELINE_MAX_CHUNKS.
+pub(crate) const SM12X_PIPELINE_MAX_CHUNKS: usize = 8;
 /// Initial physical page size used by Eider's compact SM12x cache pool.
 pub const SM12X_KV_PAGE_TOKENS: usize = 128;
 
@@ -126,6 +133,9 @@ pub struct Sm12xKvAttentionWorkspace {
     probability_tiles: DeviceBuffer<u8>,
     probability_scales: DeviceBuffer<u32>,
     pv_partials: DeviceBuffer<f32>,
+    softmax_stats: DeviceBuffer<f32>,
+    softmax_combined: DeviceBuffer<f32>,
+    aux_stream: CudaStream,
     max_tokens: usize,
     q_heads: usize,
     kv_heads: usize,
@@ -1589,6 +1599,15 @@ impl Sm12xKvAttentionWorkspace {
                 "SM12x KV PV partials",
                 &[PV_SPLIT_CAPACITY, q_heads, head_dim],
             )?)?,
+            softmax_stats: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV pipeline softmax stats",
+                &[q_heads, SM12X_PIPELINE_MAX_CHUNKS, 2],
+            )?)?,
+            softmax_combined: DeviceBuffer::zeroed(checked_product(
+                "SM12x KV pipeline softmax combined",
+                &[q_heads, 2],
+            )?)?,
+            aux_stream: CudaStream::new_non_blocking()?,
             max_tokens,
             q_heads,
             kv_heads,
@@ -1605,6 +1624,8 @@ impl Sm12xKvAttentionWorkspace {
             + self.probability_tiles.device_bytes()
             + self.probability_scales.device_bytes()
             + self.pv_partials.device_bytes()
+            + self.softmax_stats.device_bytes()
+            + self.softmax_combined.device_bytes()
     }
 
     /// Enqueues Q-to-FP4 and compact-cache QK into the internal score workspace.
@@ -1749,6 +1770,9 @@ impl Sm12xKvAttentionWorkspace {
         }
         #[cfg(not(feature = "cuda-oxide"))]
         unsafe {
+            if cache.len >= SM12X_PIPELINE_MIN_TOKENS {
+                return self.attention_pipelined_into_on_stream(cache, query, output, stream);
+            }
             check_cuda(
                 "infer_sm12x_kv_attention_on_stream",
                 crate::ffi::infer_sm12x_kv_attention_on_stream(
@@ -1773,6 +1797,87 @@ impl Sm12xKvAttentionWorkspace {
                     self.head_dim as u32,
                     pv_splits as u32,
                     stream.as_raw(),
+                ),
+            )
+        }
+    }
+
+    /// Enqueues the chunked QK/softmax pipeline over the whole cache.
+    ///
+    /// Splits the token tiles into ranges, overlapping QK(range c+1) on
+    /// `stream` with partial-softmax statistics for range c on a workspace
+    /// side stream, then combines the statistics and reuses the serial
+    /// normalize, probability-quantize, and PV launches. Requires
+    /// `cache.len() >= SM12X_PIPELINE_MIN_TOKENS`; shorter caches should use
+    /// [`Self::attention_into_on_stream`], which dispatches automatically.
+    pub fn attention_pipelined_into_on_stream(
+        &mut self,
+        cache: &Sm12xKvCache,
+        query: &DeviceBuffer<f32>,
+        mut output: DeviceOutput<'_, f32>,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if cache.len < SM12X_PIPELINE_MIN_TOKENS {
+            return Err(Error::Shape {
+                label: "SM12x KV pipelined attention cache length",
+                expected: format!("at least {SM12X_PIPELINE_MIN_TOKENS} tokens"),
+                actual: cache.len.to_string(),
+            });
+        }
+        if cache.max_tokens > self.max_tokens
+            || cache.kv_heads != self.kv_heads
+            || cache.head_dim != self.head_dim
+        {
+            return Err(Error::Shape {
+                label: "SM12x KV attention cache",
+                expected: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    self.max_tokens, self.kv_heads, self.head_dim
+                ),
+                actual: format!(
+                    "max_tokens={} kv_heads={} head_dim={}",
+                    cache.max_tokens, cache.kv_heads, cache.head_dim
+                ),
+            });
+        }
+        let output_values = self.q_heads * self.head_dim;
+        if query.len() != output_values || output.len() != output_values {
+            return Err(Error::Shape {
+                label: "SM12x KV attention query/output",
+                expected: format!("{output_values} values"),
+                actual: format!("query={} output={}", query.len(), output.len()),
+            });
+        }
+
+        let pv_splits = pv_split_count(cache.len);
+        unsafe {
+            check_cuda(
+                "infer_sm12x_kv_attention_pipelined_on_stream",
+                crate::ffi::infer_sm12x_kv_attention_pipelined_on_stream(
+                    query.as_const_ptr().cast(),
+                    cache.key_values_ptr(),
+                    cache.key_scales_ptr(),
+                    cache.key_tail_ptr(),
+                    cache.value_values_ptr(),
+                    cache.value_scales_ptr(),
+                    cache.value_tail_ptr(),
+                    self.query_tiles.as_mut_ptr().cast(),
+                    self.query_scales.as_mut_ptr().cast(),
+                    self.scores.as_mut_ptr().cast(),
+                    self.probability_tiles.as_mut_ptr().cast(),
+                    self.probability_scales.as_mut_ptr().cast(),
+                    self.pv_partials.as_mut_ptr().cast(),
+                    output.as_mut_ptr().cast(),
+                    self.softmax_stats.as_mut_ptr().cast(),
+                    self.softmax_combined.as_mut_ptr().cast(),
+                    cache.len as u32,
+                    cache.max_tokens as u32,
+                    self.q_heads as u32,
+                    self.kv_heads as u32,
+                    self.head_dim as u32,
+                    pv_splits as u32,
+                    stream.as_raw(),
+                    self.aux_stream.as_raw(),
                 ),
             )
         }
