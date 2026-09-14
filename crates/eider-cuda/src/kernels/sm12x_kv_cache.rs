@@ -175,7 +175,10 @@ impl Sm12xKvCache {
             // Cache kernels only read positions below `len`. Append writes a
             // tail row before publishing the new length, and aligned restore
             // writes every compact tile covered by the restored length.
-            storage: DeviceBuffer::uninitialized(layout.total_bytes)?,
+            // Storage is zeroed so unwritten tiles/scales read back
+            // deterministically (exact-byte tests must not depend on
+            // allocator history).
+            storage: DeviceBuffer::zeroed(layout.total_bytes)?,
             layout,
             max_tokens,
             len: 0,
@@ -1106,7 +1109,9 @@ impl Sm12xKvPagePool {
                     actual: format!("page_slots={page_slots} page_bytes={}", layout.total_bytes),
                 })?;
         Ok(Self {
-            storage: DeviceBuffer::uninitialized(total_bytes)?,
+            // Zeroed for the same determinism guarantee as the cache: pool
+            // slots outside the appended prefix read back as zeros.
+            storage: DeviceBuffer::zeroed(total_bytes)?,
             layout,
             page_slots,
             kv_heads,
@@ -3371,9 +3376,9 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
     use crate::format::bf16_to_f32;
+    use serial_test::serial;
 
     fn sparse_index_buffers(
         selected_blocks: &[u8],
