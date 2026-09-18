@@ -37,7 +37,7 @@ model_rows=(
     "eider-agents-a1|agents-a1|EIDER_MODEL=agents-a1 scripts/run-eider"
     "eider-laguna-s-2.1|laguna-s-2.1|EIDER_MODEL=laguna-s-2.1 scripts/run-eider"
     "eider-step3.7|step-3.7-flash|EIDER_MODEL=step-3.7-flash scripts/run-eider"
-    "eider-gemma4-26b|gemma-4-26b-a4b-nvfp4|EIDER_MODEL=gemma-4-26b-a4b-nvfp4 scripts/run-eider"
+    "eider-gemma4-26b|gemma-4-26b-a4b-nvfp4|scripts/run-eider-gemma4.sh"
     "eider-nemotron3-puzzle|nemotron-3-puzzle-75b-a9b|EIDER_MODEL=nemotron-3-puzzle-75b-a9b scripts/run-eider"
     "eider-nemotron3-super|nemotron-3-super-120b-a12b|EIDER_MODEL=nemotron-3-super-120b-a12b scripts/run-eider"
     "eider-ternary-bonsai-8b|local Bonsai Q2_0|scripts/run-eider-bonsai.sh"
@@ -152,7 +152,7 @@ printf '%b🍅  I’m asking %s about tomatoes!  🍅%b\n' \
     "$bold$red" "$model" "$reset" >&2
 printf '%b✓%b %bServer ready%b at %s\n' \
     "$green" "$reset" "$bold" "$reset" "$base_url" >&2
-printf '%b→%b Requesting a detailed twenty-point guide, up to %s tokens.\n' \
+printf '%b→%b Requesting a detailed twenty-point guide, up to %s output tokens.\n' \
     "$cyan" "$reset" "$max_tokens" >&2
 
 request="$(jq --null-input \
@@ -186,8 +186,10 @@ number_or_zero() {
 
 baseline_metrics="$(curl --silent --show-error "$base_url/metrics" 2>/dev/null || true)"
 baseline_generated="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_infer_generated_tokens)")"
-baseline_prefill_sum="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_prefill_tokens_per_second_sum)")"
-baseline_prefill_count="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_prefill_tokens_per_second_count)")"
+baseline_prefill_compute_sum="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_prefill_compute_tokens_per_second_sum)")"
+baseline_prefill_compute_count="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_prefill_compute_tokens_per_second_count)")"
+baseline_admission_sum="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_request_admission_duration_us_sum)")"
+baseline_admission_count="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_request_admission_duration_us_count)")"
 baseline_decode_sum="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_decode_tokens_per_second_sum)")"
 baseline_decode_count="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_server_decode_tokens_per_second_count)")"
 baseline_ttft_sum="$(number_or_zero "$(prometheus_value "$baseline_metrics" eider_infer_ttft_us_sum)")"
@@ -289,8 +291,10 @@ if ! answer="$(jq --exit-status --raw-output '
 fi
 
 final_metrics="$(curl --silent --show-error "$base_url/metrics" 2>/dev/null || true)"
-final_prefill_sum="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_prefill_tokens_per_second_sum)")"
-final_prefill_count="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_prefill_tokens_per_second_count)")"
+final_prefill_compute_sum="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_prefill_compute_tokens_per_second_sum)")"
+final_prefill_compute_count="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_prefill_compute_tokens_per_second_count)")"
+final_admission_sum="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_request_admission_duration_us_sum)")"
+final_admission_count="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_request_admission_duration_us_count)")"
 final_decode_sum="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_decode_tokens_per_second_sum)")"
 final_decode_count="$(number_or_zero "$(prometheus_value "$final_metrics" eider_server_decode_tokens_per_second_count)")"
 final_ttft_sum="$(number_or_zero "$(prometheus_value "$final_metrics" eider_infer_ttft_us_sum)")"
@@ -300,10 +304,14 @@ metrics_report="$(jq --null-input --raw-output \
     --argjson prompt_tokens "$prompt_tokens" \
     --argjson cached_prompt_tokens "$cached_prompt_tokens" \
     --argjson completion_tokens "$completion_tokens" \
-    --argjson prefill_sum_before "$baseline_prefill_sum" \
-    --argjson prefill_sum_after "$final_prefill_sum" \
-    --argjson prefill_count_before "$baseline_prefill_count" \
-    --argjson prefill_count_after "$final_prefill_count" \
+    --argjson prefill_compute_sum_before "$baseline_prefill_compute_sum" \
+    --argjson prefill_compute_sum_after "$final_prefill_compute_sum" \
+    --argjson prefill_compute_count_before "$baseline_prefill_compute_count" \
+    --argjson prefill_compute_count_after "$final_prefill_compute_count" \
+    --argjson admission_sum_before "$baseline_admission_sum" \
+    --argjson admission_sum_after "$final_admission_sum" \
+    --argjson admission_count_before "$baseline_admission_count" \
+    --argjson admission_count_after "$final_admission_count" \
     --argjson decode_sum_before "$baseline_decode_sum" \
     --argjson decode_sum_after "$final_decode_sum" \
     --argjson decode_count_before "$baseline_decode_count" \
@@ -315,21 +323,26 @@ metrics_report="$(jq --null-input --raw-output \
     def nonnegative: if . < 0 then 0 else . end;
     def delta($before; $after): ($after - $before) | nonnegative;
     def one_decimal: (. * 10 | round) / 10;
-    (delta($prefill_sum_before; $prefill_sum_after)) as $prefill_sum
-    | (delta($prefill_count_before; $prefill_count_after)) as $prefill_count
+    (delta($prefill_compute_sum_before; $prefill_compute_sum_after)) as $prefill_compute_sum
+    | (delta($prefill_compute_count_before; $prefill_compute_count_after)) as $prefill_compute_count
+    | (delta($admission_sum_before; $admission_sum_after)) as $admission_sum
+    | (delta($admission_count_before; $admission_count_after)) as $admission_count
     | (delta($decode_sum_before; $decode_sum_after)) as $decode_sum
     | (delta($decode_count_before; $decode_count_after)) as $decode_count
     | (delta($ttft_sum_before; $ttft_sum_after)) as $ttft_sum
     | (delta($ttft_count_before; $ttft_count_after)) as $ttft_count
-    | (if $prefill_count > 0 then $prefill_sum / $prefill_count else 0 end) as $prefill_rate
+    | (if $prefill_compute_count > 0 then $prefill_compute_sum / $prefill_compute_count else 0 end) as $prefill_compute_rate
+    | (if $admission_count > 0 then $admission_sum / $admission_count / 1000000 else 0 end) as $admission_seconds
     | (if $decode_count > 0 then $decode_sum / $decode_count else 0 end) as $decode_rate
     | (($prompt_tokens - $cached_prompt_tokens) | nonnegative) as $uncached_prompt_tokens
     | (($completion_tokens - 1) | nonnegative) as $timed_decode_tokens
     | [
         $prompt_tokens,
         $cached_prompt_tokens,
-        (if $prefill_rate > 0 then $uncached_prompt_tokens / $prefill_rate else 0 end),
-        ($prefill_rate | one_decimal),
+        $uncached_prompt_tokens,
+        $admission_seconds,
+        (if $prefill_compute_rate > 0 then $uncached_prompt_tokens / $prefill_compute_rate else 0 end),
+        ($prefill_compute_rate | one_decimal),
         $completion_tokens,
         (if $decode_rate > 0 then $timed_decode_tokens / $decode_rate else 0 end),
         ($decode_rate | one_decimal),
@@ -337,24 +350,30 @@ metrics_report="$(jq --null-input --raw-output \
     ]
     | @tsv
 ')"
-IFS=$'\t' read -r metric_prompt metric_cached metric_prefill_secs metric_prefill_rate \
-    metric_decode metric_decode_secs metric_decode_rate metric_ttft <<<"$metrics_report"
+IFS=$'\t' read -r metric_prompt metric_cached metric_uncached metric_admission_secs \
+    metric_prefill_secs metric_prefill_rate metric_decode metric_decode_secs \
+    metric_decode_rate metric_ttft <<<"$metrics_report"
 
 printf '%b✓ Tomato guide complete!%b\n' "$green$bold" "$reset" >&2
-printf '%b╭─ 🍅  Performance harvest  ─────────────────────────────╮%b\n' \
+printf '%b╭─ 🍅  Performance harvest  ─────────────────────────────────────╮%b\n' \
     "$bold$cyan" "$reset" >&2
-printf '%b│%b  Prefill  %b%4s prompt tokens%b · %7.3fs · %6.1f tok/s  %b│%b\n' \
-    "$cyan" "$reset" "$bold" "$metric_prompt" "$reset" \
-    "$metric_prefill_secs" "$metric_prefill_rate" "$cyan" "$reset" >&2
-if ((metric_cached > 0)); then
-    printf '%b│%b  Cache    %4s prompt tokens reused                     %b│%b\n' \
-        "$cyan" "$reset" "$metric_cached" "$cyan" "$reset" >&2
-fi
-printf '%b│%b  Decode   %b%4s output tokens%b · %7.3fs · %6.1f tok/s  %b│%b\n' \
-    "$cyan" "$reset" "$bold" "$metric_decode" "$reset" \
-    "$metric_decode_secs" "$metric_decode_rate" "$cyan" "$reset" >&2
-printf '%b│%b  TTFT      %7.3fs             · wall %4ss          %b│%b\n' \
-    "$cyan" "$reset" "$metric_ttft" "$elapsed" "$cyan" "$reset" >&2
-printf '%b╰────────────────────────────────────────────────────────╯%b\n\n' \
+performance_line() {
+    printf '%b│%b  %-62s%b│%b\n' "$cyan" "$reset" "$1" "$cyan" "$reset" >&2
+}
+printf -v metric_line 'Input      %4s prompt tokens · %4s cached' \
+    "$metric_prompt" "$metric_cached"
+performance_line "$metric_line"
+printf -v metric_line 'Admission                     · %7.3fs' "$metric_admission_secs"
+performance_line "$metric_line"
+printf -v metric_line 'Prefill   %4s uncached tokens · %7.3fs · %7.1f tok/s' \
+    "$metric_uncached" "$metric_prefill_secs" "$metric_prefill_rate"
+performance_line "$metric_line"
+printf -v metric_line 'Decode    %4s output tokens   · %7.3fs · %7.1f tok/s' \
+    "$metric_decode" "$metric_decode_secs" "$metric_decode_rate"
+performance_line "$metric_line"
+printf -v metric_line 'TTFT                          · %7.3fs · wall %4ss' \
+    "$metric_ttft" "$elapsed"
+performance_line "$metric_line"
+printf '%b╰────────────────────────────────────────────────────────────────╯%b\n\n' \
     "$bold$cyan" "$reset" >&2
 printf '%s\n' "$answer"
