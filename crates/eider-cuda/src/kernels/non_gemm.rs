@@ -14751,6 +14751,110 @@ mod tests {
 
     #[serial]
     #[test]
+    fn causal_window_softmaxes_are_correct_and_repeatable() {
+        const HEADS: usize = 8;
+        const QUERY_TOKENS: usize = 9;
+        const KEY_TOKENS: usize = 521;
+        const START_POSITION: usize = KEY_TOKENS - QUERY_TOKENS;
+        const HEAD_DIM: usize = 256;
+        const WINDOW_TOKENS: usize = 257;
+        const REPETITIONS: usize = 20;
+
+        let scores = (0..HEADS * QUERY_TOKENS * KEY_TOKENS)
+            .map(|index| {
+                let mixed = index
+                    .wrapping_mul(104_729)
+                    .wrapping_add(index / 17 * 65_537);
+                (mixed % 4_099) as f32 * 0.007 - 13.0
+            })
+            .collect::<Vec<_>>();
+        let scale = (HEAD_DIM as f32).sqrt().recip();
+        let mut expected = vec![0.0f32; scores.len()];
+        for head in 0..HEADS {
+            for query in 0..QUERY_TOKENS {
+                let row_start = (head * QUERY_TOKENS + query) * KEY_TOKENS;
+                let key_end = (START_POSITION + query + 1).min(KEY_TOKENS);
+                let key_start = key_end.saturating_sub(WINDOW_TOKENS);
+                let row = &scores[row_start..row_start + KEY_TOKENS];
+                let row_max = row[key_start..key_end]
+                    .iter()
+                    .map(|value| value * scale)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let sum = row[key_start..key_end]
+                    .iter()
+                    .map(|value| (value * scale - row_max).exp())
+                    .sum::<f32>();
+                for key in key_start..key_end {
+                    expected[row_start + key] = (row[key] * scale - row_max).exp() / sum;
+                }
+            }
+        }
+
+        let stream = CudaStream::new_non_blocking().expect("stream");
+        let scores_device = DeviceBuffer::from_host(&scores).expect("scores");
+        let mut probabilities = DeviceBuffer::<u16>::zeroed(scores.len()).expect("probabilities");
+        let mut first = None;
+        for repetition in 0..REPETITIONS {
+            causal_window_softmax_f32_to_bf16_on_stream(
+                &scores_device,
+                probabilities.output(),
+                QUERY_TOKENS,
+                KEY_TOKENS,
+                START_POSITION,
+                HEADS,
+                HEAD_DIM,
+                Some(WINDOW_TOKENS),
+                &stream,
+            )
+            .expect("causal softmax");
+            let actual_bf16 = probabilities
+                .copy_to_host(&stream)
+                .expect("probability download")
+                .into_vec();
+            if let Some(first) = &first {
+                assert_eq!(
+                    actual_bf16, *first,
+                    "launch {repetition} was not repeatable"
+                );
+            } else {
+                first = Some(actual_bf16.clone());
+            }
+            let actual = actual_bf16.into_iter().map(bf16_to_f32).collect::<Vec<_>>();
+            assert_close(&actual, &expected, 5.0e-4, "causal softmax");
+        }
+
+        let mut first = None;
+        for repetition in 0..REPETITIONS {
+            let mut probabilities = DeviceBuffer::from_host(&scores).expect("probabilities");
+            causal_window_softmax_f32_in_place_on_stream(
+                probabilities.inout(),
+                QUERY_TOKENS,
+                KEY_TOKENS,
+                START_POSITION,
+                HEADS,
+                HEAD_DIM,
+                Some(WINDOW_TOKENS),
+                &stream,
+            )
+            .expect("in-place causal softmax");
+            let actual = probabilities
+                .copy_to_host(&stream)
+                .expect("in-place probability download")
+                .into_vec();
+            if let Some(first) = &first {
+                assert_eq!(
+                    actual, *first,
+                    "in-place launch {repetition} was not repeatable"
+                );
+            } else {
+                first = Some(actual.clone());
+            }
+            assert_close(&actual, &expected, 5.0e-6, "in-place causal softmax");
+        }
+    }
+
+    #[serial]
+    #[test]
     fn grouped_gemv_address_gather_selects_typed_tables() {
         let stream = CudaStream::new_non_blocking().expect("stream");
         let a_values_storage = (0..3)

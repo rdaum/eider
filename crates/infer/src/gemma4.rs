@@ -26,7 +26,9 @@ use std::path::Path;
 mod batch;
 mod execution;
 mod sequence;
-pub use batch::{Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow};
+pub use batch::{
+    Gemma4DecisionReadout, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
+};
 pub(crate) use execution::{Gemma4SequenceId, Gemma4SequencePool};
 pub(crate) use sequence::{
     Gemma4Append, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
@@ -441,12 +443,16 @@ pub struct Gemma4DecodeState {
     hidden: DeviceBuffer<f32>,
     layers: Vec<Gemma4DecoderLayerWorkspace>,
     compact_attention: Gemma4CompactAttentionWorkspaces,
+    lm_head: Option<Gemma4LmHeadWorkspace>,
+    pub(crate) position: usize,
+    max_tokens: usize,
+}
+
+struct Gemma4LmHeadWorkspace {
     lm_logits: DeviceBuffer<f32>,
     lm_top1_scratch_index: DeviceBuffer<u32>,
     lm_argmax: DeviceBuffer<u32>,
     lm_argmax_value: DeviceBuffer<f32>,
-    pub(crate) position: usize,
-    max_tokens: usize,
 }
 
 struct Gemma4CompactAttentionWorkspaces {
@@ -1890,6 +1896,22 @@ impl Gemma4Model {
 
     /// Allocates request-private execution state for one sequence.
     pub fn new_sequence_state(&self, max_tokens: usize) -> Result<Gemma4DecodeState> {
+        self.new_sequence_state_with_lm_head(max_tokens, true)
+    }
+
+    /// Allocates sequence state without vocabulary-sized generation scratch.
+    pub(crate) fn new_decision_sequence_state(
+        &self,
+        max_tokens: usize,
+    ) -> Result<Gemma4DecodeState> {
+        self.new_sequence_state_with_lm_head(max_tokens, false)
+    }
+
+    fn new_sequence_state_with_lm_head(
+        &self,
+        max_tokens: usize,
+        with_lm_head: bool,
+    ) -> Result<Gemma4DecodeState> {
         if max_tokens == 0 || max_tokens > self.config.max_position_embeddings {
             return Err(Error::Shape {
                 label: "Gemma 4 decode capacity",
@@ -1904,14 +1926,21 @@ impl Gemma4Model {
         let workspace_capacity = sequence::gemma4_state_capacity(max_tokens)?;
         let compact_attention =
             Gemma4CompactAttentionWorkspaces::new(&self.layers, workspace_capacity)?;
+        let lm_head = if with_lm_head {
+            Some(Gemma4LmHeadWorkspace {
+                lm_logits: DeviceBuffer::zeroed(self.config.vocab_size)?,
+                lm_top1_scratch_index: DeviceBuffer::zeroed(self.config.vocab_size)?,
+                lm_argmax: DeviceBuffer::zeroed(1)?,
+                lm_argmax_value: DeviceBuffer::zeroed(1)?,
+            })
+        } else {
+            None
+        };
         Ok(Gemma4DecodeState {
             hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
             layers,
             compact_attention,
-            lm_logits: DeviceBuffer::zeroed(self.config.vocab_size)?,
-            lm_top1_scratch_index: DeviceBuffer::zeroed(self.config.vocab_size)?,
-            lm_argmax: DeviceBuffer::zeroed(1)?,
-            lm_argmax_value: DeviceBuffer::zeroed(1)?,
+            lm_head,
             position: 0,
             max_tokens,
         })
@@ -2095,27 +2124,37 @@ impl Gemma4Model {
             )?;
             match output {
                 Gemma4PrefillOutput::None => unreachable!(),
-                Gemma4PrefillOutput::FullLogits => bf16_linear_argmax_f32_into_on_stream(
-                    &state.hidden,
-                    &self.embedding,
-                    state.lm_logits.output(),
-                    state.lm_argmax.output(),
-                    state.lm_argmax_value.output(),
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    stream,
-                )?,
-                Gemma4PrefillOutput::Top1 => lm_head_top1_f32_into_on_stream(
-                    &state.hidden,
-                    &self.embedding,
-                    &state.lm_logits,
-                    &state.lm_top1_scratch_index,
-                    &state.lm_argmax,
-                    &state.lm_argmax_value,
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    stream,
-                )?,
+                Gemma4PrefillOutput::FinalHidden => {}
+                Gemma4PrefillOutput::FullLogits => {
+                    let lm_head = state.lm_head.as_mut().ok_or_else(|| Error::Format {
+                        label: "Gemma 4 LM head workspace",
+                        detail: "sequence was allocated without generation scratch".to_string(),
+                    })?;
+                    bf16_linear_argmax_f32_into_on_stream(
+                        &state.hidden,
+                        &self.embedding,
+                        lm_head.lm_logits.output(),
+                        lm_head.lm_argmax.output(),
+                        lm_head.lm_argmax_value.output(),
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        stream,
+                    )?
+                }
+                Gemma4PrefillOutput::Top1 => {
+                    let lm_head = state.lm_head()?;
+                    lm_head_top1_f32_into_on_stream(
+                        &state.hidden,
+                        &self.embedding,
+                        &lm_head.lm_logits,
+                        &lm_head.lm_top1_scratch_index,
+                        &lm_head.lm_argmax,
+                        &lm_head.lm_argmax_value,
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        stream,
+                    )?
+                }
             }
         }
         Ok(())
@@ -2127,8 +2166,9 @@ impl Gemma4Model {
         state: &Gemma4DecodeState,
         stream: &CudaStream,
     ) -> Result<(u32, f32)> {
-        let token = state.lm_argmax.copy_to_host(stream)?[0];
-        let logit = state.lm_argmax_value.copy_to_host(stream)?[0];
+        let lm_head = state.lm_head()?;
+        let token = lm_head.lm_argmax.copy_to_host(stream)?[0];
+        let logit = lm_head.lm_argmax_value.copy_to_host(stream)?[0];
         Ok((token, self.softcap_logit(logit)))
     }
 
@@ -2138,7 +2178,7 @@ impl Gemma4Model {
         state: &Gemma4DecodeState,
         stream: &CudaStream,
     ) -> Result<Vec<f32>> {
-        let mut logits = state.lm_logits.copy_to_host(stream)?.to_vec();
+        let mut logits = state.lm_head()?.lm_logits.copy_to_host(stream)?.to_vec();
         for logit in &mut logits {
             *logit = self.softcap_logit(*logit);
         }
@@ -2169,6 +2209,17 @@ impl Gemma4Model {
 }
 
 impl Gemma4DecodeState {
+    fn lm_head(&self) -> Result<&Gemma4LmHeadWorkspace> {
+        self.lm_head.as_ref().ok_or_else(|| Error::Format {
+            label: "Gemma 4 LM head workspace",
+            detail: "sequence was allocated without generation scratch".to_string(),
+        })
+    }
+
+    pub(crate) fn final_hidden(&self) -> &DeviceBuffer<f32> {
+        &self.hidden
+    }
+
     /// Returns the number of tokens already processed into the K/V cache.
     pub fn len(&self) -> usize {
         self.position
@@ -2193,10 +2244,12 @@ impl Gemma4DecodeState {
                 .map(Gemma4DecoderLayerWorkspace::device_bytes)
                 .sum::<usize>()
             + self.compact_attention.device_bytes()
-            + self.lm_logits.device_bytes()
-            + self.lm_top1_scratch_index.device_bytes()
-            + self.lm_argmax.device_bytes()
-            + self.lm_argmax_value.device_bytes()
+            + self.lm_head.as_ref().map_or(0, |workspace| {
+                workspace.lm_logits.device_bytes()
+                    + workspace.lm_top1_scratch_index.device_bytes()
+                    + workspace.lm_argmax.device_bytes()
+                    + workspace.lm_argmax_value.device_bytes()
+            })
     }
 }
 

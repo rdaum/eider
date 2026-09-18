@@ -8354,7 +8354,10 @@ __global__ void infer_causal_window_softmax_f32_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
         __syncthreads();
     }
-    const float row_max = partial[0];
+    __shared__ float shared_row_max;
+    if (threadIdx.x == 0) shared_row_max = partial[0];
+    __syncthreads();
+    const float row_max = shared_row_max;
     float local_sum = 0.0f;
     for (std::uint32_t key = threadIdx.x; key < key_tokens; key += blockDim.x) {
         float probability = 0.0f;
@@ -8428,7 +8431,10 @@ __global__ void infer_causal_window_softmax_f32_to_bf16_kernel(
         }
         __syncthreads();
     }
-    const float row_max = partial[0];
+    __shared__ float shared_row_max;
+    if (threadIdx.x == 0) shared_row_max = partial[0];
+    __syncthreads();
+    const float row_max = shared_row_max;
 
     float local_sum = 0.0f;
     for (std::uint32_t key = key_start + threadIdx.x; key < key_end; key += blockDim.x) {

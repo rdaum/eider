@@ -1,8 +1,8 @@
 //! Multi-session chat serving for Gemma 4.
 
 use crate::gemma4::{
-    Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput, Gemma4PrefillRow,
-    Gemma4SequenceId, Gemma4SequencePool,
+    Gemma4DecisionReadout, Gemma4Model, Gemma4PrefillBatchWorkspace, Gemma4PrefillOutput,
+    Gemma4PrefillRow, Gemma4SequenceId, Gemma4SequencePool,
 };
 use crate::gemma4::{
     Gemma4Sequence, Gemma4SequenceCache, gemma4_cache_error, new_gemma4_sequence_cache_with_budget,
@@ -13,10 +13,16 @@ use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use eider_runtime::cache::{SequenceCacheConfig, retained_prompt_prefix_tokens};
 use eider_runtime::chat::CheckpointChatTemplate;
 use eider_runtime::chat_output::{ChatOutputCodec, ChatOutputEvent};
+use eider_runtime::decision::{
+    DECISION_PROMPT_FORMAT, DecisionBranch, DecisionBranchLogits, DecisionCompletion,
+    DecisionRequest, DecisionTimings, DecisionUsage, answers_from_logits,
+    validated_decision_labels,
+};
 use eider_runtime::engine::{
-    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineDelta, EngineError,
-    EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId, EngineResult,
-    EngineService, EngineTick,
+    EngineAdmission, EngineAdmissionProgress, EngineCancelOutcome, EngineCapabilities,
+    EngineDecisionAdmission, EngineDecisionFailed, EngineDecisionFinished, EngineDelta,
+    EngineError, EngineFinished, EngineLifecycleEvent, EnginePrefillProgress, EngineRequestId,
+    EngineResult, EngineService, EngineTick,
 };
 use eider_runtime::request::{ChatFinishReason, ChatRequest, ChatUsage};
 use eider_runtime::sampling::{Sampler, TokenHistory};
@@ -86,6 +92,26 @@ struct ActiveRequest<'tokenizer> {
     usage: ChatUsage,
 }
 
+struct DecisionBranchState {
+    branch: DecisionBranch,
+    sequence_id: Gemma4SequenceId,
+    suffix_position: usize,
+    sequence_device_bytes: usize,
+}
+
+struct DecisionGroup {
+    id: Gemma4RequestId,
+    request: DecisionRequest,
+    parent_sequence_id: Option<Gemma4SequenceId>,
+    parent_position: usize,
+    parent_sequence_device_bytes: usize,
+    next_branch: usize,
+    active_branches: Vec<DecisionBranchState>,
+    logits: Vec<DecisionBranchLogits>,
+    released_sequence_device_bytes: usize,
+    timings: DecisionTimings,
+}
+
 /// Checkpoint rendering and decode-first, round-robin Gemma 4 execution.
 pub(crate) struct Gemma4ChatService<'model, 'template> {
     model: &'model Gemma4Model,
@@ -97,6 +123,9 @@ pub(crate) struct Gemma4ChatService<'model, 'template> {
     next_id: u64,
     waiting: VecDeque<Gemma4RequestId>,
     requests: BTreeMap<Gemma4RequestId, ActiveRequest<'template>>,
+    decision_readout: Gemma4DecisionReadout,
+    decision_queue: VecDeque<Gemma4RequestId>,
+    decisions: BTreeMap<Gemma4RequestId, Box<DecisionGroup>>,
     sequences: Gemma4SequencePool,
     sequence_cache: Gemma4SequenceCache,
 }
@@ -110,6 +139,16 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         cache_config: SequenceCacheConfig,
     ) -> Result<Self> {
         config.validate()?;
+        let label_ids = validated_decision_labels(template.tokenizer())
+            .map_err(|error| Error::Format {
+                label: "Gemma 4 decision labels",
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        let decision_readout =
+            model.new_decision_readout(&label_ids, config.decision_branch_capacity)?;
         let stream = CudaStream::new_non_blocking()?;
         let mut prefill_workspace = model.new_prefill_batch_workspace(
             config.prefill_sequence_capacity,
@@ -166,9 +205,109 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
             next_id: 1,
             waiting: VecDeque::new(),
             requests: BTreeMap::new(),
+            decision_readout,
+            decision_queue: VecDeque::new(),
+            decisions: BTreeMap::new(),
             sequences: Gemma4SequencePool::new(),
             sequence_cache,
         })
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> Result<Gemma4RequestId> {
+        if self.config.max_active_sequences < 2 {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision capacity",
+                expected: "at least two active sequences for a parent and branch".to_string(),
+                actual: self.config.max_active_sequences.to_string(),
+            });
+        }
+        if request.prompt_format != DECISION_PROMPT_FORMAT {
+            return Err(Error::Format {
+                label: "Gemma 4 decision prompt",
+                detail: format!("unsupported prompt format {:?}", request.prompt_format),
+            });
+        }
+        if request.label_token_ids != self.decision_readout.token_ids() {
+            return Err(Error::Format {
+                label: "Gemma 4 decision label head",
+                detail: "request labels differ from the loaded fixed label head".to_string(),
+            });
+        }
+        if request.prefix_tokens.is_empty() || request.branches.is_empty() {
+            return Err(Error::Format {
+                label: "Gemma 4 decision request",
+                detail: "prefix and branches must not be empty".to_string(),
+            });
+        }
+        let vocab = self.model.vocab_size();
+        let validate_tokens = |label: &'static str, tokens: &[u32]| -> Result<()> {
+            if tokens.is_empty() {
+                return Err(Error::Format {
+                    label,
+                    detail: "token sequence must not be empty".to_string(),
+                });
+            }
+            if let Some(token) = tokens.iter().find(|token| **token as usize >= vocab) {
+                return Err(Error::Shape {
+                    label,
+                    expected: format!("token < {vocab}"),
+                    actual: token.to_string(),
+                });
+            }
+            Ok(())
+        };
+        validate_tokens("Gemma 4 decision prefix", &request.prefix_tokens)?;
+        for branch in &request.branches {
+            validate_tokens("Gemma 4 decision suffix", &branch.suffix_tokens)?;
+            validate_tokens("Gemma 4 decision labels", &branch.label_token_ids)?;
+            if branch.label_token_ids.len() > request.label_token_ids.len()
+                || branch.label_token_ids.len() != branch.option_keys.len()
+                || request.label_token_ids[..branch.label_token_ids.len()] != branch.label_token_ids
+            {
+                return Err(Error::Format {
+                    label: "Gemma 4 decision labels",
+                    detail: "branch options and fixed label prefix do not match".to_string(),
+                });
+            }
+            let tokens = request
+                .prefix_tokens
+                .len()
+                .checked_add(branch.suffix_tokens.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Gemma 4 decision branch length",
+                    expected: "prefix + suffix without overflow".to_string(),
+                    actual: "overflow".to_string(),
+                })?;
+            if tokens > self.config.max_context_tokens {
+                return Err(Error::Shape {
+                    label: "Gemma 4 decision branch length",
+                    expected: format!("at most {} tokens", self.config.max_context_tokens),
+                    actual: tokens.to_string(),
+                });
+            }
+        }
+        let id = Gemma4RequestId(self.next_id);
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| Error::Format {
+            label: "Gemma 4 request ID",
+            detail: "request ID space exhausted".to_string(),
+        })?;
+        self.decisions.insert(
+            id,
+            Box::new(DecisionGroup {
+                id,
+                request,
+                parent_sequence_id: None,
+                parent_position: 0,
+                parent_sequence_device_bytes: 0,
+                next_branch: 0,
+                active_branches: Vec::new(),
+                logits: Vec::new(),
+                released_sequence_device_bytes: 0,
+                timings: DecisionTimings::default(),
+            }),
+        );
+        self.decision_queue.push_back(id);
+        Ok(id)
     }
 
     /// Renders, tokenizes, and queues a request without allocating GPU state.
@@ -307,11 +446,348 @@ impl<'model, 'template> Gemma4ChatService<'model, 'template> {
         for (id, reason) in terminal {
             self.finish_request(id, reason, &mut tick)?;
         }
+        self.run_decision_phase(&mut tick, on_lifecycle)?;
         Ok(tick)
+    }
+
+    fn run_decision_phase(
+        &mut self,
+        tick: &mut EngineTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
+        ),
+    ) -> Result<()> {
+        let Some(id) = self.decision_queue.pop_front() else {
+            return Ok(());
+        };
+        let mut group = self
+            .decisions
+            .remove(&id)
+            .expect("queued decision group is retained");
+        match self.advance_decision_group(&mut group, tick, on_lifecycle) {
+            Ok(Some(completion)) => tick.decisions_finished.push(EngineDecisionFinished {
+                request_id: EngineRequestId::new(id.get()),
+                completion,
+            }),
+            Ok(None) => {
+                self.decisions.insert(id, group);
+                self.decision_queue.push_back(id);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if let Err(release_error) = self.release_decision_group(&mut group) {
+                    warn!(
+                        request = id.get(),
+                        %release_error,
+                        "failed to release part of Gemma 4 decision group"
+                    );
+                }
+                tick.decisions_failed.push(EngineDecisionFailed {
+                    request_id: EngineRequestId::new(id.get()),
+                    message,
+                    released_sequence_device_bytes: group.released_sequence_device_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_decision_group(
+        &mut self,
+        group: &mut DecisionGroup,
+        tick: &mut EngineTick,
+        on_lifecycle: &mut dyn FnMut(
+            RequestLifecycleEvent<Gemma4RequestId, Gemma4AdmissionProgress>,
+        ),
+    ) -> Result<Option<DecisionCompletion>> {
+        if group.parent_sequence_id.is_none() {
+            if self.sequences.len() >= self.config.max_active_sequences {
+                return Ok(None);
+            }
+            let started = Instant::now();
+            let sequence = Gemma4Sequence::admit_decision(
+                self.model,
+                &mut self.sequence_cache,
+                group.request.prefix_tokens.len(),
+                &self.stream,
+            )?;
+            let sequence_device_bytes = sequence.device_bytes();
+            let sequence_id = self.sequences.insert(sequence)?;
+            group.parent_sequence_id = Some(sequence_id);
+            group.parent_sequence_device_bytes = sequence_device_bytes;
+            on_lifecycle(RequestLifecycleEvent::Admitted(Gemma4AdmissionProgress {
+                request_id: group.id,
+                sequence_device_bytes,
+                cached_prompt_tokens: 0,
+                allocation_duration: started.elapsed(),
+                checkpoint_copy_duration: Duration::ZERO,
+                admitted_after_tick_start: Duration::ZERO,
+            }));
+            return Ok(None);
+        }
+
+        if group.parent_position < group.request.prefix_tokens.len() {
+            let remaining = group.request.prefix_tokens.len() - group.parent_position;
+            let chunk = remaining.min(self.config.prefill_token_capacity);
+            let start = group.parent_position;
+            let end = start + chunk;
+            let id = group
+                .parent_sequence_id
+                .expect("admitted decision has a parent sequence");
+            on_lifecycle(RequestLifecycleEvent::PrefillStarted(group.id));
+            let started = Instant::now();
+            let mut sequences = self.sequences.lease_many(&[id])?;
+            self.model.prefill_batch(
+                &mut self.prefill_workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &group.request.prefix_tokens[start..end],
+                    sequence: sequences.sequence_mut(0),
+                    output: Gemma4PrefillOutput::None,
+                }],
+                &self.stream,
+                &mut self.sequence_cache,
+            )?;
+            self.stream.synchronize()?;
+            group.timings.shared_prefill += started.elapsed();
+            group.parent_position = end;
+            tick.prefilled.push(EnginePrefillProgress {
+                request_id: EngineRequestId::new(group.id.get()),
+                prompt_position: end,
+            });
+            return Ok(None);
+        }
+
+        let available = self
+            .config
+            .max_active_sequences
+            .saturating_sub(self.sequences.len());
+        let wave_capacity = available.min(self.config.decision_branch_capacity);
+        let mut admitted = 0;
+        let fork_started = Instant::now();
+        while admitted < wave_capacity && group.next_branch < group.request.branches.len() {
+            let branch = group.request.branches[group.next_branch].clone();
+            let max_tokens = group.request.prefix_tokens.len() + branch.suffix_tokens.len();
+            let parent_id = group
+                .parent_sequence_id
+                .expect("prefilled decision has a parent sequence");
+            let sequence = {
+                let mut parent = self.sequences.lease_many(&[parent_id])?;
+                Gemma4Sequence::branch_decision(
+                    self.model,
+                    parent.sequence_mut(0),
+                    &mut self.sequence_cache,
+                    max_tokens,
+                    &self.stream,
+                )?
+            };
+            let Some(sequence) = sequence else {
+                break;
+            };
+            let sequence_device_bytes = sequence.device_bytes();
+            let sequence_id = self.sequences.insert(sequence)?;
+            group.active_branches.push(DecisionBranchState {
+                branch,
+                sequence_id,
+                suffix_position: 0,
+                sequence_device_bytes,
+            });
+            group.next_branch += 1;
+            admitted += 1;
+        }
+        if admitted != 0 {
+            self.stream.synchronize()?;
+            group.timings.branch_fork += fork_started.elapsed();
+            return Ok(None);
+        }
+
+        let mut selected = Vec::new();
+        let mut token_budget = self.config.prefill_token_capacity;
+        for (index, branch) in group.active_branches.iter().enumerate() {
+            if selected.len() == self.config.prefill_sequence_capacity || token_budget == 0 {
+                break;
+            }
+            let target = branch.branch.suffix_tokens.len().saturating_sub(1);
+            let remaining = target.saturating_sub(branch.suffix_position);
+            if remaining == 0 {
+                continue;
+            }
+            let chunk = remaining.min(token_budget);
+            selected.push((index, chunk));
+            token_budget -= chunk;
+        }
+        if !selected.is_empty() {
+            let sequence_ids = selected
+                .iter()
+                .map(|(index, _)| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
+            let mut rows = Vec::with_capacity(selected.len());
+            for ((index, chunk), sequence) in selected.iter().zip(sequences.sequences_mut()) {
+                let branch = &group.active_branches[*index];
+                let start = branch.suffix_position;
+                let end = start + *chunk;
+                rows.push(Gemma4PrefillRow {
+                    token_ids: &branch.branch.suffix_tokens[start..end],
+                    sequence,
+                    output: Gemma4PrefillOutput::None,
+                });
+            }
+            let started = Instant::now();
+            self.model.prefill_batch(
+                &mut self.prefill_workspace,
+                &mut rows,
+                &self.stream,
+                &mut self.sequence_cache,
+            )?;
+            self.stream.synchronize()?;
+            group.timings.branch_inference += started.elapsed();
+            drop(rows);
+            drop(sequences);
+            for (index, chunk) in selected {
+                group.active_branches[index].suffix_position += chunk;
+            }
+            return Ok(None);
+        }
+
+        let ready = group
+            .active_branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| branch.suffix_position + 1 == branch.branch.suffix_tokens.len())
+            .take(
+                self.config
+                    .decision_branch_capacity
+                    .min(self.config.prefill_sequence_capacity),
+            )
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if !ready.is_empty() {
+            let sequence_ids = ready
+                .iter()
+                .map(|index| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let mut sequences = self.sequences.lease_many(&sequence_ids)?;
+            let mut rows = Vec::with_capacity(ready.len());
+            for (index, sequence) in ready.iter().zip(sequences.sequences_mut()) {
+                let branch = &group.active_branches[*index];
+                rows.push(Gemma4PrefillRow {
+                    token_ids: std::slice::from_ref(
+                        &branch.branch.suffix_tokens[branch.suffix_position],
+                    ),
+                    sequence,
+                    output: Gemma4PrefillOutput::FinalHidden,
+                });
+            }
+            let started = Instant::now();
+            self.model.prefill_batch(
+                &mut self.prefill_workspace,
+                &mut rows,
+                &self.stream,
+                &mut self.sequence_cache,
+            )?;
+            drop(rows);
+            for (row, sequence) in sequences.sequences_mut().enumerate() {
+                self.decision_readout
+                    .stage_sequence(row, sequence, &self.stream)?;
+            }
+            let logits =
+                self.decision_readout
+                    .selected_logits(self.model, ready.len(), &self.stream)?;
+            group.timings.branch_inference += started.elapsed();
+            let label_count = self.decision_readout.token_ids().len();
+            drop(sequences);
+            for (row, index) in ready.iter().copied().enumerate() {
+                let branch = &group.active_branches[index];
+                let row_logits = &logits[row * label_count..(row + 1) * label_count];
+                group.logits.push(DecisionBranchLogits {
+                    question_id: branch.branch.question_id.clone(),
+                    logits: row_logits[..branch.branch.label_token_ids.len()].to_vec(),
+                });
+            }
+            for index in ready.into_iter().rev() {
+                let branch = group.active_branches.swap_remove(index);
+                let released = self.release_decision_sequence(branch.sequence_id)?;
+                group.released_sequence_device_bytes = group
+                    .released_sequence_device_bytes
+                    .saturating_add(released.max(branch.sequence_device_bytes));
+            }
+            return Ok(None);
+        }
+
+        if group.next_branch != group.request.branches.len() || !group.active_branches.is_empty() {
+            return Ok(None);
+        }
+        if let Some(parent) = group.parent_sequence_id.take() {
+            let released = self.release_decision_sequence(parent)?;
+            group.released_sequence_device_bytes = group
+                .released_sequence_device_bytes
+                .saturating_add(released.max(group.parent_sequence_device_bytes));
+        }
+        let answers = answers_from_logits(&group.request, &group.logits, 1.0).map_err(|error| {
+            Error::Format {
+                label: "Gemma 4 decision answers",
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(Some(DecisionCompletion {
+            answers,
+            usage: DecisionUsage {
+                input_tokens: group.request.logical_input_tokens(),
+                output_tokens: group.request.branches.len(),
+            },
+            timings: group.timings,
+            released_sequence_device_bytes: group.released_sequence_device_bytes,
+        }))
+    }
+
+    fn release_decision_sequence(&mut self, id: Gemma4SequenceId) -> Result<usize> {
+        let sequence = self.sequences.release(id)?;
+        let bytes = sequence.device_bytes();
+        sequence.finish(&mut self.sequence_cache, &self.stream)?;
+        Ok(bytes)
+    }
+
+    fn release_decision_group(&mut self, group: &mut DecisionGroup) -> Result<()> {
+        let mut first_error = None;
+        for branch in group.active_branches.drain(..) {
+            match self.release_decision_sequence(branch.sequence_id) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(branch.sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(parent) = group.parent_sequence_id.take() {
+            match self.release_decision_sequence(parent) {
+                Ok(released) => {
+                    group.released_sequence_device_bytes = group
+                        .released_sequence_device_bytes
+                        .saturating_add(released.max(group.parent_sequence_device_bytes));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Cancels a waiting or active request.
     fn cancel_request(&mut self, id: Gemma4RequestId) -> Gemma4CancelOutcome {
+        if let Some(mut group) = self.decisions.remove(&id) {
+            self.decision_queue.retain(|&queued| queued != id);
+            let _ = self.release_decision_group(&mut group);
+            return Gemma4CancelOutcome::Cancelled {
+                released_sequence_device_bytes: group.released_sequence_device_bytes,
+            };
+        }
         let Some(request) = self.requests.remove(&id) else {
             return Gemma4CancelOutcome::NotFound;
         };
@@ -679,6 +1155,10 @@ fn checkpoint_ready(prompt_position: usize, prefix_target: usize, prefix_retaine
 }
 
 impl EngineService for Gemma4ChatService<'_, '_> {
+    fn capabilities(&self) -> EngineCapabilities {
+        EngineCapabilities { decisions: true }
+    }
+
     fn add_request(&mut self, request: ChatRequest) -> EngineResult<EngineAdmission> {
         let admission = Gemma4ChatService::add_request(self, request).map_err(EngineError::new)?;
         let id = admission.request_id.get();
@@ -686,6 +1166,17 @@ impl EngineService for Gemma4ChatService<'_, '_> {
             request_id: EngineRequestId::new(id),
             prompt_tokens: admission.prompt_tokens,
             max_output_tokens: admission.max_output_tokens,
+        })
+    }
+
+    fn add_decision(&mut self, request: DecisionRequest) -> EngineResult<EngineDecisionAdmission> {
+        let input_tokens = request.logical_input_tokens();
+        let branches = request.branches.len();
+        let id = Gemma4ChatService::add_decision(self, request).map_err(EngineError::new)?;
+        Ok(EngineDecisionAdmission {
+            request_id: EngineRequestId::new(id.get()),
+            input_tokens,
+            branches,
         })
     }
 

@@ -74,6 +74,48 @@ impl Gemma4Sequence {
         })
     }
 
+    /// Admits a decision sequence without vocabulary-sized generation scratch.
+    pub(crate) fn admit_decision(
+        model: &Gemma4Model,
+        cache: &mut Gemma4SequenceCache,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        let state = model.new_decision_sequence_state(max_tokens)?;
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let outcome = cache
+            .admit(
+                None,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+                |snapshot, position| {
+                    debug_assert!(snapshot.is_none());
+                    debug_assert_eq!(position, 0);
+                    Ok(())
+                },
+            )
+            .map_err(gemma4_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Err(Error::Format {
+                label: "Gemma 4 decision admission",
+                detail: "configured cache has insufficient capacity".to_string(),
+            });
+        };
+        Ok(Self {
+            cache_id,
+            page_table,
+            state,
+        })
+    }
+
     pub(crate) fn from_admission(
         cache_id: SequenceId,
         page_table: Sm12xPageTable,
@@ -109,6 +151,42 @@ impl Gemma4Sequence {
                 },
             )
             .map_err(gemma4_cache_error)
+    }
+
+    /// Forks one KV-only live sequence while sharing its sealed cache pages.
+    pub(crate) fn branch_decision(
+        model: &Gemma4Model,
+        source: &Self,
+        cache: &mut Gemma4SequenceCache,
+        max_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<Option<Self>> {
+        let mut state = model.new_decision_sequence_state(max_tokens)?;
+        let mut page_table = Sm12xPageTable::new(max_tokens)?;
+        let outcome = cache
+            .branch(
+                source.cache_id,
+                AdmissionRequest {
+                    max_position: max_tokens,
+                    private_state_bytes: state.device_bytes(),
+                    page_table_bytes: page_table.managed_bytes(),
+                    allow_emergency: false,
+                },
+                &mut Sm12xCacheContext {
+                    stream,
+                    page_table: &mut page_table,
+                },
+            )
+            .map_err(gemma4_cache_error)?;
+        let AdmissionOutcome::Admitted(cache_id) = outcome else {
+            return Ok(None);
+        };
+        state.position = source.state.position;
+        Ok(Some(Self {
+            cache_id,
+            page_table,
+            state,
+        }))
     }
 }
 

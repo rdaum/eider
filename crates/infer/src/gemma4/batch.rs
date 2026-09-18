@@ -5,8 +5,9 @@ use crate::gemma4::{Gemma4Append, Gemma4Sequence, Gemma4SequenceCache, gemma4_ca
 use crate::paged_prefill_attention::PagedTensorCorePrefillAttention;
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{
-    CublasLt, CutlassFp4GroupedGemmPlan, DeviceAddress, Fp4TnMatmulPlan, GemmShape,
+    CublasLt, CutlassFp4GroupedGemmPlan, DeviceAddress, DeviceBuffer, Fp4TnMatmulPlan, GemmShape,
     MoeSortedNvfp4Rows, MoeSortedRoutes, Nvfp4Matrix, Nvfp4TnInputs,
+    bf16_linear_logits_f32_batch_into_on_stream,
     copy_bf16_rows_to_f32_indexed_prefix_into_on_stream, copy_row_f32_into_on_stream,
     dual_rms_norm_add_then_rms_norm_add_channel_row_scale_f32_into_on_stream,
     dual_rms_norm_rope_neox_proportional_sequence_f32_at_offset_into_on_stream,
@@ -38,6 +39,7 @@ fn use_compact_prefill_attention(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Gemma4PrefillOutput {
     None,
+    FinalHidden,
     FullLogits,
     Top1,
 }
@@ -46,6 +48,84 @@ pub struct Gemma4PrefillRow<'tokens, 'state> {
     pub token_ids: &'tokens [u32],
     pub sequence: &'state mut Gemma4Sequence,
     pub output: Gemma4PrefillOutput,
+}
+
+/// Fixed 64-row tied-embedding projection used by native decision requests.
+pub struct Gemma4DecisionReadout {
+    token_ids: Vec<u32>,
+    weight: DeviceBuffer<u16>,
+    hidden: DeviceBuffer<f32>,
+    logits: DeviceBuffer<f32>,
+    capacity: usize,
+    hidden_size: usize,
+}
+
+impl Gemma4DecisionReadout {
+    /// Returns the vocabulary rows retained by this compact head.
+    pub fn token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+
+    /// Returns exact device bytes owned by the compact head and its workspace.
+    pub fn device_bytes(&self) -> usize {
+        self.weight.device_bytes() + self.hidden.device_bytes() + self.logits.device_bytes()
+    }
+
+    /// Stages one final-normalized sequence row for a batched compact projection.
+    pub(crate) fn stage_sequence(
+        &mut self,
+        row: usize,
+        sequence: &Gemma4Sequence,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if row >= self.capacity {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision readout row",
+                expected: format!("row < {}", self.capacity),
+                actual: row.to_string(),
+            });
+        }
+        self.hidden.copy_range_from_device_on_stream(
+            row * self.hidden_size,
+            sequence.state.final_hidden(),
+            0,
+            self.hidden_size,
+            stream,
+        )
+    }
+
+    /// Projects staged rows and returns soft-capped logits in row-major order.
+    pub(crate) fn selected_logits(
+        &mut self,
+        model: &Gemma4Model,
+        rows: usize,
+        stream: &CudaStream,
+    ) -> Result<Vec<f32>> {
+        if rows == 0 || rows > self.capacity {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision readout rows",
+                expected: format!("1..={}", self.capacity),
+                actual: rows.to_string(),
+            });
+        }
+        bf16_linear_logits_f32_batch_into_on_stream(
+            &self.hidden,
+            &self.weight,
+            self.logits.output(),
+            rows,
+            self.token_ids.len(),
+            self.hidden_size,
+            stream,
+        )?;
+        let mut logits = self
+            .logits
+            .copy_prefix_to_host(rows * self.token_ids.len(), stream)?
+            .into_vec();
+        for logit in &mut logits {
+            *logit = model.softcap_logit(*logit);
+        }
+        Ok(logits)
+    }
 }
 
 struct Gemma4PrefillStateRow<'tokens, 'state> {
@@ -468,6 +548,52 @@ impl Gemma4PrefillBatchWorkspace {
 }
 
 impl Gemma4Model {
+    /// Builds the fixed tied-embedding projection used by decision requests.
+    pub fn new_decision_readout(
+        &self,
+        token_ids: &[u32],
+        capacity: usize,
+    ) -> Result<Gemma4DecisionReadout> {
+        if token_ids.len() != 64
+            || capacity == 0
+            || token_ids
+                .iter()
+                .any(|token| *token as usize >= self.config.vocab_size)
+            || token_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != token_ids.len()
+        {
+            return Err(Error::Shape {
+                label: "Gemma 4 decision label head",
+                expected: "64 distinct vocabulary token IDs and positive capacity".to_string(),
+                actual: format!("{} token IDs, capacity {capacity}", token_ids.len()),
+            });
+        }
+        let stream = CudaStream::new_blocking()?;
+        let mut weight = DeviceBuffer::zeroed(token_ids.len() * self.config.hidden_size)?;
+        for (row, token) in token_ids.iter().copied().enumerate() {
+            weight.copy_range_from_device_on_stream(
+                row * self.config.hidden_size,
+                &self.embedding,
+                token as usize * self.config.hidden_size,
+                self.config.hidden_size,
+                &stream,
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(Gemma4DecisionReadout {
+            token_ids: token_ids.to_vec(),
+            weight,
+            hidden: DeviceBuffer::zeroed(capacity * self.config.hidden_size)?,
+            logits: DeviceBuffer::zeroed(capacity * token_ids.len())?,
+            capacity,
+            hidden_size: self.config.hidden_size,
+        })
+    }
+
     /// Allocates shared scratch for ragged prompt prefill.
     pub fn new_prefill_batch_workspace(
         &self,
@@ -494,6 +620,7 @@ impl Gemma4Model {
             .iter()
             .find(|layer| layer.attention.window.is_none())
             .expect("Gemma 4 has global-attention layers");
+        let attention_capacity = sequence::gemma4_state_capacity(max_context_tokens)?;
         let linear = Gemma4BatchLinearWorkspace::new(token_capacity)?;
         let moe = Gemma4BatchMoeWorkspace::new(&local.moe, token_capacity)?;
         Ok(Gemma4PrefillBatchWorkspace {
@@ -508,12 +635,12 @@ impl Gemma4Model {
             local_attention: Gemma4BatchAttentionWorkspace::new(
                 &local.attention,
                 token_capacity,
-                max_context_tokens,
+                attention_capacity,
             )?,
             global_attention: Gemma4BatchAttentionWorkspace::new(
                 &global.attention,
                 token_capacity,
-                max_context_tokens,
+                attention_capacity,
             )?,
             dense: local.dense.new_workspace(token_capacity)?,
             moe,
@@ -733,8 +860,8 @@ impl Gemma4Model {
                     row.state.hidden.output(),
                     stream,
                 )?;
-                let normalized = &mut row
-                    .state
+                let state = &mut *row.state;
+                let normalized = &mut state
                     .layers
                     .last_mut()
                     .expect("Gemma 4 state has every layer")
@@ -742,33 +869,53 @@ impl Gemma4Model {
                 self.final_norm.run_into(
                     1,
                     self.config.hidden_size,
-                    &row.state.hidden,
+                    &state.hidden,
                     normalized,
+                    stream,
+                )?;
+                state.hidden.copy_range_from_device_on_stream(
+                    0,
+                    normalized,
+                    0,
+                    self.config.hidden_size,
                     stream,
                 )?;
                 match row.output {
                     Gemma4PrefillOutput::None => unreachable!(),
-                    Gemma4PrefillOutput::FullLogits => bf16_linear_argmax_f32_into_on_stream(
-                        normalized,
-                        &self.embedding,
-                        row.state.lm_logits.output(),
-                        row.state.lm_argmax.output(),
-                        row.state.lm_argmax_value.output(),
-                        self.config.vocab_size,
-                        self.config.hidden_size,
-                        stream,
-                    )?,
-                    Gemma4PrefillOutput::Top1 => lm_head_top1_f32_into_on_stream(
-                        normalized,
-                        &self.embedding,
-                        &row.state.lm_logits,
-                        &row.state.lm_top1_scratch_index,
-                        &row.state.lm_argmax,
-                        &row.state.lm_argmax_value,
-                        self.config.vocab_size,
-                        self.config.hidden_size,
-                        stream,
-                    )?,
+                    Gemma4PrefillOutput::FinalHidden => {}
+                    Gemma4PrefillOutput::FullLogits => {
+                        let lm_head = state.lm_head.as_mut().ok_or_else(|| Error::Format {
+                            label: "Gemma 4 LM head workspace",
+                            detail: "sequence was allocated without generation scratch".to_string(),
+                        })?;
+                        bf16_linear_argmax_f32_into_on_stream(
+                            &state.hidden,
+                            &self.embedding,
+                            lm_head.lm_logits.output(),
+                            lm_head.lm_argmax.output(),
+                            lm_head.lm_argmax_value.output(),
+                            self.config.vocab_size,
+                            self.config.hidden_size,
+                            stream,
+                        )?
+                    }
+                    Gemma4PrefillOutput::Top1 => {
+                        let lm_head = state.lm_head.as_ref().ok_or_else(|| Error::Format {
+                            label: "Gemma 4 LM head workspace",
+                            detail: "sequence was allocated without generation scratch".to_string(),
+                        })?;
+                        lm_head_top1_f32_into_on_stream(
+                            &state.hidden,
+                            &self.embedding,
+                            &lm_head.lm_logits,
+                            &lm_head.lm_top1_scratch_index,
+                            &lm_head.lm_argmax,
+                            &lm_head.lm_argmax_value,
+                            self.config.vocab_size,
+                            self.config.hidden_size,
+                            stream,
+                        )?
+                    }
                 }
             }
             row_offset += row.token_ids.len();
@@ -1273,6 +1420,248 @@ fn run_moe_prefill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eider_cuda::SM12X_KV_PAGE_TOKENS;
+
+    fn local_model_dir() -> std::path::PathBuf {
+        std::env::var_os("EIDER_GEMMA4_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/gemma-4-26b-a4b-nvfp4")
+            })
+    }
+
+    fn assert_decision_fork_matches_full_head(
+        model: &Gemma4Model,
+        prefix_len: usize,
+        stream: &CudaStream,
+        cache: &mut Gemma4SequenceCache,
+        workspace: &mut Gemma4PrefillBatchWorkspace,
+        readout: &mut Gemma4DecisionReadout,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let prefix = vec![2; prefix_len];
+        let suffix = [3, 4, 5];
+        let max_tokens = prefix.len() + suffix.len();
+        let mut parent =
+            Gemma4Sequence::admit_decision(model, cache, prefix.len(), stream).expect("parent");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &prefix,
+                    sequence: &mut parent,
+                    output: Gemma4PrefillOutput::None,
+                }],
+                stream,
+                cache,
+            )
+            .expect("parent prefill");
+        stream.synchronize().expect("parent prefill completion");
+        let mut branch = Gemma4Sequence::branch_decision(model, &parent, cache, max_tokens, stream)
+            .expect("branch")
+            .expect("branch capacity");
+        stream.synchronize().expect("branch copy completion");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &suffix[..suffix.len() - 1],
+                    sequence: &mut branch,
+                    output: Gemma4PrefillOutput::None,
+                }],
+                stream,
+                cache,
+            )
+            .expect("branch suffix prefix");
+        stream.synchronize().expect("branch suffix completion");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &suffix[suffix.len() - 1..],
+                    sequence: &mut branch,
+                    output: Gemma4PrefillOutput::FinalHidden,
+                }],
+                stream,
+                cache,
+            )
+            .expect("branch final token");
+        readout
+            .stage_sequence(0, &branch, stream)
+            .expect("stage decision row");
+        let compact = readout
+            .selected_logits(model, 1, stream)
+            .expect("compact logits");
+
+        let mut reference =
+            Gemma4Sequence::admit(model, cache, max_tokens, stream).expect("reference");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &prefix,
+                    sequence: &mut reference,
+                    output: Gemma4PrefillOutput::None,
+                }],
+                stream,
+                cache,
+            )
+            .expect("reference prefix");
+        stream.synchronize().expect("reference prefix completion");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &suffix[..suffix.len() - 1],
+                    sequence: &mut reference,
+                    output: Gemma4PrefillOutput::None,
+                }],
+                stream,
+                cache,
+            )
+            .expect("reference suffix prefix");
+        stream.synchronize().expect("reference suffix completion");
+        model
+            .prefill_batch(
+                workspace,
+                &mut [Gemma4PrefillRow {
+                    token_ids: &suffix[suffix.len() - 1..],
+                    sequence: &mut reference,
+                    output: Gemma4PrefillOutput::FullLogits,
+                }],
+                stream,
+                cache,
+            )
+            .expect("reference final token");
+        let full = model
+            .logits_to_host(&reference.state, stream)
+            .expect("full logits");
+        readout
+            .stage_sequence(0, &reference, stream)
+            .expect("stage reference row");
+        let compact_reference = readout
+            .selected_logits(model, 1, stream)
+            .expect("compact reference logits");
+        let head_error = readout
+            .token_ids()
+            .iter()
+            .enumerate()
+            .map(|(row, token)| (compact_reference[row] - full[*token as usize]).abs())
+            .fold(0.0f32, f32::max);
+        let fork_error = compact
+            .iter()
+            .zip(&compact_reference)
+            .map(|(branch, reference)| (branch - reference).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            head_error <= 1.0e-4,
+            "prefix={prefix_len} head_error={head_error}"
+        );
+        assert!(
+            fork_error <= 1.0e-4,
+            "prefix={prefix_len} fork_error={fork_error}"
+        );
+
+        parent.finish(cache, stream).expect("finish parent");
+        branch.finish(cache, stream).expect("finish branch");
+        reference.finish(cache, stream).expect("finish reference");
+        (compact, compact_reference)
+    }
+
+    fn assert_logits_match(label: &str, actual: &[f32], expected: &[f32]) {
+        let max_error = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error <= 1.0e-4, "{label} max_error={max_error}");
+    }
+
+    #[test]
+    #[ignore = "requires the local Gemma 4 checkpoint"]
+    fn local_decision_head_matches_full_vocab_after_aligned_and_unaligned_forks() {
+        let model = Gemma4Model::load(local_model_dir()).expect("load Gemma 4");
+        let stream = CudaStream::new_blocking().expect("stream");
+        let max_tokens = SM12X_KV_PAGE_TOKENS + 4;
+        let mut cache = crate::gemma4::new_gemma4_sequence_cache(&model, 3, max_tokens)
+            .expect("sequence cache");
+        let mut workspace = model
+            .new_prefill_batch_workspace(1, max_tokens, max_tokens)
+            .expect("prefill workspace");
+        let label_ids = (0..64).collect::<Vec<_>>();
+        let mut readout = model
+            .new_decision_readout(&label_ids, 1)
+            .expect("decision readout");
+        let full_bytes = model
+            .new_sequence_state(max_tokens)
+            .expect("full state")
+            .device_bytes();
+        let decision_bytes = model
+            .new_decision_sequence_state(max_tokens)
+            .expect("decision state")
+            .device_bytes();
+        let vocabulary_scratch_bytes = model.vocab_size() * (size_of::<f32>() + size_of::<u32>())
+            + size_of::<u32>()
+            + size_of::<f32>();
+        assert_eq!(full_bytes - decision_bytes, vocabulary_scratch_bytes);
+
+        let (aligned_branch, aligned_reference) = assert_decision_fork_matches_full_head(
+            &model,
+            SM12X_KV_PAGE_TOKENS,
+            &stream,
+            &mut cache,
+            &mut workspace,
+            &mut readout,
+        );
+        let (aligned_branch_repeat, aligned_reference_repeat) =
+            assert_decision_fork_matches_full_head(
+                &model,
+                SM12X_KV_PAGE_TOKENS,
+                &stream,
+                &mut cache,
+                &mut workspace,
+                &mut readout,
+            );
+        assert_logits_match(
+            "repeated aligned branch",
+            &aligned_branch_repeat,
+            &aligned_branch,
+        );
+        assert_logits_match(
+            "repeated aligned reference",
+            &aligned_reference_repeat,
+            &aligned_reference,
+        );
+
+        let (unaligned_branch, unaligned_reference) = assert_decision_fork_matches_full_head(
+            &model,
+            SM12X_KV_PAGE_TOKENS + 1,
+            &stream,
+            &mut cache,
+            &mut workspace,
+            &mut readout,
+        );
+        let (unaligned_branch_repeat, unaligned_reference_repeat) =
+            assert_decision_fork_matches_full_head(
+                &model,
+                SM12X_KV_PAGE_TOKENS + 1,
+                &stream,
+                &mut cache,
+                &mut workspace,
+                &mut readout,
+            );
+        assert_logits_match(
+            "repeated unaligned branch",
+            &unaligned_branch_repeat,
+            &unaligned_branch,
+        );
+        assert_logits_match(
+            "repeated unaligned reference",
+            &unaligned_reference_repeat,
+            &unaligned_reference,
+        );
+    }
 
     #[test]
     #[ignore = "requires the local Gemma 4 checkpoint"]
