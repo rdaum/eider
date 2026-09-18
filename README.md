@@ -14,6 +14,74 @@ Eider has three priorities:
 - It provides a practical platform for experiments and for learning how
   inference systems work.
 
+## Native decisions
+
+`POST /v1/decisions` answers typed questions without generating a prose
+response. Gemma 4, Qwen3.6, and Qwen3.8 Flash Next use native model paths for
+this endpoint.
+
+Gemma 4 evaluates the shared state once. It then forks one KV-only child
+sequence for each question and batches the question suffixes. A compact
+64-row head reads the answer logits from the tied BF16 embedding. It does not
+allocate or evaluate the full vocabulary head for each branch.
+
+Start the Gemma 4 NVFP4 checkpoint:
+
+```sh
+scripts/run-eider-gemma4.sh
+```
+
+If the checkpoint is not cached, permit network access for the first start:
+
+```sh
+EIDER_OFFLINE=0 scripts/run-eider-gemma4.sh
+```
+
+Send a decision request from a second terminal:
+
+```sh
+curl -fsS http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "decision-latest",
+    "state": "Help! My payouts have been failing for three days.",
+    "questions": {
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does this message convey urgency?",
+        "criteria": {
+          "true": "Explicitly time-sensitive",
+          "false": "No urgency expressed"
+        }
+      },
+      "department": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "billing": "Payments, invoicing, refunds",
+          "technical": "Bugs, outages, integrations",
+          "sales": "Pricing, upgrades, new accounts"
+        }
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated is the customer?",
+        "criteria": ["Calm", "Frustrated", "Very angry"]
+      }
+    }
+  }' | jq
+```
+
+A `noul` answer is the probability of `true`. A `choice` answer includes the
+selected option and all option probabilities. A `score` answer is the expected
+ordinal index for its legend. The `confidence` value measures probability
+concentration, not answer correctness.
+
+Decision usage is logical API usage. Input usage includes the shared state and
+all question suffixes. Output usage contains one answer token for each
+question. Use `--decision-calibration FILE` to load a validated calibration
+artifact for the exact served model.
+
 ## Qwen3.8 Flash Next
 
 Eider served [Qwen3.8 Flash
@@ -105,15 +173,7 @@ curl -fsS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"eider-qwen3.8-flash-next","input":"What is 2+2?","max_output_tokens":64}'
 ```
 
-The same server exposes the experimental native decision path at
-`POST /v1/decisions`. Qwen3.6 remains the measured decision target; Flash Next
-is available for correctness and task-quality evaluation:
-
-```sh
-curl -fsS http://127.0.0.1:8080/v1/decisions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"eider-qwen3.8-flash-next","state":"Payouts have failed for three days.","questions":{"urgent":{"type":"noul","instructions":"Is this urgent?"}}}'
-```
+The same server exposes the native decision path described above.
 
 Start Qwen3.6 with `EIDER_MODEL=qwen3.6-35b-a3b scripts/run-eider`. See
 [`docs/decision-endpoint.md`](docs/decision-endpoint.md) for
@@ -226,7 +286,7 @@ second column.
 | [`qwen3.6-35b-a3b`](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) | `eider-qwen3.6` | 35B-A3B MoE and compact FP4 KV |
 | [`ornith-1.5-35b-a3b`](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4) | `eider-ornith-1.5-35b-a3b` | Text path, W4A16 MoE, and compact FP4 KV; vision and the MoE MTP block are not served |
 | [`agents-a1`](https://internscience.github.io/Agents-A1/) | `eider-agents-a1` | Qwen3.5-MoE agent model with 262K context |
-| [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint |
+| [`gemma-4-26b-a4b-nvfp4`](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4) | `eider-gemma4-26b` | Native NVIDIA NVFP4 checkpoint and native decisions |
 | [`gemma-4-26b-a4b-it`](https://huggingface.co/google/gemma-4-26B-A4B-it) | `eider-gemma4-26b` | Upstream BF16 checkpoint on the same runtime |
 | [`muse-glimmer-30b-nvfp4`](https://huggingface.co/Inferact/Muse-Glimmer-30B-NVFP4-W4A4) | `eider-muse-glimmer-30b` | Text path, DFlash, ATEM tools, and compact FP4 KV |
 | [`step-3.7-flash`](https://huggingface.co/stepfun-ai/Step-3.7-Flash-NVFP4) | `eider-step3.7` | 198B MoE with disk-backed expert paging |
@@ -336,16 +396,21 @@ derived artifacts below `$XDG_CACHE_HOME/eider/models/`.
 Use `--model-dir` only for local development checkpoints. Catalogue IDs select
 pinned deployments.
 
-Both API adapters use the same scheduler and model runtime:
+The generation adapters use the same scheduler and model runtime:
 
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
+
+The server also exposes these routes:
+
+- `POST /v1/decisions`
 - `GET /healthz`
 - `GET /metrics`
 
-The server supports streaming, tool history, sampling, cancellation, concurrent
-requests, and prompt-prefix caching. Run `eider-serve --help` for the complete
-command reference.
+The generation adapters support streaming, tool history, sampling, and
+prompt-prefix caching. All three request paths support cancellation and
+concurrent requests. Run `eider-serve --help` for the complete command
+reference.
 
 Set `EIDER_API_KEY` to require bearer authentication.
 
