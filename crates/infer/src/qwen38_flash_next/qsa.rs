@@ -269,6 +269,36 @@ impl Qwen38QsaWeights {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_prefill_batch(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut Qwen38QsaPrefillWorkspace,
+        config: &Qwen38FlashNextConfig,
+        hidden: &DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let projection_rows =
+            (config.indexer_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        self.index_qk
+            .run_batch_into(hidden, &mut workspace.index_projection, tokens, stream)?;
+        round_f32_to_bf16_prefix_in_place_on_stream(
+            workspace.index_projection.inout(),
+            tokens * projection_rows,
+            stream,
+        )?;
+        self.attention.enqueue_qsa_prefill_pre_positions(
+            model,
+            &mut workspace.attention,
+            hidden,
+            positions,
+            tokens,
+            stream,
+        )
+    }
+
     /// Evaluates one row after the shared prompt projections are complete.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_prepared_prefill_row(

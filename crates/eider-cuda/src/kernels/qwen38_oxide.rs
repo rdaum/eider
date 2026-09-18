@@ -16,6 +16,7 @@ struct Functions {
     repeat_streams: Kernel,
     ple_gate_value: Kernel,
     ple_conv_update: Kernel,
+    ple_conv_update_batch: Kernel,
     qsa_clear_masks: Kernel,
     qsa_prepare_query: Kernel,
     qsa_append_keys: Kernel,
@@ -34,6 +35,7 @@ impl Functions {
             repeat_streams: Kernel::load(c"qwen38_repeat_streams_f32")?,
             ple_gate_value: Kernel::load(c"qwen38_ple_gate_value_f32")?,
             ple_conv_update: Kernel::load(c"qwen38_ple_conv_update_f32")?,
+            ple_conv_update_batch: Kernel::load(c"qwen38_ple_conv_update_batch_f32")?,
             qsa_clear_masks: Kernel::load(c"qwen38_qsa_clear_masks")?,
             qsa_prepare_query: Kernel::load(c"qwen38_qsa_prepare_query_f32")?,
             qsa_append_keys: Kernel::load(c"qwen38_qsa_append_keys_f32")?,
@@ -330,6 +332,67 @@ pub(crate) unsafe fn ple_conv_update(
     unsafe {
         functions()?.ple_conv_update.launch(
             LaunchConfig::new(grid(u64::from(channels), THREADS), block(THREADS), 0),
+            stream,
+            &mut parameters,
+        )
+    }
+}
+
+/// Launches batched PLE convolution over packed independent sequences.
+///
+/// # Safety
+///
+/// The pointer table and packed-row metadata must match the validated geometry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn ple_conv_update_batch(
+    normalized: *const f32,
+    gated: *const f32,
+    weight_bf16: *const u16,
+    state_table: *const *mut f32,
+    sequence_offsets: *const u32,
+    sequence_lengths: *const u32,
+    output: *mut f32,
+    sequences: u32,
+    channels: u32,
+    kernel: u32,
+    dilation: u32,
+    stream: ffi::cudaStream_t,
+) -> Result<()> {
+    let mut normalized_arg = normalized;
+    let mut gated_arg = gated;
+    let mut weight_arg = weight_bf16;
+    let mut state_table_arg = state_table;
+    let mut sequence_offsets_arg = sequence_offsets;
+    let mut sequence_lengths_arg = sequence_lengths;
+    let mut output_arg = output;
+    let mut channels_arg = channels;
+    let mut kernel_arg = kernel;
+    let mut dilation_arg = dilation;
+    let mut history_arg = (kernel - 1) * dilation;
+    let mut parameters = [
+        (&mut normalized_arg as *mut *const f32).cast::<c_void>(),
+        (&mut gated_arg as *mut *const f32).cast::<c_void>(),
+        (&mut weight_arg as *mut *const u16).cast::<c_void>(),
+        (&mut state_table_arg as *mut *const *mut f32).cast::<c_void>(),
+        (&mut sequence_offsets_arg as *mut *const u32).cast::<c_void>(),
+        (&mut sequence_lengths_arg as *mut *const u32).cast::<c_void>(),
+        (&mut output_arg as *mut *mut f32).cast::<c_void>(),
+        (&mut channels_arg as *mut u32).cast::<c_void>(),
+        (&mut kernel_arg as *mut u32).cast::<c_void>(),
+        (&mut dilation_arg as *mut u32).cast::<c_void>(),
+        (&mut history_arg as *mut u32).cast::<c_void>(),
+    ];
+    unsafe {
+        functions()?.ple_conv_update_batch.launch(
+            LaunchConfig::new(
+                [
+                    u64::from(channels).div_ceil(u64::from(THREADS)) as u32,
+                    sequences,
+                    1,
+                ],
+                block(THREADS),
+                0,
+            ),
             stream,
             &mut parameters,
         )

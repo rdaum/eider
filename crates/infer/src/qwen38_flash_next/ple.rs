@@ -413,6 +413,52 @@ impl Qwen38PagedPle {
         Ok(())
     }
 
+    /// Starts one packed PLE read for independent sequence windows.
+    pub(crate) fn begin_read_sequences<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = (&'a mut Qwen38PleTokenWindow, &'a [u32])>,
+    ) -> Result<()> {
+        self.row_ids.clear();
+        let mut tokens = 0usize;
+        for (window, row_tokens) in rows {
+            if row_tokens.is_empty() {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 paged PLE sequence row",
+                    expected: "at least one token".to_string(),
+                    actual: "0 tokens".to_string(),
+                });
+            }
+            tokens = tokens
+                .checked_add(row_tokens.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 paged PLE packed tokens",
+                    expected: "total token count without overflow".to_string(),
+                    actual: format!("tokens={tokens} row={}", row_tokens.len()),
+                })?;
+            if tokens > self.token_capacity {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 paged PLE packed tokens",
+                    expected: format!("at most {} tokens", self.token_capacity),
+                    actual: tokens.to_string(),
+                });
+            }
+            for &token in row_tokens {
+                self.hash
+                    .hash_and_append(window, token, &mut self.row_ids)?;
+            }
+        }
+        if tokens == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 paged PLE packed tokens",
+                expected: "at least one sequence row".to_string(),
+                actual: "0 tokens".to_string(),
+            });
+        }
+        self.reader.begin_rows(&self.row_ids)?;
+        self.read_accounted = false;
+        Ok(())
+    }
+
     /// Waits for a previously started PLE read.
     pub fn wait_read(&mut self) -> Result<PagedRowReadStats> {
         let read = self.reader.wait_ready()?;

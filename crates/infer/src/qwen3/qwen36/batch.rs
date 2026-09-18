@@ -1899,33 +1899,50 @@ impl BatchLinearAttentionWorkspace {
             .copy_from_host(&self.recurrent_state_ptrs)
     }
 
-    fn begin_single_prefill(&mut self, tokens: usize) -> Result<()> {
+    fn begin_prefill(&mut self, sequence_lengths: &[u32]) -> Result<()> {
         self.conv_state_ptrs.fill(DeviceAddress::null());
         self.recurrent_state_ptrs.fill(DeviceAddress::null());
         if let Some(chunked) = self.chunked_gdn.as_mut() {
-            chunked.prepare(&[tokens as u32])?;
+            chunked.prepare(sequence_lengths)?;
         }
         Ok(())
     }
 
-    fn bind_single_prefill_state(
+    fn bind_prefill_state(
         &mut self,
         layer_idx: usize,
+        sequence_idx: usize,
+        sequence_capacity: usize,
         state: &mut Qwen36LinearAttentionState,
     ) -> Result<()> {
-        if layer_idx >= self.conv_state_ptrs.len() {
+        let Some(table_idx) = layer_idx
+            .checked_mul(sequence_capacity)
+            .and_then(|offset| offset.checked_add(sequence_idx))
+        else {
             return Err(eider_cuda::Error::Shape {
-                label: "Qwen hybrid GDN layer",
-                expected: format!("layer < {}", self.conv_state_ptrs.len()),
-                actual: layer_idx.to_string(),
+                label: "Qwen hybrid GDN state table",
+                expected: "layer * sequence capacity without overflow".to_string(),
+                actual: format!(
+                    "layer={layer_idx} sequence={sequence_idx} capacity={sequence_capacity}"
+                ),
+            });
+        };
+        if sequence_idx >= sequence_capacity || table_idx >= self.conv_state_ptrs.len() {
+            return Err(eider_cuda::Error::Shape {
+                label: "Qwen hybrid GDN state table",
+                expected: format!(
+                    "sequence < {sequence_capacity} and table index < {}",
+                    self.conv_state_ptrs.len()
+                ),
+                actual: format!("sequence={sequence_idx} table_index={table_idx}"),
             });
         }
-        self.conv_state_ptrs[layer_idx] = state.conv_state.cuda_address();
-        self.recurrent_state_ptrs[layer_idx] = state.recurrent_state.cuda_address();
+        self.conv_state_ptrs[table_idx] = state.conv_state.cuda_address();
+        self.recurrent_state_ptrs[table_idx] = state.recurrent_state.cuda_address();
         Ok(())
     }
 
-    fn upload_single_prefill_states(&mut self) -> Result<()> {
+    fn upload_prefill_states(&mut self) -> Result<()> {
         self.conv_state_table
             .copy_from_host(&self.conv_state_ptrs)?;
         self.recurrent_state_table
@@ -2526,6 +2543,10 @@ impl BatchMoeWorkspace {
 /// Shared vectorized GDN and MoE scratch for hybrid-model prompt chunks.
 pub(crate) struct Qwen36HybridPrefillWorkspace {
     token_capacity: usize,
+    sequence_capacity: usize,
+    active_sequence_count: usize,
+    host_sequence_offsets: Vec<u32>,
+    host_sequence_lengths: Vec<u32>,
     sequence_offsets: DeviceBuffer<u32>,
     sequence_lengths: DeviceBuffer<u32>,
     linear: BatchLinearAttentionWorkspace,
@@ -2540,13 +2561,38 @@ impl Qwen36HybridPrefillWorkspace {
         moe: &Qwen36MoeWeights,
         token_capacity: usize,
     ) -> Result<Self> {
-        let mut sequence_offsets = DeviceBuffer::zeroed(1)?;
-        sequence_offsets.copy_from_host(&[0])?;
+        Self::new_multi_sequence(model, linear, moe, token_capacity, 1)
+    }
+
+    pub(crate) fn new_multi_sequence(
+        model: &Qwen36BatchModelView<'_>,
+        linear: &Qwen36LinearAttentionWeights,
+        moe: &Qwen36MoeWeights,
+        token_capacity: usize,
+        sequence_capacity: usize,
+    ) -> Result<Self> {
+        if sequence_capacity == 0 {
+            return Err(eider_cuda::Error::Shape {
+                label: "Qwen hybrid prefill sequence capacity",
+                expected: "positive sequence capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
         Ok(Self {
             token_capacity,
-            sequence_offsets,
-            sequence_lengths: DeviceBuffer::zeroed(1)?,
-            linear: BatchLinearAttentionWorkspace::new(model, linear, token_capacity, 1, true)?,
+            sequence_capacity,
+            active_sequence_count: 0,
+            host_sequence_offsets: vec![0; sequence_capacity],
+            host_sequence_lengths: vec![0; sequence_capacity],
+            sequence_offsets: DeviceBuffer::zeroed(sequence_capacity)?,
+            sequence_lengths: DeviceBuffer::zeroed(sequence_capacity)?,
+            linear: BatchLinearAttentionWorkspace::new(
+                model,
+                linear,
+                token_capacity,
+                sequence_capacity,
+                true,
+            )?,
             moe: Box::new(BatchMoeWorkspace::new(model, moe, token_capacity)?),
             zero_residual: DeviceBuffer::zeroed(token_capacity * model.batch_manifest().hidden)?,
         })
@@ -2564,6 +2610,12 @@ impl Qwen36HybridPrefillWorkspace {
         stream: &CudaStream,
     ) -> Result<&'a DeviceBuffer<f32>> {
         self.require_tokens(tokens)?;
+        if self.active_sequence_count == 0 {
+            return Err(eider_cuda::Error::Format {
+                label: "Qwen hybrid GDN batch",
+                detail: "sequence rows were not prepared".to_string(),
+            });
+        }
         let serial_recurrence = self.linear.state_snapshots.is_some();
         weights.enqueue_prefill_chunks(
             model,
@@ -2571,10 +2623,10 @@ impl Qwen36HybridPrefillWorkspace {
             hidden,
             &self.sequence_offsets,
             &self.sequence_lengths,
-            &[tokens as u32],
+            &self.host_sequence_lengths[..self.active_sequence_count],
             layer,
-            1,
-            1,
+            self.sequence_capacity,
+            self.active_sequence_count,
             tokens,
             tokens,
             serial_projections,
@@ -2586,9 +2638,54 @@ impl Qwen36HybridPrefillWorkspace {
     }
 
     pub(crate) fn begin_gdn_prefill(&mut self, tokens: usize) -> Result<()> {
-        self.require_tokens(tokens)?;
-        self.sequence_lengths.copy_from_host(&[tokens as u32])?;
-        self.linear.begin_single_prefill(tokens)
+        self.begin_gdn_prefill_rows(&[tokens])
+    }
+
+    pub(crate) fn begin_gdn_prefill_rows(&mut self, sequence_lengths: &[usize]) -> Result<()> {
+        if sequence_lengths.is_empty() || sequence_lengths.len() > self.sequence_capacity {
+            return Err(eider_cuda::Error::Shape {
+                label: "Qwen hybrid GDN sequence rows",
+                expected: format!("1..={} rows", self.sequence_capacity),
+                actual: sequence_lengths.len().to_string(),
+            });
+        }
+        let mut offset = 0usize;
+        for (index, &length) in sequence_lengths.iter().enumerate() {
+            if length == 0 {
+                return Err(eider_cuda::Error::Shape {
+                    label: "Qwen hybrid GDN sequence length",
+                    expected: "positive token count".to_string(),
+                    actual: format!("row {index} has zero tokens"),
+                });
+            }
+            self.host_sequence_offsets[index] =
+                u32::try_from(offset).map_err(|_| eider_cuda::Error::Shape {
+                    label: "Qwen hybrid GDN sequence offset",
+                    expected: "u32-sized offset".to_string(),
+                    actual: offset.to_string(),
+                })?;
+            self.host_sequence_lengths[index] =
+                u32::try_from(length).map_err(|_| eider_cuda::Error::Shape {
+                    label: "Qwen hybrid GDN sequence length",
+                    expected: "u32-sized length".to_string(),
+                    actual: length.to_string(),
+                })?;
+            offset = offset
+                .checked_add(length)
+                .ok_or_else(|| eider_cuda::Error::Shape {
+                    label: "Qwen hybrid GDN token count",
+                    expected: "total token count without overflow".to_string(),
+                    actual: format!("offset={offset} length={length}"),
+                })?;
+        }
+        self.require_tokens(offset)?;
+        self.sequence_offsets
+            .copy_prefix_from_host(&self.host_sequence_offsets[..sequence_lengths.len()])?;
+        self.sequence_lengths
+            .copy_prefix_from_host(&self.host_sequence_lengths[..sequence_lengths.len()])?;
+        self.active_sequence_count = sequence_lengths.len();
+        self.linear
+            .begin_prefill(&self.host_sequence_lengths[..self.active_sequence_count])
     }
 
     pub(crate) fn bind_gdn_state(
@@ -2596,11 +2693,21 @@ impl Qwen36HybridPrefillWorkspace {
         layer: usize,
         state: &mut Qwen36LinearAttentionState,
     ) -> Result<()> {
-        self.linear.bind_single_prefill_state(layer, state)
+        self.bind_gdn_state_row(layer, 0, state)
+    }
+
+    pub(crate) fn bind_gdn_state_row(
+        &mut self,
+        layer: usize,
+        sequence: usize,
+        state: &mut Qwen36LinearAttentionState,
+    ) -> Result<()> {
+        self.linear
+            .bind_prefill_state(layer, sequence, self.sequence_capacity, state)
     }
 
     pub(crate) fn finish_gdn_prefill(&mut self) -> Result<()> {
-        self.linear.upload_single_prefill_states()
+        self.linear.upload_prefill_states()
     }
 
     pub(crate) fn enable_state_snapshots(
@@ -5973,6 +6080,48 @@ impl Qwen36FullAttentionWeights {
             &workspace.k,
             workspace.k_rope.output(),
             start_position,
+            model.batch_manifest().rope_theta,
+            stream,
+        )
+    }
+
+    pub(crate) fn enqueue_qsa_prefill_pre_positions(
+        &self,
+        model: &Qwen36BatchModelView<'_>,
+        workspace: &mut BatchFullAttentionWorkspace,
+        hidden: &DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.enqueue_batch_projections(model, workspace, hidden, tokens, stream)?;
+        let sections = MropeSections {
+            v0: model.batch_manifest().rotary_dim / 2,
+            v1: 0,
+            v2: 0,
+            v3: 0,
+        };
+        rope_imrope_text_batch_f32_into_on_stream(
+            tokens,
+            model.batch_manifest().q_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
+            sections,
+            positions,
+            &workspace.q,
+            workspace.q_rope.output(),
+            model.batch_manifest().rope_theta,
+            stream,
+        )?;
+        rope_imrope_text_batch_f32_into_on_stream(
+            tokens,
+            model.batch_manifest().kv_heads,
+            model.batch_manifest().head_dim,
+            model.batch_manifest().rotary_dim,
+            sections,
+            positions,
+            &workspace.k,
+            workspace.k_rope.output(),
             model.batch_manifest().rope_theta,
             stream,
         )

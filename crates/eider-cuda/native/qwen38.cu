@@ -569,6 +569,55 @@ __global__ void qwen38_ple_conv_update_kernel(const float* normalized,
     }
 }
 
+__global__ void qwen38_ple_conv_update_batch_kernel(
+        const float* normalized,
+        const float* gated,
+        const __nv_bfloat16* weight,
+        float* const* state_table,
+        const std::uint32_t* sequence_offsets,
+        const std::uint32_t* sequence_lengths,
+        float* output,
+        std::uint32_t channels,
+        std::uint32_t kernel,
+        std::uint32_t dilation,
+        std::uint32_t history) {
+    const std::uint32_t sequence = blockIdx.y;
+    const std::uint32_t channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+    const std::uint32_t row_offset = sequence_offsets[sequence];
+    const std::uint32_t tokens = sequence_lengths[sequence];
+    float* state = state_table[sequence];
+    const std::size_t state_offset = static_cast<std::size_t>(channel) * history;
+    const std::size_t weight_offset = static_cast<std::size_t>(channel) * kernel;
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        float conv = 0.0f;
+        for (std::uint32_t tap = 0; tap < kernel; ++tap) {
+            const std::uint32_t lag = (kernel - 1 - tap) * dilation;
+            const std::uint32_t centre = history + token;
+            const std::uint32_t source = centre - lag;
+            const float x = source < history
+                ? state[state_offset + source]
+                : normalized[(static_cast<std::size_t>(row_offset) + source - history)
+                    * channels + channel];
+            conv += x * __bfloat162float(weight[weight_offset + tap]);
+        }
+        const float activated = conv / (1.0f + expf(-conv));
+        const std::size_t output_offset =
+            (static_cast<std::size_t>(row_offset) + token) * channels + channel;
+        output[output_offset] = gated[output_offset] + activated;
+    }
+    for (std::uint32_t position = 0; position < history; ++position) {
+        const std::uint32_t source = tokens + position;
+        state[state_offset + position] = source < history
+            ? state[state_offset + source]
+            : normalized[(static_cast<std::size_t>(row_offset) + source - history)
+                * channels + channel];
+    }
+}
+
 }  // namespace
 
 extern "C" cudaError_t infer_qwen38_hc_norm_f32_on_stream(
@@ -708,6 +757,43 @@ extern "C" cudaError_t infer_qwen38_ple_conv_update_f32_on_stream(
         state,
         output,
         tokens,
+        channels,
+        kernel,
+        dilation,
+        history);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t infer_qwen38_ple_conv_update_batch_f32_on_stream(
+        const float* normalized,
+        const float* gated,
+        const std::uint16_t* weight_bf16,
+        float* const* state_table,
+        const std::uint32_t* sequence_offsets,
+        const std::uint32_t* sequence_lengths,
+        float* output,
+        std::uint32_t sequences,
+        std::uint32_t channels,
+        std::uint32_t kernel,
+        std::uint32_t dilation,
+        cudaStream_t stream) {
+    if (normalized == nullptr || gated == nullptr || weight_bf16 == nullptr
+        || state_table == nullptr || sequence_offsets == nullptr
+        || sequence_lengths == nullptr || output == nullptr || sequences == 0
+        || channels == 0 || kernel < 2 || dilation == 0) {
+        return cudaErrorInvalidValue;
+    }
+    const std::uint32_t history = (kernel - 1) * dilation;
+    constexpr int threads = 256;
+    const unsigned int blocks = (channels + threads - 1) / threads;
+    qwen38_ple_conv_update_batch_kernel<<<dim3(blocks, sequences), threads, 0, stream>>>(
+        normalized,
+        gated,
+        reinterpret_cast<const __nv_bfloat16*>(weight_bf16),
+        state_table,
+        sequence_offsets,
+        sequence_lengths,
+        output,
         channels,
         kernel,
         dilation,

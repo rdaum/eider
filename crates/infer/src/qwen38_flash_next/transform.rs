@@ -3,7 +3,8 @@
 use super::{Qwen38FlashNextConfig, Qwen38PagedPle};
 use crate::qwen3::qwen36::{Bf16Linear, read_bf16_flat_host, read_bf16_vector_as_f32_device};
 use eider_cuda::{
-    CudaStream, DeviceBuffer, Error, PagedRowReadStats, Result, qwen38_hc_norm_f32_into_on_stream,
+    CudaStream, DeviceAddress, DeviceBuffer, Error, PagedRowReadStats, Result,
+    qwen38_hc_norm_f32_into_on_stream, qwen38_ple_conv_update_batch_f32_into_on_stream,
     qwen38_ple_conv_update_f32_into_on_stream, qwen38_ple_gate_value_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
@@ -184,6 +185,92 @@ impl Qwen38PleWeights {
             &mut state.conv,
             workspace.output.output(),
             tokens,
+            self.hidden * self.hc_count,
+            self.conv_kernel,
+            self.conv_dilation,
+            stream,
+        )?;
+        Ok((&workspace.output, read))
+    }
+
+    /// Consumes one packed PLE read and advances independent convolution states.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_batch<'a>(
+        &self,
+        pager: &mut Qwen38PagedPle,
+        query_streams: &DeviceBuffer<f32>,
+        state_table: &DeviceBuffer<DeviceAddress<f32>>,
+        sequence_offsets: &DeviceBuffer<u32>,
+        sequence_lengths: &DeviceBuffer<u32>,
+        workspace: &'a mut Qwen38PleWorkspace,
+        sequences: usize,
+        total_tokens: usize,
+        stream: &CudaStream,
+    ) -> Result<(&'a DeviceBuffer<f32>, PagedRowReadStats)> {
+        workspace.require(self, total_tokens)?;
+        let read = pager.gather_into_on_stream(workspace.embeddings.output(), stream)?;
+        self.key.run_batch_into(
+            &workspace.embeddings,
+            &mut workspace.key,
+            total_tokens,
+            stream,
+        )?;
+        self.value.run_batch_into(
+            &workspace.embeddings,
+            &mut workspace.value,
+            total_tokens,
+            stream,
+        )?;
+        qwen38_hc_norm_f32_into_on_stream(
+            &workspace.key,
+            &self.key_norm_delta,
+            workspace.key_normed.output(),
+            total_tokens,
+            self.hidden,
+            self.hc_count,
+            self.eps,
+            stream,
+        )?;
+        qwen38_hc_norm_f32_into_on_stream(
+            query_streams,
+            &self.query_norm_delta,
+            workspace.query_normed.output(),
+            total_tokens,
+            self.hidden,
+            self.hc_count,
+            self.eps,
+            stream,
+        )?;
+        qwen38_ple_gate_value_f32_into_on_stream(
+            &workspace.key_normed,
+            &workspace.query_normed,
+            &workspace.value,
+            workspace.gated.output(),
+            total_tokens,
+            self.hidden,
+            self.hc_count,
+            stream,
+        )?;
+        qwen38_hc_norm_f32_into_on_stream(
+            &workspace.gated,
+            &self.conv_norm_delta,
+            workspace.conv_normed.output(),
+            total_tokens,
+            self.hidden,
+            self.hc_count,
+            self.eps,
+            stream,
+        )?;
+        qwen38_ple_conv_update_batch_f32_into_on_stream(
+            &workspace.conv_normed,
+            &workspace.gated,
+            &self.conv_weight,
+            state_table,
+            sequence_offsets,
+            sequence_lengths,
+            workspace.output.output(),
+            sequences,
+            total_tokens,
             self.hidden * self.hc_count,
             self.conv_kernel,
             self.conv_dilation,
@@ -491,6 +578,10 @@ impl Qwen38PleState {
     /// Device bytes held by current and rollback state.
     pub fn device_bytes(&self) -> usize {
         2 * self.channels * self.history * std::mem::size_of::<f32>()
+    }
+
+    pub(crate) fn conv_address(&mut self) -> DeviceAddress<f32> {
+        self.conv.cuda_address()
     }
 
     /// Copies committed convolution history for a retained prompt prefix.

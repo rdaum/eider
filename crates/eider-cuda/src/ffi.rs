@@ -3773,6 +3773,21 @@ unsafe extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[cfg(not(feature = "cuda-oxide"))]
+    pub(crate) fn infer_qwen38_ple_conv_update_batch_f32_on_stream(
+        normalized: *const f32,
+        gated: *const f32,
+        weight_bf16: *const u16,
+        state_table: *const *mut f32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        output: *mut f32,
+        sequences: u32,
+        channels: u32,
+        kernel: u32,
+        dilation: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[cfg(not(feature = "cuda-oxide"))]
     pub(crate) fn infer_qwen38_qsa_prepare_and_select_on_stream(
         projection: *const f32,
         q_norm: *const f32,

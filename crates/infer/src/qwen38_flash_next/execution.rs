@@ -4,15 +4,15 @@
 //! service ticks. Request admission and output policy stay in the runtime.
 
 use super::{
-    Qwen38FlashNextCacheConfig, Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceCache,
-    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace, Qwen38FlashNextPrefillWorkspace,
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSpeculativeFrontier,
-    Qwen38FlashNextSpeculativeWorkspace, new_qwen38_flash_next_mtp_sequence_cache,
-    new_qwen38_flash_next_sequence_cache_with_config,
+    Qwen38FlashNextCacheConfig, Qwen38FlashNextDecisionBatchWorkspace, Qwen38FlashNextModel,
+    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace,
+    Qwen38FlashNextPrefillWorkspace, Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache,
+    Qwen38FlashNextSpeculativeFrontier, Qwen38FlashNextSpeculativeWorkspace,
+    new_qwen38_flash_next_mtp_sequence_cache, new_qwen38_flash_next_sequence_cache_with_config,
 };
 use crate::qwen3::infer::QwenLayerKind;
 use eider_cuda::{DeviceBuffer, Error, GpuTokenSampler, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Capacity and retention limits for one Flash Next execution state.
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +20,7 @@ pub(crate) struct Qwen38FlashNextExecutionConfig {
     pub(crate) max_active_sequences: usize,
     pub(crate) max_context_tokens: usize,
     pub(crate) prefill_token_capacity: usize,
+    pub(crate) decision_branch_capacity: usize,
     pub(crate) speculative_drafts: usize,
     pub(crate) retained_prefix_bytes: usize,
 }
@@ -28,6 +29,7 @@ pub(crate) struct Qwen38FlashNextExecutionConfig {
 pub(crate) struct Qwen38FlashNextExecutionState {
     pub(crate) model: Qwen38FlashNextModel,
     pub(crate) prefill_workspace: Qwen38FlashNextPrefillWorkspace,
+    pub(crate) decision_workspace: Qwen38FlashNextDecisionBatchWorkspace,
     pub(crate) sequence_cache: Qwen38FlashNextSequenceCache,
     pub(crate) mtp_sequence_cache: Option<Qwen38FlashNextMtpSequenceCache>,
     pub(crate) mtp_workspace: Option<Qwen38FlashNextMtpWorkspace>,
@@ -58,6 +60,11 @@ pub(crate) struct Qwen38FlashNextSequenceLease<'a> {
     sequence: Option<Qwen38FlashNextExecutionSequence>,
 }
 
+pub(crate) struct Qwen38FlashNextSequenceBatch<'a> {
+    pool: &'a mut Qwen38FlashNextSequencePool,
+    entries: Vec<(Qwen38FlashNextSequenceId, Qwen38FlashNextExecutionSequence)>,
+}
+
 impl Qwen38FlashNextExecutionState {
     /// Allocates the persistent model, cache, and workspace resources.
     pub(crate) fn new(
@@ -65,6 +72,10 @@ impl Qwen38FlashNextExecutionState {
         config: Qwen38FlashNextExecutionConfig,
     ) -> Result<Self> {
         let prefill_workspace = model.new_prefill_workspace(config.prefill_token_capacity)?;
+        let decision_workspace = model.new_decision_batch_workspace(
+            config.decision_branch_capacity,
+            config.prefill_token_capacity,
+        )?;
         let sequence_cache = new_qwen38_flash_next_sequence_cache_with_config(
             &model,
             config.max_active_sequences,
@@ -103,6 +114,7 @@ impl Qwen38FlashNextExecutionState {
         Ok(Self {
             model,
             prefill_workspace,
+            decision_workspace,
             sequence_cache,
             mtp_sequence_cache,
             mtp_workspace,
@@ -190,6 +202,37 @@ impl Qwen38FlashNextSequencePool {
         })
     }
 
+    pub(crate) fn lease_many(
+        &mut self,
+        ids: &[Qwen38FlashNextSequenceId],
+    ) -> Result<Qwen38FlashNextSequenceBatch<'_>> {
+        let unique_ids = ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique_ids.len() != ids.len() {
+            return Err(Error::Format {
+                label: "Qwen3.8 Flash Next execution sequence lease",
+                detail: "duplicate sequence ID in one batch".to_string(),
+            });
+        }
+        let mut entries = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(entry) = self.sequences.remove(&id) else {
+                for (restored_id, restored) in entries.drain(..) {
+                    let previous = self.sequences.insert(restored_id, restored);
+                    debug_assert!(previous.is_none());
+                }
+                return Err(Error::Format {
+                    label: "Qwen3.8 Flash Next execution sequence lease",
+                    detail: "unknown or released sequence".to_string(),
+                });
+            };
+            entries.push((id, entry));
+        }
+        Ok(Qwen38FlashNextSequenceBatch {
+            pool: self,
+            entries,
+        })
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.sequences.len()
     }
@@ -205,6 +248,23 @@ impl Drop for Qwen38FlashNextSequenceLease<'_> {
     fn drop(&mut self) {
         if let Some(sequence) = self.sequence.take() {
             self.pool.sequences.insert(self.id, sequence);
+        }
+    }
+}
+
+impl Qwen38FlashNextSequenceBatch<'_> {
+    pub(crate) fn entries_mut(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = &mut Qwen38FlashNextExecutionSequence> {
+        self.entries.iter_mut().map(|(_, entry)| entry)
+    }
+}
+
+impl Drop for Qwen38FlashNextSequenceBatch<'_> {
+    fn drop(&mut self) {
+        for (id, entry) in self.entries.drain(..) {
+            let previous = self.pool.sequences.insert(id, entry);
+            debug_assert!(previous.is_none());
         }
     }
 }

@@ -221,8 +221,8 @@ pub use kernels::qwen38::{
     Qwen38QsaIndexPool, Qwen38QsaSelection, Qwen38QsaSelectionWorkspace,
     qwen38_hc_collapse_f32_into_on_stream, qwen38_hc_combine_f32_into_on_stream,
     qwen38_hc_norm_f32_into_on_stream, qwen38_hc_silu_scale_f32_in_place_on_stream,
-    qwen38_ple_conv_update_f32_into_on_stream, qwen38_ple_gate_value_f32_into_on_stream,
-    qwen38_repeat_streams_f32_into_on_stream,
+    qwen38_ple_conv_update_batch_f32_into_on_stream, qwen38_ple_conv_update_f32_into_on_stream,
+    qwen38_ple_gate_value_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
 };
 pub use kernels::sm12x_kv_cache::{
     SM12X_KV_PAGE_TOKENS, Sm12xKvAttentionWorkspace, Sm12xKvCache, Sm12xKvPagePool,

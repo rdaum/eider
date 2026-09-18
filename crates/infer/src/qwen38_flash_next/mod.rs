@@ -20,6 +20,7 @@ pub(crate) use execution::{
 };
 pub use hyperconnection::{Qwen38HyperConnectionWeights, Qwen38HyperConnectionWorkspace};
 pub(crate) use model::{
+    Qwen38FlashNextDecisionBatchRow, Qwen38FlashNextDecisionBatchWorkspace,
     Qwen38FlashNextDecisionReadout, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpWorkspace,
     Qwen38FlashNextPrefillWorkspace, Qwen38FlashNextSpeculativeFrontier,
     Qwen38FlashNextSpeculativeWorkspace,
@@ -59,8 +60,8 @@ mod tests {
         load_hybrid_linear_attention,
     };
     use crate::qwen38_flash_next::{
-        Qwen38FlashNextCacheConfig, Qwen38FlashNextSequence, new_qwen38_flash_next_sequence_cache,
-        new_qwen38_flash_next_sequence_cache_with_config,
+        Qwen38FlashNextCacheConfig, Qwen38FlashNextDecisionBatchRow, Qwen38FlashNextSequence,
+        new_qwen38_flash_next_sequence_cache, new_qwen38_flash_next_sequence_cache_with_config,
     };
     use crate::sm12x_cache::Sm12xCacheContext;
     use eider_cuda::{CudaStream, DeviceBuffer};
@@ -435,5 +436,196 @@ mod tests {
         compact_branch
             .finish(&mut cache)
             .expect("finish compact branch");
+    }
+
+    #[test]
+    #[ignore = "loads the full local Qwen3.8 Flash Next checkpoint"]
+    fn released_decision_batch_matches_independent_rows() {
+        let Ok(model_dir) = std::env::var("EIDER_QWEN38_FLASH_NEXT_FULL_MODEL_DIR") else {
+            return;
+        };
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "eider-qwen38-decision-batch-{}",
+            std::process::id()
+        ));
+        let mut model = Qwen38FlashNextModel::open(&model_dir, artifact_dir).expect("full model");
+        let mut cache =
+            new_qwen38_flash_next_sequence_cache(&model, 5, 64).expect("sequence cache");
+        let mut parent = Qwen38FlashNextSequence::admit(&model, &mut cache, 64).expect("parent");
+        for token in [17, 29, 41, 53, 67, 79, 83] {
+            parent
+                .forward_token(&mut model, &mut cache, token, Qwen38LogitsMode::None)
+                .expect("parent prefill");
+        }
+        let fork_stream = CudaStream::new_blocking().expect("fork stream");
+        let mut oracle_a =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &fork_stream)
+                .expect("oracle A branch")
+                .expect("oracle A admission");
+        let mut oracle_b =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &fork_stream)
+                .expect("oracle B branch")
+                .expect("oracle B admission");
+        let mut batch_a =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &fork_stream)
+                .expect("batch A branch")
+                .expect("batch A admission");
+        let mut batch_b =
+            Qwen38FlashNextSequence::branch(&model, &parent, &mut cache, 64, &fork_stream)
+                .expect("batch B branch")
+                .expect("batch B admission");
+        fork_stream.synchronize().expect("fork completion");
+
+        let labels = (0..64).collect::<Vec<_>>();
+        let mut oracle_readout = model
+            .new_decision_readout_with_capacity(&labels, 1)
+            .expect("oracle readout");
+        let mut batch_readout = model
+            .new_decision_readout_with_capacity(&labels, 2)
+            .expect("batch readout");
+        let mut oracle_workspace = model
+            .new_decision_batch_workspace(1, 8)
+            .expect("oracle workspace");
+        let mut batch_workspace = model
+            .new_decision_batch_workspace(2, 8)
+            .expect("batch workspace");
+        let suffix_a = [97, 101, 103];
+        let suffix_b = [107, 109];
+
+        model
+            .forward_decision_batch(
+                &mut oracle_workspace,
+                &mut [Qwen38FlashNextDecisionBatchRow {
+                    token_ids: &suffix_a[..2],
+                    sequence: &mut oracle_a,
+                }],
+                &mut cache,
+                None,
+            )
+            .expect("oracle A suffix");
+        model
+            .forward_decision_batch(
+                &mut oracle_workspace,
+                &mut [Qwen38FlashNextDecisionBatchRow {
+                    token_ids: &suffix_b[..1],
+                    sequence: &mut oracle_b,
+                }],
+                &mut cache,
+                None,
+            )
+            .expect("oracle B suffix");
+        model
+            .forward_decision_batch(
+                &mut batch_workspace,
+                &mut [
+                    Qwen38FlashNextDecisionBatchRow {
+                        token_ids: &suffix_a[..2],
+                        sequence: &mut batch_a,
+                    },
+                    Qwen38FlashNextDecisionBatchRow {
+                        token_ids: &suffix_b[..1],
+                        sequence: &mut batch_b,
+                    },
+                ],
+                &mut cache,
+                None,
+            )
+            .expect("packed suffixes");
+
+        let oracle_a_logits = model
+            .forward_decision_batch(
+                &mut oracle_workspace,
+                &mut [Qwen38FlashNextDecisionBatchRow {
+                    token_ids: &suffix_a[2..],
+                    sequence: &mut oracle_a,
+                }],
+                &mut cache,
+                Some(&mut oracle_readout),
+            )
+            .expect("oracle A final")
+            .expect("oracle A logits");
+        let oracle_b_logits = model
+            .forward_decision_batch(
+                &mut oracle_workspace,
+                &mut [Qwen38FlashNextDecisionBatchRow {
+                    token_ids: &suffix_b[1..],
+                    sequence: &mut oracle_b,
+                }],
+                &mut cache,
+                Some(&mut oracle_readout),
+            )
+            .expect("oracle B final")
+            .expect("oracle B logits");
+        let batch_logits = model
+            .forward_decision_batch(
+                &mut batch_workspace,
+                &mut [
+                    Qwen38FlashNextDecisionBatchRow {
+                        token_ids: &suffix_a[2..],
+                        sequence: &mut batch_a,
+                    },
+                    Qwen38FlashNextDecisionBatchRow {
+                        token_ids: &suffix_b[1..],
+                        sequence: &mut batch_b,
+                    },
+                ],
+                &mut cache,
+                Some(&mut batch_readout),
+            )
+            .expect("packed final tokens")
+            .expect("packed logits");
+
+        for (name, expected, actual) in [
+            ("A", oracle_a_logits.as_slice(), &batch_logits[..64]),
+            ("B", oracle_b_logits.as_slice(), &batch_logits[64..]),
+        ] {
+            let max_error = expected
+                .iter()
+                .zip(actual)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0.0f32, f32::max);
+            let scale = expected
+                .iter()
+                .copied()
+                .map(f32::abs)
+                .fold(1.0f32, f32::max);
+            let (dot, expected_norm, actual_norm, squared_error) = expected
+                .iter()
+                .zip(actual)
+                .fold((0.0f64, 0.0f64, 0.0f64, 0.0f64), |sum, (&a, &b)| {
+                    let a = f64::from(a);
+                    let b = f64::from(b);
+                    (
+                        sum.0 + a * b,
+                        sum.1 + a * a,
+                        sum.2 + b * b,
+                        sum.3 + (a - b) * (a - b),
+                    )
+                });
+            let cosine = dot / (expected_norm * actual_norm).sqrt();
+            let relative_rmse = (squared_error / expected_norm).sqrt();
+            let expected_label = expected
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index)
+                .expect("oracle labels");
+            let actual_label = actual
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index)
+                .expect("batch labels");
+            assert!(
+                expected_label == actual_label && cosine >= 0.995 && relative_rmse <= 0.1,
+                "decision row {name} batch error={max_error} scale={scale} cosine={cosine} relative_rmse={relative_rmse} labels={expected_label}/{actual_label}"
+            );
+        }
+
+        parent.finish(&mut cache).expect("finish parent");
+        oracle_a.finish(&mut cache).expect("finish oracle A");
+        oracle_b.finish(&mut cache).expect("finish oracle B");
+        batch_a.finish(&mut cache).expect("finish batch A");
+        batch_b.finish(&mut cache).expect("finish batch B");
     }
 }

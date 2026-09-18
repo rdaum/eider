@@ -1,7 +1,7 @@
 //! Qwen3.8 Flash Next hyperconnection elementwise kernels.
 
 use crate::SM12X_KV_PAGE_TOKENS;
-use crate::cuda::{CudaStream, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
+use crate::cuda::{CudaStream, DeviceAddress, DeviceBuffer, DeviceInOut, DeviceOutput, check_cuda};
 use crate::error::{Error, Result};
 use crate::ffi;
 #[cfg(feature = "cuda-oxide")]
@@ -1115,6 +1115,98 @@ pub fn qwen38_ple_conv_update_f32_into_on_stream(
                 state.ptr,
                 output.buffer_mut().ptr,
                 tokens as u32,
+                channels as u32,
+                kernel as u32,
+                dilation as u32,
+                stream.as_raw(),
+            ),
+        )
+    }
+}
+
+/// Applies the causal PLE convolution to packed independent sequence rows.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen38_ple_conv_update_batch_f32_into_on_stream(
+    normalized: &DeviceBuffer<f32>,
+    gated: &DeviceBuffer<f32>,
+    weight_bf16: &DeviceBuffer<u16>,
+    state_table: &DeviceBuffer<DeviceAddress<f32>>,
+    sequence_offsets: &DeviceBuffer<u32>,
+    sequence_lengths: &DeviceBuffer<u32>,
+    mut output: DeviceOutput<'_, f32>,
+    sequences: usize,
+    total_tokens: usize,
+    channels: usize,
+    kernel: usize,
+    dilation: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    let values = checked_values(total_tokens, channels, "Qwen3.8 PLE batch convolution")?;
+    let weight_values = checked_values(channels, kernel, "Qwen3.8 PLE batch convolution")?;
+    if sequences == 0
+        || total_tokens < sequences
+        || channels == 0
+        || kernel < 2
+        || dilation == 0
+        || sequences > u32::MAX as usize
+        || channels > u32::MAX as usize
+        || kernel > u32::MAX as usize
+        || dilation > u32::MAX as usize
+        || normalized.len() < values
+        || gated.len() < values
+        || output.len() < values
+        || weight_bf16.len() != weight_values
+        || state_table.len() < sequences
+        || sequence_offsets.len() < sequences
+        || sequence_lengths.len() < sequences
+    {
+        return Err(Error::Shape {
+            label: "Qwen3.8 PLE batch convolution",
+            expected: format!(
+                "{sequences} valid sequence rows, {total_tokens} packed tokens, buffers >= {values}, weights={weight_values}"
+            ),
+            actual: format!(
+                "normalized={} gated={} output={} weights={} states={} offsets={} lengths={}",
+                normalized.len(),
+                gated.len(),
+                output.len(),
+                weight_bf16.len(),
+                state_table.len(),
+                sequence_offsets.len(),
+                sequence_lengths.len()
+            ),
+        });
+    }
+    #[cfg(feature = "cuda-oxide")]
+    unsafe {
+        qwen38_oxide::ple_conv_update_batch(
+            normalized.ptr,
+            gated.ptr,
+            weight_bf16.ptr,
+            state_table.ptr.cast(),
+            sequence_offsets.ptr,
+            sequence_lengths.ptr,
+            output.buffer_mut().ptr,
+            sequences as u32,
+            channels as u32,
+            kernel as u32,
+            dilation as u32,
+            stream.as_raw(),
+        )
+    }
+    #[cfg(not(feature = "cuda-oxide"))]
+    unsafe {
+        check_cuda(
+            "infer_qwen38_ple_conv_update_batch_f32_on_stream",
+            ffi::infer_qwen38_ple_conv_update_batch_f32_on_stream(
+                normalized.ptr,
+                gated.ptr,
+                weight_bf16.ptr,
+                state_table.ptr.cast(),
+                sequence_offsets.ptr,
+                sequence_lengths.ptr,
+                output.buffer_mut().ptr,
+                sequences as u32,
                 channels as u32,
                 kernel as u32,
                 dilation as u32,

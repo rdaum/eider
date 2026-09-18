@@ -20,8 +20,8 @@ use crate::qwen38_flash_next::{
 };
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPage, Sm12xPageTable};
 use eider_cuda::{
-    CublasLt, CudaStream, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow, GpuTokenSampler,
-    Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
+    CublasLt, CudaStream, DeviceAddress, DeviceBuffer, Error, GpuSampledToken, GpuSamplingRow,
+    GpuTokenSampler, Result, add_f32_into_on_stream, qwen38_repeat_streams_f32_into_on_stream,
     rms_norm_f32_into_on_stream,
 };
 use eider_format::ModelOptCheckpoint;
@@ -190,6 +190,41 @@ pub(crate) struct Qwen38FlashNextPrefillWorkspace {
     exact_hyper_projections: bool,
     capture_gdn_state_snapshots: bool,
     layer_trace: Option<Vec<Qwen38LayerProbeTrace>>,
+    linear_layers: Vec<bool>,
+}
+
+/// One packed sequence row for Flash-Next decision inference.
+pub(crate) struct Qwen38FlashNextDecisionBatchRow<'tokens, 'sequence> {
+    pub(crate) token_ids: &'tokens [u32],
+    pub(crate) sequence: &'sequence mut Qwen38FlashNextSequence,
+}
+
+/// Shared packed-row workspace for Flash-Next decision suffixes and readout.
+pub(crate) struct Qwen38FlashNextDecisionBatchWorkspace {
+    sequence_capacity: usize,
+    token_capacity: usize,
+    stream: CudaStream,
+    token_ids: DeviceBuffer<u32>,
+    positions: DeviceBuffer<u32>,
+    sequence_offsets: DeviceBuffer<u32>,
+    sequence_lengths: DeviceBuffer<u32>,
+    host_token_ids: Vec<u32>,
+    host_positions: Vec<u32>,
+    host_sequence_offsets: Vec<u32>,
+    host_sequence_lengths: Vec<u32>,
+    ple_state_ptrs: Vec<DeviceAddress<f32>>,
+    ple_state_table: DeviceBuffer<DeviceAddress<f32>>,
+    streams_a: DeviceBuffer<f32>,
+    streams_b: DeviceBuffer<f32>,
+    hidden: DeviceBuffer<f32>,
+    final_streams: DeviceBuffer<f32>,
+    qsa: Qwen38QsaPrefillWorkspace,
+    attention_hyper: Qwen38HyperConnectionWorkspace,
+    mlp_hyper: Qwen38HyperConnectionWorkspace,
+    final_hyper: Qwen38HyperConnectionWorkspace,
+    ple_pager: Qwen38PagedPle,
+    ple: Qwen38PleWorkspace,
+    hybrid: Qwen36HybridPrefillWorkspace,
     linear_layers: Vec<bool>,
 }
 
@@ -519,6 +554,7 @@ pub(crate) struct Qwen38FlashNextDecisionReadout {
     token_ids: Vec<u32>,
     head: Bf16Linear,
     logits: DeviceBuffer<f32>,
+    capacity: usize,
 }
 
 impl Qwen38FlashNextDecisionReadout {
@@ -528,9 +564,18 @@ impl Qwen38FlashNextDecisionReadout {
 }
 
 impl Qwen38FlashNextModel {
+    #[cfg(test)]
     pub(crate) fn new_decision_readout(
         &self,
         token_ids: &[u32],
+    ) -> Result<Qwen38FlashNextDecisionReadout> {
+        self.new_decision_readout_with_capacity(token_ids, 1)
+    }
+
+    pub(crate) fn new_decision_readout_with_capacity(
+        &self,
+        token_ids: &[u32],
+        capacity: usize,
     ) -> Result<Qwen38FlashNextDecisionReadout> {
         if token_ids.len() != 64
             || token_ids
@@ -546,13 +591,22 @@ impl Qwen38FlashNextModel {
                 actual: format!("{} token IDs", token_ids.len()),
             });
         }
+        if capacity == 0 {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision label capacity",
+                expected: "positive row capacity".to_string(),
+                actual: "0".to_string(),
+            });
+        }
         Ok(Qwen38FlashNextDecisionReadout {
             token_ids: token_ids.to_vec(),
             head: self.lm_head.select_bf16_rows(token_ids)?,
-            logits: DeviceBuffer::zeroed(token_ids.len())?,
+            logits: DeviceBuffer::zeroed(token_ids.len() * capacity)?,
+            capacity,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn decision_logits(
         &self,
         state: &Qwen38FlashNextDecodeState,
@@ -562,6 +616,29 @@ impl Qwen38FlashNextModel {
             .head
             .run_into(&state.hidden, &mut readout.logits, &state.stream)?;
         Ok(readout.logits.copy_to_host(&state.stream)?.into_vec())
+    }
+
+    fn decision_logits_batch(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        rows: usize,
+        stream: &CudaStream,
+        readout: &mut Qwen38FlashNextDecisionReadout,
+    ) -> Result<Vec<f32>> {
+        if rows == 0 || rows > readout.capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision readout rows",
+                expected: format!("1..={} rows", readout.capacity),
+                actual: rows.to_string(),
+            });
+        }
+        readout
+            .head
+            .run_batch_into(hidden, &mut readout.logits, rows, stream)?;
+        Ok(readout
+            .logits
+            .copy_prefix_to_host(rows * readout.token_ids.len(), stream)?
+            .into_vec())
     }
 
     /// Loads the released Inferact checkpoint without materializing the PLE table.
@@ -2260,6 +2337,103 @@ impl Qwen38FlashNextModel {
         })
     }
 
+    pub(crate) fn new_decision_batch_workspace(
+        &self,
+        sequence_capacity: usize,
+        token_capacity: usize,
+    ) -> Result<Qwen38FlashNextDecisionBatchWorkspace> {
+        if sequence_capacity == 0 || token_capacity < sequence_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision batch capacity",
+                expected: "positive sequence capacity not exceeding token capacity".to_string(),
+                actual: format!("sequences={sequence_capacity} tokens={token_capacity}"),
+            });
+        }
+        let linear_layers = self
+            .layers
+            .iter()
+            .map(|layer| matches!(layer.attention, Qwen38AttentionWeights::Linear(_)))
+            .collect::<Vec<_>>();
+        let first_linear = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Qwen38AttentionWeights::Linear(weights) => Some(weights),
+                Qwen38AttentionWeights::Qsa(_) => None,
+            })
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next decision batch",
+                detail: "model has no GDN layer".to_string(),
+            })?;
+        let first_moe = &self
+            .layers
+            .first()
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next decision batch",
+                detail: "model has no transformer layers".to_string(),
+            })?
+            .moe;
+        let first_qsa = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.attention {
+                Qwen38AttentionWeights::Linear(_) => None,
+                Qwen38AttentionWeights::Qsa(weights) => Some(weights),
+            })
+            .ok_or_else(|| Error::Format {
+                label: "Qwen3.8 Flash Next decision batch",
+                detail: "model has no QSA layer".to_string(),
+            })?;
+        let batch_model = Qwen36BatchModelView::new(&self.lt, &self.manifest, &linear_layers);
+        let hybrid = Qwen36HybridPrefillWorkspace::new_multi_sequence(
+            &batch_model,
+            first_linear,
+            first_moe,
+            token_capacity,
+            sequence_capacity,
+        )?;
+        let qsa = first_qsa.new_prefill_workspace(
+            &batch_model,
+            &self.config,
+            token_capacity,
+            self.config.max_position_embeddings,
+        )?;
+        let hc_dim = self.config.hidden * self.config.hc_count;
+        Ok(Qwen38FlashNextDecisionBatchWorkspace {
+            sequence_capacity,
+            token_capacity,
+            stream: CudaStream::new_non_blocking()?,
+            token_ids: DeviceBuffer::zeroed(token_capacity)?,
+            positions: DeviceBuffer::zeroed(token_capacity)?,
+            sequence_offsets: DeviceBuffer::zeroed(sequence_capacity)?,
+            sequence_lengths: DeviceBuffer::zeroed(sequence_capacity)?,
+            host_token_ids: vec![0; token_capacity],
+            host_positions: vec![0; token_capacity],
+            host_sequence_offsets: vec![0; sequence_capacity],
+            host_sequence_lengths: vec![0; sequence_capacity],
+            ple_state_ptrs: vec![DeviceAddress::null(); sequence_capacity],
+            ple_state_table: DeviceBuffer::zeroed(sequence_capacity)?,
+            streams_a: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            streams_b: DeviceBuffer::zeroed(token_capacity * hc_dim)?,
+            hidden: DeviceBuffer::zeroed(token_capacity * self.config.hidden)?,
+            final_streams: DeviceBuffer::zeroed(sequence_capacity * hc_dim)?,
+            qsa,
+            attention_hyper: Qwen38HyperConnectionWorkspace::new_prefill(
+                &self.config,
+                token_capacity,
+            )?,
+            mlp_hyper: Qwen38HyperConnectionWorkspace::new_prefill(&self.config, token_capacity)?,
+            final_hyper: Qwen38HyperConnectionWorkspace::new_prefill(
+                &self.config,
+                sequence_capacity,
+            )?,
+            ple_pager: Qwen38PagedPle::open(&self.checkpoint, &self.config, token_capacity)?,
+            ple: Qwen38PleWorkspace::new(&self.config, token_capacity)?,
+            hybrid,
+            linear_layers,
+        })
+    }
+
     pub(crate) fn new_reference_prefill_workspace(
         &self,
         token_capacity: usize,
@@ -2605,6 +2779,518 @@ impl Qwen38FlashNextModel {
                 Err(error)
             }
         }
+    }
+
+    /// Evaluates packed prompt chunks for independent decision branches.
+    ///
+    /// When `readout` is present, every row must contain its final decision
+    /// token and the returned logits are row-major over the fixed label head.
+    pub(crate) fn forward_decision_batch(
+        &mut self,
+        workspace: &mut Qwen38FlashNextDecisionBatchWorkspace,
+        rows: &mut [Qwen38FlashNextDecisionBatchRow<'_, '_>],
+        cache: &mut Qwen38FlashNextSequenceCache,
+        readout: Option<&mut Qwen38FlashNextDecisionReadout>,
+    ) -> Result<Option<Vec<f32>>> {
+        if rows.is_empty() || rows.len() > workspace.sequence_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision batch rows",
+                expected: format!("1..={} rows", workspace.sequence_capacity),
+                actual: rows.len().to_string(),
+            });
+        }
+        let mut total_tokens = 0usize;
+        for (row_index, row) in rows.iter().enumerate() {
+            if row.token_ids.is_empty() {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 Flash Next decision batch row",
+                    expected: "at least one token".to_string(),
+                    actual: format!("row {row_index} has zero tokens"),
+                });
+            }
+            if readout.is_some() && row.token_ids.len() != 1 {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 Flash Next decision readout row",
+                    expected: "exactly one final token".to_string(),
+                    actual: format!("row {row_index} has {} tokens", row.token_ids.len()),
+                });
+            }
+            if row.sequence.state.model_id != self.model_id {
+                return Err(Error::Format {
+                    label: "Qwen3.8 Flash Next decision batch sequence",
+                    detail: format!("row {row_index} belongs to a different model"),
+                });
+            }
+            let end = row
+                .sequence
+                .state
+                .position
+                .checked_add(row.token_ids.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 Flash Next decision batch position",
+                    expected: "position + tokens without overflow".to_string(),
+                    actual: format!(
+                        "position={} tokens={}",
+                        row.sequence.state.position,
+                        row.token_ids.len()
+                    ),
+                })?;
+            if end > row.sequence.state.max_tokens {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 Flash Next decision batch position",
+                    expected: format!("end <= {}", row.sequence.state.max_tokens),
+                    actual: end.to_string(),
+                });
+            }
+            if let Some(token) = row
+                .token_ids
+                .iter()
+                .find(|&&token| token as usize >= self.config.vocab)
+            {
+                return Err(Error::Shape {
+                    label: "Qwen3.8 Flash Next decision batch token",
+                    expected: format!("token < {}", self.config.vocab),
+                    actual: token.to_string(),
+                });
+            }
+            total_tokens = total_tokens
+                .checked_add(row.token_ids.len())
+                .ok_or_else(|| Error::Shape {
+                    label: "Qwen3.8 Flash Next decision batch tokens",
+                    expected: "total token count without overflow".to_string(),
+                    actual: format!("total={total_tokens} row={}", row.token_ids.len()),
+                })?;
+        }
+        if total_tokens > workspace.token_capacity {
+            return Err(Error::Shape {
+                label: "Qwen3.8 Flash Next decision batch tokens",
+                expected: format!("at most {} tokens", workspace.token_capacity),
+                actual: total_tokens.to_string(),
+            });
+        }
+
+        let mut reservations = Vec::with_capacity(rows.len());
+        for index in 0..rows.len() {
+            let row = &mut rows[index];
+            match cache.reserve_append(
+                row.sequence.cache_id,
+                row.token_ids.len(),
+                &mut Sm12xCacheContext {
+                    stream: &workspace.stream,
+                    page_table: &mut row.sequence.page_table,
+                },
+            ) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    for (row, reservation) in rows[..index].iter_mut().zip(reservations.drain(..)) {
+                        cache
+                            .abort_append(
+                                reservation,
+                                &mut Sm12xCacheContext {
+                                    stream: &workspace.stream,
+                                    page_table: &mut row.sequence.page_table,
+                                },
+                            )
+                            .map_err(qwen38_flash_next_cache_error)?;
+                    }
+                    return Err(qwen38_flash_next_cache_error(error));
+                }
+            }
+        }
+        for index in 0..rows.len() {
+            if let Err(error) = rows[index]
+                .sequence
+                .state
+                .begin_append_on_stream(&workspace.stream)
+            {
+                for row in &mut rows[..index] {
+                    let _ = row.sequence.state.abort_append_on_stream(&workspace.stream);
+                }
+                for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: &workspace.stream,
+                                page_table: &mut row.sequence.page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                }
+                return Err(error);
+            }
+        }
+        let result = workspace.ple_pager.begin_read_sequences(
+            rows.iter_mut()
+                .map(|row| (&mut row.sequence.state.ple_window, row.token_ids)),
+        );
+        let result = result.and_then(|()| {
+            self.decision_batch_inner(workspace, rows, cache, &reservations, total_tokens, readout)
+        });
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let mut rollback_error = None;
+                for row in rows.iter_mut() {
+                    if let Err(error) = row.sequence.state.abort_append_on_stream(&workspace.stream)
+                    {
+                        rollback_error.get_or_insert(error);
+                    }
+                }
+                for (row, reservation) in rows.iter_mut().zip(reservations.drain(..)) {
+                    cache
+                        .abort_append(
+                            reservation,
+                            &mut Sm12xCacheContext {
+                                stream: &workspace.stream,
+                                page_table: &mut row.sequence.page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                }
+                return Err(rollback_error.unwrap_or(error));
+            }
+        };
+        for index in 0..rows.len() {
+            let tokens = rows[index].token_ids.len();
+            if let Err(error) = cache.commit_append(
+                reservations[index].clone(),
+                tokens,
+                &mut Sm12xCacheContext {
+                    stream: &workspace.stream,
+                    page_table: &mut rows[index].sequence.page_table,
+                },
+            ) {
+                let mut rollback_error = rows[index]
+                    .sequence
+                    .state
+                    .abort_append_on_stream(&workspace.stream)
+                    .err();
+                cache
+                    .abort_append(
+                        reservations[index].clone(),
+                        &mut Sm12xCacheContext {
+                            stream: &workspace.stream,
+                            page_table: &mut rows[index].sequence.page_table,
+                        },
+                    )
+                    .map_err(qwen38_flash_next_cache_error)?;
+                for pending in index + 1..rows.len() {
+                    if let Err(error) = rows[pending]
+                        .sequence
+                        .state
+                        .abort_append_on_stream(&workspace.stream)
+                    {
+                        rollback_error.get_or_insert(error);
+                    }
+                    cache
+                        .abort_append(
+                            reservations[pending].clone(),
+                            &mut Sm12xCacheContext {
+                                stream: &workspace.stream,
+                                page_table: &mut rows[pending].sequence.page_table,
+                            },
+                        )
+                        .map_err(qwen38_flash_next_cache_error)?;
+                }
+                return Err(rollback_error.unwrap_or_else(|| qwen38_flash_next_cache_error(error)));
+            }
+            rows[index].sequence.state.commit_append(tokens)?;
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decision_batch_inner(
+        &mut self,
+        workspace: &mut Qwen38FlashNextDecisionBatchWorkspace,
+        rows: &mut [Qwen38FlashNextDecisionBatchRow<'_, '_>],
+        cache: &mut Qwen38FlashNextSequenceCache,
+        reservations: &[AppendReservation],
+        total_tokens: usize,
+        readout: Option<&mut Qwen38FlashNextDecisionReadout>,
+    ) -> Result<Option<Vec<f32>>> {
+        let sequence_count = rows.len();
+        let mut offset = 0usize;
+        for (index, row) in rows.iter_mut().enumerate() {
+            workspace.host_sequence_offsets[index] =
+                u32::try_from(offset).map_err(|_| Error::Shape {
+                    label: "Qwen3.8 Flash Next decision sequence offset",
+                    expected: "u32-sized offset".to_string(),
+                    actual: offset.to_string(),
+                })?;
+            workspace.host_sequence_lengths[index] =
+                u32::try_from(row.token_ids.len()).map_err(|_| Error::Shape {
+                    label: "Qwen3.8 Flash Next decision sequence length",
+                    expected: "u32-sized length".to_string(),
+                    actual: row.token_ids.len().to_string(),
+                })?;
+            workspace.host_token_ids[offset..offset + row.token_ids.len()]
+                .copy_from_slice(row.token_ids);
+            for (token_offset, position) in workspace.host_positions
+                [offset..offset + row.token_ids.len()]
+                .iter_mut()
+                .enumerate()
+            {
+                *position =
+                    u32::try_from(row.sequence.state.position + token_offset).map_err(|_| {
+                        Error::Shape {
+                            label: "Qwen3.8 Flash Next decision position",
+                            expected: "u32-sized position".to_string(),
+                            actual: (row.sequence.state.position + token_offset).to_string(),
+                        }
+                    })?;
+            }
+            workspace.ple_state_ptrs[index] = row.sequence.state.ple_state.conv_address();
+            offset += row.token_ids.len();
+        }
+        debug_assert_eq!(offset, total_tokens);
+        workspace
+            .token_ids
+            .copy_prefix_from_host(&workspace.host_token_ids[..total_tokens])?;
+        workspace
+            .positions
+            .copy_prefix_from_host(&workspace.host_positions[..total_tokens])?;
+        workspace
+            .sequence_offsets
+            .copy_prefix_from_host(&workspace.host_sequence_offsets[..sequence_count])?;
+        workspace
+            .sequence_lengths
+            .copy_prefix_from_host(&workspace.host_sequence_lengths[..sequence_count])?;
+        workspace
+            .ple_state_table
+            .copy_prefix_from_host(&workspace.ple_state_ptrs[..sequence_count])?;
+
+        self.embedding.gather_prefix(
+            self.config.vocab,
+            self.config.hidden,
+            &workspace.token_ids,
+            workspace.hidden.output(),
+            total_tokens,
+            &workspace.stream,
+        )?;
+        qwen38_repeat_streams_f32_into_on_stream(
+            &workspace.hidden,
+            workspace.streams_a.output(),
+            total_tokens,
+            self.config.hidden,
+            self.config.hc_count,
+            &workspace.stream,
+        )?;
+
+        let sequence_lengths = rows
+            .iter()
+            .map(|row| row.token_ids.len())
+            .collect::<Vec<_>>();
+        let batch_model =
+            Qwen36BatchModelView::new(&self.lt, &self.manifest, &workspace.linear_layers);
+        workspace.hybrid.begin_gdn_prefill_rows(&sequence_lengths)?;
+        for (sequence, row) in rows.iter_mut().enumerate() {
+            for (layer, attention_state) in
+                row.sequence.state.attention_states.iter_mut().enumerate()
+            {
+                if let Qwen38AttentionState::Linear(linear_state) = attention_state {
+                    workspace
+                        .hybrid
+                        .bind_gdn_state_row(layer, sequence, linear_state)?;
+                }
+            }
+        }
+        workspace.hybrid.finish_gdn_prefill()?;
+
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            if layer_index == self.config.ple_layer {
+                let ple = self
+                    .ple_weights
+                    .run_batch(
+                        &mut workspace.ple_pager,
+                        &workspace.streams_a,
+                        &workspace.ple_state_table,
+                        &workspace.sequence_offsets,
+                        &workspace.sequence_lengths,
+                        &mut workspace.ple,
+                        sequence_count,
+                        total_tokens,
+                        &workspace.stream,
+                    )?
+                    .0;
+                add_f32_into_on_stream(
+                    &workspace.streams_a,
+                    ple,
+                    workspace.streams_b.output(),
+                    &workspace.stream,
+                )?;
+                std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+            }
+
+            layer.attention_hyper.mix(
+                &workspace.streams_a,
+                &mut workspace.attention_hyper,
+                total_tokens,
+                &workspace.stream,
+            )?;
+            let attention_output = match &layer.attention {
+                Qwen38AttentionWeights::Linear(weights) => workspace.hybrid.run_gdn(
+                    &batch_model,
+                    weights,
+                    workspace.attention_hyper.mixed(),
+                    layer_index,
+                    total_tokens,
+                    false,
+                    &workspace.stream,
+                )?,
+                Qwen38AttentionWeights::Qsa(weights) => {
+                    weights.prepare_prefill_batch(
+                        &batch_model,
+                        &mut workspace.qsa,
+                        &self.config,
+                        workspace.attention_hyper.mixed(),
+                        &workspace.positions,
+                        total_tokens,
+                        &workspace.stream,
+                    )?;
+                    for (sequence_index, row) in rows.iter_mut().enumerate() {
+                        let input_base = workspace.host_sequence_offsets[sequence_index] as usize;
+                        let start_position = row.sequence.state.position;
+                        cache
+                            .with_append_pages(&reservations[sequence_index], |backend, pages| {
+                                for page in pages.iter() {
+                                    let segment = page.segment();
+                                    let mut input_row = input_base + segment.input_offset();
+                                    let mut page_offset = segment.page_offset();
+                                    let mut position = start_position + segment.input_offset();
+                                    let mut remaining = segment.rows();
+                                    if position < self.config.indexer_budget {
+                                        let dense =
+                                            remaining.min(self.config.indexer_budget - position);
+                                        weights.run_prepared_prefill_dense_rows(
+                                            &mut workspace.qsa,
+                                            backend,
+                                            row.sequence.page_table.device(),
+                                            page.page(),
+                                            page_offset,
+                                            &self.config,
+                                            input_row,
+                                            dense,
+                                            layer_index,
+                                            position,
+                                            &workspace.stream,
+                                        )?;
+                                        input_row += dense;
+                                        page_offset += dense;
+                                        position += dense;
+                                        remaining -= dense;
+                                    }
+                                    if remaining != 0 {
+                                        weights.run_prepared_prefill_sparse_rows(
+                                            &mut workspace.qsa,
+                                            backend,
+                                            row.sequence.page_table.device(),
+                                            page.page(),
+                                            page_offset,
+                                            &self.config,
+                                            input_row,
+                                            remaining,
+                                            layer_index,
+                                            position,
+                                            &workspace.stream,
+                                        )?;
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .map_err(qwen38_flash_next_cache_error)?;
+                    }
+                    weights.finish_prefill(
+                        &batch_model,
+                        &mut workspace.qsa,
+                        total_tokens,
+                        &workspace.stream,
+                    )?
+                }
+            };
+            layer.attention_hyper.combine(
+                &workspace.streams_a,
+                attention_output,
+                &mut workspace.attention_hyper,
+                &mut workspace.streams_b,
+                total_tokens,
+                &workspace.stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+
+            layer.mlp_hyper.mix(
+                &workspace.streams_a,
+                &mut workspace.mlp_hyper,
+                total_tokens,
+                &workspace.stream,
+            )?;
+            let ffn = workspace.hybrid.run_moe(
+                &batch_model,
+                &layer.moe,
+                workspace.mlp_hyper.mixed(),
+                total_tokens,
+                &workspace.stream,
+            )?;
+            layer.mlp_hyper.combine(
+                &workspace.streams_a,
+                ffn,
+                &mut workspace.mlp_hyper,
+                &mut workspace.streams_b,
+                total_tokens,
+                &workspace.stream,
+            )?;
+            std::mem::swap(&mut workspace.streams_a, &mut workspace.streams_b);
+        }
+
+        let hc_dim = self.config.hidden * self.config.hc_count;
+        for (index, row) in rows.iter_mut().enumerate() {
+            let last_row =
+                workspace.host_sequence_offsets[index] as usize + row.token_ids.len() - 1;
+            workspace.final_streams.copy_range_from_device_on_stream(
+                index * hc_dim,
+                &workspace.streams_a,
+                last_row * hc_dim,
+                hc_dim,
+                &workspace.stream,
+            )?;
+            row.sequence
+                .state
+                .streams_a
+                .copy_range_from_device_on_stream(
+                    0,
+                    &workspace.streams_a,
+                    last_row * hc_dim,
+                    hc_dim,
+                    &workspace.stream,
+                )?;
+        }
+        let Some(readout) = readout else {
+            workspace.stream.synchronize()?;
+            return Ok(None);
+        };
+        self.final_mixer.mix(
+            &workspace.final_streams,
+            &mut workspace.final_hyper,
+            sequence_count,
+            &workspace.stream,
+        )?;
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.sequence.state.hidden.copy_range_from_device_on_stream(
+                0,
+                workspace.final_hyper.mixed(),
+                index * self.config.hidden,
+                self.config.hidden,
+                &workspace.stream,
+            )?;
+        }
+        self.decision_logits_batch(
+            workspace.final_hyper.mixed(),
+            sequence_count,
+            &workspace.stream,
+            readout,
+        )
+        .map(Some)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3585,6 +4271,24 @@ impl Qwen38FlashNextDecodeState {
         Ok(())
     }
 
+    fn begin_append_on_stream(&mut self, stream: &CudaStream) -> Result<()> {
+        self.ple_window.begin_append()?;
+        if let Err(error) = self.ple_state.begin_append(stream) {
+            self.ple_window.abort_append()?;
+            return Err(error);
+        }
+        for (active, rollback) in self
+            .attention_states
+            .iter()
+            .zip(&mut self.rollback_linear_states)
+        {
+            if let (Qwen38AttentionState::Linear(active), Some(rollback)) = (active, rollback) {
+                rollback.copy_from_on_stream(active, stream)?;
+            }
+        }
+        Ok(())
+    }
+
     fn commit_append(&mut self, tokens: usize) -> Result<()> {
         self.ple_window.commit_append()?;
         self.ple_state.commit_append()?;
@@ -3603,6 +4307,20 @@ impl Qwen38FlashNextDecodeState {
             }
         }
         self.ple_state.abort_append(&self.stream)?;
+        self.ple_window.abort_append()
+    }
+
+    fn abort_append_on_stream(&mut self, stream: &CudaStream) -> Result<()> {
+        for (active, rollback) in self
+            .attention_states
+            .iter_mut()
+            .zip(&self.rollback_linear_states)
+        {
+            if let (Qwen38AttentionState::Linear(active), Some(rollback)) = (active, rollback) {
+                active.copy_from_on_stream(rollback, stream)?;
+            }
+        }
+        self.ple_state.abort_append(stream)?;
         self.ple_window.abort_append()
     }
 

@@ -1,12 +1,12 @@
 //! Multi-session chat serving for the Qwen3.8 Flash Next native QSA path.
 
 use crate::qwen38_flash_next::{
-    Qwen38FlashNextDecisionReadout, Qwen38FlashNextExecutionConfig,
-    Qwen38FlashNextExecutionSequence, Qwen38FlashNextExecutionState, Qwen38FlashNextModel,
-    Qwen38FlashNextMtpSequenceCache, Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot,
-    Qwen38FlashNextSequence, Qwen38FlashNextSequenceCache, Qwen38FlashNextSequenceId,
-    Qwen38FlashNextSpeculativeFrontier, Qwen38LogitsMode, Qwen38NextToken,
-    qwen38_flash_next_cache_error,
+    Qwen38FlashNextDecisionBatchRow, Qwen38FlashNextDecisionReadout,
+    Qwen38FlashNextExecutionConfig, Qwen38FlashNextExecutionSequence,
+    Qwen38FlashNextExecutionState, Qwen38FlashNextModel, Qwen38FlashNextMtpSequenceCache,
+    Qwen38FlashNextMtpSequenceState, Qwen38FlashNextMtpSnapshot, Qwen38FlashNextSequence,
+    Qwen38FlashNextSequenceCache, Qwen38FlashNextSequenceId, Qwen38FlashNextSpeculativeFrontier,
+    Qwen38LogitsMode, Qwen38NextToken, qwen38_flash_next_cache_error,
 };
 use crate::sm12x_cache::Sm12xCacheContext;
 use eider_cuda::{CudaStream, DeviceBuffer, Error, GpuSamplingRow, Result, SM12X_KV_PAGE_TOKENS};
@@ -146,13 +146,15 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             .into_iter()
             .map(|(_, id)| id)
             .collect::<Vec<_>>();
-        let decision_readout = model.new_decision_readout(&label_ids)?;
+        let decision_readout = model
+            .new_decision_readout_with_capacity(&label_ids, config.decision_branch_capacity)?;
         let execution = Qwen38FlashNextExecutionState::new(
             model,
             Qwen38FlashNextExecutionConfig {
                 max_active_sequences: config.max_active_sequences,
                 max_context_tokens: config.max_context_tokens,
                 prefill_token_capacity: config.prefill_token_capacity,
+                decision_branch_capacity: config.decision_branch_capacity,
                 speculative_drafts: config.speculative_drafts,
                 retained_prefix_bytes: cache_config.max_retained_bytes,
             },
@@ -576,14 +578,10 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             return Ok(None);
         }
 
+        let mut selected = Vec::new();
         let mut token_budget = self.config.prefill_token_capacity;
-        let mut progressed = false;
-        for branch in group
-            .active_branches
-            .iter_mut()
-            .take(self.config.prefill_sequence_capacity)
-        {
-            if token_budget == 0 {
+        for (index, branch) in group.active_branches.iter().enumerate() {
+            if selected.len() == self.config.prefill_sequence_capacity || token_budget == 0 {
                 break;
             }
             let target = branch.branch.suffix_tokens.len().saturating_sub(1);
@@ -592,23 +590,38 @@ impl<'template> Qwen38FlashNextChatService<'template> {
                 continue;
             }
             let chunk = remaining.min(token_budget);
-            let start = branch.suffix_position;
-            let end = start + chunk;
+            selected.push((index, chunk));
+            token_budget -= chunk;
+        }
+        if !selected.is_empty() {
+            let sequence_ids = selected
+                .iter()
+                .map(|(index, _)| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
+            let mut rows = Vec::with_capacity(selected.len());
+            for ((index, chunk), sequence) in selected.iter().zip(sequences.entries_mut()) {
+                let branch = &group.active_branches[*index];
+                let start = branch.suffix_position;
+                let end = start + *chunk;
+                rows.push(Qwen38FlashNextDecisionBatchRow {
+                    token_ids: &branch.branch.suffix_tokens[start..end],
+                    sequence: &mut sequence.sequence,
+                });
+            }
             let started = Instant::now();
-            let mut sequence = self.execution.sequences.lease(branch.sequence_id)?;
-            sequence.sequence_mut().sequence.forward_tokens(
-                &mut self.execution.model,
-                &mut self.execution.prefill_workspace,
+            self.execution.model.forward_decision_batch(
+                &mut self.execution.decision_workspace,
+                &mut rows,
                 &mut self.execution.sequence_cache,
-                &branch.branch.suffix_tokens[start..end],
-                Qwen38LogitsMode::None,
+                None,
             )?;
             group.timings.branch_inference += started.elapsed();
-            branch.suffix_position = end;
-            token_budget -= chunk;
-            progressed = true;
-        }
-        if progressed {
+            drop(rows);
+            drop(sequences);
+            for (index, chunk) in selected {
+                group.active_branches[index].suffix_position += chunk;
+            }
             return Ok(None);
         }
 
@@ -621,28 +634,42 @@ impl<'template> Qwen38FlashNextChatService<'template> {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         if !ready.is_empty() {
-            for index in ready.iter().copied() {
+            let sequence_ids = ready
+                .iter()
+                .map(|index| group.active_branches[*index].sequence_id)
+                .collect::<Vec<_>>();
+            let mut sequences = self.execution.sequences.lease_many(&sequence_ids)?;
+            let mut rows = Vec::with_capacity(ready.len());
+            for (index, sequence) in ready.iter().zip(sequences.entries_mut()) {
+                let branch = &group.active_branches[*index];
+                rows.push(Qwen38FlashNextDecisionBatchRow {
+                    token_ids: std::slice::from_ref(
+                        &branch.branch.suffix_tokens[branch.suffix_position],
+                    ),
+                    sequence: &mut sequence.sequence,
+                });
+            }
+            let started = Instant::now();
+            let logits = self
+                .execution
+                .model
+                .forward_decision_batch(
+                    &mut self.execution.decision_workspace,
+                    &mut rows,
+                    &mut self.execution.sequence_cache,
+                    Some(&mut self.decision_readout),
+                )?
+                .expect("decision readout returns compact logits");
+            group.timings.branch_inference += started.elapsed();
+            let label_count = self.decision_readout.token_ids().len();
+            drop(rows);
+            drop(sequences);
+            for (row, index) in ready.iter().copied().enumerate() {
                 let branch = &group.active_branches[index];
-                let token = branch.branch.suffix_tokens[branch.suffix_position];
-                let started = Instant::now();
-                let logits = {
-                    let mut sequence = self.execution.sequences.lease(branch.sequence_id)?;
-                    let execution_sequence = sequence.sequence_mut();
-                    execution_sequence.sequence.forward_token(
-                        &mut self.execution.model,
-                        &mut self.execution.sequence_cache,
-                        token,
-                        Qwen38LogitsMode::Decision,
-                    )?;
-                    self.execution.model.decision_logits(
-                        &execution_sequence.sequence.state,
-                        &mut self.decision_readout,
-                    )?
-                };
-                group.timings.branch_inference += started.elapsed();
+                let row_logits = &logits[row * label_count..(row + 1) * label_count];
                 group.logits.push(DecisionBranchLogits {
                     question_id: branch.branch.question_id.clone(),
-                    logits: logits[..branch.branch.label_token_ids.len()].to_vec(),
+                    logits: row_logits[..branch.branch.label_token_ids.len()].to_vec(),
                 });
             }
             for index in ready.into_iter().rev() {

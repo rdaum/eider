@@ -304,6 +304,74 @@ mod device {
         }
     }
 
+    /// Applies PLE convolution to packed rows from independent sequences.
+    #[kernel]
+    #[launch_bounds(256)]
+    pub unsafe fn qwen38_ple_conv_update_batch_f32(
+        normalized: *const f32,
+        gated: *const f32,
+        weight_bf16: *const u16,
+        state_table: *const *mut f32,
+        sequence_offsets: *const u32,
+        sequence_lengths: *const u32,
+        output: *mut f32,
+        channels: u32,
+        kernel: u32,
+        dilation: u32,
+        history: u32,
+    ) {
+        let sequence = thread::blockIdx_y();
+        let channel = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if channel >= channels {
+            return;
+        }
+        let row_offset = unsafe { *sequence_offsets.add(sequence as usize) };
+        let tokens = unsafe { *sequence_lengths.add(sequence as usize) };
+        let state = unsafe { *state_table.add(sequence as usize) };
+        let state_offset = channel as usize * history as usize;
+        let weight_offset = channel as usize * kernel as usize;
+        let mut token = 0;
+        while token < tokens {
+            let mut conv = 0.0f32;
+            let mut tap = 0;
+            while tap < kernel {
+                let lag = (kernel - 1 - tap) * dilation;
+                let centre = history + token;
+                let source = centre - lag;
+                let x = if source < history {
+                    unsafe { *state.add(state_offset + source as usize) }
+                } else {
+                    let row = row_offset + source - history;
+                    unsafe { *normalized.add((row * channels + channel) as usize) }
+                };
+                conv = x.mul_add(
+                    bf16_to_f32(unsafe { *weight_bf16.add(weight_offset + tap as usize) }),
+                    conv,
+                );
+                tap += 1;
+            }
+            let index = ((row_offset + token) * channels + channel) as usize;
+            unsafe {
+                output
+                    .add(index)
+                    .write(*gated.add(index) + conv * sigmoid(conv))
+            };
+            token += 1;
+        }
+        let mut position = 0;
+        while position < history {
+            let source = tokens + position;
+            let next = if source < history {
+                unsafe { *state.add(state_offset + source as usize) }
+            } else {
+                let row = row_offset + source - history;
+                unsafe { *normalized.add((row * channels + channel) as usize) }
+            };
+            unsafe { state.add(state_offset + position as usize).write(next) };
+            position += 1;
+        }
+    }
+
     /// Clears Qwen3.8 Flash Next QSA micro-block and tile masks.
     #[kernel]
     #[launch_bounds(256)]
