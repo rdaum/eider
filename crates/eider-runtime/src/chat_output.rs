@@ -28,7 +28,8 @@ const ATEM_INVOKE_OPEN: &str = "<atem:invoke";
 const ATEM_INVOKE_CLOSE: &str = "</atem:invoke>";
 const ATEM_PARAMETER_OPEN: &str = "<atem:parameter";
 const ATEM_PARAMETER_CLOSE: &str = "</atem:parameter>";
-const GEMMA_THINK_OPEN: &str = "<|channel>thought\n";
+const GEMMA_CHANNEL_OPEN: &str = "<|channel>";
+const GEMMA_THINK_CHANNEL: &str = "thought\n";
 const GEMMA_THINK_CLOSE: &str = "<channel|>";
 const THINK_CLOSE: &str = "</think>";
 
@@ -256,6 +257,7 @@ struct ChatOutputParser {
     pending: String,
     tool_call: String,
     tool_call_protocol: ToolCallProtocol,
+    gemma_channel_header_pending: bool,
     trim_after_thinking: bool,
     trim_after_tool_call: bool,
     string_arguments: BTreeMap<String, BTreeSet<String>>,
@@ -336,6 +338,7 @@ impl ChatOutputParser {
             pending: String::new(),
             tool_call: String::new(),
             tool_call_protocol: ToolCallProtocol::Standard,
+            gemma_channel_header_pending: false,
             trim_after_thinking: false,
             trim_after_tool_call: false,
             string_arguments,
@@ -450,30 +453,56 @@ impl ChatOutputParser {
     }
 
     fn parse_reasoning(&mut self, events: &mut Vec<ChatOutputEvent>) -> bool {
-        if self.pending.starts_with(GEMMA_THINK_OPEN) {
-            self.pending.drain(..GEMMA_THINK_OPEN.len());
+        if self.pending.starts_with(GEMMA_CHANNEL_OPEN) {
+            self.pending.drain(..GEMMA_CHANNEL_OPEN.len());
+            self.gemma_channel_header_pending = true;
             return true;
         }
-        if GEMMA_THINK_OPEN.starts_with(&self.pending) {
+        if GEMMA_CHANNEL_OPEN.starts_with(&self.pending) {
             return false;
         }
-        let close = [THINK_CLOSE, GEMMA_THINK_CLOSE]
-            .into_iter()
-            .filter_map(|marker| self.pending.find(marker).map(|index| (index, marker)))
-            .min_by_key(|(index, _)| *index);
-        if let Some((index, marker)) = close {
+
+        if self.gemma_channel_header_pending {
+            if self.pending.starts_with(GEMMA_THINK_CHANNEL) {
+                self.pending.drain(..GEMMA_THINK_CHANNEL.len());
+                self.gemma_channel_header_pending = false;
+                return true;
+            }
+            if GEMMA_THINK_CHANNEL.starts_with(&self.pending) {
+                return false;
+            }
+            self.gemma_channel_header_pending = false;
+        }
+
+        let control = [
+            (GEMMA_CHANNEL_OPEN, true),
+            (THINK_CLOSE, false),
+            (GEMMA_THINK_CLOSE, false),
+        ]
+        .into_iter()
+        .filter_map(|(marker, opens_channel)| {
+            self.pending
+                .find(marker)
+                .map(|index| (index, marker, opens_channel))
+        })
+        .min_by_key(|(index, _, _)| *index);
+        if let Some((index, marker, opens_channel)) = control {
             push_nonempty(
                 events,
                 ChatOutputEvent::Reasoning(self.pending[..index].to_string()),
             );
             self.pending.drain(..index + marker.len());
-            self.mode = OutputMode::Text;
-            self.trim_after_thinking = true;
+            if opens_channel {
+                self.gemma_channel_header_pending = true;
+            } else {
+                self.mode = OutputMode::Text;
+                self.trim_after_thinking = true;
+            }
             return true;
         }
         flush_safe_prefix_with_markers(
             &mut self.pending,
-            [THINK_CLOSE, GEMMA_THINK_CLOSE].into_iter(),
+            [GEMMA_CHANNEL_OPEN, THINK_CLOSE, GEMMA_THINK_CLOSE].into_iter(),
             events,
             ChatOutputEvent::Reasoning,
         )
@@ -511,6 +540,33 @@ impl ChatOutputParser {
         .into_iter()
         .filter_map(|(open, protocol)| self.pending.find(open).map(|index| (index, open, protocol)))
         .min_by_key(|(index, _, _)| *index);
+        let channel_marker = [(GEMMA_CHANNEL_OPEN, true), (GEMMA_THINK_CLOSE, false)]
+            .into_iter()
+            .filter_map(|(marker, opens_channel)| {
+                self.pending
+                    .find(marker)
+                    .map(|index| (index, marker, opens_channel))
+            })
+            .min_by_key(|(index, _, _)| *index);
+        if let Some((index, marker, opens_channel)) = channel_marker.filter(|(index, _, _)| {
+            protocol_open
+                .as_ref()
+                .is_none_or(|(protocol_index, _, _)| *index <= *protocol_index)
+                && direct_open.is_none_or(|(direct_index, _)| *index <= direct_index)
+        }) {
+            push_nonempty(
+                events,
+                ChatOutputEvent::Text(self.pending[..index].to_string()),
+            );
+            self.pending.drain(..index + marker.len());
+            if opens_channel {
+                self.mode = OutputMode::Reasoning;
+                self.gemma_channel_header_pending = true;
+            } else {
+                self.trim_after_thinking = true;
+            }
+            return true;
+        }
         if let Some((index, open, protocol)) = protocol_open.filter(|(index, _, _)| {
             direct_open.is_none_or(|(direct_index, _)| *index <= direct_index)
         }) {
@@ -541,6 +597,8 @@ impl ChatOutputParser {
                 GEMMA_TOOL_CALL_OPEN,
                 DSML_TOOL_CALLS_OPEN,
                 ATEM_TOOL_CALLS_OPEN,
+                GEMMA_CHANNEL_OPEN,
+                GEMMA_THINK_CLOSE,
             ]
             .into_iter()
             .chain(self.direct_tools.iter().map(|tool| tool.open.as_str())),
@@ -2098,6 +2156,54 @@ mod tests {
     }
 
     #[test]
+    fn gemma_repeated_reasoning_markers_are_not_emitted() {
+        let text = concat!(
+            "I'll inspect it.\n",
+            "<|channel><|channel><|channel>thought\n",
+            "checking details<channel|>\n",
+            "The result is ready."
+        );
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&[], true).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                normalized(events),
+                [
+                    ChatOutputEvent::Reasoning("I'll inspect it.\nchecking details".to_string()),
+                    ChatOutputEvent::Text("The result is ready.".to_string()),
+                ],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_late_reasoning_channel_switches_from_text() {
+        let text = concat!(
+            "The first result is ready.",
+            "<|channel>thought\nchecking again<channel|>\n",
+            "The second result is ready."
+        );
+        for split in 0..=text.len() {
+            let mut parser = ChatOutputParser::new(&[], false).unwrap();
+            let mut events = parser.push_text(&text[..split]).unwrap();
+            events.extend(parser.push_text(&text[split..]).unwrap());
+            events.extend(parser.finish().unwrap());
+            assert_eq!(
+                normalized(events),
+                [
+                    ChatOutputEvent::Text("The first result is ready.".to_string()),
+                    ChatOutputEvent::Reasoning("checking again".to_string()),
+                    ChatOutputEvent::Text("The second result is ready.".to_string()),
+                ],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
     fn gemma_tool_call_survives_every_chunk_boundary() {
         let tools = vec![ChatTool::function(ChatFunctionDefinition {
             name: "bash".to_string(),
@@ -2176,11 +2282,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local Gemma 4 checkpoint"]
+    #[ignore = "requires GEMMA4_MODEL_DIR or the repository-local Gemma 4 checkpoint"]
     fn local_gemma_tokenizer_stream_recovers_reasoning_and_tool_call() {
-        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("models/gemma-4-26b-a4b-nvfp4");
+        let model_dir = std::env::var_os("GEMMA4_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join("models/gemma-4-26b-a4b-nvfp4")
+            });
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
         let tools = vec![ChatTool::function(ChatFunctionDefinition {
             name: "bash".to_string(),
@@ -2195,7 +2305,7 @@ mod tests {
             }),
         })];
         let generated = concat!(
-            "<|channel>thought\nchecked<channel|>",
+            "<|channel><|channel><|channel>thought\nchecked<channel|>",
             "<|tool_call>call:bash{command:<|\"|>git diff<|\"|>,timeout:10}<tool_call|>"
         );
         let encoding = tokenizer.encode(generated, false).unwrap();
