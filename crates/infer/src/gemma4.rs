@@ -1901,7 +1901,9 @@ impl Gemma4Model {
         for layer in &self.layers {
             layers.push(layer.new_workspace()?);
         }
-        let compact_attention = Gemma4CompactAttentionWorkspaces::new(&self.layers, max_tokens)?;
+        let workspace_capacity = sequence::gemma4_state_capacity(max_tokens)?;
+        let compact_attention =
+            Gemma4CompactAttentionWorkspaces::new(&self.layers, workspace_capacity)?;
         Ok(Gemma4DecodeState {
             hidden: DeviceBuffer::zeroed(self.config.hidden_size)?,
             layers,

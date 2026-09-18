@@ -181,8 +181,8 @@ struct Args {
     prefill_token_capacity: Option<usize>,
 
     /// Maximum requests retaining device sequence state.
-    #[arg(long, default_value_t = 8)]
-    max_active_sequences: usize,
+    #[arg(long)]
+    max_active_sequences: Option<usize>,
 
     /// Greedy-only native drafts per speculative cycle.
     /// Omit this option to use the model default. Zero disables speculation.
@@ -329,6 +329,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefill_token_capacity = args
         .prefill_token_capacity
         .unwrap_or(defaults.prefill_token_capacity);
+    let max_active_sequences = args
+        .max_active_sequences
+        .unwrap_or(resolved.default_max_active_sequences);
     let step_expert_capacity = args
         .step_expert_capacity
         .unwrap_or(defaults.step_expert_capacity);
@@ -354,7 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         decision_branch_capacity: args.decision_branch_capacity,
         prefill_sequence_capacity: args.prefill_sequence_capacity,
         prefill_token_capacity,
-        max_active_sequences: args.max_active_sequences,
+        max_active_sequences,
         max_context_tokens,
         speculative_drafts,
     };

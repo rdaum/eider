@@ -2,7 +2,7 @@
 
 use super::{Gemma4DecodeState, Gemma4Model};
 use crate::sm12x_cache::{Sm12xCacheContext, Sm12xPageBackend, Sm12xPageTable};
-use eider_cuda::{CudaStream, Error, Result};
+use eider_cuda::{CudaStream, Error, Result, SM12X_KV_PAGE_TOKENS};
 use seqcache::{
     AdmissionOutcome, AdmissionRequest, AppendReservation, CacheError, SequenceCache, SequenceId,
 };
@@ -18,6 +18,17 @@ pub struct Gemma4Sequence {
     pub(crate) cache_id: SequenceId,
     pub(crate) page_table: Sm12xPageTable,
     pub(crate) state: Gemma4DecodeState,
+}
+
+pub(super) fn gemma4_state_capacity(max_tokens: usize) -> Result<usize> {
+    max_tokens
+        .div_ceil(SM12X_KV_PAGE_TOKENS)
+        .checked_mul(SM12X_KV_PAGE_TOKENS)
+        .ok_or_else(|| Error::Shape {
+            label: "Gemma 4 sequence capacity",
+            expected: "page-aligned capacity without overflow".to_string(),
+            actual: max_tokens.to_string(),
+        })
 }
 
 impl Gemma4Sequence {
@@ -189,5 +200,23 @@ pub(crate) fn gemma4_cache_error(error: CacheError<Error>) -> Error {
     Error::Format {
         label: "Gemma 4 sequence cache",
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemma4_state_capacity;
+
+    #[test]
+    fn sequence_state_capacity_covers_complete_kv_pages() {
+        assert_eq!(gemma4_state_capacity(1).unwrap(), 128);
+        assert_eq!(gemma4_state_capacity(128).unwrap(), 128);
+        assert_eq!(gemma4_state_capacity(536).unwrap(), 640);
+        assert_eq!(gemma4_state_capacity(537).unwrap(), 640);
+    }
+
+    #[test]
+    fn sequence_state_capacity_rejects_overflow() {
+        assert!(gemma4_state_capacity(usize::MAX).is_err());
     }
 }

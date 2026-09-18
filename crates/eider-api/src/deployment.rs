@@ -54,6 +54,10 @@ fn default_speculative_drafts(model_type: &str) -> usize {
     usize::from(model_type == "qwen3_8_flash_next")
 }
 
+fn default_max_active_sequences(model_type: &str) -> usize {
+    if model_type == "gemma4" { 4 } else { 8 }
+}
+
 const CATALOGUE: &[ModelSpec] = &[
     ModelSpec {
         id: "bitnet-b1.58-2b-4t",
@@ -207,8 +211,8 @@ const CATALOGUE: &[ModelSpec] = &[
         artifact_estimate_bytes: 0,
         defaults: ServingDefaults {
             served_model_name: "eider-gemma4-26b",
-            max_context_tokens: 262_144,
-            prefill_token_capacity: 3_072,
+            max_context_tokens: 65_536,
+            prefill_token_capacity: 1_536,
             step_expert_capacity: 240,
         },
     },
@@ -221,8 +225,8 @@ const CATALOGUE: &[ModelSpec] = &[
         artifact_estimate_bytes: 0,
         defaults: ServingDefaults {
             served_model_name: "eider-gemma4-26b",
-            max_context_tokens: 262_144,
-            prefill_token_capacity: 3_072,
+            max_context_tokens: 65_536,
+            prefill_token_capacity: 1_536,
             step_expert_capacity: 240,
         },
     },
@@ -264,6 +268,7 @@ pub struct ResolvedModel {
     pub dflash2_dir: Option<PathBuf>,
     pub identity: String,
     pub defaults: ServingDefaults,
+    pub default_max_active_sequences: usize,
     pub default_speculative_drafts: usize,
     pub preparation: ArtifactKind,
 }
@@ -364,6 +369,7 @@ pub async fn resolve_catalogue_model(id: &str, offline: bool) -> Result<Resolved
         dflash2_dir,
         identity: format!("{}@{}", spec.id, spec.revision),
         defaults: spec.defaults,
+        default_max_active_sequences: default_max_active_sequences(spec.model_type),
         default_speculative_drafts: default_speculative_drafts(spec.model_type),
         preparation: spec.artifact_kind,
     })
@@ -672,6 +678,7 @@ pub fn resolve_local_model(model_dir: impl Into<PathBuf>) -> Result<ResolvedMode
             },
             step_expert_capacity: 240,
         },
+        default_max_active_sequences: default_max_active_sequences(&model_type),
         default_speculative_drafts: default_speculative_drafts(&model_type),
         preparation: match model_type.as_str() {
             "qwen3_5_moe" => ArtifactKind::Qwen36Experts,
@@ -867,14 +874,16 @@ mod tests {
 
     #[test]
     fn catalogue_includes_both_supported_gemma4_weight_formats() {
-        assert_eq!(
-            catalogue_model("gemma-4-26b-a4b-nvfp4").unwrap().model_type,
-            "gemma4"
-        );
+        let nvfp4 = catalogue_model("gemma-4-26b-a4b-nvfp4").unwrap();
+        assert_eq!(nvfp4.model_type, "gemma4");
+        assert_eq!(nvfp4.defaults.max_context_tokens, 65_536);
+        assert_eq!(nvfp4.defaults.prefill_token_capacity, 1_536);
+        assert_eq!(default_max_active_sequences(nvfp4.model_type), 4);
         assert_eq!(
             catalogue_model("gemma-4-26b-a4b-it").unwrap().model_type,
             "gemma4"
         );
+        assert_eq!(default_max_active_sequences("qwen3_5"), 8);
     }
 
     #[test]
